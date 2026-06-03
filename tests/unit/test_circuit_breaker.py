@@ -4,12 +4,60 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 
 import pytest
 from pydantic import BaseModel
 
 from solwyn._types import CircuitState
 from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
+
+
+class _SlowTransitionCircuitBreaker(CircuitBreaker):
+    """Expose duplicate concurrent transitions without relying on lost increments."""
+
+    def __init__(self, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.open_transitions: list[None] = []
+        self.closed_transitions: list[None] = []
+        self.half_open_transitions: list[None] = []
+
+    def _transition_to_open(self) -> None:
+        self.open_transitions.append(None)
+        time.sleep(0.02)
+        super()._transition_to_open()
+
+    def _transition_to_closed(self) -> None:
+        self.closed_transitions.append(None)
+        time.sleep(0.02)
+        super()._transition_to_closed()
+
+    def _transition_to_half_open(self) -> None:
+        self.half_open_transitions.append(None)
+        time.sleep(0.02)
+        super()._transition_to_half_open()
+
+
+def _run_concurrently(workers: int, target: Callable[[], object]) -> None:
+    barrier = threading.Barrier(workers)
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=2.0)
+            target()
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(workers)]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
 
 
 @pytest.mark.unit
@@ -104,58 +152,36 @@ class TestHalfOpenFailure:
 
 @pytest.mark.unit
 class TestConcurrentStateMutation:
-    """Concurrent sync callers must not lose breaker counter updates."""
+    """Concurrent sync callers must not duplicate state transitions."""
 
-    def test_concurrent_half_open_successes_count_exactly(self) -> None:
-        workers = 32
-        cb = CircuitBreaker(success_threshold=workers + 1)
+    def test_concurrent_half_open_successes_close_once(self) -> None:
+        cb = _SlowTransitionCircuitBreaker(success_threshold=1)
         cb.state = CircuitState.HALF_OPEN
-        barrier = threading.Barrier(workers)
-        errors: list[BaseException] = []
 
-        def worker() -> None:
-            try:
-                barrier.wait()
-                cb.record_success()
-            except BaseException as exc:
-                errors.append(exc)
+        _run_concurrently(32, cb.record_success)
 
-        threads = [threading.Thread(target=worker) for _ in range(workers)]
-
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=2.0)
-
-        assert errors == []
-        assert all(not thread.is_alive() for thread in threads)
-        assert cb.state == CircuitState.HALF_OPEN
-        assert cb.success_count == workers
-
-    def test_concurrent_closed_failures_count_exactly(self) -> None:
-        workers = 32
-        cb = CircuitBreaker(failure_threshold=workers + 1)
-        barrier = threading.Barrier(workers)
-        errors: list[BaseException] = []
-
-        def worker() -> None:
-            try:
-                barrier.wait()
-                cb.record_failure()
-            except BaseException as exc:
-                errors.append(exc)
-
-        threads = [threading.Thread(target=worker) for _ in range(workers)]
-
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=2.0)
-
-        assert errors == []
-        assert all(not thread.is_alive() for thread in threads)
         assert cb.state == CircuitState.CLOSED
-        assert cb.failure_count == workers
+        assert len(cb.closed_transitions) == 1
+        assert cb.success_count == 0
+
+    def test_concurrent_closed_failures_open_once(self) -> None:
+        cb = _SlowTransitionCircuitBreaker(failure_threshold=1)
+
+        _run_concurrently(32, cb.record_failure)
+
+        assert cb.state == CircuitState.OPEN
+        assert len(cb.open_transitions) == 1
+        assert cb.failure_count == 1
+
+    def test_concurrent_recovery_probe_transitions_half_open_once(self) -> None:
+        cb = _SlowTransitionCircuitBreaker(recovery_timeout=0)
+        cb.state = CircuitState.OPEN
+        cb.last_failure_time = time.monotonic() - 1
+
+        _run_concurrently(32, cb.can_proceed)
+
+        assert cb.state == CircuitState.HALF_OPEN
+        assert len(cb.half_open_transitions) == 1
 
 
 @pytest.mark.unit
