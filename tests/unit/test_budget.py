@@ -137,6 +137,22 @@ class TestCloudAllow:
         assert result.reservation_id == "res_123"
         assert result.warning is None
 
+    def test_shared_allow_fixture_propagates_non_none_price_hints(self) -> None:
+        enforcer = _make_enforcer()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            **ALLOW_BUDGET_RESPONSE,
+            "price_hints": {"openai": 10.0, "anthropic": 2.0},
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(enforcer._http, "post", return_value=mock_response):
+            result = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            )
+
+        assert result.price_hints == {"openai": 10.0, "anthropic": 2.0}
+
 
 # ---------------------------------------------------------------------------
 # Cloud deny: hard_deny

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -99,6 +100,62 @@ class TestHalfOpenFailure:
 
         cb.record_failure()  # -> back to OPEN
         assert cb.state == CircuitState.OPEN
+
+
+@pytest.mark.unit
+class TestConcurrentStateMutation:
+    """Concurrent sync callers must not lose breaker counter updates."""
+
+    def test_concurrent_half_open_successes_count_exactly(self) -> None:
+        workers = 32
+        cb = CircuitBreaker(success_threshold=workers + 1)
+        cb.state = CircuitState.HALF_OPEN
+        barrier = threading.Barrier(workers)
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                barrier.wait()
+                cb.record_success()
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(workers)]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2.0)
+
+        assert errors == []
+        assert all(not thread.is_alive() for thread in threads)
+        assert cb.state == CircuitState.HALF_OPEN
+        assert cb.success_count == workers
+
+    def test_concurrent_closed_failures_count_exactly(self) -> None:
+        workers = 32
+        cb = CircuitBreaker(failure_threshold=workers + 1)
+        barrier = threading.Barrier(workers)
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                barrier.wait()
+                cb.record_failure()
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(workers)]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2.0)
+
+        assert errors == []
+        assert all(not thread.is_alive() for thread in threads)
+        assert cb.state == CircuitState.CLOSED
+        assert cb.failure_count == workers
 
 
 @pytest.mark.unit

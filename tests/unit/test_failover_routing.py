@@ -13,6 +13,7 @@ a ``_Status(status_code=429)`` classifies as FAILOVER (advance the chain) while
 
 from __future__ import annotations
 
+import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -650,6 +651,35 @@ class TestPerHopDeadline:
 
         _close(solwyn)
 
+    def test_slow_google_dispatch_raises_within_per_hop_timeout(self) -> None:
+        client = _google_client()
+
+        def slow_generate_content(**kwargs: object) -> SimpleNamespace:
+            config = kwargs.get("config") if isinstance(kwargs.get("config"), dict) else {}
+            http_options = config.get("http_options", {}) if isinstance(config, dict) else {}
+            timeout_ms = http_options.get("timeout") if isinstance(http_options, dict) else None
+            if isinstance(timeout_ms, int) and timeout_ms < 50:
+                raise _Status(429, "google timed out")
+            time.sleep(0.05)
+            return _google_response()
+
+        client.models.generate_content = slow_generate_content
+        solwyn = _make_solwyn(client, model="gemini-2.0-flash")
+
+        started = time.perf_counter()
+        with pytest.raises(_Status):
+            solwyn._sync_dispatch(
+                solwyn._runtimes[0],
+                {"model": "gemini-2.0-flash", "contents": "hi"},
+                is_streaming=False,
+                timeout=0.001,
+                max_retries=0,
+            )
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 0.03
+        _close(solwyn)
+
     @pytest.mark.asyncio
     async def test_async_google_dispatch_sets_per_request_timeout_and_retry_bound(self) -> None:
         client = _google_client()
@@ -672,6 +702,37 @@ class TestPerHopDeadline:
         assert kwargs["config"]["http_options"]["timeout"] == 125
         assert kwargs["config"]["http_options"]["retry_options"]["attempts"] == 1
 
+        await solwyn._reporter._http.aclose()
+        await solwyn._budget._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_async_slow_google_dispatch_raises_within_per_hop_timeout(self) -> None:
+        client = _google_client()
+
+        async def slow_generate_content(**kwargs: object) -> SimpleNamespace:
+            config = kwargs.get("config") if isinstance(kwargs.get("config"), dict) else {}
+            http_options = config.get("http_options", {}) if isinstance(config, dict) else {}
+            timeout_ms = http_options.get("timeout") if isinstance(http_options, dict) else None
+            if isinstance(timeout_ms, int) and timeout_ms < 50:
+                raise _Status(429, "google timed out")
+            await asyncio.sleep(0.05)
+            return _google_response()
+
+        client.models.generate_content = slow_generate_content
+        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, model="gemini-2.0-flash")
+
+        started = time.perf_counter()
+        with pytest.raises(_Status):
+            await solwyn._async_dispatch(
+                solwyn._runtimes[0],
+                {"model": "gemini-2.0-flash", "contents": "hi"},
+                is_streaming=False,
+                timeout=0.001,
+                max_retries=0,
+            )
+        elapsed = time.perf_counter() - started
+
+        assert elapsed < 0.03
         await solwyn._reporter._http.aclose()
         await solwyn._budget._http.aclose()
 
