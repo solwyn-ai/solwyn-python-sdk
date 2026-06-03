@@ -58,16 +58,27 @@ def _anthropic_client() -> MagicMock:
     return client
 
 
-def _openai_response() -> MagicMock:
-    resp = MagicMock()
-    resp.usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
-    return resp
+def _openai_response() -> SimpleNamespace:
+    # Native OpenAI Chat Completions shape (duck-typed).
+    message = SimpleNamespace(role="assistant", content="ok from gpt", tool_calls=None)
+    choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
+    return SimpleNamespace(
+        choices=[choice],
+        model="gpt-4o",
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+    )
 
 
-def _anthropic_response() -> MagicMock:
-    resp = MagicMock()
-    resp.usage = SimpleNamespace(input_tokens=10, output_tokens=5)
-    return resp
+def _anthropic_response() -> SimpleNamespace:
+    # Native Anthropic Messages shape (duck-typed): survives normalize_response
+    # when it crosses back to an OpenAI-dialect caller.
+    block = SimpleNamespace(type="text", text="ok from claude")
+    return SimpleNamespace(
+        content=[block],
+        stop_reason="end_turn",
+        model="claude-3-5-sonnet",
+        usage=SimpleNamespace(input_tokens=10, output_tokens=5),
+    )
 
 
 def _allow_budget() -> SimpleNamespace:
@@ -156,7 +167,9 @@ class TestSafeDefault:
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # A 429 is a provable pre-send rejection -> safe to cross providers.
-        assert result is anthropic_resp
+        # The crossed response is normalized back to the OpenAI dialect.
+        assert result is not anthropic_resp
+        assert result.choices[0].message.content == "ok from claude"
         anthropic.messages.create.assert_called_once()
 
         _close(solwyn)
@@ -185,7 +198,9 @@ class TestAlwaysMode:
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # always = caller asserts idempotency -> ambiguous failures DO cross.
-        assert result is anthropic_resp
+        # The crossed response is normalized back to the OpenAI dialect.
+        assert result is not anthropic_resp
+        assert result.choices[0].message.content == "ok from claude"
         anthropic.messages.create.assert_called_once()
 
         _close(solwyn)
@@ -269,7 +284,9 @@ class TestPerCallOverride:
                 **_PLAIN_REQUEST,
             )
 
-        assert result is anthropic_resp
+        # The crossed response is normalized back to the OpenAI dialect.
+        assert result is not anthropic_resp
+        assert result.choices[0].message.content == "ok from claude"
         anthropic.messages.create.assert_called_once()
         # solwyn_idempotent must be stripped before dispatch on BOTH hops.
         assert "solwyn_idempotent" not in openai.chat.completions.create.call_args.kwargs

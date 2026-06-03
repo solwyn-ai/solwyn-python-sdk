@@ -20,6 +20,8 @@ from solwyn.exceptions import (
     ConfigurationError,
     ProviderUnavailableError,
     SolwynError,
+    UntranslatableModelError,
+    UntranslatableRequestError,
 )
 
 __all__ = [
@@ -31,6 +33,8 @@ __all__ = [
     "BudgetExceededError",
     "ProviderUnavailableError",
     "ConfigurationError",
+    "UntranslatableRequestError",
+    "UntranslatableModelError",
     "run",
     "run_in_executor",
     "current_run",

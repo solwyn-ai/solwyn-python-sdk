@@ -1,7 +1,7 @@
-"""Private, privacy-sensitive helpers — PRIVACY CRITICAL.
+"""Private, privacy-sensitive helpers — PRIVACY-CRITICAL.
 
-PRIVACY
-=======
+PRIVACY-CRITICAL
+================
 This module is the only place in the SDK that touches customer prompt
 content directly. Code here must obey three rules:
 

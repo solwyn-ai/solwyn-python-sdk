@@ -3,6 +3,8 @@
 BudgetExceededError -- raised when hard-deny mode blocks a request.
 ProviderUnavailableError -- raised when all providers are circuit-broken.
 ConfigurationError -- raised when configuration is invalid.
+UntranslatableRequestError -- raised when a cross-provider hop cannot translate a request.
+UntranslatableModelError -- raised when a model id is not configured for a target provider.
 """
 
 from __future__ import annotations
@@ -86,6 +88,56 @@ class ProviderUnavailableError(SolwynError):
         self.provider = provider
         self.circuit_state = circuit_state
         self.attempted = attempted
+
+
+class UntranslatableRequestError(SolwynError):
+    """Raised when a cross-provider failover hop cannot translate a request.
+
+    Raised before any network call, aborting the whole candidate chain. Carries
+    only STRUCTURAL labels describing *what* could not be translated -- never the
+    offending value and never any prompt content.
+
+    Attributes:
+        source: Provider the request was authored against (e.g. ``"openai"``).
+        target: Provider the request was being translated toward (e.g. ``"anthropic"``).
+        feature: Structural token naming the untranslatable shape (e.g.
+            ``"response_format"``, ``"temperature>1.0"``, ``"anthropic.computer_use"``,
+            ``"dangling_tool_call"``). NEVER the offending value or prompt content.
+    """
+
+    def __init__(self, *, source: str, target: str, feature: str) -> None:
+        message = f"cannot translate {feature} from {source} to {target}"
+        super().__init__(message)
+        self.source = source
+        self.target = target
+        self.feature = feature
+
+    def __repr__(self) -> str:
+        return (
+            f"UntranslatableRequestError("
+            f"source={self.source!r}, target={self.target!r}, feature={self.feature!r})"
+        )
+
+
+class UntranslatableModelError(SolwynError):
+    """Raised when a model id is not configured for the target provider.
+
+    A model id is a configuration value, not prompt content, so it is safe to
+    surface in the message.
+
+    Attributes:
+        model: The model identifier that has no mapping (e.g. ``"gpt-4o"``).
+        provider: The target provider the model was not configured for.
+    """
+
+    def __init__(self, *, model: str, provider: str) -> None:
+        message = f"model {model} is not configured for provider {provider}"
+        super().__init__(message)
+        self.model = model
+        self.provider = provider
+
+    def __repr__(self) -> str:
+        return f"UntranslatableModelError(model={self.model!r}, provider={self.provider!r})"
 
 
 class ConfigurationError(SolwynError):

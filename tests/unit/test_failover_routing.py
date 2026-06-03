@@ -55,16 +55,30 @@ def _anthropic_client() -> MagicMock:
     return client
 
 
-def _openai_response() -> MagicMock:
-    resp = MagicMock()
-    resp.usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
-    return resp
+def _openai_response() -> SimpleNamespace:
+    # Native OpenAI Chat Completions shape (duck-typed): the adapter reads
+    # ``usage`` and the normalizer reads ``choices[0].message`` + ``model``.
+    message = SimpleNamespace(role="assistant", content="ok from gpt", tool_calls=None)
+    choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
+    return SimpleNamespace(
+        choices=[choice],
+        model="gpt-4o",
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+    )
 
 
-def _anthropic_response() -> MagicMock:
-    resp = MagicMock()
-    resp.usage = SimpleNamespace(input_tokens=10, output_tokens=5)
-    return resp
+def _anthropic_response() -> SimpleNamespace:
+    # Native Anthropic Messages shape (duck-typed). When this response crosses
+    # back to an OpenAI-dialect caller it is reshaped by normalize_response, so
+    # it must expose the real ``content``/``stop_reason``/``model`` access paths
+    # (a bare MagicMock would fail CanonicalResponse validation on ``model``).
+    block = SimpleNamespace(type="text", text="ok from claude")
+    return SimpleNamespace(
+        content=[block],
+        stop_reason="end_turn",
+        model="claude-3-5-sonnet",
+        usage=SimpleNamespace(input_tokens=10, output_tokens=5),
+    )
 
 
 def _allow_budget() -> SimpleNamespace:
@@ -115,13 +129,24 @@ class TestCrossProviderFailover:
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-        # Anthropic served the request; the response came from it.
-        assert result is anthropic_resp
+        # Anthropic served the request. The plain-text request crossed via real
+        # §5 translation, and the served response was normalized back into the
+        # OpenAI dialect the caller wrote — so the native access path resolves
+        # to the Anthropic text (NOT identity with the raw Anthropic object).
+        assert result is not anthropic_resp
+        assert result.choices[0].message.content == "ok from claude"
         anthropic.messages.create.assert_called_once()
         openai.chat.completions.create.assert_called_once()
-        # Anthropic entry default_params supplied max_tokens.
-        assert anthropic.messages.create.call_args.kwargs["max_tokens"] == 256
-        assert anthropic.messages.create.call_args.kwargs["model"] == "claude-3-5-sonnet"
+        # The Anthropic call received TRANSLATED, Anthropic-native kwargs.
+        anthropic_kwargs = anthropic.messages.create.call_args.kwargs
+        assert anthropic_kwargs["max_tokens"] == 256  # from entry default_params
+        assert anthropic_kwargs["model"] == "claude-3-5-sonnet"  # fallback entry model
+        # Translation reshaped the OpenAI message into Anthropic block form.
+        assert anthropic_kwargs["messages"] == [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+        ]
+        # The OpenAI-only key never crosses to the Anthropic call.
+        assert "max_completion_tokens" not in anthropic_kwargs
 
         _close(solwyn)
 
@@ -241,9 +266,14 @@ class TestCrossProviderFailover:
         ):
             result = await solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-        assert result is anthropic_resp
+        # Response normalized back to the OpenAI dialect (not the raw Anthropic
+        # object); the native access path yields the Anthropic text.
+        assert result is not anthropic_resp
+        assert result.choices[0].message.content == "ok from claude"
         anthropic.messages.create.assert_awaited_once()
-        assert anthropic.messages.create.call_args.kwargs["max_tokens"] == 256
+        anthropic_kwargs = anthropic.messages.create.call_args.kwargs
+        assert anthropic_kwargs["max_tokens"] == 256
+        assert anthropic_kwargs["model"] == "claude-3-5-sonnet"
         # Breaker accounting mirrors the sync case.
         assert openai_cb.failure_count == 1
         assert anthropic_cb.failure_count == 0

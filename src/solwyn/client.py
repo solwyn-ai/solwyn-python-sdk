@@ -53,7 +53,7 @@ from solwyn.exceptions import (
     ConfigurationError,
     ProviderUnavailableError,
 )
-from solwyn.providers import get_adapter_for_client
+from solwyn.providers import _translation, get_adapter_for_client
 from solwyn.providers._errors import Disposition, classify_exception
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
@@ -125,6 +125,61 @@ def _detect_provider(client: object) -> ProviderName:
             f"Supported: openai.OpenAI, anthropic.Anthropic, "
             f"google.generativeai.GenerativeModel"
         ) from err
+
+
+def _build_hop_kwargs(
+    *,
+    primary: ProviderRuntime,
+    rt: ProviderRuntime,
+    is_primary: bool,
+    is_provider_fallback: bool,
+    is_streaming: bool,
+    global_defaults: dict[str, Any],
+    kwargs: dict[str, object],
+) -> dict[str, object]:
+    """Build the native kwargs for one candidate hop (§4.6, §5).
+
+    Fill-absent precedence: per-call kwargs > per-entry default_params > global.
+    For a PRIMARY or SAME-PROVIDER model-swap hop the merged kwargs pass straight
+    through to the native SDK (no translation). For a CROSS-PROVIDER hop the
+    merged kwargs are run through the §5 translation contract:
+
+        canonical  = to_canonical(primary, merged_kwargs)
+        call_kwargs = from_canonical(target, canonical, model=...)
+
+    then the target entry default_params are re-applied as fill-absent so the
+    target's own required/default fields (e.g. Anthropic ``max_tokens``) fill
+    when the caller omitted them on the source dialect.
+
+    The Untranslatable* errors raised here carry STRUCTURAL labels only; this
+    function never logs, never stringifies content, and passes dicts straight
+    through to ``_translation`` (a content-privileged module).
+    """
+    merged_defaults = {**global_defaults, **rt.entry.default_params}
+    merged_kwargs: dict[str, object] = {**merged_defaults, **kwargs}
+    if not is_provider_fallback:
+        # PRIMARY hop is native passthrough; same-provider hop only swaps model.
+        # Same-provider streaming (incl. model swap) keeps working unchanged.
+        if is_primary:
+            return merged_kwargs
+        return {**merged_kwargs, "model": rt.entry.model}
+
+    # CROSS-PROVIDER hop. Streaming failover requires stream normalization, which
+    # is P3 — not P2. Without it a cross-provider streaming hop would serve a
+    # foreign-dialect stream the caller cannot consume on its native access path,
+    # so FAIL LOUD here, BEFORE dispatch, aborting the chain cleanly (no foreign
+    # stream returned). P3 lifts this restriction (adds stream normalization).
+    if is_streaming:
+        _translation.fail_cross_provider_streaming(
+            source=primary.adapter.name, target=rt.adapter.name
+        )
+
+    # Translate via the canonical subset (may RAISE an Untranslatable* error
+    # BEFORE any network call; the caller aborts the chain).
+    canonical = _translation.to_canonical(primary.adapter.name, merged_kwargs)
+    call_kwargs = _translation.from_canonical(rt.adapter.name, canonical, model=rt.entry.model)
+    # Re-apply target entry defaults as fill-absent (e.g. Anthropic max_tokens).
+    return {**rt.entry.default_params, **call_kwargs}
 
 
 class Solwyn(_SolwynBase):
@@ -366,12 +421,19 @@ class Solwyn(_SolwynBase):
             is_provider_fallback = rt.entry.provider != primary.entry.provider
             is_model_fallback = (not is_provider_fallback) and not is_primary
 
-            # P1: native passthrough (no _translation module yet). Fill-absent
-            # defaults: per-call kwargs > per-entry default_params > global.
-            merged_defaults = {**self._config.default_params, **rt.entry.default_params}
-            call_kwargs: dict[str, object] = {**merged_defaults, **kwargs}
-            if not is_primary:
-                call_kwargs = {**call_kwargs, "model": rt.entry.model}
+            # Build native kwargs for this hop (§5). A cross-provider hop runs the
+            # §5 translation contract and may RAISE an Untranslatable* error here,
+            # BEFORE any network call — that aborts the WHOLE chain (§4.6, §6.8):
+            # do NOT classify it as transport, advance, or record a breaker failure.
+            call_kwargs = _build_hop_kwargs(
+                primary=primary,
+                rt=rt,
+                is_primary=is_primary,
+                is_provider_fallback=is_provider_fallback,
+                is_streaming=is_streaming,
+                global_defaults=self._config.default_params,
+                kwargs=kwargs,
+            )
             served_model = requested_model if is_primary else rt.entry.model
             if is_streaming:
                 call_kwargs = rt.adapter.prepare_streaming(call_kwargs)
@@ -469,7 +531,16 @@ class Solwyn(_SolwynBase):
                     agent_run=agent_run,
                 )
             )
-            return response  # P1: raw served response (normalization is P2)
+            if is_provider_fallback:
+                # Cross-provider hop: reshape the served response back to the
+                # caller's native dialect (§5). Primary / same-provider hops
+                # return the raw response unchanged.
+                return _translation.normalize_response(
+                    served=rt.adapter.name,
+                    requested=primary.adapter.name,
+                    response=response,
+                )
+            return response
 
         if last_exc is not None:
             raise last_exc
@@ -795,10 +866,19 @@ class AsyncSolwyn(_SolwynBase):
             is_provider_fallback = rt.entry.provider != primary.entry.provider
             is_model_fallback = (not is_provider_fallback) and not is_primary
 
-            merged_defaults = {**self._config.default_params, **rt.entry.default_params}
-            call_kwargs: dict[str, object] = {**merged_defaults, **kwargs}
-            if not is_primary:
-                call_kwargs = {**call_kwargs, "model": rt.entry.model}
+            # Build native kwargs for this hop (§5). A cross-provider hop runs the
+            # §5 translation contract and may RAISE an Untranslatable* error here,
+            # BEFORE any network call — that aborts the WHOLE chain (§4.6, §6.8):
+            # do NOT classify it as transport, advance, or record a breaker failure.
+            call_kwargs = _build_hop_kwargs(
+                primary=primary,
+                rt=rt,
+                is_primary=is_primary,
+                is_provider_fallback=is_provider_fallback,
+                is_streaming=is_streaming,
+                global_defaults=self._config.default_params,
+                kwargs=kwargs,
+            )
             served_model = requested_model if is_primary else rt.entry.model
             if is_streaming:
                 call_kwargs = rt.adapter.prepare_streaming(call_kwargs)
@@ -893,6 +973,15 @@ class AsyncSolwyn(_SolwynBase):
                     agent_run=agent_run,
                 )
             )
+            if is_provider_fallback:
+                # Cross-provider hop: reshape the served response back to the
+                # caller's native dialect (§5). Primary / same-provider hops
+                # return the raw response unchanged.
+                return _translation.normalize_response(
+                    served=rt.adapter.name,
+                    requested=primary.adapter.name,
+                    response=response,
+                )
             return response
 
         if last_exc is not None:
