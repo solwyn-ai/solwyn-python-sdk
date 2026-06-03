@@ -40,6 +40,7 @@ from pydantic import ValidationError
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
     BudgetCheckRequest,
+    BudgetCheckResponse,
     BudgetConfirmRequest,
     CallStatus,
     MetadataEvent,
@@ -61,6 +62,18 @@ EXPECTED_CHECK_FIELDS = {
     "provider",
     "fallback_providers",
     "fallback_models",
+}
+
+EXPECTED_CHECK_RESPONSE_FIELDS = {
+    "allowed",
+    "remaining_budget",
+    "reservation_id",
+    "mode",
+    "budget_limit",
+    "current_usage",
+    "denied_by_period",
+    "project_id",
+    "price_hints",
 }
 
 EXPECTED_CONFIRM_FIELDS = {
@@ -107,6 +120,9 @@ class TestWireModelFieldSets:
     def test_budget_check_request_field_set(self) -> None:
         assert set(BudgetCheckRequest.model_fields) == EXPECTED_CHECK_FIELDS
 
+    def test_budget_check_response_field_set(self) -> None:
+        assert set(BudgetCheckResponse.model_fields) == EXPECTED_CHECK_RESPONSE_FIELDS
+
     def test_budget_confirm_request_field_set(self) -> None:
         assert set(BudgetConfirmRequest.model_fields) == EXPECTED_CONFIRM_FIELDS
 
@@ -144,6 +160,20 @@ class TestWireModelDumpSnapshots:
         )
         # Every declared field is non-optional / has a value -> all serialize.
         assert set(req.model_dump(mode="json")) == EXPECTED_CHECK_FIELDS
+
+    def test_budget_check_response_dump_keys(self) -> None:
+        response = BudgetCheckResponse(
+            allowed=True,
+            remaining_budget=80.0,
+            reservation_id="res_123",
+            mode="alert_only",
+            budget_limit=100.0,
+            current_usage=20.0,
+            denied_by_period=None,
+            project_id="proj_abc",
+            price_hints={ProviderName.OPENAI: 1.0, ProviderName.ANTHROPIC: 2.0},
+        )
+        assert set(response.model_dump(mode="json")) == EXPECTED_CHECK_RESPONSE_FIELDS
 
     def test_budget_confirm_request_dump_keys(self) -> None:
         req = BudgetConfirmRequest(
@@ -226,6 +256,16 @@ class TestWireModelFieldConstraints:
         field = MetadataEvent.model_fields["failover_error_class"]
         max_lengths = [m.max_length for m in field.metadata if hasattr(m, "max_length")]
         assert 64 in max_lengths
+
+    def test_budget_check_fallback_models_element_max_length_pinned(self) -> None:
+        with pytest.raises(ValidationError):
+            BudgetCheckRequest(
+                estimated_input_tokens=10,
+                model="gpt-4o",
+                provider=ProviderName.OPENAI,
+                fallback_providers=[ProviderName.ANTHROPIC],
+                fallback_models=["x" * 101],
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -433,8 +473,40 @@ class TestCallIdConsistencyCrossProvider:
         confirm_spy.assert_called_once()
         # Same join key on the served-provider success event AND its confirm.
         assert confirm_spy.call_args.kwargs["call_id"] == success[0].call_id
+        assert confirm_spy.call_args.kwargs["provider"] == "anthropic"
 
         _close(solwyn)
+
+    @pytest.mark.asyncio
+    async def test_async_non_streaming_cross_provider_confirm_uses_served_provider(
+        self,
+    ) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create = AsyncMock(side_effect=_Status(429))
+        anthropic = _anthropic_client()
+        anthropic.messages.create = AsyncMock(return_value=_anthropic_response())
+        solwyn = _make_async_solwyn(
+            openai,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+        )
+
+        confirm_spy = AsyncMock()
+        with (
+            patch.object(
+                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            ),
+            patch.object(solwyn._budget, "confirm_cost", confirm_spy),
+        ):
+            await solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
+        assert len(success) == 1
+        confirm_spy.assert_awaited_once()
+        assert confirm_spy.call_args.kwargs["call_id"] == success[0].call_id
+        assert confirm_spy.call_args.kwargs["provider"] == "anthropic"
+
+        await _aclose(solwyn)
 
     def test_two_separate_calls_get_different_call_ids(self) -> None:
         openai = _openai_client()
@@ -485,6 +557,7 @@ class TestCallIdConsistencyCrossProvider:
         assert len(confirms) == 1
         # The fire-and-forget confirm carries the SAME join key as the event.
         assert confirms[0].call_id == success[0].call_id
+        assert confirms[0].provider == ProviderName.ANTHROPIC
 
         _close(solwyn)
 

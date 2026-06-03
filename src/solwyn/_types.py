@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 from pydantic import (
     BaseModel,
@@ -192,7 +192,7 @@ class BudgetCheckRequest(BaseModel):
         default_factory=list,
         description="Configured failover providers, in attempt order (chain hint)",
     )
-    fallback_models: list[str] = Field(
+    fallback_models: list[Annotated[str, Field(max_length=100)]] = Field(
         default_factory=list,
         max_length=8,
         description="Failover models aligned element-for-element with fallback_providers",

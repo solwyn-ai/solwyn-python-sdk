@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from conftest import VALID_API_KEY
 
-from solwyn._types import MetadataEvent, ProviderName
+from solwyn._token_details import TokenDetails
+from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
 from solwyn.reporter import AsyncMetadataReporter
 
 
@@ -27,6 +28,16 @@ def _make_event(**overrides) -> MetadataEvent:
     }
     defaults.update(overrides)
     return MetadataEvent(**defaults)
+
+
+def _make_confirm_request() -> BudgetConfirmRequest:
+    return BudgetConfirmRequest(
+        reservation_id="res_123",
+        model="gpt-4o",
+        provider=ProviderName.OPENAI,
+        call_id="call_async_confirm",
+        token_details=TokenDetails(input_tokens=10, output_tokens=5),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +106,24 @@ class TestAsyncReporterLifecycle:
             await reporter.close()
 
         assert reporter._shutdown_event.is_set()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_close_flushes_remaining_confirms(self) -> None:
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+            flush_interval=60.0,
+        )
+        reporter.start()
+        reporter.report_confirm(_make_confirm_request())
+
+        with patch.object(reporter._http, "post", new_callable=AsyncMock) as mock_post:
+            await reporter.close()
+
+        mock_post.assert_called_once()
+        assert "budgets/confirm" in mock_post.call_args.args[0]
+        assert mock_post.call_args.kwargs["json"]["call_id"] == "call_async_confirm"
 
 
 # ---------------------------------------------------------------------------
@@ -266,4 +295,25 @@ class TestAsyncReporterBatchFlush:
         # 5 events / batch_size 3 = 2 batches (3 + 2)
         assert mock_post.call_count == 2
         assert len(reporter._queue) == 0
+        await reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_flush_remaining_sends_queued_confirms_after_events(self) -> None:
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+        )
+        reporter.report(_make_event())
+        reporter.report_confirm(_make_confirm_request())
+
+        with patch.object(reporter._http, "post", new_callable=AsyncMock) as mock_post:
+            await reporter._flush_remaining()
+
+        assert [call.args[0] for call in mock_post.call_args_list] == [
+            "https://api.test.solwyn.ai/api/v1/metadata/ingest",
+            "https://api.test.solwyn.ai/api/v1/budgets/confirm",
+        ]
+        assert len(reporter._queue) == 0
+        assert len(reporter._confirm_queue) == 0
         await reporter._http.aclose()

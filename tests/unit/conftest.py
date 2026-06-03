@@ -44,6 +44,7 @@ ALLOW_BUDGET_RESPONSE = {
     "current_usage": 20.0,
     "denied_by_period": None,
     "project_id": VALID_PROJECT_ID,
+    "price_hints": None,
 }
 
 

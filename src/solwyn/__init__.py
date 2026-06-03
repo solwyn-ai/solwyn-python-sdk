@@ -16,9 +16,13 @@ from solwyn._routing import (
     CostPolicy,
     HealthBasedPolicy,
     LatencyPolicy,
+    ProviderCandidate,
+    RoutingRequest,
     SelectionPolicy,
 )
 from solwyn._run import current_run, run, run_in_executor
+from solwyn._types import CircuitState, FailoverReason, ProviderEntry, ProviderName
+from solwyn.circuit_breaker import CircuitBreakerState
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.config import SolwynConfig
 from solwyn.exceptions import (
@@ -41,6 +45,13 @@ __all__ = [
     "ConfigurationError",
     "UntranslatableRequestError",
     "UntranslatableModelError",
+    "ProviderEntry",
+    "ProviderName",
+    "FailoverReason",
+    "RoutingRequest",
+    "ProviderCandidate",
+    "CircuitState",
+    "CircuitBreakerState",
     # P5 selection policies (constructor selection_policy= arg; fix [E]).
     "SelectionPolicy",
     "HealthBasedPolicy",

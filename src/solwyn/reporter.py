@@ -243,6 +243,9 @@ class AsyncMetadataReporter(_ReporterBase):
         self._http = httpx.AsyncClient(timeout=10.0)
         self._shutdown_event: asyncio.Event | None = None
         self._flush_task: asyncio.Task[None] | None = None
+        self._confirm_queue: collections.deque[BudgetConfirmRequest] = collections.deque(
+            maxlen=1000
+        )
 
     def start(self) -> None:
         """Start the background flush loop.  Must be called within an event loop."""
@@ -252,6 +255,18 @@ class AsyncMetadataReporter(_ReporterBase):
     def report(self, event: MetadataEvent) -> None:
         """Enqueue a metadata event for async reporting.  Non-blocking."""
         self._enqueue(event)
+
+    def report_confirm(self, request: BudgetConfirmRequest) -> None:
+        """Fire-and-forget a confirm_cost request onto the async flush queue."""
+        if self._shutdown_event is not None and self._shutdown_event.is_set():
+            return
+        try:
+            self._confirm_queue.append(request)
+        except Exception as exc:
+            logger.warning(
+                "reporter.confirm_enqueue_failed: exc_type=%s",
+                type(exc).__name__,
+            )
 
     async def close(self) -> None:
         """Flush remaining events and shut down."""
@@ -291,6 +306,20 @@ class AsyncMetadataReporter(_ReporterBase):
             if not batch:
                 break
             await self._send_batch(batch)
+        while self._confirm_queue:
+            confirm_request = self._confirm_queue.popleft()
+            try:
+                await self._http.post(
+                    f"{self.api_url}/api/v1/budgets/confirm",
+                    json=confirm_request.model_dump(mode="json"),
+                    headers=self._auth_headers(),
+                    timeout=5.0,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "reporter.confirm_send_failed: exc_type=%s",
+                    type(exc).__name__,
+                )
 
     async def _send_batch(self, batch: list[MetadataEvent]) -> None:
         """Send a batch of events to the cloud API."""

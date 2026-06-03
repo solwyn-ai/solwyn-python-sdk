@@ -227,6 +227,10 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 
 **The SDK never captures, logs, or transmits prompts or responses.** This is enforced by [structural tests](tests/unit/test_privacy_firewall.py) and the [privacy module](src/solwyn/_privacy.py).
 
+## Release Compatibility
+
+Provider failover confirms include `provider` and `call_id` on `POST /api/v1/budgets/confirm` so Solwyn Cloud can price and deduplicate the served provider. Release this SDK only after Solwyn Cloud accepts those fields; deploy the Cloud API first.
+
 ## Requirements
 
 Python 3.11+

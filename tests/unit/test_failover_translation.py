@@ -175,6 +175,35 @@ _TOOL_REQUEST = {
 
 @pytest.mark.unit
 class TestToolExchangeFailover:
+    def test_target_native_default_params_do_not_enter_source_translation(self) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = _Status(429)
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_text_response()
+
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            fallback=[
+                (
+                    anthropic,
+                    "claude-3-5-sonnet",
+                    {"max_tokens": 256, "top_k": 40},
+                )
+            ],
+        )
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        assert result.choices[0].message.content == "ok from claude"
+        anthropic.messages.create.assert_called_once()
+        kwargs = anthropic.messages.create.call_args.kwargs
+        assert kwargs["max_tokens"] == 256
+        assert kwargs["top_k"] == 40
+
+        _close(solwyn)
+
     def test_resolved_tool_exchange_translates_to_anthropic_native(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.side_effect = _Status(429)

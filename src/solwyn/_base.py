@@ -104,6 +104,7 @@ class _SolwynBase:
         # Additional providers get lazily-created breakers via
         # _get_circuit_breaker (same jitter).
         self._circuit_breakers: dict[str, CircuitBreaker] = {}
+        self._breaker_lock = threading.Lock()
         for runtime in runtimes:
             provider = runtime.entry.provider.value
             if provider not in self._circuit_breakers:
@@ -123,9 +124,10 @@ class _SolwynBase:
 
         Lazily creates a circuit breaker if one doesn't exist for this provider.
         """
-        if provider not in self._circuit_breakers:
-            self._circuit_breakers[provider] = self._new_circuit_breaker()
-        return self._circuit_breakers[provider]
+        with self._breaker_lock:
+            if provider not in self._circuit_breakers:
+                self._circuit_breakers[provider] = self._new_circuit_breaker()
+            return self._circuit_breakers[provider]
 
     def record_latency(self, provider: str, ms: float) -> None:
         """Record one observed SUCCESS latency (ms) for a provider (LatencyPolicy).

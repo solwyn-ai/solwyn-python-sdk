@@ -67,6 +67,84 @@ logger = logging.getLogger(__name__)
 # Floor for a per-hop dispatch timeout: even when the chain deadline is nearly
 # spent we give a hop at least this long rather than passing it ~0s (§6.3).
 _MIN_HOP_TIMEOUT = 1.0
+_SOURCE_COMPATIBLE_DEFAULT_KEYS = {
+    ProviderName.OPENAI.value: frozenset(
+        {
+            "max_tokens",
+            "max_completion_tokens",
+            "temperature",
+            "top_p",
+            "stop",
+            "stream",
+            "stream_options",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+        }
+    ),
+    ProviderName.ANTHROPIC.value: frozenset(
+        {
+            "system",
+            "max_tokens",
+            "temperature",
+            "top_p",
+            "stop",
+            "stop_sequences",
+            "stream",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+        }
+    ),
+    ProviderName.GOOGLE.value: frozenset({"config", "max_output_tokens", "stream"}),
+}
+
+
+def _source_compatible_defaults(provider: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Return target defaults that are also legal in the source dialect."""
+    allowed = _SOURCE_COMPATIBLE_DEFAULT_KEYS.get(provider, frozenset())
+    return {key: value for key, value in params.items() if key in allowed}
+
+
+def _mapping_from_config(value: object) -> dict[str, Any]:
+    """Return a shallow dict view of a provider config object."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump(exclude_none=True)
+        if isinstance(dumped, dict):
+            return dict(dumped)
+    attrs = getattr(value, "__dict__", None)
+    if isinstance(attrs, dict):
+        return dict(attrs)
+    return {}
+
+
+def _with_google_http_bound(
+    kwargs: dict[str, object], *, timeout: float, max_retries: int
+) -> dict[str, object]:
+    """Inject google-genai per-request HTTP options without importing the extra.
+
+    google-genai accepts ``config={"http_options": ...}`` for generate_content
+    calls, and its timeout is milliseconds. We preserve caller config/http_options
+    but override the timeout and retry attempts because the chain deadline is a
+    mandatory Solwyn bound.
+    """
+    bounded = dict(kwargs)
+    config = _mapping_from_config(bounded.get("config"))
+    http_options = _mapping_from_config(config.get("http_options"))
+    retry_options = _mapping_from_config(http_options.get("retry_options"))
+
+    timeout_ms = max(1, int(timeout * 1000))
+    retry_options["attempts"] = max(1, max_retries + 1)
+    http_options["timeout"] = timeout_ms
+    http_options["retry_options"] = retry_options
+    config["http_options"] = http_options
+    bounded["config"] = config
+    return bounded
 
 
 class Deadline:
@@ -314,8 +392,12 @@ def _build_hop_kwargs(
         raise UntranslatableModelError(model=rt.entry.model, provider=rt.adapter.name)
 
     # Translate via the canonical subset (may RAISE an Untranslatable* error
-    # BEFORE any network call; the caller aborts the chain).
-    canonical = _translation.to_canonical(primary.adapter.name, merged_kwargs)
+    # BEFORE any network call; the caller aborts the chain). Cross-provider
+    # translation starts from SOURCE-dialect values only: the target entry's
+    # default_params may contain target-native keys such as Anthropic top_k.
+    source_defaults = _source_compatible_defaults(primary.adapter.name, rt.entry.default_params)
+    source_kwargs: dict[str, object] = {**global_defaults, **source_defaults, **kwargs}
+    canonical = _translation.to_canonical(primary.adapter.name, source_kwargs)
 
     # CROSS-PROVIDER STREAMING (P3, §4.1 Decision A). A PLAIN-TEXT cross-provider
     # streamed response is normalized per-chunk by the wrapper, so it proceeds. A
@@ -489,6 +571,7 @@ class Solwyn(_SolwynBase):
                 kwargs["stream"] = True
             return client.messages.create(**kwargs)
         # Google: its generate_content[_stream] methods take no ``stream`` kwarg.
+        kwargs = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
         kwargs.pop("stream", None)
         if is_streaming:
             return client.models.generate_content_stream(**kwargs)
@@ -734,7 +817,7 @@ class Solwyn(_SolwynBase):
             # settles. Pure signal store — no I/O, no routing change here.
             self.record_latency(provider, ctx.elapsed_ms())
 
-            token_details = self._adapter_extract_usage(rt, response)
+            token_details = rt.adapter.extract_usage(response)
             if budget.reservation_id:
                 self._budget.confirm_cost(
                     budget.reservation_id,
@@ -785,11 +868,6 @@ class Solwyn(_SolwynBase):
             "all providers unavailable",
             attempted=[r.adapter.name for r in candidates],
         )
-
-    @staticmethod
-    def _adapter_extract_usage(runtime: ProviderRuntime, response: Any) -> TokenDetails:
-        """Extract token usage via the served runtime's adapter."""
-        return runtime.adapter.extract_usage(response)
 
     def _wrap_stream(
         self,
@@ -1042,6 +1120,7 @@ class AsyncSolwyn(_SolwynBase):
                 kwargs["stream"] = True
             return await client.messages.create(**kwargs)
         # Google: its generate_content[_stream] methods take no ``stream`` kwarg.
+        kwargs = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
         kwargs.pop("stream", None)
         if is_streaming:
             return await client.models.generate_content_stream(**kwargs)
@@ -1347,14 +1426,15 @@ class AsyncSolwyn(_SolwynBase):
             # stream settles (mirrors the non-streaming path). Pure signal store.
             self.record_latency(provider, ctx.elapsed_ms())
             if budget.reservation_id:
-                await self._budget.confirm_cost(
-                    budget.reservation_id,
-                    served_model,
-                    token_details,
+                confirm = self._budget.build_confirm_request(
+                    reservation_id=budget.reservation_id,
+                    model=served_model,
+                    token_details=token_details,
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
                 )
+                self._reporter.report_confirm(confirm)
             self._reporter.report(
                 self._build_metadata_event(
                     model=served_model,

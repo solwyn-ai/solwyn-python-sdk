@@ -10,11 +10,11 @@
 - `config.py` — `SolwynConfig` with env var loading (`SOLWYN_*` prefix)
 - `tokenizer.py` — tiktoken + heuristic fallback
 - `exceptions.py` — `SolwynError` base, `BudgetExceededError`, `ProviderUnavailableError`, `ConfigurationError`
-- `_privacy.py` — length-only prompt estimation. PRIVACY-CRITICAL: only module touching prompt content
+- `_privacy.py` — length-only prompt estimation. PRIVACY-CRITICAL: content-privileged allowlist with `providers/_translation.py`
 - `_run.py` — `ContextVar`-backed agent-run scope; `run(name)` public entry point, `current_run()` read seam used by `_base.py`
 - `_types.py` — Pydantic models for API request/response contracts
 - `_validation.py` — API key + project ID format validation
-- `providers/` — extraction adapters (OpenAI, Anthropic, Google)
+- `providers/` — extraction adapters (OpenAI, Anthropic, Google); `_translation.py` is content-privileged for request/response translation only
 
 ## Provider Adapter Notes
 

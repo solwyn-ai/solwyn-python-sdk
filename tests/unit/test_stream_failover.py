@@ -980,7 +980,8 @@ class TestMaterializedGoogleStreamForwardsClose:
 
         solwyn = _make_async_solwyn(google, model="gemini-2.0-flash")
         confirms: list[Any] = []
-        confirm_mock = AsyncMock(side_effect=lambda *a, **k: confirms.append((a, k)))
+        solwyn._reporter.report_confirm = lambda req: confirms.append(req)
+        confirm_mock = AsyncMock()
 
         request = {
             "model": "gemini-2.0-flash",
@@ -1001,6 +1002,7 @@ class TestMaterializedGoogleStreamForwardsClose:
 
         assert original.aclose_calls == 1
         assert len(confirms) == 1
+        confirm_mock.assert_not_awaited()
         await _aclose(solwyn)
 
 
@@ -1456,9 +1458,8 @@ class TestAbandonedStreamSettlement:
 
         solwyn = _make_async_solwyn(client, model="gpt-4o")
         confirms: list[Any] = []
-        # Async on_complete awaits confirm_cost directly (not report_confirm); we
-        # settle-once by counting confirm_cost calls.
-        confirm_mock = AsyncMock(side_effect=lambda *a, **k: confirms.append((a, k)))
+        solwyn._reporter.report_confirm = lambda req: confirms.append(req)
+        confirm_mock = AsyncMock()
 
         request = {
             "model": "gpt-4o",
@@ -1479,6 +1480,7 @@ class TestAbandonedStreamSettlement:
 
         # Settled exactly once.
         assert len(confirms) == 1
+        confirm_mock.assert_not_awaited()
         await _aclose(solwyn)
 
 

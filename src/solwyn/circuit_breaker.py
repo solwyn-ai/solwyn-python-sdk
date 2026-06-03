@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import random
+import threading
 import time
 
 from pydantic import BaseModel, ConfigDict
@@ -79,6 +80,7 @@ class CircuitBreaker:
         # Effective recovery window for the current OPEN episode. Re-sampled on
         # each transition to OPEN; equals recovery_timeout when jitter is 0.
         self._effective_recovery_timeout: float = float(recovery_timeout)
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Public interface (synchronous)
@@ -86,37 +88,40 @@ class CircuitBreaker:
 
     def record_success(self) -> None:
         """Record a successful call from the provider."""
-        if self.state == CircuitState.HALF_OPEN:
-            self.success_count += 1
-            if self.success_count >= self.success_threshold:
-                self._transition_to_closed()
-        elif self.state == CircuitState.CLOSED:
-            # Reset failure streak on any success while closed
-            self.failure_count = 0
+        with self._lock:
+            if self.state == CircuitState.HALF_OPEN:
+                self.success_count += 1
+                if self.success_count >= self.success_threshold:
+                    self._transition_to_closed()
+            elif self.state == CircuitState.CLOSED:
+                # Reset failure streak on any success while closed
+                self.failure_count = 0
 
     def record_failure(self) -> None:
         """Record a failed call from the provider."""
-        self.last_failure_time = time.monotonic()
+        with self._lock:
+            self.last_failure_time = time.monotonic()
 
-        if self.state == CircuitState.CLOSED:
-            self.failure_count += 1
-            if self.failure_count >= self.failure_threshold:
+            if self.state == CircuitState.CLOSED:
+                self.failure_count += 1
+                if self.failure_count >= self.failure_threshold:
+                    self._transition_to_open()
+            elif self.state == CircuitState.HALF_OPEN:
+                # Any failure during probing immediately re-opens
                 self._transition_to_open()
-        elif self.state == CircuitState.HALF_OPEN:
-            # Any failure during probing immediately re-opens
-            self._transition_to_open()
 
     def can_proceed(self) -> bool:
         """Return ``True`` if the circuit allows a request through."""
-        if self.state == CircuitState.CLOSED:
-            return True
-        elif self.state == CircuitState.OPEN:
-            if self._should_attempt_recovery():
-                self._transition_to_half_open()
+        with self._lock:
+            if self.state == CircuitState.CLOSED:
                 return True
-            return False
-        else:  # HALF_OPEN
-            return True
+            elif self.state == CircuitState.OPEN:
+                if self._should_attempt_recovery():
+                    self._transition_to_half_open()
+                    return True
+                return False
+            else:  # HALF_OPEN
+                return True
 
     @property
     def recovery_eligible(self) -> bool:
@@ -129,17 +134,19 @@ class CircuitBreaker:
         Returns ``True`` only when the breaker is OPEN and the (possibly
         jittered) recovery window has elapsed; ``False`` in every other state.
         """
-        return self.state == CircuitState.OPEN and self._should_attempt_recovery()
+        with self._lock:
+            return self.state == CircuitState.OPEN and self._should_attempt_recovery()
 
     def get_state(self) -> CircuitBreakerState:
         """Return a frozen snapshot of the circuit breaker's internal state."""
-        return CircuitBreakerState(
-            state=self.state,
-            failure_count=self.failure_count,
-            success_count=self.success_count,
-            last_failure_time=self.last_failure_time,
-            last_state_change=self.last_state_change,
-        )
+        with self._lock:
+            return CircuitBreakerState(
+                state=self.state,
+                failure_count=self.failure_count,
+                success_count=self.success_count,
+                last_failure_time=self.last_failure_time,
+                last_state_change=self.last_state_change,
+            )
 
     # ------------------------------------------------------------------
     # Internal helpers

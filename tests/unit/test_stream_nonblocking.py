@@ -44,6 +44,34 @@ def test_sync_on_complete_does_not_call_confirm_cost() -> None:
 
 
 @pytest.mark.unit
+def test_async_on_complete_does_not_call_confirm_cost() -> None:
+    """The async on_complete closure must also enqueue confirm fire-and-forget."""
+    client_py = (SDK_SRC / "client.py").read_text()
+
+    tree = ast.parse(client_py)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "AsyncSolwyn":
+            for item in ast.walk(node):
+                if isinstance(item, ast.AsyncFunctionDef) and item.name == "on_complete":
+                    source_lines = client_py.splitlines()
+                    fn_lines = source_lines[item.lineno - 1 : item.end_lineno]
+                    fn_text = "\n".join(fn_lines)
+                    assert "confirm_cost(" not in fn_text, (
+                        "AsyncSolwyn._wrap_stream_async's on_complete closure must "
+                        "not await budget.confirm_cost(); it blocks stream settlement. "
+                        "Use reporter.report_confirm() instead."
+                    )
+                    assert "report_confirm(" in fn_text, (
+                        "AsyncSolwyn._wrap_stream_async's on_complete closure must "
+                        "call reporter.report_confirm() for fire-and-forget."
+                    )
+                    return
+
+    raise AssertionError("Could not find on_complete in AsyncSolwyn._wrap_stream_async")
+
+
+@pytest.mark.unit
 def test_build_confirm_request_exists_on_base() -> None:
     """_BudgetEnforcerBase must expose build_confirm_request."""
     assert hasattr(_BudgetEnforcerBase, "build_confirm_request"), (

@@ -13,6 +13,8 @@ a ``_Status(status_code=429)`` classifies as FAILOVER (advance the chain) while
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -55,6 +57,21 @@ def _anthropic_client() -> MagicMock:
     return client
 
 
+class _GoogleClient:
+    def __init__(self) -> None:
+        self.models = SimpleNamespace(
+            generate_content=MagicMock(return_value=_google_response()),
+            generate_content_stream=MagicMock(return_value=iter([_google_chunk()])),
+        )
+
+
+_GoogleClient.__module__ = "google.genai.client"
+
+
+def _google_client() -> _GoogleClient:
+    return _GoogleClient()
+
+
 def _openai_response() -> SimpleNamespace:
     # Native OpenAI Chat Completions shape (duck-typed): the adapter reads
     # ``usage`` and the normalizer reads ``choices[0].message`` + ``model``.
@@ -78,6 +95,27 @@ def _anthropic_response() -> SimpleNamespace:
         stop_reason="end_turn",
         model="claude-3-5-sonnet",
         usage=SimpleNamespace(input_tokens=10, output_tokens=5),
+    )
+
+
+def _google_response() -> SimpleNamespace:
+    return SimpleNamespace(
+        model="gemini-2.0-flash",
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=10,
+            candidates_token_count=5,
+            thoughts_token_count=0,
+        ),
+    )
+
+
+def _google_chunk() -> SimpleNamespace:
+    return SimpleNamespace(
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=10,
+            candidates_token_count=5,
+            thoughts_token_count=0,
+        )
     )
 
 
@@ -504,6 +542,63 @@ class TestChainExhaustion:
 
         _close(solwyn)
 
+    def test_all_attempted_providers_fail_reraises_last_exception(self) -> None:
+        openai = _openai_client()
+        first = _Status(429, "primary failed")
+        openai.chat.completions.create.side_effect = first
+        anthropic = _anthropic_client()
+        last = _Status(429, "fallback failed")
+        anthropic.messages.create.side_effect = last
+
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+        )
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            pytest.raises(_Status) as exc_info,
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        assert exc_info.value is last
+        assert solwyn._get_circuit_breaker("openai").failure_count == 1
+        assert solwyn._get_circuit_breaker("anthropic").failure_count == 1
+
+        _close(solwyn)
+
+    @pytest.mark.asyncio
+    async def test_async_all_attempted_providers_fail_reraises_last_exception(self) -> None:
+        openai = _openai_client()
+        first = _Status(429, "primary failed")
+        openai.chat.completions.create = AsyncMock(side_effect=first)
+        anthropic = _anthropic_client()
+        last = _Status(429, "fallback failed")
+        anthropic.messages.create = AsyncMock(side_effect=last)
+
+        solwyn = AsyncSolwyn(
+            openai,
+            api_key=VALID_API_KEY,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+        )
+
+        with (
+            patch.object(
+                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            ),
+            pytest.raises(_Status) as exc_info,
+        ):
+            await solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        assert exc_info.value is last
+        assert solwyn._get_circuit_breaker("openai").failure_count == 1
+        assert solwyn._get_circuit_breaker("anthropic").failure_count == 1
+
+        await solwyn._reporter._http.aclose()
+        await solwyn._budget._http.aclose()
+
 
 # ── per-hop deadline bound ───────────────────────────────────────────────
 
@@ -527,6 +622,58 @@ class TestPerHopDeadline:
         assert 0.0 < timeout < float("inf")
 
         _close(solwyn)
+
+    def test_google_dispatch_sets_per_request_timeout_and_retry_bound(self) -> None:
+        client = _google_client()
+        solwyn = _make_solwyn(client, model="gemini-2.0-flash")
+
+        solwyn._sync_dispatch(
+            solwyn._runtimes[0],
+            {
+                "model": "gemini-2.0-flash",
+                "contents": "hi",
+                "config": {
+                    "temperature": 0.2,
+                    "http_options": {"headers": {"x-test": "1"}, "timeout": 999_999},
+                },
+            },
+            is_streaming=False,
+            timeout=0.25,
+            max_retries=0,
+        )
+
+        kwargs = client.models.generate_content.call_args.kwargs
+        assert kwargs["config"]["temperature"] == 0.2
+        assert kwargs["config"]["http_options"]["headers"] == {"x-test": "1"}
+        assert kwargs["config"]["http_options"]["timeout"] == 250
+        assert kwargs["config"]["http_options"]["retry_options"]["attempts"] == 1
+
+        _close(solwyn)
+
+    @pytest.mark.asyncio
+    async def test_async_google_dispatch_sets_per_request_timeout_and_retry_bound(self) -> None:
+        client = _google_client()
+        client.models.generate_content = AsyncMock(return_value=_google_response())
+        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, model="gemini-2.0-flash")
+
+        await solwyn._async_dispatch(
+            solwyn._runtimes[0],
+            {
+                "model": "gemini-2.0-flash",
+                "contents": "hi",
+                "config": {"http_options": {"timeout": 999_999}},
+            },
+            is_streaming=False,
+            timeout=0.125,
+            max_retries=0,
+        )
+
+        kwargs = client.models.generate_content.call_args.kwargs
+        assert kwargs["config"]["http_options"]["timeout"] == 125
+        assert kwargs["config"]["http_options"]["retry_options"]["attempts"] == 1
+
+        await solwyn._reporter._http.aclose()
+        await solwyn._budget._http.aclose()
 
     def test_per_hop_timeout_shrinks_across_candidates(self) -> None:
         # §6.3: per-hop timeout = remaining / (candidates not yet attempted).
@@ -620,5 +767,95 @@ class TestPerHopDeadline:
         assert exc_info.value is primary_err
         openai.chat.completions.create.assert_called_once()
         anthropic.messages.create.assert_not_called()
+
+        _close(solwyn)
+
+
+# ── HALF_OPEN recovery through dispatch ──────────────────────────────────
+
+
+@pytest.mark.unit
+class TestHalfOpenRecoveryThroughDispatch:
+    def test_open_eligible_probe_success_closes_breaker(self) -> None:
+        client = _openai_client()
+        client.chat.completions.create.return_value = _openai_response()
+        solwyn = _make_solwyn(
+            client,
+            model="gpt-4o",
+            circuit_breaker_failure_threshold=1,
+            circuit_breaker_recovery_timeout=0,
+            circuit_breaker_success_threshold=1,
+        )
+
+        cb = solwyn._get_circuit_breaker("openai")
+        cb.record_failure()
+        assert cb.state == CircuitState.OPEN
+        assert cb.recovery_eligible is True
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        assert cb.state == CircuitState.CLOSED
+        assert cb.success_count == 0
+        assert cb.failure_count == 0
+
+        _close(solwyn)
+
+    @pytest.mark.asyncio
+    async def test_async_open_eligible_probe_success_closes_breaker(self) -> None:
+        client = _openai_client()
+        client.chat.completions.create = AsyncMock(return_value=_openai_response())
+        solwyn = AsyncSolwyn(
+            client,
+            api_key=VALID_API_KEY,
+            model="gpt-4o",
+            circuit_breaker_failure_threshold=1,
+            circuit_breaker_recovery_timeout=0,
+            circuit_breaker_success_threshold=1,
+        )
+
+        cb = solwyn._get_circuit_breaker("openai")
+        cb.record_failure()
+        assert cb.state == CircuitState.OPEN
+        assert cb.recovery_eligible is True
+
+        with patch.object(
+            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+        ):
+            await solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        assert cb.state == CircuitState.CLOSED
+        assert cb.success_count == 0
+        assert cb.failure_count == 0
+
+        await solwyn._reporter._http.aclose()
+        await solwyn._budget._http.aclose()
+
+
+# ── circuit-breaker lazy creation under sync concurrency ─────────────────
+
+
+@pytest.mark.unit
+class TestCircuitBreakerLazyCreation:
+    def test_get_circuit_breaker_lazy_create_is_atomic(self) -> None:
+        solwyn = _make_solwyn(_openai_client(), model="gpt-4o")
+        solwyn._circuit_breakers.clear()
+        created: list[object] = []
+        original_new_breaker = solwyn._new_circuit_breaker
+
+        def slow_new_breaker() -> object:
+            time.sleep(0.02)
+            breaker = original_new_breaker()
+            created.append(breaker)
+            return breaker
+
+        with (
+            patch.object(solwyn, "_new_circuit_breaker", side_effect=slow_new_breaker),
+            ThreadPoolExecutor(max_workers=12) as pool,
+        ):
+            breakers = list(pool.map(lambda _i: solwyn._get_circuit_breaker("google"), range(12)))
+
+        assert len({id(breaker) for breaker in breakers}) == 1
+        assert len(created) == 1
 
         _close(solwyn)
