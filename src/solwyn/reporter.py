@@ -183,7 +183,14 @@ class MetadataReporter(_ReporterBase):
                 headers=self._auth_headers(),
             )
         except Exception as exc:
-            logger.warning("Failed to send metadata batch (%d events): %s", len(batch), exc)
+            # Log only the exception's class name (fix [D]) — the type-name-only
+            # convention every other except-block follows. Safe here even though
+            # the batch is content-free; keeps the privacy contract uniform.
+            logger.warning(
+                "Failed to send metadata batch (%d events): %s",
+                len(batch),
+                type(exc).__name__,
+            )
         finally:
             with self._in_flight_lock:
                 self._in_flight -= 1
@@ -296,6 +303,13 @@ class AsyncMetadataReporter(_ReporterBase):
                 headers=self._auth_headers(),
             )
         except Exception as exc:
-            logger.warning("Failed to send metadata batch (%d events): %s", len(batch), exc)
+            # Log only the exception's class name (fix [D]) — the type-name-only
+            # convention every other except-block follows. Safe here even though
+            # the batch is content-free; keeps the privacy contract uniform.
+            logger.warning(
+                "Failed to send metadata batch (%d events): %s",
+                len(batch),
+                type(exc).__name__,
+            )
         finally:
             self._in_flight -= 1

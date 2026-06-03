@@ -30,7 +30,7 @@ import pytest
 from conftest import VALID_API_KEY
 
 from solwyn.client import Solwyn
-from solwyn.exceptions import UntranslatableRequestError
+from solwyn.exceptions import UntranslatableModelError, UntranslatableRequestError
 from solwyn.providers import _translation
 
 
@@ -373,6 +373,50 @@ class TestUntranslatableAbortsChain:
         # Structural label names the proprietary tool type, never content.
         assert exc_info.value.feature == "openai.web_search_preview"
         anthropic.messages.create.assert_not_called()
+
+        _close(solwyn)
+
+
+# ── fix [G]: empty target model on a cross-provider hop -> abort up front ──
+
+
+@pytest.mark.unit
+class TestEmptyModelAbortsCrossProviderHop:
+    def test_cross_provider_hop_with_empty_model_raises_untranslatable_model(self) -> None:
+        # §6.8: "missing model -> UntranslatableModelError up front". A
+        # cross-provider fallback whose entry model is empty would otherwise send
+        # an empty model to a healthy provider (a 400). The guard fires BEFORE any
+        # translation/dispatch, aborting the chain — the fallback is NEVER called.
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = _Status(429)
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_text_response()
+
+        # Empty model on the cross-provider fallback entry.
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            fallback=[(anthropic, "", {"max_tokens": 256})],
+        )
+        anthropic_cb = solwyn._get_circuit_breaker("anthropic")
+        before_state = anthropic_cb.get_state()
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            pytest.raises(UntranslatableModelError) as exc_info,
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        # Structural error names the target provider + the (empty) model only.
+        assert exc_info.value.provider == "anthropic"
+        assert exc_info.value.model == ""
+        # The fallback provider was NEVER dispatched (aborted before the network).
+        anthropic.messages.create.assert_not_called()
+        # No breaker mutation on the target — a structural error, not a health signal.
+        after_state = anthropic_cb.get_state()
+        assert after_state.state == before_state.state
+        assert after_state.failure_count == before_state.failure_count
+        assert after_state.success_count == before_state.success_count
 
         _close(solwyn)
 

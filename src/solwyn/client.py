@@ -54,6 +54,7 @@ from solwyn.exceptions import (
     BudgetExceededError,
     ConfigurationError,
     ProviderUnavailableError,
+    UntranslatableModelError,
 )
 from solwyn.providers import _translation, get_adapter_for_client
 from solwyn.providers._errors import Disposition, classify_exception
@@ -303,8 +304,17 @@ def _build_hop_kwargs(
             return merged_kwargs
         return {**merged_kwargs, "model": rt.entry.model}
 
-    # CROSS-PROVIDER hop. Translate via the canonical subset (may RAISE an
-    # Untranslatable* error BEFORE any network call; the caller aborts the chain).
+    # CROSS-PROVIDER hop. Defensive structural guard (§6.8, fix [G]): the target
+    # entry MUST carry a concrete model for this provider. An empty/falsy model
+    # would otherwise be sent to a healthy provider and 400, burning a chain hop.
+    # Raise UntranslatableModelError up front (structural, content-free) so the
+    # caller aborts the chain like every other Untranslatable* error — BEFORE any
+    # network call, with no breaker mutation and no advance.
+    if not rt.entry.model:
+        raise UntranslatableModelError(model=rt.entry.model, provider=rt.adapter.name)
+
+    # Translate via the canonical subset (may RAISE an Untranslatable* error
+    # BEFORE any network call; the caller aborts the chain).
     canonical = _translation.to_canonical(primary.adapter.name, merged_kwargs)
 
     # CROSS-PROVIDER STREAMING (P3, §4.1 Decision A). A PLAIN-TEXT cross-provider
@@ -591,6 +601,15 @@ class Solwyn(_SolwynBase):
             is_primary = rt is primary
             is_provider_fallback = rt.entry.provider != primary.entry.provider
             is_model_fallback = (not is_provider_fallback) and not is_primary
+            # Fix [B]: attempt_index is the served runtime's position in the
+            # CONFIGURED chain (0=primary, 1=first fallback, ... per §8.2/§8.5),
+            # NOT the candidate-walk index. When the primary breaker is
+            # OPEN-not-eligible it is dropped from the health-filtered candidate
+            # list, so the walk index would mislabel the first fallback as 0 and
+            # corrupt the dashboard chain-depth funnel. The per-hop timeout slice
+            # still uses the candidate-walk ``idx`` (remaining candidates, not
+            # chain depth).
+            chain_index = next(i for i, r in enumerate(self._runtimes) if r is rt)
 
             # Build native kwargs for this hop (§5). A cross-provider hop runs the
             # §5 translation contract and may RAISE an Untranslatable* error here,
@@ -613,7 +632,7 @@ class Solwyn(_SolwynBase):
                 model=served_model,
                 start_time=time.monotonic(),
                 is_provider_fallback=is_provider_fallback,
-                attempt_index=idx,
+                attempt_index=chain_index,
             )
             try:
                 response = self._sync_dispatch(
@@ -671,7 +690,7 @@ class Solwyn(_SolwynBase):
                         requested_provider=primary.entry.provider if is_provider_fallback else None,
                         requested_model=requested_model if is_provider_fallback else None,
                         failover_error_class=type(exc).__name__,
-                        attempt_index=idx,
+                        attempt_index=chain_index,
                         call_id=call_id,
                         possibly_succeeded=True if possibly_succeeded else None,
                         agent_run=agent_run,
@@ -685,7 +704,16 @@ class Solwyn(_SolwynBase):
                 continue  # pre-send safe -> advance to the next candidate
 
             # 6. SUCCESS — settle against the SERVED runtime.
-            cb.record_success()
+            #
+            # Fix [A]: for the STREAMING branch we do NOT credit the breaker here.
+            # The single success is settled ONLY when the stream completes, by the
+            # wrapper's on_complete (which records success + latency + confirm +
+            # metadata exactly once via the _settled guard). Crediting both here
+            # AND in on_complete would double-credit a HALF_OPEN breaker, closing
+            # it after a single streaming probe (defeating anti-flap recovery), and
+            # a stream that establishes then errors mid-flight would record a
+            # spurious success before its on_error failure. So record_success()
+            # runs ONLY on the non-streaming path, AFTER the streaming early return.
             if is_streaming:
                 return self._wrap_stream(
                     rt,
@@ -699,6 +727,7 @@ class Solwyn(_SolwynBase):
                     call_id=call_id,
                     agent_run=agent_run,
                 )
+            cb.record_success()
 
             # P5 LatencyPolicy signal: record this served hop's success latency
             # (non-streaming). Streaming records in on_complete when the stream
@@ -733,7 +762,7 @@ class Solwyn(_SolwynBase):
                         is_model_fallback=is_model_fallback,
                         primary_errored=primary_errored,
                     ),
-                    attempt_index=idx,
+                    attempt_index=chain_index,
                     call_id=call_id,
                     service_tier=rt.adapter.extract_service_tier(response),
                     agent_run=agent_run,
@@ -1114,6 +1143,15 @@ class AsyncSolwyn(_SolwynBase):
             is_primary = rt is primary
             is_provider_fallback = rt.entry.provider != primary.entry.provider
             is_model_fallback = (not is_provider_fallback) and not is_primary
+            # Fix [B]: attempt_index is the served runtime's position in the
+            # CONFIGURED chain (0=primary, 1=first fallback, ... per §8.2/§8.5),
+            # NOT the candidate-walk index. When the primary breaker is
+            # OPEN-not-eligible it is dropped from the health-filtered candidate
+            # list, so the walk index would mislabel the first fallback as 0 and
+            # corrupt the dashboard chain-depth funnel. The per-hop timeout slice
+            # still uses the candidate-walk ``idx`` (remaining candidates, not
+            # chain depth).
+            chain_index = next(i for i, r in enumerate(self._runtimes) if r is rt)
 
             # Build native kwargs for this hop (§5). A cross-provider hop runs the
             # §5 translation contract and may RAISE an Untranslatable* error here,
@@ -1136,7 +1174,7 @@ class AsyncSolwyn(_SolwynBase):
                 model=served_model,
                 start_time=time.monotonic(),
                 is_provider_fallback=is_provider_fallback,
-                attempt_index=idx,
+                attempt_index=chain_index,
             )
             try:
                 response = await self._async_dispatch(
@@ -1188,7 +1226,7 @@ class AsyncSolwyn(_SolwynBase):
                         requested_provider=primary.entry.provider if is_provider_fallback else None,
                         requested_model=requested_model if is_provider_fallback else None,
                         failover_error_class=type(exc).__name__,
-                        attempt_index=idx,
+                        attempt_index=chain_index,
                         call_id=call_id,
                         possibly_succeeded=True if possibly_succeeded else None,
                         agent_run=agent_run,
@@ -1201,7 +1239,16 @@ class AsyncSolwyn(_SolwynBase):
                 last_exc = exc
                 continue
 
-            cb.record_success()
+            # SUCCESS — settle against the SERVED runtime.
+            #
+            # Fix [A]: for the STREAMING branch we do NOT credit the breaker here.
+            # The single success is settled ONLY when the stream completes, by the
+            # wrapper's on_complete (success + latency + confirm + metadata once,
+            # via the _settled guard). Crediting both here AND in on_complete would
+            # double-credit a HALF_OPEN breaker (closing it after one streaming
+            # probe), and a stream that establishes then errors mid-flight would
+            # log a spurious success before its on_error failure. So record_success()
+            # runs ONLY on the non-streaming path, AFTER the streaming early return.
             if is_streaming:
                 return self._wrap_stream_async(
                     rt,
@@ -1215,6 +1262,7 @@ class AsyncSolwyn(_SolwynBase):
                     call_id=call_id,
                     agent_run=agent_run,
                 )
+            cb.record_success()
 
             # P5 LatencyPolicy signal: record this served hop's success latency
             # (non-streaming). Streaming records in on_complete when the stream
@@ -1249,7 +1297,7 @@ class AsyncSolwyn(_SolwynBase):
                         is_model_fallback=is_model_fallback,
                         primary_errored=primary_errored,
                     ),
-                    attempt_index=idx,
+                    attempt_index=chain_index,
                     call_id=call_id,
                     service_tier=rt.adapter.extract_service_tier(response),
                     agent_run=agent_run,

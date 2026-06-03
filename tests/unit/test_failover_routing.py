@@ -284,8 +284,51 @@ class TestCrossProviderFailover:
         assert success[0].is_provider_fallback is True
         assert success[0].failover_reason is not None
         assert success[0].failover_reason.value == "circuit_open"
+        # Fix [B]: attempt_index is the served runtime's position in the
+        # CONFIGURED chain (1 == first fallback), NOT the candidate-walk index.
+        # Even though the OPEN-not-eligible primary was dropped from the
+        # health-filtered candidate list (so the fallback was attempted at
+        # walk-index 0), the chain-depth funnel must read attempt_index == 1.
+        assert success[0].attempt_index == 1
 
         _close(solwyn)
+
+    @pytest.mark.asyncio
+    async def test_async_primary_open_attempt_index_is_chain_position(self) -> None:
+        # Async mirror of fix [B]: a pre-OPENed primary drops out of the
+        # candidate list, but the served first-fallback's success event still
+        # carries its CONFIGURED-chain attempt_index == 1.
+        openai = _openai_client()
+        openai.chat.completions.create = AsyncMock(return_value=_openai_response())
+        anthropic = _anthropic_client()
+        anthropic.messages.create = AsyncMock(return_value=_anthropic_response())
+
+        solwyn = AsyncSolwyn(
+            openai,
+            api_key=VALID_API_KEY,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+        )
+        events: list = []
+        solwyn._reporter.report = lambda e: events.append(e)
+        openai_cb = solwyn._get_circuit_breaker("openai")
+        for _ in range(3):
+            openai_cb.record_failure()
+        assert openai_cb.state == CircuitState.OPEN
+        assert openai_cb.recovery_eligible is False
+
+        with patch.object(
+            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+        ):
+            await solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        openai.chat.completions.create.assert_not_awaited()
+        success = [e for e in events if e.status.value == "success"]
+        assert len(success) == 1
+        assert success[0].is_provider_fallback is True
+        assert success[0].attempt_index == 1
+        await solwyn._reporter._http.aclose()
+        await solwyn._budget._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_openai_down_anthropic_served(self) -> None:

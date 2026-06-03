@@ -38,11 +38,18 @@ class ProviderCandidate:
     """An immutable, non-mutating snapshot of one provider link for ordering.
 
     ``breaker_state`` and ``recovery_eligible`` are read from the breaker WITHOUT
-    mutating it (unlike ``can_proceed()``). ``translatable`` is the per-target
-    request-translation predicate: always ``True`` in P1; P2 supplies the real
-    per-target value. ``price_hint`` is populated (P5) from a SERVER-provided
-    relative-price signal — the SDK never computes price. ``latency_p50`` is the
-    observed p50 latency (ms) for this provider, ``None`` until enough samples.
+    mutating it (unlike ``can_proceed()``). ``translatable`` is a FORWARD-LOOKING
+    routing seam, currently ALWAYS ``True`` (fix [H]): the design eager-aborts the
+    WHOLE chain on an untranslatable feature at the first cross-provider hop (§6.8,
+    ``UntranslatableRequestError``), so an untranslatable request is never DEMOTED
+    in routing — it fails loud before dispatch. The field (and the ``not
+    translatable`` sort term in ``_health_key``) are retained as an intentional
+    seam — like ``price_hint`` — so a future per-target translatability predicate
+    could rank a translatable target ahead of an untranslatable one within a
+    health tier without touching the dispatch loop. Do NOT delete it.
+    ``price_hint`` is populated (P5) from a SERVER-provided relative-price signal
+    — the SDK never computes price. ``latency_p50`` is the observed p50 latency
+    (ms) for this provider, ``None`` until enough samples.
     """
 
     runtime: ProviderRuntime
@@ -99,6 +106,12 @@ def _health_key(candidate: ProviderCandidate) -> tuple[int, bool]:
     always preferable when both are equally healthy). Reused by every policy so
     none can promote an untranslatable target above a translatable one in the
     same usable set, nor jump an unhealthier candidate ahead of a healthier one.
+
+    Forward-looking seam (fix [H]): ``translatable`` is currently ALWAYS ``True``
+    (see ``ProviderCandidate``) because untranslatable requests eager-abort the
+    chain (§6.8) rather than being demoted here, so this term is presently a
+    no-op. It is retained so a future per-target translatability predicate slots
+    in with zero dispatch changes.
     """
     return (_STATE_PRIORITY[candidate.breaker_state], not candidate.translatable)
 

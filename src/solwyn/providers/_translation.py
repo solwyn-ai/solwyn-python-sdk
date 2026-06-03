@@ -1453,6 +1453,41 @@ def _canonical_response_to_anthropic(canonical: CanonicalResponse) -> object:
     )
 
 
+class _GoogleResponse:
+    """Duck-typed google-genai response shape (fix [C]).
+
+    A Google drop-in caller does not only read ``candidates[0].content.parts[*]``
+    — the idiomatic google-genai accessors are ``response.text`` (the
+    concatenation of every text part) and ``response.function_calls`` (the
+    function-call objects). The OpenAI (``.choices[0].message.content``) and
+    Anthropic (``.content[0].text``) idioms already survive cross-provider
+    failover; this gives the Google-shaped normalized object the same fidelity so
+    a Google drop-in user's ``response.text`` / ``response.function_calls`` keep
+    working after failover. Pure in-memory transform; no provider import.
+    """
+
+    def __init__(self, candidates: list[SimpleNamespace], model: str | None) -> None:
+        self.candidates = candidates
+        self.model = model
+
+    def _parts(self) -> list[SimpleNamespace]:
+        if not self.candidates:
+            return []
+        content = getattr(self.candidates[0], "content", None)
+        return list(getattr(content, "parts", None) or [])
+
+    @property
+    def text(self) -> str | None:
+        """Concatenation of all text parts; ``None`` when there is no text."""
+        chunks = [p.text for p in self._parts() if getattr(p, "text", None) is not None]
+        return "".join(chunks) if chunks else None
+
+    @property
+    def function_calls(self) -> list[SimpleNamespace]:
+        """The function-call parts (idiomatic google-genai), in order."""
+        return [fc for p in self._parts() if (fc := getattr(p, "function_call", None)) is not None]
+
+
 def _canonical_response_to_google(canonical: CanonicalResponse) -> object:
     parts: list[SimpleNamespace] = []
     if canonical.text:
@@ -1468,7 +1503,7 @@ def _canonical_response_to_google(canonical: CanonicalResponse) -> object:
         content=SimpleNamespace(parts=parts, role="model"),
         finish_reason=_denormalize_finish_reason("google", canonical.finish_reason),
     )
-    return SimpleNamespace(candidates=[candidate], model=canonical.model)
+    return _GoogleResponse(candidates=[candidate], model=canonical.model)
 
 
 # --------------------------------------------------------------------------- #

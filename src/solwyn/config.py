@@ -43,6 +43,12 @@ class SolwynConfig(BaseModel):
     # Failover knobs (§4.4 / §6.3 / §6.5)
     failover_total_timeout: float = 30.0
     failover_idempotency: Literal["safe", "never", "always"] = "safe"
+    # RESERVED for the future §6.2 behavior: a single same-provider retry after a
+    # 429 with a short Retry-After on a non-idempotent call where cross-provider
+    # failover is unsafe. NOT YET HONORED — the dispatch loop never reads this
+    # field, so every chain entry is exactly one attempt regardless of its value.
+    # The default 0 == current behavior; kept as a forward-looking config seam
+    # (do not remove). Wiring it on is a separate change with its own tests.
     same_provider_retries: int = 0
     circuit_breaker_recovery_timeout_jitter: float = 0.2
 

@@ -105,6 +105,45 @@ def test_no_logger_calls_receive_prompt_variables() -> None:
 
 
 @pytest.mark.unit
+def test_no_logger_call_passes_bare_exception_argument() -> None:
+    """A bare ``exc``/``exception`` argument to a logger call is forbidden
+    outside the content-privileged allowlist (fix [D] extension).
+
+    A provider/transport exception's ``str()``/``.body`` can embed request or
+    response content, so logging the exception OBJECT (rather than
+    ``type(exc).__name__``) is a leak vector. ``type(exc).__name__`` (an
+    ``ast.Call``, not a bare ``ast.Name``) is allowed; ``exc`` / ``exception``
+    passed as a bare name (positional, keyword value, or ``exc_info=exc``) is not.
+    """
+    import ast
+
+    banned = {"exc", "exception"}
+    violations: list[str] = []
+    for path in _iter_source_files():
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            # match logger.<level>(...) calls
+            if not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)):
+                continue
+            if func.value.id != "logger":
+                continue
+            args = list(node.args) + [kw.value for kw in node.keywords]
+            for arg in args:
+                if isinstance(arg, ast.Name) and arg.id in banned:
+                    violations.append(
+                        f"{path.relative_to(SDK_SRC)}:{arg.lineno}: "
+                        f"logger.{func.attr} passes bare {arg.id!r}"
+                    )
+    assert not violations, (
+        "Privacy violation — logger calls must pass type(exc).__name__, never the "
+        "bare exception object (its str()/.body may embed content):\n" + "\n".join(violations)
+    )
+
+
+@pytest.mark.unit
 def test_extract_text_from_kwargs_is_removed() -> None:
     """The original _extract_text_from_kwargs that materialized the full
     joined prompt string must no longer exist."""

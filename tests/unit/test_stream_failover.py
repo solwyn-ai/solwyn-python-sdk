@@ -29,6 +29,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from conftest import VALID_API_KEY
 
+from solwyn._types import CircuitState
 from solwyn.client import (
     AsyncSolwyn,
     Solwyn,
@@ -1478,4 +1479,177 @@ class TestAbandonedStreamSettlement:
 
         # Settled exactly once.
         assert len(confirms) == 1
+        await _aclose(solwyn)
+
+
+# ── fix [A]: a streaming success credits the served breaker EXACTLY ONCE ──
+#
+# On a streaming success the served breaker's record_success() must run ONLY
+# in the stream wrapper's on_complete (when the stream settles), NOT also at
+# the dispatch site. Otherwise a single streaming probe double-credits a
+# HALF_OPEN breaker and closes it after one drain (success_threshold defaults
+# to 2), defeating anti-flap recovery.
+
+
+def _force_half_open(cb: Any) -> None:
+    """Drive a breaker into HALF_OPEN with a clean probe slate (success_count==0)."""
+    cb.state = CircuitState.HALF_OPEN
+    cb.success_count = 0
+    cb.failure_count = 0
+
+
+@pytest.mark.unit
+class TestStreamingSuccessSingleBreakerCredit:
+    def test_halfopen_streaming_probe_credits_once_not_closed(self) -> None:
+        # A served breaker in HALF_OPEN with success_threshold=2: ONE streaming
+        # call drained to completion is a SINGLE successful probe. It must leave
+        # the breaker HALF_OPEN with success_count==1 — NOT CLOSED. A second
+        # successful probe is required to close it.
+        client = _openai_client()
+        client.chat.completions.create.return_value = iter(
+            [_openai_text_chunk("a"), _openai_text_chunk(None, finish="stop")]
+        )
+
+        solwyn = _make_solwyn(client, model="gpt-4o", circuit_breaker_success_threshold=2)
+        cb = solwyn._get_circuit_breaker("openai")
+        _force_half_open(cb)
+
+        request = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            stream = solwyn.chat.completions.create(**request)
+            list(stream)  # drain the stream to completion -> on_complete settles
+
+        # ONE streaming probe -> ONE success credit. Still HALF_OPEN, not CLOSED.
+        assert cb.state == CircuitState.HALF_OPEN
+        assert cb.success_count == 1
+        _close(solwyn)
+
+    def test_streaming_establish_then_midstream_error_is_single_failure(self) -> None:
+        # A stream that ESTABLISHES then errors mid-flight must record EXACTLY
+        # one FAILURE (on_error) and ZERO successes on the served breaker — no
+        # spurious dispatch-site success preceding it.
+        client = _openai_client()
+
+        def _exploding_stream():
+            yield _openai_text_chunk("ok")
+            raise ConnectionError("mid-stream reset")
+
+        client.chat.completions.create.return_value = _exploding_stream()
+
+        solwyn = _make_solwyn(client, model="gpt-4o")
+        cb = solwyn._get_circuit_breaker("openai")
+        record_success = MagicMock(wraps=cb.record_success)
+        record_failure = MagicMock(wraps=cb.record_failure)
+        cb.record_success = record_success  # type: ignore[method-assign]
+        cb.record_failure = record_failure  # type: ignore[method-assign]
+
+        request = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            stream = solwyn.chat.completions.create(**request)
+            with pytest.raises(ConnectionError, match="mid-stream reset"):
+                list(stream)
+
+        # Exactly one failure (on_error), zero successes (no dispatch-site credit).
+        record_success.assert_not_called()
+        record_failure.assert_called_once()
+        _close(solwyn)
+
+    def test_nonstreaming_success_still_credits_once(self) -> None:
+        # Regression guard: the NON-streaming single-success path is unchanged —
+        # one non-streaming success still credits the breaker exactly once at the
+        # dispatch site (there is no on_complete on the non-streaming path).
+        client = _openai_client()
+        client.chat.completions.create.return_value = SimpleNamespace(
+            model="gpt-4o",
+            choices=[SimpleNamespace(message=SimpleNamespace(content="hi"), finish_reason="stop")],
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+        )
+
+        solwyn = _make_solwyn(client, model="gpt-4o", circuit_breaker_success_threshold=2)
+        cb = solwyn._get_circuit_breaker("openai")
+        _force_half_open(cb)
+
+        request = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(**request)
+
+        assert cb.state == CircuitState.HALF_OPEN
+        assert cb.success_count == 1
+        _close(solwyn)
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_halfopen_streaming_probe_credits_once_not_closed(self) -> None:
+        # Async mirror of the HALF_OPEN single-probe credit.
+        client = _openai_client()
+        client.chat.completions.create = AsyncMock(
+            return_value=_async_iter(
+                [_openai_text_chunk("a"), _openai_text_chunk(None, finish="stop")]
+            )
+        )
+
+        solwyn = _make_async_solwyn(client, model="gpt-4o", circuit_breaker_success_threshold=2)
+        cb = solwyn._get_circuit_breaker("openai")
+        _force_half_open(cb)
+
+        request = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+
+        with patch.object(
+            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+        ):
+            stream = await solwyn.chat.completions.create(**request)
+            _ = [c async for c in stream]
+
+        assert cb.state == CircuitState.HALF_OPEN
+        assert cb.success_count == 1
+        await _aclose(solwyn)
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_streaming_midstream_error_is_single_failure(self) -> None:
+        # Async mirror: establish then error mid-flight -> one failure, zero successes.
+        client = _openai_client()
+
+        async def _exploding_stream() -> AsyncIterator[Any]:
+            yield _openai_text_chunk("ok")
+            raise ConnectionError("mid-stream reset")
+
+        client.chat.completions.create = AsyncMock(return_value=_exploding_stream())
+
+        solwyn = _make_async_solwyn(client, model="gpt-4o")
+        cb = solwyn._get_circuit_breaker("openai")
+        record_success = MagicMock(wraps=cb.record_success)
+        record_failure = MagicMock(wraps=cb.record_failure)
+        cb.record_success = record_success  # type: ignore[method-assign]
+        cb.record_failure = record_failure  # type: ignore[method-assign]
+
+        request = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+
+        with patch.object(
+            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+        ):
+            stream = await solwyn.chat.completions.create(**request)
+            with pytest.raises(ConnectionError, match="mid-stream reset"):
+                _ = [c async for c in stream]
+
+        record_success.assert_not_called()
+        record_failure.assert_called_once()
         await _aclose(solwyn)

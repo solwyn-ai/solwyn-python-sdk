@@ -1061,6 +1061,38 @@ class TestNormalizeResponse:
         )
         assert resp.candidates[0].content.parts[0].text == "hello from gpt"
 
+    def test_served_openai_requested_google_exposes_text_accessor(self) -> None:
+        # Fix [C]: a Google drop-in user writes ``response.text`` — that idiom
+        # must survive cross-provider failover, not just the parts[*].text path.
+        resp = normalize_response(
+            served="openai", requested="google", response=_openai_text_response()
+        )
+        assert resp.text == "hello from gpt"
+        # No tool call -> empty function_calls list (idiomatic google-genai).
+        assert resp.function_calls == []
+
+    def test_served_anthropic_requested_google_text_accessor_concatenates(self) -> None:
+        # ``response.text`` concatenates ALL text parts (google-genai semantics).
+        block_a = _Obj(type="text", text="hello ")
+        block_b = _Obj(type="text", text="world")
+        served = _Obj(content=[block_a, block_b], stop_reason="end_turn", model="claude-3-5-sonnet")
+        resp = normalize_response(served="anthropic", requested="google", response=served)
+        assert resp.text == "hello world"
+
+    def test_served_openai_requested_google_exposes_function_calls(self) -> None:
+        # Fix [C]: a Google drop-in user writes ``response.function_calls`` for a
+        # tool response — that accessor must survive cross-provider failover.
+        resp = normalize_response(
+            served="openai", requested="google", response=_openai_tool_response()
+        )
+        # Idiomatic google-genai: the function-call parts.
+        assert len(resp.function_calls) == 1
+        fc = resp.function_calls[0]
+        assert fc.name == "get_weather"
+        assert fc.args == {"city": "paris"}
+        # A tool response has no text.
+        assert resp.text is None
+
     def test_same_provider_is_identity(self) -> None:
         original = _openai_text_response()
         resp = normalize_response(served="openai", requested="openai", response=original)

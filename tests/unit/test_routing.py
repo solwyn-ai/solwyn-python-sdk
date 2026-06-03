@@ -421,3 +421,26 @@ def test_cost_policy_is_pure_does_not_touch_breaker() -> None:
     # Assert — purity
     breaker.can_proceed.assert_not_called()
     assert breaker.method_calls == []
+
+
+# ── fix [E]: SelectionPolicy classes are exported from the package root ───
+@pytest.mark.unit
+def test_selection_policies_importable_from_package_root() -> None:
+    # P5's headline user feature is the constructor selection_policy= arg, so the
+    # policy classes must be importable from `solwyn`, not only solwyn._routing.
+    import solwyn
+    from solwyn import CostPolicy as RootCost
+    from solwyn import HealthBasedPolicy as RootHealth
+    from solwyn import LatencyPolicy as RootLatency
+    from solwyn import SelectionPolicy as RootSelection
+
+    assert RootHealth is HealthBasedPolicy
+    assert RootLatency is LatencyPolicy
+    assert RootCost is CostPolicy
+    # SelectionPolicy is the protocol seam users type their custom policy against.
+    from solwyn._routing import SelectionPolicy as PrivateSelection
+
+    assert RootSelection is PrivateSelection
+
+    for name in ("HealthBasedPolicy", "LatencyPolicy", "CostPolicy", "SelectionPolicy"):
+        assert name in solwyn.__all__, f"{name} missing from solwyn.__all__"

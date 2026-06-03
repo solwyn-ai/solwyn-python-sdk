@@ -12,6 +12,12 @@ try:
 except PackageNotFoundError:
     __version__ = "0.0.0-dev"
 
+from solwyn._routing import (
+    CostPolicy,
+    HealthBasedPolicy,
+    LatencyPolicy,
+    SelectionPolicy,
+)
 from solwyn._run import current_run, run, run_in_executor
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.config import SolwynConfig
@@ -35,6 +41,11 @@ __all__ = [
     "ConfigurationError",
     "UntranslatableRequestError",
     "UntranslatableModelError",
+    # P5 selection policies (constructor selection_policy= arg; fix [E]).
+    "SelectionPolicy",
+    "HealthBasedPolicy",
+    "LatencyPolicy",
+    "CostPolicy",
     "run",
     "run_in_executor",
     "current_run",

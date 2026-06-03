@@ -154,7 +154,9 @@ class TokenizerManager:
             encoder = self._tiktoken_encoders[model]
             return len(encoder.encode(text))
         except Exception as exc:
-            logger.warning("Failed to use tiktoken for %s: %s", model, exc)
+            # Log only the exception's class name — type-name-only convention
+            # (fix [D]); never the exception object (str() may embed input text).
+            logger.warning("Failed to use tiktoken for %s: %s", model, type(exc).__name__)
             return max(1, len(text) // 4)
 
     # ------------------------------------------------------------------
