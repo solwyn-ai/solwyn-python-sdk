@@ -1,0 +1,1584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Provider Failover — Design Spec</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,400&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#F3EFE5;
+    --surface:#F8F5EE;
+    --surface-2:#FBF9F3;
+    --hairline:#DED6C6;
+    --hairline-soft:#E7E0D2;
+    --ink:#2A2722;
+    --ink-soft:#6F6759;
+    --ink-faint:#8C8475;
+    --green:#4A7A52;
+    --green-dot:#5B9E68;
+    --amber:#C2922E;
+    --terra:#B14B32;
+    --zebra:#F1ECE0;
+    --tint-code:#F1ECDF;
+    --tint-green:#EDF1E9;
+    --tint-amber:#F6EFDD;
+    --tint-terra:#F4E7E1;
+
+    --serif-display:'Fraunces','Newsreader',Georgia,'Times New Roman',serif;
+    --serif-body:'Newsreader',Georgia,'Times New Roman',serif;
+    --mono:'IBM Plex Mono',ui-monospace,Menlo,'SF Mono',monospace;
+
+    --maxw:828px;
+    --toc-w:248px;
+  }
+
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--ink);
+    font-family:var(--serif-body);
+    font-size:18px;
+    line-height:1.62;
+    font-weight:400;
+    -webkit-font-smoothing:antialiased;
+    text-rendering:optimizeLegibility;
+  }
+
+  /* ---------- Layout ---------- */
+  .shell{
+    display:grid;
+    grid-template-columns:var(--toc-w) minmax(0,1fr);
+    gap:0;
+    max-width:1180px;
+    margin:0 auto;
+    padding:0 32px;
+  }
+  .toc-col{position:relative;}
+  .content-col{
+    min-width:0;
+    padding:72px 0 140px;
+    display:flex;
+    justify-content:center;
+  }
+  .doc{
+    width:100%;
+    max-width:var(--maxw);
+  }
+
+  /* ---------- Table of contents ---------- */
+  nav.toc{
+    position:sticky;
+    top:0;
+    max-height:100vh;
+    overflow-y:auto;
+    padding:72px 28px 48px 4px;
+    font-family:var(--mono);
+  }
+  nav.toc .toc-label{
+    font-size:10.5px;
+    letter-spacing:0.18em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+    margin-bottom:18px;
+    padding-bottom:12px;
+    border-bottom:1px solid var(--hairline);
+  }
+  nav.toc ol{
+    list-style:none;
+    margin:0;
+    padding:0;
+    counter-reset:toc;
+  }
+  nav.toc li{margin:0;}
+  nav.toc a{
+    display:flex;
+    gap:9px;
+    align-items:baseline;
+    padding:5px 0;
+    font-size:11.5px;
+    line-height:1.35;
+    letter-spacing:0.01em;
+    color:var(--ink-soft);
+    text-decoration:none;
+    border-left:2px solid transparent;
+    padding-left:11px;
+    margin-left:-2px;
+    transition:color .18s ease,border-color .18s ease;
+  }
+  nav.toc a .num{
+    color:var(--ink-faint);
+    flex:0 0 auto;
+    font-variant-numeric:tabular-nums;
+  }
+  nav.toc a:hover{color:var(--ink);}
+  nav.toc a.active{
+    color:var(--terra);
+    border-left-color:var(--terra);
+    font-weight:500;
+  }
+  nav.toc a.active .num{color:var(--terra);}
+
+  /* ---------- Title block ---------- */
+  .titleblock{
+    margin-bottom:64px;
+    padding-bottom:40px;
+    border-bottom:1px solid var(--hairline);
+  }
+  .eyebrow{
+    font-family:var(--mono);
+    font-size:11px;
+    letter-spacing:0.22em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+    margin-bottom:22px;
+  }
+  h1.doctitle{
+    font-family:var(--serif-display);
+    font-weight:600;
+    font-size:clamp(40px,6.2vw,62px);
+    line-height:1.02;
+    letter-spacing:-0.018em;
+    margin:0 0 18px;
+    color:var(--ink);
+  }
+  .subtitle{
+    font-family:var(--serif-body);
+    font-size:21px;
+    font-style:italic;
+    line-height:1.45;
+    color:var(--ink-soft);
+    margin:0 0 30px;
+    max-width:60ch;
+  }
+  .meta-row{
+    display:flex;
+    flex-wrap:wrap;
+    gap:10px 12px;
+    font-family:var(--mono);
+    font-size:11px;
+  }
+  .meta-chip{
+    display:inline-flex;
+    align-items:center;
+    gap:7px;
+    padding:5px 11px;
+    border:1px solid var(--hairline);
+    border-radius:2px;
+    background:var(--surface);
+    color:var(--ink-soft);
+    letter-spacing:0.03em;
+  }
+  .meta-chip b{
+    color:var(--ink);
+    font-weight:600;
+    text-transform:uppercase;
+    letter-spacing:0.08em;
+  }
+  .meta-chip .k{
+    color:var(--ink-faint);
+    text-transform:uppercase;
+    letter-spacing:0.1em;
+    font-size:10px;
+  }
+
+  /* ---------- Section structure ---------- */
+  section.sec{
+    margin-top:30px;
+    padding-top:42px;
+    scroll-margin-top:24px;
+  }
+  section.sec:first-of-type{padding-top:0;}
+  .sec-eyebrow{
+    font-family:var(--mono);
+    font-size:11px;
+    letter-spacing:0.2em;
+    text-transform:uppercase;
+    color:var(--terra);
+    margin-bottom:14px;
+    display:flex;
+    align-items:center;
+    gap:12px;
+  }
+  .sec-eyebrow::after{
+    content:"";
+    height:1px;
+    flex:1;
+    background:var(--hairline);
+  }
+  h2{
+    font-family:var(--serif-display);
+    font-weight:600;
+    font-size:clamp(28px,3.6vw,38px);
+    line-height:1.08;
+    letter-spacing:-0.014em;
+    margin:0 0 24px;
+    color:var(--ink);
+  }
+  h3{
+    font-family:var(--serif-display);
+    font-weight:600;
+    font-size:23px;
+    line-height:1.18;
+    letter-spacing:-0.008em;
+    margin:40px 0 14px;
+    color:var(--ink);
+  }
+  h4{
+    font-family:var(--mono);
+    font-weight:600;
+    font-size:12.5px;
+    letter-spacing:0.1em;
+    text-transform:uppercase;
+    color:var(--ink-soft);
+    margin:30px 0 12px;
+  }
+  p{margin:0 0 18px;}
+  .doc > section p:last-child{margin-bottom:0;}
+  strong{font-weight:600;color:var(--ink);}
+  em{font-style:italic;}
+  a.inline{color:var(--green);text-decoration:none;border-bottom:1px solid var(--hairline);}
+  a.inline:hover{border-color:var(--green);}
+
+  hr.rule{
+    border:0;
+    border-top:1px solid var(--hairline);
+    margin:46px 0;
+  }
+
+  ul,ol{margin:0 0 18px;padding-left:1.35em;}
+  li{margin:0 0 8px;padding-left:4px;}
+  li::marker{color:var(--ink-faint);}
+  ul.tight li,ol.tight li{margin-bottom:6px;}
+
+  /* ---------- Inline code ---------- */
+  code{
+    font-family:var(--mono);
+    font-size:0.84em;
+    background:var(--tint-code);
+    border:1px solid var(--hairline-soft);
+    border-radius:3px;
+    padding:1px 5px;
+    color:#5A4A3A;
+    word-break:break-word;
+  }
+  /* mono technical labels */
+  .lbl{
+    font-family:var(--mono);
+    font-size:0.82em;
+    letter-spacing:0.02em;
+    color:var(--ink-soft);
+  }
+
+  /* ---------- Code blocks ---------- */
+  pre{
+    margin:22px 0;
+    background:var(--tint-code);
+    border:1px solid var(--hairline-soft);
+    border-left:3px solid var(--green);
+    border-radius:3px;
+    padding:18px 20px 18px 22px;
+    overflow-x:auto;
+    line-height:1.55;
+  }
+  pre code{
+    font-family:var(--mono);
+    font-size:13px;
+    background:none;
+    border:0;
+    padding:0;
+    color:#3A352C;
+    white-space:pre;
+  }
+  pre .cm{color:#8C8475;font-style:italic;}
+  pre .kw{color:var(--terra);}
+  pre .st{color:var(--green);}
+  pre .fn{color:#4A6A8A;}
+  .codecap{
+    font-family:var(--mono);
+    font-size:10.5px;
+    letter-spacing:0.1em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+    margin:22px 0 -12px;
+  }
+
+  /* ---------- Tables ---------- */
+  .tablewrap{
+    margin:24px 0;
+    overflow-x:auto;
+    border:1px solid var(--hairline);
+    border-radius:4px;
+    background:var(--surface);
+  }
+  table{
+    border-collapse:collapse;
+    width:100%;
+    font-size:14px;
+    line-height:1.45;
+  }
+  thead th{
+    font-family:var(--mono);
+    font-weight:600;
+    font-size:10.5px;
+    letter-spacing:0.08em;
+    text-transform:uppercase;
+    color:var(--ink-soft);
+    text-align:left;
+    padding:12px 14px;
+    background:var(--surface-2);
+    border-bottom:1.5px solid var(--hairline);
+    vertical-align:bottom;
+  }
+  tbody td{
+    padding:11px 14px;
+    border-bottom:1px solid var(--hairline-soft);
+    vertical-align:top;
+    color:var(--ink);
+  }
+  tbody tr:last-child td{border-bottom:0;}
+  tbody tr:nth-child(even){background:var(--zebra);}
+  table code{font-size:12px;background:#EBE4D4;}
+  td.num,th.num{font-variant-numeric:tabular-nums;width:34px;color:var(--ink-faint);font-family:var(--mono);}
+  .yes{color:var(--green);font-weight:600;}
+  .no{color:var(--terra);font-weight:600;}
+
+  /* ---------- Callouts ---------- */
+  .callout{
+    margin:24px 0;
+    padding:16px 20px 16px 22px;
+    border:1px solid var(--hairline-soft);
+    border-left:4px solid var(--ink-soft);
+    border-radius:3px;
+    background:var(--surface);
+    font-size:16px;
+    line-height:1.55;
+  }
+  .callout p{margin:0 0 10px;}
+  .callout p:last-child{margin:0;}
+  .callout .ctag{
+    display:block;
+    font-family:var(--mono);
+    font-size:10.5px;
+    letter-spacing:0.14em;
+    text-transform:uppercase;
+    margin-bottom:8px;
+    font-weight:600;
+  }
+  .callout.decision{border-left-color:var(--green);background:var(--tint-green);}
+  .callout.decision .ctag{color:var(--green);}
+  .callout.risk{border-left-color:var(--terra);background:var(--tint-terra);}
+  .callout.risk .ctag{color:var(--terra);}
+  .callout.question{border-left-color:var(--amber);background:var(--tint-amber);}
+  .callout.question .ctag{color:#9a7220;}
+
+  /* blockquote => callout-ish */
+  blockquote{
+    margin:24px 0;
+    padding:16px 22px;
+    border-left:4px solid var(--ink-soft);
+    background:var(--surface);
+    border-radius:3px;
+    font-style:italic;
+    color:var(--ink);
+  }
+  blockquote p{margin:0 0 10px;}
+  blockquote p:last-child{margin:0;}
+
+  /* ---------- State pills + flow ---------- */
+  .stateflow{
+    margin:28px 0;
+    padding:24px 22px;
+    background:var(--surface);
+    border:1px solid var(--hairline);
+    border-radius:4px;
+  }
+  .stateflow .flowtitle{
+    font-family:var(--mono);
+    font-size:10.5px;
+    letter-spacing:0.14em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+    margin-bottom:20px;
+  }
+  .pillrow{
+    display:flex;
+    align-items:center;
+    flex-wrap:wrap;
+    gap:6px 10px;
+  }
+  .pill{
+    display:inline-flex;
+    align-items:center;
+    gap:9px;
+    font-family:var(--mono);
+    font-size:12px;
+    font-weight:600;
+    letter-spacing:0.06em;
+    text-transform:uppercase;
+    padding:8px 14px;
+    border-radius:30px;
+    border:1px solid var(--hairline);
+    background:var(--surface-2);
+    color:var(--ink);
+    white-space:nowrap;
+  }
+  .dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto;box-shadow:0 0 0 3px rgba(0,0,0,0.03);}
+  .pill.closed{border-color:#bcd3bf;background:var(--tint-green);}
+  .pill.closed .dot{background:var(--green-dot);}
+  .pill.closed{color:var(--green);}
+  .pill.open{border-color:#e0bcb0;background:var(--tint-terra);}
+  .pill.open .dot{background:var(--terra);}
+  .pill.open{color:var(--terra);}
+  .pill.half{border-color:#e3d2a6;background:var(--tint-amber);}
+  .pill.half .dot{background:var(--amber);}
+  .pill.half{color:#9a7220;}
+  .arrow{
+    font-family:var(--mono);
+    color:var(--ink-faint);
+    font-size:15px;
+    padding:0 2px;
+    flex:0 0 auto;
+  }
+  .flowleg{
+    margin-top:18px;
+    display:grid;
+    gap:6px;
+    font-size:13.5px;
+    color:var(--ink-soft);
+  }
+  .flowleg .lg{display:flex;gap:10px;align-items:baseline;}
+  .flowleg .lg .tag{
+    font-family:var(--mono);
+    font-size:10.5px;
+    letter-spacing:0.06em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+    flex:0 0 132px;
+  }
+
+  /* ---------- Call-flow diagram ---------- */
+  .callflow{
+    margin:30px 0;
+    padding:26px 22px;
+    background:var(--surface);
+    border:1px solid var(--hairline);
+    border-radius:4px;
+  }
+  .callflow .flowtitle{
+    font-family:var(--mono);
+    font-size:10.5px;
+    letter-spacing:0.14em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+    margin-bottom:24px;
+  }
+  .cf-chain{
+    display:flex;
+    flex-direction:column;
+    gap:0;
+  }
+  .cf-node{
+    border:1px solid var(--hairline);
+    border-radius:4px;
+    background:var(--surface-2);
+    padding:13px 16px;
+    position:relative;
+  }
+  .cf-node .cf-head{
+    font-family:var(--mono);
+    font-size:11.5px;
+    font-weight:600;
+    letter-spacing:0.05em;
+    text-transform:uppercase;
+    color:var(--ink);
+    display:flex;
+    align-items:center;
+    gap:9px;
+  }
+  .cf-node .cf-sub{
+    font-size:13.5px;
+    color:var(--ink-soft);
+    margin-top:5px;
+    line-height:1.45;
+  }
+  .cf-node.gate{background:var(--surface);border-style:dashed;}
+  .cf-node.primary{border-left:3px solid var(--green);}
+  .cf-node.fb1{border-left:3px solid var(--amber);}
+  .cf-node.fb2{border-left:3px solid var(--terra);}
+  .cf-conn{
+    display:flex;
+    flex-direction:column;
+    align-items:flex-start;
+    padding:0 0 0 22px;
+  }
+  .cf-conn .vline{
+    width:2px;
+    height:16px;
+    background:var(--hairline);
+    margin-left:0;
+  }
+  .cf-conn .label{
+    font-family:var(--mono);
+    font-size:10.5px;
+    letter-spacing:0.04em;
+    text-transform:uppercase;
+    color:var(--ink-faint);
+    padding:3px 0 3px 14px;
+    position:relative;
+  }
+  .cf-conn .label::before{
+    content:"↓";
+    position:absolute;
+    left:-7px;
+    top:50%;
+    transform:translateY(-50%);
+    color:var(--terra);
+    font-size:13px;
+  }
+  .cf-mini{
+    display:inline-block;
+    font-family:var(--mono);
+    font-size:9.5px;
+    letter-spacing:0.06em;
+    text-transform:uppercase;
+    padding:2px 7px;
+    border-radius:20px;
+    margin-left:auto;
+  }
+  .cf-mini.cl{background:var(--tint-green);color:var(--green);}
+  .cf-mini.op{background:var(--tint-terra);color:var(--terra);}
+  .cf-mini.ha{background:var(--tint-amber);color:#9a7220;}
+
+  /* disposition legend grid */
+  .dispgrid{
+    display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
+    gap:12px;
+    margin:24px 0;
+  }
+  .dispcard{
+    border:1px solid var(--hairline);
+    border-radius:4px;
+    padding:14px 15px;
+    background:var(--surface);
+  }
+  .dispcard .dh{
+    font-family:var(--mono);
+    font-size:11px;
+    font-weight:600;
+    letter-spacing:0.05em;
+    text-transform:uppercase;
+    margin-bottom:6px;
+  }
+  .dispcard.ff{border-top:3px solid var(--terra);}
+  .dispcard.ff .dh{color:var(--terra);}
+  .dispcard.fo{border-top:3px solid var(--green);}
+  .dispcard.fo .dh{color:var(--green);}
+  .dispcard.amb{border-top:3px solid var(--amber);}
+  .dispcard.amb .dh{color:#9a7220;}
+  .dispcard p{font-size:13.5px;color:var(--ink-soft);margin:0;line-height:1.45;}
+
+  /* ---------- footer ---------- */
+  footer.docfoot{
+    margin-top:90px;
+    padding-top:28px;
+    border-top:1px solid var(--hairline);
+    font-family:var(--mono);
+    font-size:11px;
+    letter-spacing:0.05em;
+    color:var(--ink-faint);
+    display:flex;
+    justify-content:space-between;
+    flex-wrap:wrap;
+    gap:10px;
+  }
+
+  /* ---------- responsive ---------- */
+  @media (max-width:980px){
+    .shell{grid-template-columns:1fr;padding:0 22px;}
+    .toc-col{display:none;}
+    .content-col{padding-top:48px;}
+  }
+
+  /* ---------- print ---------- */
+  @media print{
+    body{background:#fff;font-size:11pt;}
+    .toc-col{display:none;}
+    .shell{display:block;max-width:none;padding:0;}
+    .content-col{padding:0;display:block;}
+    .doc{max-width:none;}
+    pre,.tablewrap,.callout,.stateflow,.callflow,blockquote,.dispcard,section.sec{break-inside:avoid;}
+    h2,h3{break-after:avoid;}
+    a{color:inherit;text-decoration:none;}
+    pre{background:#f5f2ea;}
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- ============ TABLE OF CONTENTS ============ -->
+  <div class="toc-col">
+    <nav class="toc" aria-label="Table of contents">
+      <div class="toc-label">Contents</div>
+      <ol>
+        <li><a href="#s1"><span class="num">01</span><span>Executive Summary &amp; Recommendation</span></a></li>
+        <li><a href="#s2"><span class="num">02</span><span>Problem &amp; Current-State Gap</span></a></li>
+        <li><a href="#s3"><span class="num">03</span><span>Industry Landscape</span></a></li>
+        <li><a href="#s4"><span class="num">04</span><span>Recommended Architecture</span></a></li>
+        <li><a href="#s5"><span class="num">05</span><span>Cross-Provider Translation Contract</span></a></li>
+        <li><a href="#s6"><span class="num">06</span><span>Reliability Design</span></a></li>
+        <li><a href="#s7"><span class="num">07</span><span>Privacy Firewall Design</span></a></li>
+        <li><a href="#s8"><span class="num">08</span><span>Budget &amp; Cloud API Contract</span></a></li>
+        <li><a href="#s9"><span class="num">09</span><span>Risk Register</span></a></li>
+        <li><a href="#s10"><span class="num">10</span><span>Phased Rollout</span></a></li>
+        <li><a href="#s11"><span class="num">11</span><span>Open Questions &amp; Decisions</span></a></li>
+      </ol>
+    </nav>
+  </div>
+
+  <!-- ============ CONTENT ============ -->
+  <div class="content-col">
+  <article class="doc">
+
+    <!-- TITLE BLOCK -->
+    <header class="titleblock">
+      <div class="eyebrow">Solwyn Engineering · Design Specification</div>
+      <h1 class="doctitle">Provider Failover — Design Spec</h1>
+      <p class="subtitle">True health-based cross-provider failover: a transparent drop-in surface, an internal canonical request, and a classified candidate-walk that fails over only when it can prove the request never durably landed.</p>
+      <div class="meta-row">
+        <span class="meta-chip"><span class="k">Scope</span><b>OpenAI / Anthropic / Google</b></span>
+        <span class="meta-chip"><span class="k">Status</span><b>Draft</b></span>
+        <span class="meta-chip"><span class="k">SDK</span><b>solwyn-python-sdk</b></span>
+        <span class="meta-chip"><span class="k">Surface</span><b>sync + async</b></span>
+        <span class="meta-chip"><span class="k">Audience</span><b>maintainer + implementers</b></span>
+      </div>
+    </header>
+
+    <!-- ===================== 1 ===================== -->
+    <section class="sec" id="s1">
+      <div class="sec-eyebrow">Section 01</div>
+      <h2>Executive Summary &amp; Recommendation</h2>
+
+      <p><strong>Verdict.</strong> Build true health-based cross-provider failover by replacing today's single-provider dispatch with a four-seam architecture: an ordered <strong>ProviderRuntime registry</strong>, a pure <strong>SelectionPolicy/Router</strong> (health-only now, latency/cost-ready), a single content-privileged <strong>RequestTranslator</strong> that owns a deliberately tiny common subset and <strong>fails loudly</strong> on anything outside it, and a <strong>classified candidate-walk</strong> dispatch loop that fails over only when it can prove the original request never durably reached the primary. Roughly two-thirds of the plumbing (per-provider circuit breakers, extraction adapters, <code>_AttemptContext</code>, per-served-provider metadata/budget) already exists; this is additive seam-work, not a rewrite.</p>
+
+      <p><strong>Transparent-vs-normalized verdict (grounded in industry research).</strong> Keep the <strong>transparent drop-in <code>Solwyn(primary_client)</code> request surface</strong> — users keep calling their native client (<code>client.chat.completions.create(...)</code>). The industry's client-side libraries (LiteLLM Router, LangChain <code>with_fallbacks</code>) all normalize <em>internally</em> while exposing a familiar surface; "OpenAI-compatible" is the de-facto normalization standard. We adopt that pattern's spirit: native request surface, an internal canonical request, owned translation only on the cross-provider hop. <strong>On the response side we normalize back to the caller's native shape</strong> — returning a foreign provider object from a call made in OpenAI dialect is a silent <code>AttributeError</code> waiting to happen and directly violates the "your agents don't go down" promise. Response normalization lives behind one seam; <strong>streaming failover is first-byte-only and v1 may ship non-streaming failover first.</strong></p>
+
+      <div class="callout decision">
+        <span class="ctag">Decision · Surface</span>
+        <p>Native request surface in, caller-native response shape out. Translation activates only on a real cross-provider hop; the 99% native path pays zero translation overhead and gains zero new surface area.</p>
+      </div>
+
+      <h3>What we will build</h3>
+      <ul>
+        <li><strong>Config (breaking):</strong> replace <code>fallback_model: str | None</code> with an ordered <code>providers: list[ProviderEntry]</code> chain (each entry = provider + per-provider model + optional creds/client). Same-provider model swap becomes a repeated-provider entry.</li>
+        <li><strong><code>_registry.py</code></strong> — <code>ProviderRuntime = (entry, sdk_client, adapter)</code>; holds all chain clients, built at <code>__init__</code>.</li>
+        <li><strong><code>_routing.py</code></strong> — <code>SelectionPolicy</code> Protocol + <code>HealthBasedPolicy</code>; returns an <strong>ordered candidate list</strong> (the seam for latency/cost later). Ordering uses <strong>non-mutating</strong> breaker state reads.</li>
+        <li><strong><code>providers/_translation.py</code></strong> — the <strong>only</strong> new content-touching module; canonical request/response + per-provider translators; fails loudly via <code>UntranslatableRequestError</code>. PRIVACY-CRITICAL banner, no <code>logging</code>/<code>httpx</code>.</li>
+        <li><strong><code>providers/_errors.py</code></strong> — <code>classify_exception()</code> per adapter, <strong>status-first</strong>, <code>APITimeoutError</code> matched before <code>APIConnectionError</code>.</li>
+        <li><strong>Dispatch rewrite</strong> — candidate walk with a mandatory <strong>chain deadline + per-hop <code>timeout</code>/<code>max_retries=0</code></strong>, idempotency-gated failover, first-byte streaming rule.</li>
+        <li><strong>Cloud API contract sync</strong> — <code>provider</code> (required) added to <code>BudgetConfirmRequest</code>; advisory chain hint on <code>BudgetCheckRequest</code>; failover observability fields on <code>MetadataEvent</code>; server-side reservation TTL.</li>
+        <li><strong>Firewall hardening</strong> — allowlist-based privacy tests + end-to-end sentinel-in-payload test.</li>
+      </ul>
+
+      <div class="callout decision">
+        <span class="ctag">Decisions ratified · 2026-06 maintainer review (supersedes the matching items in §11)</span>
+        <p><strong>A · Streaming is in v1.</strong> Streaming failover ships with the first release (high-value, not deferred): first-byte-only rule across wrappers + Google first-chunk materialization so its lazy generator is failover-eligible. The response is normalized back to the caller's native shape, streaming included.</p>
+        <p><strong>B · Tools are in the failover subset — with a hard stateless/stateful line.</strong> Translate the <em>converged</em> custom-function contract (JSON-Schema declaration + <code>tool_choice</code>, and fully-<em>resolved</em> tool histories). <strong>Fail loud</strong> on dangling/unresolved tool calls at the failover boundary, parallel same-name calls, and all proprietary tools. Bidirectional round-trip tests are the drift alarm (event-driven, not perpetual); a <code>tool_call_not_failoverable</code> metric drives data-driven scope growth.</p>
+        <p><strong>C · Safe-by-default, aggressive-by-opt-in.</strong> <code>failover_idempotency="safe"</code> (no double-charge) is the default and the floor. Aggression is explicit: <code>failover_idempotency="always"</code>, the per-call <code>solwyn_idempotent</code> override, and a tunable <code>failover_total_timeout</code>.</p>
+        <p><strong>D · Provider credentials are out of scope (core tenet).</strong> Solwyn <strong>never accepts, stores, or logs provider API keys</strong> (or prompts). Provider creds come solely from the SDK client objects the caller constructs; the SDK only requires — and documents — that they be set. <code>ProviderEntry</code> carries <strong>no</strong> <code>api_key</code>/<code>base_url</code>.</p>
+        <p><strong>E · Per-provider default params.</strong> Callers who know both providers may preset fill-absent defaults (e.g. <code>max_tokens</code>) globally and per provider entry. Precedence: per-call kwargs &gt; per-entry <code>default_params</code> &gt; global <code>default_params</code>; defaults <strong>fill absent fields only, never override a provided value.</strong></p>
+        <p><strong>F · Provider-SDK version floors.</strong> Declare minimum versions for the provider libraries in the install extras (<code>solwyn[openai]</code>/<code>[anthropic]</code>/<code>[google]</code>) so exception classes, <code>max_completion_tokens</code>, and the <code>google-genai</code> surface are predictable. The core still depends only on <code>httpx</code>+<code>pydantic</code>; status-first classification (§6.1) stays the runtime net for bring-your-own-client installs that bypass the extra.</p>
+      </div>
+    </section>
+
+    <!-- ===================== 2 ===================== -->
+    <section class="sec" id="s2">
+      <div class="sec-eyebrow">Section 02</div>
+      <h2>Problem &amp; Current-State Gap</h2>
+
+      <p>Solwyn already reports per-provider circuit state and keeps <strong>one breaker per provider</strong> in a dict (<code>_base.py</code>), yet it can never route to a second provider. Three structural couplings pin every call to exactly one provider:</p>
+
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th class="num">#</th><th>Coupling</th><th>Location</th><th>Effect</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="num">1</td>
+              <td>One client/adapter/provider fixed at construction</td>
+              <td><code>client.py __init__</code>: <code>self._client</code>, <code>self._adapter</code>, <code>self._detected_provider</code></td>
+              <td>No place to hold a second SDK client or its creds</td>
+            </tr>
+            <tr>
+              <td class="num">2</td>
+              <td><code>_select_provider()</code> is structurally single-provider</td>
+              <td><code>_base.py:139-162</code> — returns <code>self._config.primary_provider.value</code> or <strong>raises</strong> <code>ProviderUnavailableError</code></td>
+              <td>The per-provider breaker dict is decorative for <em>routing</em>; selection can never name a second provider</td>
+            </tr>
+            <tr>
+              <td class="num">3</td>
+              <td>Dispatch is a hardcoded <code>if provider == …</code> ladder</td>
+              <td><code>client.py</code> <code>_sync_dispatch</code>/<code>_async_dispatch</code></td>
+              <td>Calls exactly one native method shape; never changes client/adapter/request shape</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <p><strong>The only real fallback today is a same-provider model swap.</strong> On a primary failure, <code>_intercepted_call</code> retries once with <code>kwargs['model']</code> swapped to <code>config.fallback_model</code> on the <strong>same</strong> client (<code>_should_retry_with_fallback</code> / <code>_prepare_fallback_kwargs</code> in <code>_base.py</code>). The request shape never crosses providers — each proxy passes native kwargs straight through, and the three call shapes differ structurally (OpenAI <code>messages</code>; Anthropic <code>messages</code> + top-level <code>system</code> + required <code>max_tokens</code>; Google <code>contents</code> + <code>config</code>). True failover therefore requires the one genuinely new capability: <strong>request/response translation.</strong></p>
+
+      <div class="callout decision">
+        <span class="ctag">Reusable as-is</span>
+        <p><code>circuit_breaker.py</code> (already per-provider), extraction adapters + stream accumulators (already normalize usage), <code>_AttemptContext</code>, <code>reporter.py</code>, per-served-provider <code>provider=</code> in budget/metadata.</p>
+        <p><strong>Missing:</strong> multi-entry registry, a router that can pick a non-primary entry, a translator, and a re-selecting dispatch loop.</p>
+      </div>
+    </section>
+
+    <!-- ===================== 3 ===================== -->
+    <section class="sec" id="s3">
+      <div class="sec-eyebrow">Section 03</div>
+      <h2>Industry Landscape</h2>
+
+      <h3>3.1 &nbsp;Competitor matrix</h3>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Player</th><th>Caller surface</th><th>Where translation lives</th><th>Failover mechanism</th><th>Streaming failover</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>LiteLLM Router</strong> (Py SDK)</td><td>OpenAI-compat signatures</td><td>Client-side library</td><td>Cooldown after N fails; ordered chain</td><td>Pre-stream only</td></tr>
+            <tr><td><strong>LiteLLM Proxy</strong></td><td>OpenAI-compat REST</td><td>Server-side proxy</td><td><code>allowed_fails</code> + cooldown</td><td>Pre-stream only</td></tr>
+            <tr><td><strong>OpenRouter</strong></td><td>OpenAI-compat REST</td><td>Hosted gateway</td><td>Priority array; escalate on 429/5xx</td><td>Pre-stream only</td></tr>
+            <tr><td><strong>Portkey</strong></td><td>OpenAI-compat REST</td><td>Hosted/self-host gateway</td><td>Strategy JSON, error-triggered chain</td><td>Not documented</td></tr>
+            <tr><td><strong>Cloudflare AI Gateway</strong></td><td>OpenAI-compat <code>/compat</code></td><td>Edge gateway</td><td>Retry + provider fallback</td><td>WS streaming; timing unclear</td></tr>
+            <tr><td><strong>Vercel AI SDK 6</strong></td><td>Normalized (<code>generateText</code>)</td><td>Client library (TS)</td><td>Compose <code>with_fallbacks</code>-style</td><td>First-class stream; failover not built-in</td></tr>
+            <tr><td><strong>LangChain <code>with_fallbacks</code></strong></td><td>Normalized <code>BaseChatModel</code></td><td>Client library</td><td>Ordered chain catches exceptions</td><td>Documented as unreliable</td></tr>
+            <tr><td><strong>AWS Bedrock Converse</strong></td><td>Normalized (Bedrock schema)</td><td>Managed service</td><td>Cross-region profiles</td><td>Native; Bedrock-only (no cross-vendor)</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>3.2 &nbsp;"OpenAI-shaped surface, normalized core" is the winning pattern</h3>
+      <p>Two non-competing winning positions exist. <strong>Gateways</strong> expose an OpenAI-compatible REST surface and translate server-side. <strong>Client libraries</strong> expose either OpenAI-compat signatures (LiteLLM) or a normalized interface (LangChain/Vercel) and translate inside the library. Both <strong>own the translation layer</strong>. The "transparent vs normalized" framing is a false dichotomy: OpenAI-compat <em>is</em> the normalization standard. Multi-provider failover is not niche — OpenRouter raised a $113M Series B (May 2026) on routing alone; Portkey was acquired by Palo Alto Networks (Apr 2026). The dominant trigger is rate limits (429) as much as outages.</p>
+
+      <h3>3.3 &nbsp;What being a CLIENT-side SDK constrains</h3>
+      <ul>
+        <li><strong>No mid-stream recovery.</strong> Bytes already forwarded to the user cannot be un-sent. Every production system (Sierra, Assembled, LLM Gateway) fails over <strong>only before the first token</strong> — this is the universal norm, not a Solwyn-specific weakness.</li>
+        <li><strong>Credential sprawl.</strong> The app must provision keys for every provider in the chain (a gateway holds them centrally). This is an adoption-friction reality to document.</li>
+        <li><strong>Process-local health.</strong> A fresh process starts with all breakers CLOSED; the first failing request of any new process always pays full freight. Shared by LiteLLM Router and LangChain.</li>
+        <li><strong>What we <em>gain</em>:</strong> no extra infra, no proxy hop, lower p50 — exactly the "client-side, no server in the loop" differentiator the marketing promise rests on. (Note: Solwyn's Cloud API for budget/metadata already exists; "no server in the loop" refers to the <em>routing decision</em> being local, not zero network calls.)</li>
+      </ul>
+    </section>
+
+    <!-- ===================== 4 ===================== -->
+    <section class="sec" id="s4">
+      <div class="sec-eyebrow">Section 04</div>
+      <h2>Recommended Architecture</h2>
+
+      <!-- circuit-breaker state flow diagram -->
+      <div class="stateflow">
+        <div class="flowtitle">Per-provider circuit-breaker state flow</div>
+        <div class="pillrow">
+          <span class="pill closed"><span class="dot"></span>Closed</span>
+          <span class="arrow">→</span>
+          <span class="pill open"><span class="dot"></span>Open</span>
+          <span class="arrow">→</span>
+          <span class="pill half"><span class="dot"></span>Half-Open</span>
+          <span class="arrow">→</span>
+          <span class="pill closed"><span class="dot"></span>Closed</span>
+        </div>
+        <div class="flowleg">
+          <div class="lg"><span class="tag">Closed → Open</span><span><code>failure_threshold</code> consecutive failures recorded; route stops attempting this provider.</span></div>
+          <div class="lg"><span class="tag">Open → Half-Open</span><span>After <code>recovery_timeout</code> (±20% jitter) a single probe slot opens; consumed only by the candidate actually attempted.</span></div>
+          <div class="lg"><span class="tag">Half-Open → Closed</span><span>Probe success: breaker resets, provider returns to healthy rotation.</span></div>
+          <div class="lg"><span class="tag">Half-Open → Open</span><span>Probe failure: breaker re-opens; the loop advances to the next candidate.</span></div>
+        </div>
+      </div>
+
+      <h3>4.1 &nbsp;Chosen surface</h3>
+      <ul>
+        <li><strong>Request:</strong> transparent drop-in. <code>Solwyn(OpenAI())</code> stays; the user calls their primary client's native methods.</li>
+        <li><strong>Response on failover:</strong> <strong>normalize back to the caller's primary shape</strong> via a single <code>_translate_response_out</code> seam (non-streaming v1). Do <strong>not</strong> hand back a foreign provider object — that silently breaks <code>resp.choices[0].message.content</code>.</li>
+        <li><strong>Translation activates ONLY on a real cross-provider hop.</strong> The native happy path and same-provider model swap pass kwargs straight through — <strong>zero translation overhead and zero new surface for the 99% case.</strong></li>
+      </ul>
+
+      <h3>4.2 &nbsp;The Router / SelectionPolicy seam</h3>
+      <p>The router is a <strong>pure, sans-I/O</strong> function over (ordered runtimes, breaker dict) returning an <strong>ordered candidate list</strong>. Returning a <em>list</em> (not a single provider) is what makes latency/cost routing a drop-in later: a future policy only <strong>reorders</strong> — it never touches I/O, breakers, or budget.</p>
+
+      <div class="codecap">src/solwyn/_routing.py · sans-I/O</div>
+<pre><code><span class="cm"># src/solwyn/_routing.py  (sans-I/O)</span>
+<span class="kw">class</span> <span class="fn">ProviderCandidate</span>(BaseModel):
+    runtime: ProviderRuntime
+    breaker_state: CircuitState        <span class="cm"># non-mutating read</span>
+    translatable: bool                 <span class="cm"># per-target predicate (future cost/latency policies need this)</span>
+    price_hint: float | None = None    <span class="cm"># populated later from a SERVER-provided relative-price signal</span>
+
+<span class="kw">class</span> <span class="fn">RoutingRequest</span>(BaseModel):
+    requested_provider: ProviderName
+    estimated_input_tokens: int        <span class="cm"># already computed; enables cost routing later</span>
+    <span class="cm"># additive-only; extra="forbid" preserved</span>
+
+<span class="kw">class</span> <span class="fn">SelectionPolicy</span>(Protocol):
+    <span class="kw">def</span> <span class="fn">order</span>(self, candidates: list[ProviderCandidate], req: RoutingRequest) -> list[ProviderCandidate]:
+        <span class="st">"""Pure, side-effect-free. Return runtimes in attempt order; [] => all unavailable."""</span>
+
+<span class="kw">class</span> <span class="fn">HealthBasedPolicy</span>:
+    <span class="st">"""v1 default: config order, CLOSED before HALF_OPEN-eligible. Never promotes an untranslatable target."""</span>
+    <span class="kw">def</span> <span class="fn">order</span>(self, candidates, req):
+        prio = {CircuitState.CLOSED: 0, CircuitState.HALF_OPEN: 1, CircuitState.OPEN: 2}
+        usable = [c <span class="kw">for</span> c <span class="kw">in</span> candidates <span class="kw">if</span> c.breaker_state <span class="kw">is not</span> CircuitState.OPEN <span class="kw">or</span> c.recovery_eligible]
+        <span class="kw">return</span> sorted(usable, key=<span class="kw">lambda</span> c: (prio[c.breaker_state], <span class="kw">not</span> c.translatable))</code></pre>
+
+      <div class="callout risk">
+        <span class="ctag">Critical correctness rule — separate INSPECTION from CONSUMPTION</span>
+        <p><code>circuit_breaker.can_proceed()</code> <strong>mutates</strong> state (an OPEN-but-recovery-eligible breaker flips to HALF_OPEN and returns <code>True</code>). The router must <strong>order using non-mutating <code>breaker.state</code> reads</strong>, and call <code>can_proceed()</code> <strong>only on the single candidate actually being attempted</strong>. Calling <code>can_proceed()</code> across all candidates up front would flip every recovery-eligible breaker to HALF_OPEN at once, silently consuming all probe slots.</p>
+      </div>
+
+      <h4>How latency/cost routing slots in later (no refactor)</h4>
+      <ul>
+        <li><strong>Latency:</strong> new <code>LatencyPolicy(SelectionPolicy)</code> sorts the same candidates by observed p50. Pure drop-in.</li>
+        <li><strong>Cost:</strong> <strong>NOT</strong> a pure drop-in by itself — the SDK must never compute price. It requires (a) a new <strong>server-provided relative-price hint</strong> on <code>BudgetCheckResponse</code> (or a side endpoint) to populate <code>ProviderCandidate.price_hint</code>, and (b) the <code>translatable</code> predicate already on the candidate. We design both fields <strong>now</strong> so cost routing is <em>additive</em> later, but flag the new server field as a prerequisite.</li>
+      </ul>
+
+      <h3>4.3 &nbsp;Module / responsibility map</h3>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>File</th><th>Change</th><th>Responsibility</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>config.py</code></td><td><strong>MODIFY (breaking)</strong></td><td>Replace <code>fallback_model</code> + <code>primary_provider</code> with <code>providers: list[ProviderEntry]</code>. Keep breaker/reporter tuning.</td></tr>
+            <tr><td><code>_registry.py</code></td><td><strong>NEW</strong></td><td><code>ProviderRuntime</code> dataclass <code>(entry, sdk_client, adapter)</code>. Builds ordered runtimes from config + clients. Holds clients/creds; no business logic.</td></tr>
+            <tr><td><code>_routing.py</code></td><td><strong>NEW (sans-I/O)</strong></td><td><code>SelectionPolicy</code> Protocol + <code>HealthBasedPolicy</code>. Pure ordering.</td></tr>
+            <tr><td><code>providers/_translation.py</code></td><td><strong>NEW — PRIVACY-CRITICAL</strong></td><td>Canonical request/response + per-provider translators. Only new content-touching module. Banner; no <code>logging</code>/<code>httpx</code>.</td></tr>
+            <tr><td><code>providers/_errors.py</code></td><td><strong>NEW</strong></td><td>Shared transport-error classification + per-adapter <code>classify_exception()</code>.</td></tr>
+            <tr><td><code>_base.py</code></td><td><strong>MODIFY</strong></td><td><code>_select_provider()</code> → <code>_select_candidates() -> list[ProviderRuntime]</code> delegating to policy; build registry + policy in <code>__init__</code>; seed breaker dict from <strong>all</strong> entries; delete <code>_should_retry_with_fallback</code>/<code>_prepare_fallback_kwargs</code>. Stays sans-I/O.</td></tr>
+            <tr><td><code>client.py</code></td><td><strong>MODIFY</strong></td><td><code>__init__</code> reconciles positional primary + <code>fallback=</code>; <code>_sync/_async_dispatch</code> take a <code>ProviderRuntime</code>; <code>_intercepted_call</code> becomes the classified candidate loop.</td></tr>
+            <tr><td><code>providers/_protocol.py</code></td><td><strong>MODIFY</strong></td><td>Add <code>classify_exception()</code> + <code>to_canonical()</code>/<code>from_canonical()</code> to the adapter protocol.</td></tr>
+            <tr><td><code>_types.py</code></td><td><strong>MODIFY</strong></td><td><code>provider</code> (req) on <code>BudgetConfirmRequest</code>; chain hint on <code>BudgetCheckRequest</code>; failover fields on <code>MetadataEvent</code>; <code>FailoverReason</code> enum. <code>extra="forbid"</code> preserved everywhere.</td></tr>
+            <tr><td><code>budget.py</code></td><td><strong>MODIFY</strong></td><td>Thread <code>provider=served</code> through <code>confirm_cost</code>/<code>build_confirm_request</code> (sync+async).</td></tr>
+            <tr><td><code>exceptions.py</code></td><td><strong>MODIFY</strong></td><td>Add <code>UntranslatableRequestError</code>, <code>UntranslatableModelError</code> (structural fields only).</td></tr>
+            <tr><td><code>tests/unit/test_privacy_firewall.py</code></td><td><strong>MODIFY</strong></td><td>Allowlist refactor + new assertions + sentinel test (§7).</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Unchanged:</strong> <code>circuit_breaker.py</code>, <code>reporter.py</code>, <code>stream.py</code> wrappers, adapter extraction logic.</p>
+
+      <h3>4.4 &nbsp;New config surface (breaking)</h3>
+      <div class="codecap">_types.py / config.py · Pydantic v2, extra="forbid"</div>
+<pre><code><span class="cm"># _types.py / config.py — Pydantic v2, extra="forbid"</span>
+<span class="kw">class</span> <span class="fn">ProviderEntry</span>(BaseModel):
+    model_config = ConfigDict(extra=<span class="st">"forbid"</span>)
+    provider: ProviderName                 <span class="cm"># openai | anthropic | google</span>
+    model: str                             <span class="cm"># model id ON THIS provider</span>
+    default_params: dict = Field(default_factory=dict)  <span class="cm"># FILL-ABSENT-ONLY per-provider defaults, e.g. {"max_tokens": 2048}</span>
+    <span class="cm"># NO api_key / base_url — Solwyn NEVER handles provider credentials (core tenet);</span>
+    <span class="cm"># creds live entirely in the constructed SDK client objects (which read their own env).</span>
+
+<span class="kw">class</span> <span class="fn">SolwynConfig</span>(BaseModel):
+    model_config = ConfigDict(extra=<span class="st">"forbid"</span>)
+    api_key: str                           <span class="cm"># Solwyn cloud key (unchanged)</span>
+    api_url: str = <span class="st">"https://api.solwyn.ai"</span>
+    fail_open: bool = True
+    budget_mode: BudgetMode = BudgetMode.ALERT_ONLY
+
+    providers: list[ProviderEntry] = Field(default_factory=list)   <span class="cm"># REPLACES primary_provider + fallback_model</span>
+    default_params: dict = Field(default_factory=dict)             <span class="cm"># global fill-absent defaults (per-entry wins; see §5.2)</span>
+
+    <span class="cm"># NEW failover knobs</span>
+    failover_total_timeout: float = 30.0   <span class="cm"># chain deadline (seconds); see §6.3</span>
+    failover_idempotency: Literal[<span class="st">"safe"</span>, <span class="st">"never"</span>, <span class="st">"always"</span>] = <span class="st">"safe"</span>
+    same_provider_retries: int = 0
+    circuit_breaker_recovery_timeout_jitter: float = 0.2   <span class="cm"># ±20%, anti-stampede</span>
+
+    <span class="cm"># unchanged breaker/reporter tuning ...</span>
+
+    <span class="fn">@model_validator</span>(mode=<span class="st">"after"</span>)
+    <span class="kw">def</span> <span class="fn">_check_chain</span>(self) -> <span class="st">"SolwynConfig"</span>:
+        <span class="kw">if not</span> self.providers:
+            <span class="kw">raise</span> ConfigurationError(<span class="st">"at least one provider entry required"</span>, field=<span class="st">"providers"</span>)
+        <span class="kw">return</span> self</code></pre>
+
+      <div class="callout decision">
+        <span class="ctag">Decisions D &amp; E — credentials out, default_params in</span>
+        <p><strong>No provider keys, ever.</strong> <code>ProviderEntry</code> deliberately omits <code>api_key</code>/<code>base_url</code>: Solwyn never accepts, stores, or logs a provider credential. Creds live in the client objects the caller constructs (<code>OpenAI()</code>, <code>Anthropic()</code>, …), which read their own environment. The SDK only requires that each chain provider's creds be present, and documents this.</p>
+        <p><strong>default_params precedence:</strong> per-call kwargs &gt; per-entry <code>default_params</code> &gt; global <code>default_params</code>. Defaults <strong>fill an absent field only</strong> — they never override a value the caller passed. Safe for a required field like <code>max_tokens</code> (resolves the old §11 Q3); a semantic-range field like <code>temperature&gt;1.0</code> still fails loud rather than clamps.</p>
+      </div>
+
+      <div class="callout risk">
+        <span class="ctag">Env loading regression — deliberate, accepted (zero customers)</span>
+        <p>Flat env vars cannot express an ordered chain. <code>SOLWYN_FALLBACK_MODEL</code> is <strong>removed</strong>; env supports the single-primary case only. Multi-provider chains are code-constructed.</p>
+      </div>
+
+      <h3>4.5 &nbsp;Ergonomic construction</h3>
+<pre><code><span class="cm"># Recommended: explicit clients per provider; creds come from the SDK objects themselves.</span>
+client = Solwyn(
+    OpenAI(),                                  <span class="cm"># primary, auto-detected -> providers[0]</span>
+    api_key=<span class="st">"sk_proj_..."</span>,                     <span class="cm"># Solwyn cloud key</span>
+    model=<span class="st">"gpt-4o"</span>,                            <span class="cm"># primary model</span>
+    fallback=[
+        (Anthropic(),    <span class="st">"claude-sonnet-4"</span>, {<span class="st">"max_tokens"</span>: 2048}),  <span class="cm"># per-provider fill-absent default</span>
+        (genai.Client(), <span class="st">"gemini-2.5-pro"</span>),
+    ],
+    default_params={<span class="st">"max_tokens"</span>: 1024},                          <span class="cm"># global fill-absent fallback</span>
+)
+
+<span class="cm"># Same-provider model swap == a repeated-provider entry reusing the same client:</span>
+fallback=[(same_openai_client, <span class="st">"gpt-4o-mini"</span>)]</code></pre>
+      <p><code>client.py.__init__</code> detects the positional client as <code>providers[0]</code>, then builds a <code>ProviderRuntime</code> per <code>fallback=(sdk_client, model)</code> pair via <code>get_adapter_for_client(...)</code>. <strong>All chain clients are constructed at <code>__init__</code></strong> so the first failover is pure dispatch (no client-construction latency inside the user's request). Provider credentials live entirely in those client objects — Solwyn never sees, accepts, or stores a provider API key (Decision D).</p>
+
+      <h3>4.6 &nbsp;Revised dispatch flow (sync; async mirrors with <code>await</code>)</h3>
+
+      <!-- failover call-flow diagram -->
+      <div class="callflow">
+        <div class="flowtitle">Failover routing call-flow · candidate walk</div>
+        <div class="cf-chain">
+          <div class="cf-node gate">
+            <div class="cf-head">Estimate + Budget pre-flight</div>
+            <div class="cf-sub"><code>estimate_content_length</code> (privacy seam) → <code>check_budget(provider=primary, fallback_providers=[…])</code>. Deny ⇒ raise <code>BudgetExceededError</code>. Deadline starts here.</div>
+          </div>
+          <div class="cf-conn"><div class="vline"></div><div class="label">router orders candidates (non-mutating state)</div></div>
+
+          <div class="cf-node primary">
+            <div class="cf-head">Primary · OpenAI <span class="cf-mini cl">Closed</span></div>
+            <div class="cf-sub">Native kwargs pass straight through — no translation. <code>can_proceed()</code> consumed here. On success: settle &amp; return.</div>
+          </div>
+          <div class="cf-conn"><div class="vline"></div><div class="label">pre-send failure (429 / 529 / connect-refused) · failover-safe</div></div>
+
+          <div class="cf-node fb1">
+            <div class="cf-head">Fallback 1 · Anthropic <span class="cf-mini ha">Half-Open</span></div>
+            <div class="cf-sub">Cross-provider hop ⇒ <code>to_canonical(kwargs)</code> → <code>from_canonical(model=…)</code>. May RAISE <code>UntranslatableRequestError</code> before any network call (aborts whole chain).</div>
+          </div>
+          <div class="cf-conn"><div class="vline"></div><div class="label">pre-send failure · advance · deadline checked</div></div>
+
+          <div class="cf-node fb2">
+            <div class="cf-head">Fallback 2 · Google <span class="cf-mini op">Open?</span></div>
+            <div class="cf-sub">Attempted only if breaker not OPEN (or recovery-eligible) and deadline remains. On success: normalize response back to caller's native shape; confirm against served provider.</div>
+          </div>
+          <div class="cf-conn"><div class="vline"></div><div class="label">all exhausted</div></div>
+
+          <div class="cf-node gate">
+            <div class="cf-head">raise <code>ProviderUnavailableError</code></div>
+            <div class="cf-sub">Carries the full attempted chain. Post-send-ambiguous failures re-raise the <em>original</em> provider exception instead (drop-in contract).</div>
+          </div>
+        </div>
+      </div>
+
+<pre><code><span class="kw">def</span> <span class="fn">_intercepted_call</span>(self, *, _force_stream=False, **kwargs):
+    requested_model = kwargs[<span class="st">"model"</span>]
+    is_streaming = bool(kwargs.get(<span class="st">"stream"</span>)) <span class="kw">or</span> _force_stream
+    primary = self._runtimes[0]
+    deadline = Deadline(self._config.failover_total_timeout)   <span class="cm"># covers budget pre-flight too</span>
+
+    <span class="cm"># 1+2. Estimate + budget — against the PRIMARY (we don't yet know who serves).</span>
+    char_count = estimate_content_length(kwargs)               <span class="cm"># _privacy.py ONLY</span>
+    est_in = estimate_tokens_from_length(char_count, primary.adapter.name) <span class="kw">if</span> char_count <span class="kw">else</span> 0
+    budget = self._budget.check_budget(estimated_input_tokens=est_in,
+                                       model=requested_model, provider=primary.adapter.name,
+                                       fallback_providers=[r.entry.provider <span class="kw">for</span> r <span class="kw">in</span> self._runtimes[1:]],
+                                       fallback_models=[r.entry.model <span class="kw">for</span> r <span class="kw">in</span> self._runtimes[1:]])
+    <span class="kw">if not</span> budget.allowed:
+        self._reporter.report(self._build_error_event(..., reason=BUDGET_DENIED))
+        <span class="kw">raise</span> BudgetExceededError(...)
+
+    <span class="cm"># 3. Router returns ordered, health-filtered candidates (non-mutating state reads).</span>
+    candidates = self._select_candidates(RoutingRequest(requested_provider=primary.entry.provider,
+                                                         estimated_input_tokens=est_in))
+    <span class="kw">if not</span> candidates:
+        <span class="kw">raise</span> ProviderUnavailableError(<span class="st">"all providers unavailable"</span>, attempted=[...])
+
+    last_exc = None
+    <span class="kw">for</span> idx, rt <span class="kw">in</span> enumerate(candidates):
+        <span class="kw">if</span> deadline.expired():
+            <span class="kw">break</span>
+        provider = rt.adapter.name
+        cb = self._get_circuit_breaker(provider)
+        <span class="kw">if not</span> cb.can_proceed():            <span class="cm"># probe CONSUMED only here, for the attempted provider</span>
+            <span class="kw">continue</span>
+        is_provider_fallback = rt.entry.provider != primary.entry.provider
+
+        <span class="cm"># 4. Translate ONLY when crossing providers (may RAISE before any network call).</span>
+        <span class="kw">try</span>:
+            <span class="kw">if</span> is_provider_fallback:
+                canonical = self._adapter.to_canonical(kwargs)               <span class="cm"># source = primary</span>
+                call_kwargs = rt.adapter.from_canonical(canonical, model=rt.entry.model)
+            <span class="kw">else</span>:
+                call_kwargs = {**kwargs, <span class="st">"model"</span>: rt.entry.model}            <span class="cm"># same-provider model swap</span>
+        <span class="kw">except</span> UntranslatableRequestError:
+            <span class="kw">raise</span>                            <span class="cm"># class C — abort the WHOLE chain, do not try more providers</span>
+        <span class="kw">if</span> is_streaming:
+            call_kwargs = rt.adapter.prepare_streaming(call_kwargs)
+
+        ctx = _AttemptContext(model=rt.entry.model, start_time=time.monotonic(),
+                              is_provider_fallback=is_provider_fallback, attempt_index=idx)
+        <span class="kw">try</span>:
+            <span class="cm"># MANDATORY per-hop bound: kill the 600s default read window; no SDK-internal retry stacking.</span>
+            response = self._sync_dispatch(rt, call_kwargs, _force_stream=_force_stream,
+                                           timeout=deadline.remaining(), max_retries=0)
+        <span class="kw">except</span> Exception <span class="kw">as</span> exc:
+            disp = rt.adapter.classify_exception(exc)        <span class="cm"># status-first; APITimeoutError before APIConnectionError</span>
+            cb.record_failure()                               <span class="cm"># one failure on THIS provider's breaker</span>
+            self._reporter.report(self._build_error_event(
+                model=rt.entry.model, provider=provider,
+                latency_ms=ctx.elapsed_ms(), is_provider_fallback=is_provider_fallback,
+                failover_error_class=type(exc).__name__, attempt_index=idx))
+            <span class="kw">if</span> disp <span class="kw">is</span> Disposition.FAIL_FAST:
+                <span class="kw">raise</span>                                         <span class="cm"># 4xx/404/refusal — do NOT advance the chain</span>
+            <span class="kw">if</span> disp <span class="kw">is</span> Disposition.POST_SEND_AMBIGUOUS <span class="kw">and</span> self._config.failover_idempotency != <span class="st">"always"</span>:
+                <span class="cm"># cannot prove the request didn't run -> never double-charge across providers</span>
+                <span class="kw">raise</span>                                         <span class="cm"># re-raise ORIGINAL exception (drop-in contract)</span>
+            last_exc = exc
+            <span class="kw">continue</span>                                          <span class="cm"># pre-send safe -> advance to next provider</span>
+
+        <span class="cm"># 6. SUCCESS — settle against the SERVED runtime.</span>
+        cb.record_success()
+        <span class="kw">if</span> is_streaming:
+            <span class="kw">return</span> self._wrap_stream(rt, response, ctx, budget, primary)   <span class="cm"># normalization in wrapper</span>
+        token_details = rt.adapter.extract_usage(response)
+        <span class="kw">if</span> budget.reservation_id:                              <span class="cm"># cache-hit calls have reservation_id=None</span>
+            self._budget.confirm_cost(budget.reservation_id, rt.entry.model,
+                                      token_details, provider=provider)     <span class="cm"># provider NOW required</span>
+        self._reporter.report(self._build_metadata_event(
+            model=rt.entry.model, provider=provider, is_provider_fallback=is_provider_fallback,
+            requested_provider=primary.entry.provider <span class="kw">if</span> is_provider_fallback <span class="kw">else</span> None,
+            requested_model=requested_model <span class="kw">if</span> is_provider_fallback <span class="kw">else</span> None,
+            failover_reason=FailoverReason.CIRCUIT_OPEN <span class="kw">if</span> is_provider_fallback <span class="kw">else</span> None,
+            attempt_index=idx, service_tier=rt.adapter.extract_service_tier(response)))
+        <span class="cm"># response normalized back to the caller's native shape on the failover path:</span>
+        <span class="kw">return</span> self._translate_response_out(served=provider, requested=primary.entry.provider, response=response)
+
+    <span class="kw">raise</span> last_exc <span class="kw">or</span> ProviderUnavailableError(...)</code></pre>
+
+      <div class="callout risk">
+        <span class="ctag">Same-provider double-count guard — do NOT delete the old invariant</span>
+        <p>When two consecutive chain entries share a provider (the folded model-swap case), <code>record_failure()</code> must record <strong>at most one</strong> failure on that provider's breaker per logical attempt — otherwise the breaker opens twice as fast as configured. Port this explicitly; cover with a regression test mirroring <code>test_circuit_breaker.py</code> / <code>test_fallback_model.py</code>.</p>
+      </div>
+    </section>
+
+    <!-- ===================== 5 ===================== -->
+    <section class="sec" id="s5">
+      <div class="sec-eyebrow">Section 05</div>
+      <h2>Cross-Provider Translation Contract</h2>
+
+      <p><strong>Stance — minimize the SDK-owned surface.</strong> The translator owns a tiny canonical request/response. Anything outside it <strong>raises</strong> (<code>UntranslatableRequestError</code>) on the first cross-provider hop, <strong>before</strong> any network call. The native single-provider path is <strong>never</strong> validated or translated — full provider features keep working; only cross-provider failover is constrained. This is a deliberate product tension: the most feature-rich (tool-using, structured-output) calls are the <em>least</em> failover-capable. That is acceptable per the maintainer's fail-loud decision.</p>
+
+      <h3>5.1 &nbsp;Minimal common subset (the canonical request)</h3>
+      <div class="codecap">providers/_translation.py · PRIVACY-CRITICAL banner; no <code>import logging</code>; no <code>import httpx</code></div>
+<pre><code><span class="cm"># providers/_translation.py — PRIVACY-CRITICAL banner; no `import logging`; no `import httpx`</span>
+<span class="kw">class</span> <span class="fn">CanonicalRequest</span>(BaseModel):
+    model_config = ConfigDict(extra=<span class="st">"forbid"</span>)
+    system: str | None                  <span class="cm"># plain string only; block-list/cache_control system -> RAISE</span>
+    messages: list[CanonicalMessage]    <span class="cm"># roles user|assistant; parts: text | image(base64) | tool_use | tool_result</span>
+    max_tokens: int                     <span class="cm"># REQUIRED in canonical (Anthropic requires it)</span>
+    temperature: float | None           <span class="cm"># range 0.0–1.0 (safe intersection); >1.0 -> RAISE</span>
+    top_p: float | None
+    stop: list[str] | None              <span class="cm"># ≤4</span>
+    stream: bool
+    tools: list[CanonicalTool] | None   <span class="cm"># {name, description, parameters:&lt;JSONSchema&gt;}</span>
+    tool_choice: ToolChoice | None      <span class="cm"># auto | required | none | {force: name}</span></code></pre>
+      <p>~10 request fields, ~5 response fields. Resist additions.</p>
+
+      <h3>5.2 &nbsp;Request field mapping</h3>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Concern</th><th>OpenAI Chat Completions</th><th>Anthropic Messages</th><th>Google generate_content</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>system</td><td>message role <code>system</code>/<code>developer</code></td><td>top-level <code>system=</code> (string)</td><td><code>config.system_instruction</code></td></tr>
+            <tr><td>conversation</td><td><code>messages</code> (sys/user/assistant/tool)</td><td><code>messages</code> (user/assistant)</td><td><code>contents</code> (user/model/tool)</td></tr>
+            <tr><td><strong>max output</strong></td><td><strong><code>max_completion_tokens</code></strong> (emit this, NOT <code>max_tokens</code> — o-series/GPT-5 reject <code>max_tokens</code>)</td><td><code>max_tokens</code> (<strong>required</strong>)</td><td><code>config.max_output_tokens</code></td></tr>
+            <tr><td>temperature</td><td>0–2</td><td><strong>0–1</strong></td><td>0–2</td></tr>
+            <tr><td>top_p</td><td><code>top_p</code></td><td><code>top_p</code></td><td><code>config.top_p</code></td></tr>
+            <tr><td>stop</td><td><code>stop</code> (≤4)</td><td><code>stop_sequences</code></td><td><code>config.stop_sequences</code></td></tr>
+            <tr><td>streaming</td><td><code>stream=True</code> (+<code>stream_options.include_usage</code>)</td><td><code>stream=True</code></td><td><code>generate_content_stream()</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout decision">
+        <span class="ctag">Corrections applied — verified vs live docs, June 2026</span>
+        <p><strong>Anthropic alternation is NOT required.</strong> The direct API auto-merges consecutive same-role turns (strict rejection is Bedrock-only). The translator normalizes structure for correctness but does <strong>not</strong> need to repair-or-RAISE on consecutive turns.</p>
+        <p><strong>OpenAI translator must emit <code>max_completion_tokens</code></strong>, not <code>max_tokens</code>, or same-provider-swap/failover into o-series/GPT-5 hard-400s on a healthy provider (class-C chain burn).</p>
+        <p><strong>Temperature safe intersection is 0.0–1.0</strong> (Anthropic ceiling). <code>&gt;1.0</code> targeting any cross-provider hop → RAISE (clamping is a silent degrade).</p>
+      </div>
+
+      <h3>5.3 &nbsp;Tools &amp; tool_choice</h3>
+      <p>JSON-Schema <strong>body</strong> (<code>{type:object, properties, required}</code>) is identical across all three; only the <strong>wrapper</strong> differs.</p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Wrapper</th><th>OpenAI</th><th>Anthropic</th><th>Google</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>tool decl</td><td><code>tools[{type:function, function:{name,description,parameters}}]</code></td><td><code>tools[{name,description,input_schema}]</code></td><td><code>function_declarations[{name,description,parameters_json_schema}]</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>tool_choice intent</th><th>OpenAI</th><th>Anthropic</th><th>Google (<code>function_calling_config.mode</code>)</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>auto</td><td><code>'auto'</code></td><td><code>{type:'auto'}</code></td><td><code>AUTO</code></td></tr>
+            <tr><td>required</td><td><code>'required'</code></td><td><code>{type:'any'}</code></td><td><code>ANY</code></td></tr>
+            <tr><td>none</td><td><code>'none'</code></td><td><code>{type:'none'}</code></td><td><code>NONE</code></td></tr>
+            <tr><td>force-specific</td><td><code>{type:'function',function:{name}}</code></td><td><code>{type:'tool',name}</code></td><td><code>ANY</code> + <code>allowed_function_names:[name]</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout risk">
+        <span class="ctag">Tool-result encoding — the most error-prone surface</span>
+        <p>The translator must round-trip args as <strong>JSON-string (OpenAI) ↔ JSON-object (Anthropic/Google)</strong> and remap result envelopes (<code>role:tool/tool_call_id</code> ↔ <code>tool_result/tool_use_id</code> ↔ <code>function_response</code> by name+id). Unit-test round-trip both directions. <strong><code>parallel_tool_calls=False</code> targeting Google → RAISE</strong> (no first-class equivalent).</p>
+      </div>
+
+      <div class="callout decision">
+        <span class="ctag">Decision B — tools ARE in the subset, with a hard stateless/stateful line</span>
+        <p><strong>Why this is not a perpetual-patch treadmill.</strong> The custom-function contract (JSON-Schema body + <code>tool_choice</code>) has <em>converged</em> across all three providers and is low-churn; only proprietary tool <em>types</em> keep moving, and those are already fail-loud. Translate the stable core; never chase the moving parts.</p>
+        <p><strong>Supported:</strong> tool declarations + <code>tool_choice</code>, and histories whose tool exchanges are fully <em>resolved</em> (mechanical block reshape + consistent id remap — the stateless case). <strong>Fail loud:</strong> a dangling/unresolved tool call at the failover boundary, parallel <em>same-name</em> calls, and all proprietary tools (the stateful/exotic cases).</p>
+        <p><strong>Maintenance model:</strong> bidirectional round-trip tests <em>are</em> the contract and the drift alarm — work is event-driven (a test breaks ⇒ a provider changed the stable core, rare), not continuous. Emit a <code>tool_call_not_failoverable</code> metric so any subset expansion is driven by real customer impact, not speculation. A more conservative v1 line is also valid: declarations yes, any tool <em>history</em> fails loud.</p>
+      </div>
+
+      <h3>5.4 &nbsp;Multimodal, finish reason, usage</h3>
+      <ul>
+        <li><strong>Images:</strong> base64 inline translates cleanly across all three. <strong>Corrected:</strong> current Anthropic and Gemini both accept direct public <strong>HTTPS</strong> image URLs, so a plain public URL also translates. <strong>RAISE only</strong> for provider-specific handles (Anthropic <code>file_id</code>, Gemini Files-API/<code>gs://</code> URIs) and audio/video/PDF. When translating an OpenAI <code>data:</code> URI to an Anthropic base64 block, <strong>parse <code>media_type</code> verbatim</strong> — Anthropic strictly validates media_type vs bytes.</li>
+        <li><strong>Finish/stop reason normalization:</strong> natural=<code>stop</code>/<code>end_turn</code>/<code>STOP</code>; length=<code>length</code>/<code>max_tokens</code>/<code>MAX_TOKENS</code>; tool=<code>tool_calls</code>/<code>tool_use</code>/<code>STOP+function_call</code>; content/safety=<code>content_filter</code>/<code>refusal</code>/<code>SAFETY</code>|<code>PROHIBITED_CONTENT</code>|<code>RECITATION</code>. <strong>Anthropic <code>refusal</code> is a first-class <code>stop_reason</code> (HTTP 200, not a 400)</strong> and Anthropic's full set is <code>end_turn|max_tokens|stop_sequence|tool_use|pause_turn|refusal</code>.</li>
+        <li><strong>Usage:</strong> already normalized by existing <code>*StreamAccumulator</code> / extraction adapters — <strong>no new work</strong>.</li>
+      </ul>
+
+      <h3>5.5 &nbsp;Fail-loudly unsupported list</h3>
+      <p>Each raises <code>UntranslatableRequestError(source, target, feature)</code> (structural label only, <strong>never</strong> the value) on the first cross-provider hop.</p>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Group</th><th>Items</th><th>Why it can't cross</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><strong>Semantics differ</strong></td><td><code>temperature&gt;1.0</code>→Anthropic; <code>seed</code>; <code>frequency/presence_penalty</code>→Anthropic; <code>top_k</code>→OpenAI; <code>parallel_tool_calls=False</code>→Google</td><td>silent behavior change / no equivalent</td></tr>
+            <tr><td><strong>Structured output</strong></td><td><code>response_format</code>, <code>response_schema</code>, json_schema <code>strict:true</code></td><td><strong>Corrected:</strong> all three now <em>have</em> schema-constrained JSON, but via different fields/guarantees (OpenAI <code>response_format.json_schema</code>, Anthropic <code>output_config.format</code>, Google <code>response_schema</code>). v1 RAISEs because <strong>we choose not to own three guarantee mappings yet</strong> — NOT because "Anthropic can't."</td></tr>
+            <tr><td><strong>Proprietary tools</strong></td><td>Anthropic <code>computer_use</code>/<code>bash</code>/<code>text_editor</code>/<code>web_search</code>/<code>code_execution</code>/<code>mcp_servers</code>; Google <code>google_search</code>/<code>code_execution</code>/<code>url_context</code>; OpenAI non-<code>function</code> tools</td><td>no cross-provider meaning</td></tr>
+            <tr><td><strong>Caching / pricing</strong></td><td>Anthropic <code>cache_control</code>; Google <code>cached_content</code></td><td>meaningless elsewhere + changes pricing buckets the Cloud API tracks</td></tr>
+            <tr><td><strong>Inference control</strong></td><td><code>logprobs</code>/<code>top_logprobs</code>, <code>logit_bias</code>, reasoning/thinking (<code>reasoning_effort</code>/<code>thinking</code>/<code>thinking_config</code>), <code>service_tier</code>, <code>n</code>&gt;1</td><td>no portable equivalent; alters token accounting</td></tr>
+            <tr><td><strong>Multimodal</strong></td><td>provider-specific image handles, audio/video/PDF</td><td>provider-specific encodings</td></tr>
+            <tr><td><strong>Tool-loop hazard</strong></td><td><strong>(a)</strong> a dangling/unresolved tool call at the failover boundary, or <strong>(b)</strong> parallel <strong>same-name</strong> calls → any cross-provider hop</td><td><strong>Decision B line:</strong> a tool call still awaiting its result can't be safely re-homed to a provider that never issued it → RAISE. Gemini now returns tool-call ids, so fully-resolved single/distinct-name histories DO translate (consistent id remap); same-name parallels stay RAISE.</td></tr>
+            <tr><td><strong>Source shape</strong></td><td>OpenAI <strong>Responses API</strong> call shape</td><td>translation map assumes Chat Completions; detect and RAISE</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===================== 6 ===================== -->
+    <section class="sec" id="s6">
+      <div class="sec-eyebrow">Section 06</div>
+      <h2>Reliability Design</h2>
+
+      <h3>6.1 &nbsp;Error taxonomy (classify STATUS-FIRST, never class-name-first)</h3>
+      <p>Class names diverge across SDKs and across versions. Solwyn's <strong>core</strong> still depends only on <code>httpx</code> + <code>pydantic</code>; <strong>Decision F</strong> adds minimum-version <em>floors</em> for the provider libraries via the install extras (<code>solwyn[openai]</code>/<code>[anthropic]</code>/<code>[google]</code>) so exception classes and params are predictable on the happy path. But clients remain bring-your-own — a user can install below the floor or bypass the extra — so the SDK <strong>cannot hard-assume any specific exception class exists at runtime</strong> (<code>OverloadedError</code>/<code>ServiceUnavailableError</code>/<code>DeadlineExceededError</code> appear and disappear across versions). This keeps <strong>status-first, duck-typed classification mandatory as the safety net.</strong> Use <code>getattr(exc,'status_code',None)</code> (OpenAI/Anthropic), <code>getattr(exc,'code',None)</code> (Google <code>APIError</code>), and <code>isinstance</code> on <strong>httpx transport errors</strong> for Google pre-send failures. Default unknown → <strong>FAIL_FAST</strong> (never failover into the unknown).</p>
+
+      <div class="dispgrid">
+        <div class="dispcard fo"><div class="dh">FAILOVER · safe</div><p>Provably pre-send rejection. Advance to the next candidate.</p></div>
+        <div class="dispcard amb"><div class="dh">POST_SEND_AMBIGUOUS</div><p>Request may have run. Re-raise the original exception; never failover.</p></div>
+        <div class="dispcard ff"><div class="dh">FAIL_FAST</div><p>Same error everywhere (4xx/404/refusal). Stop the chain; do not count breaker.</p></div>
+      </div>
+
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Condition</th><th>HTTP</th><th>Disposition</th><th>Breaker</th><th>Failover-safe?</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Rate limit</td><td>429</td><td>FAILOVER</td><td>count</td><td class="yes">YES (pre-send rejection)</td></tr>
+            <tr><td>Anthropic overloaded</td><td>529</td><td>FAILOVER</td><td>count</td><td class="yes">YES (pre-send) — classify by <code>status==529</code>, not class</td></tr>
+            <tr><td>Connect refused / DNS / TLS</td><td>—</td><td>FAILOVER</td><td>count</td><td class="yes">YES (never sent)</td></tr>
+            <tr><td><strong>Read timeout</strong></td><td>—</td><td><strong>POST_SEND_AMBIGUOUS</strong></td><td>count</td><td class="no">NO — may have run</td></tr>
+            <tr><td>500 / 502</td><td>post-send</td><td>POST_SEND_AMBIGUOUS</td><td>count</td><td class="no">NO (response received; can't tell if model ran)</td></tr>
+            <tr><td>503 Service Unavailable</td><td>—</td><td>POST_SEND_AMBIGUOUS</td><td>count</td><td class="no">NO (genuinely ambiguous; default unsafe)</td></tr>
+            <tr><td>504 Gateway timeout</td><td>—</td><td>POST_SEND_AMBIGUOUS</td><td>count</td><td class="no">NO</td></tr>
+            <tr><td>400 / 422</td><td>—</td><td>FAIL_FAST</td><td><strong>do NOT count</strong></td><td>N/A — same error on next provider</td></tr>
+            <tr><td>401 / 403</td><td>—</td><td>FAIL_FAST</td><td>do NOT count</td><td>N/A</td></tr>
+            <tr><td><strong>404 model-not-found</strong></td><td>—</td><td>FAIL_FAST</td><td>do NOT count</td><td>N/A — model is provider-specific; never chain-burn</td></tr>
+            <tr><td>Content refusal</td><td>200 <strong>or</strong> 400</td><td>FAIL_FAST / not an exception</td><td>do NOT count</td><td>N/A — never re-send to "get past" a filter</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout risk">
+        <span class="ctag">The double-spend trap — verified, critical</span>
+        <p><code>APITimeoutError</code> <strong>subclasses</strong> <code>APIConnectionError</code> in both <code>openai</code> and <code>anthropic</code>. A naive <code>except APIConnectionError: failover</code> catches the unsafe post-send timeout. The classifier <strong>must</strong> check <code>APITimeoutError</code> (and <code>httpx.ReadTimeout</code> for Google) <strong>first</strong> → POST_SEND_AMBIGUOUS, before the bare <code>APIConnectionError</code>/<code>httpx.ConnectError</code> pre-send branch. Prefer matching <code>httpx.ConnectError</code>/<code>ConnectTimeout</code> specifically for the "safe" path.</p>
+      </div>
+
+      <div class="callout decision">
+        <span class="ctag">Google specifics</span>
+        <p>Errors are only <code>APIError</code>/<code>ClientError</code>/<code>ServerError</code>, keyed on <code>.code</code> (int). 429→pre-send SAFE; 4xx→FAIL_FAST; <strong>5xx (ServerError)→POST_SEND_AMBIGUOUS</strong> (Google has <em>no</em> idempotency key — a re-send is an unconditional double-charge); raw <code>httpx.ConnectError</code>/<code>ConnectTimeout</code>→SAFE; <code>httpx.ReadTimeout</code>→UNSAFE. Put shared transport classification in <code>providers/_errors.py</code>; only provider-specific status/code mapping lives per-adapter.</p>
+      </div>
+
+      <h3>6.2 &nbsp;Routing / retry ordering</h3>
+      <ul>
+        <li><strong>No Solwyn same-provider retry by default</strong> (<code>same_provider_retries=0</code>). Each provider SDK already did up to <code>max_retries=2</code> with backoff before raising; stacking more inflates tail latency. The one exception: a 429 with a short <code>Retry-After</code> on a non-idempotent call where failover is unsafe → a single bounded wait+retry on the same provider, respecting the deadline.</li>
+        <li><strong>Never re-invoke <code>.create()</code> for "idempotent" same-provider retry</strong> — the SDK auto-generates a <strong>new</strong> idempotency key per top-level call, so a fresh <code>.create()</code> is <strong>not</strong> deduped. SDK idempotency only protects retries <em>inside one <code>.create()</code> invocation</em>.</li>
+        <li>On failover, pass <code>client.with_options(timeout=remaining, max_retries=0)</code> so the chain does not multiply SDK-internal retries across N providers.</li>
+      </ul>
+
+      <h3>6.3 &nbsp;Chain deadline budget (MANDATORY)</h3>
+      <p>The default OpenAI/Anthropic <strong>read timeout is 600s</strong>. A hung-but-connected provider × 2 internal retries × 3-failure threshold can stack to <strong>~30 minutes</strong> before the breaker even opens. A <code>Deadline</code> is therefore not optional:</p>
+      <ul>
+        <li>Compute once at <code>_intercepted_call</code> entry from <code>failover_total_timeout</code> (default 30s). It <strong>encompasses the budget pre-flight</strong> (the budget httpx client's own 5s timeout counts against it).</li>
+        <li>Check before every hop; pass a <strong>shrinking per-hop <code>timeout</code></strong> = <code>max(floor, remaining/len(remaining_candidates))</code> plus <code>max_retries=0</code>.</li>
+      </ul>
+
+      <h3>6.4 &nbsp;Half-open &amp; jitter</h3>
+      <ul>
+        <li>Order candidates by <strong>non-mutating</strong> state; consume the probe via <code>can_proceed()</code> <strong>only on the attempted candidate</strong> (§4.2).</li>
+        <li>A HALF_OPEN probe failure <strong>re-opens</strong> that provider's breaker (correct) and the loop advances — no special "skip record_failure" hack needed across <em>different</em> providers. The only invariant to preserve is the <strong>same-provider double-count guard</strong> (§4.6).</li>
+        <li>Add <strong>±20% jitter</strong> to <code>recovery_timeout</code> (<code>circuit_breaker_recovery_timeout_jitter</code>) so a fleet of N processes doesn't probe the recovering primary in lockstep (anti-stampede).</li>
+      </ul>
+
+      <h3>6.5 &nbsp;Idempotency &amp; double-spend safety rule</h3>
+      <blockquote>
+        <p><strong>Cross-provider failover is permitted ONLY when Solwyn can prove the request was never durably accepted by the first provider</strong> — i.e. a pre-send failure (connect-refused/DNS/TLS, or an explicit pre-processing rejection: 429/529). On any <strong>post-send-ambiguous</strong> failure (read timeout, mid-stream reset, 5xx-after-send, 503), Solwyn <strong>MUST NOT</strong> failover; it <strong>re-raises the original provider exception unchanged</strong> and lets the caller decide.</p>
+      </blockquote>
+      <ul>
+        <li>Cross-provider idempotency keys <strong>do not exist</strong> — a key in OpenAI's dedup store is meaningless to Anthropic. No header can prevent a double-charge after a post-send failure.</li>
+        <li><code>failover_idempotency</code>: <code>safe</code> (default, the rule above) · <code>never</code> (breaker still tracks health, no cross-provider failover) · <code>always</code> (caller asserts every request idempotent; loud warning at construction). Per-call override: <code>solwyn_idempotent=True/False</code> (stripped before dispatch).</li>
+        <li><strong>Preserve the drop-in contract:</strong> on a post-send no-failover decision, re-raise the <strong>original</strong> exception type (e.g. <code>APITimeoutError</code>) so the user's existing <code>except</code> handlers fire — do <strong>not</strong> synthesize a Solwyn error. Solwyn-specific errors are reserved for <strong>chain exhaustion</strong> (<code>ProviderUnavailableError</code>, carrying the full attempted chain).</li>
+      </ul>
+
+      <div class="callout decision">
+        <span class="ctag">Decision C ratified — safe default, aggressive by explicit opt-in</span>
+        <p><code>safe</code> is the shipped default and the non-negotiable floor: never double-charge. Clients who accept the risk opt in themselves — <code>failover_idempotency="always"</code> (assert all requests idempotent), the per-call <code>solwyn_idempotent=True</code> override, and a tunable <code>failover_total_timeout</code> to trade latency for more aggressive retrying. The SDK never escalates aggression on the caller's behalf.</p>
+      </div>
+
+      <h3>6.6 &nbsp;Streaming: fail-before-first-byte (per-provider mechanics)</h3>
+      <blockquote>
+        <p>Failover for streaming is permitted <strong>only before the first chunk is yielded</strong> to the user. Once <code>SyncStreamWrapper</code>/<code>AsyncStreamWrapper</code> yields chunk 1, the served provider is committed; later errors go to <code>on_error</code> (breaker records a health failure) but <strong>never</strong> trigger failover.</p>
+      </blockquote>
+      <p><strong>Corrected per-provider mechanics (verified):</strong></p>
+      <ul>
+        <li><strong>OpenAI / Anthropic:</strong> <code>.create(stream=True)</code> runs <code>raise_for_status()</code> <strong>eagerly inside dispatch</strong>, so connection/status errors raise at dispatch time (failover-eligible, no bytes yielded). The loop-around-dispatch rule works directly.</li>
+        <li><strong>Google:</strong> <code>generate_content_stream</code> is a <strong>lazy generator</strong> — no network call until first iteration. The dispatch-time loop sees no exception, so <strong>Google streaming failover is unreachable</strong> unless we <strong>force first-chunk materialization inside the loop</strong> (pull <code>next()</code>/<code>anext()</code> on the raw stream before wrapping, catch the establishment error there, re-yield the buffered first chunk from the wrapper). <strong>Decision A — streaming ships in v1:</strong> implement Google first-chunk materialization so its lazy generator is failover-eligible exactly like OpenAI/Anthropic. Streaming failover is NOT deferred; non-streaming-first is explicitly rejected as it would gut the marketing promise for the highest-value calls.</li>
+      </ul>
+
+      <h3>6.7 &nbsp;The honest millisecond claim</h3>
+      <blockquote>
+        <p>Once a provider is known-unhealthy (its circuit is OPEN), rerouting is instant — sub-millisecond, from local state, no server in the loop. <strong>Detecting</strong> that a healthy provider just went down still costs real time: the first <code>failure_threshold</code> requests must fail (bounded by your configured per-hop <code>timeout</code>, <strong>not</strong> the 600s SDK default) before the breaker opens. After that, every subsequent request reroutes instantly until the provider recovers. Process-local breakers start CLOSED, so this never covers the first failing request of a fresh process.</p>
+      </blockquote>
+
+      <h3>6.8 &nbsp;Key failure scenarios → guard</h3>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Scenario</th><th>Guard</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Silent double-charge (<code>APITimeoutError</code> post-send)</td><td>Match <code>APITimeoutError</code>/<code>httpx.ReadTimeout</code> first → POST_SEND_AMBIGUOUS → re-raise, never failover</td></tr>
+            <tr><td>Google streaming failover unreachable (lazy generator)</td><td>Force first-chunk materialization in the loop, or document non-failover</td></tr>
+            <tr><td>Ten-minute hang (600s read default × retries × threshold)</td><td>Mandatory <code>Deadline</code> + per-hop <code>timeout</code> + <code>max_retries=0</code></td></tr>
+            <tr><td>404 chain-burn (<code>gpt-4o</code> 404s on Anthropic)</td><td>404 = FAIL_FAST; per-entry provider-specific model; missing model → <code>UntranslatableModelError</code> up front</td></tr>
+            <tr><td>Content-filter loop</td><td>Refusals = FAIL_FAST; 200-refusals stay on success path; <strong>never</strong> branch on <code>finish_reason</code> to retry</td></tr>
+            <tr><td>Stampede onto backup</td><td><code>recovery_timeout</code> jitter; document per-process breakers; plan backup headroom</td></tr>
+            <tr><td>Probe-consumption race</td><td>Order via non-mutating state; <code>can_proceed()</code> only on attempted candidate</td></tr>
+            <tr><td>Same-provider breaker double-count</td><td>One <code>record_failure</code> per logical attempt per provider breaker</td></tr>
+            <tr><td>Untranslatable-feature chain burn</td><td><code>UntranslatableRequestError</code> aborts the <strong>whole</strong> chain on first cross-provider hop</td></tr>
+            <tr><td>Wrapped-exception breaks drop-in</td><td>Re-raise original provider exception on no-failover; Solwyn errors only on chain exhaustion</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===================== 7 ===================== -->
+    <section class="sec" id="s7">
+      <div class="sec-eyebrow">Section 07</div>
+      <h2>Privacy Firewall Design</h2>
+
+      <p><strong>Where translation lives.</strong> A single new content-privileged module <code>src/solwyn/providers/_translation.py</code>. <strong>Do not</strong> widen <code>_privacy.py</code> — its CI-enforced "no <code>logging</code> import / returns <code>int</code> only" guarantee is the strongest trust anchor and translation (which returns transformed structures) cannot satisfy it. The content-touching allowlist becomes <strong>exactly two</strong> modules: <code>_privacy.py</code> (returns lengths) and <code>providers/_translation.py</code> (returns transformed kwargs destined only for a provider SDK).</p>
+
+      <div class="callout decision">
+        <span class="ctag">The content-touching contract — verbatim in module banner + CLAUDE.md</span>
+        <ol class="tight">
+          <li>In-memory transform only; store content nowhere long-lived.</li>
+          <li>Output goes <strong>only</strong> to the destination provider SDK via the dispatch seam — <strong>never</strong> to <code>_reporter</code>, <code>_budget</code>, or any httpx client pointed at <code>config.api_url</code>.</li>
+          <li>No logging of content at any level; import neither <code>logging</code> nor <code>httpx</code>; hold no logger.</li>
+          <li>Fail loudly: <code>UntranslatableRequestError(source, target, feature)</code> with <strong>structural labels only</strong> (never the offending value).</li>
+          <li>Exception messages/<code>__notes__</code>/<code>__cause__</code> carry no content: re-raise across the boundary with <code>raise UntranslatableRequestError(...) from None</code> (suppress <code>__context__</code>); attach only <code>type(exc).__name__</code>.</li>
+          <li>Length/token estimation routes through <code>_privacy.estimate_content_length</code> on the <strong>translated</strong> kwargs (so budget reflects the provider actually called). <code>_translation.py</code> returns no lengths.</li>
+          <li>Solwyn wire models stay content-free (<code>extra="forbid"</code>); only <strong>structural</strong> additions (provider identifiers) allowed.</li>
+          <li>Pure, no I/O.</li>
+        </ol>
+      </div>
+
+      <h4>New leak vectors failover introduces, and closures</h4>
+      <ul>
+        <li><strong><code>add_note</code> on a shared exception</strong> (<code>client.py:308/624</code> already interpolates <code>type(exc).__name__</code> — safe). Provider SDK <code>BadRequestError</code> embeds request content in <code>str(exc)</code>/<code>.body</code>. <strong>Close:</strong> firewall assertion forbidding <code>add_note(f"…")</code> with any interpolation other than <code>type(...).__name__</code>; never stringify a provider exception into a Solwyn payload/logger.</li>
+        <li><strong>Logging of kwargs dicts.</strong> The bareword regex (<code>\bmessages\b</code>, …) misses <code>kwargs</code>/<code>fallback_kwargs</code>/<code>translated_kwargs</code>/<code>call_kwargs</code>/<code>payload</code>/<code>request_body</code>. <strong>Close:</strong> extend the regex.</li>
+        <li><strong><code>exc_info=True</code> with a provider exception in scope.</strong> <strong>Close:</strong> <code>_translation.py</code> has no logger at all; assert no <code>logger.*(..., exc_info=True)</code> in the failover except-blocks where a provider exception is live.</li>
+        <li><strong><code>_AttemptContext</code> holds kwargs.</strong> <strong>Close:</strong> assert it is never <code>.model_dump()</code>'d into an event or passed to a logger.</li>
+      </ul>
+
+      <h4>CI test changes (<code>tests/unit/test_privacy_firewall.py</code>)</h4>
+<pre><code>CONTENT_PRIVILEGED = {<span class="st">"_privacy.py"</span>, <span class="st">"_translation.py"</span>}   <span class="cm"># explicit ALLOWLIST, replaces "_privacy not in name"</span>
+
+<span class="kw">def</span> <span class="fn">test_content_privileged_modules_have_no_logging_import</span>(): ...   <span class="cm"># loop allowlist; assert no "import logging"</span>
+<span class="kw">def</span> <span class="fn">test_content_privileged_modules_carry_privacy_banner</span>(): ...     <span class="cm"># loop allowlist</span>
+<span class="kw">def</span> <span class="fn">test_translation_module_does_no_io</span>(): <span class="st">"import httpx"</span> <span class="kw">not in</span> src <span class="kw">and</span> <span class="st">"httpx"</span> <span class="kw">not in</span> src
+<span class="kw">def</span> <span class="fn">test_translation_module_has_no_logger_token</span>(): <span class="st">"logger"</span> <span class="kw">not in</span> src <span class="kw">and</span> <span class="st">"logging"</span> <span class="kw">not in</span> src
+
+<span class="cm"># Wire models stay content-free:</span>
+FORBIDDEN_FIELDS = {<span class="st">"messages"</span>,<span class="st">"content"</span>,<span class="st">"system"</span>,<span class="st">"contents"</span>,<span class="st">"prompt"</span>,<span class="st">"text"</span>,<span class="st">"input"</span>,<span class="st">"response"</span>}
+<span class="kw">for</span> M <span class="kw">in</span> (MetadataEvent, BudgetCheckRequest, BudgetConfirmRequest):
+    <span class="kw">assert not</span> (set(M.model_fields) & FORBIDDEN_FIELDS)
+
+<span class="cm"># Allowlist drift tripwire: banner set must equal CONTENT_PRIVILEGED</span>
+<span class="kw">assert</span> CONTENT_PRIVILEGED == {p.name <span class="kw">for</span> p <span class="kw">in</span> SDK_SRC.rglob(<span class="st">"*.py"</span>) <span class="kw">if</span> <span class="st">"PRIVACY-CRITICAL"</span> <span class="kw">in</span> p.read_text()[:600]}
+
+<span class="cm"># THE authoritative backstop — behavioral, end-to-end:</span>
+<span class="kw">def</span> <span class="fn">test_failover_solwyn_payloads_carry_no_content</span>(monkeypatch):
+    SENTINEL = <span class="st">"SUPER_SECRET_PROMPT_a1b2c3"</span>
+    captured = []  <span class="cm"># every json= body POSTed to config.api_url (budget check, confirm, metadata ingest)</span>
+    <span class="cm"># force primary circuit OPEN so translation+failover fires; run a call whose messages contain SENTINEL</span>
+    <span class="kw">assert</span> SENTINEL <span class="kw">not in</span> json.dumps(captured)</code></pre>
+      <p>The structural scans prove import/log-call shapes but cannot model <code>add_note</code>/<code>__repr__</code>/new-field leaks — the <strong>sentinel-in-payload test is the authoritative backstop</strong> and must ship.</p>
+    </section>
+
+    <!-- ===================== 8 ===================== -->
+    <section class="sec" id="s8">
+      <div class="sec-eyebrow">Section 08</div>
+      <h2>Budget &amp; Cloud API Contract</h2>
+
+      <div class="callout decision">
+        <span class="ctag">Decision · Reserve against primary, confirm authoritatively</span>
+        <p>Keep <strong>one</strong> reservation per logical call, priced against the primary at check time (O(1), cheap). Make <strong>confirm authoritative</strong> by sending the <strong>actually served</strong> provider+model so the Cloud API re-prices real usage. This avoids the systematic over-reservation that full-chain pre-authorization causes on the common no-failover path. <strong>The SDK still never computes cost.</strong></p>
+      </div>
+
+      <h3>8.1 &nbsp;SDK request/response field changes</h3>
+<pre><code><span class="kw">class</span> <span class="fn">BudgetCheckRequest</span>(BaseModel):                    <span class="cm"># advisory chain hint (additive)</span>
+    estimated_input_tokens: int = Field(..., ge=0)
+    model: str                                          <span class="cm"># PRIMARY</span>
+    provider: ProviderName                              <span class="cm"># PRIMARY</span>
+    fallback_providers: list[ProviderName] = Field(default_factory=list)         <span class="cm"># NEW</span>
+    fallback_models:   list[str]           = Field(default_factory=list, max_length=8)  <span class="cm"># NEW</span>
+    <span class="fn">@model_validator</span>(mode=<span class="st">"after"</span>)
+    <span class="kw">def</span> <span class="fn">_aligned</span>(self): <span class="kw">assert</span> len(self.fallback_models) == len(self.fallback_providers); <span class="kw">return</span> self
+
+<span class="kw">class</span> <span class="fn">BudgetConfirmRequest</span>(BaseModel):
+    reservation_id: str
+    model: str                                          <span class="cm"># ACTUAL served model</span>
+    provider: ProviderName                              <span class="cm"># NEW — REQUIRED; selects the price book</span>
+    token_details: TokenDetails
+    is_provider_fallback: bool = Field(default=False)   <span class="cm"># NEW (API can also derive it)</span>
+    call_id: str                                        <span class="cm"># NEW — uuid per intercepted call; dedups confirm vs metadata reconciliation (§8.4)</span></code></pre>
+      <p><code>provider</code> threads through <code>budget.py::confirm_cost</code> / <code>build_confirm_request</code> (sync <strong>and</strong> async) and <strong>all four</strong> <code>client.py</code> confirm call sites (<code>provider=served</code>). <strong>Resolve the required-vs-inferred contradiction decisively:</strong> <code>provider</code> is <strong>REQUIRED</strong>; deploy <strong>API-first</strong> with no inference window (zero customers → no compatibility cost owed).</p>
+
+      <h3>8.2 &nbsp;MetadataEvent additions (observability; None-skipped on the wire)</h3>
+<pre><code>is_model_fallback: bool                                 <span class="cm"># NARROWED: same-provider model swap ONLY</span>
+call_id: str                                            <span class="cm"># NEW — uuid per intercepted call; the join key for cache-hit spend reconciliation (§8.4)</span>
+is_provider_fallback: bool = Field(default=False)       <span class="cm"># served provider != requested</span>
+requested_provider: ProviderName | None = None
+requested_model:    str | None = Field(default=None, max_length=100)
+failover_reason:    FailoverReason | None = None
+failover_error_class: str | None = Field(default=None, max_length=64)   <span class="cm"># type(exc).__name__ ONLY — never str(exc)</span>
+attempt_index: int = Field(default=0, ge=0)             <span class="cm"># 0=primary, 1=first fallback, ...</span>
+possibly_succeeded: bool = Field(default=False)         <span class="cm"># post-send-ambiguous abort flag for reconciliation</span>
+
+<span class="kw">class</span> <span class="fn">FailoverReason</span>(StrEnum):
+    CIRCUIT_OPEN   = <span class="st">"circuit_open"</span>
+    PRIMARY_ERROR  = <span class="st">"primary_error"</span>
+    MODEL_FALLBACK = <span class="st">"model_fallback"</span></code></pre>
+      <p><code>failover_error_class</code> is <strong>strictly <code>type(exc).__name__</code></strong> — a firewall test asserts it is never populated from <code>str(exc)</code>/response text (the bareword regex would not catch an error-message leak).</p>
+
+      <h3>8.3 &nbsp;Cloud API behavior</h3>
+      <ul>
+        <li><strong><code>/budgets/check</code>:</strong> price estimate against PRIMARY (O(1)); persist <code>reserved_provider/model</code>, <code>declared_chain</code>, and a <strong>TTL</strong> on the reservation. In HARD_DENY may verify ≥1 chain tier has headroom and apply a precomputed chain margin (no per-tier pricing on the hot path).</li>
+        <li><strong><code>/budgets/confirm</code>:</strong> look up reservation; if served provider/model ≠ reserved, <strong>validate membership in <code>declared_chain</code></strong>; price <code>token_details</code> against the <strong>served</strong> provider; atomically release the primary-priced hold and apply real cost; <strong>idempotent on <code>reservation_id</code></strong>.</li>
+        <li><strong>Reservation TTL is load-bearing for reliability:</strong> on a correctly-not-failed-over post-send-ambiguous abort, no <code>token_details</code> arrive and confirm never fires — the hold must <strong>expire server-side</strong>, else HARD_DENY headroom leaks. The SDK emits an ERROR <code>MetadataEvent</code> with <code>possibly_succeeded=True</code> for reconciliation.</li>
+        <li><strong><code>/metadata/ingest</code>:</strong> accept the new optional fields (additive; deploy <strong>before</strong> the SDK sends them or ingest 422s). Old no-failover events are byte-identical (None-skipped).</li>
+        <li><strong>Spend reconciliation (resolves OQ5, the cache-hit hole — §8.4):</strong> the ingest pipeline becomes <strong>authoritative for actual spend</strong>, not just observability. For any call whose served-provider <code>MetadataEvent</code> carries <code>token_details</code> but has <strong>no matching <code>/budgets/confirm</code></strong> (joined by <code>call_id</code>) — i.e. budget-cache hits and abandoned-stream confirms — the Cloud API prices the tokens against the <strong>served</strong> provider and applies them to the budget ledger. <strong>Idempotent and deduplicated on <code>call_id</code></strong>, so each call is counted exactly once whether it settled via confirm or via metadata.</li>
+      </ul>
+
+      <h3>8.4 &nbsp;Two accounting holes to handle explicitly</h3>
+      <ul>
+        <li><strong>Cache-hit calls have <code>reservation_id=None</code></strong> (<code>budget.py</code> deliberately does not reuse reservations), so no confirm fires and a cached-allow call that fails over to a pricier provider would be invisible to budget. <strong>Resolved (Cloud-API fix, OQ5):</strong> keep the budget cache and make the Cloud API reconcile actual spend from the served-provider <code>MetadataEvent</code> — priced against the served provider, joined and deduped against any confirm by <code>call_id</code> (§8.3). Trade-off accepted: HARD_DENY enforcement on a cached call is <strong>eventually-consistent</strong> (the ledger is corrected when the metadata event is ingested) — which is already inherent to any budget cache.</li>
+        <li><strong>Streaming confirm is fire-and-forget</strong> via <code>reporter.report_confirm</code>; a dropped/abandoned-stream confirm leaves the cheaper primary estimate. Reservation TTL + the served-provider metadata event are the backstop.</li>
+      </ul>
+
+      <h3>8.5 &nbsp;Dashboard implications</h3>
+      <p>Failover rate = <code>count(is_provider_fallback)/count(*)</code>; requested-vs-served confusion matrix; <code>failover_reason</code> × <code>failover_error_class</code> distribution (proactive breaker-open vs hard error); exact cost attribution (confirm prices the served provider); <code>attempt_index</code> funnel (how deep the chain is exercised); confirm-vs-metadata served-provider cross-check as an SDK-bug tripwire. All content-free by construction.</p>
+    </section>
+
+    <!-- ===================== 9 ===================== -->
+    <section class="sec" id="s9">
+      <div class="sec-eyebrow">Section 09</div>
+      <h2>Risk Register</h2>
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr><th>Risk</th><th>Likelihood</th><th>Impact</th><th>Mitigation</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>APITimeoutError ⊂ APIConnectionError</code> → double-charge</td><td>High (easiest mistake)</td><td>Critical (real money + double side-effects)</td><td>Match <code>APITimeoutError</code>/<code>httpx.ReadTimeout</code> first → POST_SEND_AMBIGUOUS → re-raise; reviewer must verify ordering</td></tr>
+            <tr><td>Google streaming failover unreachable (lazy generator)</td><td>High</td><td>High (silent broken promise for the common Google call)</td><td>Force first-chunk materialization in loop, or document Google streaming as non-failover</td></tr>
+            <tr><td>600s read default → multi-minute "instant" failover</td><td>High</td><td>High (violates marketing claim ×1000)</td><td>Mandatory <code>Deadline</code> + per-hop <code>timeout</code> + <code>max_retries=0</code></td></tr>
+            <tr><td>Probe-consumption race from ordering via <code>can_proceed()</code></td><td>Medium</td><td>High (probes wasted, breakers dangle)</td><td>Order via non-mutating <code>breaker.state</code>; consume probe only on attempted candidate</td></tr>
+            <tr><td>Same-provider chain entry double-counts breaker</td><td>Medium</td><td>Medium (breaker opens 2× too fast)</td><td>One <code>record_failure</code> per logical attempt per provider breaker; regression test</td></tr>
+            <tr><td>Translation surface creep (tool_choice/logprobs/seed/…)</td><td>High</td><td>Medium (unbounded bug backlog)</td><td>Allowlist (fail-closed) enforced at dispatch boundary; explicit subset frozen at launch</td></tr>
+            <tr><td>Foreign-response shape break on failover (returning a raw foreign provider object)</td><td>Medium (only if response normalization is skipped)</td><td>High (caller <code>AttributeError</code>)</td><td>Normalize response back to caller shape (chosen); streaming first-byte-only</td></tr>
+            <tr><td>Privacy regression via new content module</td><td>Medium</td><td>Critical (sacred invariant)</td><td>Allowlist tests + extended regex + <code>from None</code> re-raise + <strong>sentinel-in-payload backstop</strong></td></tr>
+            <tr><td>Cache-hit failover invisible to budget</td><td>Medium</td><td>Medium (spend undercount)</td><td>Cloud-API metadata reconciliation (OQ5, chosen): price served-provider <code>MetadataEvent</code> into the ledger, dedup by <code>call_id</code>; budget cache retained</td></tr>
+            <tr><td>Stampede onto backup provider</td><td>Medium</td><td>High (cascading chain exhaustion)</td><td><code>recovery_timeout</code> jitter; backup-capacity guidance; per-shard chains</td></tr>
+            <tr><td>Cost-routing "no-refactor" overstated</td><td>Low (future)</td><td>Medium</td><td>Design <code>price_hint</code>/<code>translatable</code> on candidate now; flag server price-hint field as prerequisite</td></tr>
+            <tr><td>Provider SDK version varies (BYO client; floors are opt-in extras) → exception classes vary or are absent</td><td>Medium</td><td>Medium (misclassification → wrong failover/breaker action)</td><td><strong>Decision F</strong> version floors in the extras for predictability, <strong>plus</strong> status-first classification by numeric <code>status_code</code>/<code>code</code> as the runtime net; never <code>isinstance</code> on version-specific classes; unknown → FAIL_FAST</td></tr>
+            <tr><td>OpenAI <code>max_tokens</code> → o-series/GPT-5 400</td><td>Medium</td><td>Medium (healthy-provider chain burn)</td><td>OpenAI translator emits <code>max_completion_tokens</code></td></tr>
+            <tr><td>Reservation TTL not implemented → headroom leak</td><td>Medium</td><td>Medium (HARD_DENY drift)</td><td>Server-side TTL sweep + <code>possibly_succeeded</code> reconciliation</td></tr>
+            <tr><td>Most valuable (tool/structured-output) calls are least failover-capable</td><td>High</td><td>Medium (product tension)</td><td>Documented; fail loudly; expand subset in later phases if warranted</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ===================== 10 ===================== -->
+    <section class="sec" id="s10">
+      <div class="sec-eyebrow">Section 10</div>
+      <h2>Phased Rollout</h2>
+
+      <h3>P1 — Routing seam + 2-provider health failover (behind a flag)</h3>
+      <p><strong>Ships:</strong> <code>_registry.py</code>, <code>_routing.py</code> (<code>HealthBasedPolicy</code>, non-mutating ordering), <code>_select_candidates()</code>, the candidate-walk dispatch loop with classified exceptions (<code>providers/_errors.py</code>, status-first, <code>APITimeoutError</code>-first), mandatory <code>Deadline</code> + per-hop <code>timeout</code>/<code>max_retries=0</code>, <code>recovery_timeout</code> jitter, same-provider double-count guard. New config <code>providers</code> chain (model-swap-only and openai↔anthropic with <strong>identical/passthrough kwargs</strong>, i.e. no rich features yet). Failover gated by a feature flag.</p>
+      <p><strong>DoD:</strong> OpenAI-down → Anthropic served for a plain text request; breaker accounting correct (one failure on primary, one success on served); deadline bounds worst-case latency; <code>test_failover_routing.py</code> + <code>test_failover_idempotency.py</code> (asserts <strong>no</strong> failover on <code>APITimeoutError</code>) green; existing suites green.</p>
+
+      <h3>P2 — Translation subset + fail-loudly</h3>
+      <p><strong>Ships:</strong> <code>providers/_translation.py</code> (canonical request, per-provider <code>to_canonical</code>/<code>from_canonical</code>, response normalization seam), <code>UntranslatableRequestError</code>/<code>UntranslatableModelError</code>, the full §5 mapping (system/messages/tools/tool-result/images/finish-reason), the allowlist. Privacy firewall extended (P2 is the gate: <strong>firewall tests must land before/with the module</strong>).</p>
+      <p><strong>DoD:</strong> cross-provider failover works for the subset; every §5.5 item raises with structural-only messages; round-trip tool-result tests pass; firewall sentinel test + allowlist tests green.</p>
+
+      <h3>P3 — Streaming + idempotency hardening</h3>
+      <p><strong>Ships:</strong> first-byte streaming rule across all wrappers; Google first-chunk materialization (committed — Decision A); <code>failover_idempotency</code> modes + <code>solwyn_idempotent</code> per-call override; original-exception re-raise on post-send no-failover; abandoned-stream reservation-expiry test.</p>
+      <p><strong>DoD:</strong> streaming establishment-error failover works (OpenAI/Anthropic eager, Google materialized); a mid-stream error never fails over and surfaces the original exception; no double-emit/splice; idempotency matrix tests green.</p>
+
+      <h3>P4 — Budget / Cloud API contract sync</h3>
+      <p><strong>Ships (API-first deploy):</strong> <code>provider</code> required on <code>BudgetConfirmRequest</code>; chain hint on <code>BudgetCheckRequest</code>; <code>MetadataEvent</code> failover fields + <code>FailoverReason</code>; reservation TTL + chain-membership validation server-side; cache-hit handling decision; contract-snapshot CI test pinning the new JSON shapes.</p>
+      <p><strong>DoD:</strong> confirm prices the served provider; failover spend attributed correctly on the dashboard; reservations expire server-side; <code>is_model_fallback</code> narrowed; contract-snapshot test green; deploy order enforced (API ships first).</p>
+
+      <h3>P5 — Latency / cost routing</h3>
+      <p><strong>Ships:</strong> <code>LatencyPolicy</code> (pure drop-in over observed p50). Cost routing <strong>only after</strong> the Cloud API exposes a relative-price hint that populates <code>ProviderCandidate.price_hint</code> (SDK never computes price).</p>
+      <p><strong>DoD:</strong> swapping the injected policy changes order with <strong>zero</strong> changes to dispatch/translation/budget; cost policy consumes the server price hint without local price math.</p>
+    </section>
+
+    <!-- ===================== 11 ===================== -->
+    <section class="sec" id="s11">
+      <div class="sec-eyebrow">Section 11</div>
+      <h2>Decisions Made — All Questions Resolved</h2>
+      <p>The 2026-06 maintainer review settled <strong>all seven</strong> of the original questions (recorded here and in the §1 ratified-decisions block). None remain open; what follows is the decision record.</p>
+
+      <div class="callout decision">
+        <span class="ctag">Resolved · 1 &amp; 2 — Response normalization + streaming in v1 (Decision A)</span>
+        <p>Full normalization back to the caller's native shape, <strong>streaming included</strong>. Streaming failover is NOT deferred — Google gets first-chunk materialization so it's failover-eligible like OpenAI/Anthropic. Non-streaming-first is rejected.</p>
+      </div>
+      <div class="callout decision">
+        <span class="ctag">Resolved · 3 — max_tokens default (Decision E)</span>
+        <p>Per-provider <code>default_params</code> plus a global <code>default_params</code>, applied <strong>fill-absent-only</strong> (per-call &gt; per-entry &gt; global). A request that omits <code>max_tokens</code> and fails into Anthropic is filled from the Anthropic entry's default. RAISE only if still absent after defaults and the target requires it.</p>
+      </div>
+      <div class="callout decision">
+        <span class="ctag">Resolved · 4 — Tools in the v1 subset (Decision B)</span>
+        <p>Yes for the converged custom-function contract (declaration + <code>tool_choice</code> + fully-resolved histories). Fail loud on dangling/unresolved tool calls, parallel same-name calls, and proprietary tools. Round-trip tests are the drift alarm; a <code>tool_call_not_failoverable</code> metric drives data-driven expansion. Not a perpetual-patch surface, because proprietary tools are never chased.</p>
+      </div>
+      <div class="callout decision">
+        <span class="ctag">Resolved · 7 — failover_idempotency default (Decision C)</span>
+        <p><code>safe</code> (no double-charge) is the default and floor; aggression is explicit opt-in (<code>always</code> / per-call <code>solwyn_idempotent</code> / tunable <code>failover_total_timeout</code>). The "first request to a hard-down provider still errors until the breaker opens" cost is accepted.</p>
+      </div>
+      <div class="callout decision">
+        <span class="ctag">Constraint · Provider credentials out of scope (Decision D)</span>
+        <p>Solwyn never accepts, stores, or logs provider API keys (or prompts). Creds come only from the caller's client objects; the SDK documents that each chain provider must be configured. <code>ProviderEntry</code> has no <code>api_key</code>/<code>base_url</code>.</p>
+      </div>
+
+      <div class="callout decision">
+        <span class="ctag">Resolved · 6 — Provider-SDK version floors (Decision F)</span>
+        <p>Declare minimum-version <em>floors</em> for the provider libraries in the install extras (<code>solwyn[openai]</code>/<code>[anthropic]</code>/<code>[google]</code>) so exception classes, <code>max_completion_tokens</code>, and the <code>google-genai</code> surface are predictable. Core still depends only on <code>httpx</code>+<code>pydantic</code>; status-first classification (§6.1) stays the runtime net for BYO installs below the floor. Concrete floor versions: TBD (pick current stable minimums).</p>
+      </div>
+
+      <div class="callout decision">
+        <span class="ctag">Resolved · 5 — Cache-hit budget hole (Cloud-API fix)</span>
+        <p>Fix it in the Cloud API: keep the budget-check cache and make the metadata ingest pipeline authoritative for spend — price the served-provider <code>MetadataEvent</code> into the ledger, joined and deduped against any <code>/budgets/confirm</code> by a new per-call <code>call_id</code> (§8.3–§8.4). One mechanism closes both the cache-hit hole and the abandoned-stream confirm gap.</p>
+      </div>
+      <!-- OQ6 resolved above as Decision F (version floors) -->
+    </section>
+
+    <footer class="docfoot">
+      <span>Provider Failover — Design Spec</span>
+      <span>solwyn-python-sdk · Status: Draft</span>
+    </footer>
+
+  </article>
+  </div>
+</div>
+
+<script>
+(function(){
+  var links = Array.prototype.slice.call(document.querySelectorAll('nav.toc a'));
+  var map = {};
+  links.forEach(function(a){
+    var id = a.getAttribute('href').slice(1);
+    var sec = document.getElementById(id);
+    if(sec) map[id] = a;
+  });
+  var sections = Object.keys(map).map(function(id){ return document.getElementById(id); });
+
+  function setActive(id){
+    links.forEach(function(a){ a.classList.remove('active'); });
+    if(map[id]) map[id].classList.add('active');
+  }
+
+  if('IntersectionObserver' in window){
+    var visible = {};
+    var obs = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        visible[e.target.id] = e.isIntersecting ? e.intersectionRatio : 0;
+      });
+      // pick the section nearest the top that is intersecting
+      var best = null, bestTop = Infinity;
+      sections.forEach(function(s){
+        var r = s.getBoundingClientRect();
+        if(r.bottom > 80 && r.top < window.innerHeight*0.5){
+          if(r.top < bestTop){ bestTop = r.top; best = s.id; }
+        }
+      });
+      if(best) setActive(best);
+    }, { rootMargin: '-10% 0px -70% 0px', threshold: [0,0.25,0.5,1] });
+    sections.forEach(function(s){ obs.observe(s); });
+  }
+
+  // fallback / refinement on scroll
+  var ticking = false;
+  function onScroll(){
+    if(ticking) return;
+    ticking = true;
+    window.requestAnimationFrame(function(){
+      var best = sections[0] ? sections[0].id : null, bestTop = Infinity;
+      sections.forEach(function(s){
+        var r = s.getBoundingClientRect();
+        var top = Math.abs(r.top - 90);
+        if(r.top - 120 <= 0 && r.top - 120 > -Infinity){
+          if(top < bestTop || r.top <= 120){ /* keep last passed */ }
+        }
+      });
+      // simpler: last section whose top is above 140px
+      var current = sections[0] ? sections[0].id : null;
+      for(var i=0;i<sections.length;i++){
+        if(sections[i].getBoundingClientRect().top - 140 <= 0){
+          current = sections[i].id;
+        } else { break; }
+      }
+      if(current) setActive(current);
+      ticking = false;
+    });
+  }
+  window.addEventListener('scroll', onScroll, { passive:true });
+  onScroll();
+})();
+</script>
+</body>
+</html>
