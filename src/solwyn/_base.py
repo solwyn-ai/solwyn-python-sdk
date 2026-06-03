@@ -127,13 +127,23 @@ class _SolwynBase:
         failover_reason: FailoverReason | None = None,
         failover_error_class: str | None = None,
         attempt_index: int = 0,
+        call_id: str | None = None,
+        possibly_succeeded: bool | None = None,
         service_tier: str | None = None,
         sdk_instance_id: str | None = None,
         timestamp: datetime | None = None,
         agent_run: tuple[str | None, str | None] | None = None,
     ) -> MetadataEvent:
-        """Build a MetadataEvent for reporting to the cloud API."""
+        """Build a MetadataEvent for reporting to the cloud API.
+
+        ``call_id`` is the per-call reconciliation join key (§8.4); when None the
+        model's default_factory fills a fresh uuid. ``possibly_succeeded`` is the
+        post-send-ambiguous abort flag — left None on every non-abort event.
+        """
         agent_run_id, agent_run_name = current_run() if agent_run is None else agent_run
+        # When call_id is None let the MetadataEvent default_factory mint one so
+        # direct construction keeps working; the client threads an explicit value.
+        extra: dict[str, str] = {} if call_id is None else {"call_id": call_id}
         return MetadataEvent(
             model=model,
             provider=ProviderName(provider),
@@ -149,11 +159,13 @@ class _SolwynBase:
             failover_reason=failover_reason,
             failover_error_class=failover_error_class,
             attempt_index=attempt_index,
+            possibly_succeeded=possibly_succeeded,
             service_tier=service_tier,
             sdk_instance_id=sdk_instance_id or self._sdk_instance_id,
             timestamp=timestamp or datetime.now(UTC),
             agent_run_id=agent_run_id,
             agent_run_name=agent_run_name,
+            **extra,
         )
 
     def _build_error_event(
@@ -168,12 +180,16 @@ class _SolwynBase:
         requested_model: str | None = None,
         failover_error_class: str | None = None,
         attempt_index: int = 0,
+        call_id: str | None = None,
+        possibly_succeeded: bool | None = None,
         agent_run: tuple[str | None, str | None] | None = None,
     ) -> MetadataEvent:
         """Build an error-status MetadataEvent with zeroed token counts.
 
         Convenience wrapper for the dispatch-failure paths where
-        token_details is unavailable and status is always ERROR.
+        token_details is unavailable and status is always ERROR. ``call_id``
+        threads the reconciliation join key; ``possibly_succeeded`` is True only
+        on a correctly-not-failed-over post-send-ambiguous abort (§8.4).
         """
         return self._build_metadata_event(
             model=model,
@@ -189,5 +205,7 @@ class _SolwynBase:
             requested_model=requested_model,
             failover_error_class=failover_error_class,
             attempt_index=attempt_index,
+            call_id=call_id,
+            possibly_succeeded=possibly_succeeded,
             agent_run=agent_run,
         )

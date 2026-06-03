@@ -23,6 +23,7 @@ from __future__ import annotations
 import functools
 import logging
 import time
+import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any, cast
 
@@ -229,11 +230,21 @@ def _normalize_fallback(fallback: object) -> list[Any]:
 
 
 def _success_failover_reason(
-    *, is_provider_fallback: bool, is_model_fallback: bool
+    *, is_provider_fallback: bool, is_model_fallback: bool, primary_errored: bool
 ) -> FailoverReason | None:
-    """Pick the success-path failover reason for a served candidate (§4.6)."""
+    """Pick the success-path failover reason for a served candidate (§4.6, §8.2/§8.5).
+
+    Distinguishes WHY the router advanced past the primary on a cross-provider
+    success:
+      * ``PRIMARY_ERROR`` — the primary runtime was ATTEMPTED in this walk and
+        ERRORED (a transport failure -> reactive failover).
+      * ``CIRCUIT_OPEN`` — the primary was SKIPPED because its breaker was
+        already OPEN (proactive reroute; the primary was never attempted here).
+      * ``MODEL_FALLBACK`` — a same-provider model swap.
+    ``None`` for a primary success.
+    """
     if is_provider_fallback:
-        return FailoverReason.CIRCUIT_OPEN
+        return FailoverReason.PRIMARY_ERROR if primary_errored else FailoverReason.CIRCUIT_OPEN
     if is_model_fallback:
         return FailoverReason.MODEL_FALLBACK
     return None
@@ -477,6 +488,10 @@ class Solwyn(_SolwynBase):
         requested_model = cast(str, kwargs["model"])
         is_streaming = bool(kwargs.get("stream", False)) or _force_stream
         agent_run = current_run()
+        # One reconciliation join key per intercepted call (§8.4): threaded into
+        # every served-provider metadata event AND its confirm so the Cloud API
+        # can join them (and dedup cache-hit / abandoned-stream spend).
+        call_id = str(uuid.uuid4())
         primary = self._runtimes[0]
         # Deadline starts here — it encompasses the budget pre-flight (§6.3).
         deadline = Deadline(self._config.failover_total_timeout)
@@ -511,6 +526,7 @@ class Solwyn(_SolwynBase):
                     latency_ms=0.0,
                     status=CallStatus.BUDGET_DENIED,
                     is_model_fallback=False,
+                    call_id=call_id,
                     agent_run=agent_run,
                 )
                 self._reporter.report(event)
@@ -552,6 +568,10 @@ class Solwyn(_SolwynBase):
         # 5. Walk the candidates.
         failed_providers: set[str] = set()
         last_exc: Exception | None = None
+        # §8.2/§8.5 [A]: did the PRIMARY runtime get attempted-and-error in this
+        # walk? Drives the cross-provider success reason (PRIMARY_ERROR if the
+        # primary was attempted and raised; CIRCUIT_OPEN if it was skipped OPEN).
+        primary_errored = False
         for idx, rt in enumerate(candidates):
             if deadline.expired():
                 break
@@ -614,6 +634,11 @@ class Solwyn(_SolwynBase):
                     response = _materialize_stream(response)
             except Exception as exc:
                 disp = classify_exception(exc)
+                # §8.2/§8.5 [A]: the PRIMARY was attempted and raised in this walk
+                # -> a later cross-provider success is a REACTIVE failover
+                # (PRIMARY_ERROR), not a proactive breaker-open reroute.
+                if is_primary:
+                    primary_errored = True
                 # Breaker accounting (§6.1): FAILOVER and POST_SEND_AMBIGUOUS are
                 # provider-health signals and DO count; FAIL_FAST (4xx/refusal) is
                 # a request-shaped error, not a health signal, so it must NOT open
@@ -622,6 +647,12 @@ class Solwyn(_SolwynBase):
                 if disp is not Disposition.FAIL_FAST and provider not in failed_providers:
                     cb.record_failure()
                     failed_providers.add(provider)
+                # §8.3/§8.4: a correctly-not-failed-over post-send-ambiguous abort
+                # emits an ERROR event with possibly_succeeded=True so the Cloud API
+                # can reconcile the (possibly-landed, never-confirmed) reservation.
+                possibly_succeeded = (
+                    disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
+                )
                 self._reporter.report(
                     self._build_error_event(
                         model=served_model,
@@ -633,6 +664,8 @@ class Solwyn(_SolwynBase):
                         requested_model=requested_model if is_provider_fallback else None,
                         failover_error_class=type(exc).__name__,
                         attempt_index=idx,
+                        call_id=call_id,
+                        possibly_succeeded=True if possibly_succeeded else None,
                         agent_run=agent_run,
                     )
                 )
@@ -654,6 +687,8 @@ class Solwyn(_SolwynBase):
                     primary,
                     requested_model=requested_model,
                     is_model_fallback=is_model_fallback,
+                    primary_errored=primary_errored,
+                    call_id=call_id,
                     agent_run=agent_run,
                 )
 
@@ -665,6 +700,7 @@ class Solwyn(_SolwynBase):
                     token_details,
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
+                    call_id=call_id,
                 )
             self._reporter.report(
                 self._build_metadata_event(
@@ -682,8 +718,10 @@ class Solwyn(_SolwynBase):
                     failover_reason=_success_failover_reason(
                         is_provider_fallback=is_provider_fallback,
                         is_model_fallback=is_model_fallback,
+                        primary_errored=primary_errored,
                     ),
                     attempt_index=idx,
+                    call_id=call_id,
                     service_tier=rt.adapter.extract_service_tier(response),
                     agent_run=agent_run,
                 )
@@ -721,6 +759,8 @@ class Solwyn(_SolwynBase):
         *,
         requested_model: str,
         is_model_fallback: bool,
+        primary_errored: bool,
+        call_id: str,
         agent_run: tuple[str | None, str | None],
     ) -> SyncStreamWrapper:
         """Wrap a streaming response, settling against the SERVED runtime."""
@@ -738,6 +778,7 @@ class Solwyn(_SolwynBase):
                     token_details=token_details,
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
+                    call_id=call_id,
                 )
                 self._reporter.report_confirm(confirm)
             self._reporter.report(
@@ -756,8 +797,10 @@ class Solwyn(_SolwynBase):
                     failover_reason=_success_failover_reason(
                         is_provider_fallback=is_provider_fallback,
                         is_model_fallback=is_model_fallback,
+                        primary_errored=primary_errored,
                     ),
                     attempt_index=ctx.attempt_index,
+                    call_id=call_id,
                     service_tier=accumulator.get_service_tier(),
                     agent_run=agent_run,
                 )
@@ -775,6 +818,7 @@ class Solwyn(_SolwynBase):
                     requested_provider=primary.entry.provider if is_provider_fallback else None,
                     requested_model=requested_model if is_provider_fallback else None,
                     attempt_index=ctx.attempt_index,
+                    call_id=call_id,
                     agent_run=agent_run,
                 )
             )
@@ -962,6 +1006,9 @@ class AsyncSolwyn(_SolwynBase):
         requested_model = cast(str, kwargs["model"])
         is_streaming = bool(kwargs.get("stream", False)) or _force_stream
         agent_run = current_run()
+        # One reconciliation join key per intercepted call (§8.4): see the sync
+        # _intercepted_call for the join/dedup contract.
+        call_id = str(uuid.uuid4())
         primary = self._runtimes[0]
         deadline = Deadline(self._config.failover_total_timeout)
 
@@ -991,6 +1038,7 @@ class AsyncSolwyn(_SolwynBase):
                     latency_ms=0.0,
                     status=CallStatus.BUDGET_DENIED,
                     is_model_fallback=False,
+                    call_id=call_id,
                     agent_run=agent_run,
                 )
                 self._reporter.report(event)
@@ -1029,6 +1077,10 @@ class AsyncSolwyn(_SolwynBase):
 
         failed_providers: set[str] = set()
         last_exc: Exception | None = None
+        # §8.2/§8.5 [A]: did the PRIMARY runtime get attempted-and-error in this
+        # walk? Drives the cross-provider success reason (PRIMARY_ERROR if the
+        # primary was attempted and raised; CIRCUIT_OPEN if it was skipped OPEN).
+        primary_errored = False
         for idx, rt in enumerate(candidates):
             if deadline.expired():
                 break
@@ -1087,12 +1139,23 @@ class AsyncSolwyn(_SolwynBase):
                     response = await _materialize_stream_async(response)
             except Exception as exc:
                 disp = classify_exception(exc)
+                # §8.2/§8.5 [A]: the PRIMARY was attempted and raised in this walk
+                # -> a later cross-provider success is a REACTIVE failover
+                # (PRIMARY_ERROR), not a proactive breaker-open reroute.
+                if is_primary:
+                    primary_errored = True
                 # Breaker accounting (§6.1): count FAILOVER + POST_SEND_AMBIGUOUS
                 # (real health signals); skip FAIL_FAST (request-shaped, not a
                 # health signal). Same-provider double-count guard (§4.6).
                 if disp is not Disposition.FAIL_FAST and provider not in failed_providers:
                     cb.record_failure()
                     failed_providers.add(provider)
+                # §8.3/§8.4: a correctly-not-failed-over post-send-ambiguous abort
+                # emits an ERROR event with possibly_succeeded=True so the Cloud API
+                # can reconcile the (possibly-landed, never-confirmed) reservation.
+                possibly_succeeded = (
+                    disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
+                )
                 self._reporter.report(
                     self._build_error_event(
                         model=served_model,
@@ -1104,6 +1167,8 @@ class AsyncSolwyn(_SolwynBase):
                         requested_model=requested_model if is_provider_fallback else None,
                         failover_error_class=type(exc).__name__,
                         attempt_index=idx,
+                        call_id=call_id,
+                        possibly_succeeded=True if possibly_succeeded else None,
                         agent_run=agent_run,
                     )
                 )
@@ -1124,6 +1189,8 @@ class AsyncSolwyn(_SolwynBase):
                     primary,
                     requested_model=requested_model,
                     is_model_fallback=is_model_fallback,
+                    primary_errored=primary_errored,
+                    call_id=call_id,
                     agent_run=agent_run,
                 )
 
@@ -1135,6 +1202,7 @@ class AsyncSolwyn(_SolwynBase):
                     token_details,
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
+                    call_id=call_id,
                 )
             self._reporter.report(
                 self._build_metadata_event(
@@ -1152,8 +1220,10 @@ class AsyncSolwyn(_SolwynBase):
                     failover_reason=_success_failover_reason(
                         is_provider_fallback=is_provider_fallback,
                         is_model_fallback=is_model_fallback,
+                        primary_errored=primary_errored,
                     ),
                     attempt_index=idx,
+                    call_id=call_id,
                     service_tier=rt.adapter.extract_service_tier(response),
                     agent_run=agent_run,
                 )
@@ -1186,6 +1256,8 @@ class AsyncSolwyn(_SolwynBase):
         *,
         requested_model: str,
         is_model_fallback: bool,
+        primary_errored: bool,
+        call_id: str,
         agent_run: tuple[str | None, str | None],
     ) -> AsyncStreamWrapper:
         """Wrap an async streaming response, settling against the SERVED runtime."""
@@ -1203,6 +1275,7 @@ class AsyncSolwyn(_SolwynBase):
                     token_details,
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
+                    call_id=call_id,
                 )
             self._reporter.report(
                 self._build_metadata_event(
@@ -1220,8 +1293,10 @@ class AsyncSolwyn(_SolwynBase):
                     failover_reason=_success_failover_reason(
                         is_provider_fallback=is_provider_fallback,
                         is_model_fallback=is_model_fallback,
+                        primary_errored=primary_errored,
                     ),
                     attempt_index=ctx.attempt_index,
+                    call_id=call_id,
                     service_tier=accumulator.get_service_tier(),
                     agent_run=agent_run,
                 )
@@ -1239,6 +1314,7 @@ class AsyncSolwyn(_SolwynBase):
                     requested_provider=primary.entry.provider if is_provider_fallback else None,
                     requested_model=requested_model if is_provider_fallback else None,
                     attempt_index=ctx.attempt_index,
+                    call_id=call_id,
                     agent_run=agent_run,
                 )
             )

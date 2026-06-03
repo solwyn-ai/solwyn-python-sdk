@@ -7,6 +7,7 @@ NotificationEventType, Environment, BudgetPeriod.
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, cast
@@ -139,6 +140,21 @@ class MetadataEvent(BaseModel):
         description="type(exc).__name__ ONLY — never str(exc)",
     )
     attempt_index: int = Field(default=0, ge=0, description="0=primary, 1=first fallback")
+    call_id: str = Field(
+        default_factory=lambda: str(uuid.uuid4()),
+        description=(
+            "uuid per intercepted call; join key for cache-hit spend reconciliation "
+            "(§8.4). Always present on the wire — it is NOT content."
+        ),
+    )
+    possibly_succeeded: bool | None = Field(
+        default=None,
+        description=(
+            "post-send-ambiguous abort flag for reconciliation (§8.4); True only on a "
+            "correctly-not-failed-over post-send-ambiguous abort. None default keeps "
+            "every non-abort event clean on the wire."
+        ),
+    )
     service_tier: str | None = Field(
         default=None,
         max_length=SERVICE_TIER_MAX_LENGTH,
@@ -223,6 +239,10 @@ class BudgetConfirmRequest(BaseModel):
     )
     is_provider_fallback: bool = Field(
         default=False, description="served provider != requested provider"
+    )
+    call_id: str = Field(
+        default_factory=lambda: str(uuid.uuid4()),
+        description=("uuid per intercepted call; dedups confirm vs metadata reconciliation (§8.4)"),
     )
     token_details: TokenDetails = Field(
         ..., description="Actual token breakdown from the provider adapter"

@@ -1385,7 +1385,7 @@ requested_model:    str | None = Field(default=None, max_length=100)
 failover_reason:    FailoverReason | None = None
 failover_error_class: str | None = Field(default=None, max_length=64)   <span class="cm"># type(exc).__name__ ONLY — never str(exc)</span>
 attempt_index: int = Field(default=0, ge=0)             <span class="cm"># 0=primary, 1=first fallback, ...</span>
-possibly_succeeded: bool = Field(default=False)         <span class="cm"># post-send-ambiguous abort flag for reconciliation</span>
+possibly_succeeded: bool | None = Field(default=None)   <span class="cm"># post-send-ambiguous abort flag; None keeps non-abort events off the wire</span>
 
 <span class="kw">class</span> <span class="fn">FailoverReason</span>(StrEnum):
     CIRCUIT_OPEN   = <span class="st">"circuit_open"</span>

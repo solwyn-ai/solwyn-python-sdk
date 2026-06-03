@@ -205,6 +205,69 @@ class TestAlwaysMode:
 
         _close(solwyn)
 
+    def test_failed_over_psa_error_event_never_flags_possibly_succeeded(self) -> None:
+        # §8.3/§8.4 [C]: under failover_idempotency="always" a POST_SEND_AMBIGUOUS
+        # primary failure DOES fail over to the fallback. Because the call failed
+        # over, its primary ERROR event must carry possibly_succeeded None (absent
+        # from model_dump) — never True — so reconciliation cannot double-count a
+        # call that both failed over AND is flagged possibly-succeeded.
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = APITimeoutError("read timed out")
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            failover_idempotency="always",
+        )
+        events: list = []
+        solwyn._reporter.report = lambda e: events.append(e)
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        # The PSA failure DID fail over: the fallback served.
+        anthropic.messages.create.assert_called_once()
+        errors = [e for e in events if e.status.value == "error"]
+        success = [e for e in events if e.status.value == "success"]
+        assert len(errors) == 1  # primary PSA error event
+        assert len(success) == 1  # fallback served
+        # The failed-over primary error event NEVER flags possibly_succeeded.
+        assert errors[0].possibly_succeeded is None
+        assert "possibly_succeeded" not in errors[0].model_dump()
+
+        _close(solwyn)
+
+    def test_per_call_idempotent_failed_over_psa_error_event_clean(self) -> None:
+        # §8.3/§8.4 [C], per-call variant: solwyn_idempotent=True escalates the
+        # default "safe" policy to allow ambiguous failover. The PSA primary
+        # error still fails over and its error event stays clean (None, absent).
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = APITimeoutError("read timed out")
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+        )
+        events: list = []
+        solwyn._reporter.report = lambda e: events.append(e)
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(solwyn_idempotent=True, **_PLAIN_REQUEST)
+
+        anthropic.messages.create.assert_called_once()
+        errors = [e for e in events if e.status.value == "error"]
+        assert len(errors) == 1
+        assert errors[0].possibly_succeeded is None
+        assert "possibly_succeeded" not in errors[0].model_dump()
+
+        _close(solwyn)
+
 
 # ── never ────────────────────────────────────────────────────────────────
 

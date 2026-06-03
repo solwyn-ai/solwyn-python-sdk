@@ -184,7 +184,8 @@ class TestCrossProviderFailover:
     def test_cross_provider_success_event_attribution(self) -> None:
         # The success MetadataEvent must be attributed to the SERVED provider,
         # flagged as a provider fallback, and carry requested_provider/model +
-        # failover_reason for the dashboard (§4.6, §8.2/§8.5).
+        # failover_reason for the dashboard (§4.6, §8.2/§8.5). Here the primary
+        # is CLOSED, ATTEMPTED, and 429s — a REACTIVE failover -> PRIMARY_ERROR.
         openai = _openai_client()
         openai.chat.completions.create.side_effect = _Status(429)
         anthropic = _anthropic_client()
@@ -210,8 +211,41 @@ class TestCrossProviderFailover:
         assert ev.is_model_fallback is False
         assert ev.requested_provider.value == "openai"
         assert ev.requested_model == "gpt-4o"
-        assert ev.failover_reason is not None and ev.failover_reason.value == "circuit_open"
+        # Primary was attempted-and-errored -> reactive failover -> PRIMARY_ERROR.
+        assert ev.failover_reason is not None and ev.failover_reason.value == "primary_error"
         assert ev.attempt_index == 1
+
+        _close(solwyn)
+
+    def test_primary_errored_success_reason_is_primary_error(self) -> None:
+        # §8.2/§8.5 [A]: PRIMARY CLOSED, ATTEMPTED in this walk, raises 429 ->
+        # the cross-provider success event's failover_reason is PRIMARY_ERROR
+        # (reactive failover), NOT CIRCUIT_OPEN.
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = _Status(429)
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+        )
+        # Primary breaker starts CLOSED, so the primary IS attempted in the walk.
+        assert solwyn._get_circuit_breaker("openai").state == CircuitState.CLOSED
+        events: list = []
+        solwyn._reporter.report = lambda e: events.append(e)
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        # Primary WAS dispatched (and errored); fallback served.
+        openai.chat.completions.create.assert_called_once()
+        success = [e for e in events if e.status.value == "success"]
+        assert len(success) == 1
+        assert success[0].is_provider_fallback is True
+        assert success[0].failover_reason is not None
+        assert success[0].failover_reason.value == "primary_error"
 
         _close(solwyn)
 
@@ -226,6 +260,8 @@ class TestCrossProviderFailover:
             model="gpt-4o",
             fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
         )
+        events: list = []
+        solwyn._reporter.report = lambda e: events.append(e)
         # Force the primary breaker OPEN and not recovery-eligible.
         openai_cb = solwyn._get_circuit_breaker("openai")
         for _ in range(3):
@@ -240,6 +276,14 @@ class TestCrossProviderFailover:
         openai.chat.completions.create.assert_not_called()
         anthropic.messages.create.assert_called_once()
         assert result is not None
+
+        # §8.2/§8.5 [A]: the primary was SKIPPED (breaker pre-OPEN), never
+        # attempted in this walk -> proactive reroute -> CIRCUIT_OPEN.
+        success = [e for e in events if e.status.value == "success"]
+        assert len(success) == 1
+        assert success[0].is_provider_fallback is True
+        assert success[0].failover_reason is not None
+        assert success[0].failover_reason.value == "circuit_open"
 
         _close(solwyn)
 

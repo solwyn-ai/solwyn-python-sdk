@@ -280,19 +280,24 @@ class _BudgetEnforcerBase:
         *,
         provider: str,
         is_provider_fallback: bool = False,
+        call_id: str | None = None,
     ) -> BudgetConfirmRequest:
         """Build a validated confirm request for fire-and-forget callers.
 
         Stream completion builds this synchronously (no I/O) and enqueues
         it on the reporter thread, avoiding a blocking httpx.post. ``provider``
         is the provider that actually served the call (required; §8.1).
+        ``call_id`` is the per-call reconciliation join key (§8.4); when None the
+        model's default_factory mints one.
         """
+        extra: dict[str, str] = {} if call_id is None else {"call_id": call_id}
         return BudgetConfirmRequest(
             reservation_id=reservation_id,
             model=model,
             provider=ProviderName(provider),
             is_provider_fallback=is_provider_fallback,
             token_details=token_details,
+            **extra,
         )
 
 
@@ -376,7 +381,10 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             return self._build_result_from_response(cloud_response)
 
         except Exception as exc:
-            logger.warning("Cloud API budget check failed: %s", exc)
+            # Log the exception TYPE only — symmetric with confirm_cost and
+            # defense-in-depth: never interpolate the full exception (which could
+            # carry response/body text) into the log.
+            logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
 
             if self.fail_open:
                 return self._build_fail_open_result(estimated_input_tokens)
@@ -391,22 +399,26 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         *,
         provider: str,
         is_provider_fallback: bool = False,
+        call_id: str | None = None,
     ) -> None:
         """Confirm actual token usage for a budget reservation.
 
         ``provider`` is the provider that actually served the call (required).
+        ``call_id`` is the per-call reconciliation join key (§8.4); when None the
+        model's default_factory mints one.
 
         Best-effort: failures are logged but do not raise.
         Tracks consecutive failures; after _confirm_failure_threshold consecutive
         failures, logs at ERROR level so operators can see a persistent problem.
         """
         try:
-            request = BudgetConfirmRequest(
-                reservation_id=reservation_id,
-                model=model,
-                provider=ProviderName(provider),
+            request = self.build_confirm_request(
+                reservation_id,
+                model,
+                token_details,
+                provider=provider,
                 is_provider_fallback=is_provider_fallback,
-                token_details=token_details,
+                call_id=call_id,
             )
             self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",
@@ -502,7 +514,10 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             return self._build_result_from_response(cloud_response)
 
         except Exception as exc:
-            logger.warning("Cloud API budget check failed: %s", exc)
+            # Log the exception TYPE only — symmetric with confirm_cost and
+            # defense-in-depth: never interpolate the full exception (which could
+            # carry response/body text) into the log.
+            logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
 
             if self.fail_open:
                 return self._build_fail_open_result(estimated_input_tokens)
@@ -517,15 +532,17 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         *,
         provider: str,
         is_provider_fallback: bool = False,
+        call_id: str | None = None,
     ) -> None:
         """Async version of cost confirmation. See BudgetEnforcer.confirm_cost."""
         try:
-            request = BudgetConfirmRequest(
-                reservation_id=reservation_id,
-                model=model,
-                provider=ProviderName(provider),
+            request = self.build_confirm_request(
+                reservation_id,
+                model,
+                token_details,
+                provider=provider,
                 is_provider_fallback=is_provider_fallback,
-                token_details=token_details,
+                call_id=call_id,
             )
             await self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",

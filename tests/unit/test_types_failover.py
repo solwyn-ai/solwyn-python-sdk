@@ -11,8 +11,10 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
+from solwyn._token_details import TokenDetails
 from solwyn._types import (
     BudgetCheckRequest,
+    BudgetConfirmRequest,
     CallStatus,
     FailoverReason,
     MetadataEvent,
@@ -151,6 +153,52 @@ class TestMetadataEventFailoverFields:
 
 
 @pytest.mark.unit
+class TestMetadataEventReconciliationFields:
+    """§8.2/§8.4 spend-reconciliation fields: call_id (join key) + possibly_succeeded."""
+
+    def test_call_id_auto_populates_on_direct_construction(self) -> None:
+        # The default_factory keeps direct construction working — call_id is
+        # always present (it is the join key), even when not threaded explicitly.
+        ev = _metadata_event()
+
+        assert isinstance(ev.call_id, str)
+        assert ev.call_id  # non-empty
+
+    def test_call_id_unique_per_event(self) -> None:
+        a = _metadata_event()
+        b = _metadata_event()
+
+        assert a.call_id != b.call_id
+
+    def test_explicit_call_id_threaded_through(self) -> None:
+        ev = _metadata_event(call_id="call-fixed-123")
+
+        assert ev.call_id == "call-fixed-123"
+
+    def test_call_id_always_on_the_wire(self) -> None:
+        # call_id is the join key for cache-hit reconciliation — never None-skipped.
+        ev = _metadata_event(call_id="call-fixed-123")
+        dumped = ev.model_dump()
+
+        assert dumped["call_id"] == "call-fixed-123"
+
+    def test_possibly_succeeded_defaults_none_and_is_skipped(self) -> None:
+        # None default so the None-skipping serializer keeps non-abort events clean.
+        ev = _metadata_event()
+        dumped = ev.model_dump()
+
+        assert ev.possibly_succeeded is None
+        assert "possibly_succeeded" not in dumped
+
+    def test_possibly_succeeded_true_serializes(self) -> None:
+        ev = _metadata_event(possibly_succeeded=True)
+        dumped = ev.model_dump()
+
+        assert ev.possibly_succeeded is True
+        assert dumped["possibly_succeeded"] is True
+
+
+@pytest.mark.unit
 class TestBudgetCheckRequestChainHints:
     """fallback_providers / fallback_models must align element-for-element."""
 
@@ -195,3 +243,38 @@ class TestBudgetCheckRequestChainHints:
                 fallback_providers=[ProviderName.ANTHROPIC] * 9,
                 fallback_models=["claude-x"] * 9,
             )
+
+
+def _confirm_request(**overrides: object) -> BudgetConfirmRequest:
+    base: dict[str, object] = {
+        "reservation_id": "res_123",
+        "model": "gpt-4o",
+        "provider": ProviderName.OPENAI,
+        "token_details": TokenDetails(input_tokens=10, output_tokens=5),
+    }
+    base.update(overrides)
+    return BudgetConfirmRequest(**base)  # type: ignore[arg-type]
+
+
+@pytest.mark.unit
+class TestBudgetConfirmRequestCallId:
+    """§8.1/§8.4: call_id dedups confirm vs metadata reconciliation."""
+
+    def test_call_id_auto_populates(self) -> None:
+        # default_factory keeps direct construction working.
+        req = _confirm_request()
+
+        assert isinstance(req.call_id, str)
+        assert req.call_id  # non-empty
+
+    def test_call_id_unique_per_request(self) -> None:
+        a = _confirm_request()
+        b = _confirm_request()
+
+        assert a.call_id != b.call_id
+
+    def test_explicit_call_id_threaded_through(self) -> None:
+        req = _confirm_request(call_id="call-fixed-123")
+
+        assert req.call_id == "call-fixed-123"
+        assert req.model_dump()["call_id"] == "call-fixed-123"
