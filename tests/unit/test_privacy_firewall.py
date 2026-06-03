@@ -288,6 +288,74 @@ def test_no_exc_info_logging_in_failover_provider_except_blocks() -> None:
     )
 
 
+@pytest.mark.unit
+def test_no_exc_info_logging_in_stream_settlement() -> None:
+    """stream.py's settlement-suppression logs must not use exc_info=True (fix [D]).
+
+    During _settle_error the live exception context includes the provider's
+    mid-stream exception (whose str() may embed streamed response content);
+    exc_info=True would render that into the log record. The suppression logs
+    must be STRUCTURAL only — never capture a traceback."""
+    src = (SDK_SRC / "stream.py").read_text()
+    assert "exc_info=True" not in src, (
+        "stream.py settlement-suppression logs must not use exc_info=True — it "
+        "captures the provider mid-stream exception (content may live in its str())."
+    )
+
+
+@pytest.mark.unit
+def test_stream_settlement_logs_only_callback_exception_class_name() -> None:
+    """Every logger.warning argument in stream.py may only be type(...).__name__.
+
+    The suppression log identifies the CALLBACK failure structurally — its class
+    name — never str(exc), the provider exception, or chunk content (spec §7).
+    Parses each ``logger.warning(...)`` via AST and asserts that beyond the
+    literal-string template, the ONLY argument expression is ``type(x).__name__``;
+    no f-strings, no str(exc), no bareword content names."""
+    import ast
+
+    src = (SDK_SRC / "stream.py").read_text()
+    tree = ast.parse(src)
+
+    def _is_type_name(node: ast.expr) -> bool:
+        # Matches `type(<anything>).__name__`.
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "__name__"
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "type"
+        )
+
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "warning"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "logger"
+        ):
+            continue
+        # arg[0] is the literal template; every later positional arg must be
+        # type(...).__name__. No keyword args (exc_info etc.) are permitted.
+        if node.args and not isinstance(node.args[0], ast.Constant):
+            violations.append(f"stream.py:{node.lineno}: non-literal log template")
+        for extra in node.args[1:]:
+            if not _is_type_name(extra):
+                violations.append(
+                    f"stream.py:{node.lineno}: logger.warning arg is not type(...).__name__"
+                )
+        for kw in node.keywords:
+            violations.append(
+                f"stream.py:{node.lineno}: forbidden kwarg {kw.arg!r} on logger.warning"
+            )
+    assert not violations, (
+        "stream.py logger.warning may only pass type(...).__name__ (no exc_info, "
+        "no str(exc), no content):\n" + "\n".join(violations)
+    )
+
+
 # --------------------------------------------------------------------------- #
 # THE authoritative backstop — behavioral, end-to-end (spec §7)               #
 # --------------------------------------------------------------------------- #
@@ -408,6 +476,117 @@ def test_failover_solwyn_payloads_carry_no_content() -> None:
     assert SENTINEL not in blob, (
         "PRIVACY BREACH: prompt/response content reached the Solwyn Cloud API on "
         "the translating cross-provider failover path."
+    )
+
+    solwyn._budget._http.close()
+    solwyn._reporter._http.close()
+
+
+@pytest.mark.unit
+def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
+    """STREAMING backstop (fix [F]): on the translating cross-provider failover
+    STREAM path, no prompt OR streamed-chunk content reaches the Solwyn Cloud API.
+
+    The request carries a SENTINEL AND every streamed Anthropic chunk carries the
+    SENTINEL in its text. Draining the wrapper to completion fires on_complete ->
+    a fire-and-forget confirm (report_confirm) + a success metadata event. We
+    capture every json= body POSTed across budget check, confirm, and metadata
+    ingest and assert the SENTINEL appears in NONE of them."""
+    from solwyn.client import Solwyn
+
+    SENTINEL = "SUPER_SECRET_PROMPT_a1b2c3"
+
+    def _provider_client(module: str, name: str) -> object:
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.__class__.__module__ = module
+        client.__class__.__name__ = name
+        client.with_options.return_value = client
+        return client
+
+    def _anthropic_text_chunk(text: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(type="text_delta", text=text),
+        )
+
+    def _anthropic_message_start(input_tokens: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            type="message_start",
+            message=SimpleNamespace(
+                usage=SimpleNamespace(input_tokens=input_tokens, cache_read_input_tokens=0)
+            ),
+        )
+
+    def _anthropic_message_delta(output_tokens: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason="end_turn"),
+            usage=SimpleNamespace(output_tokens=output_tokens),
+        )
+
+    openai = _provider_client("openai._client", "OpenAI")
+    anthropic = _provider_client("anthropic._client", "Anthropic")
+    # Every streamed chunk's CONTENT carries the SENTINEL — proving streamed
+    # response text never reaches the Cloud API either.
+    anthropic.messages.create.return_value = iter(
+        [
+            _anthropic_message_start(input_tokens=11),
+            _anthropic_text_chunk(f"echo {SENTINEL}"),
+            _anthropic_text_chunk(f" again {SENTINEL}"),
+            _anthropic_message_delta(output_tokens=7),
+        ]
+    )
+
+    with patch("solwyn.reporter.MetadataReporter._flush_loop"):
+        solwyn = Solwyn(
+            openai,
+            api_key=VALID_API_KEY,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+        )
+    # The background thread ran the no-op _flush_loop and exited; _shutdown stays
+    # UNSET so on_complete's report_confirm can still enqueue the confirm.
+    solwyn._reporter._thread.join(timeout=2.0)
+
+    captured: list[object] = []
+    solwyn._budget._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
+    solwyn._reporter._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
+
+    # Force the primary circuit OPEN so the cross-provider Anthropic stream hop
+    # fires (per-chunk translation runs on SENTINEL-bearing chunk content).
+    openai_cb = solwyn._get_circuit_breaker("openai")
+    for _ in range(openai_cb.failure_threshold):
+        openai_cb.record_failure()
+
+    request = {
+        "model": "gpt-4o",
+        "messages": [
+            {"role": "system", "content": f"system {SENTINEL}"},
+            {"role": "user", "content": f"user prompt {SENTINEL}"},
+        ],
+        "stream": True,
+    }
+
+    # ── Act: DRAIN the wrapper to completion so on_complete (confirm + metadata)
+    #         fires; then flush the reporter queue through the fake. ───────────
+    stream = solwyn.chat.completions.create(**request)
+    chunks = list(stream)
+    solwyn._reporter._flush_remaining()
+
+    # Sanity: the cross-provider stream hop actually served, and the caller saw
+    # OpenAI-dialect chunks carrying the (SENTINEL-bearing) Anthropic text.
+    anthropic.messages.create.assert_called_once()
+    texts = [c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content]
+    assert SENTINEL in "".join(texts)
+
+    # ── Assert: budget check + confirm + ingest captured, NONE carry content. ─
+    assert len(captured) >= 3, f"expected budget/confirm/ingest payloads, got {len(captured)}"
+    blob = json.dumps(captured)
+    assert SENTINEL not in blob, (
+        "PRIVACY BREACH: prompt/streamed-response content reached the Solwyn Cloud "
+        "API on the translating cross-provider failover STREAM path."
     )
 
     solwyn._budget._http.close()

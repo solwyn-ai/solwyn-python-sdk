@@ -34,6 +34,14 @@ class SyncStreamWrapper:
     Thread safety: _settle() and _settle_error() are protected by a
     threading.Lock so that concurrent calls (e.g. close() racing with
     iterator exhaustion) fire on_complete/on_error exactly once.
+
+    Cross-provider stream normalization (§6.6): an optional ``chunk_translator``
+    maps ONE raw served chunk into a LIST of caller-dialect chunks. The
+    accumulator ALWAYS observes the RAW served chunk (served-provider usage); the
+    wrapper yields the translated chunks. ``None`` (default) is passthrough — the
+    raw chunk is yielded unchanged (same-dialect / primary / same-provider swap).
+    This wrapper never logs/stores/stringifies chunk content; it only ROUTES the
+    raw chunk to ``chunk_translator`` (a content-privileged ``_translation`` seam).
     """
 
     def __init__(
@@ -42,11 +50,13 @@ class SyncStreamWrapper:
         accumulator: StreamUsageAccumulator,
         on_complete: Callable[[TokenDetails, float], None],
         on_error: Callable[[Exception], None],
+        chunk_translator: Callable[[Any], list[Any]] | None = None,
     ) -> None:
         self._stream = stream
         self._accumulator = accumulator
         self._on_complete = on_complete
         self._on_error = on_error
+        self._chunk_translator = chunk_translator
         self._start_time = time.monotonic()
         self._settled = False
         self._lock = threading.Lock()
@@ -61,9 +71,13 @@ class SyncStreamWrapper:
         token_details = self._accumulator.finalize()
         try:
             self._on_complete(token_details, elapsed_ms)
-        except Exception:
+        except Exception as cb_exc:
+            # Log only the CALLBACK failure's class name — no traceback/exc_info
+            # (which would capture the live exception context, possibly a provider
+            # mid-stream exception whose str() embeds streamed content; fix [D]).
             logger.warning(
-                "on_complete raised during stream settlement; suppressing", exc_info=True
+                "on_complete raised during stream settlement; suppressing (%s)",
+                type(cb_exc).__name__,
             )
 
     def _settle_error(self, exc: Exception) -> None:
@@ -74,14 +88,25 @@ class SyncStreamWrapper:
             self._settled = True
         try:
             self._on_error(exc)
-        except Exception:
-            logger.warning("on_error raised during stream settlement; suppressing", exc_info=True)
+        except Exception as cb_exc:
+            # Structural-only log of the CALLBACK failure; never exc_info (which,
+            # during error settlement, holds the provider exception ``exc``; fix [D]).
+            logger.warning(
+                "on_error raised during stream settlement; suppressing (%s)",
+                type(cb_exc).__name__,
+            )
 
     def __iter__(self) -> Iterator[Any]:
         try:
             for chunk in self._stream:
+                # The accumulator ALWAYS observes the RAW served chunk so usage
+                # settles against the served provider. Translation (if any) only
+                # reshapes what the caller SEES — never what we account.
                 self._accumulator.observe(chunk)
-                yield chunk
+                if self._chunk_translator is None:
+                    yield chunk
+                else:
+                    yield from self._chunk_translator(chunk)
         except Exception as exc:
             self._settle_error(exc)
             raise
@@ -113,8 +138,12 @@ class SyncStreamWrapper:
             # must not mask the application exception propagating through
             # __exit__ (if any).
             self.close()
-        except Exception:
-            logger.warning("on_complete raised during __exit__; suppressing", exc_info=True)
+        except Exception as cb_exc:
+            # Structural-only: log the suppressed callback class, never exc_info
+            # (fix [D]).
+            logger.warning(
+                "on_complete raised during __exit__; suppressing (%s)", type(cb_exc).__name__
+            )
         if hasattr(self._stream, "__exit__"):
             return cast("bool | None", self._stream.__exit__(*args))
         return False
@@ -133,6 +162,10 @@ class AsyncStreamWrapper:
 
     No lock needed: async wrappers run in a single-threaded event loop,
     so concurrent settlement is not possible.
+
+    Cross-provider stream normalization (§6.6): see ``SyncStreamWrapper`` — the
+    optional ``chunk_translator`` reshapes raw served chunks into caller-dialect
+    chunks while the accumulator still observes the RAW served chunk.
     """
 
     def __init__(
@@ -141,11 +174,13 @@ class AsyncStreamWrapper:
         accumulator: StreamUsageAccumulator,
         on_complete: Callable[[TokenDetails, float], Awaitable[None]],
         on_error: Callable[[Exception], Awaitable[None]],
+        chunk_translator: Callable[[Any], list[Any]] | None = None,
     ) -> None:
         self._stream = stream
         self._accumulator = accumulator
         self._on_complete = on_complete
         self._on_error = on_error
+        self._chunk_translator = chunk_translator
         self._start_time = time.monotonic()
         self._settled = False
 
@@ -158,10 +193,11 @@ class AsyncStreamWrapper:
         token_details = self._accumulator.finalize()
         try:
             await self._on_complete(token_details, elapsed_ms)
-        except Exception:
+        except Exception as cb_exc:
+            # Structural-only log of the CALLBACK failure; never exc_info (fix [D]).
             logger.warning(
-                "on_complete raised during async stream settlement; suppressing",
-                exc_info=True,
+                "on_complete raised during async stream settlement; suppressing (%s)",
+                type(cb_exc).__name__,
             )
 
     async def _settle_error(self, exc: Exception) -> None:
@@ -171,17 +207,26 @@ class AsyncStreamWrapper:
         self._settled = True
         try:
             await self._on_error(exc)
-        except Exception:
+        except Exception as cb_exc:
+            # Structural-only log; never exc_info (which holds provider ``exc``
+            # during error settlement; fix [D]).
             logger.warning(
-                "on_error raised during async stream settlement; suppressing",
-                exc_info=True,
+                "on_error raised during async stream settlement; suppressing (%s)",
+                type(cb_exc).__name__,
             )
 
     async def __aiter__(self) -> AsyncIterator[Any]:
         try:
             async for chunk in self._stream:
+                # The accumulator ALWAYS observes the RAW served chunk so usage
+                # settles against the served provider. Translation (if any) only
+                # reshapes what the caller SEES — never what we account.
                 self._accumulator.observe(chunk)
-                yield chunk
+                if self._chunk_translator is None:
+                    yield chunk
+                else:
+                    for translated in self._chunk_translator(chunk):
+                        yield translated
         except Exception as exc:
             await self._settle_error(exc)
             raise
@@ -214,8 +259,12 @@ class AsyncStreamWrapper:
             # must not mask the application exception propagating through
             # __aexit__ (if any).
             await self.close()
-        except Exception:
-            logger.warning("on_complete raised during __aexit__; suppressing", exc_info=True)
+        except Exception as cb_exc:
+            # Structural-only: log the suppressed callback class, never exc_info
+            # (fix [D]).
+            logger.warning(
+                "on_complete raised during __aexit__; suppressing (%s)", type(cb_exc).__name__
+            )
         if hasattr(self._stream, "__aexit__"):
             return cast("bool | None", await self._stream.__aexit__(*args))
         return False

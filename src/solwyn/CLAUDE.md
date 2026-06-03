@@ -25,7 +25,7 @@
 ## Client Proxy Patterns
 
 - Proxy properties (`chat`, `messages`, `models`) use `@functools.cached_property`
-- `_force_stream=True` is Google-only — guarded by runtime assert
+- `_force_stream=True` is set by the Google proxy's `generate_content_stream`; `_intercepted_call` folds it into the dispatch-level `is_streaming` boolean, which (not the original flag) drives the served hop's stream-method selection — so cross-provider failover INTO Google streams via `generate_content_stream` and OUT OF Google streams via `stream=True`
 - Stream `on_complete` fire-and-forgets `confirm_cost` via `reporter.report_confirm()` — never blocks user thread
 
 ## Thread Safety

@@ -23,6 +23,7 @@ from __future__ import annotations
 import functools
 import logging
 import time
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any, cast
 
 from pydantic import ValidationError
@@ -86,6 +87,133 @@ class Deadline:
     def expired(self) -> bool:
         """True once the chain deadline has elapsed."""
         return self.remaining() <= 0.0
+
+
+class _MaterializedStream:
+    """A first-chunk-materialized SYNC stream that owns the ORIGINAL generator.
+
+    ``__iter__`` replays the buffered first chunk, then drains the ORIGINAL
+    provider stream — so the wrapper observes + yields every chunk exactly once
+    (no double-emit). Critically, ``close()`` forwards to the ORIGINAL provider
+    stream's ``close()`` (fix [C]): the wrapper's getattr/close forwarding reaches
+    THIS object, which in turn releases the real provider connection. Without this
+    seam the wrapper would close an ``itertools.chain`` (a no-op) and leak the
+    connection when a caller abandons the stream.
+
+    ``_original`` is the SOURCE stream object (whose ``close()`` releases the
+    connection); ``_iter`` is the iterator drained for chunks. Forwarding close()
+    to the SOURCE — not the iterator — is what reaches a provider stream whose
+    ``__iter__`` returns a distinct generator object.
+    """
+
+    def __init__(
+        self, first: Any, original: Any, iterator: Iterator[Any], *, empty: bool = False
+    ) -> None:
+        self._first = first
+        self._original = original
+        self._iter = iterator
+        self._empty = empty
+
+    def __iter__(self) -> Iterator[Any]:
+        if self._empty:
+            return
+        yield self._first
+        yield from self._iter
+
+    def close(self) -> None:
+        close = getattr(self._original, "close", None)
+        if close is not None:
+            close()
+
+
+def _materialize_stream(stream: Any) -> _MaterializedStream:
+    """Force the first chunk of a streaming response (§6.6 first-byte rule).
+
+    GOOGLE ONLY (fix [B]): pulls ``next()`` on the raw lazy generator BEFORE the
+    wrapper is returned. For a Google ``generate_content_stream`` LAZY generator
+    this ``next()`` is what actually establishes the connection — so an
+    establishment error PROPAGATES out of here, landing in the candidate-walk
+    except where ``classify_exception`` can route it to failover, exactly like
+    OpenAI/Anthropic's eager ``raise_for_status``.
+
+    No double-emit: the buffered first chunk is replayed by ``_MaterializedStream``
+    so the wrapper observes + yields it exactly once. An empty stream
+    (``StopIteration`` on the first pull) yields nothing. The returned object
+    forwards ``close()`` to the ORIGINAL generator (fix [C]).
+    """
+    it = iter(stream)
+    try:
+        first = next(it)
+    except StopIteration:
+        return _MaterializedStream(None, stream, it, empty=True)
+    return _MaterializedStream(first, stream, it)
+
+
+class _MaterializedAsyncStream:
+    """Async mirror of ``_MaterializedStream`` (fix [B]/[C]).
+
+    ``__aiter__`` replays the buffered first chunk then drains the ORIGINAL async
+    iterator; ``aclose()`` forwards to the ORIGINAL SOURCE stream's ``aclose()``
+    (or ``close()``) so abandoning the stream releases the provider connection.
+    """
+
+    def __init__(
+        self, first: Any, original: Any, iterator: AsyncIterator[Any], *, empty: bool = False
+    ) -> None:
+        self._first = first
+        self._original = original
+        self._iter = iterator
+        self._empty = empty
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        if self._empty:
+            return
+        yield self._first
+        async for chunk in self._iter:
+            yield chunk
+
+    async def aclose(self) -> None:
+        aclose = getattr(self._original, "aclose", None)
+        if aclose is not None:
+            await aclose()
+            return
+        close = getattr(self._original, "close", None)
+        if close is not None:
+            close()
+
+
+async def _materialize_stream_async(stream: Any) -> _MaterializedAsyncStream:
+    """Async first-chunk materialization (§6.6). Mirror of ``_materialize_stream``.
+
+    ``await anext()`` forces a Google async lazy generator to establish, so an
+    establishment error PROPAGATES out of THIS coroutine — landing in the
+    candidate-walk except (failover-eligible). Because this is an ``async def``
+    (not an async generator), awaiting it runs the eager ``anext`` immediately and
+    returns the wrapper; the establishment error therefore surfaces at the
+    ``await`` site inside the dispatch try. No double-emit: the first chunk is
+    replayed ahead of the remaining iterator and yielded exactly once. The
+    returned object forwards ``aclose()`` to the ORIGINAL SOURCE stream (fix [C]).
+    """
+    it = stream.__aiter__()
+    try:
+        first = await it.__anext__()
+    except StopAsyncIteration:
+        return _MaterializedAsyncStream(None, stream, it, empty=True)
+    return _MaterializedAsyncStream(first, stream, it)
+
+
+def _make_chunk_translator(*, served: str, requested: str) -> Callable[[Any], list[Any]]:
+    """Closure that reshapes ONE raw served chunk into caller-dialect chunks.
+
+    Routes the raw chunk straight to ``_translation.translate_stream_chunk`` (the
+    content-privileged seam). This function — and the wrapper that calls it — never
+    logs, stores, or stringifies chunk content; the chunk passes through opaquely.
+    """
+
+    def translate(chunk: Any) -> list[Any]:
+        return _translation.translate_stream_chunk(served=served, requested=requested, chunk=chunk)
+
+    return translate
 
 
 def _normalize_fallback(fallback: object) -> list[Any]:
@@ -164,19 +292,21 @@ def _build_hop_kwargs(
             return merged_kwargs
         return {**merged_kwargs, "model": rt.entry.model}
 
-    # CROSS-PROVIDER hop. Streaming failover requires stream normalization, which
-    # is P3 — not P2. Without it a cross-provider streaming hop would serve a
-    # foreign-dialect stream the caller cannot consume on its native access path,
-    # so FAIL LOUD here, BEFORE dispatch, aborting the chain cleanly (no foreign
-    # stream returned). P3 lifts this restriction (adds stream normalization).
-    if is_streaming:
-        _translation.fail_cross_provider_streaming(
+    # CROSS-PROVIDER hop. Translate via the canonical subset (may RAISE an
+    # Untranslatable* error BEFORE any network call; the caller aborts the chain).
+    canonical = _translation.to_canonical(primary.adapter.name, merged_kwargs)
+
+    # CROSS-PROVIDER STREAMING (P3, §4.1 Decision A). A PLAIN-TEXT cross-provider
+    # streamed response is normalized per-chunk by the wrapper, so it proceeds. A
+    # TOOL-using streamed response cannot be normalized cross-provider (tool-call
+    # deltas are out of the v1 streaming subset, §6.6) — so FAIL LOUD here, BEFORE
+    # dispatch, aborting the chain cleanly (no foreign stream returned). Checking
+    # the canonical keeps this structural and content-free.
+    if is_streaming and canonical.tools is not None:
+        _translation.fail_cross_provider_tool_stream(
             source=primary.adapter.name, target=rt.adapter.name
         )
 
-    # Translate via the canonical subset (may RAISE an Untranslatable* error
-    # BEFORE any network call; the caller aborts the chain).
-    canonical = _translation.to_canonical(primary.adapter.name, merged_kwargs)
     call_kwargs = _translation.from_canonical(rt.adapter.name, canonical, model=rt.entry.model)
     # Re-apply target entry defaults as fill-absent (e.g. Anthropic max_tokens).
     return {**rt.entry.default_params, **call_kwargs}
@@ -306,7 +436,7 @@ class Solwyn(_SolwynBase):
         runtime: ProviderRuntime,
         kwargs: dict[str, object],
         *,
-        _force_stream: bool,
+        is_streaming: bool,
         timeout: float,
         max_retries: int,
     ) -> Any:
@@ -314,18 +444,31 @@ class Solwyn(_SolwynBase):
 
         Applies the mandatory per-hop bound via ``with_options`` (kills the
         600s SDK read default and any internal retry stacking; §6.3).
+
+        The served hop's stream-method selection is driven by the dispatch-level
+        ``is_streaming`` boolean — NOT the original ``_force_stream``/canonical
+        flag (fix [A]). A caller who streamed via OpenAI/Anthropic ``stream=True``
+        and fails over to Google must still hit ``generate_content_stream``; a
+        Google streamer that fails over to OpenAI/Anthropic must serve with
+        ``stream=True``. OpenAI/Anthropic stream via ``stream=True`` in kwargs;
+        Google streams via its dedicated method (and the ``stream`` kwarg, which
+        its SDK does not accept, is stripped).
         """
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(timeout=timeout, max_retries=max_retries)
         name = runtime.adapter.name
         if name == ProviderName.OPENAI.value:
+            if is_streaming:
+                kwargs["stream"] = True
             return client.chat.completions.create(**kwargs)
         if name == ProviderName.ANTHROPIC.value:
+            if is_streaming:
+                kwargs["stream"] = True
             return client.messages.create(**kwargs)
-        if _force_stream:
-            if name != ProviderName.GOOGLE.value:
-                raise RuntimeError(f"_force_stream is Google-only but provider is {name}")
+        # Google: its generate_content[_stream] methods take no ``stream`` kwarg.
+        kwargs.pop("stream", None)
+        if is_streaming:
             return client.models.generate_content_stream(**kwargs)
         return client.models.generate_content(**kwargs)
 
@@ -448,13 +591,27 @@ class Solwyn(_SolwynBase):
                 response = self._sync_dispatch(
                     rt,
                     call_kwargs,
-                    _force_stream=_force_stream,
+                    is_streaming=is_streaming,
                     # Shrinking per-hop slice (§6.3): divide what's left of the
                     # chain deadline across the candidates not yet attempted so a
                     # single hung hop cannot consume the whole budget.
                     timeout=max(_MIN_HOP_TIMEOUT, deadline.remaining() / (len(candidates) - idx)),
                     max_retries=0,
                 )
+                if is_streaming and provider == ProviderName.GOOGLE.value:
+                    # First-chunk materialization (§6.6, §6.8) — GOOGLE ONLY (fix
+                    # [B]). A Google lazy generator does no network I/O until the
+                    # first pull, so we force it INSIDE this try; an establishment
+                    # error then falls into the candidate-walk except ->
+                    # classify_exception -> failover, exactly like OpenAI/Anthropic's
+                    # eager raise_for_status. OpenAI/Anthropic .create(stream=True)
+                    # ALREADY established eagerly at dispatch (its establishment
+                    # errors raised above and are failover-eligible), so pre-pulling
+                    # their first chunk is unnecessary AND would misclassify a
+                    # post-connect first-chunk read error as pre-send (double-spend
+                    # risk) — so we DON'T materialize them. No double-emit: the
+                    # buffered first chunk is replayed via the wrapper.
+                    response = _materialize_stream(response)
             except Exception as exc:
                 disp = classify_exception(exc)
                 # Breaker accounting (§6.1): FAILOVER and POST_SEND_AMBIGUOUS are
@@ -622,7 +779,19 @@ class Solwyn(_SolwynBase):
                 )
             )
 
-        return SyncStreamWrapper(response, accumulator, on_complete, on_error)
+        # Cross-provider hop: reshape each served chunk back to the caller's
+        # native streaming dialect (§6.6). Same-dialect (primary / same-provider
+        # model swap) passes None -> zero translation. The accumulator still
+        # observes the RAW served chunk inside the wrapper, so usage settles
+        # against the served provider.
+        chunk_translator = (
+            _make_chunk_translator(served=provider, requested=primary.adapter.name)
+            if is_provider_fallback
+            else None
+        )
+        return SyncStreamWrapper(
+            response, accumulator, on_complete, on_error, chunk_translator=chunk_translator
+        )
 
     def close(self) -> None:
         """Shut down the reporter and close HTTP clients."""
@@ -760,25 +929,31 @@ class AsyncSolwyn(_SolwynBase):
         runtime: ProviderRuntime,
         kwargs: dict[str, object],
         *,
-        _force_stream: bool,
+        is_streaming: bool,
         timeout: float,
         max_retries: int,
     ) -> Any:
         """Dispatch one hop to the runtime's async SDK client. Pure I/O.
 
-        Applies the mandatory per-hop bound via ``with_options`` (§6.3).
+        Applies the mandatory per-hop bound via ``with_options`` (§6.3). Mirrors
+        ``_sync_dispatch``: the served hop's stream-method selection is driven by
+        the dispatch-level ``is_streaming`` boolean (fix [A]).
         """
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(timeout=timeout, max_retries=max_retries)
         name = runtime.adapter.name
         if name == ProviderName.OPENAI.value:
+            if is_streaming:
+                kwargs["stream"] = True
             return await client.chat.completions.create(**kwargs)
         if name == ProviderName.ANTHROPIC.value:
+            if is_streaming:
+                kwargs["stream"] = True
             return await client.messages.create(**kwargs)
-        if _force_stream:
-            if name != ProviderName.GOOGLE.value:
-                raise RuntimeError(f"_force_stream is Google-only but provider is {name}")
+        # Google: its generate_content[_stream] methods take no ``stream`` kwarg.
+        kwargs.pop("stream", None)
+        if is_streaming:
             return await client.models.generate_content_stream(**kwargs)
         return await client.models.generate_content(**kwargs)
 
@@ -893,13 +1068,23 @@ class AsyncSolwyn(_SolwynBase):
                 response = await self._async_dispatch(
                     rt,
                     call_kwargs,
-                    _force_stream=_force_stream,
+                    is_streaming=is_streaming,
                     # Shrinking per-hop slice (§6.3): divide what's left of the
                     # chain deadline across the candidates not yet attempted so a
                     # single hung hop cannot consume the whole budget.
                     timeout=max(_MIN_HOP_TIMEOUT, deadline.remaining() / (len(candidates) - idx)),
                     max_retries=0,
                 )
+                if is_streaming and provider == ProviderName.GOOGLE.value:
+                    # First-chunk materialization (§6.6, §6.8) — GOOGLE ONLY (fix
+                    # [B]). Awaiting this runs the eager anext, so a Google
+                    # lazy-generator establishment error falls into THIS except ->
+                    # classify_exception -> failover. OpenAI/Anthropic established
+                    # eagerly at dispatch, so we DON'T materialize them (a
+                    # post-connect first-chunk error must NOT be misread as pre-send
+                    # -> double-spend risk). No double-emit: the buffered first
+                    # chunk is replayed via the wrapper.
+                    response = await _materialize_stream_async(response)
             except Exception as exc:
                 disp = classify_exception(exc)
                 # Breaker accounting (§6.1): count FAILOVER + POST_SEND_AMBIGUOUS
@@ -1058,7 +1243,17 @@ class AsyncSolwyn(_SolwynBase):
                 )
             )
 
-        return AsyncStreamWrapper(response, accumulator, on_complete, on_error)
+        # Cross-provider hop: reshape each served chunk back to the caller's
+        # native streaming dialect (§6.6). Same-dialect passes None (zero
+        # translation). See the sync ``_wrap_stream`` for the accounting note.
+        chunk_translator = (
+            _make_chunk_translator(served=provider, requested=primary.adapter.name)
+            if is_provider_fallback
+            else None
+        )
+        return AsyncStreamWrapper(
+            response, accumulator, on_complete, on_error, chunk_translator=chunk_translator
+        )
 
     async def close(self) -> None:
         """Shut down the reporter and close HTTP clients."""

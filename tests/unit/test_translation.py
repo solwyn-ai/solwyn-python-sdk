@@ -16,6 +16,7 @@ from solwyn.providers._translation import (
     from_canonical,
     normalize_response,
     to_canonical,
+    translate_stream_chunk,
 )
 
 # A value we plant inside prompt content / argument values and then assert never
@@ -1178,6 +1179,9 @@ class TestMalformedRequestGuard:
             )
         except UntranslatableRequestError as exc:
             assert exc.__cause__ is None
+            # Fix [E]: __context__ is also severed (not merely display-suppressed),
+            # so the offending value is retained nowhere on the raised object.
+            assert exc.__context__ is None
             assert "999888" not in repr(exc.__cause__)
             _assert_no_value_leak(exc, "999888")
         else:  # pragma: no cover
@@ -1528,3 +1532,280 @@ class TestProviderValidation:
         canonical = to_canonical("openai", openai_req())
         with pytest.raises(ValueError, match="provider"):
             from_canonical("cohere", canonical, model="x")
+
+
+# --------------------------------------------------------------------------- #
+# §6.6 Per-chunk stream translation (P3).                                      #
+# --------------------------------------------------------------------------- #
+# A SERVED-provider stream yields raw chunk objects in that provider's native
+# streaming dialect; translate_stream_chunk maps ONE such chunk into ZERO OR
+# MORE chunks in the REQUESTED provider's native streaming dialect. Streamed
+# text is CONTENT — these tests assert the mapping is correct AND that a
+# tool/multimodal chunk RAISES with no content leak.
+from types import SimpleNamespace  # noqa: E402
+
+
+# ----- served-chunk factories (duck-typed, mirroring real SDK stream events) - #
+def _anthropic_message_start() -> SimpleNamespace:
+    return SimpleNamespace(
+        type="message_start",
+        message=SimpleNamespace(role="assistant"),
+    )
+
+
+def _anthropic_content_block_start(*, text: bool = True) -> SimpleNamespace:
+    block_type = "text" if text else "tool_use"
+    return SimpleNamespace(
+        type="content_block_start",
+        index=0,
+        content_block=SimpleNamespace(type=block_type),
+    )
+
+
+def _anthropic_text_delta(text: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        type="content_block_delta",
+        index=0,
+        delta=SimpleNamespace(type="text_delta", text=text),
+    )
+
+
+def _anthropic_tool_delta(partial_json: str) -> SimpleNamespace:
+    # A tool-call stream emits input_json_delta inside content_block_delta.
+    return SimpleNamespace(
+        type="content_block_delta",
+        index=0,
+        delta=SimpleNamespace(type="input_json_delta", partial_json=partial_json),
+    )
+
+
+def _anthropic_content_block_stop() -> SimpleNamespace:
+    return SimpleNamespace(type="content_block_stop", index=0)
+
+
+def _anthropic_message_delta(stop_reason: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        type="message_delta",
+        delta=SimpleNamespace(stop_reason=stop_reason),
+    )
+
+
+def _anthropic_message_stop() -> SimpleNamespace:
+    return SimpleNamespace(type="message_stop")
+
+
+def _openai_text_chunk(text: str | None) -> SimpleNamespace:
+    delta = SimpleNamespace(role=None, content=text)
+    choice = SimpleNamespace(index=0, delta=delta, finish_reason=None)
+    return SimpleNamespace(choices=[choice], model="gpt-4o")
+
+
+def _openai_finish_chunk(finish_reason: str) -> SimpleNamespace:
+    delta = SimpleNamespace(role=None, content=None)
+    choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], model="gpt-4o")
+
+
+def _openai_tool_chunk() -> SimpleNamespace:
+    tool_call = SimpleNamespace(
+        index=0,
+        id="call_1",
+        type="function",
+        function=SimpleNamespace(name="get_weather", arguments='{"city":"' + SECRET + '"}'),
+    )
+    delta = SimpleNamespace(role=None, content=None, tool_calls=[tool_call])
+    choice = SimpleNamespace(index=0, delta=delta, finish_reason=None)
+    return SimpleNamespace(choices=[choice], model="gpt-4o")
+
+
+def _google_text_chunk(*texts: str) -> SimpleNamespace:
+    parts = [SimpleNamespace(text=t) for t in texts]
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=parts, role="model"),
+        finish_reason=None,
+    )
+    return SimpleNamespace(candidates=[candidate], model="gemini-1.5-pro")
+
+
+def _google_finish_chunk(finish_reason: str) -> SimpleNamespace:
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[], role="model"),
+        finish_reason=finish_reason,
+    )
+    return SimpleNamespace(candidates=[candidate], model="gemini-1.5-pro")
+
+
+def _google_tool_chunk() -> SimpleNamespace:
+    fc = SimpleNamespace(name="get_weather", args={"city": SECRET})
+    part = SimpleNamespace(text=None, function_call=fc)
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[part], role="model"),
+        finish_reason=None,
+    )
+    return SimpleNamespace(candidates=[candidate], model="gemini-1.5-pro")
+
+
+@pytest.mark.unit
+class TestStreamChunkTextTranslation:
+    def test_anthropic_to_openai_text_deltas_accumulate(self) -> None:
+        served_events = [
+            _anthropic_message_start(),
+            _anthropic_content_block_start(),
+            _anthropic_text_delta("Hello"),
+            _anthropic_text_delta(", "),
+            _anthropic_text_delta("world"),
+            _anthropic_content_block_stop(),
+            _anthropic_message_delta("end_turn"),
+            _anthropic_message_stop(),
+        ]
+        accumulated = ""
+        finish = None
+        for event in served_events:
+            for out in translate_stream_chunk(served="anthropic", requested="openai", chunk=event):
+                delta_text = out.choices[0].delta.content
+                if delta_text is not None:
+                    accumulated += delta_text
+                if out.choices[0].finish_reason is not None:
+                    finish = out.choices[0].finish_reason
+        assert accumulated == "Hello, world"
+        # anthropic end_turn -> canonical stop -> openai-native "stop"
+        assert finish == "stop"
+
+    def test_anthropic_structural_events_map_to_empty(self) -> None:
+        for event in (
+            _anthropic_message_start(),
+            _anthropic_content_block_start(),
+            _anthropic_content_block_stop(),
+            _anthropic_message_stop(),
+        ):
+            assert translate_stream_chunk(served="anthropic", requested="openai", chunk=event) == []
+
+    def test_openai_to_anthropic_text_deltas_and_stop(self) -> None:
+        text_events: list[object] = []
+        for chunk in (_openai_text_chunk("Hello"), _openai_text_chunk(" world")):
+            text_events.extend(
+                translate_stream_chunk(served="openai", requested="anthropic", chunk=chunk)
+            )
+        # Each text delta is a content_block_delta-shaped event with a text_delta.
+        assert [e.type for e in text_events] == ["content_block_delta", "content_block_delta"]
+        assert [e.delta.type for e in text_events] == ["text_delta", "text_delta"]
+        assert "".join(e.delta.text for e in text_events) == "Hello world"
+
+        # The finish chunk maps to a message_delta carrying the mapped stop_reason.
+        finish_events = translate_stream_chunk(
+            served="openai", requested="anthropic", chunk=_openai_finish_chunk("stop")
+        )
+        assert len(finish_events) == 1
+        assert finish_events[0].type == "message_delta"
+        assert finish_events[0].delta.stop_reason == "end_turn"
+
+    def test_openai_empty_delta_maps_to_empty(self) -> None:
+        # A chunk with neither text nor finish (e.g. a role-only opener) yields [].
+        assert (
+            translate_stream_chunk(
+                served="openai", requested="anthropic", chunk=_openai_text_chunk(None)
+            )
+            == []
+        )
+
+    def test_google_to_openai_text(self) -> None:
+        out = translate_stream_chunk(
+            served="google", requested="openai", chunk=_google_text_chunk("Hi there")
+        )
+        assert len(out) == 1
+        assert out[0].choices[0].delta.content == "Hi there"
+
+    def test_google_multi_part_text_maps_to_multiple_chunks(self) -> None:
+        out = translate_stream_chunk(
+            served="google", requested="openai", chunk=_google_text_chunk("a", "b")
+        )
+        assert [o.choices[0].delta.content for o in out] == ["a", "b"]
+
+    def test_google_finish_to_openai(self) -> None:
+        out = translate_stream_chunk(
+            served="google", requested="openai", chunk=_google_finish_chunk("STOP")
+        )
+        assert len(out) == 1
+        assert out[0].choices[0].finish_reason == "stop"
+
+    def test_anthropic_to_google_text(self) -> None:
+        out = translate_stream_chunk(
+            served="anthropic", requested="google", chunk=_anthropic_text_delta("hola")
+        )
+        assert len(out) == 1
+        assert out[0].candidates[0].content.parts[0].text == "hola"
+
+    def test_anthropic_to_google_finish(self) -> None:
+        out = translate_stream_chunk(
+            served="anthropic", requested="google", chunk=_anthropic_message_delta("max_tokens")
+        )
+        assert len(out) == 1
+        # anthropic max_tokens -> canonical length -> google-native MAX_TOKENS
+        assert out[0].candidates[0].finish_reason == "MAX_TOKENS"
+
+
+@pytest.mark.unit
+class TestStreamChunkFailLoud:
+    def test_anthropic_tool_stream_raises_no_leak(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            translate_stream_chunk(
+                served="anthropic",
+                requested="openai",
+                chunk=_anthropic_tool_delta('{"city":"' + SECRET + '"}'),
+            )
+        assert ei.value.feature == "cross_provider_tool_stream"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_openai_tool_stream_raises_no_leak(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            translate_stream_chunk(
+                served="openai", requested="anthropic", chunk=_openai_tool_chunk()
+            )
+        assert ei.value.feature == "cross_provider_tool_stream"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_google_tool_stream_raises_no_leak(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            translate_stream_chunk(served="google", requested="openai", chunk=_google_tool_chunk())
+        assert ei.value.feature == "cross_provider_tool_stream"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_google_multimodal_stream_raises_no_leak(self) -> None:
+        inline = SimpleNamespace(mime_type="image/png", data=SECRET)
+        part = SimpleNamespace(text=None, function_call=None, inline_data=inline)
+        candidate = SimpleNamespace(
+            content=SimpleNamespace(parts=[part], role="model"),
+            finish_reason=None,
+        )
+        chunk = SimpleNamespace(candidates=[candidate], model="gemini-1.5-pro")
+        with pytest.raises(UntranslatableRequestError) as ei:
+            translate_stream_chunk(served="google", requested="openai", chunk=chunk)
+        assert ei.value.feature == "cross_provider_multimodal_stream"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_stream_chunk_validates_providers(self) -> None:
+        with pytest.raises(ValueError, match="provider"):
+            translate_stream_chunk(
+                served="cohere", requested="openai", chunk=_openai_text_chunk("x")
+            )
+
+    def test_malformed_stream_chunk_severs_cause_and_context(self) -> None:
+        # Fix [E]: a malformed served chunk (content is a non-string carrying a
+        # SECRET) makes _StreamDelta construction raise a pydantic ValidationError
+        # whose text embeds the SECRET. The _Guard converts it to a STRUCTURAL
+        # UntranslatableRequestError; both __cause__ AND __context__ must be None
+        # (the offending value is not retained ANYWHERE on the raised object), and
+        # the SECRET must be absent from str/repr/args.
+        bad_delta = SimpleNamespace(role=None, content=[f"leak::{SECRET}"], tool_calls=None)
+        choice = SimpleNamespace(index=0, delta=bad_delta, finish_reason=None)
+        chunk = SimpleNamespace(choices=[choice], model="gpt-4o")
+
+        try:
+            translate_stream_chunk(served="openai", requested="anthropic", chunk=chunk)
+        except UntranslatableRequestError as exc:
+            assert exc.__cause__ is None
+            assert exc.__context__ is None
+            assert "malformed" in exc.feature
+            _assert_no_value_leak(exc, SECRET)
+        else:  # pragma: no cover
+            pytest.fail("expected UntranslatableRequestError")

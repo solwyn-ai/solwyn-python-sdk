@@ -165,8 +165,16 @@ class TestGoogleModelsProxy:
     def test_generate_content_stream_dispatches_correctly(self) -> None:
         """generate_content_stream() calls the correct underlying method via _force_stream."""
         client = _mock_google_client()
-        mock_response = SimpleNamespace(
-            text="Hello",
+        # A real generate_content_stream yields chunk objects (not a single
+        # complete response). First-chunk materialization (§6.6) iterates it, so
+        # the mock must be an ITERABLE of chunks.
+        chunk = SimpleNamespace(
+            candidates=[
+                SimpleNamespace(
+                    content=SimpleNamespace(parts=[SimpleNamespace(text="Hello")]),
+                    finish_reason="STOP",
+                )
+            ],
             usage_metadata=SimpleNamespace(
                 prompt_token_count=100,
                 candidates_token_count=50,
@@ -175,7 +183,7 @@ class TestGoogleModelsProxy:
                 tool_use_prompt_token_count=0,
             ),
         )
-        client.models.generate_content_stream.return_value = mock_response
+        client.models.generate_content_stream.return_value = iter([chunk])
 
         solwyn = _make_solwyn(client)
         reported: list = []

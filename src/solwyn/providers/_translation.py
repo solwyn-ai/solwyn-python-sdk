@@ -49,14 +49,22 @@ __all__ = [
     "CanonicalResponse",
     "CanonicalTool",
     "ToolChoice",
-    "fail_cross_provider_streaming",
+    "fail_cross_provider_tool_stream",
     "from_canonical",
     "normalize_response",
     "normalize_finish_reason",
     "to_canonical",
+    "translate_stream_chunk",
 ]
 
 _PROVIDERS = ("openai", "anthropic", "google")
+
+# Cross-provider streaming structural labels (§6.6). A tool-call or non-text media
+# delta is out of the v1 streaming subset and RAISES with one of these; chunk
+# content NEVER reaches the error. Defined here so the pre-dispatch fail-loud
+# helper and the per-chunk translator share one label.
+_CROSS_PROVIDER_TOOL_STREAM = "cross_provider_tool_stream"
+_CROSS_PROVIDER_MULTIMODAL_STREAM = "cross_provider_multimodal_stream"
 
 
 # --------------------------------------------------------------------------- #
@@ -150,8 +158,13 @@ class CanonicalResponse(_Canonical):
 def _raise(source: str, target: str, feature: str) -> NoReturn:
     """Raise a STRUCTURAL UntranslatableRequestError, suppressing any context.
 
-    ``from None`` drops ``__context__``/``__cause__`` so no provider-exception
-    text or prompt content can leak through the chained-exception machinery.
+    ``from None`` sets ``__suppress_context__``/drops ``__cause__`` so no
+    provider-exception text or prompt content leaks through the chained-exception
+    display. When this is raised from inside a ``_Guard`` that is handling a
+    content-bearing exception, ``raise ... from None`` would still re-bind
+    ``__context__`` to that exception object (retaining the offending value on the
+    raised error even though it is hidden from display); the guard NULLS
+    ``__context__`` after the fact for defense-in-depth (fix [E]).
     """
     raise UntranslatableRequestError(source=source, target=target, feature=feature) from None
 
@@ -161,16 +174,16 @@ def _validate_provider(provider: str) -> None:
         raise ValueError(f"Unknown provider {provider!r}. Known: {list(_PROVIDERS)}")
 
 
-def fail_cross_provider_streaming(*, source: str, target: str) -> NoReturn:
-    """Abort a cross-provider STREAMING hop (P2; fix [D]).
+def fail_cross_provider_tool_stream(*, source: str, target: str) -> NoReturn:
+    """Abort a cross-provider TOOL-using STREAMING hop (P3; §6.6, §4.1 Decision A).
 
-    P2 has request translation but not stream normalization (that is P3), so a
-    cross-provider streaming hop would serve a foreign-dialect stream the caller
-    cannot consume on its native access path. RAISE a structural
-    ``cross_provider_streaming`` error BEFORE dispatch so the chain aborts
-    cleanly. Carries STRUCTURAL labels only. P3 lifts this restriction.
+    P3 ships per-chunk text-stream normalization, so a PLAIN-TEXT cross-provider
+    streaming hop now proceeds. A TOOL-using streamed response, however, cannot be
+    normalized cross-provider — tool-call deltas are out of the v1 streaming
+    subset. RAISE a structural ``cross_provider_tool_stream`` error BEFORE dispatch
+    so the chain aborts cleanly (no foreign stream served). STRUCTURAL labels only.
     """
-    _raise(source, target, "cross_provider_streaming")
+    _raise(source, target, _CROSS_PROVIDER_TOOL_STREAM)
 
 
 # --------------------------------------------------------------------------- #
@@ -215,7 +228,16 @@ class _Guard:
         # Anything else (ValidationError/ValueError/KeyError/TypeError) may carry
         # the offending value in its text — convert to a structural label and
         # DROP the chain so nothing leaks.
-        _raise(self._source, self._target, self._feature)
+        try:
+            _raise(self._source, self._target, self._feature)
+        except UntranslatableRequestError as structural:
+            # ``raise ... from None`` inside _raise re-binds __context__ to the
+            # content-bearing ``exc`` we are handling here (whose text may embed
+            # the offending chunk/value). SEVER it so the offending value is
+            # retained NOWHERE on the raised object — not merely hidden from the
+            # traceback display (fix [E]). __cause__ is already None.
+            structural.__context__ = None
+            raise
 
 
 def _guard(source: str, target: str, feature: str = _MALFORMED_REQUEST) -> _Guard:
@@ -1447,6 +1469,177 @@ def _canonical_response_to_google(canonical: CanonicalResponse) -> object:
         finish_reason=_denormalize_finish_reason("google", canonical.finish_reason),
     )
     return SimpleNamespace(candidates=[candidate], model=canonical.model)
+
+
+# --------------------------------------------------------------------------- #
+# §6.6 Per-chunk stream translation — map ONE served-stream event into ZERO     #
+# OR MORE chunks in the requested provider's native streaming dialect.          #
+# --------------------------------------------------------------------------- #
+# A streamed _StreamDelta is the tiny canonical event the per-provider parsers
+# emit and the per-provider renderers consume. Exactly one of (text, finish) is
+# set per delta; a served structural event yields NO _StreamDelta at all (an
+# empty list out of translate_stream_chunk). This mirrors normalize_response's
+# served->canonical->requested pipeline at the chunk granularity. Tool-call and
+# non-text media on a cross-provider hop are OUT of the v1 streaming subset and
+# RAISE structurally (no chunk content ever reaches the error). The
+# _CROSS_PROVIDER_*_STREAM labels are defined near the top of the module so the
+# pre-dispatch fail-loud helper can share them.
+
+
+class _StreamDelta(_Canonical):
+    # A text increment OR a terminal finish-reason; never both. ``text`` carries
+    # streamed CONTENT and lives only inside this in-memory frame.
+    text: str | None = None
+    finish_reason: Literal["stop", "length", "tool_use", "content_filter"] | None = None
+
+
+def translate_stream_chunk(*, served: str, requested: str, chunk: object) -> list[object]:
+    """Map ONE raw *served*-stream chunk into ZERO OR MORE *requested* chunks.
+
+    Returns a list because one foreign streaming event can map to zero caller
+    chunks (a structural event: message_start / content_block_start / stop) or
+    one caller chunk (a text delta or a terminal finish). TEXT streaming only:
+    a tool-call or non-text media part on a cross-provider hop is out of the v1
+    subset and RAISES ``UntranslatableRequestError`` with a STRUCTURAL label —
+    chunk content is NEVER read into the error.
+    """
+    _validate_provider(served)
+    _validate_provider(requested)
+    # Guard chunk-content access: a malformed served chunk must convert to a
+    # structural error, never leak via a raw exception (fix [B], parity with
+    # normalize_response).
+    with _guard(served, requested):
+        deltas = _stream_chunk_to_deltas(served, requested, chunk)
+        return [_stream_delta_to_requested(requested, delta) for delta in deltas]
+
+
+def _stream_chunk_to_deltas(served: str, requested: str, chunk: object) -> list[_StreamDelta]:
+    if served == "openai":
+        return _openai_stream_chunk_to_deltas(served, requested, chunk)
+    if served == "anthropic":
+        return _anthropic_stream_chunk_to_deltas(served, requested, chunk)
+    return _google_stream_chunk_to_deltas(served, requested, chunk)
+
+
+# ------------------------------ served: OpenAI ------------------------------ #
+def _openai_stream_chunk_to_deltas(
+    served: str, requested: str, chunk: object
+) -> list[_StreamDelta]:
+    choices = getattr(chunk, "choices", None) or []
+    if not choices:
+        return []
+    choice = choices[0]
+    delta = getattr(choice, "delta", None)
+    # A tool-call delta is out of the v1 streaming subset -> RAISE (no content).
+    if getattr(delta, "tool_calls", None):
+        _raise(served, requested, _CROSS_PROVIDER_TOOL_STREAM)
+    out: list[_StreamDelta] = []
+    text = getattr(delta, "content", None)
+    if text:
+        out.append(_StreamDelta(text=text))
+    finish_raw = getattr(choice, "finish_reason", None)
+    if finish_raw is not None:
+        out.append(_StreamDelta(finish_reason=normalize_finish_reason(served, finish_raw)))
+    return out
+
+
+# ---------------------------- served: Anthropic ----------------------------- #
+def _anthropic_stream_chunk_to_deltas(
+    served: str, requested: str, chunk: object
+) -> list[_StreamDelta]:
+    etype = getattr(chunk, "type", None)
+    if etype == "content_block_delta":
+        delta = getattr(chunk, "delta", None)
+        dtype = getattr(delta, "type", None)
+        if dtype == "text_delta":
+            return [_StreamDelta(text=getattr(delta, "text", "") or "")]
+        # input_json_delta (tool-call args) / any non-text block delta is out of
+        # the v1 streaming subset -> RAISE structurally (never read the value).
+        _raise(served, requested, _CROSS_PROVIDER_TOOL_STREAM)
+    if etype == "message_delta":
+        stop_raw = getattr(getattr(chunk, "delta", None), "stop_reason", None)
+        if stop_raw is None:
+            return []
+        return [_StreamDelta(finish_reason=normalize_finish_reason(served, stop_raw))]
+    # content_block_start may open a tool_use block — that whole block is out of
+    # the v1 subset, so fail loud at the START rather than mid-stream.
+    if etype == "content_block_start":
+        block = getattr(chunk, "content_block", None)
+        if getattr(block, "type", None) not in (None, "text"):
+            _raise(served, requested, _CROSS_PROVIDER_TOOL_STREAM)
+        return []
+    # message_start / content_block_stop / message_stop -> no caller chunk.
+    return []
+
+
+# ------------------------------ served: Google ------------------------------ #
+def _google_stream_chunk_to_deltas(
+    served: str, requested: str, chunk: object
+) -> list[_StreamDelta]:
+    candidates = getattr(chunk, "candidates", None) or []
+    if not candidates:
+        return []
+    candidate = candidates[0]
+    parts = getattr(getattr(candidate, "content", None), "parts", None) or []
+    out: list[_StreamDelta] = []
+    for part in parts:
+        # A function_call part (tool-call stream) is out of the v1 subset.
+        if getattr(part, "function_call", None) is not None:
+            _raise(served, requested, _CROSS_PROVIDER_TOOL_STREAM)
+        # inline_data / file_data (image/non-text media) is out of the v1 subset.
+        if (
+            getattr(part, "inline_data", None) is not None
+            or getattr(part, "file_data", None) is not None
+        ):
+            _raise(served, requested, _CROSS_PROVIDER_MULTIMODAL_STREAM)
+        text = getattr(part, "text", None)
+        if text:
+            out.append(_StreamDelta(text=text))
+    finish_raw = getattr(candidate, "finish_reason", None)
+    if finish_raw is not None:
+        out.append(_StreamDelta(finish_reason=normalize_finish_reason(served, finish_raw)))
+    return out
+
+
+# --------------- canonical _StreamDelta -> requested native chunk ----------- #
+def _stream_delta_to_requested(requested: str, delta: _StreamDelta) -> object:
+    if requested == "openai":
+        return _stream_delta_to_openai(delta)
+    if requested == "anthropic":
+        return _stream_delta_to_anthropic(delta)
+    return _stream_delta_to_google(delta)
+
+
+def _stream_delta_to_openai(delta: _StreamDelta) -> object:
+    finish = _denormalize_finish_reason("openai", delta.finish_reason)
+    inner = SimpleNamespace(
+        index=0,
+        delta=SimpleNamespace(role=None, content=delta.text),
+        finish_reason=finish,
+    )
+    return SimpleNamespace(choices=[inner], model=None)
+
+
+def _stream_delta_to_anthropic(delta: _StreamDelta) -> object:
+    if delta.finish_reason is not None:
+        stop = _denormalize_finish_reason("anthropic", delta.finish_reason)
+        return SimpleNamespace(
+            type="message_delta",
+            delta=SimpleNamespace(stop_reason=stop),
+        )
+    return SimpleNamespace(
+        type="content_block_delta",
+        delta=SimpleNamespace(type="text_delta", text=delta.text),
+    )
+
+
+def _stream_delta_to_google(delta: _StreamDelta) -> object:
+    finish = _denormalize_finish_reason("google", delta.finish_reason)
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[SimpleNamespace(text=delta.text)]),
+        finish_reason=finish,
+    )
+    return SimpleNamespace(candidates=[candidate])
 
 
 # --------------------------------------------------------------------------- #

@@ -430,18 +430,26 @@ class TestResponseNormalization:
 # ── 4. native happy path / same-provider swap pay ZERO translation cost ──
 
 
-# ── 5. cross-provider STREAMING fails loud in P2 ─────────────────────────
+# ── 5. cross-provider STREAMING (P3: text streams; tools fail loud) ──────
 
 
 @pytest.mark.unit
 class TestCrossProviderStreamingFailsLoud:
-    def test_cross_provider_streaming_raises_and_aborts(self) -> None:
-        # P2: a cross-provider hop that is ALSO streaming has no stream
-        # normalization yet (P3), so it must fail loud BEFORE dispatch.
+    def test_cross_provider_text_streaming_now_fails_over(self) -> None:
+        # P3 LIFTS the P2 text fail-loud: a PLAIN-TEXT cross-provider streaming
+        # hop now fails over and the served (Anthropic) stream is normalized to
+        # the caller's OpenAI dialect, served chunk-by-chunk.
         openai = _openai_client()
         openai.chat.completions.create.side_effect = _Status(429)
         anthropic = _anthropic_client()
-        anthropic.messages.create.return_value = _anthropic_text_response()
+        anthropic.messages.create.return_value = iter(
+            [
+                SimpleNamespace(
+                    type="content_block_delta",
+                    delta=SimpleNamespace(type="text_delta", text="hi from claude"),
+                )
+            ]
+        )
 
         solwyn = _make_solwyn(
             openai,
@@ -455,13 +463,58 @@ class TestCrossProviderStreamingFailsLoud:
             "stream": True,
         }
 
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            stream = solwyn.chat.completions.create(**request)
+            chunks = list(stream)
+
+        # The Anthropic fallback served and its text delta surfaces as an
+        # OpenAI-dialect chunk (choices[0].delta.content).
+        anthropic.messages.create.assert_called_once()
+        texts = [
+            c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content
+        ]
+        assert "".join(texts) == "hi from claude"
+
+        _close(solwyn)
+
+    def test_cross_provider_tool_streaming_still_fails_loud(self) -> None:
+        # P3 keeps the fail-loud for the TOOL case: tool-call deltas are out of
+        # the v1 streaming subset, so a tool-using cross-provider streaming hop
+        # raises cross_provider_tool_stream BEFORE dispatch.
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = _Status(429)
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_text_response()
+
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+        )
+
+        request = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "weather?"}],
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get the weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        }
+
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(UntranslatableRequestError) as exc_info,
         ):
             solwyn.chat.completions.create(**request)
 
-        assert exc_info.value.feature == "cross_provider_streaming"
+        assert exc_info.value.feature == "cross_provider_tool_stream"
         assert exc_info.value.source == "openai"
         # The foreign-dialect stream was never served.
         anthropic.messages.create.assert_not_called()
