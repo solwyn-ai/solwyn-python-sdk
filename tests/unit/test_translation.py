@@ -8,12 +8,15 @@ with a STRUCTURAL feature label and NO offending value anywhere in the error.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from solwyn.exceptions import UntranslatableRequestError
 from solwyn.providers._translation import (
     CanonicalRequest,
     from_canonical,
+    normalize_finish_reason,
     normalize_response,
     to_canonical,
     translate_stream_chunk,
@@ -433,8 +436,6 @@ class TestToolResultRoundTrip:
         assert block["content"] == "sunny"
 
     def test_anthropic_to_openai_args_become_string(self) -> None:
-        import json
-
         canonical = to_canonical(
             "anthropic", anthropic_req(messages=_anthropic_resolved_tool_history())
         )
@@ -453,8 +454,6 @@ class TestToolResultRoundTrip:
         assert result["content"] == "sunny"
 
     def test_openai_anthropic_openai_full_roundtrip(self) -> None:
-        import json
-
         original = _openai_resolved_tool_history()
         canonical = to_canonical("openai", openai_req(messages=original))
         anthro = from_canonical("anthropic", canonical, model="m")
@@ -483,8 +482,6 @@ class TestToolResultRoundTrip:
         assert fr_part["function_response"]["name"] == "get_weather"
 
     def test_google_to_openai_roundtrip(self) -> None:
-        import json
-
         google_history = [
             {"role": "user", "parts": [{"text": "weather?"}]},
             {
@@ -689,8 +686,6 @@ class TestFinishReason:
         ],
     )
     def test_finish_reason_normalizes(self, served: str, raw: str, expected: str) -> None:
-        from solwyn.providers._translation import normalize_finish_reason
-
         assert normalize_finish_reason(served, raw) == expected
 
 
@@ -1026,8 +1021,6 @@ class TestNormalizeResponse:
         assert resp.choices[0].message.role == "assistant"
 
     def test_anthropic_served_openai_requested_tool(self) -> None:
-        import json
-
         resp = normalize_response(
             served="anthropic", requested="openai", response=_anthropic_tool_response()
         )

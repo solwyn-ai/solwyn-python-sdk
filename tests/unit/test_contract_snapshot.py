@@ -28,6 +28,7 @@ the live dispatch path (sync + async, streaming + non-streaming):
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -740,8 +741,6 @@ class TestFailoverErrorClassFirewall:
         # The field equals the class name ONLY — never str(exc).
         assert ev.failover_error_class == "_LeakyError"
         # And the SENTINEL is absent from EVERY byte of the wire payload.
-        import json
-
         blob = json.dumps(ev.model_dump(mode="json"))
         assert sentinel not in blob
 
@@ -768,8 +767,6 @@ class TestFailoverErrorClassFirewall:
         assert len(errors) == 1
         ev = errors[0]
         assert ev.failover_error_class == "_LeakyError"
-        import json
-
         blob = json.dumps(ev.model_dump(mode="json"))
         assert sentinel not in blob
 

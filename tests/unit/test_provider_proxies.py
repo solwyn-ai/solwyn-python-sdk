@@ -15,6 +15,7 @@ import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 
 from solwyn.client import AsyncSolwyn, Solwyn
+from solwyn.exceptions import BudgetExceededError
 
 
 def _mock_anthropic_client():
@@ -102,8 +103,6 @@ class TestAnthropicMessagesProxy:
         solwyn.close()
 
     def test_messages_create_checks_budget(self) -> None:
-        from solwyn.exceptions import BudgetExceededError
-
         client = _mock_anthropic_client()
         solwyn = _make_solwyn(client, budget_mode="hard_deny")
 

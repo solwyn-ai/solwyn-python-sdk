@@ -14,14 +14,18 @@ These tests enforce the design-spec §7 content-touching contract:
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY
+
+from solwyn._types import BudgetCheckRequest, BudgetConfirmRequest, MetadataEvent
+from solwyn.client import Solwyn
 
 SDK_SRC = Path(__file__).resolve().parent.parent.parent / "src" / "solwyn"
 
@@ -115,8 +119,6 @@ def test_no_logger_call_passes_bare_exception_argument() -> None:
     ``ast.Call``, not a bare ``ast.Name``) is allowed; ``exc`` / ``exception``
     passed as a bare name (positional, keyword value, or ``exc_info=exc``) is not.
     """
-    import ast
-
     banned = {"exc", "exception"}
     violations: list[str] = []
     for path in _iter_source_files():
@@ -233,8 +235,6 @@ def test_privacy_banner_set_equals_allowlist() -> None:
 def test_wire_models_stay_content_free() -> None:
     """SDK<->API wire models must never carry a content-bearing field name.
     Failover adds only STRUCTURAL fields (provider identifiers, error class)."""
-    from solwyn._types import BudgetCheckRequest, BudgetConfirmRequest, MetadataEvent
-
     for model in (MetadataEvent, BudgetCheckRequest, BudgetConfirmRequest):
         leaked = set(model.model_fields) & FORBIDDEN_FIELDS
         assert not leaked, f"{model.__name__} leaks content-bearing fields: {leaked}"
@@ -351,8 +351,6 @@ def test_stream_settlement_logs_only_callback_exception_class_name() -> None:
     Parses each ``logger.warning(...)`` via AST and asserts that beyond the
     literal-string template, the ONLY argument expression is ``type(x).__name__``;
     no f-strings, no str(exc), no bareword content names."""
-    import ast
-
     src = (SDK_SRC / "stream.py").read_text()
     tree = ast.parse(src)
 
@@ -444,14 +442,10 @@ def test_failover_solwyn_payloads_carry_no_content() -> None:
     """End-to-end: on the translating cross-provider failover path, no prompt
     content reaches the Solwyn Cloud API across budget check, confirm, and
     metadata ingest. SENTINEL must never appear in ANY captured ``json=`` body."""
-    from solwyn.client import Solwyn
-
     SENTINEL = "SUPER_SECRET_PROMPT_a1b2c3"
 
     # ── Arrange: fake provider clients (no real SDKs importable). ──────────
     def _provider_client(module: str, name: str) -> object:
-        from unittest.mock import MagicMock
-
         client = MagicMock()
         client.__class__.__module__ = module
         client.__class__.__name__ = name
@@ -531,13 +525,9 @@ def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
     a fire-and-forget confirm (report_confirm) + a success metadata event. We
     capture every json= body POSTed across budget check, confirm, and metadata
     ingest and assert the SENTINEL appears in NONE of them."""
-    from solwyn.client import Solwyn
-
     SENTINEL = "SUPER_SECRET_PROMPT_a1b2c3"
 
     def _provider_client(module: str, name: str) -> object:
-        from unittest.mock import MagicMock
-
         client = MagicMock()
         client.__class__.__module__ = module
         client.__class__.__name__ = name

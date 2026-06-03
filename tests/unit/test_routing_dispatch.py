@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from conftest import VALID_API_KEY
@@ -31,7 +31,7 @@ from conftest import VALID_API_KEY
 from solwyn._routing import CostPolicy, LatencyPolicy, RoutingRequest
 from solwyn._types import ProviderName
 from solwyn.budget import BudgetCheckResult
-from solwyn.client import Solwyn
+from solwyn.client import AsyncSolwyn, Solwyn
 
 # ── client + response fakes ──────────────────────────────────────────────
 
@@ -170,10 +170,6 @@ class TestPriceHintLifetimeAcrossCacheHit:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_async_cache_hit_with_none_hints_preserves_last_known_hints(self) -> None:
-        from unittest.mock import AsyncMock
-
-        from solwyn.client import AsyncSolwyn
-
         openai = _openai_client()
         openai.chat.completions.create = AsyncMock(return_value=_openai_response())
         solwyn = AsyncSolwyn(  # type: ignore[arg-type]

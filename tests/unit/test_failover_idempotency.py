@@ -19,6 +19,7 @@ import pytest
 from conftest import VALID_API_KEY
 
 from solwyn.client import Solwyn
+from solwyn.exceptions import ProviderUnavailableError
 from solwyn.providers._errors import Disposition, classify_exception
 
 
@@ -407,8 +408,6 @@ class TestSameProviderDoubleCountGuard:
 
             # Call 3 trips the threshold -> the chain finds no eligible
             # candidate and raises ProviderUnavailableError.
-            from solwyn.exceptions import ProviderUnavailableError
-
             with pytest.raises((ProviderUnavailableError, _Status)):
                 solwyn.chat.completions.create(**_PLAIN_REQUEST)
 

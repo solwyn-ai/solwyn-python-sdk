@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import VALID_API_KEY
 
+from solwyn._base import _LATENCY_WINDOW
 from solwyn._routing import (
     CostPolicy,
     HealthBasedPolicy,
@@ -214,8 +215,6 @@ def test_record_latency_thread_safety_smoke() -> None:
 
         # Assert — no corruption: window is capped at _LATENCY_WINDOW and the
         # median of an all-100.0 window is exactly 100.0 (no torn writes).
-        from solwyn._base import _LATENCY_WINDOW
-
         with solwyn._latency_lock:
             window_len = len(solwyn._latency_windows["openai"])
         assert window_len == _LATENCY_WINDOW

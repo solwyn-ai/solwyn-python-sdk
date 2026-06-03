@@ -37,6 +37,7 @@ from solwyn.client import (
     _materialize_stream_async,
 )
 from solwyn.exceptions import UntranslatableRequestError
+from solwyn.providers import _translation
 
 # ── establishment-error helpers ──────────────────────────────────────────
 
@@ -568,8 +569,6 @@ class TestCrossProviderTextStreamingNormalizes:
 @pytest.mark.unit
 class TestSameDialectStreamingNoTranslation:
     def test_same_provider_model_swap_stream_is_passthrough(self) -> None:
-        from solwyn.providers import _translation
-
         client = _openai_client()
         client.chat.completions.create.side_effect = [
             _Status(429),

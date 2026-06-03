@@ -13,6 +13,7 @@ from solwyn._privacy import estimate_content_length
 from solwyn._types import BudgetMode, ProviderName
 from solwyn.client import Solwyn, _detect_provider
 from solwyn.exceptions import BudgetExceededError, ProviderUnavailableError
+from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
 
 
 def _mock_openai_client():
@@ -700,8 +701,6 @@ class TestSyncStreamingInterception:
     """Streaming calls return a wrapped iterator that reports usage on completion."""
 
     def test_streaming_call_returns_wrapper(self) -> None:
-        from solwyn.stream import SyncStreamWrapper
-
         client, _ = _mock_openai_client()
         # Make the provider return an iterable when stream=True
         mock_chunks = [
@@ -1082,8 +1081,6 @@ class TestAsyncStreamingInterception:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_async_streaming_reports_metadata(self) -> None:
-        from solwyn.stream import AsyncStreamWrapper
-
         client, _ = _mock_openai_client()
 
         async def async_stream():

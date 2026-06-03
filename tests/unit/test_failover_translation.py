@@ -23,6 +23,7 @@ Covered (spec §5 + §6.8):
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -259,8 +260,6 @@ class TestToolExchangeFailover:
         # OpenAI dialect the caller wrote.
         call = result.choices[0].message.tool_calls[0]
         assert call.function.name == "get_weather"
-        import json
-
         assert json.loads(call.function.arguments) == {"city": "paris"}
         assert result.choices[0].finish_reason == "tool_calls"
 
