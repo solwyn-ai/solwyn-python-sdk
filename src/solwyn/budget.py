@@ -434,11 +434,12 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 is_provider_fallback=is_provider_fallback,
                 call_id=call_id,
             )
-            self._http.post(
+            resp = self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",
                 json=request.model_dump(mode="json"),
                 headers=self._auth_headers(),
             )
+            resp.raise_for_status()
             with self._state_lock:
                 self._consecutive_confirm_failures = 0
         except Exception as exc:
@@ -558,11 +559,12 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 is_provider_fallback=is_provider_fallback,
                 call_id=call_id,
             )
-            await self._http.post(
+            resp = await self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",
                 json=request.model_dump(mode="json"),
                 headers=self._auth_headers(),
             )
+            resp.raise_for_status()
             self._consecutive_confirm_failures = 0
         except Exception as exc:
             self._consecutive_confirm_failures += 1

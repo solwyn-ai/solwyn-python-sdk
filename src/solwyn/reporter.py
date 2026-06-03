@@ -159,12 +159,13 @@ class MetadataReporter(_ReporterBase):
         while self._confirm_queue:
             confirm_request = self._confirm_queue.popleft()
             try:
-                self._http.post(
+                resp = self._http.post(
                     f"{self.api_url}/api/v1/budgets/confirm",
                     json=confirm_request.model_dump(mode="json"),
                     headers=self._auth_headers(),
                     timeout=5.0,
                 )
+                resp.raise_for_status()
             except Exception as exc:
                 logger.warning(
                     "reporter.confirm_send_failed: exc_type=%s",
@@ -177,11 +178,12 @@ class MetadataReporter(_ReporterBase):
             self._in_flight += 1
         try:
             payload = [e.model_dump(mode="json") for e in batch]
-            self._http.post(
+            resp = self._http.post(
                 f"{self.api_url}/api/v1/metadata/ingest",
                 json=payload,
                 headers=self._auth_headers(),
             )
+            resp.raise_for_status()
         except Exception as exc:
             # Log only the exception's class name (fix [D]) — the type-name-only
             # convention every other except-block follows. Safe here even though
@@ -309,12 +311,13 @@ class AsyncMetadataReporter(_ReporterBase):
         while self._confirm_queue:
             confirm_request = self._confirm_queue.popleft()
             try:
-                await self._http.post(
+                resp = await self._http.post(
                     f"{self.api_url}/api/v1/budgets/confirm",
                     json=confirm_request.model_dump(mode="json"),
                     headers=self._auth_headers(),
                     timeout=5.0,
                 )
+                resp.raise_for_status()
             except Exception as exc:
                 logger.warning(
                     "reporter.confirm_send_failed: exc_type=%s",
@@ -326,11 +329,12 @@ class AsyncMetadataReporter(_ReporterBase):
         self._in_flight += 1
         try:
             payload = [e.model_dump(mode="json") for e in batch]
-            await self._http.post(
+            resp = await self._http.post(
                 f"{self.api_url}/api/v1/metadata/ingest",
                 json=payload,
                 headers=self._auth_headers(),
             )
+            resp.raise_for_status()
         except Exception as exc:
             # Log only the exception's class name (fix [D]) — the type-name-only
             # convention every other except-block follows. Safe here even though

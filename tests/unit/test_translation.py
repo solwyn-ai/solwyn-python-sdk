@@ -14,7 +14,11 @@ import pytest
 
 from solwyn.exceptions import UntranslatableRequestError
 from solwyn.providers._translation import (
+    CanonicalMessage,
     CanonicalRequest,
+    TextPart,
+    ToolResultPart,
+    ToolUsePart,
     from_canonical,
     normalize_finish_reason,
     normalize_response,
@@ -1834,3 +1838,178 @@ class TestStreamChunkFailLoud:
             _assert_no_value_leak(exc, SECRET)
         else:  # pragma: no cover
             pytest.fail("expected UntranslatableRequestError")
+
+
+# --------------------------------------------------------------------------- #
+# Finding #2 — orphan tool_result fails loud at the failover boundary.         #
+# A tool_result whose id matches no prior tool_use is NOT in ``pending`` and    #
+# must RAISE (Decision B: fail loud on dangling/unresolved tool calls) rather   #
+# than render to the target and 400 after dispatch.                            #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestOrphanToolResult:
+    def test_openai_orphan_tool_result_raises(self) -> None:
+        # role:tool referencing a tool_call_id that was never issued.
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call_never_issued", "content": f"x{SECRET}"},
+        ]
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(messages=messages))
+        assert ei.value.feature == "orphan_tool_result"
+        assert ei.value.source == "openai"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_anthropic_orphan_tool_result_raises(self) -> None:
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_never_issued",
+                        "content": f"x{SECRET}",
+                    }
+                ],
+            },
+        ]
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("anthropic", anthropic_req(messages=messages))
+        assert ei.value.feature == "orphan_tool_result"
+        assert ei.value.source == "anthropic"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_google_orphan_function_response_raises(self) -> None:
+        # function_response with no matching function_call earlier in the contents.
+        contents = [
+            {"role": "user", "parts": [{"text": "hi"}]},
+            {
+                "role": "tool",
+                "parts": [
+                    {
+                        "function_response": {
+                            "name": "get_weather",
+                            "response": {"result": f"x{SECRET}"},
+                        }
+                    }
+                ],
+            },
+        ]
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("google", google_req(contents=contents))
+        assert ei.value.feature == "orphan_tool_result"
+        assert ei.value.source == "google"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_resolved_history_still_canonicalizes_no_error(self) -> None:
+        # Regression guard: a fully-resolved tool exchange (result id matches a
+        # prior tool_use id) must canonicalize cleanly for all three providers.
+        to_canonical("openai", openai_req(messages=_openai_resolved_tool_history()))
+        to_canonical("anthropic", anthropic_req(messages=_anthropic_resolved_tool_history()))
+        google_history = [
+            {"role": "user", "parts": [{"text": "weather?"}]},
+            {
+                "role": "model",
+                "parts": [{"function_call": {"id": "fc_1", "name": "get_weather", "args": {}}}],
+            },
+            {
+                "role": "tool",
+                "parts": [
+                    {
+                        "function_response": {
+                            "id": "fc_1",
+                            "name": "get_weather",
+                            "response": {"result": "sunny"},
+                        }
+                    }
+                ],
+            },
+        ]
+        to_canonical("google", google_req(contents=google_history))
+
+
+# --------------------------------------------------------------------------- #
+# Finding #3 — mixed tool_result + text user turn.                             #
+# OpenAI/Google cannot represent it, so the RENDER boundary fails loud rather   #
+# than silently dropping the text. Anthropic CAN represent it and must keep     #
+# both blocks (same-provider Anthropic->Anthropic hop stays valid).            #
+# --------------------------------------------------------------------------- #
+def _mixed_tool_result_text_request() -> CanonicalRequest:
+    return CanonicalRequest(
+        messages=[
+            CanonicalMessage(
+                role="user",
+                content=[
+                    ToolResultPart(tool_use_id="call_1", content="sunny"),
+                    TextPart(text="please continue"),
+                ],
+            )
+        ],
+        max_tokens=256,
+    )
+
+
+@pytest.mark.unit
+class TestMixedToolResultRender:
+    def test_openai_mixed_tool_result_text_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            from_canonical("openai", _mixed_tool_result_text_request(), model="gpt-4o")
+        assert ei.value.feature == "tool_result.mixed_content"
+        assert ei.value.target == "openai"
+
+    def test_google_mixed_tool_result_text_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            from_canonical("google", _mixed_tool_result_text_request(), model="gemini-1.5-pro")
+        assert ei.value.feature == "tool_result.mixed_content"
+        assert ei.value.target == "google"
+
+    def test_anthropic_mixed_tool_result_text_keeps_both_blocks(self) -> None:
+        out = from_canonical("anthropic", _mixed_tool_result_text_request(), model="m")
+        blocks = out["messages"][0]["content"]
+        types = [b["type"] for b in blocks]
+        assert types == ["tool_result", "text"]
+        assert blocks[0]["tool_use_id"] == "call_1"
+        assert blocks[0]["content"] == "sunny"
+        assert blocks[1]["text"] == "please continue"
+
+
+def _assistant_text_plus_tool_use_request() -> CanonicalRequest:
+    # An assistant turn with TextPart + ToolUsePart coexisting is VALID on every
+    # provider and must keep rendering (must NOT trip the mixed-content guard).
+    return CanonicalRequest(
+        messages=[
+            CanonicalMessage(
+                role="assistant",
+                content=[
+                    TextPart(text="let me check"),
+                    ToolUsePart(id="call_1", name="get_weather", input={"city": "paris"}),
+                ],
+            )
+        ],
+        max_tokens=256,
+    )
+
+
+@pytest.mark.unit
+class TestAssistantTextPlusToolUseStillRenders:
+    def test_openai_assistant_text_plus_tool_use(self) -> None:
+        out = from_canonical("openai", _assistant_text_plus_tool_use_request(), model="gpt-4o")
+        assistant = out["messages"][0]
+        assert assistant["role"] == "assistant"
+        assert assistant["content"] == "let me check"
+        assert assistant["tool_calls"][0]["function"]["name"] == "get_weather"
+
+    def test_anthropic_assistant_text_plus_tool_use(self) -> None:
+        out = from_canonical("anthropic", _assistant_text_plus_tool_use_request(), model="m")
+        blocks = out["messages"][0]["content"]
+        assert [b["type"] for b in blocks] == ["text", "tool_use"]
+        assert blocks[1]["name"] == "get_weather"
+
+    def test_google_assistant_text_plus_tool_use(self) -> None:
+        out = from_canonical(
+            "google", _assistant_text_plus_tool_use_request(), model="gemini-1.5-pro"
+        )
+        parts = out["contents"][0]["parts"]
+        assert parts[0]["text"] == "let me check"
+        assert parts[1]["function_call"]["name"] == "get_weather"

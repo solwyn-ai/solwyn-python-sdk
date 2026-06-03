@@ -5,11 +5,18 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from conftest import VALID_API_KEY
 from pydantic import ValidationError
 
-from solwyn._types import SERVICE_TIER_MAX_LENGTH, MetadataEvent, ProviderName
+from solwyn._token_details import TokenDetails
+from solwyn._types import (
+    SERVICE_TIER_MAX_LENGTH,
+    BudgetConfirmRequest,
+    MetadataEvent,
+    ProviderName,
+)
 from solwyn.reporter import (
     AsyncMetadataReporter,
     MetadataReporter,
@@ -32,6 +39,41 @@ def _make_event(**overrides) -> MetadataEvent:
     }
     defaults.update(overrides)
     return MetadataEvent(**defaults)
+
+
+def _make_confirm_request() -> BudgetConfirmRequest:
+    return BudgetConfirmRequest(
+        reservation_id="res_123",
+        model="gpt-4o",
+        provider=ProviderName.OPENAI,
+        call_id="call_sync_confirm",
+        token_details=TokenDetails(input_tokens=10, output_tokens=5),
+    )
+
+
+def _error_response(status_code: int) -> MagicMock:
+    """A 4xx/5xx httpx.Response stand-in: raise_for_status raises HTTPStatusError."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = status_code
+    resp.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "error", request=MagicMock(spec=httpx.Request), response=resp
+        )
+    )
+    return resp
+
+
+def _quiet_sync_reporter(**kwargs) -> MetadataReporter:
+    """Build a sync reporter with its background flush thread stopped."""
+    with patch("solwyn.reporter.MetadataReporter._flush_loop"):
+        reporter = MetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+            **kwargs,
+        )
+    reporter._shutdown.set()
+    reporter._thread.join(timeout=2.0)
+    return reporter
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +301,48 @@ class TestMetadataReporter:
     def test_metadata_event_rejects_overlength_service_tier(self) -> None:
         with pytest.raises(ValidationError):
             _make_event(service_tier="x" * (SERVICE_TIER_MAX_LENGTH + 1))
+
+    def test_send_batch_4xx_logged_type_only_and_survives(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A 4xx on the ingest POST must surface via raise_for_status, be caught,
+        # logged by class name only (no body), and not propagate.
+        reporter = _quiet_sync_reporter()
+
+        with (
+            patch.object(reporter._http, "post", return_value=_error_response(422)),
+            caplog.at_level("WARNING"),
+        ):
+            # Should not raise despite the 422.
+            reporter._send_batch([_make_event()])
+
+        assert "HTTPStatusError" in caplog.text
+        # Privacy: never log the response body — only the exception class name.
+        assert "422 Unprocessable" not in caplog.text
+        reporter._http.close()
+
+    def test_flush_remaining_confirm_4xx_logged_type_only_and_survives(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A 4xx on the confirm POST must surface via raise_for_status, be caught,
+        # logged by class name only, drain from the queue, and not propagate.
+        reporter = _quiet_sync_reporter()
+        # Enqueue directly: report_confirm gates on the shutdown flag that
+        # _quiet_sync_reporter sets to stop the background thread.
+        reporter._confirm_queue.append(_make_confirm_request())
+
+        with (
+            patch.object(reporter._http, "post", return_value=_error_response(422)),
+            caplog.at_level("WARNING"),
+        ):
+            # Should not raise despite the 422.
+            reporter._flush_remaining()
+
+        assert "reporter.confirm_send_failed" in caplog.text
+        assert "HTTPStatusError" in caplog.text
+        # The flush loop survives and drains the confirm queue.
+        assert len(reporter._confirm_queue) == 0
+        reporter._http.close()
 
 
 # ---------------------------------------------------------------------------

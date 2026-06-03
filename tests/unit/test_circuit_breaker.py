@@ -60,6 +60,39 @@ def _run_concurrently(workers: int, target: Callable[[], object]) -> None:
     assert all(not thread.is_alive() for thread in threads)
 
 
+def _run_concurrently_collecting(workers: int, target: Callable[[], object]) -> list[object]:
+    """Run ``target`` on ``workers`` threads and return each call's result.
+
+    Like ``_run_concurrently`` but captures return values under a lock so
+    callers can assert on the distribution of outcomes (e.g. exactly one
+    ``can_proceed()`` probe wins the single HALF_OPEN slot).
+    """
+    barrier = threading.Barrier(workers)
+    errors: list[BaseException] = []
+    results: list[object] = []
+    results_lock = threading.Lock()
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=2.0)
+            result = target()
+            with results_lock:
+                results.append(result)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(workers)]
+
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=2.0)
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    return results
+
+
 @pytest.mark.unit
 class TestClosedToOpen:
     """CLOSED -> OPEN after N consecutive failures."""
@@ -178,10 +211,14 @@ class TestConcurrentStateMutation:
         cb.state = CircuitState.OPEN
         cb.last_failure_time = time.monotonic() - 1
 
-        _run_concurrently(32, cb.can_proceed)
+        results = _run_concurrently_collecting(32, cb.can_proceed)
 
         assert cb.state == CircuitState.HALF_OPEN
         assert len(cb.half_open_transitions) == 1
+        # Single-probe slot (§6.2/§6.4): exactly ONE concurrent caller wins the
+        # probe; the other 31 are refused — no recovery stampede.
+        assert results.count(True) == 1
+        assert results.count(False) == 31
 
 
 @pytest.mark.unit
@@ -197,11 +234,28 @@ class TestCanProceed:
         cb.record_failure()
         assert cb.can_proceed() is False
 
-    def test_returns_true_when_half_open(self) -> None:
-        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0)
+    def test_half_open_single_probe_slot(self) -> None:
+        # §6.2/§6.4: HALF_OPEN opens exactly ONE probe slot. The first caller
+        # consumes it; a concurrent second caller is refused while the probe is
+        # in flight; once the probe reports a non-closing success the slot is
+        # freed and a fresh caller may probe again.
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0, success_threshold=2)
         cb.record_failure()
-        cb.can_proceed()  # triggers HALF_OPEN transition
+
+        # First caller wins the probe slot and transitions OPEN -> HALF_OPEN.
+        assert cb.can_proceed() is True
         assert cb.state == CircuitState.HALF_OPEN
+
+        # A second caller while the probe is still in flight is refused.
+        assert cb.can_proceed() is False
+        assert cb.state == CircuitState.HALF_OPEN
+
+        # The in-flight probe reports a success that does NOT close the breaker
+        # (success_threshold=2), which frees the slot.
+        cb.record_success()
+        assert cb.state == CircuitState.HALF_OPEN
+
+        # A fresh caller may now probe again — the slot was freed on outcome.
         assert cb.can_proceed() is True
 
 

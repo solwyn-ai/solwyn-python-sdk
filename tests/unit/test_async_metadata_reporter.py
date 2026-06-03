@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from conftest import VALID_API_KEY
 
@@ -38,6 +39,29 @@ def _make_confirm_request() -> BudgetConfirmRequest:
         call_id="call_async_confirm",
         token_details=TokenDetails(input_tokens=10, output_tokens=5),
     )
+
+
+def _ok_response() -> MagicMock:
+    """A 2xx httpx.Response stand-in: raise_for_status is a no-op.
+
+    The response is sync (httpx.Response.raise_for_status() is sync even on the
+    async client), so use MagicMock — not AsyncMock — per tests/CLAUDE.md.
+    """
+    resp = MagicMock(spec=httpx.Response)
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
+def _error_response(status_code: int) -> MagicMock:
+    """A 4xx/5xx httpx.Response stand-in: raise_for_status raises HTTPStatusError."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = status_code
+    resp.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "error", request=MagicMock(spec=httpx.Request), response=resp
+        )
+    )
+    return resp
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +108,7 @@ class TestAsyncReporterLifecycle:
 
         assert len(reporter._queue) == 3
 
-        mock_response = AsyncMock()
+        mock_response = _ok_response()
         with patch.object(reporter._http, "post", return_value=mock_response) as mock_post:
             await reporter.close()
 
@@ -118,7 +142,9 @@ class TestAsyncReporterLifecycle:
         reporter.start()
         reporter.report_confirm(_make_confirm_request())
 
-        with patch.object(reporter._http, "post", new_callable=AsyncMock) as mock_post:
+        with patch.object(
+            reporter._http, "post", new_callable=AsyncMock, return_value=_ok_response()
+        ) as mock_post:
             await reporter.close()
 
         mock_post.assert_called_once()
@@ -144,7 +170,7 @@ class TestAsyncReporterSendBatch:
         )
 
         batch = [_make_event() for _ in range(3)]
-        mock_response = AsyncMock()
+        mock_response = _ok_response()
 
         with patch.object(reporter._http, "post", return_value=mock_response) as mock_post:
             await reporter._send_batch(batch)
@@ -163,7 +189,9 @@ class TestAsyncReporterSendBatch:
             VALID_API_KEY,
         )
 
-        with patch.object(reporter._http, "post", new_callable=AsyncMock) as mock_post:
+        with patch.object(
+            reporter._http, "post", new_callable=AsyncMock, return_value=_ok_response()
+        ) as mock_post:
             await reporter._send_batch([_make_event(service_tier=None)])
 
         payload = mock_post.call_args.kwargs["json"][0]
@@ -179,7 +207,9 @@ class TestAsyncReporterSendBatch:
             VALID_API_KEY,
         )
 
-        with patch.object(reporter._http, "post", new_callable=AsyncMock) as mock_post:
+        with patch.object(
+            reporter._http, "post", new_callable=AsyncMock, return_value=_ok_response()
+        ) as mock_post:
             await reporter._send_batch([_make_event(service_tier="priority")])
 
         payload = mock_post.call_args.kwargs["json"][0]
@@ -199,7 +229,9 @@ class TestAsyncReporterSendBatch:
             agent_run_id="run_test_xyz",
             agent_run_name="async-batch",
         )
-        with patch.object(reporter._http, "post", new_callable=AsyncMock) as mock_post:
+        with patch.object(
+            reporter._http, "post", new_callable=AsyncMock, return_value=_ok_response()
+        ) as mock_post:
             await reporter._send_batch([event])
 
         payload = mock_post.call_args.kwargs["json"][0]
@@ -217,7 +249,9 @@ class TestAsyncReporterSendBatch:
             VALID_API_KEY,
         )
 
-        with patch.object(reporter._http, "post", new_callable=AsyncMock) as mock_post:
+        with patch.object(
+            reporter._http, "post", new_callable=AsyncMock, return_value=_ok_response()
+        ) as mock_post:
             await reporter._send_batch([_make_event()])
 
         payload = mock_post.call_args.kwargs["json"][0]
@@ -239,6 +273,32 @@ class TestAsyncReporterSendBatch:
             # Should not raise
             await reporter._send_batch(batch)
 
+        await reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_send_batch_4xx_logged_type_only_and_survives(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A 4xx on the ingest POST must surface via raise_for_status, be caught,
+        # logged by class name only (no body), and not propagate.
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+        )
+
+        with (
+            patch.object(
+                reporter._http, "post", new_callable=AsyncMock, return_value=_error_response(422)
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            # Should not raise despite the 422.
+            await reporter._send_batch([_make_event()])
+
+        assert "HTTPStatusError" in caplog.text
+        # Privacy: never log the response body — only the exception class name.
+        assert "422 Unprocessable" not in caplog.text
         await reporter._http.aclose()
 
 
@@ -288,7 +348,7 @@ class TestAsyncReporterBatchFlush:
         for _ in range(5):
             reporter.report(_make_event())
 
-        mock_response = AsyncMock()
+        mock_response = _ok_response()
         with patch.object(reporter._http, "post", return_value=mock_response) as mock_post:
             await reporter._flush_remaining()
 
@@ -307,7 +367,9 @@ class TestAsyncReporterBatchFlush:
         reporter.report(_make_event())
         reporter.report_confirm(_make_confirm_request())
 
-        with patch.object(reporter._http, "post", new_callable=AsyncMock) as mock_post:
+        with patch.object(
+            reporter._http, "post", new_callable=AsyncMock, return_value=_ok_response()
+        ) as mock_post:
             await reporter._flush_remaining()
 
         assert [call.args[0] for call in mock_post.call_args_list] == [
@@ -315,5 +377,33 @@ class TestAsyncReporterBatchFlush:
             "https://api.test.solwyn.ai/api/v1/budgets/confirm",
         ]
         assert len(reporter._queue) == 0
+        assert len(reporter._confirm_queue) == 0
+        await reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_flush_remaining_confirm_4xx_logged_type_only_and_survives(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A 4xx on the confirm POST must surface via raise_for_status, be caught,
+        # logged by class name only, drain from the queue, and not propagate.
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+        )
+        reporter.report_confirm(_make_confirm_request())
+
+        with (
+            patch.object(
+                reporter._http, "post", new_callable=AsyncMock, return_value=_error_response(422)
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            # Should not raise despite the 422.
+            await reporter._flush_remaining()
+
+        assert "reporter.confirm_send_failed" in caplog.text
+        assert "HTTPStatusError" in caplog.text
+        # The flush loop survives and drains the confirm queue.
         assert len(reporter._confirm_queue) == 0
         await reporter._http.aclose()

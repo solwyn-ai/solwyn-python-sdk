@@ -610,6 +610,8 @@ def _openai_assistant_to_canonical(
 
 def _openai_tool_result_to_canonical(msg: dict[str, Any], pending: set[str]) -> CanonicalMessage:
     call_id = msg.get("tool_call_id", "")
+    if call_id not in pending:
+        _raise("openai", "*", "orphan_tool_result")
     pending.discard(call_id)
     return CanonicalMessage(
         role="user",
@@ -786,6 +788,8 @@ def _anthropic_user_to_canonical(content: Any, pending: set[str]) -> CanonicalMe
             btype = block.get("type")
             if btype == "tool_result":
                 tuid = block.get("tool_use_id", "")
+                if tuid not in pending:
+                    _raise("anthropic", "*", "orphan_tool_result")
                 pending.discard(tuid)
                 parts.append(
                     ToolResultPart(tool_use_id=tuid, content=_as_text(block.get("content")))
@@ -921,6 +925,8 @@ def _google_user_to_canonical(
         elif "function_response" in part:
             fr = part["function_response"]
             tuid = fr.get("id") or f"call_{fr.get('name', '')}"
+            if tuid not in pending:
+                _raise("google", "*", "orphan_tool_result")
             pending.discard(tuid)
             parts.append(
                 ToolResultPart(tool_use_id=tuid, content=_as_text(_unwrap_google_response(fr)))
@@ -1073,6 +1079,12 @@ def _canonical_msg_to_openai(msg: CanonicalMessage) -> list[dict[str, Any]]:
     # User turn: tool_result parts become separate role:tool messages.
     tool_results = [p for p in msg.content if isinstance(p, ToolResultPart)]
     if tool_results:
+        # OpenAI cannot represent a tool_result turn that also carries text/image
+        # content — rendering only the role:tool messages would silently DROP the
+        # other parts. Fail loud at the render boundary (Anthropic CAN represent
+        # mixed turns, so this is render-side, not canonicalization-side).
+        if any(not isinstance(p, ToolResultPart) for p in msg.content):
+            _raise("*", "openai", "tool_result.mixed_content")
         return [
             {"role": "tool", "tool_call_id": p.tool_use_id, "content": p.content}
             for p in tool_results
@@ -1254,6 +1266,11 @@ def _canonical_msg_to_google(msg: CanonicalMessage, name_by_id: dict[str, str]) 
     # tool_result parts make this a `tool` turn; otherwise user/model.
     parts: list[dict[str, Any]] = []
     if any(isinstance(p, ToolResultPart) for p in msg.content):
+        # Google cannot represent a tool_result turn mixed with text/image parts —
+        # emitting only function_response would silently DROP the other parts. Fail
+        # loud at the render boundary (Anthropic CAN represent mixed turns).
+        if any(not isinstance(p, ToolResultPart) for p in msg.content):
+            _raise("*", "google", "tool_result.mixed_content")
         for p in msg.content:
             if isinstance(p, ToolResultPart):
                 parts.append(

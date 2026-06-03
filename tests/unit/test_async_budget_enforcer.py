@@ -24,6 +24,29 @@ _DENY_RESPONSE = {
 }
 
 
+def _error_response(status_code: int) -> MagicMock:
+    """A 4xx/5xx httpx.Response stand-in: raise_for_status raises HTTPStatusError.
+
+    raise_for_status is sync even on the async client, so it is a MagicMock.
+    """
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = status_code
+    resp.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "error", request=MagicMock(spec=httpx.Request), response=resp
+        )
+    )
+    return resp
+
+
+def _ok_response() -> MagicMock:
+    """A 2xx httpx.Response stand-in: raise_for_status is a no-op."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 200
+    resp.raise_for_status = MagicMock()
+    return resp
+
+
 def _make_async_enforcer(**overrides) -> AsyncBudgetEnforcer:
     """Create an AsyncBudgetEnforcer with sensible test defaults."""
     defaults = {
@@ -178,6 +201,45 @@ class TestAsyncConfirmCost:
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
             # Should not raise
             await enforcer.confirm_cost("res_123", "gpt-4o", token_details, provider="openai")
+
+        await enforcer.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_confirm_4xx_increments_failure_counter(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A server 422 must surface via raise_for_status and be counted as a
+        # failure, not silently treated as success.
+        enforcer = _make_async_enforcer()
+        token_details = TokenDetails(input_tokens=100, output_tokens=50)
+        enforcer._http.post = AsyncMock(return_value=_error_response(422))
+
+        with caplog.at_level("WARNING"):
+            await enforcer.confirm_cost("res_123", "gpt-4o", token_details, provider="openai")
+
+        assert enforcer._consecutive_confirm_failures == 1
+        assert "budget.confirm_cost_failed" in caplog.text
+        # Privacy: only the exception class name is logged, never the body.
+        assert "HTTPStatusError" in caplog.text
+        assert "422 Unprocessable" not in caplog.text
+        await enforcer.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_confirm_2xx_resets_failure_counter(self) -> None:
+        # A successful confirm clears any accumulated consecutive-failure count.
+        enforcer = _make_async_enforcer()
+        token_details = TokenDetails(input_tokens=100, output_tokens=50)
+
+        enforcer._http.post = AsyncMock(return_value=_error_response(422))
+        for _ in range(2):
+            await enforcer.confirm_cost("res_123", "gpt-4o", token_details, provider="openai")
+        assert enforcer._consecutive_confirm_failures == 2
+
+        enforcer._http.post = AsyncMock(return_value=_ok_response())
+        await enforcer.confirm_cost("res_123", "gpt-4o", token_details, provider="openai")
+        assert enforcer._consecutive_confirm_failures == 0
 
         await enforcer.close()
 

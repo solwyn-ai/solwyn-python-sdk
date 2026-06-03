@@ -80,6 +80,11 @@ class CircuitBreaker:
         # Effective recovery window for the current OPEN episode. Re-sampled on
         # each transition to OPEN; equals recovery_timeout when jitter is 0.
         self._effective_recovery_timeout: float = float(recovery_timeout)
+        # Single-probe slot (§6.2/§6.4): while HALF_OPEN, exactly one in-flight
+        # probe is permitted. Set True by the caller that opens the slot;
+        # freed (False) when that probe reports an outcome so the next call
+        # may probe again (matters when success_threshold > 1).
+        self._half_open_probe_active: bool = False
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -90,6 +95,9 @@ class CircuitBreaker:
         """Record a successful call from the provider."""
         with self._lock:
             if self.state == CircuitState.HALF_OPEN:
+                # Free the probe slot before the close check so that when
+                # success_threshold > 1 the next call can probe again.
+                self._half_open_probe_active = False
                 self.success_count += 1
                 if self.success_count >= self.success_threshold:
                     self._transition_to_closed()
@@ -107,7 +115,10 @@ class CircuitBreaker:
                 if self.failure_count >= self.failure_threshold:
                     self._transition_to_open()
             elif self.state == CircuitState.HALF_OPEN:
-                # Any failure during probing immediately re-opens
+                # Any failure during probing immediately re-opens. Free the
+                # probe slot first (defense-in-depth; _transition_to_open also
+                # resets it for a fresh OPEN episode).
+                self._half_open_probe_active = False
                 self._transition_to_open()
 
     def can_proceed(self) -> bool:
@@ -118,9 +129,16 @@ class CircuitBreaker:
             elif self.state == CircuitState.OPEN:
                 if self._should_attempt_recovery():
                     self._transition_to_half_open()
+                    # This caller is the first (and only) probe in flight.
+                    self._half_open_probe_active = True
                     return True
                 return False
             else:  # HALF_OPEN
+                # Single-probe slot: if a probe is already in flight, refuse so
+                # concurrent callers cannot stampede a just-recovering provider.
+                if self._half_open_probe_active:
+                    return False
+                self._half_open_probe_active = True
                 return True
 
     @property
@@ -170,6 +188,8 @@ class CircuitBreaker:
         self.state = CircuitState.OPEN
         self.last_state_change = time.monotonic()
         self.success_count = 0
+        # A fresh OPEN episode starts with no probe in flight.
+        self._half_open_probe_active = False
         self._effective_recovery_timeout = self._sample_recovery_window()
         logger.warning("Circuit breaker opened due to failures")
 
@@ -179,6 +199,8 @@ class CircuitBreaker:
         self.last_state_change = time.monotonic()
         self.failure_count = 0
         self.success_count = 0
+        # A fresh CLOSED episode starts with no probe in flight.
+        self._half_open_probe_active = False
         logger.info("Circuit breaker closed, provider recovered")
 
     def _transition_to_half_open(self) -> None:
