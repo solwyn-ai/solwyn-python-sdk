@@ -29,6 +29,7 @@ def test_reporter_report_confirm_concurrent_appends() -> None:
                     BudgetConfirmRequest(
                         reservation_id=f"r{i}",
                         model="gpt-4o",
+                        provider="openai",
                         token_details=_DUMMY_DETAILS,
                     )
                 )

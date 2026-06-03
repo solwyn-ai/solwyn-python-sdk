@@ -8,8 +8,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import VALID_API_KEY
 
-from solwyn._types import BudgetMode
+from solwyn._types import BudgetMode, ProviderEntry, ProviderName
 from solwyn.client import AsyncSolwyn, Solwyn
+from solwyn.config import SolwynConfig
 from solwyn.exceptions import ConfigurationError, SolwynError
 
 
@@ -262,49 +263,63 @@ class TestAsyncSolwynConstructors:
 
 
 @pytest.mark.unit
-class TestEnvVarConstructionFallbackModel:
-    """SOLWYN_FALLBACK_MODEL env var populates config.fallback_model."""
+class TestProvidersChainRequired:
+    """SolwynConfig requires a non-empty providers chain (§4.4 / Decision D)."""
 
-    def test_fallback_model_loads_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """SOLWYN_FALLBACK_MODEL populates config.fallback_model."""
-        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
-        monkeypatch.setenv("SOLWYN_FALLBACK_MODEL", "gpt-4o-mini")
+    def test_empty_chain_raises_configuration_error(self) -> None:
+        """_check_chain raises ConfigurationError when providers is empty."""
+        with pytest.raises(ConfigurationError) as exc_info:
+            SolwynConfig(api_key=VALID_API_KEY, providers=[])
 
-        client = _mock_openai_client()
-        solwyn = _make_solwyn(client)
+        assert exc_info.value.field == "providers"
 
-        assert solwyn._config.fallback_model == "gpt-4o-mini"
+    def test_single_entry_chain_is_valid(self) -> None:
+        """A chain with one entry round-trips and is the primary."""
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-4o")],
+        )
+        assert len(config.providers) == 1
+        assert config.providers[0].provider == ProviderName.OPENAI
+        assert config.providers[0].model == "gpt-4o"
 
-        solwyn.close()
-
-    def test_fallback_model_default_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Without config, fallback_model is None."""
-        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
-
-        client = _mock_openai_client()
-        solwyn = _make_solwyn(client)
-
-        assert solwyn._config.fallback_model is None
-
-        solwyn.close()
+    def test_provider_entry_round_trips(self) -> None:
+        """ProviderEntry serializes and reconstructs without loss."""
+        entry = ProviderEntry(
+            provider=ProviderName.ANTHROPIC,
+            model="claude-3-5-sonnet",
+            default_params={"max_tokens": 256},
+        )
+        rebuilt = ProviderEntry.model_validate(entry.model_dump())
+        assert rebuilt == entry
+        assert rebuilt.default_params == {"max_tokens": 256}
 
 
 @pytest.mark.unit
-class TestFallbackProviderRemoved:
-    """fallback_provider is removed — extra='forbid' rejects it."""
+class TestFailoverKnobDefaults:
+    """Failover tuning knobs carry the spec defaults (§4.4 / §6.3 / §6.5)."""
 
-    def test_fallback_provider_kwarg_is_rejected(self) -> None:
-        client = _mock_openai_client()
-        with pytest.raises(ConfigurationError):
-            _make_solwyn(client, api_key=VALID_API_KEY, fallback_provider="anthropic")
+    def test_failover_knob_defaults(self) -> None:
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-4o")],
+        )
+        assert config.failover_total_timeout == 30.0
+        assert config.failover_idempotency == "safe"
+        assert config.same_provider_retries == 0
+        assert config.circuit_breaker_recovery_timeout_jitter == 0.2
+        assert config.default_params == {}
 
-    def test_fallback_provider_env_var_is_ignored(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """SOLWYN_FALLBACK_PROVIDER must not be read anymore."""
-        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
-        monkeypatch.setenv("SOLWYN_FALLBACK_PROVIDER", "anthropic")
-
-        client = _mock_openai_client()
-        solwyn = _make_solwyn(client)
-        assert not hasattr(solwyn._config, "fallback_provider")
-
-        solwyn.close()
+    def test_failover_knobs_are_overridable(self) -> None:
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-4o")],
+            failover_total_timeout=12.5,
+            failover_idempotency="always",
+            same_provider_retries=2,
+            default_params={"temperature": 0.0},
+        )
+        assert config.failover_total_timeout == 12.5
+        assert config.failover_idempotency == "always"
+        assert config.same_provider_retries == 2
+        assert config.default_params == {"temperature": 0.0}

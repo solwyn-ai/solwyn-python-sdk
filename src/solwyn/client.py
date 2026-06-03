@@ -37,21 +37,78 @@ from solwyn._proxies import (
     _SyncMessagesProxy,
     _SyncModelsProxy,
 )
+from solwyn._registry import ProviderRuntime, build_runtimes
+from solwyn._routing import RoutingRequest
 from solwyn._run import current_run
 from solwyn._token_details import TokenDetails
-from solwyn._types import CallStatus, CircuitState, ProviderName
+from solwyn._types import CallStatus, FailoverReason, ProviderName
 from solwyn.budget import (
     DEFAULT_COST_PER_TOKEN,
     AsyncBudgetEnforcer,
     BudgetEnforcer,
 )
 from solwyn.config import SolwynConfig
-from solwyn.exceptions import BudgetExceededError, ConfigurationError
+from solwyn.exceptions import (
+    BudgetExceededError,
+    ConfigurationError,
+    ProviderUnavailableError,
+)
 from solwyn.providers import get_adapter_for_client
+from solwyn.providers._errors import Disposition, classify_exception
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
 
 logger = logging.getLogger(__name__)
+
+
+# Floor for a per-hop dispatch timeout: even when the chain deadline is nearly
+# spent we give a hop at least this long rather than passing it ~0s (§6.3).
+_MIN_HOP_TIMEOUT = 1.0
+
+
+class Deadline:
+    """A monotonic chain deadline (§6.3).
+
+    Stamped once at ``_intercepted_call`` entry from ``failover_total_timeout``;
+    it encompasses the budget pre-flight and every per-hop dispatch. Per-hop
+    timeouts are derived from ``remaining()`` so a hung-but-connected provider
+    cannot stack the 600s SDK read default across the chain.
+    """
+
+    def __init__(self, total: float) -> None:
+        self._total = total
+        self._start = time.monotonic()
+
+    def remaining(self) -> float:
+        """Seconds left on the chain deadline (never negative)."""
+        return max(0.0, self._total - (time.monotonic() - self._start))
+
+    def expired(self) -> bool:
+        """True once the chain deadline has elapsed."""
+        return self.remaining() <= 0.0
+
+
+def _normalize_fallback(fallback: object) -> list[Any]:
+    """Normalize the ``fallback=`` constructor arg into a list of specs.
+
+    ``None`` -> ``[]``. Each item is a ``(client, model)`` or
+    ``(client, model, default_params)`` tuple validated downstream by
+    ``build_runtimes``.
+    """
+    if fallback is None:
+        return []
+    return list(cast("list[Any]", fallback))
+
+
+def _success_failover_reason(
+    *, is_provider_fallback: bool, is_model_fallback: bool
+) -> FailoverReason | None:
+    """Pick the success-path failover reason for a served candidate (§4.6)."""
+    if is_provider_fallback:
+        return FailoverReason.CIRCUIT_OPEN
+    if is_model_fallback:
+        return FailoverReason.MODEL_FALLBACK
+    return None
 
 
 def _detect_provider(client: object) -> ProviderName:
@@ -97,6 +154,9 @@ class Solwyn(_SolwynBase):
         client: object,
         *,
         api_key: str | None = None,
+        model: str | None = None,
+        fallback: object = None,
+        default_params: dict[str, Any] | None = None,
         **config_kwargs: object,
     ) -> None:
         # Detect provider and store adapter for usage extraction
@@ -110,13 +170,19 @@ class Solwyn(_SolwynBase):
         if "project_id" in config_kwargs:
             raise TypeError("unexpected keyword argument 'project_id'")
 
+        # Build the [primary, *fallbacks] runtime chain. All chain clients are
+        # constructed up front so the first failover is pure dispatch.
+        fallback_specs = _normalize_fallback(fallback)
+        runtimes = build_runtimes(client, model, fallback_specs)
+
         # Build config — SolwynConfig._load_from_env fills missing
         # values from SOLWYN_API_KEY env var.
         # cfg_kwargs stays dict[str, Any]: mypy can't verify Pydantic's **kwargs
         # validation against SolwynConfig's typed fields, so tightening here
         # adds noise without type-safety gain. SolwynConfig validates at runtime.
         cfg_kwargs: dict[str, Any] = {
-            "primary_provider": self._detected_provider,
+            "providers": [rt.entry for rt in runtimes],
+            "default_params": default_params or {},
             **config_kwargs,
         }
         if api_key is not None:
@@ -129,7 +195,7 @@ class Solwyn(_SolwynBase):
                 first["msg"] if first else str(exc),
                 field=str(first["loc"][-1]) if first else None,
             ) from exc
-        super().__init__(config)
+        super().__init__(config, runtimes)
 
         # Budget enforcer
         self._budget = BudgetEnforcer(
@@ -180,60 +246,68 @@ class Solwyn(_SolwynBase):
             return _SyncModelsProxy(self)
         return self._client.models
 
-    def _sync_dispatch(self, kwargs: dict[str, object], *, _force_stream: bool) -> Any:
-        """Dispatch the call to the underlying SDK client. Pure I/O — no retry, no metrics."""
-        if self._detected_provider == ProviderName.OPENAI:
-            return self._client.chat.completions.create(**kwargs)
-        if self._detected_provider == ProviderName.ANTHROPIC:
-            return self._client.messages.create(**kwargs)
+    def _sync_dispatch(
+        self,
+        runtime: ProviderRuntime,
+        kwargs: dict[str, object],
+        *,
+        _force_stream: bool,
+        timeout: float,
+        max_retries: int,
+    ) -> Any:
+        """Dispatch one hop to the runtime's SDK client. Pure I/O — no metrics.
+
+        Applies the mandatory per-hop bound via ``with_options`` (kills the
+        600s SDK read default and any internal retry stacking; §6.3).
+        """
+        client = runtime.sdk_client
+        if hasattr(client, "with_options"):
+            client = client.with_options(timeout=timeout, max_retries=max_retries)
+        name = runtime.adapter.name
+        if name == ProviderName.OPENAI.value:
+            return client.chat.completions.create(**kwargs)
+        if name == ProviderName.ANTHROPIC.value:
+            return client.messages.create(**kwargs)
         if _force_stream:
-            if self._detected_provider != ProviderName.GOOGLE:
-                raise RuntimeError(
-                    f"_force_stream is Google-only but provider is {self._detected_provider}"
-                )
-            return self._client.models.generate_content_stream(**kwargs)
-        return self._client.models.generate_content(**kwargs)
+            if name != ProviderName.GOOGLE.value:
+                raise RuntimeError(f"_force_stream is Google-only but provider is {name}")
+            return client.models.generate_content_stream(**kwargs)
+        return client.models.generate_content(**kwargs)
 
     def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
-        """Core interception logic for LLM calls.
-
-        Steps:
-        1. Estimate input tokens
-        2. Check budget
-        3. Select provider (circuit breaker)
-        4. Prepare kwargs (inject stream_options if streaming)
-        5. Call underlying client
-        6a. Non-streaming: extract usage, confirm budget, report metadata
-        6b. Streaming: return wrapped stream that does 6a on exhaustion
-        """
-        model = cast(str, kwargs["model"])
+        """Core interception logic: the classified candidate walk (§4.6)."""
+        requested_model = cast(str, kwargs["model"])
         is_streaming = bool(kwargs.get("stream", False)) or _force_stream
         agent_run = current_run()
-        is_model_fallback = False
+        primary = self._runtimes[0]
+        # Deadline starts here — it encompasses the budget pre-flight (§6.3).
+        deadline = Deadline(self._config.failover_total_timeout)
 
-        # 1. Estimate input tokens from input text (length-only; never materializes joined string)
+        # 1. Estimate input tokens (length-only; never materializes joined string).
         char_count = estimate_content_length(kwargs)
-        estimated_input_tokens = (
-            estimate_tokens_from_length(char_count, provider=self._detected_provider.value)
+        est_in = (
+            estimate_tokens_from_length(char_count, provider=primary.adapter.name)
             if char_count
             else 0
         )
 
-        # 2. Check budget
-        budget_result = self._budget.check_budget(
-            estimated_input_tokens=estimated_input_tokens,
-            model=model,
-            provider=self._detected_provider.value,
+        # 2. Check budget against the PRIMARY (we don't yet know who serves).
+        budget = self._budget.check_budget(
+            estimated_input_tokens=est_in,
+            model=requested_model,
+            provider=primary.adapter.name,
+            fallback_providers=[r.entry.provider.value for r in self._runtimes[1:]],
+            fallback_models=[r.entry.model for r in self._runtimes[1:]],
         )
 
-        if not budget_result.allowed:
+        if not budget.allowed:
             # Report estimated tokens so the API keeps an accurate running total
             # even for calls that were blocked by hard-deny.
             try:
                 event = self._build_metadata_event(
-                    model=model,
-                    provider=self._detected_provider.value,
-                    input_tokens=estimated_input_tokens,
+                    model=requested_model,
+                    provider=primary.adapter.name,
+                    input_tokens=est_in,
                     output_tokens=0,
                     token_details=None,
                     latency_ms=0.0,
@@ -246,147 +320,238 @@ class Solwyn(_SolwynBase):
                 logger.warning("Failed to report budget_denied metadata event", exc_info=True)
 
             raise BudgetExceededError(
-                project_id=budget_result.project_id,
-                budget_limit=budget_result.budget_limit,
-                current_usage=budget_result.current_usage,
-                estimated_cost=estimated_input_tokens * DEFAULT_COST_PER_TOKEN,
+                project_id=budget.project_id,
+                budget_limit=budget.budget_limit,
+                current_usage=budget.current_usage,
+                estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
                 budget_period="unknown",
-                mode=budget_result.mode.value,
+                mode=budget.mode.value,
             )
 
-        # 3. Select provider via circuit breaker
-        selected_provider = self._select_provider()
-        is_model_fallback = selected_provider != self._detected_provider.value
+        # 3. Resolve per-call idempotency override (strip before dispatch).
+        idempotent_override = cast(bool | None, kwargs.pop("solwyn_idempotent", None))
+        if idempotent_override is True:
+            effective_idempotency = "always"
+        elif idempotent_override is False:
+            effective_idempotency = "safe"
+        else:
+            effective_idempotency = self._config.failover_idempotency
+        allow_cross_provider = effective_idempotency != "never"
+        allow_ambiguous_failover = effective_idempotency == "always"
 
-        # 4. Prepare kwargs for streaming if needed
-        if is_streaming:
-            kwargs = self._adapter.prepare_streaming(kwargs)
-
-        # 5. Call underlying client (with same-provider model fallback retry)
-        ctx = _AttemptContext(
-            model=model,
-            kwargs=kwargs,
-            start_time=time.monotonic(),
-            is_model_fallback=is_model_fallback,
+        # 4. Router returns ordered, health-filtered candidates (non-mutating reads).
+        candidates = self._select_candidates(
+            RoutingRequest(
+                requested_provider=primary.entry.provider,
+                estimated_input_tokens=est_in,
+            )
         )
-        try:
-            response = self._sync_dispatch(ctx.kwargs, _force_stream=_force_stream)
-        except Exception as primary_exc:
-            cb = self._get_circuit_breaker(selected_provider)
-            should_retry_with_fallback = self._should_retry_with_fallback(ctx.model)
-            if not (should_retry_with_fallback and cb.state == CircuitState.HALF_OPEN):
-                cb.record_failure()
-            self._reporter.report(
-                self._build_error_event(
-                    model=ctx.model,
-                    provider=selected_provider,
-                    latency_ms=(time.monotonic() - ctx.start_time) * 1000,
-                    is_model_fallback=ctx.is_model_fallback,
-                    agent_run=agent_run,
-                )
+        if not allow_cross_provider:
+            candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
+        if not candidates:
+            raise ProviderUnavailableError("all providers unavailable", attempted=[])
+
+        # 5. Walk the candidates.
+        failed_providers: set[str] = set()
+        last_exc: Exception | None = None
+        for idx, rt in enumerate(candidates):
+            if deadline.expired():
+                break
+            provider = rt.adapter.name
+            cb = self._get_circuit_breaker(provider)
+            if not cb.can_proceed():  # probe CONSUMED only here, for the attempted candidate
+                continue
+
+            is_primary = rt is primary
+            is_provider_fallback = rt.entry.provider != primary.entry.provider
+            is_model_fallback = (not is_provider_fallback) and not is_primary
+
+            # P1: native passthrough (no _translation module yet). Fill-absent
+            # defaults: per-call kwargs > per-entry default_params > global.
+            merged_defaults = {**self._config.default_params, **rt.entry.default_params}
+            call_kwargs: dict[str, object] = {**merged_defaults, **kwargs}
+            if not is_primary:
+                call_kwargs = {**call_kwargs, "model": rt.entry.model}
+            served_model = requested_model if is_primary else rt.entry.model
+            if is_streaming:
+                call_kwargs = rt.adapter.prepare_streaming(call_kwargs)
+
+            ctx = _AttemptContext(
+                model=served_model,
+                start_time=time.monotonic(),
+                is_provider_fallback=is_provider_fallback,
+                attempt_index=idx,
             )
-
-            if not should_retry_with_fallback:
-                raise
-
-            fallback_kwargs = self._prepare_fallback_kwargs(ctx.kwargs)
-            fallback_model = cast(str, fallback_kwargs["model"])
-            retry_start = time.monotonic()
             try:
-                response = self._sync_dispatch(fallback_kwargs, _force_stream=_force_stream)
-            except Exception as retry_exc:
-                cb.record_failure()
+                response = self._sync_dispatch(
+                    rt,
+                    call_kwargs,
+                    _force_stream=_force_stream,
+                    # Shrinking per-hop slice (§6.3): divide what's left of the
+                    # chain deadline across the candidates not yet attempted so a
+                    # single hung hop cannot consume the whole budget.
+                    timeout=max(_MIN_HOP_TIMEOUT, deadline.remaining() / (len(candidates) - idx)),
+                    max_retries=0,
+                )
+            except Exception as exc:
+                disp = classify_exception(exc)
+                # Breaker accounting (§6.1): FAILOVER and POST_SEND_AMBIGUOUS are
+                # provider-health signals and DO count; FAIL_FAST (4xx/refusal) is
+                # a request-shaped error, not a health signal, so it must NOT open
+                # the breaker. Same-provider double-count guard (§4.6): at most one
+                # failure per provider per logical attempt.
+                if disp is not Disposition.FAIL_FAST and provider not in failed_providers:
+                    cb.record_failure()
+                    failed_providers.add(provider)
                 self._reporter.report(
                     self._build_error_event(
-                        model=fallback_model,
-                        provider=selected_provider,
-                        latency_ms=(time.monotonic() - retry_start) * 1000,
-                        is_model_fallback=True,
+                        model=served_model,
+                        provider=provider,
+                        latency_ms=ctx.elapsed_ms(),
+                        is_model_fallback=is_model_fallback,
+                        is_provider_fallback=is_provider_fallback,
+                        requested_provider=primary.entry.provider if is_provider_fallback else None,
+                        requested_model=requested_model if is_provider_fallback else None,
+                        failover_error_class=type(exc).__name__,
+                        attempt_index=idx,
                         agent_run=agent_run,
                     )
                 )
-                primary_exc.add_note(
-                    f"fallback_model={fallback_model!r} also failed: {type(retry_exc).__name__}"
+                if disp is Disposition.FAIL_FAST:
+                    raise  # 4xx/404/refusal — do NOT advance the chain
+                if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
+                    raise  # re-raise ORIGINAL exception (drop-in contract, §6.5)
+                last_exc = exc
+                continue  # pre-send safe -> advance to the next candidate
+
+            # 6. SUCCESS — settle against the SERVED runtime.
+            cb.record_success()
+            if is_streaming:
+                return self._wrap_stream(
+                    rt,
+                    response,
+                    ctx,
+                    budget,
+                    primary,
+                    requested_model=requested_model,
+                    is_model_fallback=is_model_fallback,
+                    agent_run=agent_run,
                 )
-                raise primary_exc from None
 
-            ctx = ctx.model_copy(
-                update={
-                    "model": fallback_model,
-                    "kwargs": fallback_kwargs,
-                    "is_model_fallback": True,
-                }
-            )
-
-        # 6. Streaming vs non-streaming post-processing
-        if is_streaming:
-            accumulator = self._adapter.create_stream_accumulator()
-
-            def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
-                cb = self._get_circuit_breaker(selected_provider)
-                cb.record_success()
-                if budget_result.reservation_id:
-                    confirm = self._budget.build_confirm_request(
-                        reservation_id=budget_result.reservation_id,
-                        model=ctx.model,
-                        token_details=token_details,
-                    )
-                    self._reporter.report_confirm(confirm)
-                service_tier = accumulator.get_service_tier()
-                event = self._build_metadata_event(
-                    model=ctx.model,
-                    provider=selected_provider,
+            token_details = self._adapter_extract_usage(rt, response)
+            if budget.reservation_id:
+                self._budget.confirm_cost(
+                    budget.reservation_id,
+                    served_model,
+                    token_details,
+                    provider=provider,
+                    is_provider_fallback=is_provider_fallback,
+                )
+            self._reporter.report(
+                self._build_metadata_event(
+                    model=served_model,
+                    provider=provider,
                     input_tokens=token_details.input_tokens,
                     output_tokens=token_details.output_tokens,
                     token_details=token_details,
-                    latency_ms=(time.monotonic() - ctx.start_time) * 1000,
+                    latency_ms=ctx.elapsed_ms(),
                     status=CallStatus.SUCCESS,
-                    is_model_fallback=ctx.is_model_fallback,
-                    service_tier=service_tier,
+                    is_model_fallback=is_model_fallback,
+                    is_provider_fallback=is_provider_fallback,
+                    requested_provider=primary.entry.provider if is_provider_fallback else None,
+                    requested_model=requested_model if is_provider_fallback else None,
+                    failover_reason=_success_failover_reason(
+                        is_provider_fallback=is_provider_fallback,
+                        is_model_fallback=is_model_fallback,
+                    ),
+                    attempt_index=idx,
+                    service_tier=rt.adapter.extract_service_tier(response),
                     agent_run=agent_run,
                 )
-                self._reporter.report(event)
+            )
+            return response  # P1: raw served response (normalization is P2)
 
-            def on_error(exc: Exception) -> None:
-                cb = self._get_circuit_breaker(selected_provider)
-                cb.record_failure()
-                self._reporter.report(
-                    self._build_error_event(
-                        model=ctx.model,
-                        provider=selected_provider,
-                        latency_ms=(time.monotonic() - ctx.start_time) * 1000,
-                        is_model_fallback=ctx.is_model_fallback,
-                        agent_run=agent_run,
-                    )
-                )
-
-            return SyncStreamWrapper(response, accumulator, on_complete, on_error)
-
-        # Non-streaming: existing flow
-        token_details = self._adapter.extract_usage(response)
-        elapsed_ms = (time.monotonic() - ctx.start_time) * 1000
-        cb = self._get_circuit_breaker(selected_provider)
-        cb.record_success()
-
-        if budget_result.reservation_id:
-            self._budget.confirm_cost(budget_result.reservation_id, ctx.model, token_details)
-
-        service_tier = self._adapter.extract_service_tier(response)
-        event = self._build_metadata_event(
-            model=ctx.model,
-            provider=selected_provider,
-            input_tokens=token_details.input_tokens,
-            output_tokens=token_details.output_tokens,
-            token_details=token_details,
-            latency_ms=elapsed_ms,
-            status=CallStatus.SUCCESS,
-            is_model_fallback=ctx.is_model_fallback,
-            service_tier=service_tier,
-            agent_run=agent_run,
+        if last_exc is not None:
+            raise last_exc
+        raise ProviderUnavailableError(
+            "all providers unavailable",
+            attempted=[r.adapter.name for r in candidates],
         )
-        self._reporter.report(event)
 
-        return response
+    @staticmethod
+    def _adapter_extract_usage(runtime: ProviderRuntime, response: Any) -> TokenDetails:
+        """Extract token usage via the served runtime's adapter."""
+        return runtime.adapter.extract_usage(response)
+
+    def _wrap_stream(
+        self,
+        runtime: ProviderRuntime,
+        response: Any,
+        ctx: _AttemptContext,
+        budget: Any,
+        primary: ProviderRuntime,
+        *,
+        requested_model: str,
+        is_model_fallback: bool,
+        agent_run: tuple[str | None, str | None],
+    ) -> SyncStreamWrapper:
+        """Wrap a streaming response, settling against the SERVED runtime."""
+        provider = runtime.adapter.name
+        served_model = ctx.model
+        is_provider_fallback = ctx.is_provider_fallback
+        accumulator = runtime.adapter.create_stream_accumulator()
+
+        def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
+            self._get_circuit_breaker(provider).record_success()
+            if budget.reservation_id:
+                confirm = self._budget.build_confirm_request(
+                    reservation_id=budget.reservation_id,
+                    model=served_model,
+                    token_details=token_details,
+                    provider=provider,
+                    is_provider_fallback=is_provider_fallback,
+                )
+                self._reporter.report_confirm(confirm)
+            self._reporter.report(
+                self._build_metadata_event(
+                    model=served_model,
+                    provider=provider,
+                    input_tokens=token_details.input_tokens,
+                    output_tokens=token_details.output_tokens,
+                    token_details=token_details,
+                    latency_ms=ctx.elapsed_ms(),
+                    status=CallStatus.SUCCESS,
+                    is_model_fallback=is_model_fallback,
+                    is_provider_fallback=is_provider_fallback,
+                    requested_provider=primary.entry.provider if is_provider_fallback else None,
+                    requested_model=requested_model if is_provider_fallback else None,
+                    failover_reason=_success_failover_reason(
+                        is_provider_fallback=is_provider_fallback,
+                        is_model_fallback=is_model_fallback,
+                    ),
+                    attempt_index=ctx.attempt_index,
+                    service_tier=accumulator.get_service_tier(),
+                    agent_run=agent_run,
+                )
+            )
+
+        def on_error(_exc: Exception) -> None:
+            self._get_circuit_breaker(provider).record_failure()
+            self._reporter.report(
+                self._build_error_event(
+                    model=served_model,
+                    provider=provider,
+                    latency_ms=ctx.elapsed_ms(),
+                    is_model_fallback=is_model_fallback,
+                    is_provider_fallback=is_provider_fallback,
+                    requested_provider=primary.entry.provider if is_provider_fallback else None,
+                    requested_model=requested_model if is_provider_fallback else None,
+                    attempt_index=ctx.attempt_index,
+                    agent_run=agent_run,
+                )
+            )
+
+        return SyncStreamWrapper(response, accumulator, on_complete, on_error)
 
     def close(self) -> None:
         """Shut down the reporter and close HTTP clients."""
@@ -434,6 +599,9 @@ class AsyncSolwyn(_SolwynBase):
         client: object,
         *,
         api_key: str | None = None,
+        model: str | None = None,
+        fallback: object = None,
+        default_params: dict[str, Any] | None = None,
         **config_kwargs: object,
     ) -> None:
         # Detect provider and store adapter for usage extraction
@@ -445,11 +613,16 @@ class AsyncSolwyn(_SolwynBase):
         if "project_id" in config_kwargs:
             raise TypeError("unexpected keyword argument 'project_id'")
 
+        # Build the [primary, *fallbacks] runtime chain (constructed up front).
+        fallback_specs = _normalize_fallback(fallback)
+        runtimes = build_runtimes(client, model, fallback_specs)
+
         # cfg_kwargs stays dict[str, Any]: mypy can't verify Pydantic's **kwargs
         # validation against SolwynConfig's typed fields, so tightening here
         # adds noise without type-safety gain. SolwynConfig validates at runtime.
         cfg_kwargs: dict[str, Any] = {
-            "primary_provider": self._detected_provider,
+            "providers": [rt.entry for rt in runtimes],
+            "default_params": default_params or {},
             **config_kwargs,
         }
         if api_key is not None:
@@ -462,7 +635,7 @@ class AsyncSolwyn(_SolwynBase):
                 first["msg"] if first else str(exc),
                 field=str(first["loc"][-1]) if first else None,
             ) from exc
-        super().__init__(config)
+        super().__init__(config, runtimes)
 
         self._budget = AsyncBudgetEnforcer(
             api_url=config.api_url,
@@ -511,48 +684,62 @@ class AsyncSolwyn(_SolwynBase):
             return _AsyncModelsProxy(self)
         return self._client.models
 
-    async def _async_dispatch(self, kwargs: dict[str, object], *, _force_stream: bool) -> Any:
-        """Dispatch the call to the underlying async SDK client. Pure I/O."""
-        if self._detected_provider == ProviderName.OPENAI:
-            return await self._client.chat.completions.create(**kwargs)
-        if self._detected_provider == ProviderName.ANTHROPIC:
-            return await self._client.messages.create(**kwargs)
+    async def _async_dispatch(
+        self,
+        runtime: ProviderRuntime,
+        kwargs: dict[str, object],
+        *,
+        _force_stream: bool,
+        timeout: float,
+        max_retries: int,
+    ) -> Any:
+        """Dispatch one hop to the runtime's async SDK client. Pure I/O.
+
+        Applies the mandatory per-hop bound via ``with_options`` (§6.3).
+        """
+        client = runtime.sdk_client
+        if hasattr(client, "with_options"):
+            client = client.with_options(timeout=timeout, max_retries=max_retries)
+        name = runtime.adapter.name
+        if name == ProviderName.OPENAI.value:
+            return await client.chat.completions.create(**kwargs)
+        if name == ProviderName.ANTHROPIC.value:
+            return await client.messages.create(**kwargs)
         if _force_stream:
-            if self._detected_provider != ProviderName.GOOGLE:
-                raise RuntimeError(
-                    f"_force_stream is Google-only but provider is {self._detected_provider}"
-                )
-            return await self._client.models.generate_content_stream(**kwargs)
-        return await self._client.models.generate_content(**kwargs)
+            if name != ProviderName.GOOGLE.value:
+                raise RuntimeError(f"_force_stream is Google-only but provider is {name}")
+            return await client.models.generate_content_stream(**kwargs)
+        return await client.models.generate_content(**kwargs)
 
     async def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
-        """Async core interception logic. See Solwyn._intercepted_call."""
-        model = cast(str, kwargs["model"])
+        """Async core interception logic: the classified candidate walk (§4.6)."""
+        requested_model = cast(str, kwargs["model"])
         is_streaming = bool(kwargs.get("stream", False)) or _force_stream
         agent_run = current_run()
-        is_model_fallback = False
+        primary = self._runtimes[0]
+        deadline = Deadline(self._config.failover_total_timeout)
 
         char_count = estimate_content_length(kwargs)
-        estimated_input_tokens = (
-            estimate_tokens_from_length(char_count, provider=self._detected_provider.value)
+        est_in = (
+            estimate_tokens_from_length(char_count, provider=primary.adapter.name)
             if char_count
             else 0
         )
 
-        budget_result = await self._budget.check_budget(
-            estimated_input_tokens=estimated_input_tokens,
-            model=model,
-            provider=self._detected_provider.value,
+        budget = await self._budget.check_budget(
+            estimated_input_tokens=est_in,
+            model=requested_model,
+            provider=primary.adapter.name,
+            fallback_providers=[r.entry.provider.value for r in self._runtimes[1:]],
+            fallback_models=[r.entry.model for r in self._runtimes[1:]],
         )
 
-        if not budget_result.allowed:
-            # Report estimated tokens so the API keeps an accurate running total
-            # even for calls that were blocked by hard-deny.
+        if not budget.allowed:
             try:
                 event = self._build_metadata_event(
-                    model=model,
-                    provider=self._detected_provider.value,
-                    input_tokens=estimated_input_tokens,
+                    model=requested_model,
+                    provider=primary.adapter.name,
+                    input_tokens=est_in,
                     output_tokens=0,
                     token_details=None,
                     latency_ms=0.0,
@@ -565,139 +752,224 @@ class AsyncSolwyn(_SolwynBase):
                 logger.warning("Failed to report budget_denied metadata event", exc_info=True)
 
             raise BudgetExceededError(
-                project_id=budget_result.project_id,
-                budget_limit=budget_result.budget_limit,
-                current_usage=budget_result.current_usage,
-                estimated_cost=estimated_input_tokens * DEFAULT_COST_PER_TOKEN,
+                project_id=budget.project_id,
+                budget_limit=budget.budget_limit,
+                current_usage=budget.current_usage,
+                estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
                 budget_period="unknown",
-                mode=budget_result.mode.value,
+                mode=budget.mode.value,
             )
 
-        selected_provider = self._select_provider()
-        is_model_fallback = selected_provider != self._detected_provider.value
+        idempotent_override = cast(bool | None, kwargs.pop("solwyn_idempotent", None))
+        if idempotent_override is True:
+            effective_idempotency = "always"
+        elif idempotent_override is False:
+            effective_idempotency = "safe"
+        else:
+            effective_idempotency = self._config.failover_idempotency
+        allow_cross_provider = effective_idempotency != "never"
+        allow_ambiguous_failover = effective_idempotency == "always"
 
-        if is_streaming:
-            kwargs = self._adapter.prepare_streaming(kwargs)
-
-        ctx = _AttemptContext(
-            model=model,
-            kwargs=kwargs,
-            start_time=time.monotonic(),
-            is_model_fallback=is_model_fallback,
+        candidates = self._select_candidates(
+            RoutingRequest(
+                requested_provider=primary.entry.provider,
+                estimated_input_tokens=est_in,
+            )
         )
-        try:
-            response = await self._async_dispatch(ctx.kwargs, _force_stream=_force_stream)
-        except Exception as primary_exc:
-            cb = self._get_circuit_breaker(selected_provider)
-            should_retry_with_fallback = self._should_retry_with_fallback(ctx.model)
-            if not (should_retry_with_fallback and cb.state == CircuitState.HALF_OPEN):
-                cb.record_failure()
-            self._reporter.report(
-                self._build_error_event(
-                    model=ctx.model,
-                    provider=selected_provider,
-                    latency_ms=(time.monotonic() - ctx.start_time) * 1000,
-                    is_model_fallback=ctx.is_model_fallback,
-                    agent_run=agent_run,
-                )
+        if not allow_cross_provider:
+            candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
+        if not candidates:
+            raise ProviderUnavailableError("all providers unavailable", attempted=[])
+
+        failed_providers: set[str] = set()
+        last_exc: Exception | None = None
+        for idx, rt in enumerate(candidates):
+            if deadline.expired():
+                break
+            provider = rt.adapter.name
+            cb = self._get_circuit_breaker(provider)
+            if not cb.can_proceed():
+                continue
+
+            is_primary = rt is primary
+            is_provider_fallback = rt.entry.provider != primary.entry.provider
+            is_model_fallback = (not is_provider_fallback) and not is_primary
+
+            merged_defaults = {**self._config.default_params, **rt.entry.default_params}
+            call_kwargs: dict[str, object] = {**merged_defaults, **kwargs}
+            if not is_primary:
+                call_kwargs = {**call_kwargs, "model": rt.entry.model}
+            served_model = requested_model if is_primary else rt.entry.model
+            if is_streaming:
+                call_kwargs = rt.adapter.prepare_streaming(call_kwargs)
+
+            ctx = _AttemptContext(
+                model=served_model,
+                start_time=time.monotonic(),
+                is_provider_fallback=is_provider_fallback,
+                attempt_index=idx,
             )
-
-            if not should_retry_with_fallback:
-                raise
-
-            fallback_kwargs = self._prepare_fallback_kwargs(ctx.kwargs)
-            fallback_model = cast(str, fallback_kwargs["model"])
-            retry_start = time.monotonic()
             try:
-                response = await self._async_dispatch(fallback_kwargs, _force_stream=_force_stream)
-            except Exception as retry_exc:
-                cb.record_failure()
+                response = await self._async_dispatch(
+                    rt,
+                    call_kwargs,
+                    _force_stream=_force_stream,
+                    # Shrinking per-hop slice (§6.3): divide what's left of the
+                    # chain deadline across the candidates not yet attempted so a
+                    # single hung hop cannot consume the whole budget.
+                    timeout=max(_MIN_HOP_TIMEOUT, deadline.remaining() / (len(candidates) - idx)),
+                    max_retries=0,
+                )
+            except Exception as exc:
+                disp = classify_exception(exc)
+                # Breaker accounting (§6.1): count FAILOVER + POST_SEND_AMBIGUOUS
+                # (real health signals); skip FAIL_FAST (request-shaped, not a
+                # health signal). Same-provider double-count guard (§4.6).
+                if disp is not Disposition.FAIL_FAST and provider not in failed_providers:
+                    cb.record_failure()
+                    failed_providers.add(provider)
                 self._reporter.report(
                     self._build_error_event(
-                        model=fallback_model,
-                        provider=selected_provider,
-                        latency_ms=(time.monotonic() - retry_start) * 1000,
-                        is_model_fallback=True,
+                        model=served_model,
+                        provider=provider,
+                        latency_ms=ctx.elapsed_ms(),
+                        is_model_fallback=is_model_fallback,
+                        is_provider_fallback=is_provider_fallback,
+                        requested_provider=primary.entry.provider if is_provider_fallback else None,
+                        requested_model=requested_model if is_provider_fallback else None,
+                        failover_error_class=type(exc).__name__,
+                        attempt_index=idx,
                         agent_run=agent_run,
                     )
                 )
-                primary_exc.add_note(
-                    f"fallback_model={fallback_model!r} also failed: {type(retry_exc).__name__}"
+                if disp is Disposition.FAIL_FAST:
+                    raise
+                if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
+                    raise
+                last_exc = exc
+                continue
+
+            cb.record_success()
+            if is_streaming:
+                return self._wrap_stream_async(
+                    rt,
+                    response,
+                    ctx,
+                    budget,
+                    primary,
+                    requested_model=requested_model,
+                    is_model_fallback=is_model_fallback,
+                    agent_run=agent_run,
                 )
-                raise primary_exc from None
 
-            ctx = ctx.model_copy(
-                update={
-                    "model": fallback_model,
-                    "kwargs": fallback_kwargs,
-                    "is_model_fallback": True,
-                }
-            )
-
-        if is_streaming:
-            accumulator = self._adapter.create_stream_accumulator()
-
-            async def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
-                cb = self._get_circuit_breaker(selected_provider)
-                cb.record_success()
-                if budget_result.reservation_id:
-                    await self._budget.confirm_cost(
-                        budget_result.reservation_id, ctx.model, token_details
-                    )
-                service_tier = accumulator.get_service_tier()
-                event = self._build_metadata_event(
-                    model=ctx.model,
-                    provider=selected_provider,
+            token_details = rt.adapter.extract_usage(response)
+            if budget.reservation_id:
+                await self._budget.confirm_cost(
+                    budget.reservation_id,
+                    served_model,
+                    token_details,
+                    provider=provider,
+                    is_provider_fallback=is_provider_fallback,
+                )
+            self._reporter.report(
+                self._build_metadata_event(
+                    model=served_model,
+                    provider=provider,
                     input_tokens=token_details.input_tokens,
                     output_tokens=token_details.output_tokens,
                     token_details=token_details,
-                    latency_ms=(time.monotonic() - ctx.start_time) * 1000,
+                    latency_ms=ctx.elapsed_ms(),
                     status=CallStatus.SUCCESS,
-                    is_model_fallback=ctx.is_model_fallback,
-                    service_tier=service_tier,
+                    is_model_fallback=is_model_fallback,
+                    is_provider_fallback=is_provider_fallback,
+                    requested_provider=primary.entry.provider if is_provider_fallback else None,
+                    requested_model=requested_model if is_provider_fallback else None,
+                    failover_reason=_success_failover_reason(
+                        is_provider_fallback=is_provider_fallback,
+                        is_model_fallback=is_model_fallback,
+                    ),
+                    attempt_index=idx,
+                    service_tier=rt.adapter.extract_service_tier(response),
                     agent_run=agent_run,
                 )
-                self._reporter.report(event)
+            )
+            return response
 
-            async def on_error(exc: Exception) -> None:
-                cb = self._get_circuit_breaker(selected_provider)
-                cb.record_failure()
-                self._reporter.report(
-                    self._build_error_event(
-                        model=ctx.model,
-                        provider=selected_provider,
-                        latency_ms=(time.monotonic() - ctx.start_time) * 1000,
-                        is_model_fallback=ctx.is_model_fallback,
-                        agent_run=agent_run,
-                    )
-                )
-
-            return AsyncStreamWrapper(response, accumulator, on_complete, on_error)
-
-        token_details = self._adapter.extract_usage(response)
-        elapsed_ms = (time.monotonic() - ctx.start_time) * 1000
-        cb = self._get_circuit_breaker(selected_provider)
-        cb.record_success()
-
-        if budget_result.reservation_id:
-            await self._budget.confirm_cost(budget_result.reservation_id, ctx.model, token_details)
-
-        service_tier = self._adapter.extract_service_tier(response)
-        event = self._build_metadata_event(
-            model=ctx.model,
-            provider=selected_provider,
-            input_tokens=token_details.input_tokens,
-            output_tokens=token_details.output_tokens,
-            token_details=token_details,
-            latency_ms=elapsed_ms,
-            status=CallStatus.SUCCESS,
-            is_model_fallback=ctx.is_model_fallback,
-            service_tier=service_tier,
-            agent_run=agent_run,
+        if last_exc is not None:
+            raise last_exc
+        raise ProviderUnavailableError(
+            "all providers unavailable",
+            attempted=[r.adapter.name for r in candidates],
         )
-        self._reporter.report(event)
 
-        return response
+    def _wrap_stream_async(
+        self,
+        runtime: ProviderRuntime,
+        response: Any,
+        ctx: _AttemptContext,
+        budget: Any,
+        primary: ProviderRuntime,
+        *,
+        requested_model: str,
+        is_model_fallback: bool,
+        agent_run: tuple[str | None, str | None],
+    ) -> AsyncStreamWrapper:
+        """Wrap an async streaming response, settling against the SERVED runtime."""
+        provider = runtime.adapter.name
+        served_model = ctx.model
+        is_provider_fallback = ctx.is_provider_fallback
+        accumulator = runtime.adapter.create_stream_accumulator()
+
+        async def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
+            self._get_circuit_breaker(provider).record_success()
+            if budget.reservation_id:
+                await self._budget.confirm_cost(
+                    budget.reservation_id,
+                    served_model,
+                    token_details,
+                    provider=provider,
+                    is_provider_fallback=is_provider_fallback,
+                )
+            self._reporter.report(
+                self._build_metadata_event(
+                    model=served_model,
+                    provider=provider,
+                    input_tokens=token_details.input_tokens,
+                    output_tokens=token_details.output_tokens,
+                    token_details=token_details,
+                    latency_ms=ctx.elapsed_ms(),
+                    status=CallStatus.SUCCESS,
+                    is_model_fallback=is_model_fallback,
+                    is_provider_fallback=is_provider_fallback,
+                    requested_provider=primary.entry.provider if is_provider_fallback else None,
+                    requested_model=requested_model if is_provider_fallback else None,
+                    failover_reason=_success_failover_reason(
+                        is_provider_fallback=is_provider_fallback,
+                        is_model_fallback=is_model_fallback,
+                    ),
+                    attempt_index=ctx.attempt_index,
+                    service_tier=accumulator.get_service_tier(),
+                    agent_run=agent_run,
+                )
+            )
+
+        async def on_error(_exc: Exception) -> None:
+            self._get_circuit_breaker(provider).record_failure()
+            self._reporter.report(
+                self._build_error_event(
+                    model=served_model,
+                    provider=provider,
+                    latency_ms=ctx.elapsed_ms(),
+                    is_model_fallback=is_model_fallback,
+                    is_provider_fallback=is_provider_fallback,
+                    requested_provider=primary.entry.provider if is_provider_fallback else None,
+                    requested_model=requested_model if is_provider_fallback else None,
+                    attempt_index=ctx.attempt_index,
+                    agent_run=agent_run,
+                )
+            )
+
+        return AsyncStreamWrapper(response, accumulator, on_complete, on_error)
 
     async def close(self) -> None:
         """Shut down the reporter and close HTTP clients."""

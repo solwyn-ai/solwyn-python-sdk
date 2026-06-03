@@ -66,8 +66,10 @@ def test_build_confirm_request_returns_pydantic_model() -> None:
         reservation_id="r_test_123",
         model="gpt-4o",
         token_details=token_details,
+        provider="openai",
     )
     assert isinstance(request, BudgetConfirmRequest)
     assert request.reservation_id == "r_test_123"
     assert request.model == "gpt-4o"
+    assert request.provider == "openai"
     enforcer.close()

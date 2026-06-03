@@ -21,6 +21,9 @@ def _mock_openai_client():
     # Set module to openai so auto-detection works
     client.__class__.__module__ = "openai._client"
     client.__class__.__name__ = "OpenAI"
+    # Per-hop with_options(timeout, max_retries) returns the SAME client so the
+    # configured .chat.completions.create mock is the one dispatch invokes.
+    client.with_options.return_value = client
 
     # Mock response with usage
     mock_response = MagicMock()
@@ -37,6 +40,7 @@ def _mock_anthropic_client():
     client = MagicMock()
     client.__class__.__module__ = "anthropic._client"
     client.__class__.__name__ = "Anthropic"
+    client.with_options.return_value = client
 
     mock_response = MagicMock()
     mock_response.usage = SimpleNamespace(
@@ -68,6 +72,19 @@ def _make_solwyn(client, **overrides):
 def _allow_budget_result() -> SimpleNamespace:
     """Minimal budget-check result for tests that bypass HTTP."""
     return SimpleNamespace(allowed=True, reservation_id=None)
+
+
+class _Status(Exception):
+    """A duck-typed transport error carrying an HTTP status_code.
+
+    classify_exception reads ``status_code``: 429 -> FAILOVER (advance the
+    chain). A bare ``RuntimeError`` would instead classify as FAIL_FAST and
+    stop the chain, so failover tests must use a status-bearing exception.
+    """
+
+    def __init__(self, status_code: int, message: str = "boom") -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 # ---------------------------------------------------------------------------
@@ -640,12 +657,15 @@ class TestSyncErrorAgentRunTagging:
         solwyn._budget._http.close()
 
     def test_fallback_retry_error_events_tag_agent_run_id(self) -> None:
+        # Same-provider model-swap fallback: the SAME client serves both hops.
+        # A 429-style error on the primary advances the chain to the gpt-4o-mini
+        # swap; the swap also 429s, so the chain exhausts and re-raises.
         client, _ = _mock_openai_client()
         client.chat.completions.create.side_effect = [
-            RuntimeError("primary failed"),
-            RuntimeError("fallback failed"),
+            _Status(429, "primary failed"),
+            _Status(429, "fallback failed"),
         ]
-        solwyn = _make_solwyn(client, fallback_model="gpt-4o-mini")
+        solwyn = _make_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
 
         reported_events: list = []
         solwyn._reporter.report = lambda e: reported_events.append(e)
@@ -653,7 +673,7 @@ class TestSyncErrorAgentRunTagging:
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()),
             solwyn_pkg.run("retry-doomed") as run_id,
-            pytest.raises(RuntimeError, match="primary failed"),
+            pytest.raises(_Status, match="fallback failed"),
         ):
             solwyn.chat.completions.create(
                 model="gpt-4o",
@@ -663,6 +683,8 @@ class TestSyncErrorAgentRunTagging:
         assert [event.status for event in reported_events] == ["error", "error"]
         assert all(event.agent_run_id == run_id for event in reported_events)
         assert all(event.agent_run_name == "retry-doomed" for event in reported_events)
+        # Second hop swapped the model on the same client.
+        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-4o-mini"
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
@@ -921,6 +943,7 @@ class TestSyncStreamingInterception:
         """Google models.generate_content_stream() wraps and reports after exhaustion."""
         client = MagicMock()
         client.__class__.__module__ = "google.genai._client"
+        client.with_options.return_value = client
 
         mock_chunks = [
             SimpleNamespace(
@@ -978,6 +1001,7 @@ class TestSyncStreamingInterception:
         """Anthropic messages.create(stream=True) wraps and reports after exhaustion."""
         client = MagicMock()
         client.__class__.__module__ = "anthropic._client"
+        client.with_options.return_value = client
 
         mock_events = [
             SimpleNamespace(
@@ -1202,6 +1226,7 @@ class TestAsyncStreamingInterception:
         """Async Google models.generate_content_stream() wraps and reports."""
         client = MagicMock()
         client.__class__.__module__ = "google.genai._client"
+        client.with_options.return_value = client
 
         async def async_google_stream():
             yield SimpleNamespace(
@@ -1246,6 +1271,7 @@ class TestAsyncStreamingInterception:
         """Async Anthropic messages.create(stream=True) wraps and reports."""
         client = MagicMock()
         client.__class__.__module__ = "anthropic._client"
+        client.with_options.return_value = client
 
         async def async_anthropic_stream():
             yield SimpleNamespace(
@@ -1464,15 +1490,16 @@ class TestAsyncNonStreamingInterception:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_async_fallback_retry_error_events_tag_agent_run_id(self) -> None:
+        # Same-provider model-swap fallback on the SAME client; both hops 429.
         client, _ = _mock_openai_client()
         client.chat.completions.create = AsyncMockFn(
             side_effect=[
-                RuntimeError("primary failed"),
-                RuntimeError("fallback failed"),
+                _Status(429, "primary failed"),
+                _Status(429, "fallback failed"),
             ]
         )
 
-        solwyn = _make_async_solwyn(client, fallback_model="gpt-4o-mini")
+        solwyn = _make_async_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
         reported_events: list = []
         solwyn._reporter.report = lambda e: reported_events.append(e)
 
@@ -1482,7 +1509,7 @@ class TestAsyncNonStreamingInterception:
             new=AsyncMockFn(return_value=_allow_budget_result()),
         ):
             async with solwyn_pkg.run("async-retry-doomed") as run_id:
-                with pytest.raises(RuntimeError, match="primary failed"):
+                with pytest.raises(_Status, match="fallback failed"):
                     await solwyn.chat.completions.create(
                         model="gpt-4o",
                         messages=[{"role": "user", "content": "Hello"}],
@@ -1491,6 +1518,7 @@ class TestAsyncNonStreamingInterception:
         assert [event.status for event in reported_events] == ["error", "error"]
         assert all(event.agent_run_id == run_id for event in reported_events)
         assert all(event.agent_run_name == "async-retry-doomed" for event in reported_events)
+        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-4o-mini"
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

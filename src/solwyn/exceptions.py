@@ -63,23 +63,29 @@ class BudgetExceededError(SolwynError):
 
 
 class ProviderUnavailableError(SolwynError):
-    """Raised when a provider's circuit breaker is open.
+    """Raised when a provider's circuit breaker is open or the chain is exhausted.
 
     Attributes:
-        provider: Name of the unavailable provider (e.g. ``"openai"``).
-        circuit_state: Current circuit breaker state string.
+        provider: Name of the unavailable provider (e.g. ``"openai"``), or
+            ``None`` when the error describes an exhausted chain rather than a
+            single provider.
+        circuit_state: Current circuit breaker state string, or ``None``.
+        attempted: Ordered list of providers the dispatcher tried before giving
+            up, or ``None`` when not applicable. Never contains prompt content.
     """
 
     def __init__(
         self,
         message: str,
         *,
-        provider: str,
-        circuit_state: str,
+        provider: str | None = None,
+        circuit_state: str | None = None,
+        attempted: list[str] | None = None,
     ) -> None:
         super().__init__(message)
         self.provider = provider
         self.circuit_state = circuit_state
+        self.attempted = attempted
 
 
 class ConfigurationError(SolwynError):

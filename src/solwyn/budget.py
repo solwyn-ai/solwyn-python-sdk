@@ -90,12 +90,21 @@ class _BudgetEnforcerBase:
         estimated_input_tokens: int,
         model: str,
         provider: str,
+        fallback_providers: list[str] | None = None,
+        fallback_models: list[str] | None = None,
     ) -> BudgetCheckRequest:
-        """Build a BudgetCheckRequest for the cloud API."""
+        """Build a BudgetCheckRequest for the cloud API.
+
+        ``fallback_providers``/``fallback_models`` describe the configured
+        failover chain (aligned element-for-element) as a hint to the API.
+        Both default to empty lists; the caller's lists are never mutated.
+        """
         return BudgetCheckRequest(
             estimated_input_tokens=estimated_input_tokens,
             model=model,
             provider=ProviderName(provider),
+            fallback_providers=[ProviderName(p) for p in (fallback_providers or [])],
+            fallback_models=list(fallback_models or []),
         )
 
     def _should_use_cache(self) -> bool:
@@ -268,15 +277,21 @@ class _BudgetEnforcerBase:
         reservation_id: str,
         model: str,
         token_details: TokenDetails,
+        *,
+        provider: str,
+        is_provider_fallback: bool = False,
     ) -> BudgetConfirmRequest:
         """Build a validated confirm request for fire-and-forget callers.
 
         Stream completion builds this synchronously (no I/O) and enqueues
-        it on the reporter thread, avoiding a blocking httpx.post.
+        it on the reporter thread, avoiding a blocking httpx.post. ``provider``
+        is the provider that actually served the call (required; §8.1).
         """
         return BudgetConfirmRequest(
             reservation_id=reservation_id,
             model=model,
+            provider=ProviderName(provider),
+            is_provider_fallback=is_provider_fallback,
             token_details=token_details,
         )
 
@@ -313,8 +328,13 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         estimated_input_tokens: int,
         model: str,
         provider: str,
+        fallback_providers: list[str] = [],  # noqa: B006 — read-only; never mutated
+        fallback_models: list[str] = [],  # noqa: B006 — read-only; never mutated
     ) -> BudgetCheckResult:
         """Check whether a call is within budget.
+
+        ``fallback_providers``/``fallback_models`` describe the configured
+        failover chain (aligned element-for-element) as a hint to the API.
 
         Behaviour matrix:
         - Cloud reachable + allowed: return allowed=True
@@ -339,7 +359,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     current_usage=cached.current_usage,
                 )
 
-        request = self._build_check_request(estimated_input_tokens, model, provider)
+        request = self._build_check_request(
+            estimated_input_tokens, model, provider, fallback_providers, fallback_models
+        )
 
         try:
             resp = self._http.post(
@@ -366,8 +388,13 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         reservation_id: str,
         model: str,
         token_details: TokenDetails,
+        *,
+        provider: str,
+        is_provider_fallback: bool = False,
     ) -> None:
         """Confirm actual token usage for a budget reservation.
+
+        ``provider`` is the provider that actually served the call (required).
 
         Best-effort: failures are logged but do not raise.
         Tracks consecutive failures; after _confirm_failure_threshold consecutive
@@ -377,6 +404,8 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             request = BudgetConfirmRequest(
                 reservation_id=reservation_id,
                 model=model,
+                provider=ProviderName(provider),
+                is_provider_fallback=is_provider_fallback,
                 token_details=token_details,
             )
             self._http.post(
@@ -438,6 +467,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         estimated_input_tokens: int,
         model: str,
         provider: str,
+        fallback_providers: list[str] = [],  # noqa: B006 — read-only; never mutated
+        fallback_models: list[str] = [],  # noqa: B006 — read-only; never mutated
     ) -> BudgetCheckResult:
         """Async version of budget check. See BudgetEnforcer.check_budget."""
         if self._should_use_cache():
@@ -454,7 +485,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 current_usage=cached.current_usage,
             )
 
-        request = self._build_check_request(estimated_input_tokens, model, provider)
+        request = self._build_check_request(
+            estimated_input_tokens, model, provider, fallback_providers, fallback_models
+        )
 
         try:
             resp = await self._http.post(
@@ -481,12 +514,17 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         reservation_id: str,
         model: str,
         token_details: TokenDetails,
+        *,
+        provider: str,
+        is_provider_fallback: bool = False,
     ) -> None:
         """Async version of cost confirmation. See BudgetEnforcer.confirm_cost."""
         try:
             request = BudgetConfirmRequest(
                 reservation_id=reservation_id,
                 model=model,
+                provider=ProviderName(provider),
+                is_provider_fallback=is_provider_fallback,
                 token_details=token_details,
             )
             await self._http.post(

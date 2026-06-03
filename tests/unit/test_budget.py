@@ -388,7 +388,7 @@ class TestConfirmCost:
         token_details = TokenDetails(input_tokens=100, output_tokens=50)
 
         with patch.object(enforcer._http, "post", return_value=mock_response) as mock_post:
-            enforcer.confirm_cost("res_123", "gpt-4o", token_details)
+            enforcer.confirm_cost("res_123", "gpt-4o", token_details, provider="openai")
 
         mock_post.assert_called_once()
         call_kwargs = mock_post.call_args
@@ -400,7 +400,7 @@ class TestConfirmCost:
 
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
             # Should not raise
-            enforcer.confirm_cost("res_123", "gpt-4o", token_details)
+            enforcer.confirm_cost("res_123", "gpt-4o", token_details, provider="openai")
 
 
 def test_budget_check_result_is_pydantic_model() -> None:

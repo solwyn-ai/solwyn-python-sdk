@@ -21,6 +21,9 @@ def _mock_anthropic_client():
     """Create a mock that looks like anthropic.Anthropic."""
     client = MagicMock()
     client.__class__.__module__ = "anthropic._client"
+    # Per-hop with_options(timeout, max_retries) must return the same client so
+    # the configured .messages.create mock is the one actually invoked.
+    client.with_options.return_value = client
     client.messages.create.return_value = SimpleNamespace(
         content=[SimpleNamespace(text="Hello")],
         usage=SimpleNamespace(
@@ -36,6 +39,8 @@ def _mock_google_client():
     """Create a mock that looks like google.genai.Client."""
     client = MagicMock()
     client.__class__.__module__ = "google.genai._client"
+    # Per-hop with_options must return the same client (see _mock_anthropic_client).
+    client.with_options.return_value = client
     client.models.generate_content.return_value = SimpleNamespace(
         text="Hello",
         usage_metadata=SimpleNamespace(

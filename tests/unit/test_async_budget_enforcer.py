@@ -162,7 +162,7 @@ class TestAsyncConfirmCost:
         token_details = TokenDetails(input_tokens=100, output_tokens=50)
 
         enforcer._http.post = AsyncMock(return_value=mock_response)
-        await enforcer.confirm_cost("res_123", "gpt-4o", token_details)
+        await enforcer.confirm_cost("res_123", "gpt-4o", token_details, provider="openai")
 
         enforcer._http.post.assert_called_once()
         call_args = enforcer._http.post.call_args
@@ -177,7 +177,7 @@ class TestAsyncConfirmCost:
 
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
             # Should not raise
-            await enforcer.confirm_cost("res_123", "gpt-4o", token_details)
+            await enforcer.confirm_cost("res_123", "gpt-4o", token_details, provider="openai")
 
         await enforcer.close()
 

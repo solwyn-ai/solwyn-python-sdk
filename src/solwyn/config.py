@@ -7,11 +7,11 @@ Configuration via constructor kwargs or environment variables with the
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from solwyn._types import BudgetMode, ProviderName
+from solwyn._types import BudgetMode, ProviderEntry
 from solwyn._validation import validate_project_key_format
 from solwyn.exceptions import ConfigurationError
 
@@ -33,8 +33,18 @@ class SolwynConfig(BaseModel):
     api_url: str = "https://api.solwyn.ai"
     fail_open: bool = True
     budget_mode: BudgetMode = BudgetMode.ALERT_ONLY
-    primary_provider: ProviderName = ProviderName.OPENAI
-    fallback_model: str | None = None
+
+    # Provider failover chain (replaces primary_provider + fallback_model).
+    # providers[0] is the primary; the rest are fallbacks in attempt order.
+    providers: list[ProviderEntry] = Field(default_factory=list)
+    # Global fill-absent defaults (per-entry default_params wins; see §5.2).
+    default_params: dict[str, Any] = Field(default_factory=dict)
+
+    # Failover knobs (§4.4 / §6.3 / §6.5)
+    failover_total_timeout: float = 30.0
+    failover_idempotency: Literal["safe", "never", "always"] = "safe"
+    same_provider_retries: int = 0
+    circuit_breaker_recovery_timeout_jitter: float = 0.2
 
     # Circuit breaker tuning
     circuit_breaker_failure_threshold: int = 3
@@ -61,8 +71,6 @@ class SolwynConfig(BaseModel):
             "api_url": "API_URL",
             "fail_open": "FAIL_OPEN",
             "budget_mode": "BUDGET_MODE",
-            "primary_provider": "PRIMARY_PROVIDER",
-            "fallback_model": "FALLBACK_MODEL",
             "circuit_breaker_failure_threshold": "CIRCUIT_BREAKER_FAILURE_THRESHOLD",
             "circuit_breaker_recovery_timeout": "CIRCUIT_BREAKER_RECOVERY_TIMEOUT",
             "circuit_breaker_success_threshold": "CIRCUIT_BREAKER_SUCCESS_THRESHOLD",
@@ -93,4 +101,11 @@ class SolwynConfig(BaseModel):
         except ValueError as exc:
             raise ConfigurationError(str(exc), field="api_key") from exc
 
+        return self
+
+    @model_validator(mode="after")
+    def _check_chain(self) -> SolwynConfig:
+        """Require at least one provider entry in the failover chain."""
+        if not self.providers:
+            raise ConfigurationError("at least one provider entry required", field="providers")
         return self

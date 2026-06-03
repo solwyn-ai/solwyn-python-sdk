@@ -8,18 +8,28 @@ seam without exercising the full HTTP layer.
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 from conftest import VALID_API_KEY
 
 import solwyn
 from solwyn._base import _SolwynBase
-from solwyn._types import CallStatus, MetadataEvent
+from solwyn._registry import build_runtimes
+from solwyn._types import CallStatus, MetadataEvent, ProviderEntry, ProviderName
 from solwyn.config import SolwynConfig
 
 
 def _make_base() -> _SolwynBase:
-    return _SolwynBase(SolwynConfig(api_key=VALID_API_KEY))
+    client = MagicMock()
+    client.__class__.__module__ = "openai._client"
+    client.__class__.__name__ = "OpenAI"
+    runtimes = build_runtimes(client, "gpt-4o", [])
+    config = SolwynConfig(
+        api_key=VALID_API_KEY,
+        providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-4o")],
+    )
+    return _SolwynBase(config, runtimes)
 
 
 def _build(base: _SolwynBase) -> MetadataEvent:

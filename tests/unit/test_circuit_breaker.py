@@ -149,3 +149,84 @@ class TestGetState:
 def test_circuit_breaker_state_is_pydantic_model() -> None:
     """CircuitBreakerState must be a Pydantic BaseModel, not a dataclass."""
     assert issubclass(CircuitBreakerState, BaseModel)
+
+
+@pytest.mark.unit
+class TestRecoveryEligible:
+    """recovery_eligible is a non-mutating read; the router orders on it."""
+
+    def test_false_when_closed(self) -> None:
+        cb = CircuitBreaker()
+        assert cb.recovery_eligible is False
+        assert cb.state == CircuitState.CLOSED
+
+    def test_false_when_open_before_timeout(self) -> None:
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=60)
+        cb.record_failure()
+        assert cb.state == CircuitState.OPEN
+
+        assert cb.recovery_eligible is False
+        assert cb.state == CircuitState.OPEN  # unchanged
+
+    def test_true_when_open_after_timeout_without_mutating(self) -> None:
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=10)
+        cb.record_failure()
+        assert cb.state == CircuitState.OPEN
+
+        # Simulate time passing beyond recovery_timeout.
+        cb.last_failure_time = time.monotonic() - 15
+
+        # Inspection must report eligibility WITHOUT flipping to HALF_OPEN.
+        assert cb.recovery_eligible is True
+        assert cb.state == CircuitState.OPEN  # still OPEN — pure read
+
+        # Re-reading is idempotent (still non-mutating).
+        assert cb.recovery_eligible is True
+        assert cb.state == CircuitState.OPEN
+
+        # can_proceed() is the ONLY consumer permitted to transition.
+        assert cb.can_proceed() is True
+        assert cb.state == CircuitState.HALF_OPEN
+
+    def test_false_when_half_open(self) -> None:
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0)
+        cb.record_failure()
+        cb.can_proceed()  # -> HALF_OPEN
+        assert cb.state == CircuitState.HALF_OPEN
+
+        assert cb.recovery_eligible is False
+        assert cb.state == CircuitState.HALF_OPEN
+
+
+@pytest.mark.unit
+class TestRecoveryTimeoutJitter:
+    """recovery_timeout_jitter widens/narrows the effective recovery window."""
+
+    def test_default_jitter_is_deterministic(self) -> None:
+        # jitter=0.0 (default) keeps behavior identical to the un-jittered path.
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=10)
+        cb.record_failure()
+
+        cb.last_failure_time = time.monotonic() - 9.9
+        assert cb.recovery_eligible is False  # below window
+        cb.last_failure_time = time.monotonic() - 10.1
+        assert cb.recovery_eligible is True  # above window
+
+    def test_effective_window_within_jitter_bounds(self) -> None:
+        # With ±20% jitter the effective window stays inside [8, 12] for a
+        # 10s base across many opens — never outside the bound.
+        for _ in range(200):
+            cb = CircuitBreaker(
+                failure_threshold=1,
+                recovery_timeout=10,
+                recovery_timeout_jitter=0.2,
+            )
+            cb.record_failure()  # opens -> samples an effective window
+
+            # Just under the minimum possible window -> never eligible.
+            cb.last_failure_time = time.monotonic() - 7.9
+            assert cb.recovery_eligible is False
+
+            # Just over the maximum possible window -> always eligible.
+            cb.last_failure_time = time.monotonic() - 12.1
+            assert cb.recovery_eligible is True

@@ -1,0 +1,156 @@
+"""Unit tests for solwyn._registry.build_runtimes (sans-I/O client holder).
+
+The registry detects each client's adapter by *type* only (no network), builds
+a ProviderEntry per spec, and returns ProviderRuntime objects in
+[primary, *fallbacks] order. Clients are faked with MagicMock whose
+__class__.__module__ matches a provider SDK so get_adapter_for_client detects
+them.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+import pytest
+
+from solwyn._registry import ProviderRuntime, build_runtimes
+from solwyn._types import ProviderName
+from solwyn.exceptions import ConfigurationError
+
+
+def _mock_client(module: str) -> MagicMock:
+    """Return a MagicMock whose type module path triggers adapter detection."""
+    client = MagicMock()
+    client.__class__.__module__ = module
+    return client
+
+
+@pytest.mark.unit
+def test_build_runtimes_primary_only() -> None:
+    # Arrange
+    primary = _mock_client("openai._client")
+
+    # Act
+    runtimes = build_runtimes(primary, "gpt-4o", [])
+
+    # Assert
+    assert len(runtimes) == 1
+    assert isinstance(runtimes[0], ProviderRuntime)
+    assert runtimes[0].entry.provider == ProviderName.OPENAI
+    assert runtimes[0].entry.model == "gpt-4o"
+    assert runtimes[0].entry.default_params == {}
+    assert runtimes[0].sdk_client is primary
+    assert runtimes[0].adapter.name == "openai"
+
+
+@pytest.mark.unit
+def test_build_runtimes_order_is_primary_then_fallbacks() -> None:
+    # Arrange
+    primary = _mock_client("openai._client")
+    fb_anthropic = _mock_client("anthropic._client")
+    fb_google = _mock_client("google.genai")
+
+    # Act
+    runtimes = build_runtimes(
+        primary,
+        "gpt-4o",
+        [(fb_anthropic, "claude-3-5-sonnet"), (fb_google, "gemini-1.5-pro")],
+    )
+
+    # Assert — order preserved: [primary, *fallbacks]
+    assert [r.entry.provider for r in runtimes] == [
+        ProviderName.OPENAI,
+        ProviderName.ANTHROPIC,
+        ProviderName.GOOGLE,
+    ]
+    assert [r.entry.model for r in runtimes] == [
+        "gpt-4o",
+        "claude-3-5-sonnet",
+        "gemini-1.5-pro",
+    ]
+    assert runtimes[1].sdk_client is fb_anthropic
+    assert runtimes[2].sdk_client is fb_google
+
+
+@pytest.mark.unit
+def test_entry_provider_matches_detected_adapter() -> None:
+    # Arrange — each client maps to a distinct provider
+    primary = _mock_client("anthropic._client")
+    fb = _mock_client("google.genai")
+
+    # Act
+    runtimes = build_runtimes(primary, "claude-3-5-sonnet", [(fb, "gemini-1.5-pro")])
+
+    # Assert — entry.provider is derived from adapter.name, not the caller
+    for runtime in runtimes:
+        assert runtime.entry.provider.value == runtime.adapter.name
+
+
+@pytest.mark.unit
+def test_two_tuple_fallback_spec_has_empty_default_params() -> None:
+    # Arrange
+    primary = _mock_client("openai._client")
+    fb = _mock_client("anthropic._client")
+
+    # Act
+    runtimes = build_runtimes(primary, "gpt-4o", [(fb, "claude-3-5-sonnet")])
+
+    # Assert
+    assert runtimes[1].entry.default_params == {}
+
+
+@pytest.mark.unit
+def test_three_tuple_fallback_spec_carries_default_params() -> None:
+    # Arrange
+    primary = _mock_client("openai._client")
+    fb = _mock_client("anthropic._client")
+    params = {"max_tokens": 1024, "temperature": 0.2}
+
+    # Act
+    runtimes = build_runtimes(primary, "gpt-4o", [(fb, "claude-3-5-sonnet", params)])
+
+    # Assert
+    assert runtimes[1].entry.default_params == params
+
+
+@pytest.mark.unit
+def test_primary_model_none_yields_empty_model_string() -> None:
+    # Arrange
+    primary = _mock_client("openai._client")
+
+    # Act
+    runtimes = build_runtimes(primary, None, [])
+
+    # Assert — per-call model wins for primary, "" placeholder is fine
+    assert runtimes[0].entry.model == ""
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "bad_spec",
+    [
+        (_mock_client("anthropic._client"),),  # 1-tuple: missing model
+        (_mock_client("anthropic._client"), "m", {}, "extra"),  # 4-tuple: too long
+        "not-a-tuple",  # not a sequence pair at all
+        (_mock_client("anthropic._client"), 123),  # model not a str
+        (_mock_client("anthropic._client"), "m", "not-a-dict"),  # params not a dict
+    ],
+)
+def test_malformed_fallback_spec_raises_configuration_error(bad_spec: object) -> None:
+    # Arrange
+    primary = _mock_client("openai._client")
+
+    # Act / Assert
+    with pytest.raises(ConfigurationError):
+        build_runtimes(primary, "gpt-4o", [bad_spec])
+
+
+@pytest.mark.unit
+def test_runtime_is_frozen_dataclass() -> None:
+    # Arrange
+    primary = _mock_client("openai._client")
+    runtimes = build_runtimes(primary, "gpt-4o", [])
+
+    # Act / Assert — frozen dataclass rejects attribute assignment
+    with pytest.raises(Exception):  # noqa: B017 — FrozenInstanceError subclass varies
+        runtimes[0].entry = None  # type: ignore[misc]
