@@ -40,8 +40,9 @@ class ProviderCandidate:
     ``breaker_state`` and ``recovery_eligible`` are read from the breaker WITHOUT
     mutating it (unlike ``can_proceed()``). ``translatable`` is the per-target
     request-translation predicate: always ``True`` in P1; P2 supplies the real
-    per-target value. ``price_hint`` is populated later (P5) from a
-    SERVER-provided relative-price signal — the SDK never computes price.
+    per-target value. ``price_hint`` is populated (P5) from a SERVER-provided
+    relative-price signal — the SDK never computes price. ``latency_p50`` is the
+    observed p50 latency (ms) for this provider, ``None`` until enough samples.
     """
 
     runtime: ProviderRuntime
@@ -49,6 +50,7 @@ class ProviderCandidate:
     recovery_eligible: bool
     translatable: bool
     price_hint: float | None = None
+    latency_p50: float | None = None
 
 
 class RoutingRequest(BaseModel):
@@ -70,6 +72,37 @@ class SelectionPolicy(Protocol):
         ...
 
 
+_STATE_PRIORITY = {
+    CircuitState.CLOSED: 0,
+    CircuitState.HALF_OPEN: 1,
+    CircuitState.OPEN: 2,
+}
+
+
+def _usable(candidates: list[ProviderCandidate]) -> list[ProviderCandidate]:
+    """Drop OPEN breakers that are not recovery-eligible (shared health filter).
+
+    Every policy reuses THIS one filter so health filtering can never drift: a
+    candidate that is OPEN-not-eligible is unavailable and must never be
+    attempted, regardless of how a policy then orders the survivors.
+    """
+    return [
+        c for c in candidates if c.breaker_state is not CircuitState.OPEN or c.recovery_eligible
+    ]
+
+
+def _health_key(candidate: ProviderCandidate) -> tuple[int, bool]:
+    """Shared health-tier sort key: CLOSED < HALF_OPEN < recovery-eligible OPEN.
+
+    The secondary ``not translatable`` term sinks an untranslatable target below
+    a translatable one WITHIN the same state tier (a translatable target is
+    always preferable when both are equally healthy). Reused by every policy so
+    none can promote an untranslatable target above a translatable one in the
+    same usable set, nor jump an unhealthier candidate ahead of a healthier one.
+    """
+    return (_STATE_PRIORITY[candidate.breaker_state], not candidate.translatable)
+
+
 class HealthBasedPolicy:
     """v1 default policy.
 
@@ -85,13 +118,69 @@ class HealthBasedPolicy:
     def order(
         self, candidates: list[ProviderCandidate], req: RoutingRequest
     ) -> list[ProviderCandidate]:
-        prio = {
-            CircuitState.CLOSED: 0,
-            CircuitState.HALF_OPEN: 1,
-            CircuitState.OPEN: 2,
-        }
-        usable = [
-            c for c in candidates if c.breaker_state is not CircuitState.OPEN or c.recovery_eligible
-        ]
         # sorted() is stable, so configured order is preserved within a tier.
-        return sorted(usable, key=lambda c: (prio[c.breaker_state], not c.translatable))
+        return sorted(_usable(candidates), key=_health_key)
+
+
+class LatencyPolicy:
+    """Latency-aware drop-in policy (pure; sans-I/O).
+
+    Applies the SAME health filtering as ``HealthBasedPolicy`` (drop
+    OPEN-not-eligible; CLOSED before HALF_OPEN before recovery-eligible OPEN;
+    untranslatable sinks below translatable in a tier), then within that usable
+    health-ordered set prefers the LOWER observed p50 latency. A candidate whose
+    ``latency_p50`` is ``None`` (not enough samples yet) sorts AFTER any
+    candidate with a known p50 — unknown latency never jumps the queue.
+
+    PURE drop-in: only REORDERS the usable set. Never calls ``can_proceed()``,
+    never mutates a breaker, does no I/O, and computes no price. Swapping this in
+    for ``HealthBasedPolicy`` changes routing order with zero dispatch changes.
+    """
+
+    def order(
+        self, candidates: list[ProviderCandidate], req: RoutingRequest
+    ) -> list[ProviderCandidate]:
+        # Stable secondary sort by latency keeps the health tier dominant: a
+        # candidate with a known low p50 still never outranks a healthier tier.
+        # (None p50 -> +inf sentinel so it sinks below every known p50.)
+        return sorted(
+            _usable(candidates),
+            key=lambda c: (
+                *_health_key(c),
+                c.latency_p50 if c.latency_p50 is not None else float("inf"),
+            ),
+        )
+
+
+class CostPolicy:
+    """Cost-aware drop-in policy (pure; sans-I/O; NO price math).
+
+    Applies the SAME health filtering as ``HealthBasedPolicy``, then within that
+    usable health-ordered set prefers the LOWER ``price_hint``. ``price_hint`` is
+    a SERVER-provided RELATIVE price signal (from ``BudgetCheckResponse``); the
+    SDK never computes, derives, or arithmetically combines price — it only reads
+    the hint and orders by it. A candidate whose ``price_hint`` is ``None`` sorts
+    AFTER any candidate with a known hint. If NO candidate carries a hint (the
+    server has not provided one yet), this falls back to the plain
+    ``HealthBasedPolicy`` order so behaviour is identical to today.
+
+    PURE drop-in: only REORDERS the usable set. Never calls ``can_proceed()``,
+    never mutates a breaker, does no I/O, and does no price arithmetic.
+    """
+
+    def order(
+        self, candidates: list[ProviderCandidate], req: RoutingRequest
+    ) -> list[ProviderCandidate]:
+        usable = _usable(candidates)
+        if not any(c.price_hint is not None for c in usable):
+            # Server has fed no price hints yet — identical to health order.
+            return sorted(usable, key=_health_key)
+        # Stable secondary sort by the server hint keeps the health tier dominant.
+        # (None hint -> +inf sentinel so it sinks below every known hint.)
+        return sorted(
+            usable,
+            key=lambda c: (
+                *_health_key(c),
+                c.price_hint if c.price_hint is not None else float("inf"),
+            ),
+        )

@@ -71,7 +71,7 @@ def _make_solwyn(client, **overrides):
 
 def _allow_budget_result() -> SimpleNamespace:
     """Minimal budget-check result for tests that bypass HTTP."""
-    return SimpleNamespace(allowed=True, reservation_id=None)
+    return SimpleNamespace(allowed=True, reservation_id=None, price_hints=None)
 
 
 class _Status(Exception):
@@ -1379,6 +1379,7 @@ class TestAsyncNonStreamingInterception:
             current_usage=10.0,
             mode=BudgetMode.HARD_DENY,
             reservation_id=None,
+            price_hints=None,
         )
 
         with patch.object(

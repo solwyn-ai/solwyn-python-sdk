@@ -223,6 +223,13 @@ class BudgetCheckResponse(BaseModel):
         ..., description="Which budget period triggered denial (e.g. 'daily')"
     )
     project_id: str = Field(..., description="Project identifier resolved from the API key")
+    price_hints: dict[ProviderName, float] | None = Field(
+        default=None,
+        description=(
+            "Server-provided RELATIVE price signal per provider for cost routing; "
+            "SDK never computes price"
+        ),
+    )
 
 
 class BudgetConfirmRequest(BaseModel):

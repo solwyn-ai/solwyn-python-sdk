@@ -83,7 +83,7 @@ def _anthropic_response() -> SimpleNamespace:
 
 def _allow_budget() -> SimpleNamespace:
     """Allow result with no reservation (skips confirm_cost)."""
-    return SimpleNamespace(allowed=True, reservation_id=None)
+    return SimpleNamespace(allowed=True, reservation_id=None, price_hints=None)
 
 
 def _make_solwyn(client: object, **overrides: object) -> Solwyn:

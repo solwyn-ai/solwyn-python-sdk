@@ -50,6 +50,7 @@ def _allow_budget(reservation_id: str | None = "res_123") -> SimpleNamespace:
         budget_limit=100.0,
         current_usage=0.0,
         mode=SimpleNamespace(value="alert_only"),
+        price_hints=None,
     )
 
 

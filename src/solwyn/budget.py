@@ -46,6 +46,9 @@ class BudgetCheckResult(BaseModel):
     warning: str | None = None
     budget_limit: float = 0.0
     current_usage: float = 0.0
+    # Server-provided RELATIVE price signal per provider for cost routing
+    # (CostPolicy). The SDK never computes price. None on the cache path.
+    price_hints: dict[str, float] | None = None
 
 
 class _BudgetEnforcerBase:
@@ -159,6 +162,15 @@ class _BudgetEnforcerBase:
         - denied + alert_only -> return allowed=True with warning
         - denied + hard_deny -> return allowed=False
         """
+        # Server-provided RELATIVE price hints (cost routing); str-keyed for the
+        # routing layer. None when the server has not provided them. The SDK
+        # never computes price — it only forwards this signal to CostPolicy.
+        price_hints = (
+            {provider.value: hint for provider, hint in response.price_hints.items()}
+            if response.price_hints is not None
+            else None
+        )
+
         if response.allowed:
             return BudgetCheckResult(
                 allowed=True,
@@ -168,6 +180,7 @@ class _BudgetEnforcerBase:
                 mode=response.mode,
                 budget_limit=response.budget_limit,
                 current_usage=response.current_usage,
+                price_hints=price_hints,
             )
 
         # Denied by cloud
@@ -189,6 +202,7 @@ class _BudgetEnforcerBase:
                 ),
                 budget_limit=response.budget_limit,
                 current_usage=response.current_usage,
+                price_hints=price_hints,
             )
 
         # hard_deny

@@ -156,7 +156,7 @@ def _google_client() -> MagicMock:
 
 
 def _allow_budget(reservation_id: str | None = None) -> SimpleNamespace:
-    return SimpleNamespace(allowed=True, reservation_id=reservation_id)
+    return SimpleNamespace(allowed=True, reservation_id=reservation_id, price_hints=None)
 
 
 def _make_solwyn(client: object, **overrides: object) -> Solwyn:

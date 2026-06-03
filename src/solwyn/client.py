@@ -40,7 +40,7 @@ from solwyn._proxies import (
     _SyncModelsProxy,
 )
 from solwyn._registry import ProviderRuntime, build_runtimes
-from solwyn._routing import RoutingRequest
+from solwyn._routing import RoutingRequest, SelectionPolicy
 from solwyn._run import current_run
 from solwyn._token_details import TokenDetails
 from solwyn._types import CallStatus, FailoverReason, ProviderName
@@ -353,6 +353,7 @@ class Solwyn(_SolwynBase):
         model: str | None = None,
         fallback: object = None,
         default_params: dict[str, Any] | None = None,
+        selection_policy: SelectionPolicy | None = None,
         **config_kwargs: object,
     ) -> None:
         # Detect provider and store adapter for usage extraction
@@ -391,7 +392,7 @@ class Solwyn(_SolwynBase):
                 first["msg"] if first else str(exc),
                 field=str(first["loc"][-1]) if first else None,
             ) from exc
-        super().__init__(config, runtimes)
+        super().__init__(config, runtimes, selection_policy=selection_policy)
 
         # Budget enforcer
         self._budget = BudgetEnforcer(
@@ -512,6 +513,13 @@ class Solwyn(_SolwynBase):
             fallback_providers=[r.entry.provider.value for r in self._runtimes[1:]],
             fallback_models=[r.entry.model for r in self._runtimes[1:]],
         )
+        # Refresh the CostPolicy signal from the server. Price hints are advisory
+        # and slow-moving, so they PERSIST across hint-less responses — a budget
+        # cache hit (price_hints None) leaves the last-known hints in place; we
+        # only overwrite when the server actually returns hints. The SDK never
+        # computes price — it only forwards this relative signal.
+        if budget.price_hints is not None:
+            self.update_price_hints(budget.price_hints)
 
         if not budget.allowed:
             # Report estimated tokens so the API keeps an accurate running total
@@ -692,6 +700,11 @@ class Solwyn(_SolwynBase):
                     agent_run=agent_run,
                 )
 
+            # P5 LatencyPolicy signal: record this served hop's success latency
+            # (non-streaming). Streaming records in on_complete when the stream
+            # settles. Pure signal store — no I/O, no routing change here.
+            self.record_latency(provider, ctx.elapsed_ms())
+
             token_details = self._adapter_extract_usage(rt, response)
             if budget.reservation_id:
                 self._budget.confirm_cost(
@@ -771,6 +784,9 @@ class Solwyn(_SolwynBase):
 
         def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             self._get_circuit_breaker(provider).record_success()
+            # P5 LatencyPolicy signal: record the SERVED provider's latency as the
+            # stream settles (mirrors the non-streaming path). Pure signal store.
+            self.record_latency(provider, ctx.elapsed_ms())
             if budget.reservation_id:
                 confirm = self._budget.build_confirm_request(
                     reservation_id=budget.reservation_id,
@@ -886,6 +902,7 @@ class AsyncSolwyn(_SolwynBase):
         model: str | None = None,
         fallback: object = None,
         default_params: dict[str, Any] | None = None,
+        selection_policy: SelectionPolicy | None = None,
         **config_kwargs: object,
     ) -> None:
         # Detect provider and store adapter for usage extraction
@@ -919,7 +936,7 @@ class AsyncSolwyn(_SolwynBase):
                 first["msg"] if first else str(exc),
                 field=str(first["loc"][-1]) if first else None,
             ) from exc
-        super().__init__(config, runtimes)
+        super().__init__(config, runtimes, selection_policy=selection_policy)
 
         self._budget = AsyncBudgetEnforcer(
             api_url=config.api_url,
@@ -1026,6 +1043,11 @@ class AsyncSolwyn(_SolwynBase):
             fallback_providers=[r.entry.provider.value for r in self._runtimes[1:]],
             fallback_models=[r.entry.model for r in self._runtimes[1:]],
         )
+        # Refresh the CostPolicy signal from the server. Hints PERSIST across
+        # hint-less responses (cache hits) until the server sends new ones — see
+        # the sync _intercepted_call for the rationale.
+        if budget.price_hints is not None:
+            self.update_price_hints(budget.price_hints)
 
         if not budget.allowed:
             try:
@@ -1194,6 +1216,11 @@ class AsyncSolwyn(_SolwynBase):
                     agent_run=agent_run,
                 )
 
+            # P5 LatencyPolicy signal: record this served hop's success latency
+            # (non-streaming). Streaming records in on_complete when the stream
+            # settles. Pure signal store — no I/O, no routing change here.
+            self.record_latency(provider, ctx.elapsed_ms())
+
             token_details = rt.adapter.extract_usage(response)
             if budget.reservation_id:
                 await self._budget.confirm_cost(
@@ -1268,6 +1295,9 @@ class AsyncSolwyn(_SolwynBase):
 
         async def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             self._get_circuit_breaker(provider).record_success()
+            # P5 LatencyPolicy signal: record the SERVED provider's latency as the
+            # stream settles (mirrors the non-streaming path). Pure signal store.
+            self.record_latency(provider, ctx.elapsed_ms())
             if budget.reservation_id:
                 await self._budget.confirm_cost(
                     budget.reservation_id,

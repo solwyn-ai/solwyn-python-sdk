@@ -109,7 +109,7 @@ def _anthropic_tool_response() -> SimpleNamespace:
 
 
 def _allow_budget() -> SimpleNamespace:
-    return SimpleNamespace(allowed=True, reservation_id=None)
+    return SimpleNamespace(allowed=True, reservation_id=None, price_hints=None)
 
 
 def _make_solwyn(client: object, **overrides: object) -> Solwyn:

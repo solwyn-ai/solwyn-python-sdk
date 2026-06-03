@@ -7,14 +7,22 @@ from this and add their own HTTP layer.
 
 from __future__ import annotations
 
+import statistics
+import threading
 import time
 import uuid
+from collections import defaultdict, deque
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, ConfigDict
 
-from solwyn._routing import HealthBasedPolicy, ProviderCandidate, RoutingRequest
+from solwyn._routing import (
+    HealthBasedPolicy,
+    ProviderCandidate,
+    RoutingRequest,
+    SelectionPolicy,
+)
 from solwyn._run import current_run
 from solwyn._token_details import TokenDetails
 from solwyn._types import CallStatus, FailoverReason, MetadataEvent, ProviderName
@@ -24,6 +32,13 @@ from solwyn.tokenizer import TokenizerManager
 
 if TYPE_CHECKING:
     from solwyn._registry import ProviderRuntime
+
+# Bounded rolling window of recent SUCCESS latencies kept per provider, and the
+# minimum sample count before observed_p50 reports a value. Until that many
+# samples accrue, observed_p50 returns None so an under-sampled provider's
+# latency never jumps the LatencyPolicy queue (it sorts AFTER known-p50 peers).
+_LATENCY_WINDOW = 50
+_LATENCY_MIN_SAMPLES = 3
 
 
 class _AttemptContext(BaseModel):
@@ -56,12 +71,34 @@ class _SolwynBase:
     - SDK instance identity
     """
 
-    def __init__(self, config: SolwynConfig, runtimes: list[ProviderRuntime]) -> None:
+    def __init__(
+        self,
+        config: SolwynConfig,
+        runtimes: list[ProviderRuntime],
+        selection_policy: SelectionPolicy | None = None,
+    ) -> None:
         self._config = config
         self._runtimes = runtimes
         self._sdk_instance_id = str(uuid.uuid4())
         self._tokenizer = TokenizerManager()
-        self._policy = HealthBasedPolicy()
+        # Injectable routing policy (P5): defaults to the health-only policy.
+        # Swapping in LatencyPolicy/CostPolicy reorders candidates with ZERO
+        # changes to dispatch / translation / budget.
+        self._policy: SelectionPolicy = selection_policy or HealthBasedPolicy()
+
+        # Per-provider rolling window of recent SUCCESS latencies (ms) for the
+        # LatencyPolicy signal. Lock-guarded because the sync client is
+        # multi-threaded (the async client is event-loop-serialized; the lock is
+        # then uncontended). Pure signal store — no I/O.
+        self._latency_lock = threading.Lock()
+        self._latency_windows: defaultdict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=_LATENCY_WINDOW)
+        )
+
+        # Last server-provided RELATIVE price hints per provider (CostPolicy
+        # signal). The client refreshes this after each budget check. The SDK
+        # never computes price — this only forwards the server signal.
+        self._last_price_hints: dict[str, float] = {}
 
         # One circuit breaker per DISTINCT provider across ALL runtimes.
         # Additional providers get lazily-created breakers via
@@ -90,6 +127,41 @@ class _SolwynBase:
             self._circuit_breakers[provider] = self._new_circuit_breaker()
         return self._circuit_breakers[provider]
 
+    def record_latency(self, provider: str, ms: float) -> None:
+        """Record one observed SUCCESS latency (ms) for a provider (LatencyPolicy).
+
+        Appends to the provider's bounded rolling window. Lock-guarded for the
+        multi-threaded sync client (uncontended on the async client). Pure signal
+        store — no I/O, no breaker mutation.
+        """
+        with self._latency_lock:
+            self._latency_windows[provider].append(ms)
+
+    def observed_p50(self, provider: str) -> float | None:
+        """Observed p50 (median) latency (ms) for a provider, or None.
+
+        Returns None until at least ``_LATENCY_MIN_SAMPLES`` samples have
+        accrued, so an under-sampled provider never jumps the LatencyPolicy
+        queue. Lock-guarded; snapshots the window under the lock and computes the
+        median outside it.
+        """
+        with self._latency_lock:
+            window = self._latency_windows.get(provider)
+            samples = list(window) if window is not None else []
+        if len(samples) < _LATENCY_MIN_SAMPLES:
+            return None
+        return statistics.median(samples)
+
+    def update_price_hints(self, hints: dict[str, float]) -> None:
+        """Replace the last-known server price hints (CostPolicy signal).
+
+        Called by the client after each budget check with the server-provided
+        RELATIVE price signal. The SDK never computes price — it only stores and
+        forwards this. An empty dict clears the hints (server provided none).
+        """
+        with self._latency_lock:
+            self._last_price_hints = dict(hints)
+
     def _select_candidates(self, req: RoutingRequest) -> list[ProviderRuntime]:
         """Order runtimes into attempt order via the pure SelectionPolicy.
 
@@ -98,17 +170,33 @@ class _SolwynBase:
         (which consumes a probe). Probe consumption happens exactly once, on the
         single candidate actually attempted, in the dispatch loop (§4.2).
         """
+        # Snapshot the price hints once under the lock so every candidate in this
+        # selection sees a consistent view (the setter may replace the dict
+        # concurrently on another thread).
+        with self._latency_lock:
+            price_hints = dict(self._last_price_hints)
         candidates = [
             ProviderCandidate(
                 runtime=runtime,
                 breaker_state=self._get_circuit_breaker(runtime.adapter.name).state,
                 recovery_eligible=self._get_circuit_breaker(runtime.adapter.name).recovery_eligible,
                 translatable=True,  # P1: native passthrough; P2 supplies the real predicate
+                # P5 routing signals: observed p50 latency (LatencyPolicy) and the
+                # server-provided relative price hint (CostPolicy). Both default to
+                # None when unavailable; HealthBasedPolicy ignores them.
+                latency_p50=self.observed_p50(runtime.adapter.name),
+                price_hint=price_hints.get(runtime.adapter.name),
             )
             for runtime in self._runtimes
         ]
         ordered = self._policy.order(candidates, req)
-        return [c.runtime for c in ordered]
+        # Defensive: a custom (possibly misbehaving) injected policy must not be
+        # able to inject a runtime that was never in the configured chain into the
+        # dispatch walk. Keep ONLY candidates whose runtime is one of our own
+        # runtimes (identity check), preserving the policy's order for that valid
+        # subset. Drops any foreign/unknown runtime the policy may have appended.
+        chain = set(map(id, self._runtimes))
+        return [c.runtime for c in ordered if id(c.runtime) in chain]
 
     def _build_metadata_event(
         self,
