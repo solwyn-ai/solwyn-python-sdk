@@ -168,7 +168,7 @@ class _SolwynBase:
         """Order runtimes into attempt order via the pure SelectionPolicy.
 
         Builds one ProviderCandidate per runtime using NON-MUTATING breaker
-        reads only (``state`` / ``recovery_eligible``) — never ``can_proceed()``
+        reads only (``state`` / ``recovery_eligible``) — never ``admit()``
         (which consumes a probe). Probe consumption happens exactly once, on the
         single candidate actually attempted, in the dispatch loop (§4.2).
         """

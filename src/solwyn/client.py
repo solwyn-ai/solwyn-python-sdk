@@ -678,7 +678,8 @@ class Solwyn(_SolwynBase):
                 break
             provider = rt.adapter.name
             cb = self._get_circuit_breaker(provider)
-            if not cb.can_proceed():  # probe CONSUMED only here, for the attempted candidate
+            admission = cb.admit()  # probe CONSUMED only here, for the attempted candidate
+            if not admission.allowed:
                 continue
 
             is_primary = rt is primary
@@ -698,18 +699,25 @@ class Solwyn(_SolwynBase):
             # §5 translation contract and may RAISE an Untranslatable* error here,
             # BEFORE any network call — that aborts the WHOLE chain (§4.6, §6.8):
             # do NOT classify it as transport, advance, or record a breaker failure.
-            call_kwargs = _build_hop_kwargs(
-                primary=primary,
-                rt=rt,
-                is_primary=is_primary,
-                is_provider_fallback=is_provider_fallback,
-                is_streaming=is_streaming,
-                global_defaults=self._config.default_params,
-                kwargs=kwargs,
-            )
-            served_model = requested_model if is_primary else rt.entry.model
-            if is_streaming:
-                call_kwargs = rt.adapter.prepare_streaming(call_kwargs)
+            # This is a no-health-signal abort: if admit() already consumed
+            # this breaker's single HALF_OPEN probe slot, free it before the error
+            # propagates so the provider is not stranded HALF_OPEN with no probe.
+            try:
+                call_kwargs = _build_hop_kwargs(
+                    primary=primary,
+                    rt=rt,
+                    is_primary=is_primary,
+                    is_provider_fallback=is_provider_fallback,
+                    is_streaming=is_streaming,
+                    global_defaults=self._config.default_params,
+                    kwargs=kwargs,
+                )
+                served_model = requested_model if is_primary else rt.entry.model
+                if is_streaming:
+                    call_kwargs = rt.adapter.prepare_streaming(call_kwargs)
+            except Exception:
+                cb.release_probe(admission)
+                raise
 
             ctx = _AttemptContext(
                 model=served_model,
@@ -757,6 +765,12 @@ class Solwyn(_SolwynBase):
                 if disp is not Disposition.FAIL_FAST and provider not in failed_providers:
                     cb.record_failure()
                     failed_providers.add(provider)
+                else:
+                    # No NEW health verdict for this hop: FAIL_FAST is request-shaped,
+                    # or this provider was already counted this walk (double-count
+                    # guard). If the hop consumed a HALF_OPEN probe slot, free it
+                    # (no state change) so the breaker is not stranded HALF_OPEN.
+                    cb.release_probe(admission)
                 # §8.3/§8.4: a correctly-not-failed-over post-send-ambiguous abort
                 # emits an ERROR event with possibly_succeeded=True so the Cloud API
                 # can reconcile the (possibly-landed, never-confirmed) reservation.
@@ -1216,7 +1230,8 @@ class AsyncSolwyn(_SolwynBase):
                 break
             provider = rt.adapter.name
             cb = self._get_circuit_breaker(provider)
-            if not cb.can_proceed():
+            admission = cb.admit()
+            if not admission.allowed:
                 continue
 
             is_primary = rt is primary
@@ -1236,18 +1251,25 @@ class AsyncSolwyn(_SolwynBase):
             # §5 translation contract and may RAISE an Untranslatable* error here,
             # BEFORE any network call — that aborts the WHOLE chain (§4.6, §6.8):
             # do NOT classify it as transport, advance, or record a breaker failure.
-            call_kwargs = _build_hop_kwargs(
-                primary=primary,
-                rt=rt,
-                is_primary=is_primary,
-                is_provider_fallback=is_provider_fallback,
-                is_streaming=is_streaming,
-                global_defaults=self._config.default_params,
-                kwargs=kwargs,
-            )
-            served_model = requested_model if is_primary else rt.entry.model
-            if is_streaming:
-                call_kwargs = rt.adapter.prepare_streaming(call_kwargs)
+            # This is a no-health-signal abort: if admit() already consumed
+            # this breaker's single HALF_OPEN probe slot, free it before the error
+            # propagates so the provider is not stranded HALF_OPEN with no probe.
+            try:
+                call_kwargs = _build_hop_kwargs(
+                    primary=primary,
+                    rt=rt,
+                    is_primary=is_primary,
+                    is_provider_fallback=is_provider_fallback,
+                    is_streaming=is_streaming,
+                    global_defaults=self._config.default_params,
+                    kwargs=kwargs,
+                )
+                served_model = requested_model if is_primary else rt.entry.model
+                if is_streaming:
+                    call_kwargs = rt.adapter.prepare_streaming(call_kwargs)
+            except Exception:
+                cb.release_probe(admission)
+                raise
 
             ctx = _AttemptContext(
                 model=served_model,
@@ -1289,6 +1311,12 @@ class AsyncSolwyn(_SolwynBase):
                 if disp is not Disposition.FAIL_FAST and provider not in failed_providers:
                     cb.record_failure()
                     failed_providers.add(provider)
+                else:
+                    # No NEW health verdict for this hop: FAIL_FAST is request-shaped,
+                    # or this provider was already counted this walk (double-count
+                    # guard). If the hop consumed a HALF_OPEN probe slot, free it
+                    # (no state change) so the breaker is not stranded HALF_OPEN.
+                    cb.release_probe(admission)
                 # §8.3/§8.4: a correctly-not-failed-over post-send-ambiguous abort
                 # emits an ERROR event with possibly_succeeded=True so the Cloud API
                 # can reconcile the (possibly-landed, never-confirmed) reservation.

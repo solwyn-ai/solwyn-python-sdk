@@ -4,7 +4,7 @@ HealthBasedPolicy.order is a PURE ordering over non-mutating breaker-state
 snapshots: it filters out OPEN-not-recovery-eligible candidates and ranks the
 rest CLOSED < HALF_OPEN < recovery-eligible OPEN, sinking untranslatable
 targets within a state tier. sorted() is stable, so configured (input) order is
-preserved inside a priority tier. order() must NEVER call can_proceed() or
+preserved inside a priority tier. order() must NEVER call admit() or
 mutate a breaker (§4.2 inspection-vs-consumption rule).
 """
 
@@ -144,7 +144,7 @@ def test_all_open_blocked_returns_empty() -> None:
 def test_order_does_not_touch_the_breaker() -> None:
     # Arrange — a breaker mock that would explode if any method/attr were read
     breaker = MagicMock()
-    breaker.can_proceed.side_effect = AssertionError("order() must not call can_proceed()")
+    breaker.admit.side_effect = AssertionError("order() must not call admit()")
 
     runtime = types.SimpleNamespace(breaker=breaker)
     candidate = ProviderCandidate(
@@ -158,7 +158,7 @@ def test_order_does_not_touch_the_breaker() -> None:
     HealthBasedPolicy().order([candidate], _req())
 
     # Assert — purity: the breaker was never inspected or mutated
-    breaker.can_proceed.assert_not_called()
+    breaker.admit.assert_not_called()
     assert breaker.method_calls == []
 
 
@@ -253,7 +253,7 @@ def test_latency_policy_health_tier_dominates_p50() -> None:
 def test_latency_policy_is_pure_does_not_touch_breaker() -> None:
     # Arrange — a breaker mock that explodes on any access
     breaker = MagicMock()
-    breaker.can_proceed.side_effect = AssertionError("order() must not call can_proceed()")
+    breaker.admit.side_effect = AssertionError("order() must not call admit()")
     runtime = types.SimpleNamespace(breaker=breaker)
     candidate = ProviderCandidate(
         runtime=runtime,  # type: ignore[arg-type]
@@ -267,7 +267,7 @@ def test_latency_policy_is_pure_does_not_touch_breaker() -> None:
     LatencyPolicy().order([candidate], _req())
 
     # Assert — purity
-    breaker.can_proceed.assert_not_called()
+    breaker.admit.assert_not_called()
     assert breaker.method_calls == []
 
 
@@ -405,7 +405,7 @@ def test_cost_policy_ranks_strictly_by_relative_hint_order() -> None:
 def test_cost_policy_is_pure_does_not_touch_breaker() -> None:
     # Arrange
     breaker = MagicMock()
-    breaker.can_proceed.side_effect = AssertionError("order() must not call can_proceed()")
+    breaker.admit.side_effect = AssertionError("order() must not call admit()")
     runtime = types.SimpleNamespace(breaker=breaker)
     candidate = ProviderCandidate(
         runtime=runtime,  # type: ignore[arg-type]
@@ -419,7 +419,7 @@ def test_cost_policy_is_pure_does_not_touch_breaker() -> None:
     CostPolicy().order([candidate], _req())
 
     # Assert — purity
-    breaker.can_proceed.assert_not_called()
+    breaker.admit.assert_not_called()
     assert breaker.method_calls == []
 
 

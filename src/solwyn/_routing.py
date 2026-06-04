@@ -6,11 +6,11 @@ candidates in attempt order, with all unavailable targets dropped. Returning a
 *list* (not a single provider) is what lets latency/cost policies slot in later
 as drop-in reorderings — they never touch I/O, circuit breakers, or budget.
 
-Critical correctness rule (§4.2): ``circuit_breaker.can_proceed()`` MUTATES
+Critical correctness rule (§4.2): ``circuit_breaker.admit()`` MUTATES
 breaker state (an OPEN-but-recovery-eligible breaker flips to HALF_OPEN). The
 router therefore orders purely on the non-mutating ``breaker_state`` /
 ``recovery_eligible`` snapshots captured into each candidate. It NEVER calls
-``can_proceed()`` or otherwise mutates a breaker — that happens exactly once, on
+``admit()`` or otherwise mutates a breaker — that happens exactly once, on
 the single candidate actually being attempted, outside this module.
 
 No httpx, no provider SDKs, no logging: this is a leaf module.
@@ -38,7 +38,7 @@ class ProviderCandidate:
     """An immutable, non-mutating snapshot of one provider link for ordering.
 
     ``breaker_state`` and ``recovery_eligible`` are read from the breaker WITHOUT
-    mutating it (unlike ``can_proceed()``). ``translatable`` is a FORWARD-LOOKING
+    mutating it (unlike ``admit()``). ``translatable`` is a FORWARD-LOOKING
     routing seam, currently ALWAYS ``True`` (fix [H]): the design eager-aborts the
     WHOLE chain on an untranslatable feature at the first cross-provider hop (§6.8,
     ``UntranslatableRequestError``), so an untranslatable request is never DEMOTED
@@ -125,7 +125,7 @@ class HealthBasedPolicy:
     are not recovery-eligible are dropped.
 
     PURE: orders on the non-mutating ``breaker_state`` / ``recovery_eligible``
-    snapshots only — never calls ``can_proceed()`` or mutates a breaker.
+    snapshots only — never calls ``admit()`` or mutates a breaker.
     """
 
     def order(
@@ -145,7 +145,7 @@ class LatencyPolicy:
     ``latency_p50`` is ``None`` (not enough samples yet) sorts AFTER any
     candidate with a known p50 — unknown latency never jumps the queue.
 
-    PURE drop-in: only REORDERS the usable set. Never calls ``can_proceed()``,
+    PURE drop-in: only REORDERS the usable set. Never calls ``admit()``,
     never mutates a breaker, does no I/O, and computes no price. Swapping this in
     for ``HealthBasedPolicy`` changes routing order with zero dispatch changes.
     """
@@ -177,7 +177,7 @@ class CostPolicy:
     server has not provided one yet), this falls back to the plain
     ``HealthBasedPolicy`` order so behaviour is identical to today.
 
-    PURE drop-in: only REORDERS the usable set. Never calls ``can_proceed()``,
+    PURE drop-in: only REORDERS the usable set. Never calls ``admit()``,
     never mutates a breaker, does no I/O, and does no price arithmetic.
     """
 

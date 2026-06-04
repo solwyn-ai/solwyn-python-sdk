@@ -34,6 +34,20 @@ class CircuitBreakerState(BaseModel):
     last_state_change: float  # monotonic seconds
 
 
+class CircuitBreakerAdmission(BaseModel):
+    """Result of asking a circuit breaker to admit one provider attempt."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    allowed: bool
+    probe_token: int | None = None
+
+    @property
+    def owns_probe(self) -> bool:
+        """Whether this admission consumed a HALF_OPEN probe slot."""
+        return self.probe_token is not None
+
+
 class CircuitBreaker:
     """Circuit breaker for handling LLM provider failures.
 
@@ -85,6 +99,8 @@ class CircuitBreaker:
         # freed (False) when that probe reports an outcome so the next call
         # may probe again (matters when success_threshold > 1).
         self._half_open_probe_active: bool = False
+        self._half_open_probe_token: int | None = None
+        self._next_probe_token = 0
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -98,6 +114,7 @@ class CircuitBreaker:
                 # Free the probe slot before the close check so that when
                 # success_threshold > 1 the next call can probe again.
                 self._half_open_probe_active = False
+                self._half_open_probe_token = None
                 self.success_count += 1
                 if self.success_count >= self.success_threshold:
                     self._transition_to_closed()
@@ -119,27 +136,54 @@ class CircuitBreaker:
                 # probe slot first (defense-in-depth; _transition_to_open also
                 # resets it for a fresh OPEN episode).
                 self._half_open_probe_active = False
+                self._half_open_probe_token = None
                 self._transition_to_open()
 
-    def can_proceed(self) -> bool:
-        """Return ``True`` if the circuit allows a request through."""
+    def admit(self) -> CircuitBreakerAdmission:
+        """Return an admission result for one provider attempt.
+
+        ``allowed`` indicates whether the attempt may run. When the attempt
+        consumes a HALF_OPEN probe slot, ``probe_token`` identifies the slot so
+        a later neutral release can prove ownership.
+        """
         with self._lock:
             if self.state == CircuitState.CLOSED:
-                return True
+                return CircuitBreakerAdmission(allowed=True)
             elif self.state == CircuitState.OPEN:
                 if self._should_attempt_recovery():
                     self._transition_to_half_open()
-                    # This caller is the first (and only) probe in flight.
-                    self._half_open_probe_active = True
-                    return True
-                return False
+                    return self._consume_probe_slot_locked()
+                return CircuitBreakerAdmission(allowed=False)
             else:  # HALF_OPEN
                 # Single-probe slot: if a probe is already in flight, refuse so
                 # concurrent callers cannot stampede a just-recovering provider.
                 if self._half_open_probe_active:
-                    return False
-                self._half_open_probe_active = True
-                return True
+                    return CircuitBreakerAdmission(allowed=False)
+                return self._consume_probe_slot_locked()
+
+    def release_probe(self, admission: CircuitBreakerAdmission | None = None) -> None:
+        """Release a consumed HALF_OPEN probe slot WITHOUT a health verdict.
+
+        ``record_success`` / ``record_failure`` are health signals that both
+        free the slot AND move state. This is the neutral third outcome: a probe
+        that aborted before producing any verdict about the provider — a
+        cross-provider translation error or a FAIL_FAST (request-shaped)
+        response raised after ``admit()`` consumed the slot. It frees the
+        slot only; state, success_count, and failure_count are untouched, so the
+        breaker stays HALF_OPEN and the next caller may probe instead of being
+        stranded behind a permanently-occupied slot. No-op if ``admission`` did
+        not acquire the currently active probe; safe to call in any state.
+        """
+        if admission is None or not admission.owns_probe:
+            return
+        with self._lock:
+            if (
+                self.state == CircuitState.HALF_OPEN
+                and self._half_open_probe_active
+                and self._half_open_probe_token == admission.probe_token
+            ):
+                self._half_open_probe_active = False
+                self._half_open_probe_token = None
 
     @property
     def recovery_eligible(self) -> bool:
@@ -147,7 +191,7 @@ class CircuitBreaker:
 
         The router orders candidates on this read; it must never transition
         state (§4.2/§6.4: separate INSPECTION from CONSUMPTION). Only
-        ``can_proceed()`` may flip an eligible OPEN breaker to HALF_OPEN.
+        ``admit()`` may flip an eligible OPEN breaker to HALF_OPEN.
 
         Returns ``True`` only when the breaker is OPEN and the (possibly
         jittered) recovery window has elapsed; ``False`` in every other state.
@@ -183,6 +227,13 @@ class CircuitBreaker:
         factor = 1.0 + random.uniform(-self.recovery_timeout_jitter, self.recovery_timeout_jitter)
         return self.recovery_timeout * factor
 
+    def _consume_probe_slot_locked(self) -> CircuitBreakerAdmission:
+        """Consume the HALF_OPEN probe slot and return its ownership token."""
+        self._next_probe_token += 1
+        self._half_open_probe_active = True
+        self._half_open_probe_token = self._next_probe_token
+        return CircuitBreakerAdmission(allowed=True, probe_token=self._half_open_probe_token)
+
     def _transition_to_open(self) -> None:
         """Transition to OPEN state."""
         self.state = CircuitState.OPEN
@@ -190,6 +241,7 @@ class CircuitBreaker:
         self.success_count = 0
         # A fresh OPEN episode starts with no probe in flight.
         self._half_open_probe_active = False
+        self._half_open_probe_token = None
         self._effective_recovery_timeout = self._sample_recovery_window()
         logger.warning("Circuit breaker opened due to failures")
 
@@ -201,6 +253,7 @@ class CircuitBreaker:
         self.success_count = 0
         # A fresh CLOSED episode starts with no probe in flight.
         self._half_open_probe_active = False
+        self._half_open_probe_token = None
         logger.info("Circuit breaker closed, provider recovered")
 
     def _transition_to_half_open(self) -> None:

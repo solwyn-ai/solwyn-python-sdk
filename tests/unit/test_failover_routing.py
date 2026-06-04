@@ -24,7 +24,7 @@ from conftest import VALID_API_KEY
 
 from solwyn._types import CircuitState
 from solwyn.client import AsyncSolwyn, Solwyn
-from solwyn.exceptions import ProviderUnavailableError
+from solwyn.exceptions import ProviderUnavailableError, UntranslatableRequestError
 
 
 class _Status(Exception):
@@ -888,6 +888,154 @@ class TestHalfOpenRecoveryThroughDispatch:
         assert cb.state == CircuitState.CLOSED
         assert cb.success_count == 0
         assert cb.failure_count == 0
+
+        await solwyn._reporter._http.aclose()
+        await solwyn._budget._http.aclose()
+
+
+# ── probe-slot release on no-health-signal dispatch exits ────────────────
+
+
+@pytest.mark.unit
+class TestProbeSlotReleaseOnNoHealthSignalExit:
+    """A HALF_OPEN probe slot consumed at admit() must be freed when the
+    hop exits WITHOUT a health verdict — a cross-provider translation abort or a
+    FAIL_FAST raised after the slot was taken. Otherwise the only probe slot is
+    permanently occupied and the provider is stranded HALF_OPEN forever.
+    """
+
+    def test_fail_fast_in_half_open_frees_probe_slot(self) -> None:
+        client = _openai_client()
+        client.chat.completions.create.side_effect = _Status(400, "bad request")
+        solwyn = _make_solwyn(
+            client,
+            model="gpt-4o",
+            circuit_breaker_failure_threshold=1,
+            circuit_breaker_recovery_timeout=0,
+            circuit_breaker_success_threshold=1,
+        )
+        cb = solwyn._get_circuit_breaker("openai")
+        cb.record_failure()  # -> OPEN, recovery-eligible (recovery_timeout=0)
+        assert cb.state == CircuitState.OPEN
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            pytest.raises(_Status),
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        # FAIL_FAST is request-shaped, not a health verdict: state stays HALF_OPEN,
+        # but the consumed probe slot must be released for the next caller.
+        assert cb.state == CircuitState.HALF_OPEN
+        assert cb._half_open_probe_active is False
+        admission = cb.admit()
+        assert admission.allowed is True
+        assert admission.owns_probe is True
+
+        _close(solwyn)
+
+    def test_translation_abort_in_half_open_frees_probe_slot(self) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = _Status(429)  # FAILOVER off primary
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            circuit_breaker_failure_threshold=1,
+            circuit_breaker_recovery_timeout=0,
+            circuit_breaker_success_threshold=1,
+        )
+        anthropic_cb = solwyn._get_circuit_breaker("anthropic")
+        anthropic_cb.record_failure()  # -> OPEN, recovery-eligible
+        assert anthropic_cb.state == CircuitState.OPEN
+
+        # n>1 is outside the §5 subset -> the cross-provider hop's translation
+        # RAISES UntranslatableRequestError before any anthropic network call.
+        request = {**_PLAIN_REQUEST, "n": 2}
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            pytest.raises(UntranslatableRequestError),
+        ):
+            solwyn.chat.completions.create(**request)
+
+        anthropic.messages.create.assert_not_called()  # aborted before dispatch
+        assert anthropic_cb.state == CircuitState.HALF_OPEN
+        assert anthropic_cb._half_open_probe_active is False
+        admission = anthropic_cb.admit()
+        assert admission.allowed is True
+        assert admission.owns_probe is True
+
+        _close(solwyn)
+
+    @pytest.mark.asyncio
+    async def test_async_fail_fast_in_half_open_frees_probe_slot(self) -> None:
+        client = _openai_client()
+        client.chat.completions.create = AsyncMock(side_effect=_Status(400, "bad request"))
+        solwyn = AsyncSolwyn(
+            client,
+            api_key=VALID_API_KEY,
+            model="gpt-4o",
+            circuit_breaker_failure_threshold=1,
+            circuit_breaker_recovery_timeout=0,
+            circuit_breaker_success_threshold=1,
+        )
+        cb = solwyn._get_circuit_breaker("openai")
+        cb.record_failure()
+        assert cb.state == CircuitState.OPEN
+
+        with (
+            patch.object(
+                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            ),
+            pytest.raises(_Status),
+        ):
+            await solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        assert cb.state == CircuitState.HALF_OPEN
+        assert cb._half_open_probe_active is False
+        admission = cb.admit()
+        assert admission.allowed is True
+        assert admission.owns_probe is True
+
+        await solwyn._reporter._http.aclose()
+        await solwyn._budget._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_async_translation_abort_in_half_open_frees_probe_slot(self) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create = AsyncMock(side_effect=_Status(429))
+        anthropic = _anthropic_client()
+        anthropic.messages.create = AsyncMock(return_value=_anthropic_response())
+        solwyn = AsyncSolwyn(
+            openai,
+            api_key=VALID_API_KEY,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            circuit_breaker_failure_threshold=1,
+            circuit_breaker_recovery_timeout=0,
+            circuit_breaker_success_threshold=1,
+        )
+        anthropic_cb = solwyn._get_circuit_breaker("anthropic")
+        anthropic_cb.record_failure()
+        assert anthropic_cb.state == CircuitState.OPEN
+
+        request = {**_PLAIN_REQUEST, "n": 2}
+        with (
+            patch.object(
+                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            ),
+            pytest.raises(UntranslatableRequestError),
+        ):
+            await solwyn.chat.completions.create(**request)
+
+        anthropic.messages.create.assert_not_called()
+        assert anthropic_cb.state == CircuitState.HALF_OPEN
+        assert anthropic_cb._half_open_probe_active is False
+        admission = anthropic_cb.admit()
+        assert admission.allowed is True
+        assert admission.owns_probe is True
 
         await solwyn._reporter._http.aclose()
         await solwyn._budget._http.aclose()

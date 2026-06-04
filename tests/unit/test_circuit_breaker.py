@@ -65,7 +65,7 @@ def _run_concurrently_collecting(workers: int, target: Callable[[], object]) -> 
 
     Like ``_run_concurrently`` but captures return values under a lock so
     callers can assert on the distribution of outcomes (e.g. exactly one
-    ``can_proceed()`` probe wins the single HALF_OPEN slot).
+    ``admit()`` call wins the single HALF_OPEN slot).
     """
     barrier = threading.Barrier(workers)
     errors: list[BaseException] = []
@@ -131,14 +131,18 @@ class TestOpenToHalfOpen:
 
         # Simulate time passing beyond recovery_timeout
         cb.last_failure_time = time.monotonic() - 15
-        assert cb.can_proceed() is True
+        admission = cb.admit()
+        assert admission.allowed is True
+        assert admission.owns_probe is True
         assert cb.state == CircuitState.HALF_OPEN
 
     def test_stays_open_before_timeout(self) -> None:
         cb = CircuitBreaker(failure_threshold=1, recovery_timeout=60)
         cb.record_failure()
         assert cb.state == CircuitState.OPEN
-        assert cb.can_proceed() is False
+        admission = cb.admit()
+        assert admission.allowed is False
+        assert admission.owns_probe is False
         assert cb.state == CircuitState.OPEN
 
 
@@ -155,7 +159,9 @@ class TestHalfOpenToClosed:
         cb.record_failure()  # -> OPEN
         assert cb.state == CircuitState.OPEN
 
-        cb.can_proceed()  # -> HALF_OPEN (recovery_timeout=0)
+        admission = cb.admit()  # -> HALF_OPEN (recovery_timeout=0)
+        assert admission.allowed is True
+        assert admission.owns_probe is True
         assert cb.state == CircuitState.HALF_OPEN
 
         cb.record_success()
@@ -176,7 +182,9 @@ class TestHalfOpenFailure:
             success_threshold=3,
         )
         cb.record_failure()  # -> OPEN
-        cb.can_proceed()  # -> HALF_OPEN
+        admission = cb.admit()  # -> HALF_OPEN
+        assert admission.allowed is True
+        assert admission.owns_probe is True
         assert cb.state == CircuitState.HALF_OPEN
 
         cb.record_failure()  # -> back to OPEN
@@ -211,28 +219,33 @@ class TestConcurrentStateMutation:
         cb.state = CircuitState.OPEN
         cb.last_failure_time = time.monotonic() - 1
 
-        results = _run_concurrently_collecting(32, cb.can_proceed)
+        admissions = _run_concurrently_collecting(32, cb.admit)
 
         assert cb.state == CircuitState.HALF_OPEN
         assert len(cb.half_open_transitions) == 1
         # Single-probe slot (§6.2/§6.4): exactly ONE concurrent caller wins the
         # probe; the other 31 are refused — no recovery stampede.
-        assert results.count(True) == 1
-        assert results.count(False) == 31
+        assert sum(1 for admission in admissions if admission.allowed) == 1
+        assert sum(1 for admission in admissions if not admission.allowed) == 31
+        assert sum(1 for admission in admissions if admission.owns_probe) == 1
 
 
 @pytest.mark.unit
-class TestCanProceed:
-    """can_proceed() returns correct value per state."""
+class TestAdmit:
+    """admit() returns admission and probe-ownership details per state."""
 
-    def test_returns_true_when_closed(self) -> None:
+    def test_allows_without_probe_when_closed(self) -> None:
         cb = CircuitBreaker()
-        assert cb.can_proceed() is True
+        admission = cb.admit()
+        assert admission.allowed is True
+        assert admission.owns_probe is False
 
-    def test_returns_false_when_open(self) -> None:
+    def test_refuses_without_probe_when_open_before_recovery(self) -> None:
         cb = CircuitBreaker(failure_threshold=1, recovery_timeout=9999)
         cb.record_failure()
-        assert cb.can_proceed() is False
+        admission = cb.admit()
+        assert admission.allowed is False
+        assert admission.owns_probe is False
 
     def test_half_open_single_probe_slot(self) -> None:
         # §6.2/§6.4: HALF_OPEN opens exactly ONE probe slot. The first caller
@@ -243,11 +256,15 @@ class TestCanProceed:
         cb.record_failure()
 
         # First caller wins the probe slot and transitions OPEN -> HALF_OPEN.
-        assert cb.can_proceed() is True
+        first = cb.admit()
+        assert first.allowed is True
+        assert first.owns_probe is True
         assert cb.state == CircuitState.HALF_OPEN
 
         # A second caller while the probe is still in flight is refused.
-        assert cb.can_proceed() is False
+        second = cb.admit()
+        assert second.allowed is False
+        assert second.owns_probe is False
         assert cb.state == CircuitState.HALF_OPEN
 
         # The in-flight probe reports a success that does NOT close the breaker
@@ -256,7 +273,84 @@ class TestCanProceed:
         assert cb.state == CircuitState.HALF_OPEN
 
         # A fresh caller may now probe again — the slot was freed on outcome.
-        assert cb.can_proceed() is True
+        third = cb.admit()
+        assert third.allowed is True
+        assert third.owns_probe is True
+
+
+@pytest.mark.unit
+class TestReleaseProbe:
+    """release_probe() frees a HALF_OPEN probe slot without a health verdict."""
+
+    def test_release_probe_frees_slot_without_state_change(self) -> None:
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0, success_threshold=2)
+        cb.record_failure()  # -> OPEN
+        admission = cb.admit()
+        assert admission.allowed is True
+        assert admission.owns_probe is True
+        assert cb.state == CircuitState.HALF_OPEN
+        blocked = cb.admit()
+        assert blocked.allowed is False
+        assert blocked.owns_probe is False
+
+        cb.release_probe(admission)
+
+        # Neutral outcome: no verdict recorded, breaker stays HALF_OPEN...
+        assert cb.state == CircuitState.HALF_OPEN
+        assert cb.success_count == 0
+        assert cb.failure_count == 0
+        # ...but the slot is freed, so the next caller may probe again.
+        fresh = cb.admit()
+        assert fresh.allowed is True
+        assert fresh.owns_probe is True
+
+    def test_release_probe_is_noop_when_no_probe_active(self) -> None:
+        cb = CircuitBreaker()
+        assert cb.state == CircuitState.CLOSED
+        cb.release_probe()  # must not raise or change state
+        assert cb.state == CircuitState.CLOSED
+        admission = cb.admit()
+        assert admission.allowed is True
+        assert admission.owns_probe is False
+
+    def test_stale_closed_admission_cannot_release_active_probe(self) -> None:
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0)
+        closed_admission = cb.admit()
+        assert closed_admission.allowed is True
+        assert closed_admission.owns_probe is False
+
+        cb.record_failure()  # -> OPEN, recovery-eligible
+        half_open_admission = cb.admit()
+        assert half_open_admission.allowed is True
+        assert half_open_admission.owns_probe is True
+        blocked = cb.admit()
+        assert blocked.allowed is False
+        assert blocked.owns_probe is False
+
+        cb.release_probe(closed_admission)
+
+        still_blocked = cb.admit()
+        assert still_blocked.allowed is False
+        assert still_blocked.owns_probe is False
+
+    def test_stale_probe_admission_cannot_release_new_active_probe(self) -> None:
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0)
+        cb.record_failure()  # -> OPEN, recovery-eligible
+        stale_admission = cb.admit()
+        assert stale_admission.owns_probe is True
+        cb.release_probe(stale_admission)
+
+        active_admission = cb.admit()
+        assert active_admission.owns_probe is True
+        blocked = cb.admit()
+        assert blocked.allowed is False
+        assert blocked.owns_probe is False
+
+        cb.release_probe(stale_admission)
+
+        still_blocked = cb.admit()
+        assert still_blocked.allowed is False
+        assert still_blocked.owns_probe is False
 
 
 @pytest.mark.unit
@@ -286,6 +380,12 @@ class TestGetState:
 def test_circuit_breaker_state_is_pydantic_model() -> None:
     """CircuitBreakerState must be a Pydantic BaseModel, not a dataclass."""
     assert issubclass(CircuitBreakerState, BaseModel)
+
+
+@pytest.mark.unit
+def test_can_proceed_boolean_api_is_removed() -> None:
+    """Admission must expose probe ownership instead of hiding it behind bool."""
+    assert not hasattr(CircuitBreaker, "can_proceed")
 
 
 @pytest.mark.unit
@@ -321,14 +421,18 @@ class TestRecoveryEligible:
         assert cb.recovery_eligible is True
         assert cb.state == CircuitState.OPEN
 
-        # can_proceed() is the ONLY consumer permitted to transition.
-        assert cb.can_proceed() is True
+        # admit() is the ONLY consumer permitted to transition.
+        admission = cb.admit()
+        assert admission.allowed is True
+        assert admission.owns_probe is True
         assert cb.state == CircuitState.HALF_OPEN
 
     def test_false_when_half_open(self) -> None:
         cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0)
         cb.record_failure()
-        cb.can_proceed()  # -> HALF_OPEN
+        admission = cb.admit()  # -> HALF_OPEN
+        assert admission.allowed is True
+        assert admission.owns_probe is True
         assert cb.state == CircuitState.HALF_OPEN
 
         assert cb.recovery_eligible is False
