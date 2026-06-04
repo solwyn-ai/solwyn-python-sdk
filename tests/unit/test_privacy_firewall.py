@@ -4,9 +4,9 @@ These tests enforce the design-spec §7 content-touching contract:
 
   1. Customer prompts/responses are never passed into a log statement —
      not via a bareword name, not via a kwargs/payload dict.
-  2. Content is reshaped in EXACTLY TWO allowlisted modules
-     (``_privacy.py`` + ``providers/_translation.py``) and nowhere else.
-  3. The translation module is pure: no logger, no httpx, no I/O.
+  2. Content is reshaped in EXACTLY the allowlisted modules
+     (``_privacy.py`` + every ``providers/_translation/*.py``) and nowhere else.
+  3. The translation package is pure: no logger, no httpx, no I/O.
   4. SDK<->API wire models stay structurally content-free.
   5. Failover's new leak vectors (``add_note`` interpolation, ``exc_info=True``
      with a provider exception in scope) are structurally forbidden.
@@ -29,10 +29,22 @@ from solwyn.client import Solwyn
 
 SDK_SRC = Path(__file__).resolve().parent.parent.parent / "src" / "solwyn"
 
-# The content-touching allowlist (spec §7). EXACTLY these two modules may reshape
-# customer prompt content. This explicit ALLOWLIST replaces the older
-# "_privacy not in name" exclusion.
-CONTENT_PRIVILEGED = {"_privacy.py", "_translation.py"}
+# The content-touching allowlist (spec §7). EXACTLY these paths may reshape
+# customer prompt content: ``_privacy.py`` at the SDK root, PLUS every module
+# under the ``providers/_translation/`` package. This PATH-based allowlist
+# replaces the older filename-set notion so a content-privileged *package* (not
+# just a single file) stays fully covered as modules are added.
+TRANSLATION_PKG_REL = Path("providers") / "_translation"
+
+
+def _is_content_privileged(path: Path) -> bool:
+    """True iff *path* (a .py file under SDK_SRC) is content-privileged: it is
+    ``_privacy.py`` at the SDK root, OR its path lives under the
+    ``providers/_translation/`` package."""
+    rel = path.relative_to(SDK_SRC)
+    if rel == Path("_privacy.py"):
+        return True
+    return rel.parts[: len(TRANSLATION_PKG_REL.parts)] == TRANSLATION_PKG_REL.parts
 
 # Field names that would carry prompt/response content onto the SDK<->API wire.
 FORBIDDEN_FIELDS = {
@@ -49,16 +61,24 @@ FORBIDDEN_FIELDS = {
 
 def _iter_source_files() -> list[Path]:
     """All SDK source files EXCEPT the content-privileged allowlist."""
-    return [p for p in SDK_SRC.rglob("*.py") if p.name not in CONTENT_PRIVILEGED]
+    return [p for p in SDK_SRC.rglob("*.py") if not _is_content_privileged(p)]
 
 
 def _content_privileged_paths() -> list[Path]:
-    """The concrete on-disk paths of the allowlisted content-touching modules."""
-    paths = [p for p in SDK_SRC.rglob("*.py") if p.name in CONTENT_PRIVILEGED]
-    # Tripwire: the allowlist names must all actually resolve to a file.
-    assert {p.name for p in paths} == CONTENT_PRIVILEGED, (
-        f"CONTENT_PRIVILEGED names do not all resolve to a file: "
-        f"found {sorted(p.name for p in paths)}"
+    """The concrete on-disk paths of the allowlisted content-touching modules:
+    ``_privacy.py`` PLUS every ``*.py`` under ``providers/_translation/``."""
+    paths = [p for p in SDK_SRC.rglob("*.py") if _is_content_privileged(p)]
+    rels = {p.relative_to(SDK_SRC) for p in paths}
+    # Tripwire: the allowlist may never silently go empty. ``_privacy.py`` must
+    # resolve, and at least one ``providers/_translation/*.py`` must be present.
+    assert Path("_privacy.py") in rels, (
+        f"content-privileged allowlist is missing _privacy.py: found {sorted(map(str, rels))}"
+    )
+    assert any(
+        r.parts[: len(TRANSLATION_PKG_REL.parts)] == TRANSLATION_PKG_REL.parts for r in rels
+    ), (
+        "content-privileged allowlist has no providers/_translation/*.py: "
+        f"found {sorted(map(str, rels))}"
     )
     return paths
 
@@ -197,34 +217,59 @@ def test_content_privileged_modules_carry_privacy_banner() -> None:
         )
 
 
+def _translation_package_files() -> list[Path]:
+    """Every ``*.py`` under the ``providers/_translation/`` package."""
+    return sorted((SDK_SRC / TRANSLATION_PKG_REL).rglob("*.py"))
+
+
 @pytest.mark.unit
 def test_translation_module_does_no_io() -> None:
-    """_translation.py must import no HTTP client — not even as a bare token.
-    It is pure / sans-I/O and may never reach a client pointed at config.api_url."""
-    src = (SDK_SRC / "providers" / "_translation.py").read_text()
-    assert "import httpx" not in src, "_translation.py must not import httpx"
-    assert "httpx" not in src, "_translation.py must not even name httpx"
+    """Every translation-package module must import no HTTP client — not even as
+    a bare token. The package is pure / sans-I/O and may never reach a client
+    pointed at config.api_url. Scoped to the translation PACKAGE only (the
+    _privacy.py docstring legitimately uses the word 'logger')."""
+    files = _translation_package_files()
+    assert files, "no providers/_translation/*.py files found"
+    for path in files:
+        src = path.read_text()
+        rel = path.relative_to(SDK_SRC)
+        assert "import httpx" not in src, f"{rel} must not import httpx"
+        assert "httpx" not in src, f"{rel} must not even name httpx"
 
 
 @pytest.mark.unit
 def test_translation_module_has_no_logger_token() -> None:
-    """_translation.py must hold no logger and not even name one — a missing
-    logger is the strongest guarantee that content cannot be logged here."""
-    src = (SDK_SRC / "providers" / "_translation.py").read_text()
-    assert "logger" not in src, "_translation.py must not name a logger"
-    assert "logging" not in src, "_translation.py must not reference logging"
+    """Every translation-package module must hold no logger and not even name
+    one — a missing logger is the strongest guarantee that content cannot be
+    logged here. Scoped to the translation PACKAGE only (the _privacy.py
+    docstring legitimately uses the word 'logger')."""
+    files = _translation_package_files()
+    assert files, "no providers/_translation/*.py files found"
+    for path in files:
+        src = path.read_text()
+        rel = path.relative_to(SDK_SRC)
+        assert "logger" not in src, f"{rel} must not name a logger"
+        assert "logging" not in src, f"{rel} must not reference logging"
 
 
 @pytest.mark.unit
 def test_privacy_banner_set_equals_allowlist() -> None:
-    """Allowlist drift tripwire: the set of modules whose first ~600 chars
-    contain the literal 'PRIVACY-CRITICAL' banner must equal CONTENT_PRIVILEGED
-    EXACTLY. Adding the banner to a third file (or dropping it from one of the
-    two) trips this immediately — keeping the allowlist honest."""
-    bannered = {p.name for p in SDK_SRC.rglob("*.py") if "PRIVACY-CRITICAL" in p.read_text()[:600]}
-    assert bannered == CONTENT_PRIVILEGED, (
-        "Exactly the two content-privileged modules may open with a "
-        f"PRIVACY-CRITICAL banner. Found: {sorted(bannered)}"
+    """Allowlist drift tripwire: the set of module PATHS whose first ~600 chars
+    contain the literal 'PRIVACY-CRITICAL' banner must equal the
+    content-privileged path set (``_privacy.py`` + every
+    ``providers/_translation/*.py``) EXACTLY. Adding the banner to an outside
+    file (or dropping it from a privileged one) trips this immediately —
+    keeping the allowlist honest as modules are added."""
+    bannered = {
+        p.relative_to(SDK_SRC)
+        for p in SDK_SRC.rglob("*.py")
+        if "PRIVACY-CRITICAL" in p.read_text()[:600]
+    }
+    expected = {p.relative_to(SDK_SRC) for p in _content_privileged_paths()}
+    assert bannered == expected, (
+        "Exactly the content-privileged modules may open with a "
+        f"PRIVACY-CRITICAL banner. Found: {sorted(map(str, bannered))}, "
+        f"expected: {sorted(map(str, expected))}"
     )
 
 

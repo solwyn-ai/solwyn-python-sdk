@@ -1132,13 +1132,19 @@ class TestPrivacyBoundary:
 
         import solwyn.providers._translation as mod
 
-        src = Path(mod.__file__).read_text()
-        assert "PRIVACY-CRITICAL" in src[:600]
-        # Spec §7 CI form: the literal substrings must not appear ANYWHERE,
-        # not just in import statements (prose mentions are forbidden too).
-        assert "logging" not in src
-        assert "logger" not in src
-        assert "httpx" not in src
+        # Package-aware: scan EVERY module under the translation package, not
+        # just __init__.py, so the firewall guarantees hold across the package.
+        pkg_dir = Path(mod.__file__).parent
+        files = sorted(pkg_dir.rglob("*.py"))
+        assert files, "no providers/_translation/*.py files found"
+        for path in files:
+            src = path.read_text()
+            assert "PRIVACY-CRITICAL" in src[:600], f"{path.name} missing PRIVACY-CRITICAL banner"
+            # Spec §7 CI form: the literal substrings must not appear ANYWHERE,
+            # not just in import statements (prose mentions are forbidden too).
+            assert "logging" not in src, f"{path.name} references logging"
+            assert "logger" not in src, f"{path.name} names a logger"
+            assert "httpx" not in src, f"{path.name} names httpx"
 
 
 # --------------------------------------------------------------------------- #
