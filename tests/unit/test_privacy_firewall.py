@@ -46,6 +46,7 @@ def _is_content_privileged(path: Path) -> bool:
         return True
     return rel.parts[: len(TRANSLATION_PKG_REL.parts)] == TRANSLATION_PKG_REL.parts
 
+
 # Field names that would carry prompt/response content onto the SDK<->API wire.
 FORBIDDEN_FIELDS = {
     "messages",
