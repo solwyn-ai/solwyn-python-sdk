@@ -37,11 +37,23 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from typing import Annotated, Any, Literal, NoReturn
-
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Any, Literal, NoReturn
 
 from solwyn.exceptions import UntranslatableRequestError
+from solwyn.providers._translation._models import (
+    CanonicalMessage,
+    CanonicalRequest,
+    CanonicalResponse,
+    CanonicalTool,
+    CanonicalToolCall,
+    ContentPart,
+    ImagePart,
+    TextPart,
+    ToolChoice,
+    ToolResultPart,
+    ToolUsePart,
+    _StreamDelta,
+)
 
 __all__ = [
     "CanonicalMessage",
@@ -65,91 +77,6 @@ _PROVIDERS = ("openai", "anthropic", "google")
 # helper and the per-chunk translator share one label.
 _CROSS_PROVIDER_TOOL_STREAM = "cross_provider_tool_stream"
 _CROSS_PROVIDER_MULTIMODAL_STREAM = "cross_provider_multimodal_stream"
-
-
-# --------------------------------------------------------------------------- #
-# §5.1  Canonical models (Pydantic v2, extra="forbid")                         #
-# --------------------------------------------------------------------------- #
-class _Canonical(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
-class TextPart(_Canonical):
-    type: Literal["text"] = "text"
-    text: str
-
-
-class ImagePart(_Canonical):
-    type: Literal["image"] = "image"
-    # Exactly one of (media_type+data) for base64, or url for a public HTTPS image.
-    media_type: str | None = None
-    data: str | None = None  # base64 payload
-    url: str | None = None
-
-
-class ToolUsePart(_Canonical):
-    type: Literal["tool_use"] = "tool_use"
-    id: str
-    name: str
-    input: dict[str, Any]
-
-
-class ToolResultPart(_Canonical):
-    type: Literal["tool_result"] = "tool_result"
-    tool_use_id: str
-    content: str
-
-
-ContentPart = Annotated[
-    TextPart | ImagePart | ToolUsePart | ToolResultPart,
-    Field(discriminator="type"),
-]
-
-
-class CanonicalMessage(_Canonical):
-    role: Literal["user", "assistant"]
-    content: list[ContentPart]
-
-
-class CanonicalTool(_Canonical):
-    name: str
-    description: str | None = None
-    parameters: dict[str, Any]
-
-
-class ToolChoice(_Canonical):
-    mode: Literal["auto", "required", "none", "force"]
-    name: str | None = None  # set only when mode == "force"
-
-
-class CanonicalRequest(_Canonical):
-    system: str | None = None
-    messages: list[CanonicalMessage]
-    max_tokens: int
-    temperature: float | None = None
-    top_p: float | None = None
-    stop: list[str] | None = None
-    stream: bool = False
-    tools: list[CanonicalTool] | None = None
-    tool_choice: ToolChoice | None = None
-    # Structural request-shaping flag (NOT content). Default True == provider
-    # default. Carried so the target-aware ``from_canonical`` can RAISE when a
-    # ``parallel_tool_calls=False`` request targets Google, which has no
-    # first-class equivalent (§5.5). This is the only non-content addition.
-    parallel_tool_calls: bool = True
-
-
-class CanonicalToolCall(_Canonical):
-    id: str
-    name: str
-    arguments: dict[str, Any]
-
-
-class CanonicalResponse(_Canonical):
-    text: str | None = None
-    tool_calls: list[CanonicalToolCall] | None = None
-    finish_reason: Literal["stop", "length", "tool_use", "content_filter"] | None = None
-    model: str | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -1536,13 +1463,6 @@ def _canonical_response_to_google(canonical: CanonicalResponse) -> object:
 # RAISE structurally (no chunk content ever reaches the error). The
 # _CROSS_PROVIDER_*_STREAM labels are defined near the top of the module so the
 # pre-dispatch fail-loud helper can share them.
-
-
-class _StreamDelta(_Canonical):
-    # A text increment OR a terminal finish-reason; never both. ``text`` carries
-    # streamed CONTENT and lives only inside this in-memory frame.
-    text: str | None = None
-    finish_reason: Literal["stop", "length", "tool_use", "content_filter"] | None = None
 
 
 def translate_stream_chunk(*, served: str, requested: str, chunk: object) -> list[object]:
