@@ -109,8 +109,8 @@ class CanonicalResponse(_Canonical):
 # served->canonical->requested pipeline at the chunk granularity. Tool-call and
 # non-text media on a cross-provider hop are OUT of the v1 streaming subset and
 # RAISE structurally (no chunk content ever reaches the error). The
-# _CROSS_PROVIDER_*_STREAM labels are defined near the top of the module so the
-# pre-dispatch fail-loud helper can share them.
+# _CROSS_PROVIDER_*_STREAM labels live in ``_guardrails`` so the pre-dispatch
+# fail-loud helper can share them.
 
 
 class _StreamDelta(_Canonical):

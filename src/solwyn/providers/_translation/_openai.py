@@ -20,7 +20,6 @@ from ._common import (
     _as_text,
     _common_scalars,
     _denormalize_finish_reason,
-    _image_to_url,
     _loads_args,
     _parse_data_uri,
     _secure_image_url,
@@ -335,6 +334,12 @@ def _canonical_parts_to_openai(parts: list[ContentPart]) -> Any:
         elif isinstance(part, ImagePart):
             out.append({"type": "image_url", "image_url": {"url": _image_to_url(part)}})
     return out
+
+
+def _image_to_url(part: ImagePart) -> str:
+    if part.url is not None:
+        return part.url
+    return f"data:{part.media_type};base64,{part.data}"
 
 
 def _canonical_tool_choice_to_openai(choice: ToolChoice) -> Any:

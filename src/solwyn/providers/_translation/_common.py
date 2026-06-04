@@ -137,12 +137,6 @@ def _parse_data_uri(uri: str) -> tuple[str, str]:
     return media_type, data
 
 
-def _image_to_url(part: ImagePart) -> str:
-    if part.url is not None:
-        return part.url
-    return f"data:{part.media_type};base64,{part.data}"
-
-
 def _loads_args(raw: Any) -> dict[str, Any]:
     """Decode a tool-call ``arguments`` value to a JSON object.
 

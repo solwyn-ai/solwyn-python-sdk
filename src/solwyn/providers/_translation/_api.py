@@ -127,15 +127,10 @@ def _response_to_canonical(served: str, response: object) -> CanonicalResponse:
 # §6.6 Per-chunk stream translation — map ONE served-stream event into ZERO     #
 # OR MORE chunks in the requested provider's native streaming dialect.          #
 # --------------------------------------------------------------------------- #
-# A streamed _StreamDelta is the tiny canonical event the per-provider parsers
-# emit and the per-provider renderers consume. Exactly one of (text, finish) is
-# set per delta; a served structural event yields NO _StreamDelta at all (an
-# empty list out of translate_stream_chunk). This mirrors normalize_response's
-# served->canonical->requested pipeline at the chunk granularity. Tool-call and
-# non-text media on a cross-provider hop are OUT of the v1 streaming subset and
-# RAISE structurally (no chunk content ever reaches the error). The
-# _CROSS_PROVIDER_*_STREAM labels are defined near the top of the module so the
-# pre-dispatch fail-loud helper can share them.
+# See ``_StreamDelta`` in ``_models`` for the canonical per-chunk event contract
+# (text-OR-finish; a served structural event emits no delta; tool-call / non-text
+# media on a cross-provider hop RAISE structurally — chunk content never reaches
+# the error).
 
 
 def translate_stream_chunk(*, served: str, requested: str, chunk: object) -> list[object]:
