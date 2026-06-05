@@ -1,27 +1,27 @@
-"""P4 contract snapshot — pin the SDK<->Cloud-API wire contract (§8).
+"""Contract snapshot — pin the SDK<->Cloud-API wire contract.
 
-This is the P4 Definition-of-Done backstop. It freezes the exact serialized
+This is the wire-contract backstop. It freezes the exact serialized
 field SETS of the three wire models so ANY future drift — an added, removed, or
 renamed field — fails CI loudly instead of silently breaking the Cloud-API
-contract (which deploys API-first with no inference window; §8.1). It also pins
+contract (which deploys API-first with no inference window). It also pins
 a representative ``model_dump(mode="json")`` key set for each and proves the
 None-skipping serializer keeps non-failover events byte-compatible with the
 pre-failover wire (``possibly_succeeded`` omitted, ``call_id`` always present).
 
-Beyond the static snapshots it carries the behavioral P4 proofs that exercise
+Beyond the static snapshots it carries the behavioral proofs that exercise
 the live dispatch path (sync + async, streaming + non-streaming):
 
-  * call_id is the per-call reconciliation join key (§8.4): the served-provider
+  * call_id is the per-call reconciliation join key: the served-provider
     success MetadataEvent and its /budgets/confirm carry the SAME call_id;
     two separate calls get DIFFERENT call_ids.
-  * possibly_succeeded (§8.3): a POST_SEND_AMBIGUOUS primary failure under the
+  * possibly_succeeded: a POST_SEND_AMBIGUOUS primary failure under the
     default "safe" idempotency re-raises the ORIGINAL exception AND emits an
     error event with possibly_succeeded=True; a plain FAILOVER (429) and a plain
     success emit events with possibly_succeeded None/absent.
-  * is_model_fallback NARROWED (§8.2): same-provider model swap -> True +
+  * is_model_fallback NARROWED: same-provider model swap -> True +
     is_provider_fallback False; cross-provider failover -> False +
     is_provider_fallback True; primary success -> both False.
-  * failover_error_class FIREWALL (§7/§8.2): the field is ONLY ever populated
+  * failover_error_class FIREWALL: the field is ONLY ever populated
     from ``type(exc).__name__`` — a SENTINEL embedded in ``str(exc)`` never
     reaches the field NOR any byte of the event's model_dump.
 """
@@ -49,12 +49,12 @@ from solwyn._types import (
 )
 from solwyn.client import AsyncSolwyn, Solwyn
 
-# The name of THIS contract-snapshot test module, surfaced in the P4 report.
+# The name of THIS contract-snapshot test module, surfaced in the report.
 CONTRACT_SNAPSHOT_TEST = "tests/unit/test_contract_snapshot.py"
 
 
-# ── EXACT expected field sets (the pinned contract — §8.1/§8.2) ──────────────
-# Hand-written from the design spec, NOT derived from the model, so a drift in
+# ── EXACT expected field sets (the pinned contract) ──────────────────────────
+# Hand-written, NOT derived from the model, so a drift in
 # either direction (model gains/loses a field) trips the assertion.
 
 EXPECTED_CHECK_FIELDS = {
@@ -227,11 +227,11 @@ class TestWireModelFieldConstraints:
 
     A field can keep its name while silently losing a required/length constraint;
     the name-set snapshots above would not catch that. These assertions freeze the
-    load-bearing constraints (§8.1/§8.2).
+    load-bearing constraints.
     """
 
     def test_confirm_provider_is_required(self) -> None:
-        # §8.1: the served provider is REQUIRED on confirm so the Cloud API can
+        # the served provider is REQUIRED on confirm so the Cloud API can
         # price against the provider that actually served the call.
         assert BudgetConfirmRequest.model_fields["provider"].is_required() is True
 
@@ -399,14 +399,14 @@ _STREAM_REQUEST = {**_PLAIN_REQUEST, "stream": True}
 
 
 # --------------------------------------------------------------------------- #
-# 1c. Advisory chain-hint wiring into /budgets/check (§8.1)                    #
+# 1c. Advisory chain-hint wiring into /budgets/check                           #
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
 class TestChainHintWiring:
-    """The client threads the configured failover chain into check_budget (§8.1)."""
+    """The client threads the configured failover chain into check_budget."""
 
     def test_check_budget_carries_fallback_chain_from_runtimes(self) -> None:
-        # The §8.1 advisory chain hint: check_budget must receive
+        # The advisory chain hint: check_budget must receive
         # fallback_providers + fallback_models drawn from runtimes[1:] (the
         # fallback entries — primary excluded), aligned element-for-element.
         openai = _openai_client()
@@ -444,7 +444,7 @@ class TestChainHintWiring:
 
 
 # --------------------------------------------------------------------------- #
-# 2. call_id consistency across metadata + confirm (§8.4)                      #
+# 2. call_id consistency across metadata + confirm                             #
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
 class TestCallIdConsistencyCrossProvider:
@@ -527,7 +527,7 @@ class TestCallIdConsistencyCrossProvider:
     def test_streaming_on_complete_event_and_report_confirm_share_call_id(self) -> None:
         # Sync streaming settles via reporter.report_confirm (fire-and-forget) —
         # NOT confirm_cost. The on_complete success event's call_id must equal the
-        # report_confirm request's call_id (the §8.4 join key).
+        # report_confirm request's call_id (the join key).
         openai = _openai_client()
         openai.chat.completions.create.side_effect = _Status(429)
         anthropic = _anthropic_client()
@@ -564,7 +564,7 @@ class TestCallIdConsistencyCrossProvider:
 
 
 # --------------------------------------------------------------------------- #
-# 3. possibly_succeeded matrix (§8.3)                                          #
+# 3. possibly_succeeded matrix                                                 #
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
 class TestPossiblySucceededMatrix:
@@ -642,7 +642,7 @@ class TestPossiblySucceededMatrix:
 
 
 # --------------------------------------------------------------------------- #
-# 4. is_model_fallback NARROWED (§8.2)                                         #
+# 4. is_model_fallback NARROWED                                                #
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
 class TestIsModelFallbackNarrowed:
@@ -705,7 +705,7 @@ class TestIsModelFallbackNarrowed:
 
 
 # --------------------------------------------------------------------------- #
-# 5. failover_error_class FIREWALL (§7/§8.2)                                   #
+# 5. failover_error_class FIREWALL                                             #
 # --------------------------------------------------------------------------- #
 class _LeakyError(Exception):
     """A POST_SEND_AMBIGUOUS error whose str() embeds a content SENTINEL.

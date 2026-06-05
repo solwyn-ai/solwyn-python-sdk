@@ -1,7 +1,7 @@
 """Failover-related additions to wire-format models in ``_types.py``.
 
 Covers ProviderEntry, FailoverReason, the new MetadataEvent fields, and the
-BudgetCheckRequest chain-hint alignment validator. All additive (P1 FOUNDATION).
+BudgetCheckRequest chain-hint alignment validator. All additive.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ class TestProviderEntry:
         assert b.default_params == {}
 
     def test_rejects_api_key_via_extra_forbid(self) -> None:
-        # Decision D: ProviderEntry must NEVER accept a provider credential.
+        # ProviderEntry must NEVER accept a provider credential.
         with pytest.raises(ValidationError):
             ProviderEntry(
                 provider=ProviderName.OPENAI,
@@ -154,7 +154,7 @@ class TestMetadataEventFailoverFields:
 
 @pytest.mark.unit
 class TestMetadataEventReconciliationFields:
-    """§8.2/§8.4 spend-reconciliation fields: call_id (join key) + possibly_succeeded."""
+    """Spend-reconciliation fields: call_id (join key) + possibly_succeeded."""
 
     def test_call_id_auto_populates_on_direct_construction(self) -> None:
         # The default_factory keeps direct construction working — call_id is
@@ -258,7 +258,7 @@ def _confirm_request(**overrides: object) -> BudgetConfirmRequest:
 
 @pytest.mark.unit
 class TestBudgetConfirmRequestCallId:
-    """§8.1/§8.4: call_id dedups confirm vs metadata reconciliation."""
+    """call_id dedups confirm vs metadata reconciliation."""
 
     def test_call_id_auto_populates(self) -> None:
         # default_factory keeps direct construction working.

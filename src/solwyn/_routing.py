@@ -1,4 +1,4 @@
-"""Pure, sans-I/O provider selection (§4.2 — the Router / SelectionPolicy seam).
+"""Pure, sans-I/O provider selection (the Router / SelectionPolicy seam).
 
 A ``SelectionPolicy`` is a pure function over an ordered list of
 ``ProviderCandidate`` snapshots plus a ``RoutingRequest``: it returns the
@@ -6,7 +6,7 @@ candidates in attempt order, with all unavailable targets dropped. Returning a
 *list* (not a single provider) is what lets latency/cost policies slot in later
 as drop-in reorderings — they never touch I/O, circuit breakers, or budget.
 
-Critical correctness rule (§4.2): ``circuit_breaker.admit()`` MUTATES
+Critical correctness rule: ``circuit_breaker.admit()`` MUTATES
 breaker state (an OPEN-but-recovery-eligible breaker flips to HALF_OPEN). The
 router therefore orders purely on the non-mutating ``breaker_state`` /
 ``recovery_eligible`` snapshots captured into each candidate. It NEVER calls
@@ -40,14 +40,14 @@ class ProviderCandidate:
     ``breaker_state`` and ``recovery_eligible`` are read from the breaker WITHOUT
     mutating it (unlike ``admit()``). ``translatable`` is a FORWARD-LOOKING
     routing seam, currently ALWAYS ``True`` (fix [H]): the design eager-aborts the
-    WHOLE chain on an untranslatable feature at the first cross-provider hop (§6.8,
-    ``UntranslatableRequestError``), so an untranslatable request is never DEMOTED
+    WHOLE chain on an untranslatable feature at the first cross-provider hop
+    (``UntranslatableRequestError``), so an untranslatable request is never DEMOTED
     in routing — it fails loud before dispatch. The field (and the ``not
     translatable`` sort term in ``_health_key``) are retained as an intentional
     seam — like ``price_hint`` — so a future per-target translatability predicate
     could rank a translatable target ahead of an untranslatable one within a
     health tier without touching the dispatch loop. Do NOT delete it.
-    ``price_hint`` is populated (P5) from a SERVER-provided relative-price signal
+    ``price_hint`` is populated from a SERVER-provided relative-price signal
     — the SDK never computes price. ``latency_p50`` is the observed p50 latency
     (ms) for this provider, ``None`` until enough samples.
     """
@@ -109,7 +109,7 @@ def _health_key(candidate: ProviderCandidate) -> tuple[int, bool]:
 
     Forward-looking seam (fix [H]): ``translatable`` is currently ALWAYS ``True``
     (see ``ProviderCandidate``) because untranslatable requests eager-abort the
-    chain (§6.8) rather than being demoted here, so this term is presently a
+    chain rather than being demoted here, so this term is presently a
     no-op. It is retained so a future per-target translatability predicate slots
     in with zero dispatch changes.
     """

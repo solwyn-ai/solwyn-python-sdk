@@ -81,7 +81,7 @@ class _SolwynBase:
         self._runtimes = runtimes
         self._sdk_instance_id = str(uuid.uuid4())
         self._tokenizer = TokenizerManager()
-        # Injectable routing policy (P5): defaults to the health-only policy.
+        # Injectable routing policy: defaults to the health-only policy.
         # Swapping in LatencyPolicy/CostPolicy reorders candidates with ZERO
         # changes to dispatch / translation / budget.
         self._policy: SelectionPolicy = selection_policy or HealthBasedPolicy()
@@ -170,7 +170,7 @@ class _SolwynBase:
         Builds one ProviderCandidate per runtime using NON-MUTATING breaker
         reads only (``state`` / ``recovery_eligible``) — never ``admit()``
         (which consumes a probe). Probe consumption happens exactly once, on the
-        single candidate actually attempted, in the dispatch loop (§4.2).
+        single candidate actually attempted, in the dispatch loop.
         """
         # Snapshot the price hints once under the lock so every candidate in this
         # selection sees a consistent view (the setter may replace the dict
@@ -182,8 +182,8 @@ class _SolwynBase:
                 runtime=runtime,
                 breaker_state=self._get_circuit_breaker(runtime.adapter.name).state,
                 recovery_eligible=self._get_circuit_breaker(runtime.adapter.name).recovery_eligible,
-                translatable=True,  # P1: native passthrough; P2 supplies the real predicate
-                # P5 routing signals: observed p50 latency (LatencyPolicy) and the
+                translatable=True,  # native passthrough; a later predicate refines this
+                # Routing signals: observed p50 latency (LatencyPolicy) and the
                 # server-provided relative price hint (CostPolicy). Both default to
                 # None when unavailable; HealthBasedPolicy ignores them.
                 latency_p50=self.observed_p50(runtime.adapter.name),
@@ -226,7 +226,7 @@ class _SolwynBase:
     ) -> MetadataEvent:
         """Build a MetadataEvent for reporting to the cloud API.
 
-        ``call_id`` is the per-call reconciliation join key (§8.4); when None the
+        ``call_id`` is the per-call reconciliation join key; when None the
         model's default_factory fills a fresh uuid. ``possibly_succeeded`` is the
         post-send-ambiguous abort flag — left None on every non-abort event.
         """
@@ -279,7 +279,7 @@ class _SolwynBase:
         Convenience wrapper for the dispatch-failure paths where
         token_details is unavailable and status is always ERROR. ``call_id``
         threads the reconciliation join key; ``possibly_succeeded`` is True only
-        on a correctly-not-failed-over post-send-ambiguous abort (§8.4).
+        on a correctly-not-failed-over post-send-ambiguous abort.
         """
         return self._build_metadata_event(
             model=model,

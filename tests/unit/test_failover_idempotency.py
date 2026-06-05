@@ -1,4 +1,4 @@
-"""Idempotency & double-spend safety — the P1 DoD (spec §6.5).
+"""Idempotency & double-spend safety.
 
 Cross-provider failover is permitted ONLY when Solwyn can prove the request was
 never durably accepted (pre-send: 429/529/connect-refused). A post-send
@@ -207,7 +207,7 @@ class TestAlwaysMode:
         _close(solwyn)
 
     def test_failed_over_psa_error_event_never_flags_possibly_succeeded(self) -> None:
-        # §8.3/§8.4 [C]: under failover_idempotency="always" a POST_SEND_AMBIGUOUS
+        # Under failover_idempotency="always" a POST_SEND_AMBIGUOUS
         # primary failure DOES fail over to the fallback. Because the call failed
         # over, its primary ERROR event must carry possibly_succeeded None (absent
         # from model_dump) — never True — so reconciliation cannot double-count a
@@ -242,7 +242,7 @@ class TestAlwaysMode:
         _close(solwyn)
 
     def test_per_call_idempotent_failed_over_psa_error_event_clean(self) -> None:
-        # §8.3/§8.4 [C], per-call variant: solwyn_idempotent=True escalates the
+        # Per-call variant: solwyn_idempotent=True escalates the
         # default "safe" policy to allow ambiguous failover. The PSA primary
         # error still fails over and its error event stays clean (None, absent).
         openai = _openai_client()
@@ -367,7 +367,7 @@ class TestSameProviderDoubleCountGuard:
     def test_two_same_provider_failures_count_breaker_once(self) -> None:
         # A chain of two same-provider entries that both 429 must record the
         # provider breaker failure only ONCE per logical call — otherwise the
-        # breaker opens twice as fast as configured (§4.6).
+        # breaker opens twice as fast as configured.
         client = _openai_client()
         client.chat.completions.create.side_effect = [_Status(429), _Status(429)]
 

@@ -223,7 +223,7 @@ class TestConcurrentStateMutation:
 
         assert cb.state == CircuitState.HALF_OPEN
         assert len(cb.half_open_transitions) == 1
-        # Single-probe slot (§6.2/§6.4): exactly ONE concurrent caller wins the
+        # Single-probe slot: exactly ONE concurrent caller wins the
         # probe; the other 31 are refused — no recovery stampede.
         assert sum(1 for admission in admissions if admission.allowed) == 1
         assert sum(1 for admission in admissions if not admission.allowed) == 31
@@ -248,7 +248,7 @@ class TestAdmit:
         assert admission.owns_probe is False
 
     def test_half_open_single_probe_slot(self) -> None:
-        # §6.2/§6.4: HALF_OPEN opens exactly ONE probe slot. The first caller
+        # HALF_OPEN opens exactly ONE probe slot. The first caller
         # consumes it; a concurrent second caller is refused while the probe is
         # in flight; once the probe reports a non-closing success the slot is
         # freed and a fresh caller may probe again.

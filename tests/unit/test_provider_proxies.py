@@ -165,7 +165,7 @@ class TestGoogleModelsProxy:
         """generate_content_stream() calls the correct underlying method via _force_stream."""
         client = _mock_google_client()
         # A real generate_content_stream yields chunk objects (not a single
-        # complete response). First-chunk materialization (§6.6) iterates it, so
+        # complete response). First-chunk materialization iterates it, so
         # the mock must be an ITERABLE of chunks.
         chunk = SimpleNamespace(
             candidates=[

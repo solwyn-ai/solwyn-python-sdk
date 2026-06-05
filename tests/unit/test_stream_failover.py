@@ -1,15 +1,15 @@
-"""P3 streaming failover + idempotency hardening (spec §6.6, §6.5, §4.6, §8.4).
+"""Streaming failover + idempotency hardening.
 
 Three mechanisms under test:
 
-  1. First-chunk MATERIALIZATION (§6.6, §6.8). ``_materialize_stream`` /
+  1. First-chunk MATERIALIZATION. ``_materialize_stream`` /
      ``_materialize_stream_async`` pull the first chunk eagerly so a Google lazy
      generator's establishment error surfaces INSIDE the candidate-walk except
      (failover-eligible) exactly like OpenAI/Anthropic's eager raise_for_status.
      No double-emit: the materialized first chunk is chained back so the wrapper
      observes + yields it exactly once.
 
-  2. Cross-provider TEXT stream normalization (§4.1 Decision A). The P2 fail-loud
+  2. Cross-provider TEXT stream normalization. The fail-loud
      is lifted for plain-text cross-provider streaming; it stays only for the
      TOOL case (``cross_provider_tool_stream``). The wrapper accumulates the RAW
      served chunk but yields caller-dialect chunks via a chunk_translator.
@@ -481,7 +481,7 @@ class TestGooglePrimaryStreamingFailoverIntoOpenAI:
         await _aclose(solwyn)
 
 
-# ── cross-provider TEXT stream: P2 fail-loud LIFTED ──────────────────────
+# ── cross-provider TEXT stream: fail-loud LIFTED ─────────────────────────
 
 
 @pytest.mark.unit
@@ -523,7 +523,7 @@ class TestCrossProviderTextStreamingNormalizes:
 
     def test_cross_provider_tool_stream_still_fails_loud(self) -> None:
         # A cross-provider streaming hop carrying TOOLS cannot be normalized:
-        # must fail loud upfront with cross_provider_tool_stream (P3 keeps this).
+        # must fail loud upfront with cross_provider_tool_stream.
         openai = _openai_client()
         openai.chat.completions.create.side_effect = _Status(429)
         anthropic = _anthropic_client()
@@ -1191,7 +1191,7 @@ class TestCrossProviderStreamSettlement:
         await _aclose(solwyn)
 
 
-# ── streaming idempotency matrix (spec §6.5) ─────────────────────────────
+# ── streaming idempotency matrix ─────────────────────────────────────────
 
 
 @pytest.mark.unit
@@ -1300,7 +1300,7 @@ class TestStreamingIdempotencyMatrix:
     def test_never_disables_cross_provider_streaming_failover(self) -> None:
         # failover_idempotency="never" forbids ANY cross-provider hop, even a 429.
         # The original error re-raises and the fallback is never served. BUT the
-        # primary breaker STILL tracks health (§6.5 "never = breaker still tracks
+        # primary breaker STILL tracks health ("never = breaker still tracks
         # health, no cross-provider failover") — so it records a failure.
         openai = _openai_client()
         openai.chat.completions.create.side_effect = _Status(429, "rate limited")
@@ -1328,7 +1328,7 @@ class TestStreamingIdempotencyMatrix:
             solwyn.chat.completions.create(**request)
 
         anthropic.messages.create.assert_not_called()
-        # The primary breaker tracked health: exactly one recorded failure (§6.5).
+        # The primary breaker tracked health: exactly one recorded failure.
         assert openai_cb.failure_count == 1
         _close(solwyn)
 
@@ -1371,7 +1371,7 @@ class TestStreamingIdempotencyMatrix:
         _close(solwyn)
 
 
-# ── abandoned-stream settlement (spec §8.4) ──────────────────────────────
+# ── abandoned-stream settlement ──────────────────────────────────────────
 
 
 @pytest.mark.unit

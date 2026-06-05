@@ -1,4 +1,4 @@
-"""Status-first, duck-typed transport-error classification (§6.1).
+"""Status-first, duck-typed transport-error classification.
 
 Maps an arbitrary transport exception onto a failover ``Disposition`` WITHOUT
 importing any provider SDK. The core depends only on ``httpx`` + ``pydantic``;
@@ -11,8 +11,8 @@ numeric status from ``getattr(exc, "status_code", ...)`` (OpenAI/Anthropic) or
 *names* via the MRO rather than the classes themselves. Unknown → ``FAIL_FAST``;
 we never failover into the unknown.
 
-THE ORDERING TRAP (the reason the branch order below is load-bearing — §6.1
-risk callout). ``APITimeoutError`` SUBCLASSES ``APIConnectionError`` in both the
+THE ORDERING TRAP (the reason the branch order below is load-bearing).
+``APITimeoutError`` SUBCLASSES ``APIConnectionError`` in both the
 openai and anthropic SDKs. A read timeout is POST-send: the request may have
 already reached the model and run (a real charge + real side effects), so it is
 ambiguous and must NOT failover. A bare ``APIConnectionError`` is PRE-send (DNS /

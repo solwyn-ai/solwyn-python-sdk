@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 
 # Floor for a per-hop dispatch timeout: even when the chain deadline is nearly
-# spent we give a hop at least this long rather than passing it ~0s (§6.3).
+# spent we give a hop at least this long rather than passing it ~0s.
 _MIN_HOP_TIMEOUT = 1.0
 _SOURCE_COMPATIBLE_DEFAULT_KEYS = {
     ProviderName.OPENAI.value: frozenset(
@@ -148,7 +148,7 @@ def _with_google_http_bound(
 
 
 class Deadline:
-    """A monotonic chain deadline (§6.3).
+    """A monotonic chain deadline.
 
     Stamped once at ``_intercepted_call`` entry from ``failover_total_timeout``;
     it encompasses the budget pre-flight and every per-hop dispatch. Per-hop
@@ -207,7 +207,7 @@ class _MaterializedStream:
 
 
 def _materialize_stream(stream: Any) -> _MaterializedStream:
-    """Force the first chunk of a streaming response (§6.6 first-byte rule).
+    """Force the first chunk of a streaming response (first-byte rule).
 
     GOOGLE ONLY (fix [B]): pulls ``next()`` on the raw lazy generator BEFORE the
     wrapper is returned. For a Google ``generate_content_stream`` LAZY generator
@@ -263,7 +263,7 @@ class _MaterializedAsyncStream:
 
 
 async def _materialize_stream_async(stream: Any) -> _MaterializedAsyncStream:
-    """Async first-chunk materialization (§6.6). Mirror of ``_materialize_stream``.
+    """Async first-chunk materialization. Mirror of ``_materialize_stream``.
 
     ``await anext()`` forces a Google async lazy generator to establish, so an
     establishment error PROPAGATES out of THIS coroutine — landing in the
@@ -311,7 +311,7 @@ def _normalize_fallback(fallback: object) -> list[Any]:
 def _success_failover_reason(
     *, is_provider_fallback: bool, is_model_fallback: bool, primary_errored: bool
 ) -> FailoverReason | None:
-    """Pick the success-path failover reason for a served candidate (§4.6, §8.2/§8.5).
+    """Pick the success-path failover reason for a served candidate.
 
     Distinguishes WHY the router advanced past the primary on a cross-provider
     success:
@@ -355,12 +355,12 @@ def _build_hop_kwargs(
     global_defaults: dict[str, Any],
     kwargs: dict[str, object],
 ) -> dict[str, object]:
-    """Build the native kwargs for one candidate hop (§4.6, §5).
+    """Build the native kwargs for one candidate hop.
 
     Fill-absent precedence: per-call kwargs > per-entry default_params > global.
     For a PRIMARY or SAME-PROVIDER model-swap hop the merged kwargs pass straight
     through to the native SDK (no translation). For a CROSS-PROVIDER hop the
-    merged kwargs are run through the §5 translation contract:
+    merged kwargs are run through the translation contract:
 
         canonical  = to_canonical(primary, merged_kwargs)
         call_kwargs = from_canonical(target, canonical, model=...)
@@ -382,7 +382,7 @@ def _build_hop_kwargs(
             return merged_kwargs
         return {**merged_kwargs, "model": rt.entry.model}
 
-    # CROSS-PROVIDER hop. Defensive structural guard (§6.8, fix [G]): the target
+    # CROSS-PROVIDER hop. Defensive structural guard (fix [G]): the target
     # entry MUST carry a concrete model for this provider. An empty/falsy model
     # would otherwise be sent to a healthy provider and 400, burning a chain hop.
     # Raise UntranslatableModelError up front (structural, content-free) so the
@@ -399,10 +399,10 @@ def _build_hop_kwargs(
     source_kwargs: dict[str, object] = {**global_defaults, **source_defaults, **kwargs}
     canonical = _translation.to_canonical(primary.adapter.name, source_kwargs)
 
-    # CROSS-PROVIDER STREAMING (P3, §4.1 Decision A). A PLAIN-TEXT cross-provider
+    # CROSS-PROVIDER STREAMING. A PLAIN-TEXT cross-provider
     # streamed response is normalized per-chunk by the wrapper, so it proceeds. A
     # TOOL-using streamed response cannot be normalized cross-provider (tool-call
-    # deltas are out of the v1 streaming subset, §6.6) — so FAIL LOUD here, BEFORE
+    # deltas are out of the v1 streaming subset) — so FAIL LOUD here, BEFORE
     # dispatch, aborting the chain cleanly (no foreign stream returned). Checking
     # the canonical keeps this structural and content-free.
     if is_streaming and canonical.tools is not None:
@@ -547,7 +547,7 @@ class Solwyn(_SolwynBase):
         """Dispatch one hop to the runtime's SDK client. Pure I/O — no metrics.
 
         Applies the mandatory per-hop bound via ``with_options`` (kills the
-        600s SDK read default and any internal retry stacking; §6.3).
+        600s SDK read default and any internal retry stacking).
 
         The served hop's stream-method selection is driven by the dispatch-level
         ``is_streaming`` boolean — NOT the original ``_force_stream``/canonical
@@ -578,16 +578,16 @@ class Solwyn(_SolwynBase):
         return client.models.generate_content(**kwargs)
 
     def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
-        """Core interception logic: the classified candidate walk (§4.6)."""
+        """Core interception logic: the classified candidate walk."""
         requested_model = cast(str, kwargs["model"])
         is_streaming = bool(kwargs.get("stream", False)) or _force_stream
         agent_run = current_run()
-        # One reconciliation join key per intercepted call (§8.4): threaded into
+        # One reconciliation join key per intercepted call: threaded into
         # every served-provider metadata event AND its confirm so the Cloud API
         # can join them (and dedup cache-hit / abandoned-stream spend).
         call_id = str(uuid.uuid4())
         primary = self._runtimes[0]
-        # Deadline starts here — it encompasses the budget pre-flight (§6.3).
+        # Deadline starts here — it encompasses the budget pre-flight.
         deadline = Deadline(self._config.failover_total_timeout)
 
         # 1. Estimate input tokens (length-only; never materializes joined string).
@@ -669,7 +669,7 @@ class Solwyn(_SolwynBase):
         # 5. Walk the candidates.
         failed_providers: set[str] = set()
         last_exc: Exception | None = None
-        # §8.2/§8.5 [A]: did the PRIMARY runtime get attempted-and-error in this
+        # Fix [A]: did the PRIMARY runtime get attempted-and-error in this
         # walk? Drives the cross-provider success reason (PRIMARY_ERROR if the
         # primary was attempted and raised; CIRCUIT_OPEN if it was skipped OPEN).
         primary_errored = False
@@ -686,7 +686,7 @@ class Solwyn(_SolwynBase):
             is_provider_fallback = rt.entry.provider != primary.entry.provider
             is_model_fallback = (not is_provider_fallback) and not is_primary
             # Fix [B]: attempt_index is the served runtime's position in the
-            # CONFIGURED chain (0=primary, 1=first fallback, ... per §8.2/§8.5),
+            # CONFIGURED chain (0=primary, 1=first fallback, ...),
             # NOT the candidate-walk index. When the primary breaker is
             # OPEN-not-eligible it is dropped from the health-filtered candidate
             # list, so the walk index would mislabel the first fallback as 0 and
@@ -695,9 +695,9 @@ class Solwyn(_SolwynBase):
             # chain depth).
             chain_index = next(i for i, r in enumerate(self._runtimes) if r is rt)
 
-            # Build native kwargs for this hop (§5). A cross-provider hop runs the
-            # §5 translation contract and may RAISE an Untranslatable* error here,
-            # BEFORE any network call — that aborts the WHOLE chain (§4.6, §6.8):
+            # Build native kwargs for this hop. A cross-provider hop runs the
+            # translation contract and may RAISE an Untranslatable* error here,
+            # BEFORE any network call — that aborts the WHOLE chain:
             # do NOT classify it as transport, advance, or record a breaker failure.
             # This is a no-health-signal abort: if admit() already consumed
             # this breaker's single HALF_OPEN probe slot, free it before the error
@@ -730,14 +730,14 @@ class Solwyn(_SolwynBase):
                     rt,
                     call_kwargs,
                     is_streaming=is_streaming,
-                    # Shrinking per-hop slice (§6.3): divide what's left of the
+                    # Shrinking per-hop slice: divide what's left of the
                     # chain deadline across the candidates not yet attempted so a
                     # single hung hop cannot consume the whole budget.
                     timeout=max(_MIN_HOP_TIMEOUT, deadline.remaining() / (len(candidates) - idx)),
                     max_retries=0,
                 )
                 if is_streaming and provider == ProviderName.GOOGLE.value:
-                    # First-chunk materialization (§6.6, §6.8) — GOOGLE ONLY (fix
+                    # First-chunk materialization — GOOGLE ONLY (fix
                     # [B]). A Google lazy generator does no network I/O until the
                     # first pull, so we force it INSIDE this try; an establishment
                     # error then falls into the candidate-walk except ->
@@ -752,15 +752,15 @@ class Solwyn(_SolwynBase):
                     response = _materialize_stream(response)
             except Exception as exc:
                 disp = classify_exception(exc)
-                # §8.2/§8.5 [A]: the PRIMARY was attempted and raised in this walk
+                # Fix [A]: the PRIMARY was attempted and raised in this walk
                 # -> a later cross-provider success is a REACTIVE failover
                 # (PRIMARY_ERROR), not a proactive breaker-open reroute.
                 if is_primary:
                     primary_errored = True
-                # Breaker accounting (§6.1): FAILOVER and POST_SEND_AMBIGUOUS are
+                # Breaker accounting: FAILOVER and POST_SEND_AMBIGUOUS are
                 # provider-health signals and DO count; FAIL_FAST (4xx/refusal) is
                 # a request-shaped error, not a health signal, so it must NOT open
-                # the breaker. Same-provider double-count guard (§4.6): at most one
+                # the breaker. Same-provider double-count guard: at most one
                 # failure per provider per logical attempt.
                 if disp is not Disposition.FAIL_FAST and provider not in failed_providers:
                     cb.record_failure()
@@ -771,7 +771,7 @@ class Solwyn(_SolwynBase):
                     # guard). If the hop consumed a HALF_OPEN probe slot, free it
                     # (no state change) so the breaker is not stranded HALF_OPEN.
                     cb.release_probe(admission)
-                # §8.3/§8.4: a correctly-not-failed-over post-send-ambiguous abort
+                # A correctly-not-failed-over post-send-ambiguous abort
                 # emits an ERROR event with possibly_succeeded=True so the Cloud API
                 # can reconcile the (possibly-landed, never-confirmed) reservation.
                 possibly_succeeded = (
@@ -796,7 +796,7 @@ class Solwyn(_SolwynBase):
                 if disp is Disposition.FAIL_FAST:
                     raise  # 4xx/404/refusal — do NOT advance the chain
                 if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
-                    raise  # re-raise ORIGINAL exception (drop-in contract, §6.5)
+                    raise  # re-raise ORIGINAL exception (drop-in contract)
                 last_exc = exc
                 continue  # pre-send safe -> advance to the next candidate
 
@@ -826,7 +826,7 @@ class Solwyn(_SolwynBase):
                 )
             cb.record_success()
 
-            # P5 LatencyPolicy signal: record this served hop's success latency
+            # LatencyPolicy signal: record this served hop's success latency
             # (non-streaming). Streaming records in on_complete when the stream
             # settles. Pure signal store — no I/O, no routing change here.
             self.record_latency(provider, ctx.elapsed_ms())
@@ -867,7 +867,7 @@ class Solwyn(_SolwynBase):
             )
             if is_provider_fallback:
                 # Cross-provider hop: reshape the served response back to the
-                # caller's native dialect (§5). Primary / same-provider hops
+                # caller's native dialect. Primary / same-provider hops
                 # return the raw response unchanged.
                 return _translation.normalize_response(
                     served=rt.adapter.name,
@@ -905,7 +905,7 @@ class Solwyn(_SolwynBase):
 
         def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             self._get_circuit_breaker(provider).record_success()
-            # P5 LatencyPolicy signal: record the SERVED provider's latency as the
+            # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
             self.record_latency(provider, ctx.elapsed_ms())
             if budget.reservation_id:
@@ -961,7 +961,7 @@ class Solwyn(_SolwynBase):
             )
 
         # Cross-provider hop: reshape each served chunk back to the caller's
-        # native streaming dialect (§6.6). Same-dialect (primary / same-provider
+        # native streaming dialect. Same-dialect (primary / same-provider
         # model swap) passes None -> zero translation. The accumulator still
         # observes the RAW served chunk inside the wrapper, so usage settles
         # against the served provider.
@@ -1117,7 +1117,7 @@ class AsyncSolwyn(_SolwynBase):
     ) -> Any:
         """Dispatch one hop to the runtime's async SDK client. Pure I/O.
 
-        Applies the mandatory per-hop bound via ``with_options`` (§6.3). Mirrors
+        Applies the mandatory per-hop bound via ``with_options``. Mirrors
         ``_sync_dispatch``: the served hop's stream-method selection is driven by
         the dispatch-level ``is_streaming`` boolean (fix [A]).
         """
@@ -1141,11 +1141,11 @@ class AsyncSolwyn(_SolwynBase):
         return await client.models.generate_content(**kwargs)
 
     async def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
-        """Async core interception logic: the classified candidate walk (§4.6)."""
+        """Async core interception logic: the classified candidate walk."""
         requested_model = cast(str, kwargs["model"])
         is_streaming = bool(kwargs.get("stream", False)) or _force_stream
         agent_run = current_run()
-        # One reconciliation join key per intercepted call (§8.4): see the sync
+        # One reconciliation join key per intercepted call: see the sync
         # _intercepted_call for the join/dedup contract.
         call_id = str(uuid.uuid4())
         primary = self._runtimes[0]
@@ -1221,7 +1221,7 @@ class AsyncSolwyn(_SolwynBase):
 
         failed_providers: set[str] = set()
         last_exc: Exception | None = None
-        # §8.2/§8.5 [A]: did the PRIMARY runtime get attempted-and-error in this
+        # Fix [A]: did the PRIMARY runtime get attempted-and-error in this
         # walk? Drives the cross-provider success reason (PRIMARY_ERROR if the
         # primary was attempted and raised; CIRCUIT_OPEN if it was skipped OPEN).
         primary_errored = False
@@ -1238,7 +1238,7 @@ class AsyncSolwyn(_SolwynBase):
             is_provider_fallback = rt.entry.provider != primary.entry.provider
             is_model_fallback = (not is_provider_fallback) and not is_primary
             # Fix [B]: attempt_index is the served runtime's position in the
-            # CONFIGURED chain (0=primary, 1=first fallback, ... per §8.2/§8.5),
+            # CONFIGURED chain (0=primary, 1=first fallback, ...),
             # NOT the candidate-walk index. When the primary breaker is
             # OPEN-not-eligible it is dropped from the health-filtered candidate
             # list, so the walk index would mislabel the first fallback as 0 and
@@ -1247,9 +1247,9 @@ class AsyncSolwyn(_SolwynBase):
             # chain depth).
             chain_index = next(i for i, r in enumerate(self._runtimes) if r is rt)
 
-            # Build native kwargs for this hop (§5). A cross-provider hop runs the
-            # §5 translation contract and may RAISE an Untranslatable* error here,
-            # BEFORE any network call — that aborts the WHOLE chain (§4.6, §6.8):
+            # Build native kwargs for this hop. A cross-provider hop runs the
+            # translation contract and may RAISE an Untranslatable* error here,
+            # BEFORE any network call — that aborts the WHOLE chain:
             # do NOT classify it as transport, advance, or record a breaker failure.
             # This is a no-health-signal abort: if admit() already consumed
             # this breaker's single HALF_OPEN probe slot, free it before the error
@@ -1282,14 +1282,14 @@ class AsyncSolwyn(_SolwynBase):
                     rt,
                     call_kwargs,
                     is_streaming=is_streaming,
-                    # Shrinking per-hop slice (§6.3): divide what's left of the
+                    # Shrinking per-hop slice: divide what's left of the
                     # chain deadline across the candidates not yet attempted so a
                     # single hung hop cannot consume the whole budget.
                     timeout=max(_MIN_HOP_TIMEOUT, deadline.remaining() / (len(candidates) - idx)),
                     max_retries=0,
                 )
                 if is_streaming and provider == ProviderName.GOOGLE.value:
-                    # First-chunk materialization (§6.6, §6.8) — GOOGLE ONLY (fix
+                    # First-chunk materialization — GOOGLE ONLY (fix
                     # [B]). Awaiting this runs the eager anext, so a Google
                     # lazy-generator establishment error falls into THIS except ->
                     # classify_exception -> failover. OpenAI/Anthropic established
@@ -1300,14 +1300,14 @@ class AsyncSolwyn(_SolwynBase):
                     response = await _materialize_stream_async(response)
             except Exception as exc:
                 disp = classify_exception(exc)
-                # §8.2/§8.5 [A]: the PRIMARY was attempted and raised in this walk
+                # Fix [A]: the PRIMARY was attempted and raised in this walk
                 # -> a later cross-provider success is a REACTIVE failover
                 # (PRIMARY_ERROR), not a proactive breaker-open reroute.
                 if is_primary:
                     primary_errored = True
-                # Breaker accounting (§6.1): count FAILOVER + POST_SEND_AMBIGUOUS
+                # Breaker accounting: count FAILOVER + POST_SEND_AMBIGUOUS
                 # (real health signals); skip FAIL_FAST (request-shaped, not a
-                # health signal). Same-provider double-count guard (§4.6).
+                # health signal). Same-provider double-count guard.
                 if disp is not Disposition.FAIL_FAST and provider not in failed_providers:
                     cb.record_failure()
                     failed_providers.add(provider)
@@ -1317,7 +1317,7 @@ class AsyncSolwyn(_SolwynBase):
                     # guard). If the hop consumed a HALF_OPEN probe slot, free it
                     # (no state change) so the breaker is not stranded HALF_OPEN.
                     cb.release_probe(admission)
-                # §8.3/§8.4: a correctly-not-failed-over post-send-ambiguous abort
+                # A correctly-not-failed-over post-send-ambiguous abort
                 # emits an ERROR event with possibly_succeeded=True so the Cloud API
                 # can reconcile the (possibly-landed, never-confirmed) reservation.
                 possibly_succeeded = (
@@ -1371,7 +1371,7 @@ class AsyncSolwyn(_SolwynBase):
                 )
             cb.record_success()
 
-            # P5 LatencyPolicy signal: record this served hop's success latency
+            # LatencyPolicy signal: record this served hop's success latency
             # (non-streaming). Streaming records in on_complete when the stream
             # settles. Pure signal store — no I/O, no routing change here.
             self.record_latency(provider, ctx.elapsed_ms())
@@ -1412,7 +1412,7 @@ class AsyncSolwyn(_SolwynBase):
             )
             if is_provider_fallback:
                 # Cross-provider hop: reshape the served response back to the
-                # caller's native dialect (§5). Primary / same-provider hops
+                # caller's native dialect. Primary / same-provider hops
                 # return the raw response unchanged.
                 return _translation.normalize_response(
                     served=rt.adapter.name,
@@ -1450,7 +1450,7 @@ class AsyncSolwyn(_SolwynBase):
 
         async def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             self._get_circuit_breaker(provider).record_success()
-            # P5 LatencyPolicy signal: record the SERVED provider's latency as the
+            # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
             self.record_latency(provider, ctx.elapsed_ms())
             if budget.reservation_id:
@@ -1506,7 +1506,7 @@ class AsyncSolwyn(_SolwynBase):
             )
 
         # Cross-provider hop: reshape each served chunk back to the caller's
-        # native streaming dialect (§6.6). Same-dialect passes None (zero
+        # native streaming dialect. Same-dialect passes None (zero
         # translation). See the sync ``_wrap_stream`` for the accounting note.
         chunk_translator = (
             _make_chunk_translator(served=provider, requested=primary.adapter.name)

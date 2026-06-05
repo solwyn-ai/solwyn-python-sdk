@@ -791,7 +791,7 @@ class TestSettleErrorSymmetry:
 
 
 # ---------------------------------------------------------------------------
-# P2 fix: close()/aclose() forward cleanup to inner stream
+# close()/aclose() forward cleanup to inner stream
 # ---------------------------------------------------------------------------
 
 

@@ -1,4 +1,4 @@
-"""P5 routing signals proven END-TO-END through the real dispatch loop.
+"""Routing signals proven END-TO-END through the real dispatch loop.
 
 Where ``test_routing_policy_swap.py`` drives the ``_select_candidates`` seam
 directly, these tests run real intercepted calls (mocked provider clients) so

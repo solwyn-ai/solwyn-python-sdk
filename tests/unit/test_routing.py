@@ -5,7 +5,7 @@ snapshots: it filters out OPEN-not-recovery-eligible candidates and ranks the
 rest CLOSED < HALF_OPEN < recovery-eligible OPEN, sinking untranslatable
 targets within a state tier. sorted() is stable, so configured (input) order is
 preserved inside a priority tier. order() must NEVER call admit() or
-mutate a breaker (§4.2 inspection-vs-consumption rule).
+mutate a breaker (inspection-vs-consumption rule).
 """
 
 from __future__ import annotations
@@ -186,7 +186,7 @@ def test_routing_request_estimated_input_tokens_defaults_zero() -> None:
     assert RoutingRequest(requested_provider=ProviderName.ANTHROPIC).estimated_input_tokens == 0
 
 
-# ── P5: LatencyPolicy (pure drop-in over observed p50) ───────────────────────
+# ── LatencyPolicy (pure drop-in over observed p50) ───────────────────────────
 
 
 @pytest.mark.unit
@@ -271,7 +271,7 @@ def test_latency_policy_is_pure_does_not_touch_breaker() -> None:
     assert breaker.method_calls == []
 
 
-# ── P5: CostPolicy (pure drop-in over SERVER price hint; NO price math) ───────
+# ── CostPolicy (pure drop-in over SERVER price hint; NO price math) ───────────
 
 
 @pytest.mark.unit
@@ -426,7 +426,7 @@ def test_cost_policy_is_pure_does_not_touch_breaker() -> None:
 # ── fix [E]: SelectionPolicy classes are exported from the package root ───
 @pytest.mark.unit
 def test_selection_policies_importable_from_package_root() -> None:
-    # P5's headline user feature is the constructor selection_policy= arg, so the
+    # The headline user feature is the constructor selection_policy= arg, so the
     # policy classes must be importable from `solwyn`, not only solwyn._routing.
     import solwyn
     from solwyn import CostPolicy as RootCost

@@ -56,7 +56,7 @@ def _secure_image_url(provider: str, url: str) -> ImagePart:
 
 
 # --------------------------------------------------------------------------- #
-# §5.4 Finish-reason normalization (and the inverse for response shaping).      #
+# Finish-reason normalization (and the inverse for response shaping).           #
 # --------------------------------------------------------------------------- #
 _FINISH_TO_CANONICAL: dict[str, dict[str, str]] = {
     "openai": {
@@ -128,7 +128,7 @@ def _denormalize_finish_reason(requested: str, canonical: str | None) -> str | N
 def _parse_data_uri(uri: str) -> tuple[str, str]:
     """Split ``data:<media_type>;base64,<data>`` -> (media_type, data) VERBATIM.
 
-    Anthropic strictly validates ``media_type`` vs bytes (§5.4), so the media
+    Anthropic strictly validates ``media_type`` vs bytes, so the media
     type is preserved exactly as written.
     """
     header, _, data = uri.partition(",")

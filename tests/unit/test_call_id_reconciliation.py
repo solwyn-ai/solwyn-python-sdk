@@ -1,4 +1,4 @@
-"""call_id spend-reconciliation join key + possibly_succeeded abort flag (§8.4).
+"""call_id spend-reconciliation join key + possibly_succeeded abort flag.
 
 The Cloud API joins a served-provider MetadataEvent to its /budgets/confirm by
 ``call_id`` (one uuid per intercepted call), so cache-hit / abandoned-stream
@@ -124,11 +124,11 @@ class TestCallIdJoinKey:
 
 @pytest.mark.unit
 class TestCacheHitReconciliation:
-    """Budget-cache hit: confirm is skipped; the metadata event carries spend (§8.4)."""
+    """Budget-cache hit: confirm is skipped; the metadata event carries spend."""
 
     def test_cache_hit_skips_confirm_but_metadata_event_reconciles(self) -> None:
         # On a budget-cache hit the allow result has reservation_id=None, so the
-        # SDK correctly SKIPS /budgets/confirm. The spec relies on the served-
+        # SDK correctly SKIPS /budgets/confirm. Reconciliation relies on the served-
         # provider SUCCESS MetadataEvent being sufficient for the Cloud API to
         # reconcile the cache-hit spend: it must carry the call_id join key, the
         # token_details, AND the served provider — the confirm-free path.
@@ -137,7 +137,7 @@ class TestCacheHitReconciliation:
         solwyn = _make_solwyn(openai, model="gpt-4o")
 
         confirm_spy = MagicMock()
-        # reservation_id=None mimics a budget-cache hit (§8.4).
+        # reservation_id=None mimics a budget-cache hit.
         with (
             patch.object(
                 solwyn._budget, "check_budget", return_value=_allow_budget(reservation_id=None)
@@ -167,7 +167,7 @@ class TestCacheHitReconciliation:
 
 @pytest.mark.unit
 class TestPossiblySucceededAbortFlag:
-    """possibly_succeeded=True only on the post-send-ambiguous abort path (§8.3)."""
+    """possibly_succeeded=True only on the post-send-ambiguous abort path."""
 
     def test_post_send_ambiguous_abort_sets_possibly_succeeded(self) -> None:
         openai = _openai_client()

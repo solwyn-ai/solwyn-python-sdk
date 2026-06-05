@@ -300,8 +300,8 @@ class _BudgetEnforcerBase:
 
         Stream completion builds this synchronously (no I/O) and enqueues
         it on the reporter thread, avoiding a blocking httpx.post. ``provider``
-        is the provider that actually served the call (required; §8.1).
-        ``call_id`` is the per-call reconciliation join key (§8.4); when None the
+        is the provider that actually served the call (required).
+        ``call_id`` is the per-call reconciliation join key; when None the
         model's default_factory mints one.
         """
         extra: dict[str, str] = {} if call_id is None else {"call_id": call_id}
@@ -418,7 +418,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         """Confirm actual token usage for a budget reservation.
 
         ``provider`` is the provider that actually served the call (required).
-        ``call_id`` is the per-call reconciliation join key (§8.4); when None the
+        ``call_id`` is the per-call reconciliation join key; when None the
         model's default_factory mints one.
 
         Best-effort: failures are logged but do not raise.

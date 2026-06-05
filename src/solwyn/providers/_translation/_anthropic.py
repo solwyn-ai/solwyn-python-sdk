@@ -85,7 +85,7 @@ def _anthropic_to_canonical(kwargs: dict[str, Any]) -> CanonicalRequest:
 def _anthropic_system(system: Any) -> str | None:
     if system is None or isinstance(system, str):
         return system
-    # A block-list system (used for cache_control) is not a plain string (§5.2).
+    # A block-list system (used for cache_control) is not a plain string.
     _raise("anthropic", "*", "system_block_list")
 
 
@@ -116,7 +116,7 @@ def _anthropic_image_to_canonical(source: dict[str, Any]) -> ImagePart:
         return ImagePart(media_type=source.get("media_type"), data=source.get("data"))
     if stype == "url":
         return _secure_image_url("anthropic", source.get("url", ""))
-    # file_id / Files-API handles are provider-specific (§5.4) -> RAISE.
+    # file_id / Files-API handles are provider-specific -> RAISE.
     _raise("anthropic", "*", "image.opaque_handle")
 
 
@@ -225,7 +225,7 @@ def _canonical_to_anthropic(canonical: CanonicalRequest, model: str) -> dict[str
     ]
     out: dict[str, Any] = {
         "model": model,
-        "max_tokens": canonical.max_tokens,  # required (§5.2)
+        "max_tokens": canonical.max_tokens,  # required
         "messages": messages,
     }
     if canonical.system is not None:

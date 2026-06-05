@@ -52,7 +52,7 @@ __all__ = [
     "ProviderCandidate",
     "CircuitState",
     "CircuitBreakerState",
-    # P5 selection policies (constructor selection_policy= arg; fix [E]).
+    # Selection policies (constructor selection_policy= arg).
     "SelectionPolicy",
     "HealthBasedPolicy",
     "LatencyPolicy",

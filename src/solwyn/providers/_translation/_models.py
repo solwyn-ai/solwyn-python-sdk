@@ -1,4 +1,4 @@
-"""Canonical Pydantic models for cross-provider translation (design spec §5.1).
+"""Canonical Pydantic models for cross-provider translation.
 
 ================================ PRIVACY-CRITICAL ==============================
 Part of the content-privileged ``providers/_translation`` package. These models
@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 # --------------------------------------------------------------------------- #
-# §5.1  Canonical models (Pydantic v2, extra="forbid")                         #
+# Canonical models (Pydantic v2, extra="forbid")                               #
 # --------------------------------------------------------------------------- #
 class _Canonical(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -85,7 +85,7 @@ class CanonicalRequest(_Canonical):
     # Structural request-shaping flag (NOT content). Default True == provider
     # default. Carried so the target-aware ``from_canonical`` can RAISE when a
     # ``parallel_tool_calls=False`` request targets Google, which has no
-    # first-class equivalent (§5.5). This is the only non-content addition.
+    # first-class equivalent. This is the only non-content addition.
     parallel_tool_calls: bool = True
 
 

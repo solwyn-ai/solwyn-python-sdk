@@ -79,7 +79,7 @@ class FailoverReason(StrEnum):
 class ProviderEntry(BaseModel):
     """One link in the configured provider/model failover chain.
 
-    Decision D: deliberately carries NO ``api_key`` / ``base_url``. Solwyn
+    Deliberately carries NO ``api_key`` / ``base_url``. Solwyn
     never accepts, stores, or logs a provider credential — credentials live
     only in the caller's client objects. ``extra="forbid"`` makes any attempt
     to smuggle one in a hard error.
@@ -143,14 +143,14 @@ class MetadataEvent(BaseModel):
     call_id: str = Field(
         default_factory=lambda: str(uuid.uuid4()),
         description=(
-            "uuid per intercepted call; join key for cache-hit spend reconciliation "
-            "(§8.4). Always present on the wire — it is NOT content."
+            "uuid per intercepted call; join key for cache-hit spend reconciliation. "
+            "Always present on the wire — it is NOT content."
         ),
     )
     possibly_succeeded: bool | None = Field(
         default=None,
         description=(
-            "post-send-ambiguous abort flag for reconciliation (§8.4); True only on a "
+            "post-send-ambiguous abort flag for reconciliation; True only on a "
             "correctly-not-failed-over post-send-ambiguous abort. None default keeps "
             "every non-abort event clean on the wire."
         ),
@@ -242,14 +242,14 @@ class BudgetConfirmRequest(BaseModel):
     )
     model: str = Field(..., max_length=100, description="LLM model name used for the call")
     provider: ProviderName = Field(
-        ..., description="Provider that actually served the call (required; §8.1)"
+        ..., description="Provider that actually served the call (required)"
     )
     is_provider_fallback: bool = Field(
         default=False, description="served provider != requested provider"
     )
     call_id: str = Field(
         default_factory=lambda: str(uuid.uuid4()),
-        description=("uuid per intercepted call; dedups confirm vs metadata reconciliation (§8.4)"),
+        description=("uuid per intercepted call; dedups confirm vs metadata reconciliation"),
     )
     token_details: TokenDetails = Field(
         ..., description="Actual token breakdown from the provider adapter"

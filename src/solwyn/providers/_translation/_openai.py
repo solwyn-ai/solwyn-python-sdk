@@ -50,7 +50,7 @@ from ._models import (
 
 # ------------------------------- OpenAI -> canonical ------------------------ #
 def _openai_to_canonical(kwargs: dict[str, Any]) -> CanonicalRequest:
-    # Responses API shape uses input=/instructions=, not messages= (§5.5).
+    # Responses API shape uses input=/instructions=, not messages=.
     if "input" in kwargs or "instructions" in kwargs:
         _raise("openai", "*", "responses_api")
     _check_forbidden_keys("openai", kwargs)
@@ -110,7 +110,7 @@ def _openai_system_text(msg: dict[str, Any]) -> str:
     content = msg.get("content")
     if isinstance(content, str):
         return content
-    # A list-content system message (block list) is not a plain string (§5.2).
+    # A list-content system message (block list) is not a plain string.
     _raise("openai", "*", "system_block_list")
 
 
@@ -250,7 +250,7 @@ def _canonical_to_openai(canonical: CanonicalRequest, model: str) -> dict[str, A
 
     out: dict[str, Any] = {
         "model": model,
-        # MUST emit max_completion_tokens, never max_tokens (§5.2).
+        # MUST emit max_completion_tokens, never max_tokens.
         "max_completion_tokens": canonical.max_tokens,
         "messages": messages,
     }

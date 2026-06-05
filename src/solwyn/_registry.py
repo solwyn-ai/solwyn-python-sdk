@@ -7,7 +7,7 @@ turns the primary client plus an ordered list of fallback specs into the
 ``[primary, *fallbacks]`` chain the router walks.
 
 No business logic, no network, no credentials: ``ProviderEntry`` deliberately
-carries no api_key/base_url (Decision D). Provider credentials live only on the
+carries no api_key/base_url. Provider credentials live only on the
 caller's client objects.
 """
 

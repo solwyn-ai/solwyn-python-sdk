@@ -1,13 +1,13 @@
-"""Cross-provider failover with REAL §5 translation wired into dispatch (P2).
+"""Cross-provider failover with REAL translation wired into dispatch.
 
-P1 shipped the candidate walk with a cross-provider PASSTHROUGH. P2 replaces it
-with the §5 translation contract: on a real cross-provider hop the request is
+The candidate walk no longer uses a cross-provider PASSTHROUGH; it now applies
+the translation contract: on a real cross-provider hop the request is
 reshaped via ``to_canonical``/``from_canonical`` BEFORE the network call, and the
 served response is reshaped back into the caller's native dialect via
 ``normalize_response``. These tests exercise that seam end-to-end through
 ``Solwyn._intercepted_call`` with faked provider clients (no real SDKs importable).
 
-Covered (spec §5 + §6.8):
+Covered:
   * a fully-resolved tool exchange crosses OpenAI->Anthropic and the Anthropic
     call receives wrapped tool declarations + tool_result envelopes (id remap,
     JSON-object args);
@@ -135,7 +135,7 @@ _PLAIN_REQUEST = {
 }
 
 # A fully-resolved tool exchange in the OpenAI dialect: tool_call issued AND its
-# tool result returned (the stateless/resolvable case the §5.3 subset supports).
+# tool result returned (the stateless/resolvable case the subset supports).
 _TOOL_REQUEST = {
     "model": "gpt-4o",
     "messages": [
@@ -284,7 +284,7 @@ class TestUntranslatableAbortsChain:
     ) -> None:
         # The primary 429s (FAILOVER), so the walk advances to the cross-provider
         # Anthropic candidate, where translation runs and RAISES before any
-        # Anthropic network call — the whole chain aborts (§6.8).
+        # Anthropic network call — the whole chain aborts.
         openai = _openai_client()
         openai.chat.completions.create.side_effect = _Status(429)
         anthropic = _anthropic_client()
@@ -330,8 +330,8 @@ class TestUntranslatableAbortsChain:
         _close(solwyn)
 
     def test_dangling_tool_call_aborts_chain(self) -> None:
-        # A tool_call still awaiting its result cannot be safely re-homed (§5.5
-        # Decision B line) -> RAISE on the first cross-provider hop.
+        # A tool_call still awaiting its result cannot be safely re-homed
+        # -> RAISE on the first cross-provider hop.
         openai = _openai_client()
         openai.chat.completions.create.side_effect = _Status(429)
         anthropic = _anthropic_client()
@@ -374,7 +374,7 @@ class TestUntranslatableAbortsChain:
         _close(solwyn)
 
     def test_proprietary_tool_aborts_chain(self) -> None:
-        # A non-function (proprietary) tool has no cross-provider meaning (§5.5).
+        # A non-function (proprietary) tool has no cross-provider meaning.
         openai = _openai_client()
         openai.chat.completions.create.side_effect = _Status(429)
         anthropic = _anthropic_client()
@@ -411,7 +411,7 @@ class TestUntranslatableAbortsChain:
 @pytest.mark.unit
 class TestEmptyModelAbortsCrossProviderHop:
     def test_cross_provider_hop_with_empty_model_raises_untranslatable_model(self) -> None:
-        # §6.8: "missing model -> UntranslatableModelError up front". A
+        # Missing model -> UntranslatableModelError up front. A
         # cross-provider fallback whose entry model is empty would otherwise send
         # an empty model to a healthy provider (a 400). The guard fires BEFORE any
         # translation/dispatch, aborting the chain — the fallback is NEVER called.
@@ -502,13 +502,13 @@ class TestResponseNormalization:
 # ── 4. native happy path / same-provider swap pay ZERO translation cost ──
 
 
-# ── 5. cross-provider STREAMING (P3: text streams; tools fail loud) ──────
+# ── 5. cross-provider STREAMING (text streams; tools fail loud) ──────────
 
 
 @pytest.mark.unit
 class TestCrossProviderStreamingFailsLoud:
     def test_cross_provider_text_streaming_now_fails_over(self) -> None:
-        # P3 LIFTS the P2 text fail-loud: a PLAIN-TEXT cross-provider streaming
+        # The text fail-loud is now lifted: a PLAIN-TEXT cross-provider streaming
         # hop now fails over and the served (Anthropic) stream is normalized to
         # the caller's OpenAI dialect, served chunk-by-chunk.
         openai = _openai_client()
@@ -550,7 +550,7 @@ class TestCrossProviderStreamingFailsLoud:
         _close(solwyn)
 
     def test_cross_provider_tool_streaming_still_fails_loud(self) -> None:
-        # P3 keeps the fail-loud for the TOOL case: tool-call deltas are out of
+        # The fail-loud is kept for the TOOL case: tool-call deltas are out of
         # the v1 streaming subset, so a tool-using cross-provider streaming hop
         # raises cross_provider_tool_stream BEFORE dispatch.
         openai = _openai_client()
@@ -595,7 +595,7 @@ class TestCrossProviderStreamingFailsLoud:
 
     def test_same_provider_streaming_model_swap_still_streams(self) -> None:
         # A same-provider streaming model swap must NOT be blocked — only the
-        # cross-provider streaming hop fails loud in P2.
+        # cross-provider streaming hop fails loud.
         client = _openai_client()
 
         def _stream() -> object:

@@ -1,6 +1,6 @@
 """Structural firewall tests for the SDK prompt-privacy promise.
 
-These tests enforce the design-spec §7 content-touching contract:
+These tests enforce the content-touching contract:
 
   1. Customer prompts/responses are never passed into a log statement —
      not via a bareword name, not via a kwargs/payload dict.
@@ -29,7 +29,7 @@ from solwyn.client import Solwyn
 
 SDK_SRC = Path(__file__).resolve().parent.parent.parent / "src" / "solwyn"
 
-# The content-touching allowlist (spec §7). EXACTLY these paths may reshape
+# The content-touching allowlist. EXACTLY these paths may reshape
 # customer prompt content: ``_privacy.py`` at the SDK root, PLUS every module
 # under the ``providers/_translation/`` package. This PATH-based allowlist
 # replaces the older filename-set notion so a content-privileged *package* (not
@@ -91,7 +91,7 @@ def _content_privileged_paths() -> list[Path]:
 def test_no_logger_calls_receive_prompt_variables() -> None:
     """Source files must not pass a prompt/content-bearing variable into a
     logger call. Covers bareword content names AND the kwargs/payload dict
-    names that the failover dispatch threads (spec §7 leak vector — the
+    names that the failover dispatch threads (leak vector — the
     bareword regex alone misses ``kwargs``/``translated_kwargs``/``payload``)."""
     leak_words = [
         # bareword content names
@@ -196,7 +196,7 @@ def test_no_print_calls_in_sdk_source() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# §7 — content-privileged allowlist enforcement                               #
+# content-privileged allowlist enforcement                                    #
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
 def test_content_privileged_modules_have_no_logging_import() -> None:
@@ -293,7 +293,7 @@ def test_wire_models_stay_content_free() -> None:
 def test_add_note_interpolates_only_exception_type_name() -> None:
     """Provider SDK exceptions embed request content in str(exc)/.body. Any
     add_note(f"…") in SDK source may only interpolate ``type(...).__name__`` —
-    never str(exc), .body, or any other expression (spec §7 leak vector)."""
+    never str(exc), .body, or any other expression (leak vector)."""
     # Matches an f-string add_note and captures every {...} placeholder inside it.
     note_call = re.compile(r"add_note\(\s*f(['\"])(.*?)\1", re.DOTALL)
     placeholder = re.compile(r"\{([^{}]*)\}")
@@ -325,7 +325,7 @@ def test_no_exc_info_logging_in_failover_provider_except_blocks() -> None:
     provider exception (``except ... as exc:`` whose body calls
     ``classify_exception``). A ``logger.*(..., exc_info=True)`` there would
     render the provider exception (whose str()/body embeds request content)
-    into the log record. Assert no such call lives in those blocks (§7)."""
+    into the log record. Assert no such call lives in those blocks."""
     client_py = (SDK_SRC / "client.py").read_text()
     lines = client_py.splitlines()
 
@@ -393,7 +393,7 @@ def test_stream_settlement_logs_only_callback_exception_class_name() -> None:
     """Every logger.warning argument in stream.py may only be type(...).__name__.
 
     The suppression log identifies the CALLBACK failure structurally — its class
-    name — never str(exc), the provider exception, or chunk content (spec §7).
+    name — never str(exc), the provider exception, or chunk content.
     Parses each ``logger.warning(...)`` via AST and asserts that beyond the
     literal-string template, the ONLY argument expression is ``type(x).__name__``;
     no f-strings, no str(exc), no bareword content names."""
@@ -440,7 +440,7 @@ def test_stream_settlement_logs_only_callback_exception_class_name() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# THE authoritative backstop — behavioral, end-to-end (spec §7)               #
+# THE authoritative backstop — behavioral, end-to-end                         #
 # --------------------------------------------------------------------------- #
 # The structural scans above prove import/log-call/add_note shapes, but cannot
 # model new-field / __repr__ / translated-kwargs leaks. This test is the

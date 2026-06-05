@@ -1,6 +1,6 @@
-"""P5 DoD: injectable SelectionPolicy + latency/cost routing signals.
+"""Injectable SelectionPolicy + latency/cost routing signals.
 
-The headline P5 invariant is the POLICY-SWAP DROP-IN: swapping the injected
+The headline invariant is the POLICY-SWAP DROP-IN: swapping the injected
 ``selection_policy`` changes routing order with ZERO changes to dispatch /
 translation / budget. These tests build real ``Solwyn`` clients over the same
 provider chain and assert ``_select_candidates`` reorders purely as a function
@@ -81,7 +81,7 @@ def _ordered_providers(solwyn: Solwyn) -> list[str]:
     return [rt.adapter.name for rt in solwyn._select_candidates(_req())]
 
 
-# ── 1+2: POLICY-SWAP DROP-IN (the headline DoD) ──────────────────────────────
+# ── 1+2: POLICY-SWAP DROP-IN ─────────────────────────────────────────────────
 
 
 @pytest.mark.unit

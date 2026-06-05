@@ -37,13 +37,13 @@ class SolwynConfig(BaseModel):
     # Provider failover chain (replaces primary_provider + fallback_model).
     # providers[0] is the primary; the rest are fallbacks in attempt order.
     providers: list[ProviderEntry] = Field(default_factory=list)
-    # Global fill-absent defaults (per-entry default_params wins; see §5.2).
+    # Global fill-absent defaults (per-entry default_params wins).
     default_params: dict[str, Any] = Field(default_factory=dict)
 
-    # Failover knobs (§4.4 / §6.3 / §6.5)
+    # Failover knobs
     failover_total_timeout: float = 30.0
     failover_idempotency: Literal["safe", "never", "always"] = "safe"
-    # RESERVED for the future §6.2 behavior: a single same-provider retry after a
+    # RESERVED for future behavior: a single same-provider retry after a
     # 429 with a short Retry-After on a non-idempotent call where cross-provider
     # failover is unsafe. NOT YET HONORED — the dispatch loop never reads this
     # field, so every chain entry is exactly one attempt regardless of its value.

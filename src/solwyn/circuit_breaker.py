@@ -74,7 +74,7 @@ class CircuitBreaker:
             failure_threshold: Number of consecutive failures before opening.
             recovery_timeout: Seconds to wait before probing recovery.
             success_threshold: Successes in HALF_OPEN needed to close.
-            recovery_timeout_jitter: Anti-stampede jitter fraction (§6.4). When
+            recovery_timeout_jitter: Anti-stampede jitter fraction. When
                 ``> 0``, each time the breaker opens it samples an effective
                 recovery window of ``recovery_timeout * (1 +
                 uniform(-jitter, +jitter))``. ``0.0`` (default) keeps the window
@@ -94,7 +94,7 @@ class CircuitBreaker:
         # Effective recovery window for the current OPEN episode. Re-sampled on
         # each transition to OPEN; equals recovery_timeout when jitter is 0.
         self._effective_recovery_timeout: float = float(recovery_timeout)
-        # Single-probe slot (§6.2/§6.4): while HALF_OPEN, exactly one in-flight
+        # Single-probe slot: while HALF_OPEN, exactly one in-flight
         # probe is permitted. Set True by the caller that opens the slot;
         # freed (False) when that probe reports an outcome so the next call
         # may probe again (matters when success_threshold > 1).
@@ -190,7 +190,7 @@ class CircuitBreaker:
         """Report whether an OPEN breaker is ready to probe — WITHOUT mutating.
 
         The router orders candidates on this read; it must never transition
-        state (§4.2/§6.4: separate INSPECTION from CONSUMPTION). Only
+        state (separate INSPECTION from CONSUMPTION). Only
         ``admit()`` may flip an eligible OPEN breaker to HALF_OPEN.
 
         Returns ``True`` only when the breaker is OPEN and the (possibly

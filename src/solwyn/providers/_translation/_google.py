@@ -139,7 +139,7 @@ def _google_user_to_canonical(
         elif "inline_data" in part:
             parts.append(_google_inline_image_to_canonical(part["inline_data"]))
         elif "file_data" in part:
-            # gs:// / Files-API handles are provider-specific (§5.4) -> RAISE.
+            # gs:// / Files-API handles are provider-specific -> RAISE.
             _raise("google", "*", "image.opaque_handle")
         else:
             _raise("google", "*", "content_part.unknown")
@@ -217,7 +217,7 @@ def _google_tool_choice_to_canonical(tool_config: Any) -> ToolChoice | None:
 
 # ------------------------------ canonical -> Google ------------------------- #
 def _canonical_to_google(canonical: CanonicalRequest, model: str) -> dict[str, Any]:
-    # Google has no first-class equivalent of disabling parallel tool calls (§5.5).
+    # Google has no first-class equivalent of disabling parallel tool calls.
     if canonical.parallel_tool_calls is False:
         _raise("*", "google", "parallel_tool_calls=False")
     # Google function_response carries the function NAME, which the canonical
@@ -345,7 +345,7 @@ def _google_response_to_canonical(response: object) -> CanonicalResponse:
                 )
             )
     finish_reason = normalize_finish_reason("google", getattr(candidate, "finish_reason", None))
-    # §5.4: Google encodes a tool call as STOP + function_call (no dedicated tool
+    # Google encodes a tool call as STOP + function_call (no dedicated tool
     # finish reason). When tool calls are present and the mapped reason is the
     # plain "stop", upgrade to "tool_use" so the caller sees the tool finish
     # reason on normalization (fix [E]).

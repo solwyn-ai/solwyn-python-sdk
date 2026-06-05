@@ -57,7 +57,7 @@ from ._openai import (
 def to_canonical(provider: str, kwargs: dict[str, Any]) -> CanonicalRequest:
     """Parse a native ``provider`` request dict into the canonical request.
 
-    RAISES ``UntranslatableRequestError`` for anything outside the §5 subset.
+    RAISES ``UntranslatableRequestError`` for anything outside the subset.
     """
     _validate_provider(provider)
     # Guard ALL caller-content access: any non-Untranslatable error (a malformed
@@ -124,7 +124,7 @@ def _response_to_canonical(served: str, response: object) -> CanonicalResponse:
 
 
 # --------------------------------------------------------------------------- #
-# §6.6 Per-chunk stream translation — map ONE served-stream event into ZERO     #
+# Per-chunk stream translation — map ONE served-stream event into ZERO          #
 # OR MORE chunks in the requested provider's native streaming dialect.          #
 # --------------------------------------------------------------------------- #
 # See ``_StreamDelta`` in ``_models`` for the canonical per-chunk event contract

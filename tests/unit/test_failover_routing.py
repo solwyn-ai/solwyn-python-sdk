@@ -1,4 +1,4 @@
-"""Cross-provider failover routing — the P1 DoD (spec §10 P1, §4.6).
+"""Cross-provider failover routing.
 
 Exercises the classified candidate walk in Solwyn/AsyncSolwyn._intercepted_call
 with faked provider clients. Clients are MagicMocks whose
@@ -147,7 +147,7 @@ _PLAIN_REQUEST = {
 }
 
 
-# ── cross-provider failover (the core P1 DoD case) ───────────────────────
+# ── cross-provider failover (the core case) ──────────────────────────────
 
 
 @pytest.mark.unit
@@ -169,7 +169,7 @@ class TestCrossProviderFailover:
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # Anthropic served the request. The plain-text request crossed via real
-        # §5 translation, and the served response was normalized back into the
+        # translation, and the served response was normalized back into the
         # OpenAI dialect the caller wrote — so the native access path resolves
         # to the Anthropic text (NOT identity with the raw Anthropic object).
         assert result is not anthropic_resp
@@ -223,7 +223,7 @@ class TestCrossProviderFailover:
     def test_cross_provider_success_event_attribution(self) -> None:
         # The success MetadataEvent must be attributed to the SERVED provider,
         # flagged as a provider fallback, and carry requested_provider/model +
-        # failover_reason for the dashboard (§4.6, §8.2/§8.5). Here the primary
+        # failover_reason for the dashboard. Here the primary
         # is CLOSED, ATTEMPTED, and 429s — a REACTIVE failover -> PRIMARY_ERROR.
         openai = _openai_client()
         openai.chat.completions.create.side_effect = _Status(429)
@@ -257,7 +257,7 @@ class TestCrossProviderFailover:
         _close(solwyn)
 
     def test_primary_errored_success_reason_is_primary_error(self) -> None:
-        # §8.2/§8.5 [A]: PRIMARY CLOSED, ATTEMPTED in this walk, raises 429 ->
+        # PRIMARY CLOSED, ATTEMPTED in this walk, raises 429 ->
         # the cross-provider success event's failover_reason is PRIMARY_ERROR
         # (reactive failover), NOT CIRCUIT_OPEN.
         openai = _openai_client()
@@ -316,7 +316,7 @@ class TestCrossProviderFailover:
         anthropic.messages.create.assert_called_once()
         assert result is not None
 
-        # §8.2/§8.5 [A]: the primary was SKIPPED (breaker pre-OPEN), never
+        # the primary was SKIPPED (breaker pre-OPEN), never
         # attempted in this walk -> proactive reroute -> CIRCUIT_OPEN.
         success = [e for e in events if e.status.value == "success"]
         assert len(success) == 1
@@ -464,12 +464,12 @@ class TestFailFast:
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # A 400 classifies FAIL_FAST: the chain STOPS, the fallback is NOT
-        # attempted, and the ORIGINAL exception propagates unchanged (§6.1).
+        # attempted, and the ORIGINAL exception propagates unchanged.
         assert exc_info.value is original
         anthropic.messages.create.assert_not_called()
         openai.chat.completions.create.assert_called_once()
 
-        # §6.1 disposition table: FAIL_FAST is request-shaped, NOT a provider-
+        # Disposition table: FAIL_FAST is request-shaped, NOT a provider-
         # health signal, so it must NOT count the breaker.
         assert openai_cb.failure_count == 0
         assert openai_cb.state == CircuitState.CLOSED
@@ -479,7 +479,7 @@ class TestFailFast:
     def test_post_send_ambiguous_counts_breaker_but_does_not_failover(self) -> None:
         # A 500 classifies POST_SEND_AMBIGUOUS: it IS a health signal (counts the
         # breaker) but the request may have run, so the chain must NOT fail over
-        # under the default "safe" idempotency — it re-raises the original (§6.1).
+        # under the default "safe" idempotency — it re-raises the original.
         openai = _openai_client()
         original = _Status(500, "server error")
         openai.chat.completions.create.side_effect = original
@@ -737,7 +737,7 @@ class TestPerHopDeadline:
         await solwyn._budget._http.aclose()
 
     def test_per_hop_timeout_shrinks_across_candidates(self) -> None:
-        # §6.3: per-hop timeout = remaining / (candidates not yet attempted).
+        # Per-hop timeout = remaining / (candidates not yet attempted).
         # With a 30s chain budget and 2 candidates, hop0 gets ~total/2 (NOT the
         # full remaining); the final hop gets the whole remaining slice.
         openai = _openai_client()
@@ -768,7 +768,7 @@ class TestPerHopDeadline:
     def test_deadline_expired_stops_chain_and_reports_attempted(self) -> None:
         # A zero chain budget means the deadline is already spent by the time the
         # walk begins: NO candidate is dispatched and ProviderUnavailableError
-        # carries the full attempted chain (§6.3).
+        # carries the full attempted chain.
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
         anthropic = _anthropic_client()
@@ -951,7 +951,7 @@ class TestProbeSlotReleaseOnNoHealthSignalExit:
         anthropic_cb.record_failure()  # -> OPEN, recovery-eligible
         assert anthropic_cb.state == CircuitState.OPEN
 
-        # n>1 is outside the §5 subset -> the cross-provider hop's translation
+        # n>1 is outside the subset -> the cross-provider hop's translation
         # RAISES UntranslatableRequestError before any anthropic network call.
         request = {**_PLAIN_REQUEST, "n": 2}
         with (

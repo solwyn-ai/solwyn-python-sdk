@@ -35,7 +35,7 @@ class SyncStreamWrapper:
     threading.Lock so that concurrent calls (e.g. close() racing with
     iterator exhaustion) fire on_complete/on_error exactly once.
 
-    Cross-provider stream normalization (§6.6): an optional ``chunk_translator``
+    Cross-provider stream normalization: an optional ``chunk_translator``
     maps ONE raw served chunk into a LIST of caller-dialect chunks. The
     accumulator ALWAYS observes the RAW served chunk (served-provider usage); the
     wrapper yields the translated chunks. ``None`` (default) is passthrough — the
@@ -163,7 +163,7 @@ class AsyncStreamWrapper:
     No lock needed: async wrappers run in a single-threaded event loop,
     so concurrent settlement is not possible.
 
-    Cross-provider stream normalization (§6.6): see ``SyncStreamWrapper`` — the
+    Cross-provider stream normalization: see ``SyncStreamWrapper`` — the
     optional ``chunk_translator`` reshapes raw served chunks into caller-dialect
     chunks while the accumulator still observes the RAW served chunk.
     """

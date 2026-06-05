@@ -1,9 +1,9 @@
-"""Cross-provider request/response translation (design spec §5).
+"""Cross-provider request/response translation.
 
 ================================ PRIVACY-CRITICAL ==============================
 This is one of EXACTLY TWO content-privileged modules (the other is
 ``solwyn/_privacy.py``). It is the only place in the SDK that reshapes customer
-prompt CONTENT. The content-touching contract (spec §7) is non-negotiable:
+prompt CONTENT. The content-touching contract is non-negotiable:
 
   * In-memory transform ONLY. Content is never stored on a long-lived object;
     it lives only inside the call frame and the returned kwargs/response that go
@@ -27,7 +27,7 @@ Public surface (keyed by provider name ``openai`` | ``anthropic`` | ``google``):
   from_canonical(provider, canonical, *, model) -> dict  (native target kwargs)
   normalize_response(*, served, requested, response) -> object (duck-typed)
 
-The canonical form is intentionally tiny (spec §5.1): ~10 request fields, ~5
+The canonical form is intentionally tiny: ~10 request fields, ~5
 response fields. Anything outside the subset RAISES on the first cross-provider
 hop, BEFORE any network call. Usage extraction is NOT done here — the existing
 extraction adapters own that.

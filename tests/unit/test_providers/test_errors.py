@@ -1,4 +1,4 @@
-"""Tests for status-first, duck-typed transport-error classification (§6.1).
+"""Tests for status-first, duck-typed transport-error classification.
 
 These tests mirror the real provider-SDK exception subclassing without importing
 any provider SDK (openai/anthropic/google are NOT installed). The critical

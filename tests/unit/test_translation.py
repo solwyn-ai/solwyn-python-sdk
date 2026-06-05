@@ -1,8 +1,8 @@
-"""Cross-provider translation contract tests (design spec §5).
+"""Cross-provider translation contract tests.
 
 Round-trip is the contract AND the drift alarm: a fully-resolved request must
 survive ``to_canonical -> from_canonical`` with correct id remap and argument
-encoding. Every §5.5 unsupported item must RAISE ``UntranslatableRequestError``
+encoding. Every unsupported item must RAISE ``UntranslatableRequestError``
 with a STRUCTURAL feature label and NO offending value anywhere in the error.
 """
 
@@ -72,7 +72,7 @@ def _assert_no_value_leak(exc: UntranslatableRequestError, *values: str) -> None
 
 
 # --------------------------------------------------------------------------- #
-# Canonical model invariants (§5.1)                                            #
+# Canonical model invariants                                                   #
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
 class TestCanonicalModel:
@@ -97,7 +97,7 @@ class TestCanonicalModel:
 
 
 # --------------------------------------------------------------------------- #
-# §5.2 Request field mapping                                                   #
+# Request field mapping                                                        #
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
 class TestFieldMapping:
@@ -168,7 +168,7 @@ class TestFieldMapping:
         assert out["stop_sequences"] == ["STOP"]
 
     def test_anthropic_consecutive_same_role_does_not_raise(self) -> None:
-        # §5.2: do NOT repair-or-RAISE on consecutive same-role turns.
+        # Do NOT repair-or-RAISE on consecutive same-role turns.
         canonical = to_canonical(
             "openai",
             openai_req(
@@ -183,7 +183,7 @@ class TestFieldMapping:
 
 
 # --------------------------------------------------------------------------- #
-# §5.3 Tools & tool_choice                                                     #
+# Tools & tool_choice                                                          #
 # --------------------------------------------------------------------------- #
 TOOL = {
     "name": "get_weather",
@@ -377,7 +377,7 @@ class TestToolChoice:
 
 
 # --------------------------------------------------------------------------- #
-# §5.3 Tool-result round-trip (the most error-prone surface)                  #
+# Tool-result round-trip (the most error-prone surface)                       #
 # --------------------------------------------------------------------------- #
 def _openai_resolved_tool_history() -> list[dict[str, object]]:
     return [
@@ -522,7 +522,7 @@ class TestToolResultRoundTrip:
 
 
 # --------------------------------------------------------------------------- #
-# §5.4 Multimodal                                                              #
+# Multimodal                                                                   #
 # --------------------------------------------------------------------------- #
 PNG_B64 = "iVBORw0KGgoAAAANS"
 
@@ -666,7 +666,7 @@ class TestMultimodal:
 
 
 # --------------------------------------------------------------------------- #
-# §5.4 Finish reason normalization                                            #
+# Finish reason normalization                                                 #
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
 class TestFinishReason:
@@ -694,7 +694,7 @@ class TestFinishReason:
 
 
 # --------------------------------------------------------------------------- #
-# §5.5 Fail-loudly unsupported list — every item RAISES, no value leak.        #
+# Fail-loudly unsupported list — every item RAISES, no value leak.             #
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
 class TestFailLoudly:
@@ -977,7 +977,7 @@ class TestFailLoudly:
 
 
 # --------------------------------------------------------------------------- #
-# normalize_response — duck-typed cross-provider response shaping (§5.4)        #
+# normalize_response — duck-typed cross-provider response shaping               #
 # --------------------------------------------------------------------------- #
 class _Obj:
     """Tiny duck-typed namespace mirroring a native SDK response object."""
@@ -1140,7 +1140,7 @@ class TestPrivacyBoundary:
         for path in files:
             src = path.read_text()
             assert "PRIVACY-CRITICAL" in src[:600], f"{path.name} missing PRIVACY-CRITICAL banner"
-            # Spec §7 CI form: the literal substrings must not appear ANYWHERE,
+            # The CI form: the literal substrings must not appear ANYWHERE,
             # not just in import statements (prose mentions are forbidden too).
             assert "logging" not in src, f"{path.name} references logging"
             assert "logger" not in src, f"{path.name} names a logger"
@@ -1570,7 +1570,7 @@ class TestProviderValidation:
 
 
 # --------------------------------------------------------------------------- #
-# §6.6 Per-chunk stream translation (P3).                                      #
+# Per-chunk stream translation.                                                #
 # --------------------------------------------------------------------------- #
 # A SERVED-provider stream yields raw chunk objects in that provider's native
 # streaming dialect; translate_stream_chunk maps ONE such chunk into ZERO OR
@@ -1849,7 +1849,7 @@ class TestStreamChunkFailLoud:
 # --------------------------------------------------------------------------- #
 # Finding #2 — orphan tool_result fails loud at the failover boundary.         #
 # A tool_result whose id matches no prior tool_use is NOT in ``pending`` and    #
-# must RAISE (Decision B: fail loud on dangling/unresolved tool calls) rather   #
+# must RAISE (fail loud on dangling/unresolved tool calls) rather               #
 # than render to the target and 400 after dispatch.                            #
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit

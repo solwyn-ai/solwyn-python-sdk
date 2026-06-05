@@ -1,4 +1,4 @@
-"""Structural errors, guards, and provider validation for translation (spec §5.5).
+"""Structural errors, guards, and provider validation for translation.
 
 ================================ PRIVACY-CRITICAL ==============================
 Part of the content-privileged ``providers/_translation`` package. Everything
@@ -19,7 +19,7 @@ from solwyn.exceptions import UntranslatableRequestError
 
 _PROVIDERS = ("openai", "anthropic", "google")
 
-# Cross-provider streaming structural labels (§6.6). A tool-call or non-text media
+# Cross-provider streaming structural labels. A tool-call or non-text media
 # delta is out of the v1 streaming subset and RAISES with one of these; chunk
 # content NEVER reaches the error. Defined here so the pre-dispatch fail-loud
 # helper and the per-chunk translator share one label.
@@ -50,9 +50,9 @@ def _validate_provider(provider: str) -> None:
 
 
 def fail_cross_provider_tool_stream(*, source: str, target: str) -> NoReturn:
-    """Abort a cross-provider TOOL-using STREAMING hop (P3; §6.6, §4.1 Decision A).
+    """Abort a cross-provider TOOL-using STREAMING hop.
 
-    P3 ships per-chunk text-stream normalization, so a PLAIN-TEXT cross-provider
+    Per-chunk text-stream normalization ships, so a PLAIN-TEXT cross-provider
     streaming hop now proceeds. A TOOL-using streamed response, however, cannot be
     normalized cross-provider — tool-call deltas are out of the v1 streaming
     subset. RAISE a structural ``cross_provider_tool_stream`` error BEFORE dispatch
@@ -120,7 +120,7 @@ def _guard(source: str, target: str, feature: str = _MALFORMED_REQUEST) -> _Guar
 
 
 # --------------------------------------------------------------------------- #
-# Unsupported scalar/structural keys, checked per inbound dialect (§5.5).      #
+# Unsupported scalar/structural keys, checked per inbound dialect.             #
 # The label is the structural key name; the value is NEVER read into the error.#
 # --------------------------------------------------------------------------- #
 # Keys that are unsupported regardless of value (presence alone -> RAISE).
@@ -247,7 +247,7 @@ _GOOGLE_BUILTIN_TOOL_KEYS = (
 
 
 def _check_forbidden_keys(provider: str, kwargs: dict[str, Any]) -> None:
-    """RAISE on any §5.5 inference-control / structured-output / caching key,
+    """RAISE on any inference-control / structured-output / caching key,
     then FAIL CLOSED on any remaining unrecognized native kwarg (fix [A]).
 
     Scans top-level kwargs AND (for Google) the nested ``config`` dict, since

@@ -264,7 +264,7 @@ class TestAsyncSolwynConstructors:
 
 @pytest.mark.unit
 class TestProvidersChainRequired:
-    """SolwynConfig requires a non-empty providers chain (§4.4 / Decision D)."""
+    """SolwynConfig requires a non-empty providers chain."""
 
     def test_empty_chain_raises_configuration_error(self) -> None:
         """_check_chain raises ConfigurationError when providers is empty."""
@@ -297,7 +297,7 @@ class TestProvidersChainRequired:
 
 @pytest.mark.unit
 class TestFailoverKnobDefaults:
-    """Failover tuning knobs carry the spec defaults (§4.4 / §6.3 / §6.5)."""
+    """Failover tuning knobs carry their default values."""
 
     def test_failover_knob_defaults(self) -> None:
         config = SolwynConfig(
