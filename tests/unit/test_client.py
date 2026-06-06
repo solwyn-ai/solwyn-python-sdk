@@ -68,6 +68,10 @@ def _make_solwyn(client, **overrides):
     solwyn._reporter._shutdown.set()
     solwyn._reporter._thread.join(timeout=2.0)
 
+    def report_settlement(_request, event):
+        solwyn._reporter.report(event)
+
+    solwyn._reporter.report_settlement = report_settlement
     return solwyn
 
 
@@ -892,9 +896,11 @@ class TestSyncStreamingInterception:
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        # Confirm now goes through reporter.report_confirm (not budget.confirm_cost)
-        confirm_calls: list = []
-        solwyn._reporter.report_confirm = lambda request: confirm_calls.append(request)
+        # Confirm now goes through reporter.report_settlement (not budget.confirm_cost)
+        settlement_calls: list = []
+        solwyn._reporter.report_settlement = lambda request, event: settlement_calls.append(
+            (request, event)
+        )
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             stream = solwyn.chat.completions.create(
@@ -903,12 +909,12 @@ class TestSyncStreamingInterception:
                 stream=True,
             )
             # Before exhaustion — no confirm yet
-            assert len(confirm_calls) == 0
+            assert len(settlement_calls) == 0
             list(stream)
 
-        # After exhaustion — reporter.report_confirm called once with the reservation_id
-        assert len(confirm_calls) == 1
-        assert confirm_calls[0].reservation_id == "res_123"
+        # After exhaustion -- reporter.report_settlement called once with the reservation_id
+        assert len(settlement_calls) == 1
+        assert settlement_calls[0][0].reservation_id == "res_123"
         # budget.confirm_cost must NOT have been called directly
         assert not hasattr(solwyn._budget, "_direct_confirm_calls")
 
@@ -1072,6 +1078,11 @@ def _make_async_solwyn(client, **overrides):
     }
     defaults.update(overrides)
     solwyn = AsyncSolwyn(client, **defaults)
+
+    def report_settlement(_request, event):
+        solwyn._reporter.report(event)
+
+    solwyn._reporter.report_settlement = report_settlement
     return solwyn
 
 

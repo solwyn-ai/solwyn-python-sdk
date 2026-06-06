@@ -568,7 +568,7 @@ def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
 
     The request carries a SENTINEL AND every streamed Anthropic chunk carries the
     SENTINEL in its text. Draining the wrapper to completion fires on_complete ->
-    a fire-and-forget confirm (report_confirm) + a success metadata event. We
+    a fire-and-forget settlement carrying confirm + success metadata. We
     capture every json= body POSTed across budget check, confirm, and metadata
     ingest and assert the SENTINEL appears in NONE of them."""
     SENTINEL = "SUPER_SECRET_PROMPT_a1b2c3"
@@ -622,7 +622,7 @@ def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
             fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
         )
     # The background thread ran the no-op _flush_loop and exited; _shutdown stays
-    # UNSET so on_complete's report_confirm can still enqueue the confirm.
+    # UNSET so on_complete's report_settlement can still enqueue the settlement.
     solwyn._reporter._thread.join(timeout=2.0)
 
     captured: list[object] = []

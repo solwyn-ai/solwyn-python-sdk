@@ -964,7 +964,7 @@ class TestMaterializedGoogleStreamForwardsClose:
 
         solwyn = _make_solwyn(google, model="gemini-2.0-flash")
         confirms: list[Any] = []
-        solwyn._reporter.report_confirm = lambda req: confirms.append(req)
+        solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
 
         request = {
             "model": "gemini-2.0-flash",
@@ -1000,7 +1000,7 @@ class TestMaterializedGoogleStreamForwardsClose:
 
         solwyn = _make_async_solwyn(google, model="gemini-2.0-flash")
         confirms: list[Any] = []
-        solwyn._reporter.report_confirm = lambda req: confirms.append(req)
+        solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
         confirm_mock = AsyncMock()
 
         request = {
@@ -1397,10 +1397,10 @@ class TestStreamingIdempotencyMatrix:
 
 @pytest.mark.unit
 class TestAbandonedStreamSettlement:
-    def test_early_break_then_close_settles_once_via_report_confirm(self) -> None:
+    def test_early_break_then_close_settles_once_via_report_settlement(self) -> None:
         # A caller that breaks early and closes the stream still settles via
         # close()/__exit__: on_complete fires ONCE with whatever usage was
-        # observed, and confirm is fire-and-forget via reporter.report_confirm.
+        # observed, and settlement is fire-and-forget via reporter.report_settlement.
         client = _openai_client()
         # A long stream the caller abandons after the first chunk.
         client.chat.completions.create.return_value = iter(
@@ -1410,7 +1410,7 @@ class TestAbandonedStreamSettlement:
         solwyn = _make_solwyn(client, model="gpt-4o")
         # A reservation makes on_complete build + fire-and-forget a confirm.
         confirms: list[Any] = []
-        solwyn._reporter.report_confirm = lambda req: confirms.append(req)
+        solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
 
         request = {
             "model": "gpt-4o",
@@ -1445,7 +1445,7 @@ class TestAbandonedStreamSettlement:
 
         solwyn = _make_solwyn(client, model="gpt-4o")
         confirms: list[Any] = []
-        solwyn._reporter.report_confirm = lambda req: confirms.append(req)
+        solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
 
         request = {
             "model": "gpt-4o",
@@ -1478,7 +1478,7 @@ class TestAbandonedStreamSettlement:
 
         solwyn = _make_async_solwyn(client, model="gpt-4o")
         confirms: list[Any] = []
-        solwyn._reporter.report_confirm = lambda req: confirms.append(req)
+        solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
         confirm_mock = AsyncMock()
 
         request = {

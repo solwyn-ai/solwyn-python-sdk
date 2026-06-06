@@ -576,10 +576,10 @@ class TestCallIdConsistencyCrossProvider:
 
         _close(solwyn)
 
-    def test_streaming_on_complete_event_and_report_confirm_share_call_id(self) -> None:
-        # Sync streaming settles via reporter.report_confirm (fire-and-forget) —
-        # NOT confirm_cost. The on_complete success event's call_id must equal the
-        # report_confirm request's call_id (the join key).
+    def test_streaming_on_complete_settlement_confirm_and_event_share_call_id(self) -> None:
+        # Sync streaming settles via reporter.report_settlement (fire-and-forget)
+        # -- NOT confirm_cost. The on_complete success event's call_id must equal
+        # the confirm request's call_id (the join key).
         openai = _openai_client()
         openai.chat.completions.create.side_effect = _Status(429)
         anthropic = _anthropic_client()
@@ -596,8 +596,13 @@ class TestCallIdConsistencyCrossProvider:
             model="gpt-4o",
             fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
         )
-        confirms: list[Any] = []
-        solwyn._reporter.report_confirm = lambda req: confirms.append(req)
+        settlements: list[tuple[Any, Any]] = []
+
+        def report_settlement(req: Any, event: Any) -> None:
+            settlements.append((req, event))
+            solwyn._reporter.report(event)
+
+        solwyn._reporter.report_settlement = report_settlement
 
         with patch.object(
             solwyn._budget, "check_budget", return_value=_allow_budget(reservation_id="resv_s")
@@ -607,10 +612,11 @@ class TestCallIdConsistencyCrossProvider:
 
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
         assert len(success) == 1
-        assert len(confirms) == 1
+        assert len(settlements) == 1
+        confirm, event = settlements[0]
         # The fire-and-forget confirm carries the SAME join key as the event.
-        assert confirms[0].call_id == success[0].call_id
-        assert confirms[0].provider == ProviderName.ANTHROPIC
+        assert confirm.call_id == event.call_id == success[0].call_id
+        assert confirm.provider == ProviderName.ANTHROPIC
 
         _close(solwyn)
 

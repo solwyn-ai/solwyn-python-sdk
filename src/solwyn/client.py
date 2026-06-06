@@ -941,6 +941,7 @@ class Solwyn(_SolwynBase):
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
             self.record_latency(provider, ctx.elapsed_ms())
+            confirm = None
             if budget.reservation_id:
                 confirm = self._budget.build_confirm_request(
                     reservation_id=budget.reservation_id,
@@ -950,31 +951,32 @@ class Solwyn(_SolwynBase):
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
                 )
-                self._reporter.report_confirm(confirm)
-            self._reporter.report(
-                self._build_metadata_event(
-                    model=served_model,
-                    provider=provider,
-                    input_tokens=token_details.input_tokens,
-                    output_tokens=token_details.output_tokens,
-                    token_details=token_details,
-                    latency_ms=ctx.elapsed_ms(),
-                    status=CallStatus.SUCCESS,
-                    is_model_fallback=is_model_fallback,
+            event = self._build_metadata_event(
+                model=served_model,
+                provider=provider,
+                input_tokens=token_details.input_tokens,
+                output_tokens=token_details.output_tokens,
+                token_details=token_details,
+                latency_ms=ctx.elapsed_ms(),
+                status=CallStatus.SUCCESS,
+                is_model_fallback=is_model_fallback,
+                is_provider_fallback=is_provider_fallback,
+                requested_provider=primary.entry.provider if is_provider_fallback else None,
+                requested_model=requested_model if is_provider_fallback else None,
+                failover_reason=_success_failover_reason(
                     is_provider_fallback=is_provider_fallback,
-                    requested_provider=primary.entry.provider if is_provider_fallback else None,
-                    requested_model=requested_model if is_provider_fallback else None,
-                    failover_reason=_success_failover_reason(
-                        is_provider_fallback=is_provider_fallback,
-                        is_model_fallback=is_model_fallback,
-                        primary_errored=primary_errored,
-                    ),
-                    attempt_index=ctx.attempt_index,
-                    call_id=call_id,
-                    service_tier=accumulator.get_service_tier(),
-                    agent_run=agent_run,
-                )
+                    is_model_fallback=is_model_fallback,
+                    primary_errored=primary_errored,
+                ),
+                attempt_index=ctx.attempt_index,
+                call_id=call_id,
+                service_tier=accumulator.get_service_tier(),
+                agent_run=agent_run,
             )
+            if confirm is not None:
+                self._reporter.report_settlement(confirm, event)
+            else:
+                self._reporter.report(event)
 
         def on_error(_exc: Exception) -> None:
             self._get_circuit_breaker(provider).record_failure()
@@ -1494,6 +1496,7 @@ class AsyncSolwyn(_SolwynBase):
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
             self.record_latency(provider, ctx.elapsed_ms())
+            confirm = None
             if budget.reservation_id:
                 confirm = self._budget.build_confirm_request(
                     reservation_id=budget.reservation_id,
@@ -1503,31 +1506,32 @@ class AsyncSolwyn(_SolwynBase):
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
                 )
-                self._reporter.report_confirm(confirm)
-            self._reporter.report(
-                self._build_metadata_event(
-                    model=served_model,
-                    provider=provider,
-                    input_tokens=token_details.input_tokens,
-                    output_tokens=token_details.output_tokens,
-                    token_details=token_details,
-                    latency_ms=ctx.elapsed_ms(),
-                    status=CallStatus.SUCCESS,
-                    is_model_fallback=is_model_fallback,
+            event = self._build_metadata_event(
+                model=served_model,
+                provider=provider,
+                input_tokens=token_details.input_tokens,
+                output_tokens=token_details.output_tokens,
+                token_details=token_details,
+                latency_ms=ctx.elapsed_ms(),
+                status=CallStatus.SUCCESS,
+                is_model_fallback=is_model_fallback,
+                is_provider_fallback=is_provider_fallback,
+                requested_provider=primary.entry.provider if is_provider_fallback else None,
+                requested_model=requested_model if is_provider_fallback else None,
+                failover_reason=_success_failover_reason(
                     is_provider_fallback=is_provider_fallback,
-                    requested_provider=primary.entry.provider if is_provider_fallback else None,
-                    requested_model=requested_model if is_provider_fallback else None,
-                    failover_reason=_success_failover_reason(
-                        is_provider_fallback=is_provider_fallback,
-                        is_model_fallback=is_model_fallback,
-                        primary_errored=primary_errored,
-                    ),
-                    attempt_index=ctx.attempt_index,
-                    call_id=call_id,
-                    service_tier=accumulator.get_service_tier(),
-                    agent_run=agent_run,
-                )
+                    is_model_fallback=is_model_fallback,
+                    primary_errored=primary_errored,
+                ),
+                attempt_index=ctx.attempt_index,
+                call_id=call_id,
+                service_tier=accumulator.get_service_tier(),
+                agent_run=agent_run,
             )
+            if confirm is not None:
+                self._reporter.report_settlement(confirm, event)
+            else:
+                self._reporter.report(event)
 
         async def on_error(_exc: Exception) -> None:
             self._get_circuit_breaker(provider).record_failure()

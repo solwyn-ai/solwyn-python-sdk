@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -384,6 +385,51 @@ class TestAsyncReporterBatchFlush:
         assert mock_post.call_args_list[1].kwargs["json"][0]["call_id"] == call_id
         assert len(reporter._queue) == 0
         assert len(reporter._confirm_queue) == 0
+        await reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_settlement_enqueued_during_metadata_send_waits_for_confirm_first(
+        self,
+    ) -> None:
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+            batch_size=1,
+        )
+        older_call_id = "call_async_older_metadata"
+        settlement_call_id = "call_async_mid_flush_settlement"
+        reporter.report(_make_event(call_id=older_call_id))
+        settlement_confirm = _make_confirm_request(call_id=settlement_call_id)
+        settlement_event = _make_event(call_id=settlement_call_id)
+        calls: list[tuple[str, Any]] = []
+        did_enqueue = False
+
+        async def post(url: str, **kwargs: Any) -> MagicMock:
+            nonlocal did_enqueue
+            payload = kwargs["json"]
+            calls.append((url, payload))
+            if (
+                not did_enqueue
+                and "metadata/ingest" in url
+                and payload[0]["call_id"] == older_call_id
+            ):
+                did_enqueue = True
+                reporter.report_settlement(settlement_confirm, settlement_event)
+            return _ok_response()
+
+        with patch.object(reporter._http, "post", new=post):
+            await reporter._flush_remaining()
+            await reporter._flush_remaining()
+
+        settlement_posts = []
+        for url, payload in calls:
+            if "budgets/confirm" in url and payload["call_id"] == settlement_call_id:
+                settlement_posts.append("confirm")
+            elif "metadata/ingest" in url and payload[0]["call_id"] == settlement_call_id:
+                settlement_posts.append("metadata")
+
+        assert settlement_posts == ["confirm", "metadata"]
         await reporter._http.aclose()
 
     @pytest.mark.unit
