@@ -20,6 +20,7 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 import time
@@ -57,7 +58,7 @@ from solwyn.exceptions import (
     UntranslatableModelError,
 )
 from solwyn.providers import _translation, get_adapter_for_client
-from solwyn.providers._errors import Disposition, classify_exception
+from solwyn.providers._errors import Disposition, classify_exception, retry_after_seconds
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
 
@@ -751,85 +752,122 @@ class Solwyn(_SolwynBase):
                 cb.release_probe(admission)
                 raise
 
-            ctx = _AttemptContext(
-                model=served_model,
-                start_time=time.monotonic(),
-                is_provider_fallback=is_provider_fallback,
-                attempt_index=chain_index,
-            )
-            try:
-                response = self._sync_dispatch(
-                    rt,
-                    call_kwargs,
-                    is_streaming=is_streaming,
-                    # Shrinking per-hop slice: divide what's left of the
-                    # chain deadline across the candidates not yet attempted so a
-                    # single hung hop cannot consume the whole budget.
-                    timeout=_hop_timeout(deadline, len(candidates) - idx),
-                    max_retries=0,
+            # Same-provider retry budget for THIS chain entry (config seam,
+            # default 0). Consumed inside the inner attempt loop below.
+            same_retries_left = self._config.same_provider_retries
+            advanced = False
+            while True:
+                ctx = _AttemptContext(
+                    model=served_model,
+                    start_time=time.monotonic(),
+                    is_provider_fallback=is_provider_fallback,
+                    attempt_index=chain_index,
                 )
-                if is_streaming and provider == ProviderName.GOOGLE.value:
-                    # First-chunk materialization — GOOGLE ONLY (fix
-                    # [B]). A Google lazy generator does no network I/O until the
-                    # first pull, so we force it INSIDE this try; an establishment
-                    # error then falls into the candidate-walk except ->
-                    # classify_exception -> failover, exactly like OpenAI/Anthropic's
-                    # eager raise_for_status. OpenAI/Anthropic .create(stream=True)
-                    # ALREADY established eagerly at dispatch (its establishment
-                    # errors raised above and are failover-eligible), so pre-pulling
-                    # their first chunk is unnecessary AND would misclassify a
-                    # post-connect first-chunk read error as pre-send (double-spend
-                    # risk) — so we DON'T materialize them. No double-emit: the
-                    # buffered first chunk is replayed via the wrapper.
-                    response = _materialize_stream(response)
-            except Exception as exc:
-                disp = classify_exception(exc)
-                # Fix [A]: the PRIMARY was attempted and raised in this walk
-                # -> a later cross-provider success is a REACTIVE failover
-                # (PRIMARY_ERROR), not a proactive breaker-open reroute.
-                if is_primary:
-                    primary_errored = True
-                # Breaker accounting: FAILOVER and POST_SEND_AMBIGUOUS are
-                # provider-health signals and DO count; FAIL_FAST (4xx/refusal) is
-                # a request-shaped error, not a health signal, so it must NOT open
-                # the breaker. Same-provider double-count guard: at most one
-                # failure per provider per logical attempt.
-                if disp is not Disposition.FAIL_FAST and provider not in failed_providers:
-                    cb.record_failure()
-                    failed_providers.add(provider)
-                else:
-                    # No NEW health verdict for this hop: FAIL_FAST is request-shaped,
-                    # or this provider was already counted this walk (double-count
-                    # guard). If the hop consumed a HALF_OPEN probe slot, free it
-                    # (no state change) so the breaker is not stranded HALF_OPEN.
-                    cb.release_probe(admission)
-                # A correctly-not-failed-over post-send-ambiguous abort
-                # emits an ERROR event with possibly_succeeded=True so the Cloud API
-                # can reconcile the (possibly-landed, never-confirmed) reservation.
-                possibly_succeeded = (
-                    disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
-                )
-                self._reporter.report(
-                    self._build_error_event(
-                        model=served_model,
-                        provider=provider,
-                        latency_ms=ctx.elapsed_ms(),
-                        is_model_fallback=is_model_fallback,
-                        is_provider_fallback=is_provider_fallback,
-                        requested_provider=primary.entry.provider if is_provider_fallback else None,
-                        requested_model=requested_model if is_provider_fallback else None,
-                        failover_error_class=type(exc).__name__,
-                        attempt_index=chain_index,
-                        call_id=call_id,
-                        possibly_succeeded=True if possibly_succeeded else None,
-                        agent_run=agent_run,
+                try:
+                    response = self._sync_dispatch(
+                        rt,
+                        call_kwargs,
+                        is_streaming=is_streaming,
+                        # Shrinking per-hop slice: divide what's left of the
+                        # chain deadline across the candidates not yet attempted so a
+                        # single hung hop cannot consume the whole budget.
+                        timeout=_hop_timeout(deadline, len(candidates) - idx),
+                        max_retries=0,
                     )
-                )
-                if disp is Disposition.FAIL_FAST:
-                    raise  # 4xx/404/refusal — do NOT advance the chain
-                if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
-                    raise  # re-raise ORIGINAL exception (drop-in contract)
-                last_exc = exc
+                    if is_streaming and provider == ProviderName.GOOGLE.value:
+                        # First-chunk materialization — GOOGLE ONLY (fix
+                        # [B]). A Google lazy generator does no network I/O until the
+                        # first pull, so we force it INSIDE this try; an establishment
+                        # error then falls into the candidate-walk except ->
+                        # classify_exception -> failover, exactly like OpenAI/Anthropic's
+                        # eager raise_for_status. OpenAI/Anthropic .create(stream=True)
+                        # ALREADY established eagerly at dispatch (its establishment
+                        # errors raised above and are failover-eligible), so pre-pulling
+                        # their first chunk is unnecessary AND would misclassify a
+                        # post-connect first-chunk read error as pre-send (double-spend
+                        # risk) — so we DON'T materialize them. No double-emit: the
+                        # buffered first chunk is replayed via the wrapper.
+                        response = _materialize_stream(response)
+                except Exception as exc:
+                    disp = classify_exception(exc)
+                    # Fix [A]: the PRIMARY was attempted and raised in this walk
+                    # -> a later cross-provider success is a REACTIVE failover
+                    # (PRIMARY_ERROR), not a proactive breaker-open reroute.
+                    if is_primary:
+                        primary_errored = True
+                    # Same-provider retry: a 429 the provider asked us to retry (a
+                    # usable Retry-After that fits the remaining deadline, leaving a
+                    # min hop for the re-attempt) sleeps then re-attempts the SAME
+                    # provider before burning a cross-provider hop. We HOLD this
+                    # admission across the sleep — an unresolved 429 is neither a
+                    # success nor a failure, so NO breaker verdict is recorded and the
+                    # HALF_OPEN probe slot stays ours (never stranded). The terminal
+                    # outcome (success below, or the exhausted/unretryable failure
+                    # here) is the single verdict that frees the slot.
+                    if (
+                        disp is Disposition.FAILOVER
+                        and same_retries_left > 0
+                        and provider not in failed_providers
+                    ):
+                        retry_delay = retry_after_seconds(exc)
+                        if (
+                            retry_delay is not None
+                            and retry_delay + _MIN_HOP_TIMEOUT <= deadline.remaining()
+                        ):
+                            same_retries_left -= 1
+                            time.sleep(retry_delay)
+                            if not deadline.expired():
+                                continue  # re-attempt the SAME candidate
+                    # Breaker accounting: FAILOVER and POST_SEND_AMBIGUOUS are
+                    # provider-health signals and DO count; FAIL_FAST (4xx/refusal) is
+                    # a request-shaped error, not a health signal, so it must NOT open
+                    # the breaker. Same-provider double-count guard: at most one
+                    # failure per provider per logical attempt.
+                    if disp is not Disposition.FAIL_FAST and provider not in failed_providers:
+                        cb.record_failure()
+                        failed_providers.add(provider)
+                    else:
+                        # No NEW health verdict for this hop: FAIL_FAST is request-shaped,
+                        # or this provider was already counted this walk (double-count
+                        # guard). If the hop consumed a HALF_OPEN probe slot, free it
+                        # (no state change) so the breaker is not stranded HALF_OPEN.
+                        cb.release_probe(admission)
+                    # A correctly-not-failed-over post-send-ambiguous abort
+                    # emits an ERROR event with possibly_succeeded=True so the Cloud API
+                    # can reconcile the (possibly-landed, never-confirmed) reservation.
+                    possibly_succeeded = (
+                        disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
+                    )
+                    self._reporter.report(
+                        self._build_error_event(
+                            model=served_model,
+                            provider=provider,
+                            latency_ms=ctx.elapsed_ms(),
+                            is_model_fallback=is_model_fallback,
+                            is_provider_fallback=is_provider_fallback,
+                            requested_provider=(
+                                primary.entry.provider if is_provider_fallback else None
+                            ),
+                            requested_model=requested_model if is_provider_fallback else None,
+                            failover_error_class=type(exc).__name__,
+                            attempt_index=chain_index,
+                            call_id=call_id,
+                            possibly_succeeded=True if possibly_succeeded else None,
+                            agent_run=agent_run,
+                        )
+                    )
+                    if disp is Disposition.FAIL_FAST:
+                        raise  # 4xx/404/refusal — do NOT advance the chain
+                    if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
+                        raise  # re-raise ORIGINAL exception (drop-in contract)
+                    last_exc = exc
+                    advanced = True
+                # Reached on a successful hop OR on a terminal failure that advances
+                # the chain; a same-provider retry `continue`s above and never lands
+                # here. `advanced` distinguishes the two so success falls through to
+                # settlement below.
+                break
+            if advanced:
                 continue  # pre-send safe -> advance to the next candidate
 
             # 6. SUCCESS — settle against the SERVED runtime.
@@ -1313,79 +1351,116 @@ class AsyncSolwyn(_SolwynBase):
                 cb.release_probe(admission)
                 raise
 
-            ctx = _AttemptContext(
-                model=served_model,
-                start_time=time.monotonic(),
-                is_provider_fallback=is_provider_fallback,
-                attempt_index=chain_index,
-            )
-            try:
-                response = await self._async_dispatch(
-                    rt,
-                    call_kwargs,
-                    is_streaming=is_streaming,
-                    # Shrinking per-hop slice: divide what's left of the
-                    # chain deadline across the candidates not yet attempted so a
-                    # single hung hop cannot consume the whole budget.
-                    timeout=_hop_timeout(deadline, len(candidates) - idx),
-                    max_retries=0,
+            # Same-provider retry budget for THIS chain entry (mirrors the sync
+            # walk); consumed inside the inner attempt loop below.
+            same_retries_left = self._config.same_provider_retries
+            advanced = False
+            while True:
+                ctx = _AttemptContext(
+                    model=served_model,
+                    start_time=time.monotonic(),
+                    is_provider_fallback=is_provider_fallback,
+                    attempt_index=chain_index,
                 )
-                if is_streaming and provider == ProviderName.GOOGLE.value:
-                    # First-chunk materialization — GOOGLE ONLY (fix
-                    # [B]). Awaiting this runs the eager anext, so a Google
-                    # lazy-generator establishment error falls into THIS except ->
-                    # classify_exception -> failover. OpenAI/Anthropic established
-                    # eagerly at dispatch, so we DON'T materialize them (a
-                    # post-connect first-chunk error must NOT be misread as pre-send
-                    # -> double-spend risk). No double-emit: the buffered first
-                    # chunk is replayed via the wrapper.
-                    response = await _materialize_stream_async(response)
-            except Exception as exc:
-                disp = classify_exception(exc)
-                # Fix [A]: the PRIMARY was attempted and raised in this walk
-                # -> a later cross-provider success is a REACTIVE failover
-                # (PRIMARY_ERROR), not a proactive breaker-open reroute.
-                if is_primary:
-                    primary_errored = True
-                # Breaker accounting: count FAILOVER + POST_SEND_AMBIGUOUS
-                # (real health signals); skip FAIL_FAST (request-shaped, not a
-                # health signal). Same-provider double-count guard.
-                if disp is not Disposition.FAIL_FAST and provider not in failed_providers:
-                    cb.record_failure()
-                    failed_providers.add(provider)
-                else:
-                    # No NEW health verdict for this hop: FAIL_FAST is request-shaped,
-                    # or this provider was already counted this walk (double-count
-                    # guard). If the hop consumed a HALF_OPEN probe slot, free it
-                    # (no state change) so the breaker is not stranded HALF_OPEN.
-                    cb.release_probe(admission)
-                # A correctly-not-failed-over post-send-ambiguous abort
-                # emits an ERROR event with possibly_succeeded=True so the Cloud API
-                # can reconcile the (possibly-landed, never-confirmed) reservation.
-                possibly_succeeded = (
-                    disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
-                )
-                self._reporter.report(
-                    self._build_error_event(
-                        model=served_model,
-                        provider=provider,
-                        latency_ms=ctx.elapsed_ms(),
-                        is_model_fallback=is_model_fallback,
-                        is_provider_fallback=is_provider_fallback,
-                        requested_provider=primary.entry.provider if is_provider_fallback else None,
-                        requested_model=requested_model if is_provider_fallback else None,
-                        failover_error_class=type(exc).__name__,
-                        attempt_index=chain_index,
-                        call_id=call_id,
-                        possibly_succeeded=True if possibly_succeeded else None,
-                        agent_run=agent_run,
+                try:
+                    response = await self._async_dispatch(
+                        rt,
+                        call_kwargs,
+                        is_streaming=is_streaming,
+                        # Shrinking per-hop slice: divide what's left of the
+                        # chain deadline across the candidates not yet attempted so a
+                        # single hung hop cannot consume the whole budget.
+                        timeout=_hop_timeout(deadline, len(candidates) - idx),
+                        max_retries=0,
                     )
-                )
-                if disp is Disposition.FAIL_FAST:
-                    raise
-                if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
-                    raise
-                last_exc = exc
+                    if is_streaming and provider == ProviderName.GOOGLE.value:
+                        # First-chunk materialization — GOOGLE ONLY (fix
+                        # [B]). Awaiting this runs the eager anext, so a Google
+                        # lazy-generator establishment error falls into THIS except ->
+                        # classify_exception -> failover. OpenAI/Anthropic established
+                        # eagerly at dispatch, so we DON'T materialize them (a
+                        # post-connect first-chunk error must NOT be misread as pre-send
+                        # -> double-spend risk). No double-emit: the buffered first
+                        # chunk is replayed via the wrapper.
+                        response = await _materialize_stream_async(response)
+                except Exception as exc:
+                    disp = classify_exception(exc)
+                    # Fix [A]: the PRIMARY was attempted and raised in this walk
+                    # -> a later cross-provider success is a REACTIVE failover
+                    # (PRIMARY_ERROR), not a proactive breaker-open reroute.
+                    if is_primary:
+                        primary_errored = True
+                    # Same-provider retry: a 429 the provider asked us to retry (a
+                    # usable Retry-After that fits the remaining deadline, leaving a
+                    # min hop for the re-attempt) sleeps then re-attempts the SAME
+                    # provider before burning a cross-provider hop. We HOLD this
+                    # admission across the sleep — an unresolved 429 is neither a
+                    # success nor a failure, so NO breaker verdict is recorded and the
+                    # HALF_OPEN probe slot stays ours (never stranded). The terminal
+                    # outcome (success below, or the exhausted/unretryable failure
+                    # here) is the single verdict that frees the slot.
+                    if (
+                        disp is Disposition.FAILOVER
+                        and same_retries_left > 0
+                        and provider not in failed_providers
+                    ):
+                        retry_delay = retry_after_seconds(exc)
+                        if (
+                            retry_delay is not None
+                            and retry_delay + _MIN_HOP_TIMEOUT <= deadline.remaining()
+                        ):
+                            same_retries_left -= 1
+                            await asyncio.sleep(retry_delay)
+                            if not deadline.expired():
+                                continue  # re-attempt the SAME candidate
+                    # Breaker accounting: count FAILOVER + POST_SEND_AMBIGUOUS
+                    # (real health signals); skip FAIL_FAST (request-shaped, not a
+                    # health signal). Same-provider double-count guard.
+                    if disp is not Disposition.FAIL_FAST and provider not in failed_providers:
+                        cb.record_failure()
+                        failed_providers.add(provider)
+                    else:
+                        # No NEW health verdict for this hop: FAIL_FAST is request-shaped,
+                        # or this provider was already counted this walk (double-count
+                        # guard). If the hop consumed a HALF_OPEN probe slot, free it
+                        # (no state change) so the breaker is not stranded HALF_OPEN.
+                        cb.release_probe(admission)
+                    # A correctly-not-failed-over post-send-ambiguous abort
+                    # emits an ERROR event with possibly_succeeded=True so the Cloud API
+                    # can reconcile the (possibly-landed, never-confirmed) reservation.
+                    possibly_succeeded = (
+                        disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
+                    )
+                    self._reporter.report(
+                        self._build_error_event(
+                            model=served_model,
+                            provider=provider,
+                            latency_ms=ctx.elapsed_ms(),
+                            is_model_fallback=is_model_fallback,
+                            is_provider_fallback=is_provider_fallback,
+                            requested_provider=(
+                                primary.entry.provider if is_provider_fallback else None
+                            ),
+                            requested_model=requested_model if is_provider_fallback else None,
+                            failover_error_class=type(exc).__name__,
+                            attempt_index=chain_index,
+                            call_id=call_id,
+                            possibly_succeeded=True if possibly_succeeded else None,
+                            agent_run=agent_run,
+                        )
+                    )
+                    if disp is Disposition.FAIL_FAST:
+                        raise
+                    if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
+                        raise
+                    last_exc = exc
+                    advanced = True
+                # Reached on a successful hop OR on a terminal failure that advances
+                # the chain; a same-provider retry `continue`s above and never lands
+                # here. `advanced` distinguishes the two so success falls through to
+                # settlement below.
+                break
+            if advanced:
                 continue
 
             # SUCCESS — settle against the SERVED runtime.

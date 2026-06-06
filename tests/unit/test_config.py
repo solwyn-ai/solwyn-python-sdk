@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import VALID_API_KEY
+from pydantic import ValidationError
 
 from solwyn._types import BudgetMode, ProviderEntry, ProviderName
 from solwyn.client import AsyncSolwyn, Solwyn
@@ -323,3 +324,21 @@ class TestFailoverKnobDefaults:
         assert config.failover_idempotency == "always"
         assert config.same_provider_retries == 2
         assert config.default_params == {"temperature": 0.0}
+
+    def test_negative_same_provider_retries_rejected(self) -> None:
+        # The knob is a max-retry COUNT per chain entry; a negative value is
+        # nonsensical and must be rejected at config time (Field(ge=0)).
+        with pytest.raises(ValidationError):
+            SolwynConfig(
+                api_key=VALID_API_KEY,
+                providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-4o")],
+                same_provider_retries=-1,
+            )
+
+    def test_negative_same_provider_retries_via_client_raises_configuration_error(self) -> None:
+        # The client wraps the pydantic ValidationError into a ConfigurationError
+        # naming the offending field.
+        client = _mock_openai_client()
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_solwyn(client, api_key=VALID_API_KEY, same_provider_retries=-1)
+        assert exc_info.value.field == "same_provider_retries"

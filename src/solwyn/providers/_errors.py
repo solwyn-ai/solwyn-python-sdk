@@ -54,6 +54,9 @@ prove the request never landed.
 
 from __future__ import annotations
 
+import math
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 
 import httpx
@@ -153,3 +156,76 @@ def classify_exception(exc: BaseException) -> Disposition:
 
     # 8. Default: never failover into the unknown.
     return Disposition.FAIL_FAST
+
+
+def retry_after_seconds(exc: BaseException) -> float | None:
+    """Return a non-negative ``Retry-After`` delay (seconds) for an HTTP 429, else None.
+
+    Duck-typed and status-first, exactly like :func:`classify_exception` — never
+    imports a provider SDK. Only HTTP 429 qualifies (the provider explicitly asked
+    us to retry); every other status (including 529) returns ``None`` so the caller
+    falls through to normal failover. The header is read off ``exc.response.headers``
+    (the OpenAI/Anthropic/httpx shape) and honored in both RFC 7231 forms:
+    delta-seconds (``"2"``) and an HTTP-date (``"Wed, 21 Oct 2026 07:28:00 GMT"``). A
+    past HTTP-date clamps to ``0.0``. A missing or unparseable header returns ``None``
+    — we never synthesize a backoff the provider did not request.
+    """
+    if _numeric_status(exc) != 429:
+        return None
+    raw = _retry_after_header(exc)
+    if raw is None:
+        return None
+    return _parse_retry_after(raw)
+
+
+def _retry_after_header(exc: BaseException) -> str | None:
+    """Read the ``Retry-After`` header off a transport exception, duck-typed.
+
+    Looks for a ``headers`` mapping on ``exc.response`` (the OpenAI/Anthropic
+    shape) and falls back to a ``headers`` attribute on the exception itself.
+    Lookup is case-insensitive: ``httpx.Headers.get`` already is, and a plain
+    dict carrier is scanned case-insensitively. Total by construction — this runs
+    inside the dispatch except-handler on an arbitrary third-party exception, so a
+    pathological ``headers`` object is swallowed and treated as "no header" rather
+    than allowed to raise over the original provider exception.
+    """
+    for carrier in (getattr(exc, "response", None), exc):
+        headers = getattr(carrier, "headers", None)
+        if headers is None:
+            continue
+        try:
+            getter = getattr(headers, "get", None)
+            if getter is not None:
+                # httpx.Headers.get resolves any casing; a plain dict matches lowercase.
+                value = getter("retry-after")
+                if value is not None:
+                    return str(value)
+            items = getattr(headers, "items", None)
+            if items is not None:
+                # Plain dict / non-httpx mapping with a non-canonical key casing.
+                for key, value in items():
+                    if value is not None and str(key).lower() == "retry-after":
+                        return str(value)
+        except Exception:
+            # A headers carrier whose get()/items() raises must not escape into the
+            # dispatch loop and mask the original exception; treat as no header.
+            continue
+    return None
+
+
+def _parse_retry_after(raw: str) -> float | None:
+    """Parse a ``Retry-After`` value (delta-seconds or HTTP-date) into seconds."""
+    text = raw.strip()
+    try:
+        seconds = float(text)
+    except ValueError:
+        seconds = None
+    if seconds is not None:
+        return max(0.0, seconds) if math.isfinite(seconds) else None
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
