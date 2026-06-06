@@ -294,24 +294,24 @@ class _BudgetEnforcerBase:
         *,
         provider: str,
         is_provider_fallback: bool = False,
-        call_id: str | None = None,
+        call_id: str,
     ) -> BudgetConfirmRequest:
         """Build a validated confirm request for fire-and-forget callers.
 
         Stream completion builds this synchronously (no I/O) and enqueues
         it on the reporter thread, avoiding a blocking httpx.post. ``provider``
         is the provider that actually served the call (required).
-        ``call_id`` is the per-call reconciliation join key; when None the
-        model's default_factory mints one.
+        ``call_id`` is the required per-call reconciliation join key.
         """
-        extra: dict[str, str] = {} if call_id is None else {"call_id": call_id}
+        if not call_id:
+            raise RuntimeError("call_id is required for budget confirm reconciliation")
         return BudgetConfirmRequest(
             reservation_id=reservation_id,
             model=model,
             provider=ProviderName(provider),
             is_provider_fallback=is_provider_fallback,
             token_details=token_details,
-            **extra,
+            call_id=call_id,
         )
 
 
@@ -349,6 +349,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         provider: str,
         fallback_providers: list[str] = [],  # noqa: B006 — read-only; never mutated
         fallback_models: list[str] = [],  # noqa: B006 — read-only; never mutated
+        timeout: float | None = None,
     ) -> BudgetCheckResult:
         """Check whether a call is within budget.
 
@@ -383,11 +384,19 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         )
 
         try:
-            resp = self._http.post(
-                f"{self.api_url}/api/v1/budgets/check",
-                json=request.model_dump(mode="json"),
-                headers=self._auth_headers(),
-            )
+            if timeout is not None:
+                resp = self._http.post(
+                    f"{self.api_url}/api/v1/budgets/check",
+                    json=request.model_dump(mode="json"),
+                    headers=self._auth_headers(),
+                    timeout=timeout,
+                )
+            else:
+                resp = self._http.post(
+                    f"{self.api_url}/api/v1/budgets/check",
+                    json=request.model_dump(mode="json"),
+                    headers=self._auth_headers(),
+                )
             resp.raise_for_status()
 
             cloud_response = BudgetCheckResponse.model_validate(resp.json())
@@ -413,7 +422,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         *,
         provider: str,
         is_provider_fallback: bool = False,
-        call_id: str | None = None,
+        call_id: str,
     ) -> None:
         """Confirm actual token usage for a budget reservation.
 
@@ -496,6 +505,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         provider: str,
         fallback_providers: list[str] = [],  # noqa: B006 — read-only; never mutated
         fallback_models: list[str] = [],  # noqa: B006 — read-only; never mutated
+        timeout: float | None = None,
     ) -> BudgetCheckResult:
         """Async version of budget check. See BudgetEnforcer.check_budget."""
         if self._should_use_cache():
@@ -517,11 +527,19 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         )
 
         try:
-            resp = await self._http.post(
-                f"{self.api_url}/api/v1/budgets/check",
-                json=request.model_dump(mode="json"),
-                headers=self._auth_headers(),
-            )
+            if timeout is not None:
+                resp = await self._http.post(
+                    f"{self.api_url}/api/v1/budgets/check",
+                    json=request.model_dump(mode="json"),
+                    headers=self._auth_headers(),
+                    timeout=timeout,
+                )
+            else:
+                resp = await self._http.post(
+                    f"{self.api_url}/api/v1/budgets/check",
+                    json=request.model_dump(mode="json"),
+                    headers=self._auth_headers(),
+                )
             resp.raise_for_status()
 
             cloud_response = BudgetCheckResponse.model_validate(resp.json())
@@ -547,7 +565,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         *,
         provider: str,
         is_provider_fallback: bool = False,
-        call_id: str | None = None,
+        call_id: str,
     ) -> None:
         """Async version of cost confirmation. See BudgetEnforcer.confirm_cost."""
         try:

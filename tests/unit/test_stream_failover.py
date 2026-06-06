@@ -29,7 +29,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from conftest import VALID_API_KEY
 
-from solwyn._types import CircuitState
+from solwyn._types import CallStatus, CircuitState
 from solwyn.client import (
     AsyncSolwyn,
     Solwyn,
@@ -635,6 +635,13 @@ class TestMidStreamErrorNeverFailsOver:
 
         # The fallback was NEVER attempted — mid-stream errors don't fail over.
         anthropic.messages.create.assert_not_called()
+        errors = [
+            c.args[0]
+            for c in solwyn._reporter.report.call_args_list
+            if c.args[0].status is CallStatus.ERROR
+        ]
+        assert len(errors) == 1
+        assert errors[0].possibly_succeeded is True
         _close(solwyn)
 
     def test_openai_first_chunk_error_after_establishment_no_failover(self) -> None:
@@ -678,6 +685,13 @@ class TestMidStreamErrorNeverFailsOver:
         anthropic.messages.create.assert_not_called()
         openai.chat.completions.create.assert_called_once()
         assert openai_cb.failure_count == 1
+        errors = [
+            c.args[0]
+            for c in solwyn._reporter.report.call_args_list
+            if c.args[0].status is CallStatus.ERROR
+        ]
+        assert len(errors) == 1
+        assert errors[0].possibly_succeeded is True
         _close(solwyn)
 
     @pytest.mark.unit
@@ -720,6 +734,13 @@ class TestMidStreamErrorNeverFailsOver:
         # health failure via on_error.
         anthropic.messages.create.assert_not_awaited()
         assert openai_cb.failure_count == 1
+        errors = [
+            c.args[0]
+            for c in solwyn._reporter.report.call_args_list
+            if c.args[0].status is CallStatus.ERROR
+        ]
+        assert len(errors) == 1
+        assert errors[0].possibly_succeeded is True
         await _aclose(solwyn)
 
 

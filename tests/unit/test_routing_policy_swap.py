@@ -215,7 +215,7 @@ def test_record_latency_thread_safety_smoke() -> None:
 
         # Assert — no corruption: window is capped at _LATENCY_WINDOW and the
         # median of an all-100.0 window is exactly 100.0 (no torn writes).
-        with solwyn._latency_lock:
+        with solwyn._signal_lock:
             window_len = len(solwyn._latency_windows["openai"])
         assert window_len == _LATENCY_WINDOW
         assert solwyn.observed_p50("openai") == 100.0
@@ -250,6 +250,24 @@ def test_select_candidates_surfaces_observed_p50_onto_candidate() -> None:
         by_provider = {c.runtime.adapter.name: c for c in captured}  # type: ignore[attr-defined]
         assert by_provider["openai"].latency_p50 == 123.0  # type: ignore[attr-defined]
         assert by_provider["anthropic"].latency_p50 is None  # type: ignore[attr-defined]
+    finally:
+        _close(solwyn)
+
+
+@pytest.mark.unit
+def test_select_candidates_reads_each_breaker_once_per_runtime() -> None:
+    solwyn = _make_solwyn(
+        _openai_client(),
+        model="gpt-4o",
+        fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+    )
+    try:
+        with patch.object(
+            solwyn, "_get_circuit_breaker", wraps=solwyn._get_circuit_breaker
+        ) as get_breaker:
+            solwyn._select_candidates(_req())
+
+        assert get_breaker.call_count == len(solwyn._runtimes)
     finally:
         _close(solwyn)
 

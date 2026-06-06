@@ -48,6 +48,8 @@ class _ReporterBase:
         # Bounded deque: drops oldest events when full
         self._queue: collections.deque[MetadataEvent] = collections.deque(maxlen=max_queue_size)
         self._in_flight = 0
+        self._consecutive_confirm_failures = 0
+        self._confirm_failure_threshold = 10
 
     def _enqueue(self, event: MetadataEvent) -> None:
         """Add an event to the queue.  Drop-oldest semantics on overflow."""
@@ -69,6 +71,26 @@ class _ReporterBase:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+
+    def _record_confirm_success(self) -> None:
+        """Reset the confirm failure counter after a successful confirm POST."""
+        self._consecutive_confirm_failures = 0
+
+    def _record_confirm_failure(self, exc: Exception) -> None:
+        """Track confirm send failures and escalate persistent outages."""
+        self._consecutive_confirm_failures += 1
+        count = self._consecutive_confirm_failures
+        if count >= self._confirm_failure_threshold:
+            logger.error(
+                "reporter.confirm_send_persistent_failure: exc_type=%s consecutive_failures=%d",
+                type(exc).__name__,
+                count,
+            )
+        else:
+            logger.warning(
+                "reporter.confirm_send_failed: exc_type=%s",
+                type(exc).__name__,
+            )
 
 
 class MetadataReporter(_ReporterBase):
@@ -166,11 +188,9 @@ class MetadataReporter(_ReporterBase):
                     timeout=5.0,
                 )
                 resp.raise_for_status()
+                self._record_confirm_success()
             except Exception as exc:
-                logger.warning(
-                    "reporter.confirm_send_failed: exc_type=%s",
-                    type(exc).__name__,
-                )
+                self._record_confirm_failure(exc)
 
     def _send_batch(self, batch: list[MetadataEvent]) -> None:
         """Send a batch of events to the cloud API."""
@@ -318,11 +338,9 @@ class AsyncMetadataReporter(_ReporterBase):
                     timeout=5.0,
                 )
                 resp.raise_for_status()
+                self._record_confirm_success()
             except Exception as exc:
-                logger.warning(
-                    "reporter.confirm_send_failed: exc_type=%s",
-                    type(exc).__name__,
-                )
+                self._record_confirm_failure(exc)
 
     async def _send_batch(self, batch: list[MetadataEvent]) -> None:
         """Send a batch of events to the cloud API."""

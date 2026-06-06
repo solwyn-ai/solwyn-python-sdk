@@ -90,7 +90,7 @@ class _SolwynBase:
         # LatencyPolicy signal. Lock-guarded because the sync client is
         # multi-threaded (the async client is event-loop-serialized; the lock is
         # then uncontended). Pure signal store — no I/O.
-        self._latency_lock = threading.Lock()
+        self._signal_lock = threading.Lock()
         self._latency_windows: defaultdict[str, deque[float]] = defaultdict(
             lambda: deque(maxlen=_LATENCY_WINDOW)
         )
@@ -136,7 +136,7 @@ class _SolwynBase:
         multi-threaded sync client (uncontended on the async client). Pure signal
         store — no I/O, no breaker mutation.
         """
-        with self._latency_lock:
+        with self._signal_lock:
             self._latency_windows[provider].append(ms)
 
     def observed_p50(self, provider: str) -> float | None:
@@ -147,7 +147,7 @@ class _SolwynBase:
         queue. Lock-guarded; snapshots the window under the lock and computes the
         median outside it.
         """
-        with self._latency_lock:
+        with self._signal_lock:
             window = self._latency_windows.get(provider)
             samples = list(window) if window is not None else []
         if len(samples) < _LATENCY_MIN_SAMPLES:
@@ -161,7 +161,7 @@ class _SolwynBase:
         RELATIVE price signal. The SDK never computes price — it only stores and
         forwards this. An empty dict clears the hints (server provided none).
         """
-        with self._latency_lock:
+        with self._signal_lock:
             self._last_price_hints = dict(hints)
 
     def _select_candidates(self, req: RoutingRequest) -> list[ProviderRuntime]:
@@ -175,22 +175,25 @@ class _SolwynBase:
         # Snapshot the price hints once under the lock so every candidate in this
         # selection sees a consistent view (the setter may replace the dict
         # concurrently on another thread).
-        with self._latency_lock:
+        with self._signal_lock:
             price_hints = dict(self._last_price_hints)
-        candidates = [
-            ProviderCandidate(
-                runtime=runtime,
-                breaker_state=self._get_circuit_breaker(runtime.adapter.name).state,
-                recovery_eligible=self._get_circuit_breaker(runtime.adapter.name).recovery_eligible,
-                translatable=True,  # native passthrough; a later predicate refines this
-                # Routing signals: observed p50 latency (LatencyPolicy) and the
-                # server-provided relative price hint (CostPolicy). Both default to
-                # None when unavailable; HealthBasedPolicy ignores them.
-                latency_p50=self.observed_p50(runtime.adapter.name),
-                price_hint=price_hints.get(runtime.adapter.name),
+        candidates: list[ProviderCandidate] = []
+        for runtime in self._runtimes:
+            breaker = self._get_circuit_breaker(runtime.adapter.name)
+            state = breaker.get_state()
+            candidates.append(
+                ProviderCandidate(
+                    runtime=runtime,
+                    breaker_state=state.state,
+                    recovery_eligible=state.recovery_eligible,
+                    translatable=True,  # native passthrough; a later predicate refines this
+                    # Routing signals: observed p50 latency (LatencyPolicy) and the
+                    # server-provided relative price hint (CostPolicy). Both default to
+                    # None when unavailable; HealthBasedPolicy ignores them.
+                    latency_p50=self.observed_p50(runtime.adapter.name),
+                    price_hint=price_hints.get(runtime.adapter.name),
+                )
             )
-            for runtime in self._runtimes
-        ]
         ordered = self._policy.order(candidates, req)
         # Defensive: a custom (possibly misbehaving) injected policy must not be
         # able to inject a runtime that was never in the configured chain into the
@@ -217,7 +220,7 @@ class _SolwynBase:
         failover_reason: FailoverReason | None = None,
         failover_error_class: str | None = None,
         attempt_index: int = 0,
-        call_id: str | None = None,
+        call_id: str,
         possibly_succeeded: bool | None = None,
         service_tier: str | None = None,
         sdk_instance_id: str | None = None,
@@ -226,14 +229,12 @@ class _SolwynBase:
     ) -> MetadataEvent:
         """Build a MetadataEvent for reporting to the cloud API.
 
-        ``call_id`` is the per-call reconciliation join key; when None the
-        model's default_factory fills a fresh uuid. ``possibly_succeeded`` is the
-        post-send-ambiguous abort flag — left None on every non-abort event.
+        ``call_id`` is the per-call reconciliation join key. ``possibly_succeeded``
+        is the post-send-ambiguous abort flag — left None on every non-abort event.
         """
+        if not call_id:
+            raise RuntimeError("call_id is required for metadata reconciliation")
         agent_run_id, agent_run_name = current_run() if agent_run is None else agent_run
-        # When call_id is None let the MetadataEvent default_factory mint one so
-        # direct construction keeps working; the client threads an explicit value.
-        extra: dict[str, str] = {} if call_id is None else {"call_id": call_id}
         return MetadataEvent(
             model=model,
             provider=ProviderName(provider),
@@ -255,7 +256,7 @@ class _SolwynBase:
             timestamp=timestamp or datetime.now(UTC),
             agent_run_id=agent_run_id,
             agent_run_name=agent_run_name,
-            **extra,
+            call_id=call_id,
         )
 
     def _build_error_event(
@@ -270,7 +271,7 @@ class _SolwynBase:
         requested_model: str | None = None,
         failover_error_class: str | None = None,
         attempt_index: int = 0,
-        call_id: str | None = None,
+        call_id: str,
         possibly_succeeded: bool | None = None,
         agent_run: tuple[str | None, str | None] | None = None,
     ) -> MetadataEvent:

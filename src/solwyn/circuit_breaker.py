@@ -32,6 +32,7 @@ class CircuitBreakerState(BaseModel):
     success_count: int
     last_failure_time: float | None  # monotonic seconds
     last_state_change: float  # monotonic seconds
+    recovery_eligible: bool
 
 
 class CircuitBreakerAdmission(BaseModel):
@@ -208,6 +209,8 @@ class CircuitBreaker:
                 success_count=self.success_count,
                 last_failure_time=self.last_failure_time,
                 last_state_change=self.last_state_change,
+                recovery_eligible=self.state == CircuitState.OPEN
+                and self._should_attempt_recovery(),
             )
 
     # ------------------------------------------------------------------

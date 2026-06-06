@@ -95,6 +95,7 @@ def test_build_confirm_request_returns_pydantic_model() -> None:
         model="gpt-4o",
         token_details=token_details,
         provider="openai",
+        call_id="call_stream_confirm",
     )
     assert isinstance(request, BudgetConfirmRequest)
     assert request.reservation_id == "r_test_123"

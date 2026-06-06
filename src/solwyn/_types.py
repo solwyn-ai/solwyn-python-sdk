@@ -7,7 +7,6 @@ NotificationEventType, Environment, BudgetPeriod.
 
 from __future__ import annotations
 
-import uuid
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any, cast
@@ -141,7 +140,7 @@ class MetadataEvent(BaseModel):
     )
     attempt_index: int = Field(default=0, ge=0, description="0=primary, 1=first fallback")
     call_id: str = Field(
-        default_factory=lambda: str(uuid.uuid4()),
+        ...,
         description=(
             "uuid per intercepted call; join key for cache-hit spend reconciliation. "
             "Always present on the wire — it is NOT content."
@@ -248,7 +247,7 @@ class BudgetConfirmRequest(BaseModel):
         default=False, description="served provider != requested provider"
     )
     call_id: str = Field(
-        default_factory=lambda: str(uuid.uuid4()),
+        ...,
         description=("uuid per intercepted call; dedups confirm vs metadata reconciliation"),
     )
     token_details: TokenDetails = Field(

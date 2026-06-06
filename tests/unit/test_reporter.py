@@ -36,6 +36,7 @@ def _make_event(**overrides) -> MetadataEvent:
         "is_model_fallback": False,
         "sdk_instance_id": "test-instance-001",
         "timestamp": datetime.now(UTC),
+        "call_id": "call_reporter_event",
     }
     defaults.update(overrides)
     return MetadataEvent(**defaults)
@@ -342,6 +343,25 @@ class TestMetadataReporter:
         assert "HTTPStatusError" in caplog.text
         # The flush loop survives and drains the confirm queue.
         assert len(reporter._confirm_queue) == 0
+        reporter._http.close()
+
+    def test_flush_remaining_confirm_persistent_failures_escalate_to_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        reporter = _quiet_sync_reporter()
+        for _ in range(10):
+            reporter._confirm_queue.append(_make_confirm_request())
+
+        with (
+            patch.object(reporter._http, "post", return_value=_error_response(503)),
+            caplog.at_level("ERROR"),
+        ):
+            reporter._flush_remaining()
+
+        assert reporter._consecutive_confirm_failures == 10
+        assert "reporter.confirm_send_persistent_failure" in caplog.text
+        assert "consecutive_failures=10" in caplog.text
+        assert "HTTPStatusError" in caplog.text
         reporter._http.close()
 
 

@@ -45,7 +45,11 @@ def test_confirm_failure_emits_error_after_threshold(caplog: object) -> None:
     with caplog.at_level(logging.WARNING):  # type: ignore[union-attr]
         for _ in range(9):
             enforcer.confirm_cost(
-                reservation_id="r1", model="gpt-4o", token_details=MagicMock(), provider="openai"
+                reservation_id="r1",
+                model="gpt-4o",
+                token_details=MagicMock(),
+                provider="openai",
+                call_id="call_confirm_failure",
             )
 
     assert "budget.confirm_cost_persistent_failure" not in caplog.text  # type: ignore[union-attr]
@@ -54,7 +58,11 @@ def test_confirm_failure_emits_error_after_threshold(caplog: object) -> None:
     caplog.clear()  # type: ignore[union-attr]
     with caplog.at_level(logging.ERROR):  # type: ignore[union-attr]
         enforcer.confirm_cost(
-            reservation_id="r1", model="gpt-4o", token_details=MagicMock(), provider="openai"
+            reservation_id="r1",
+            model="gpt-4o",
+            token_details=MagicMock(),
+            provider="openai",
+            call_id="call_confirm_failure",
         )
 
     assert "budget.confirm_cost_persistent_failure" in caplog.text  # type: ignore[union-attr]
@@ -74,7 +82,11 @@ def test_confirm_4xx_increments_failure_counter(caplog: pytest.LogCaptureFixture
 
     with caplog.at_level(logging.WARNING):
         enforcer.confirm_cost(
-            reservation_id="r1", model="gpt-4o", token_details=token_details, provider="openai"
+            reservation_id="r1",
+            model="gpt-4o",
+            token_details=token_details,
+            provider="openai",
+            call_id="call_confirm_failure",
         )
 
     assert enforcer._consecutive_confirm_failures == 1
@@ -96,14 +108,22 @@ def test_confirm_2xx_resets_failure_counter() -> None:
     enforcer._http.post = MagicMock(return_value=_error_response(422))
     for _ in range(2):
         enforcer.confirm_cost(
-            reservation_id="r1", model="gpt-4o", token_details=token_details, provider="openai"
+            reservation_id="r1",
+            model="gpt-4o",
+            token_details=token_details,
+            provider="openai",
+            call_id="call_confirm_failure",
         )
     assert enforcer._consecutive_confirm_failures == 2
 
     # A 200 resets it to zero.
     enforcer._http.post = MagicMock(return_value=_ok_response())
     enforcer.confirm_cost(
-        reservation_id="r1", model="gpt-4o", token_details=token_details, provider="openai"
+        reservation_id="r1",
+        model="gpt-4o",
+        token_details=token_details,
+        provider="openai",
+        call_id="call_confirm_failure",
     )
     assert enforcer._consecutive_confirm_failures == 0
 

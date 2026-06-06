@@ -15,6 +15,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from conftest import VALID_API_KEY
 
@@ -146,6 +147,30 @@ class TestSafeDefault:
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # The EXACT original instance propagates; the fallback never ran.
+        assert exc_info.value is original
+        anthropic.messages.create.assert_not_called()
+
+        _close(solwyn)
+
+    def test_real_httpx_readtimeout_does_not_failover_reraises_original(self) -> None:
+        openai = _openai_client()
+        original = httpx.ReadTimeout("read timed out")
+        openai.chat.completions.create.side_effect = original
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+        )
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            pytest.raises(httpx.ReadTimeout) as exc_info,
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
         assert exc_info.value is original
         anthropic.messages.create.assert_not_called()
 
@@ -296,6 +321,33 @@ class TestNeverMode:
 
         # never = breaker still tracks health, but NEVER cross providers.
         anthropic.messages.create.assert_not_called()
+
+        _close(solwyn)
+
+
+@pytest.mark.unit
+class TestSameProviderOpenAITokenKeyRewrite:
+    def test_o_series_model_swap_rewrites_max_tokens_default(self) -> None:
+        client = _openai_client()
+        success = _openai_response()
+        client.chat.completions.create.side_effect = [_Status(429), success]
+
+        solwyn = _make_solwyn(
+            client,
+            model="gpt-4o",
+            fallback=[(client, "o3-mini")],
+            default_params={"max_tokens": 256},
+            failover_idempotency="never",
+        )
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        assert result is success
+        swap_kwargs = client.chat.completions.create.call_args_list[1].kwargs
+        assert swap_kwargs["model"] == "o3-mini"
+        assert swap_kwargs["max_completion_tokens"] == 256
+        assert "max_tokens" not in swap_kwargs
 
         _close(solwyn)
 

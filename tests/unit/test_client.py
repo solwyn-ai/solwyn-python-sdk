@@ -11,8 +11,9 @@ from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 import solwyn as solwyn_pkg
 from solwyn._privacy import estimate_content_length
 from solwyn._types import BudgetMode, ProviderName
-from solwyn.client import Solwyn, _detect_provider
+from solwyn.client import Solwyn
 from solwyn.exceptions import BudgetExceededError, ProviderUnavailableError
+from solwyn.providers import get_adapter_for_client
 from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
 
 
@@ -99,24 +100,24 @@ class TestProviderDetection:
 
     def test_detects_openai(self) -> None:
         client, _ = _mock_openai_client()
-        assert _detect_provider(client) == ProviderName.OPENAI
+        assert ProviderName(get_adapter_for_client(client).name) == ProviderName.OPENAI
 
     def test_detects_anthropic(self) -> None:
         client, _ = _mock_anthropic_client()
-        assert _detect_provider(client) == ProviderName.ANTHROPIC
+        assert ProviderName(get_adapter_for_client(client).name) == ProviderName.ANTHROPIC
 
     def test_detects_google(self) -> None:
         client = MagicMock()
         client.__class__.__module__ = "google.generativeai._client"
         client.__class__.__name__ = "GenerativeModel"
-        assert _detect_provider(client) == ProviderName.GOOGLE
+        assert ProviderName(get_adapter_for_client(client).name) == ProviderName.GOOGLE
 
     def test_raises_on_unknown_client(self) -> None:
         client = MagicMock()
         client.__class__.__module__ = "some_other_lib"
         client.__class__.__name__ = "UnknownClient"
-        with pytest.raises(ValueError, match="Cannot auto-detect"):
-            _detect_provider(client)
+        with pytest.raises(ValueError, match="No provider adapter"):
+            get_adapter_for_client(client)
 
 
 # ---------------------------------------------------------------------------

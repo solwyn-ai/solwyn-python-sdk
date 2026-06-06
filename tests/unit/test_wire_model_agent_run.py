@@ -27,6 +27,7 @@ def _make_event(**overrides: object) -> MetadataEvent:
         "is_model_fallback": False,
         "sdk_instance_id": "test-instance-001",
         "timestamp": datetime.now(UTC),
+        "call_id": "call_agent_run_event",
     }
     defaults.update(overrides)
     return MetadataEvent(**defaults)  # type: ignore[arg-type]

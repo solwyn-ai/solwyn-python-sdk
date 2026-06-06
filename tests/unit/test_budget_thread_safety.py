@@ -31,6 +31,7 @@ def test_reporter_report_confirm_concurrent_appends() -> None:
                         model="gpt-4o",
                         provider="openai",
                         token_details=_DUMMY_DETAILS,
+                        call_id=f"call-{threading.get_ident()}-{i}",
                     )
                 )
 

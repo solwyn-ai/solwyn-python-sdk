@@ -142,6 +142,7 @@ def _metadata_event(**overrides: object) -> MetadataEvent:
         "is_model_fallback": False,
         "sdk_instance_id": "sdk_abc",
         "timestamp": datetime(2026, 6, 2, tzinfo=UTC),
+        "call_id": "call-test-123",
     }
     base.update(overrides)
     return MetadataEvent(**base)  # type: ignore[arg-type]
@@ -175,6 +176,28 @@ class TestWireModelDumpSnapshots:
             price_hints={ProviderName.OPENAI: 1.0, ProviderName.ANTHROPIC: 2.0},
         )
         assert set(response.model_dump(mode="json")) == EXPECTED_CHECK_RESPONSE_FIELDS
+
+    def test_budget_check_response_coerces_raw_string_price_hint_keys(self) -> None:
+        response = BudgetCheckResponse(
+            allowed=True,
+            remaining_budget=80.0,
+            reservation_id="res_123",
+            mode="alert_only",
+            budget_limit=100.0,
+            current_usage=20.0,
+            denied_by_period=None,
+            project_id="proj_abc",
+            price_hints={"openai": 1.0, "anthropic": 2.0},
+        )
+
+        assert response.price_hints == {
+            ProviderName.OPENAI: 1.0,
+            ProviderName.ANTHROPIC: 2.0,
+        }
+        assert response.model_dump(mode="json")["price_hints"] == {
+            "openai": 1.0,
+            "anthropic": 2.0,
+        }
 
     def test_budget_confirm_request_dump_keys(self) -> None:
         req = BudgetConfirmRequest(
@@ -235,6 +258,9 @@ class TestWireModelFieldConstraints:
         # price against the provider that actually served the call.
         assert BudgetConfirmRequest.model_fields["provider"].is_required() is True
 
+    def test_confirm_call_id_is_required(self) -> None:
+        assert BudgetConfirmRequest.model_fields["call_id"].is_required() is True
+
     def test_confirm_without_provider_raises_validation_error(self) -> None:
         # Constructing a confirm with no provider must hard-fail, not default.
         with pytest.raises(ValidationError):
@@ -242,6 +268,32 @@ class TestWireModelFieldConstraints:
                 reservation_id="res_123",
                 model="gpt-4o",
                 token_details=TokenDetails(input_tokens=10, output_tokens=5),
+            )
+
+    def test_confirm_without_call_id_raises_validation_error(self) -> None:
+        with pytest.raises(ValidationError):
+            BudgetConfirmRequest(  # type: ignore[call-arg]
+                reservation_id="res_123",
+                model="gpt-4o",
+                provider=ProviderName.OPENAI,
+                token_details=TokenDetails(input_tokens=10, output_tokens=5),
+            )
+
+    def test_metadata_call_id_is_required(self) -> None:
+        assert MetadataEvent.model_fields["call_id"].is_required() is True
+
+    def test_metadata_without_call_id_raises_validation_error(self) -> None:
+        with pytest.raises(ValidationError):
+            MetadataEvent(
+                model="gpt-4o",
+                provider=ProviderName.OPENAI,
+                input_tokens=10,
+                output_tokens=5,
+                latency_ms=12.0,
+                status=CallStatus.SUCCESS,
+                is_model_fallback=False,
+                sdk_instance_id="sdk_abc",
+                timestamp=datetime(2026, 6, 2, tzinfo=UTC),
             )
 
     def test_metadata_requested_model_max_length_pinned(self) -> None:
@@ -561,6 +613,66 @@ class TestCallIdConsistencyCrossProvider:
         assert confirms[0].provider == ProviderName.ANTHROPIC
 
         _close(solwyn)
+
+
+@pytest.mark.unit
+class TestNormalizeBeforeSettlement:
+    """Cross-provider success must normalize before confirm + SUCCESS metadata."""
+
+    def test_sync_normalize_failure_does_not_confirm_or_report_success(self) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = _Status(429)
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+        )
+
+        confirm_spy = MagicMock()
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._budget, "confirm_cost", confirm_spy),
+            patch("solwyn.client._translation.normalize_response", side_effect=RuntimeError),
+            pytest.raises(RuntimeError),
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        confirm_spy.assert_not_called()
+        success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
+        assert success == []
+
+        _close(solwyn)
+
+    @pytest.mark.asyncio
+    async def test_async_normalize_failure_does_not_confirm_or_report_success(self) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create = AsyncMock(side_effect=_Status(429))
+        anthropic = _anthropic_client()
+        anthropic.messages.create = AsyncMock(return_value=_anthropic_response())
+        solwyn = _make_async_solwyn(
+            openai,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+        )
+
+        confirm_spy = AsyncMock()
+        with (
+            patch.object(
+                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            ),
+            patch.object(solwyn._budget, "confirm_cost", confirm_spy),
+            patch("solwyn.client._translation.normalize_response", side_effect=RuntimeError),
+            pytest.raises(RuntimeError),
+        ):
+            await solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        confirm_spy.assert_not_awaited()
+        success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
+        assert success == []
+
+        await _aclose(solwyn)
 
 
 # --------------------------------------------------------------------------- #

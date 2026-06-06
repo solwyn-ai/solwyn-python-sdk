@@ -24,6 +24,7 @@ def _make_event(seq: int = 0) -> MetadataEvent:
         is_model_fallback=False,
         sdk_instance_id=uuid.uuid4().hex,
         timestamp=datetime.now(UTC),
+        call_id=uuid.uuid4().hex,
     )
 
 

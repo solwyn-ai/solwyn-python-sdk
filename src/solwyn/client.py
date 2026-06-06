@@ -67,6 +67,7 @@ logger = logging.getLogger(__name__)
 # Floor for a per-hop dispatch timeout: even when the chain deadline is nearly
 # spent we give a hop at least this long rather than passing it ~0s.
 _MIN_HOP_TIMEOUT = 1.0
+_BUDGET_CHECK_TIMEOUT = 5.0
 _SOURCE_COMPATIBLE_DEFAULT_KEYS = {
     ProviderName.OPENAI.value: frozenset(
         {
@@ -145,6 +146,42 @@ def _with_google_http_bound(
     config["http_options"] = http_options
     bounded["config"] = config
     return bounded
+
+
+def _openai_uses_max_completion_tokens(model: str) -> bool:
+    """Return whether an OpenAI model rejects the legacy max_tokens key."""
+    return model.startswith(("o1", "o3", "o4", "gpt-5"))
+
+
+def _with_openai_completion_token_key(
+    provider: str,
+    model: str,
+    kwargs: dict[str, object],
+) -> dict[str, object]:
+    """Rewrite OpenAI max_tokens for models that require max_completion_tokens."""
+    if provider != ProviderName.OPENAI.value or not _openai_uses_max_completion_tokens(model):
+        return kwargs
+    if "max_tokens" not in kwargs:
+        return kwargs
+    rewritten = dict(kwargs)
+    if "max_completion_tokens" not in rewritten:
+        rewritten["max_completion_tokens"] = rewritten["max_tokens"]
+    del rewritten["max_tokens"]
+    return rewritten
+
+
+def _budget_timeout(deadline: Deadline) -> float:
+    """Timeout for the budget pre-flight, clamped by the chain deadline."""
+    return max(0.001, min(_BUDGET_CHECK_TIMEOUT, deadline.remaining()))
+
+
+def _hop_timeout(deadline: Deadline, remaining_candidates: int) -> float:
+    """Timeout for one provider hop, never exceeding the remaining deadline."""
+    remaining = deadline.remaining()
+    if remaining <= 0:
+        return 0.001
+    slice_timeout = remaining / max(1, remaining_candidates)
+    return min(remaining, max(_MIN_HOP_TIMEOUT, slice_timeout))
 
 
 class Deadline:
@@ -329,22 +366,6 @@ def _success_failover_reason(
     return None
 
 
-def _detect_provider(client: object) -> ProviderName:
-    """Auto-detect the LLM provider from the client instance.
-
-    Delegates to the provider adapter registry for consistent detection.
-    """
-    try:
-        adapter = get_adapter_for_client(client)
-        return ProviderName(adapter.name)
-    except ValueError as err:
-        raise ValueError(
-            f"Cannot auto-detect provider for client type {type(client).__name__}. "
-            f"Supported: openai.OpenAI, anthropic.Anthropic, "
-            f"google.generativeai.GenerativeModel"
-        ) from err
-
-
 def _build_hop_kwargs(
     *,
     primary: ProviderRuntime,
@@ -379,8 +400,13 @@ def _build_hop_kwargs(
         # PRIMARY hop is native passthrough; same-provider hop only swaps model.
         # Same-provider streaming (incl. model swap) keeps working unchanged.
         if is_primary:
-            return merged_kwargs
-        return {**merged_kwargs, "model": rt.entry.model}
+            target_model = cast(str, merged_kwargs["model"])
+            return _with_openai_completion_token_key(rt.adapter.name, target_model, merged_kwargs)
+        return _with_openai_completion_token_key(
+            rt.adapter.name,
+            rt.entry.model,
+            {**merged_kwargs, "model": rt.entry.model},
+        )
 
     # CROSS-PROVIDER hop. Defensive structural guard (fix [G]): the target
     # entry MUST carry a concrete model for this provider. An empty/falsy model
@@ -605,6 +631,7 @@ class Solwyn(_SolwynBase):
             provider=primary.adapter.name,
             fallback_providers=[r.entry.provider.value for r in self._runtimes[1:]],
             fallback_models=[r.entry.model for r in self._runtimes[1:]],
+            timeout=_budget_timeout(deadline),
         )
         # Refresh the CostPolicy signal from the server. Price hints are advisory
         # and slow-moving, so they PERSIST across hint-less responses — a budget
@@ -665,6 +692,11 @@ class Solwyn(_SolwynBase):
             candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
         if not candidates:
             raise ProviderUnavailableError("all providers unavailable", attempted=[])
+        if deadline.remaining() <= 0.0:
+            raise ProviderUnavailableError(
+                "failover deadline expired",
+                attempted=[r.adapter.name for r in candidates],
+            )
 
         # 5. Walk the candidates.
         failed_providers: set[str] = set()
@@ -733,7 +765,7 @@ class Solwyn(_SolwynBase):
                     # Shrinking per-hop slice: divide what's left of the
                     # chain deadline across the candidates not yet attempted so a
                     # single hung hop cannot consume the whole budget.
-                    timeout=max(_MIN_HOP_TIMEOUT, deadline.remaining() / (len(candidates) - idx)),
+                    timeout=_hop_timeout(deadline, len(candidates) - idx),
                     max_retries=0,
                 )
                 if is_streaming and provider == ProviderName.GOOGLE.value:
@@ -832,6 +864,16 @@ class Solwyn(_SolwynBase):
             self.record_latency(provider, ctx.elapsed_ms())
 
             token_details = rt.adapter.extract_usage(response)
+            result = response
+            if is_provider_fallback:
+                # Cross-provider hop: reshape the served response back to the
+                # caller's native dialect BEFORE confirm/report success. If the
+                # served shape is unexpected, do not mark Solwyn billing settled.
+                result = _translation.normalize_response(
+                    served=rt.adapter.name,
+                    requested=primary.adapter.name,
+                    response=response,
+                )
             if budget.reservation_id:
                 self._budget.confirm_cost(
                     budget.reservation_id,
@@ -865,16 +907,7 @@ class Solwyn(_SolwynBase):
                     agent_run=agent_run,
                 )
             )
-            if is_provider_fallback:
-                # Cross-provider hop: reshape the served response back to the
-                # caller's native dialect. Primary / same-provider hops
-                # return the raw response unchanged.
-                return _translation.normalize_response(
-                    served=rt.adapter.name,
-                    requested=primary.adapter.name,
-                    response=response,
-                )
-            return response
+            return result
 
         if last_exc is not None:
             raise last_exc
@@ -956,6 +989,7 @@ class Solwyn(_SolwynBase):
                     requested_model=requested_model if is_provider_fallback else None,
                     attempt_index=ctx.attempt_index,
                     call_id=call_id,
+                    possibly_succeeded=True,
                     agent_run=agent_run,
                 )
             )
@@ -1164,6 +1198,7 @@ class AsyncSolwyn(_SolwynBase):
             provider=primary.adapter.name,
             fallback_providers=[r.entry.provider.value for r in self._runtimes[1:]],
             fallback_models=[r.entry.model for r in self._runtimes[1:]],
+            timeout=_budget_timeout(deadline),
         )
         # Refresh the CostPolicy signal from the server. Hints PERSIST across
         # hint-less responses (cache hits) until the server sends new ones — see
@@ -1218,6 +1253,11 @@ class AsyncSolwyn(_SolwynBase):
             candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
         if not candidates:
             raise ProviderUnavailableError("all providers unavailable", attempted=[])
+        if deadline.remaining() <= 0.0:
+            raise ProviderUnavailableError(
+                "failover deadline expired",
+                attempted=[r.adapter.name for r in candidates],
+            )
 
         failed_providers: set[str] = set()
         last_exc: Exception | None = None
@@ -1285,7 +1325,7 @@ class AsyncSolwyn(_SolwynBase):
                     # Shrinking per-hop slice: divide what's left of the
                     # chain deadline across the candidates not yet attempted so a
                     # single hung hop cannot consume the whole budget.
-                    timeout=max(_MIN_HOP_TIMEOUT, deadline.remaining() / (len(candidates) - idx)),
+                    timeout=_hop_timeout(deadline, len(candidates) - idx),
                     max_retries=0,
                 )
                 if is_streaming and provider == ProviderName.GOOGLE.value:
@@ -1377,6 +1417,16 @@ class AsyncSolwyn(_SolwynBase):
             self.record_latency(provider, ctx.elapsed_ms())
 
             token_details = rt.adapter.extract_usage(response)
+            result = response
+            if is_provider_fallback:
+                # Cross-provider hop: reshape the served response back to the
+                # caller's native dialect BEFORE confirm/report success. If the
+                # served shape is unexpected, do not mark Solwyn billing settled.
+                result = _translation.normalize_response(
+                    served=rt.adapter.name,
+                    requested=primary.adapter.name,
+                    response=response,
+                )
             if budget.reservation_id:
                 await self._budget.confirm_cost(
                     budget.reservation_id,
@@ -1410,16 +1460,7 @@ class AsyncSolwyn(_SolwynBase):
                     agent_run=agent_run,
                 )
             )
-            if is_provider_fallback:
-                # Cross-provider hop: reshape the served response back to the
-                # caller's native dialect. Primary / same-provider hops
-                # return the raw response unchanged.
-                return _translation.normalize_response(
-                    served=rt.adapter.name,
-                    requested=primary.adapter.name,
-                    response=response,
-                )
-            return response
+            return result
 
         if last_exc is not None:
             raise last_exc
@@ -1501,6 +1542,7 @@ class AsyncSolwyn(_SolwynBase):
                     requested_model=requested_model if is_provider_fallback else None,
                     attempt_index=ctx.attempt_index,
                     call_id=call_id,
+                    possibly_succeeded=True,
                     agent_run=agent_run,
                 )
             )

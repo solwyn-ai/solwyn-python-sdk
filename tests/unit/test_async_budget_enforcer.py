@@ -185,7 +185,13 @@ class TestAsyncConfirmCost:
         token_details = TokenDetails(input_tokens=100, output_tokens=50)
 
         enforcer._http.post = AsyncMock(return_value=mock_response)
-        await enforcer.confirm_cost("res_123", "gpt-4o", token_details, provider="openai")
+        await enforcer.confirm_cost(
+            "res_123",
+            "gpt-4o",
+            token_details,
+            provider="openai",
+            call_id="call_async_budget_confirm",
+        )
 
         enforcer._http.post.assert_called_once()
         call_args = enforcer._http.post.call_args
@@ -200,7 +206,13 @@ class TestAsyncConfirmCost:
 
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
             # Should not raise
-            await enforcer.confirm_cost("res_123", "gpt-4o", token_details, provider="openai")
+            await enforcer.confirm_cost(
+                "res_123",
+                "gpt-4o",
+                token_details,
+                provider="openai",
+                call_id="call_async_budget_confirm",
+            )
 
         await enforcer.close()
 
@@ -216,7 +228,13 @@ class TestAsyncConfirmCost:
         enforcer._http.post = AsyncMock(return_value=_error_response(422))
 
         with caplog.at_level("WARNING"):
-            await enforcer.confirm_cost("res_123", "gpt-4o", token_details, provider="openai")
+            await enforcer.confirm_cost(
+                "res_123",
+                "gpt-4o",
+                token_details,
+                provider="openai",
+                call_id="call_async_budget_confirm",
+            )
 
         assert enforcer._consecutive_confirm_failures == 1
         assert "budget.confirm_cost_failed" in caplog.text
@@ -234,11 +252,23 @@ class TestAsyncConfirmCost:
 
         enforcer._http.post = AsyncMock(return_value=_error_response(422))
         for _ in range(2):
-            await enforcer.confirm_cost("res_123", "gpt-4o", token_details, provider="openai")
+            await enforcer.confirm_cost(
+                "res_123",
+                "gpt-4o",
+                token_details,
+                provider="openai",
+                call_id="call_async_budget_confirm",
+            )
         assert enforcer._consecutive_confirm_failures == 2
 
         enforcer._http.post = AsyncMock(return_value=_ok_response())
-        await enforcer.confirm_cost("res_123", "gpt-4o", token_details, provider="openai")
+        await enforcer.confirm_cost(
+            "res_123",
+            "gpt-4o",
+            token_details,
+            provider="openai",
+            call_id="call_async_budget_confirm",
+        )
         assert enforcer._consecutive_confirm_failures == 0
 
         await enforcer.close()

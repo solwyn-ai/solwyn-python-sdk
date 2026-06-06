@@ -89,6 +89,7 @@ def _metadata_event(**overrides: object) -> MetadataEvent:
         "is_model_fallback": False,
         "sdk_instance_id": "sdk_abc",
         "timestamp": datetime(2026, 6, 2, tzinfo=UTC),
+        "call_id": "call-test-123",
     }
     base.update(overrides)
     return MetadataEvent(**base)  # type: ignore[arg-type]
@@ -156,19 +157,21 @@ class TestMetadataEventFailoverFields:
 class TestMetadataEventReconciliationFields:
     """Spend-reconciliation fields: call_id (join key) + possibly_succeeded."""
 
-    def test_call_id_auto_populates_on_direct_construction(self) -> None:
-        # The default_factory keeps direct construction working — call_id is
-        # always present (it is the join key), even when not threaded explicitly.
-        ev = _metadata_event()
-
-        assert isinstance(ev.call_id, str)
-        assert ev.call_id  # non-empty
-
-    def test_call_id_unique_per_event(self) -> None:
-        a = _metadata_event()
-        b = _metadata_event()
-
-        assert a.call_id != b.call_id
+    def test_call_id_required_on_direct_construction(self) -> None:
+        # call_id is the reconciliation join key; callers must pass the shared
+        # per-call id explicitly so metadata + confirm cannot silently diverge.
+        with pytest.raises(ValidationError):
+            MetadataEvent(
+                model="gpt-4o",
+                provider=ProviderName.OPENAI,
+                input_tokens=10,
+                output_tokens=5,
+                latency_ms=12.0,
+                status=CallStatus.SUCCESS,
+                is_model_fallback=False,
+                sdk_instance_id="sdk_abc",
+                timestamp=datetime(2026, 6, 2, tzinfo=UTC),
+            )
 
     def test_explicit_call_id_threaded_through(self) -> None:
         ev = _metadata_event(call_id="call-fixed-123")
@@ -251,6 +254,7 @@ def _confirm_request(**overrides: object) -> BudgetConfirmRequest:
         "model": "gpt-4o",
         "provider": ProviderName.OPENAI,
         "token_details": TokenDetails(input_tokens=10, output_tokens=5),
+        "call_id": "call-test-123",
     }
     base.update(overrides)
     return BudgetConfirmRequest(**base)  # type: ignore[arg-type]
@@ -260,18 +264,14 @@ def _confirm_request(**overrides: object) -> BudgetConfirmRequest:
 class TestBudgetConfirmRequestCallId:
     """call_id dedups confirm vs metadata reconciliation."""
 
-    def test_call_id_auto_populates(self) -> None:
-        # default_factory keeps direct construction working.
-        req = _confirm_request()
-
-        assert isinstance(req.call_id, str)
-        assert req.call_id  # non-empty
-
-    def test_call_id_unique_per_request(self) -> None:
-        a = _confirm_request()
-        b = _confirm_request()
-
-        assert a.call_id != b.call_id
+    def test_call_id_required_on_direct_construction(self) -> None:
+        with pytest.raises(ValidationError):
+            BudgetConfirmRequest(
+                reservation_id="res_123",
+                model="gpt-4o",
+                provider=ProviderName.OPENAI,
+                token_details=TokenDetails(input_tokens=10, output_tokens=5),
+            )
 
     def test_explicit_call_id_threaded_through(self) -> None:
         req = _confirm_request(call_id="call-fixed-123")

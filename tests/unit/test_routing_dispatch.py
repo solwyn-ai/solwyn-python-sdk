@@ -337,3 +337,26 @@ class TestPriceHintPlumbingFromBudgetCheck:
             assert _ordered_providers(solwyn) == ["anthropic", "openai"]
         finally:
             _close(solwyn)
+
+
+@pytest.mark.unit
+class TestDeadlineBoundsThroughDispatch:
+    def test_budget_and_provider_hop_timeouts_do_not_exceed_chain_deadline(self) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create.return_value = _openai_response()
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            failover_total_timeout=0.25,
+        )
+        try:
+            check_spy = MagicMock(return_value=_budget_result())
+            with patch.object(solwyn._budget, "check_budget", check_spy):
+                solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+            budget_timeout = check_spy.call_args.kwargs["timeout"]
+            hop_timeout = openai.with_options.call_args.kwargs["timeout"]
+            assert 0 < budget_timeout <= 0.25
+            assert 0 < hop_timeout <= 0.25
+        finally:
+            _close(solwyn)

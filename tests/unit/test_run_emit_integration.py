@@ -42,6 +42,7 @@ def _build(base: _SolwynBase) -> MetadataEvent:
         latency_ms=12.3,
         status=CallStatus.SUCCESS,
         is_model_fallback=False,
+        call_id="call_run_emit",
     )
 
 
@@ -78,6 +79,7 @@ class TestEmitWithActiveRun:
                 provider="openai",
                 latency_ms=12.3,
                 is_model_fallback=False,
+                call_id="call_run_emit_error",
             )
         assert event.agent_run_id == run_id
         assert event.agent_run_name == "nightly-batch"
