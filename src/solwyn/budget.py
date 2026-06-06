@@ -427,8 +427,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         """Confirm actual token usage for a budget reservation.
 
         ``provider`` is the provider that actually served the call (required).
-        ``call_id`` is the per-call reconciliation join key; when None the
-        model's default_factory mints one.
+        ``call_id`` is the required per-call reconciliation join key.
 
         Best-effort: failures are logged but do not raise.
         Tracks consecutive failures; after _confirm_failure_threshold consecutive

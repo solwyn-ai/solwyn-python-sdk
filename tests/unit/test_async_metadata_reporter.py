@@ -32,14 +32,16 @@ def _make_event(**overrides) -> MetadataEvent:
     return MetadataEvent(**defaults)
 
 
-def _make_confirm_request() -> BudgetConfirmRequest:
-    return BudgetConfirmRequest(
-        reservation_id="res_123",
-        model="gpt-4o",
-        provider=ProviderName.OPENAI,
-        call_id="call_async_confirm",
-        token_details=TokenDetails(input_tokens=10, output_tokens=5),
-    )
+def _make_confirm_request(**overrides) -> BudgetConfirmRequest:
+    defaults = {
+        "reservation_id": "res_123",
+        "model": "gpt-4o",
+        "provider": ProviderName.OPENAI,
+        "call_id": "call_async_confirm",
+        "token_details": TokenDetails(input_tokens=10, output_tokens=5),
+    }
+    defaults.update(overrides)
+    return BudgetConfirmRequest(**defaults)
 
 
 def _ok_response() -> MagicMock:
@@ -360,13 +362,14 @@ class TestAsyncReporterBatchFlush:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_flush_remaining_sends_queued_confirms_after_events(self) -> None:
+    async def test_flush_remaining_sends_queued_confirms_before_success_events(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
             VALID_API_KEY,
         )
-        reporter.report(_make_event())
-        reporter.report_confirm(_make_confirm_request())
+        call_id = "call_async_stream_settlement"
+        reporter.report(_make_event(call_id=call_id))
+        reporter.report_confirm(_make_confirm_request(call_id=call_id))
 
         with patch.object(
             reporter._http, "post", new_callable=AsyncMock, return_value=_ok_response()
@@ -374,9 +377,11 @@ class TestAsyncReporterBatchFlush:
             await reporter._flush_remaining()
 
         assert [call.args[0] for call in mock_post.call_args_list] == [
-            "https://api.test.solwyn.ai/api/v1/metadata/ingest",
             "https://api.test.solwyn.ai/api/v1/budgets/confirm",
+            "https://api.test.solwyn.ai/api/v1/metadata/ingest",
         ]
+        assert mock_post.call_args_list[0].kwargs["json"]["call_id"] == call_id
+        assert mock_post.call_args_list[1].kwargs["json"][0]["call_id"] == call_id
         assert len(reporter._queue) == 0
         assert len(reporter._confirm_queue) == 0
         await reporter._http.aclose()

@@ -168,16 +168,7 @@ class MetadataReporter(_ReporterBase):
             self._flush_remaining()
 
     def _flush_remaining(self) -> None:
-        """Flush all queued events in batches."""
-        while len(self._queue) > 0:
-            with self._in_flight_lock:
-                if self._in_flight >= self.max_in_flight:
-                    break
-            batch = self._drain_batch()
-            if not batch:
-                break
-            self._send_batch(batch)
-        # Drain any queued confirm-cost requests
+        """Flush queued confirms, then metadata events in batches."""
         while self._confirm_queue:
             confirm_request = self._confirm_queue.popleft()
             try:
@@ -191,6 +182,14 @@ class MetadataReporter(_ReporterBase):
                 self._record_confirm_success()
             except Exception as exc:
                 self._record_confirm_failure(exc)
+        while len(self._queue) > 0:
+            with self._in_flight_lock:
+                if self._in_flight >= self.max_in_flight:
+                    break
+            batch = self._drain_batch()
+            if not batch:
+                break
+            self._send_batch(batch)
 
     def _send_batch(self, batch: list[MetadataEvent]) -> None:
         """Send a batch of events to the cloud API."""
@@ -320,14 +319,7 @@ class AsyncMetadataReporter(_ReporterBase):
             await self._flush_remaining()
 
     async def _flush_remaining(self) -> None:
-        """Flush all queued events in batches."""
-        while len(self._queue) > 0:
-            if self._in_flight >= self.max_in_flight:
-                break
-            batch = self._drain_batch()
-            if not batch:
-                break
-            await self._send_batch(batch)
+        """Flush queued confirms, then metadata events in batches."""
         while self._confirm_queue:
             confirm_request = self._confirm_queue.popleft()
             try:
@@ -341,6 +333,13 @@ class AsyncMetadataReporter(_ReporterBase):
                 self._record_confirm_success()
             except Exception as exc:
                 self._record_confirm_failure(exc)
+        while len(self._queue) > 0:
+            if self._in_flight >= self.max_in_flight:
+                break
+            batch = self._drain_batch()
+            if not batch:
+                break
+            await self._send_batch(batch)
 
     async def _send_batch(self, batch: list[MetadataEvent]) -> None:
         """Send a batch of events to the cloud API."""
