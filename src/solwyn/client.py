@@ -804,11 +804,7 @@ class Solwyn(_SolwynBase):
                     # HALF_OPEN probe slot stays ours (never stranded). The terminal
                     # outcome (success below, or the exhausted/unretryable failure
                     # here) is the single verdict that frees the slot.
-                    if (
-                        disp is Disposition.FAILOVER
-                        and same_retries_left > 0
-                        and provider not in failed_providers
-                    ):
+                    if disp is Disposition.FAILOVER and same_retries_left > 0:
                         retry_delay = retry_after_seconds(exc)
                         if (
                             retry_delay is not None
@@ -1399,11 +1395,7 @@ class AsyncSolwyn(_SolwynBase):
                     # HALF_OPEN probe slot stays ours (never stranded). The terminal
                     # outcome (success below, or the exhausted/unretryable failure
                     # here) is the single verdict that frees the slot.
-                    if (
-                        disp is Disposition.FAILOVER
-                        and same_retries_left > 0
-                        and provider not in failed_providers
-                    ):
+                    if disp is Disposition.FAILOVER and same_retries_left > 0:
                         retry_delay = retry_after_seconds(exc)
                         if (
                             retry_delay is not None

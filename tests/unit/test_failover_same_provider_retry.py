@@ -181,10 +181,6 @@ class TestSameProviderRetryOn429:
         # 429, retry (still 429), single retry exhausted -> fail over. Exactly
         # ONE breaker failure for the provider (the terminal 429), not per attempt.
         openai = _openai_client()
-        openai.chat.completions.create.side_effect = [
-            _Status429RetryAfter("0"),
-            _Status429RetryAfter("0"),
-        ]
         anthropic = _anthropic_client()
         anthropic_resp = _anthropic_response()
         anthropic.messages.create.return_value = anthropic_resp
@@ -197,18 +193,34 @@ class TestSameProviderRetryOn429:
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
         anthropic_cb = solwyn._get_circuit_breaker("anthropic")
+        attempts = 0
 
         with (
+            patch.object(
+                openai_cb, "record_failure", wraps=openai_cb.record_failure
+            ) as record_failure,
             patch("solwyn.client.time.sleep") as sleep,
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
         ):
+
+            def openai_create(*_args: object, **_kwargs: object) -> object:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise _Status429RetryAfter("0")
+                assert record_failure.call_count == 0
+                raise _Status429RetryAfter("0")
+
+            openai.chat.completions.create.side_effect = openai_create
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
+        assert attempts == 2
         assert openai.chat.completions.create.call_count == 2
         anthropic.messages.create.assert_called_once()
         assert result is not anthropic_resp  # normalized back to the OpenAI dialect
         assert result.choices[0].message.content == "ok from claude"
         sleep.assert_called_once_with(0.0)
+        record_failure.assert_called_once_with()
         assert openai_cb.failure_count == 1
         assert anthropic_cb.failure_count == 0
 
@@ -421,10 +433,10 @@ class TestSameProviderRetryOn429:
         _close(solwyn)
 
     def test_retry_after_margin_boundary_skips_retry(self) -> None:
-        # remaining=5.0; Retry-After 4.5 + _MIN_HOP_TIMEOUT(1.0) = 5.5 > 5.0 -- the
+        # remaining=5.0; Retry-After 5 + _MIN_HOP_TIMEOUT(1.0) = 6.0 > 5.0 -- the
         # re-attempt would not fit, so the retry is skipped. Pins the margin term.
         openai = _openai_client()
-        openai.chat.completions.create.side_effect = _Status429RetryAfter("4.5")
+        openai.chat.completions.create.side_effect = _Status429RetryAfter("5")
         anthropic = _anthropic_client()
         anthropic.messages.create.return_value = _anthropic_response()
 
@@ -449,11 +461,11 @@ class TestSameProviderRetryOn429:
         _close(solwyn)
 
     def test_retry_after_just_fits_margin_retries(self) -> None:
-        # remaining=5.0; Retry-After 3.5 + 1.0 = 4.5 <= 5.0 -- the retry fits, so the
+        # remaining=5.0; Retry-After 4 + 1.0 = 5.0 <= 5.0 -- the retry fits, so the
         # same provider is re-attempted (the other side of the margin boundary).
         openai = _openai_client()
         success = _openai_response()
-        openai.chat.completions.create.side_effect = [_Status429RetryAfter("3.5"), success]
+        openai.chat.completions.create.side_effect = [_Status429RetryAfter("4"), success]
 
         solwyn = _make_solwyn(openai, model="gpt-4o", same_provider_retries=1)
 
@@ -466,7 +478,7 @@ class TestSameProviderRetryOn429:
 
         assert result is success
         assert openai.chat.completions.create.call_count == 2
-        sleep.assert_called_once_with(3.5)
+        sleep.assert_called_once_with(4.0)
 
         _close(solwyn)
 
@@ -594,6 +606,45 @@ class TestSameProviderRetryOn429:
 
         _close(solwyn)
 
+    def test_same_provider_model_swap_gets_its_own_retry_budget(self) -> None:
+        # same_provider_retries is per chain entry. A primary model can fail and
+        # count the provider breaker once, then a later same-provider model swap
+        # that returns 429 + Retry-After still gets its own same-provider retry.
+        client = _openai_client()
+        success = _openai_response()
+        client.chat.completions.create.side_effect = [
+            _Status(429, "primary model failed"),
+            _Status429RetryAfter("0"),
+            success,
+        ]
+
+        solwyn = _make_solwyn(
+            client,
+            model="gpt-4o",
+            same_provider_retries=1,
+            fallback=[(client, "gpt-4o-mini")],
+        )
+        openai_cb = solwyn._get_circuit_breaker("openai")
+
+        with (
+            patch("solwyn.client.time.sleep") as sleep,
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+        ):
+            result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        assert result is success
+        assert client.chat.completions.create.call_count == 3
+        assert [c.kwargs["model"] for c in client.chat.completions.create.call_args_list] == [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4o-mini",
+        ]
+        sleep.assert_called_once_with(0.0)
+        assert openai_cb.failure_count == 0
+        assert openai_cb.state == CircuitState.CLOSED
+
+        _close(solwyn)
+
 
 # ── async (mirror) ───────────────────────────────────────────────────────
 
@@ -639,9 +690,6 @@ class TestAsyncSameProviderRetryOn429:
     @pytest.mark.asyncio
     async def test_async_retry_exhausted_falls_over(self) -> None:
         openai = _openai_client()
-        openai.chat.completions.create = AsyncMock(
-            side_effect=[_Status429RetryAfter("0"), _Status429RetryAfter("0")]
-        )
         anthropic = _anthropic_client()
         anthropic_resp = _anthropic_response()
         anthropic.messages.create = AsyncMock(return_value=anthropic_resp)
@@ -656,8 +704,63 @@ class TestAsyncSameProviderRetryOn429:
         solwyn._reporter.report = MagicMock()
         openai_cb = solwyn._get_circuit_breaker("openai")
         anthropic_cb = solwyn._get_circuit_breaker("anthropic")
+        attempts = 0
 
         with (
+            patch.object(
+                openai_cb, "record_failure", wraps=openai_cb.record_failure
+            ) as record_failure,
+            patch("solwyn.client.asyncio.sleep", new=AsyncMock()) as sleep,
+            patch.object(
+                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            ),
+        ):
+
+            async def openai_create(*_args: object, **_kwargs: object) -> object:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise _Status429RetryAfter("0")
+                assert record_failure.call_count == 0
+                raise _Status429RetryAfter("0")
+
+            openai.chat.completions.create = AsyncMock(side_effect=openai_create)
+            result = await solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        assert attempts == 2
+        assert openai.chat.completions.create.await_count == 2
+        anthropic.messages.create.assert_awaited_once()
+        assert result is not anthropic_resp
+        assert result.choices[0].message.content == "ok from claude"
+        sleep.assert_awaited_once_with(0.0)
+        record_failure.assert_called_once_with()
+        assert openai_cb.failure_count == 1
+        assert anthropic_cb.failure_count == 0
+
+        await solwyn._reporter._http.aclose()
+        await solwyn._budget._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_async_retry_after_exceeds_deadline_skips_retry(self) -> None:
+        # Async mirror of the deadline-bound guard: over-deadline Retry-After does
+        # not sleep or retry; it records the terminal primary failure and falls over.
+        openai = _openai_client()
+        openai.chat.completions.create = AsyncMock(side_effect=_Status429RetryAfter("30"))
+        anthropic = _anthropic_client()
+        anthropic.messages.create = AsyncMock(return_value=_anthropic_response())
+
+        solwyn = AsyncSolwyn(
+            openai,
+            api_key=VALID_API_KEY,
+            model="gpt-4o",
+            same_provider_retries=1,
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+        )
+        solwyn._reporter.report = MagicMock()
+        openai_cb = solwyn._get_circuit_breaker("openai")
+
+        with (
+            patch("solwyn.client.Deadline", _FixedDeadline),
             patch("solwyn.client.asyncio.sleep", new=AsyncMock()) as sleep,
             patch.object(
                 solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
@@ -665,13 +768,11 @@ class TestAsyncSameProviderRetryOn429:
         ):
             result = await solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-        assert openai.chat.completions.create.await_count == 2
+        assert result is not None
+        assert openai.chat.completions.create.await_count == 1
         anthropic.messages.create.assert_awaited_once()
-        assert result is not anthropic_resp
-        assert result.choices[0].message.content == "ok from claude"
-        sleep.assert_awaited_once_with(0.0)
+        sleep.assert_not_awaited()
         assert openai_cb.failure_count == 1
-        assert anthropic_cb.failure_count == 0
 
         await solwyn._reporter._http.aclose()
         await solwyn._budget._http.aclose()

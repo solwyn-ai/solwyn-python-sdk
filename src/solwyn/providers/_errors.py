@@ -216,12 +216,12 @@ def _retry_after_header(exc: BaseException) -> str | None:
 def _parse_retry_after(raw: str) -> float | None:
     """Parse a ``Retry-After`` value (delta-seconds or HTTP-date) into seconds."""
     text = raw.strip()
-    try:
-        seconds = float(text)
-    except ValueError:
-        seconds = None
-    if seconds is not None:
-        return max(0.0, seconds) if math.isfinite(seconds) else None
+    if text and all("0" <= ch <= "9" for ch in text):
+        try:
+            seconds = float(text)
+        except OverflowError:
+            return None
+        return seconds if math.isfinite(seconds) else None
     try:
         when = parsedate_to_datetime(text)
     except (TypeError, ValueError):

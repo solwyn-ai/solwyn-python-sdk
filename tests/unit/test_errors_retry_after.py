@@ -59,6 +59,12 @@ class TestRetryAfterSeconds:
     def test_non_finite_delta_returns_none(self) -> None:
         assert retry_after_seconds(_exc(429, retry_after="inf")) is None
 
+    @pytest.mark.parametrize("retry_after", ["-1", "2.5", "+2", "1e3"])
+    def test_invalid_delta_seconds_syntax_returns_none(self, retry_after: str) -> None:
+        # RFC delta-seconds is an unsigned integer; other numeric-looking values
+        # are unparseable and should not trigger a synthetic same-provider retry.
+        assert retry_after_seconds(_exc(429, retry_after=retry_after)) is None
+
     def test_non_429_status_returns_none(self) -> None:
         # A 503 (or 529) with a Retry-After is out of scope: only 429 retries.
         assert retry_after_seconds(_exc(503, retry_after="2")) is None
