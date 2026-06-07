@@ -10,11 +10,11 @@
 - `config.py` — `SolwynConfig` with env var loading (`SOLWYN_*` prefix)
 - `tokenizer.py` — tiktoken + heuristic fallback
 - `exceptions.py` — `SolwynError` base, `BudgetExceededError`, `ProviderUnavailableError`, `ConfigurationError`
-- `_privacy.py` — length-only prompt estimation. PRIVACY-CRITICAL: only module touching prompt content
+- `_privacy.py` — length-only prompt estimation. PRIVACY-CRITICAL: content-privileged allowlist with `providers/_translation/`
 - `_run.py` — `ContextVar`-backed agent-run scope; `run(name)` public entry point, `current_run()` read seam used by `_base.py`
 - `_types.py` — Pydantic models for API request/response contracts
 - `_validation.py` — API key + project ID format validation
-- `providers/` — extraction adapters (OpenAI, Anthropic, Google)
+- `providers/` — extraction adapters (OpenAI, Anthropic, Google); `_translation/` is content-privileged for request/response translation only
 
 ## Provider Adapter Notes
 
@@ -25,8 +25,8 @@
 ## Client Proxy Patterns
 
 - Proxy properties (`chat`, `messages`, `models`) use `@functools.cached_property`
-- `_force_stream=True` is Google-only — guarded by runtime assert
-- Stream `on_complete` fire-and-forgets `confirm_cost` via `reporter.report_confirm()` — never blocks user thread
+- `_force_stream=True` is set by the Google proxy's `generate_content_stream`; `_intercepted_call` folds it into the dispatch-level `is_streaming` boolean, which (not the original flag) drives the served hop's stream-method selection — so cross-provider failover INTO Google streams via `generate_content_stream` and OUT OF Google streams via `stream=True`
+- Stream `on_complete` fire-and-forgets reservation settlement via `reporter.report_settlement()` -- never blocks user thread
 
 ## Thread Safety
 

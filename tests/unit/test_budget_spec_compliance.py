@@ -1,9 +1,8 @@
 """Spec-derived tests for budget enforcement.
 
-These tests are derived directly from the design doc Section 5.4
-(Fail-Open / Fail-Closed Matrix) and Section 5.3 (Budget Check: Atomic
-Reservation via Cloud API).  Each test maps to a specific cell in the
-design doc's behaviour matrix or a specific requirement.
+These tests cover the fail-open / fail-closed behaviour matrix and atomic
+reservation via the Cloud API.  Each test maps to a specific cell in the
+behaviour matrix or a specific requirement.
 
 These tests would have caught:
 - Bug 1.1: BudgetExceededError constructed with wrong field values
@@ -59,13 +58,13 @@ def _mock_cloud_response(
 
 
 # ---------------------------------------------------------------------------
-# Design Doc §5.4: Fail-Open / Fail-Closed Matrix
+# Fail-Open / Fail-Closed Matrix
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
 class TestDesignDocFailMatrix:
-    """Tests derived from the design doc §5.4 fail-open/fail-closed matrix.
+    """Tests for the fail-open/fail-closed matrix.
 
     Matrix:
     | Budget Mode | Cloud Reachable | Cloud Unreachable |

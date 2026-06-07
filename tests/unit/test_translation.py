@@ -1,0 +1,2021 @@
+"""Cross-provider translation contract tests.
+
+Round-trip is the contract AND the drift alarm: a fully-resolved request must
+survive ``to_canonical -> from_canonical`` with correct id remap and argument
+encoding. Every unsupported item must RAISE ``UntranslatableRequestError``
+with a STRUCTURAL feature label and NO offending value anywhere in the error.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from solwyn.exceptions import UntranslatableRequestError
+from solwyn.providers._translation import (
+    CanonicalMessage,
+    CanonicalRequest,
+    TextPart,
+    ToolResultPart,
+    ToolUsePart,
+    from_canonical,
+    normalize_finish_reason,
+    normalize_response,
+    to_canonical,
+    translate_stream_chunk,
+)
+
+# A value we plant inside prompt content / argument values and then assert never
+# leaks into any UntranslatableRequestError surface.
+SECRET = "SUPER_SECRET_PROMPT_a1b2c3"
+
+
+# --------------------------------------------------------------------------- #
+# Helpers — minimal native request dicts per provider dialect.                 #
+# --------------------------------------------------------------------------- #
+def openai_req(**over: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "model": "gpt-4o",
+        "max_completion_tokens": 256,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    base.update(over)
+    return base
+
+
+def anthropic_req(**over: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "model": "claude-3-5-sonnet",
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    base.update(over)
+    return base
+
+
+def google_req(**over: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "model": "gemini-1.5-pro",
+        "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+        "config": {"max_output_tokens": 256},
+    }
+    base.update(over)
+    return base
+
+
+def _assert_no_value_leak(exc: UntranslatableRequestError, *values: str) -> None:
+    """The error must carry STRUCTURAL labels only — never an offending value."""
+    blob = str(exc) + repr(exc) + repr(exc.args) + repr(exc.feature)
+    for value in values:
+        assert value not in blob
+
+
+# --------------------------------------------------------------------------- #
+# Canonical model invariants                                                   #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestCanonicalModel:
+    def test_extra_forbid(self) -> None:
+        with pytest.raises(Exception):  # noqa: B017 - pydantic ValidationError
+            CanonicalRequest(
+                system=None,
+                messages=[],
+                max_tokens=10,
+                temperature=None,
+                top_p=None,
+                stop=None,
+                stream=False,
+                tools=None,
+                tool_choice=None,
+                bogus_field=1,  # type: ignore[call-arg]
+            )
+
+    def test_max_tokens_required(self) -> None:
+        canonical = to_canonical("anthropic", anthropic_req(max_tokens=512))
+        assert canonical.max_tokens == 512
+
+
+# --------------------------------------------------------------------------- #
+# Request field mapping                                                        #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestFieldMapping:
+    def test_openai_emits_max_completion_tokens_not_max_tokens(self) -> None:
+        canonical = to_canonical("openai", openai_req(max_completion_tokens=128))
+        out = from_canonical("openai", canonical, model="gpt-4o")
+        assert out["max_completion_tokens"] == 128
+        assert "max_tokens" not in out
+
+    def test_openai_accepts_legacy_max_tokens_input(self) -> None:
+        # Inbound Chat Completions may still use max_tokens; canonical normalizes.
+        canonical = to_canonical("openai", openai_req(max_tokens=77, max_completion_tokens=None))
+        assert canonical.max_tokens == 77
+
+    def test_anthropic_hoists_system_to_top_level(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                messages=[
+                    {"role": "system", "content": "be terse"},
+                    {"role": "user", "content": "hi"},
+                ]
+            ),
+        )
+        assert canonical.system == "be terse"
+        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        assert out["system"] == "be terse"
+        assert out["max_tokens"] == 256
+        # system must NOT remain as a message
+        assert all(m["role"] != "system" for m in out["messages"])
+
+    def test_google_nests_under_config(self) -> None:
+        canonical = to_canonical("openai", openai_req(stop=["X"]))
+        out = from_canonical("google", canonical, model="gemini-1.5-pro")
+        assert out["config"]["max_output_tokens"] == 256
+        assert out["config"]["stop_sequences"] == ["X"]
+
+    def test_google_system_instruction(self) -> None:
+        canonical = to_canonical("anthropic", anthropic_req(system="be terse"))
+        out = from_canonical("google", canonical, model="gemini-1.5-pro")
+        assert out["config"]["system_instruction"] == "be terse"
+
+    def test_temperature_in_range_passes(self) -> None:
+        canonical = to_canonical("openai", openai_req(temperature=0.5))
+        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        assert out["temperature"] == 0.5
+
+    def test_temperature_above_one_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(temperature=1.5))
+        assert ei.value.feature == "temperature>1.0"
+        _assert_no_value_leak(ei.value, "1.5")
+
+    def test_top_p_straight_passes(self) -> None:
+        canonical = to_canonical("openai", openai_req(top_p=0.9))
+        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        assert out["top_p"] == 0.9
+
+    def test_stop_over_four_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(stop=["a", "b", "c", "d", "e"]))
+        assert ei.value.feature == "stop>4"
+
+    def test_stop_string_normalizes_to_list(self) -> None:
+        canonical = to_canonical("openai", openai_req(stop="STOP"))
+        assert canonical.stop == ["STOP"]
+        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        assert out["stop_sequences"] == ["STOP"]
+
+    def test_anthropic_consecutive_same_role_does_not_raise(self) -> None:
+        # Do NOT repair-or-RAISE on consecutive same-role turns.
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                messages=[
+                    {"role": "user", "content": "a"},
+                    {"role": "user", "content": "b"},
+                ]
+            ),
+        )
+        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        assert len(out["messages"]) == 2
+
+
+# --------------------------------------------------------------------------- #
+# Tools & tool_choice                                                          #
+# --------------------------------------------------------------------------- #
+TOOL = {
+    "name": "get_weather",
+    "description": "Look up weather",
+    "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    },
+}
+
+
+@pytest.mark.unit
+class TestToolDeclarations:
+    def test_openai_wrapper(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                tools=[{"type": "function", "function": TOOL}],
+            ),
+        )
+        out = from_canonical("openai", canonical, model="gpt-4o")
+        assert out["tools"][0]["type"] == "function"
+        assert out["tools"][0]["function"]["name"] == "get_weather"
+        assert out["tools"][0]["function"]["parameters"] == TOOL["parameters"]
+
+    def test_anthropic_wrapper(self) -> None:
+        canonical = to_canonical(
+            "openai", openai_req(tools=[{"type": "function", "function": TOOL}])
+        )
+        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        decl = out["tools"][0]
+        assert decl["name"] == "get_weather"
+        assert decl["input_schema"] == TOOL["parameters"]
+        assert "type" not in decl  # anthropic decl has no top-level type
+
+    def test_google_wrapper(self) -> None:
+        canonical = to_canonical(
+            "openai", openai_req(tools=[{"type": "function", "function": TOOL}])
+        )
+        out = from_canonical("google", canonical, model="gemini-1.5-pro")
+        decls = out["config"]["tools"][0]["function_declarations"]
+        assert decls[0]["name"] == "get_weather"
+        assert decls[0]["parameters_json_schema"] == TOOL["parameters"]
+
+    def test_anthropic_inbound_tool_decl(self) -> None:
+        canonical = to_canonical(
+            "anthropic",
+            anthropic_req(
+                tools=[
+                    {
+                        "name": "get_weather",
+                        "description": "Look up weather",
+                        "input_schema": TOOL["parameters"],
+                    }
+                ]
+            ),
+        )
+        out = from_canonical("openai", canonical, model="gpt-4o")
+        assert out["tools"][0]["function"]["name"] == "get_weather"
+
+    def test_google_inbound_tool_decl(self) -> None:
+        canonical = to_canonical(
+            "google",
+            google_req(
+                config={
+                    "max_output_tokens": 256,
+                    "tools": [
+                        {
+                            "function_declarations": [
+                                {
+                                    "name": "get_weather",
+                                    "description": "Look up weather",
+                                    "parameters_json_schema": TOOL["parameters"],
+                                }
+                            ]
+                        }
+                    ],
+                }
+            ),
+        )
+        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        assert out["tools"][0]["name"] == "get_weather"
+
+
+@pytest.mark.unit
+class TestToolChoice:
+    @pytest.mark.parametrize(
+        ("native_choice", "expected"),
+        [
+            ("auto", "auto"),
+            ("required", "required"),
+            ("none", "none"),
+        ],
+    )
+    def test_openai_simple_choices(self, native_choice: str, expected: str) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                tools=[{"type": "function", "function": TOOL}],
+                tool_choice=native_choice,
+            ),
+        )
+        out = from_canonical("openai", canonical, model="gpt-4o")
+        assert out["tool_choice"] == expected
+
+    def test_openai_force_specific(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                tools=[{"type": "function", "function": TOOL}],
+                tool_choice={"type": "function", "function": {"name": "get_weather"}},
+            ),
+        )
+        out = from_canonical("openai", canonical, model="gpt-4o")
+        assert out["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "get_weather"},
+        }
+
+    def test_anthropic_choices(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                tools=[{"type": "function", "function": TOOL}],
+                tool_choice="auto",
+            ),
+        )
+        assert from_canonical("anthropic", canonical, model="m")["tool_choice"] == {"type": "auto"}
+        canonical = to_canonical(
+            "openai",
+            openai_req(tools=[{"type": "function", "function": TOOL}], tool_choice="required"),
+        )
+        assert from_canonical("anthropic", canonical, model="m")["tool_choice"] == {"type": "any"}
+        canonical = to_canonical(
+            "openai",
+            openai_req(tools=[{"type": "function", "function": TOOL}], tool_choice="none"),
+        )
+        assert from_canonical("anthropic", canonical, model="m")["tool_choice"] == {"type": "none"}
+
+    def test_anthropic_force_specific(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                tools=[{"type": "function", "function": TOOL}],
+                tool_choice={"type": "function", "function": {"name": "get_weather"}},
+            ),
+        )
+        out = from_canonical("anthropic", canonical, model="m")
+        assert out["tool_choice"] == {"type": "tool", "name": "get_weather"}
+
+    def test_google_choices(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(tools=[{"type": "function", "function": TOOL}], tool_choice="auto"),
+        )
+        cfg = from_canonical("google", canonical, model="m")["config"]["tool_config"][
+            "function_calling_config"
+        ]
+        assert cfg["mode"] == "AUTO"
+        canonical = to_canonical(
+            "openai",
+            openai_req(tools=[{"type": "function", "function": TOOL}], tool_choice="required"),
+        )
+        cfg = from_canonical("google", canonical, model="m")["config"]["tool_config"][
+            "function_calling_config"
+        ]
+        assert cfg["mode"] == "ANY"
+        canonical = to_canonical(
+            "openai",
+            openai_req(tools=[{"type": "function", "function": TOOL}], tool_choice="none"),
+        )
+        cfg = from_canonical("google", canonical, model="m")["config"]["tool_config"][
+            "function_calling_config"
+        ]
+        assert cfg["mode"] == "NONE"
+
+    def test_google_force_specific(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                tools=[{"type": "function", "function": TOOL}],
+                tool_choice={"type": "function", "function": {"name": "get_weather"}},
+            ),
+        )
+        cfg = from_canonical("google", canonical, model="m")["config"]["tool_config"][
+            "function_calling_config"
+        ]
+        assert cfg["mode"] == "ANY"
+        assert cfg["allowed_function_names"] == ["get_weather"]
+
+
+# --------------------------------------------------------------------------- #
+# Tool-result round-trip (the most error-prone surface)                       #
+# --------------------------------------------------------------------------- #
+def _openai_resolved_tool_history() -> list[dict[str, object]]:
+    return [
+        {"role": "user", "content": "weather in paris?"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "arguments": '{"city": "paris"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+    ]
+
+
+def _anthropic_resolved_tool_history() -> list[dict[str, object]]:
+    return [
+        {"role": "user", "content": "weather in paris?"},
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "get_weather",
+                    "input": {"city": "paris"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny"}],
+        },
+    ]
+
+
+@pytest.mark.unit
+class TestToolResultRoundTrip:
+    def test_openai_to_anthropic_args_become_object(self) -> None:
+        canonical = to_canonical("openai", openai_req(messages=_openai_resolved_tool_history()))
+        out = from_canonical("anthropic", canonical, model="m")
+        # assistant tool_use carries a JSON OBJECT input (not a string)
+        assistant = out["messages"][1]
+        tool_use = assistant["content"][0]
+        assert tool_use["type"] == "tool_use"
+        assert tool_use["input"] == {"city": "paris"}
+        assert tool_use["name"] == "get_weather"
+        # the tool result is remapped to a tool_result block keyed by tool_use_id
+        result_msg = out["messages"][2]
+        block = result_msg["content"][0]
+        assert block["type"] == "tool_result"
+        assert block["tool_use_id"] == tool_use["id"]
+        assert block["content"] == "sunny"
+
+    def test_anthropic_to_openai_args_become_string(self) -> None:
+        canonical = to_canonical(
+            "anthropic", anthropic_req(messages=_anthropic_resolved_tool_history())
+        )
+        out = from_canonical("openai", canonical, model="gpt-4o")
+        assistant = out["messages"][1]
+        call = assistant["tool_calls"][0]
+        assert call["type"] == "function"
+        assert call["function"]["name"] == "get_weather"
+        # arguments must be a JSON STRING on OpenAI
+        assert isinstance(call["function"]["arguments"], str)
+        assert json.loads(call["function"]["arguments"]) == {"city": "paris"}
+        # tool result becomes role:tool keyed by tool_call_id
+        result = out["messages"][2]
+        assert result["role"] == "tool"
+        assert result["tool_call_id"] == call["id"]
+        assert result["content"] == "sunny"
+
+    def test_openai_anthropic_openai_full_roundtrip(self) -> None:
+        original = _openai_resolved_tool_history()
+        canonical = to_canonical("openai", openai_req(messages=original))
+        anthro = from_canonical("anthropic", canonical, model="m")
+        canonical2 = to_canonical("anthropic", anthropic_req(messages=anthro["messages"]))
+        back = from_canonical("openai", canonical2, model="gpt-4o")
+        call = back["messages"][1]["tool_calls"][0]
+        assert json.loads(call["function"]["arguments"]) == {"city": "paris"}
+        assert back["messages"][2]["content"] == "sunny"
+        # ids remap consistently: result points at the (re)issued call id
+        assert back["messages"][2]["tool_call_id"] == call["id"]
+
+    def test_openai_to_google_function_response(self) -> None:
+        canonical = to_canonical("openai", openai_req(messages=_openai_resolved_tool_history()))
+        out = from_canonical("google", canonical, model="m")
+        contents = out["contents"]
+        # model turn carries a functionCall part
+        model_turn = contents[1]
+        assert model_turn["role"] == "model"
+        fc_part = model_turn["parts"][0]
+        assert fc_part["function_call"]["name"] == "get_weather"
+        assert fc_part["function_call"]["args"] == {"city": "paris"}
+        # tool turn carries a functionResponse part keyed by name
+        tool_turn = contents[2]
+        assert tool_turn["role"] == "tool"
+        fr_part = tool_turn["parts"][0]
+        assert fr_part["function_response"]["name"] == "get_weather"
+
+    def test_google_to_openai_roundtrip(self) -> None:
+        google_history = [
+            {"role": "user", "parts": [{"text": "weather?"}]},
+            {
+                "role": "model",
+                "parts": [
+                    {
+                        "function_call": {
+                            "id": "fc_1",
+                            "name": "get_weather",
+                            "args": {"city": "paris"},
+                        }
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "parts": [
+                    {
+                        "function_response": {
+                            "id": "fc_1",
+                            "name": "get_weather",
+                            "response": {"weather": "sunny"},
+                        }
+                    }
+                ],
+            },
+        ]
+        canonical = to_canonical("google", google_req(contents=google_history))
+        out = from_canonical("openai", canonical, model="gpt-4o")
+        call = out["messages"][1]["tool_calls"][0]
+        assert call["function"]["name"] == "get_weather"
+        assert json.loads(call["function"]["arguments"]) == {"city": "paris"}
+        assert out["messages"][2]["tool_call_id"] == call["id"]
+
+
+# --------------------------------------------------------------------------- #
+# Multimodal                                                                   #
+# --------------------------------------------------------------------------- #
+PNG_B64 = "iVBORw0KGgoAAAANS"
+
+
+@pytest.mark.unit
+class TestMultimodal:
+    def test_openai_base64_image_to_anthropic(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "what is this?"},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{PNG_B64}"},
+                            },
+                        ],
+                    }
+                ]
+            ),
+        )
+        out = from_canonical("anthropic", canonical, model="m")
+        blocks = out["messages"][0]["content"]
+        img = next(b for b in blocks if b["type"] == "image")
+        assert img["source"]["type"] == "base64"
+        # media_type parsed VERBATIM from the data: URI
+        assert img["source"]["media_type"] == "image/png"
+        assert img["source"]["data"] == PNG_B64
+
+    def test_public_https_url_image_translates(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "https://ex.com/a.png"},
+                            }
+                        ],
+                    }
+                ]
+            ),
+        )
+        out = from_canonical("anthropic", canonical, model="m")
+        img = out["messages"][0]["content"][0]
+        assert img["source"]["type"] == "url"
+        assert img["source"]["url"] == "https://ex.com/a.png"
+
+    def test_data_uri_media_type_parsed_verbatim(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/jpeg;base64,{PNG_B64}"},
+                            }
+                        ],
+                    }
+                ]
+            ),
+        )
+        out = from_canonical("anthropic", canonical, model="m")
+        img = out["messages"][0]["content"][0]
+        assert img["source"]["media_type"] == "image/jpeg"
+
+    def test_gs_uri_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "google",
+                google_req(
+                    contents=[
+                        {
+                            "role": "user",
+                            "parts": [
+                                {
+                                    "file_data": {
+                                        "file_uri": f"gs://bucket/{SECRET}.png",
+                                        "mime_type": "image/png",
+                                    }
+                                }
+                            ],
+                        }
+                    ]
+                ),
+            )
+        assert "image" in ei.value.feature
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_anthropic_file_id_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "anthropic",
+                anthropic_req(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "file",
+                                        "file_id": f"file_{SECRET}",
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                ),
+            )
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_audio_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "openai",
+                openai_req(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_audio",
+                                    "input_audio": {"data": SECRET, "format": "wav"},
+                                }
+                            ],
+                        }
+                    ]
+                ),
+            )
+        _assert_no_value_leak(ei.value, SECRET)
+
+
+# --------------------------------------------------------------------------- #
+# Finish reason normalization                                                 #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestFinishReason:
+    @pytest.mark.parametrize(
+        ("served", "raw", "expected"),
+        [
+            ("openai", "stop", "stop"),
+            ("openai", "length", "length"),
+            ("openai", "tool_calls", "tool_use"),
+            ("openai", "content_filter", "content_filter"),
+            ("anthropic", "end_turn", "stop"),
+            ("anthropic", "max_tokens", "length"),
+            ("anthropic", "tool_use", "tool_use"),
+            ("anthropic", "stop_sequence", "stop"),
+            ("anthropic", "refusal", "content_filter"),
+            ("google", "STOP", "stop"),
+            ("google", "MAX_TOKENS", "length"),
+            ("google", "SAFETY", "content_filter"),
+            ("google", "RECITATION", "content_filter"),
+            ("google", "PROHIBITED_CONTENT", "content_filter"),
+        ],
+    )
+    def test_finish_reason_normalizes(self, served: str, raw: str, expected: str) -> None:
+        assert normalize_finish_reason(served, raw) == expected
+
+
+# --------------------------------------------------------------------------- #
+# Fail-loudly unsupported list — every item RAISES, no value leak.             #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestFailLoudly:
+    def test_seed_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(seed=42))
+        assert ei.value.feature == "seed"
+        _assert_no_value_leak(ei.value, "42")
+
+    def test_frequency_penalty_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(frequency_penalty=0.5))
+        assert ei.value.feature == "frequency_penalty"
+        _assert_no_value_leak(ei.value, "0.5")
+
+    def test_presence_penalty_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(presence_penalty=0.5))
+        assert ei.value.feature == "presence_penalty"
+
+    def test_top_k_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("anthropic", anthropic_req(top_k=5))
+        assert ei.value.feature == "top_k"
+
+    def test_response_format_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "openai",
+                openai_req(response_format={"type": "json_object", "secret": SECRET}),
+            )
+        assert ei.value.feature == "response_format"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_response_schema_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "google",
+                google_req(config={"max_output_tokens": 10, "response_schema": {"x": SECRET}}),
+            )
+        assert ei.value.feature == "response_schema"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_logprobs_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(logprobs=True))
+        assert ei.value.feature == "logprobs"
+
+    def test_top_logprobs_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(top_logprobs=5))
+        assert ei.value.feature == "top_logprobs"
+
+    def test_logit_bias_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(logit_bias={"123": -100}))
+        assert ei.value.feature == "logit_bias"
+
+    def test_service_tier_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(service_tier="flex"))
+        assert ei.value.feature == "service_tier"
+
+    def test_n_gt_one_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(n=2))
+        assert ei.value.feature == "n>1"
+
+    def test_reasoning_effort_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(reasoning_effort="high"))
+        assert ei.value.feature == "reasoning_effort"
+
+    def test_anthropic_thinking_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("anthropic", anthropic_req(thinking={"type": "enabled"}))
+        assert ei.value.feature == "thinking"
+
+    def test_google_thinking_config_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "google",
+                google_req(config={"max_output_tokens": 10, "thinking_config": {"x": 1}}),
+            )
+        assert ei.value.feature == "thinking_config"
+
+    def test_anthropic_cache_control_system_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "anthropic",
+                anthropic_req(
+                    system=[
+                        {
+                            "type": "text",
+                            "text": SECRET,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ]
+                ),
+            )
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_anthropic_cache_control_block_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "anthropic",
+                anthropic_req(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": SECRET,
+                                    "cache_control": {"type": "ephemeral"},
+                                }
+                            ],
+                        }
+                    ]
+                ),
+            )
+        assert ei.value.feature == "cache_control"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_google_cached_content_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "google",
+                google_req(config={"max_output_tokens": 10, "cached_content": f"cc_{SECRET}"}),
+            )
+        assert ei.value.feature == "cached_content"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_anthropic_proprietary_tool_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "anthropic",
+                anthropic_req(tools=[{"type": "computer_20241022", "name": "computer"}]),
+            )
+        assert "computer" in ei.value.feature
+
+    def test_anthropic_web_search_tool_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "anthropic",
+                anthropic_req(tools=[{"type": "web_search_20250305", "name": "web_search"}]),
+            )
+        assert "web_search" in ei.value.feature
+
+    def test_google_search_tool_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "google",
+                google_req(
+                    config={
+                        "max_output_tokens": 10,
+                        "tools": [{"google_search": {}}],
+                    }
+                ),
+            )
+        assert "google_search" in ei.value.feature
+
+    def test_openai_non_function_tool_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "openai",
+                openai_req(tools=[{"type": "file_search"}]),
+            )
+        assert ei.value.feature == "openai.file_search"
+
+    def test_parallel_tool_calls_false_to_google_raises(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                tools=[{"type": "function", "function": TOOL}],
+                parallel_tool_calls=False,
+            ),
+        )
+        with pytest.raises(UntranslatableRequestError) as ei:
+            from_canonical("google", canonical, model="m")
+        assert ei.value.feature == "parallel_tool_calls=False"
+
+    def test_parallel_tool_calls_false_to_anthropic_ok(self) -> None:
+        # only RAISES toward google; anthropic is fine
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                tools=[{"type": "function", "function": TOOL}],
+                parallel_tool_calls=False,
+            ),
+        )
+        out = from_canonical("anthropic", canonical, model="m")
+        assert "tools" in out
+
+    def test_dangling_tool_call_raises(self) -> None:
+        history = [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }
+                ],
+            },
+            # NO tool result follows -> dangling
+        ]
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(messages=history))
+        assert ei.value.feature == "dangling_tool_call"
+
+    def test_parallel_same_name_tool_calls_raises(self) -> None:
+        history = [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city":"a"}'},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city":"b"}'},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "x"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "y"},
+        ]
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(messages=history))
+        assert ei.value.feature == "parallel_same_name_tool_calls"
+
+    def test_parallel_distinct_name_tool_calls_ok(self) -> None:
+        history = [
+            {"role": "user", "content": "weather + time?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": '{"city":"a"}'},
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "get_time", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "x"},
+            {"role": "tool", "tool_call_id": "call_2", "content": "y"},
+        ]
+        canonical = to_canonical("openai", openai_req(messages=history))
+        out = from_canonical("anthropic", canonical, model="m")
+        assert len(out["messages"][1]["content"]) == 2
+
+    def test_openai_responses_api_shape_raises(self) -> None:
+        # Responses API uses `input=` + `instructions=`, not messages.
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "openai",
+                {
+                    "model": "gpt-4o",
+                    "max_completion_tokens": 10,
+                    "input": [{"role": "user", "content": SECRET}],
+                },
+            )
+        assert ei.value.feature == "responses_api"
+        _assert_no_value_leak(ei.value, SECRET)
+
+
+# --------------------------------------------------------------------------- #
+# normalize_response — duck-typed cross-provider response shaping               #
+# --------------------------------------------------------------------------- #
+class _Obj:
+    """Tiny duck-typed namespace mirroring a native SDK response object."""
+
+    def __init__(self, **kw: object) -> None:
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def _anthropic_text_response() -> _Obj:
+    block = _Obj(type="text", text="hello from claude")
+    return _Obj(content=[block], stop_reason="end_turn", model="claude-3-5-sonnet")
+
+
+def _anthropic_tool_response() -> _Obj:
+    block = _Obj(type="tool_use", id="toolu_9", name="get_weather", input={"city": "paris"})
+    return _Obj(content=[block], stop_reason="tool_use", model="claude-3-5-sonnet")
+
+
+def _openai_text_response() -> _Obj:
+    msg = _Obj(role="assistant", content="hello from gpt", tool_calls=None)
+    choice = _Obj(index=0, message=msg, finish_reason="stop")
+    return _Obj(choices=[choice], model="gpt-4o")
+
+
+def _openai_tool_response() -> _Obj:
+    call = _Obj(
+        id="call_9",
+        type="function",
+        function=_Obj(name="get_weather", arguments='{"city": "paris"}'),
+    )
+    msg = _Obj(role="assistant", content=None, tool_calls=[call])
+    choice = _Obj(index=0, message=msg, finish_reason="tool_calls")
+    return _Obj(choices=[choice], model="gpt-4o")
+
+
+@pytest.mark.unit
+class TestNormalizeResponse:
+    def test_anthropic_served_openai_requested_text(self) -> None:
+        resp = normalize_response(
+            served="anthropic", requested="openai", response=_anthropic_text_response()
+        )
+        assert resp.choices[0].message.content == "hello from claude"
+        assert resp.choices[0].finish_reason == "stop"
+        assert resp.choices[0].message.role == "assistant"
+
+    def test_anthropic_served_openai_requested_tool(self) -> None:
+        resp = normalize_response(
+            served="anthropic", requested="openai", response=_anthropic_tool_response()
+        )
+        call = resp.choices[0].message.tool_calls[0]
+        assert call.function.name == "get_weather"
+        assert json.loads(call.function.arguments) == {"city": "paris"}
+        # OpenAI-shaped object carries the OpenAI-native finish reason.
+        assert resp.choices[0].finish_reason == "tool_calls"
+
+    def test_openai_served_anthropic_requested_text(self) -> None:
+        resp = normalize_response(
+            served="openai", requested="anthropic", response=_openai_text_response()
+        )
+        assert resp.content[0].text == "hello from gpt"
+        assert resp.content[0].type == "text"
+        assert resp.stop_reason == "end_turn"
+
+    def test_openai_served_anthropic_requested_tool(self) -> None:
+        resp = normalize_response(
+            served="openai", requested="anthropic", response=_openai_tool_response()
+        )
+        block = resp.content[0]
+        assert block.type == "tool_use"
+        assert block.name == "get_weather"
+        assert block.input == {"city": "paris"}
+        assert resp.stop_reason == "tool_use"
+
+    def test_served_openai_requested_google_text(self) -> None:
+        resp = normalize_response(
+            served="openai", requested="google", response=_openai_text_response()
+        )
+        assert resp.candidates[0].content.parts[0].text == "hello from gpt"
+
+    def test_served_openai_requested_google_exposes_text_accessor(self) -> None:
+        # Fix [C]: a Google drop-in user writes ``response.text`` — that idiom
+        # must survive cross-provider failover, not just the parts[*].text path.
+        resp = normalize_response(
+            served="openai", requested="google", response=_openai_text_response()
+        )
+        assert resp.text == "hello from gpt"
+        # No tool call -> empty function_calls list (idiomatic google-genai).
+        assert resp.function_calls == []
+
+    def test_served_anthropic_requested_google_text_accessor_concatenates(self) -> None:
+        # ``response.text`` concatenates ALL text parts (google-genai semantics).
+        block_a = _Obj(type="text", text="hello ")
+        block_b = _Obj(type="text", text="world")
+        served = _Obj(content=[block_a, block_b], stop_reason="end_turn", model="claude-3-5-sonnet")
+        resp = normalize_response(served="anthropic", requested="google", response=served)
+        assert resp.text == "hello world"
+
+    def test_served_openai_requested_google_exposes_function_calls(self) -> None:
+        # Fix [C]: a Google drop-in user writes ``response.function_calls`` for a
+        # tool response — that accessor must survive cross-provider failover.
+        resp = normalize_response(
+            served="openai", requested="google", response=_openai_tool_response()
+        )
+        # Idiomatic google-genai: the function-call parts.
+        assert len(resp.function_calls) == 1
+        fc = resp.function_calls[0]
+        assert fc.name == "get_weather"
+        assert fc.args == {"city": "paris"}
+        # A tool response has no text.
+        assert resp.text is None
+
+    def test_same_provider_is_identity(self) -> None:
+        original = _openai_text_response()
+        resp = normalize_response(served="openai", requested="openai", response=original)
+        assert resp is original
+
+
+# --------------------------------------------------------------------------- #
+# Privacy — fail-loud across the boundary with `from None`, no content leak.   #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestPrivacyBoundary:
+    def test_untranslatable_suppresses_context(self) -> None:
+        # Errors raised inside _translation use `from None` -> no __cause__ chain.
+        req = openai_req(seed=1, messages=[{"role": "user", "content": SECRET}])
+        try:
+            to_canonical("openai", req)
+        except UntranslatableRequestError as exc:
+            assert exc.__cause__ is None
+            assert exc.__suppress_context__ is True
+            _assert_no_value_leak(exc, SECRET)
+        else:  # pragma: no cover
+            pytest.fail("expected UntranslatableRequestError")
+
+    def test_no_content_in_any_raise_surface(self) -> None:
+        # A request packed with the sentinel in every content slot must never
+        # echo it back through the structural error.
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "openai",
+                openai_req(
+                    system=SECRET,
+                    messages=[{"role": "user", "content": SECRET}],
+                    response_format={"schema": SECRET},
+                ),
+            )
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_module_banner_and_no_io_imports(self) -> None:
+        from pathlib import Path
+
+        import solwyn.providers._translation as mod
+
+        # Package-aware: scan EVERY module under the translation package, not
+        # just __init__.py, so the firewall guarantees hold across the package.
+        pkg_dir = Path(mod.__file__).parent
+        files = sorted(pkg_dir.rglob("*.py"))
+        assert files, "no providers/_translation/*.py files found"
+        for path in files:
+            src = path.read_text()
+            assert "PRIVACY-CRITICAL" in src[:600], f"{path.name} missing PRIVACY-CRITICAL banner"
+            # The CI form: the literal substrings must not appear ANYWHERE,
+            # not just in import statements (prose mentions are forbidden too).
+            assert "logging" not in src, f"{path.name} references logging"
+            assert "logger" not in src, f"{path.name} names a logger"
+            assert "httpx" not in src, f"{path.name} names httpx"
+
+
+# --------------------------------------------------------------------------- #
+# [A] Fail-closed: unrecognized native kwargs RAISE on a cross-provider hop.   #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestFailClosedUnknownKwargs:
+    def test_unknown_top_level_kwarg_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(frobnicate=1))
+        assert ei.value.feature == "unsupported_kwarg.frobnicate"
+
+    def test_unknown_kwarg_value_not_leaked(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(frobnicate=SECRET))
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_recognized_request_still_translates(self) -> None:
+        canonical = to_canonical("openai", openai_req(temperature=0.5, top_p=0.9, stop=["X"]))
+        out = from_canonical("anthropic", canonical, model="m")
+        assert out["max_tokens"] == 256
+        assert out["temperature"] == 0.5
+
+    def test_unknown_anthropic_top_level_kwarg_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("anthropic", anthropic_req(frobnicate=1))
+        assert ei.value.feature == "unsupported_kwarg.frobnicate"
+
+    def test_unknown_google_config_kwarg_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "google",
+                google_req(config={"max_output_tokens": 10, "frobnicate": 1}),
+            )
+        assert ei.value.feature == "unsupported_kwarg.frobnicate"
+
+    def test_specific_label_takes_precedence_over_generic(self) -> None:
+        # seed has a dedicated raise; it must win over the generic fallback.
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(seed=42))
+        assert ei.value.feature == "seed"
+
+
+# --------------------------------------------------------------------------- #
+# [B] Malformed content NEVER escapes as a raw ValidationError/value leak.     #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestMalformedRequestGuard:
+    def test_non_string_text_raises_structurally(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "openai",
+                openai_req(
+                    messages=[{"role": "user", "content": [{"type": "text", "text": 12345}]}]
+                ),
+            )
+        assert "malformed" in ei.value.feature
+        _assert_no_value_leak(ei.value, "12345")
+
+    def test_malformed_value_not_in_cause(self) -> None:
+        try:
+            to_canonical(
+                "openai",
+                openai_req(
+                    messages=[{"role": "user", "content": [{"type": "text", "text": 999888}]}]
+                ),
+            )
+        except UntranslatableRequestError as exc:
+            assert exc.__cause__ is None
+            # Fix [E]: __context__ is also severed (not merely display-suppressed),
+            # so the offending value is retained nowhere on the raised object.
+            assert exc.__context__ is None
+            assert "999888" not in repr(exc.__cause__)
+            _assert_no_value_leak(exc, "999888")
+        else:  # pragma: no cover
+            pytest.fail("expected UntranslatableRequestError")
+
+    def test_malformed_tool_input_raises_structurally(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "anthropic",
+                anthropic_req(
+                    messages=[
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "toolu_1",
+                                    "name": "x",
+                                    "input": "not-a-dict",
+                                }
+                            ],
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+                            ],
+                        },
+                    ]
+                ),
+            )
+        assert "malformed" in ei.value.feature
+
+
+# --------------------------------------------------------------------------- #
+# [C] Caller-controlled discriminators map to FIXED labels (no echo-back).     #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestDiscriminatorLabelsAreConstant:
+    def test_exotic_block_type_does_not_echo(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "openai",
+                openai_req(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [{"type": "deadbeef-secret", "data": SECRET}],
+                        }
+                    ]
+                ),
+            )
+        assert "deadbeef-secret" not in ei.value.feature
+        assert "deadbeef-secret" not in str(ei.value)
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_exotic_anthropic_block_type_does_not_echo(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "anthropic",
+                anthropic_req(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [{"type": "deadbeef-secret", "x": SECRET}],
+                        }
+                    ]
+                ),
+            )
+        assert "deadbeef-secret" not in str(ei.value)
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_exotic_tool_type_does_not_echo(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "openai",
+                openai_req(tools=[{"type": "deadbeef-secret"}]),
+            )
+        assert "deadbeef-secret" not in str(ei.value)
+
+    def test_google_exotic_mime_does_not_echo(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "google",
+                google_req(
+                    contents=[
+                        {
+                            "role": "user",
+                            "parts": [
+                                {"inline_data": {"mime_type": "deadbeef/secret", "data": SECRET}}
+                            ],
+                        }
+                    ]
+                ),
+            )
+        assert "deadbeef" not in str(ei.value)
+        _assert_no_value_leak(ei.value, SECRET)
+
+
+# --------------------------------------------------------------------------- #
+# [E] Google tool-call response keeps the tool finish-reason (STOP+fc).        #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestGoogleToolFinishReason:
+    def test_google_tool_call_response_normalizes_to_tool_use(self) -> None:
+        fc = _Obj(id="fc_1", name="get_weather", args={"city": "paris"})
+        part = _Obj(text=None, function_call=fc)
+        candidate = _Obj(content=_Obj(parts=[part], role="model"), finish_reason="STOP")
+        resp = _Obj(candidates=[candidate], model="gemini-1.5-pro")
+        # served google -> requested openai exposes the tool finish reason.
+        out = normalize_response(served="google", requested="openai", response=resp)
+        assert out.choices[0].finish_reason == "tool_calls"
+
+    def test_google_plain_stop_stays_stop(self) -> None:
+        part = _Obj(text="hi", function_call=None)
+        candidate = _Obj(content=_Obj(parts=[part], role="model"), finish_reason="STOP")
+        resp = _Obj(candidates=[candidate], model="gemini-1.5-pro")
+        out = normalize_response(served="google", requested="openai", response=resp)
+        assert out.choices[0].finish_reason == "stop"
+
+
+# --------------------------------------------------------------------------- #
+# [F] parallel_tool_calls=False emitted toward OpenAI/Anthropic, RAISE Google. #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestParallelToolCallsFalse:
+    def _canonical_no_parallel(self) -> CanonicalRequest:
+        return to_canonical(
+            "anthropic",
+            anthropic_req(
+                tools=[
+                    {"name": "get_weather", "input_schema": TOOL["parameters"]},
+                ],
+                tool_choice={"type": "auto"},
+                parallel_tool_calls=False,
+            ),
+        )
+
+    def test_toward_openai_emits_false(self) -> None:
+        out = from_canonical("openai", self._canonical_no_parallel(), model="gpt-4o")
+        assert out["parallel_tool_calls"] is False
+
+    def test_toward_anthropic_disables_parallel(self) -> None:
+        out = from_canonical("anthropic", self._canonical_no_parallel(), model="m")
+        assert out["tool_choice"]["disable_parallel_tool_use"] is True
+        assert out["tool_choice"]["type"] == "auto"
+
+    def test_toward_google_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            from_canonical("google", self._canonical_no_parallel(), model="m")
+        assert ei.value.feature == "parallel_tool_calls=False"
+
+
+# --------------------------------------------------------------------------- #
+# [G] Google tool-result CONTENT survives a hop into-and-out-of Google.        #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestGoogleToolResultContentRoundTrip:
+    def test_openai_google_openai_content_survives(self) -> None:
+        original = _openai_resolved_tool_history()
+        canonical = to_canonical("openai", openai_req(messages=original))
+        google = from_canonical("google", canonical, model="m")
+        # round back through google -> canonical -> openai
+        canonical2 = to_canonical("google", google_req(contents=google["contents"]))
+        back = from_canonical("openai", canonical2, model="gpt-4o")
+        assert back["messages"][2]["content"] == "sunny"
+
+    def test_google_to_anthropic_content_survives(self) -> None:
+        original = _openai_resolved_tool_history()
+        canonical = to_canonical("openai", openai_req(messages=original))
+        google = from_canonical("google", canonical, model="m")
+        canonical2 = to_canonical("google", google_req(contents=google["contents"]))
+        anthro = from_canonical("anthropic", canonical2, model="m")
+        result_block = anthro["messages"][2]["content"][0]
+        assert result_block["type"] == "tool_result"
+        assert result_block["content"] == "sunny"
+
+
+# --------------------------------------------------------------------------- #
+# [H] Multiple system messages concatenate; insecure image URL RAISEs.        #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestSystemAndImageUrl:
+    def test_multiple_openai_system_messages_concatenate(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                messages=[
+                    {"role": "system", "content": "first"},
+                    {"role": "system", "content": "second"},
+                    {"role": "user", "content": "hi"},
+                ]
+            ),
+        )
+        assert canonical.system == "first\n\nsecond"
+
+    def test_http_image_url_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "openai",
+                openai_req(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": "http://ex.com/a.png"}}
+                            ],
+                        }
+                    ]
+                ),
+            )
+        assert ei.value.feature == "image.insecure_url"
+
+
+# --------------------------------------------------------------------------- #
+# [I] Empty assistant turn crossing to Anthropic is dropped (no content=[]).   #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestEmptyAssistantTurn:
+    def test_empty_assistant_turn_dropped_for_anthropic(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                messages=[
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": ""},
+                    {"role": "user", "content": "still there?"},
+                ]
+            ),
+        )
+        out = from_canonical("anthropic", canonical, model="m")
+        # No message may carry an empty content list (Anthropic 400s on it).
+        for msg in out["messages"]:
+            assert msg["content"] != []
+
+
+# --------------------------------------------------------------------------- #
+# [J] Google candidate_count>1 fails loud.                                     #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestGoogleCandidateCount:
+    def test_candidate_count_gt_one_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "google",
+                google_req(config={"max_output_tokens": 10, "candidate_count": 2}),
+            )
+        assert ei.value.feature == "candidate_count>1"
+
+    def test_candidate_count_one_ok(self) -> None:
+        canonical = to_canonical(
+            "google",
+            google_req(config={"max_output_tokens": 10, "candidate_count": 1}),
+        )
+        assert canonical.max_tokens == 10
+
+
+# --------------------------------------------------------------------------- #
+# [K] Public URL image targeting Google fails loud (base64 still works).       #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestUrlImageTowardGoogle:
+    def test_url_image_to_google_raises(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": "https://ex.com/a.png"}}
+                        ],
+                    }
+                ]
+            ),
+        )
+        with pytest.raises(UntranslatableRequestError) as ei:
+            from_canonical("google", canonical, model="m")
+        assert ei.value.feature == "image.url_unsupported_google"
+
+    def test_base64_image_to_google_ok(self) -> None:
+        canonical = to_canonical(
+            "openai",
+            openai_req(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{PNG_B64}"},
+                            }
+                        ],
+                    }
+                ]
+            ),
+        )
+        out = from_canonical("google", canonical, model="m")
+        part = out["contents"][0]["parts"][0]
+        assert part["inline_data"]["data"] == PNG_B64
+
+
+# --------------------------------------------------------------------------- #
+# [L] document/audio/video block types route to multimodal.* fixed labels.    #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestMultimodalLabelConsistency:
+    def test_anthropic_user_document_uses_multimodal_label(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "anthropic",
+                anthropic_req(
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [{"type": "document", "source": {"data": SECRET}}],
+                        }
+                    ]
+                ),
+            )
+        assert ei.value.feature == "multimodal.document"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_anthropic_assistant_document_uses_multimodal_label(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical(
+                "anthropic",
+                anthropic_req(
+                    messages=[
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "document", "source": {"data": SECRET}}],
+                        }
+                    ]
+                ),
+            )
+        assert ei.value.feature == "multimodal.document"
+        _assert_no_value_leak(ei.value, SECRET)
+
+
+@pytest.mark.unit
+class TestProviderValidation:
+    def test_unknown_provider_to_canonical_raises(self) -> None:
+        with pytest.raises(ValueError, match="provider"):
+            to_canonical("cohere", {"messages": []})
+
+    def test_unknown_provider_from_canonical_raises(self) -> None:
+        canonical = to_canonical("openai", openai_req())
+        with pytest.raises(ValueError, match="provider"):
+            from_canonical("cohere", canonical, model="x")
+
+
+# --------------------------------------------------------------------------- #
+# Per-chunk stream translation.                                                #
+# --------------------------------------------------------------------------- #
+# A SERVED-provider stream yields raw chunk objects in that provider's native
+# streaming dialect; translate_stream_chunk maps ONE such chunk into ZERO OR
+# MORE chunks in the REQUESTED provider's native streaming dialect. Streamed
+# text is CONTENT — these tests assert the mapping is correct AND that a
+# tool/multimodal chunk RAISES with no content leak.
+from types import SimpleNamespace  # noqa: E402
+
+
+# ----- served-chunk factories (duck-typed, mirroring real SDK stream events) - #
+def _anthropic_message_start() -> SimpleNamespace:
+    return SimpleNamespace(
+        type="message_start",
+        message=SimpleNamespace(role="assistant"),
+    )
+
+
+def _anthropic_content_block_start(*, text: bool = True) -> SimpleNamespace:
+    block_type = "text" if text else "tool_use"
+    return SimpleNamespace(
+        type="content_block_start",
+        index=0,
+        content_block=SimpleNamespace(type=block_type),
+    )
+
+
+def _anthropic_text_delta(text: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        type="content_block_delta",
+        index=0,
+        delta=SimpleNamespace(type="text_delta", text=text),
+    )
+
+
+def _anthropic_tool_delta(partial_json: str) -> SimpleNamespace:
+    # A tool-call stream emits input_json_delta inside content_block_delta.
+    return SimpleNamespace(
+        type="content_block_delta",
+        index=0,
+        delta=SimpleNamespace(type="input_json_delta", partial_json=partial_json),
+    )
+
+
+def _anthropic_content_block_stop() -> SimpleNamespace:
+    return SimpleNamespace(type="content_block_stop", index=0)
+
+
+def _anthropic_message_delta(stop_reason: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        type="message_delta",
+        delta=SimpleNamespace(stop_reason=stop_reason),
+    )
+
+
+def _anthropic_message_stop() -> SimpleNamespace:
+    return SimpleNamespace(type="message_stop")
+
+
+def _openai_text_chunk(text: str | None) -> SimpleNamespace:
+    delta = SimpleNamespace(role=None, content=text)
+    choice = SimpleNamespace(index=0, delta=delta, finish_reason=None)
+    return SimpleNamespace(choices=[choice], model="gpt-4o")
+
+
+def _openai_finish_chunk(finish_reason: str) -> SimpleNamespace:
+    delta = SimpleNamespace(role=None, content=None)
+    choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], model="gpt-4o")
+
+
+def _openai_tool_chunk() -> SimpleNamespace:
+    tool_call = SimpleNamespace(
+        index=0,
+        id="call_1",
+        type="function",
+        function=SimpleNamespace(name="get_weather", arguments='{"city":"' + SECRET + '"}'),
+    )
+    delta = SimpleNamespace(role=None, content=None, tool_calls=[tool_call])
+    choice = SimpleNamespace(index=0, delta=delta, finish_reason=None)
+    return SimpleNamespace(choices=[choice], model="gpt-4o")
+
+
+def _google_text_chunk(*texts: str) -> SimpleNamespace:
+    parts = [SimpleNamespace(text=t) for t in texts]
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=parts, role="model"),
+        finish_reason=None,
+    )
+    return SimpleNamespace(candidates=[candidate], model="gemini-1.5-pro")
+
+
+def _google_finish_chunk(finish_reason: str) -> SimpleNamespace:
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[], role="model"),
+        finish_reason=finish_reason,
+    )
+    return SimpleNamespace(candidates=[candidate], model="gemini-1.5-pro")
+
+
+def _google_tool_chunk() -> SimpleNamespace:
+    fc = SimpleNamespace(name="get_weather", args={"city": SECRET})
+    part = SimpleNamespace(text=None, function_call=fc)
+    candidate = SimpleNamespace(
+        content=SimpleNamespace(parts=[part], role="model"),
+        finish_reason=None,
+    )
+    return SimpleNamespace(candidates=[candidate], model="gemini-1.5-pro")
+
+
+@pytest.mark.unit
+class TestStreamChunkTextTranslation:
+    def test_anthropic_to_openai_text_deltas_accumulate(self) -> None:
+        served_events = [
+            _anthropic_message_start(),
+            _anthropic_content_block_start(),
+            _anthropic_text_delta("Hello"),
+            _anthropic_text_delta(", "),
+            _anthropic_text_delta("world"),
+            _anthropic_content_block_stop(),
+            _anthropic_message_delta("end_turn"),
+            _anthropic_message_stop(),
+        ]
+        accumulated = ""
+        finish = None
+        for event in served_events:
+            for out in translate_stream_chunk(served="anthropic", requested="openai", chunk=event):
+                delta_text = out.choices[0].delta.content
+                if delta_text is not None:
+                    accumulated += delta_text
+                if out.choices[0].finish_reason is not None:
+                    finish = out.choices[0].finish_reason
+        assert accumulated == "Hello, world"
+        # anthropic end_turn -> canonical stop -> openai-native "stop"
+        assert finish == "stop"
+
+    def test_anthropic_structural_events_map_to_empty(self) -> None:
+        for event in (
+            _anthropic_message_start(),
+            _anthropic_content_block_start(),
+            _anthropic_content_block_stop(),
+            _anthropic_message_stop(),
+        ):
+            assert translate_stream_chunk(served="anthropic", requested="openai", chunk=event) == []
+
+    def test_openai_to_anthropic_text_deltas_and_stop(self) -> None:
+        text_events: list[object] = []
+        for chunk in (_openai_text_chunk("Hello"), _openai_text_chunk(" world")):
+            text_events.extend(
+                translate_stream_chunk(served="openai", requested="anthropic", chunk=chunk)
+            )
+        # Each text delta is a content_block_delta-shaped event with a text_delta.
+        assert [e.type for e in text_events] == ["content_block_delta", "content_block_delta"]
+        assert [e.delta.type for e in text_events] == ["text_delta", "text_delta"]
+        assert "".join(e.delta.text for e in text_events) == "Hello world"
+
+        # The finish chunk maps to a message_delta carrying the mapped stop_reason.
+        finish_events = translate_stream_chunk(
+            served="openai", requested="anthropic", chunk=_openai_finish_chunk("stop")
+        )
+        assert len(finish_events) == 1
+        assert finish_events[0].type == "message_delta"
+        assert finish_events[0].delta.stop_reason == "end_turn"
+
+    def test_openai_empty_delta_maps_to_empty(self) -> None:
+        # A chunk with neither text nor finish (e.g. a role-only opener) yields [].
+        assert (
+            translate_stream_chunk(
+                served="openai", requested="anthropic", chunk=_openai_text_chunk(None)
+            )
+            == []
+        )
+
+    def test_google_to_openai_text(self) -> None:
+        out = translate_stream_chunk(
+            served="google", requested="openai", chunk=_google_text_chunk("Hi there")
+        )
+        assert len(out) == 1
+        assert out[0].choices[0].delta.content == "Hi there"
+
+    def test_google_multi_part_text_maps_to_multiple_chunks(self) -> None:
+        out = translate_stream_chunk(
+            served="google", requested="openai", chunk=_google_text_chunk("a", "b")
+        )
+        assert [o.choices[0].delta.content for o in out] == ["a", "b"]
+
+    def test_google_finish_to_openai(self) -> None:
+        out = translate_stream_chunk(
+            served="google", requested="openai", chunk=_google_finish_chunk("STOP")
+        )
+        assert len(out) == 1
+        assert out[0].choices[0].finish_reason == "stop"
+
+    def test_anthropic_to_google_text(self) -> None:
+        out = translate_stream_chunk(
+            served="anthropic", requested="google", chunk=_anthropic_text_delta("hola")
+        )
+        assert len(out) == 1
+        assert out[0].candidates[0].content.parts[0].text == "hola"
+
+    def test_anthropic_to_google_finish(self) -> None:
+        out = translate_stream_chunk(
+            served="anthropic", requested="google", chunk=_anthropic_message_delta("max_tokens")
+        )
+        assert len(out) == 1
+        # anthropic max_tokens -> canonical length -> google-native MAX_TOKENS
+        assert out[0].candidates[0].finish_reason == "MAX_TOKENS"
+
+
+@pytest.mark.unit
+class TestStreamChunkFailLoud:
+    def test_anthropic_tool_stream_raises_no_leak(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            translate_stream_chunk(
+                served="anthropic",
+                requested="openai",
+                chunk=_anthropic_tool_delta('{"city":"' + SECRET + '"}'),
+            )
+        assert ei.value.feature == "cross_provider_tool_stream"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_openai_tool_stream_raises_no_leak(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            translate_stream_chunk(
+                served="openai", requested="anthropic", chunk=_openai_tool_chunk()
+            )
+        assert ei.value.feature == "cross_provider_tool_stream"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_google_tool_stream_raises_no_leak(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            translate_stream_chunk(served="google", requested="openai", chunk=_google_tool_chunk())
+        assert ei.value.feature == "cross_provider_tool_stream"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_google_multimodal_stream_raises_no_leak(self) -> None:
+        inline = SimpleNamespace(mime_type="image/png", data=SECRET)
+        part = SimpleNamespace(text=None, function_call=None, inline_data=inline)
+        candidate = SimpleNamespace(
+            content=SimpleNamespace(parts=[part], role="model"),
+            finish_reason=None,
+        )
+        chunk = SimpleNamespace(candidates=[candidate], model="gemini-1.5-pro")
+        with pytest.raises(UntranslatableRequestError) as ei:
+            translate_stream_chunk(served="google", requested="openai", chunk=chunk)
+        assert ei.value.feature == "cross_provider_multimodal_stream"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_stream_chunk_validates_providers(self) -> None:
+        with pytest.raises(ValueError, match="provider"):
+            translate_stream_chunk(
+                served="cohere", requested="openai", chunk=_openai_text_chunk("x")
+            )
+
+    def test_malformed_stream_chunk_severs_cause_and_context(self) -> None:
+        # Fix [E]: a malformed served chunk (content is a non-string carrying a
+        # SECRET) makes _StreamDelta construction raise a pydantic ValidationError
+        # whose text embeds the SECRET. The _Guard converts it to a STRUCTURAL
+        # UntranslatableRequestError; both __cause__ AND __context__ must be None
+        # (the offending value is not retained ANYWHERE on the raised object), and
+        # the SECRET must be absent from str/repr/args.
+        bad_delta = SimpleNamespace(role=None, content=[f"leak::{SECRET}"], tool_calls=None)
+        choice = SimpleNamespace(index=0, delta=bad_delta, finish_reason=None)
+        chunk = SimpleNamespace(choices=[choice], model="gpt-4o")
+
+        try:
+            translate_stream_chunk(served="openai", requested="anthropic", chunk=chunk)
+        except UntranslatableRequestError as exc:
+            assert exc.__cause__ is None
+            assert exc.__context__ is None
+            assert "malformed" in exc.feature
+            _assert_no_value_leak(exc, SECRET)
+        else:  # pragma: no cover
+            pytest.fail("expected UntranslatableRequestError")
+
+
+# --------------------------------------------------------------------------- #
+# Finding #2 — orphan tool_result fails loud at the failover boundary.         #
+# A tool_result whose id matches no prior tool_use is NOT in ``pending`` and    #
+# must RAISE (fail loud on dangling/unresolved tool calls) rather               #
+# than render to the target and 400 after dispatch.                            #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestOrphanToolResult:
+    def test_openai_orphan_tool_result_raises(self) -> None:
+        # role:tool referencing a tool_call_id that was never issued.
+        messages = [
+            {"role": "user", "content": "hi"},
+            {"role": "tool", "tool_call_id": "call_never_issued", "content": f"x{SECRET}"},
+        ]
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("openai", openai_req(messages=messages))
+        assert ei.value.feature == "orphan_tool_result"
+        assert ei.value.source == "openai"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_anthropic_orphan_tool_result_raises(self) -> None:
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_never_issued",
+                        "content": f"x{SECRET}",
+                    }
+                ],
+            },
+        ]
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("anthropic", anthropic_req(messages=messages))
+        assert ei.value.feature == "orphan_tool_result"
+        assert ei.value.source == "anthropic"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_google_orphan_function_response_raises(self) -> None:
+        # function_response with no matching function_call earlier in the contents.
+        contents = [
+            {"role": "user", "parts": [{"text": "hi"}]},
+            {
+                "role": "tool",
+                "parts": [
+                    {
+                        "function_response": {
+                            "name": "get_weather",
+                            "response": {"result": f"x{SECRET}"},
+                        }
+                    }
+                ],
+            },
+        ]
+        with pytest.raises(UntranslatableRequestError) as ei:
+            to_canonical("google", google_req(contents=contents))
+        assert ei.value.feature == "orphan_tool_result"
+        assert ei.value.source == "google"
+        _assert_no_value_leak(ei.value, SECRET)
+
+    def test_resolved_history_still_canonicalizes_no_error(self) -> None:
+        # Regression guard: a fully-resolved tool exchange (result id matches a
+        # prior tool_use id) must canonicalize cleanly for all three providers.
+        to_canonical("openai", openai_req(messages=_openai_resolved_tool_history()))
+        to_canonical("anthropic", anthropic_req(messages=_anthropic_resolved_tool_history()))
+        google_history = [
+            {"role": "user", "parts": [{"text": "weather?"}]},
+            {
+                "role": "model",
+                "parts": [{"function_call": {"id": "fc_1", "name": "get_weather", "args": {}}}],
+            },
+            {
+                "role": "tool",
+                "parts": [
+                    {
+                        "function_response": {
+                            "id": "fc_1",
+                            "name": "get_weather",
+                            "response": {"result": "sunny"},
+                        }
+                    }
+                ],
+            },
+        ]
+        to_canonical("google", google_req(contents=google_history))
+
+
+# --------------------------------------------------------------------------- #
+# Finding #3 — mixed tool_result + text user turn.                             #
+# OpenAI/Google cannot represent it, so the RENDER boundary fails loud rather   #
+# than silently dropping the text. Anthropic CAN represent it and must keep     #
+# both blocks (same-provider Anthropic->Anthropic hop stays valid).            #
+# --------------------------------------------------------------------------- #
+def _mixed_tool_result_text_request() -> CanonicalRequest:
+    return CanonicalRequest(
+        messages=[
+            CanonicalMessage(
+                role="user",
+                content=[
+                    ToolResultPart(tool_use_id="call_1", content="sunny"),
+                    TextPart(text="please continue"),
+                ],
+            )
+        ],
+        max_tokens=256,
+    )
+
+
+@pytest.mark.unit
+class TestMixedToolResultRender:
+    def test_openai_mixed_tool_result_text_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            from_canonical("openai", _mixed_tool_result_text_request(), model="gpt-4o")
+        assert ei.value.feature == "tool_result.mixed_content"
+        assert ei.value.target == "openai"
+
+    def test_google_mixed_tool_result_text_raises(self) -> None:
+        with pytest.raises(UntranslatableRequestError) as ei:
+            from_canonical("google", _mixed_tool_result_text_request(), model="gemini-1.5-pro")
+        assert ei.value.feature == "tool_result.mixed_content"
+        assert ei.value.target == "google"
+
+    def test_anthropic_mixed_tool_result_text_keeps_both_blocks(self) -> None:
+        out = from_canonical("anthropic", _mixed_tool_result_text_request(), model="m")
+        blocks = out["messages"][0]["content"]
+        types = [b["type"] for b in blocks]
+        assert types == ["tool_result", "text"]
+        assert blocks[0]["tool_use_id"] == "call_1"
+        assert blocks[0]["content"] == "sunny"
+        assert blocks[1]["text"] == "please continue"
+
+
+def _assistant_text_plus_tool_use_request() -> CanonicalRequest:
+    # An assistant turn with TextPart + ToolUsePart coexisting is VALID on every
+    # provider and must keep rendering (must NOT trip the mixed-content guard).
+    return CanonicalRequest(
+        messages=[
+            CanonicalMessage(
+                role="assistant",
+                content=[
+                    TextPart(text="let me check"),
+                    ToolUsePart(id="call_1", name="get_weather", input={"city": "paris"}),
+                ],
+            )
+        ],
+        max_tokens=256,
+    )
+
+
+@pytest.mark.unit
+class TestAssistantTextPlusToolUseStillRenders:
+    def test_openai_assistant_text_plus_tool_use(self) -> None:
+        out = from_canonical("openai", _assistant_text_plus_tool_use_request(), model="gpt-4o")
+        assistant = out["messages"][0]
+        assert assistant["role"] == "assistant"
+        assert assistant["content"] == "let me check"
+        assert assistant["tool_calls"][0]["function"]["name"] == "get_weather"
+
+    def test_anthropic_assistant_text_plus_tool_use(self) -> None:
+        out = from_canonical("anthropic", _assistant_text_plus_tool_use_request(), model="m")
+        blocks = out["messages"][0]["content"]
+        assert [b["type"] for b in blocks] == ["text", "tool_use"]
+        assert blocks[1]["name"] == "get_weather"
+
+    def test_google_assistant_text_plus_tool_use(self) -> None:
+        out = from_canonical(
+            "google", _assistant_text_plus_tool_use_request(), model="gemini-1.5-pro"
+        )
+        parts = out["contents"][0]["parts"]
+        assert parts[0]["text"] == "let me check"
+        assert parts[1]["function_call"]["name"] == "get_weather"

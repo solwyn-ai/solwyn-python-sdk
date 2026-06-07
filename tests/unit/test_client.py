@@ -11,8 +11,10 @@ from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 import solwyn as solwyn_pkg
 from solwyn._privacy import estimate_content_length
 from solwyn._types import BudgetMode, ProviderName
-from solwyn.client import Solwyn, _detect_provider
+from solwyn.client import Solwyn
 from solwyn.exceptions import BudgetExceededError, ProviderUnavailableError
+from solwyn.providers import get_adapter_for_client
+from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
 
 
 def _mock_openai_client():
@@ -21,6 +23,9 @@ def _mock_openai_client():
     # Set module to openai so auto-detection works
     client.__class__.__module__ = "openai._client"
     client.__class__.__name__ = "OpenAI"
+    # Per-hop with_options(timeout, max_retries) returns the SAME client so the
+    # configured .chat.completions.create mock is the one dispatch invokes.
+    client.with_options.return_value = client
 
     # Mock response with usage
     mock_response = MagicMock()
@@ -37,6 +42,7 @@ def _mock_anthropic_client():
     client = MagicMock()
     client.__class__.__module__ = "anthropic._client"
     client.__class__.__name__ = "Anthropic"
+    client.with_options.return_value = client
 
     mock_response = MagicMock()
     mock_response.usage = SimpleNamespace(
@@ -62,12 +68,29 @@ def _make_solwyn(client, **overrides):
     solwyn._reporter._shutdown.set()
     solwyn._reporter._thread.join(timeout=2.0)
 
+    def report_settlement(_request, event):
+        solwyn._reporter.report(event)
+
+    solwyn._reporter.report_settlement = report_settlement
     return solwyn
 
 
 def _allow_budget_result() -> SimpleNamespace:
     """Minimal budget-check result for tests that bypass HTTP."""
-    return SimpleNamespace(allowed=True, reservation_id=None)
+    return SimpleNamespace(allowed=True, reservation_id=None, price_hints=None)
+
+
+class _Status(Exception):
+    """A duck-typed transport error carrying an HTTP status_code.
+
+    classify_exception reads ``status_code``: 429 -> FAILOVER (advance the
+    chain). A bare ``RuntimeError`` would instead classify as FAIL_FAST and
+    stop the chain, so failover tests must use a status-bearing exception.
+    """
+
+    def __init__(self, status_code: int, message: str = "boom") -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 # ---------------------------------------------------------------------------
@@ -81,24 +104,24 @@ class TestProviderDetection:
 
     def test_detects_openai(self) -> None:
         client, _ = _mock_openai_client()
-        assert _detect_provider(client) == ProviderName.OPENAI
+        assert ProviderName(get_adapter_for_client(client).name) == ProviderName.OPENAI
 
     def test_detects_anthropic(self) -> None:
         client, _ = _mock_anthropic_client()
-        assert _detect_provider(client) == ProviderName.ANTHROPIC
+        assert ProviderName(get_adapter_for_client(client).name) == ProviderName.ANTHROPIC
 
     def test_detects_google(self) -> None:
         client = MagicMock()
         client.__class__.__module__ = "google.generativeai._client"
         client.__class__.__name__ = "GenerativeModel"
-        assert _detect_provider(client) == ProviderName.GOOGLE
+        assert ProviderName(get_adapter_for_client(client).name) == ProviderName.GOOGLE
 
     def test_raises_on_unknown_client(self) -> None:
         client = MagicMock()
         client.__class__.__module__ = "some_other_lib"
         client.__class__.__name__ = "UnknownClient"
-        with pytest.raises(ValueError, match="Cannot auto-detect"):
-            _detect_provider(client)
+        with pytest.raises(ValueError, match="No provider adapter"):
+            get_adapter_for_client(client)
 
 
 # ---------------------------------------------------------------------------
@@ -640,12 +663,15 @@ class TestSyncErrorAgentRunTagging:
         solwyn._budget._http.close()
 
     def test_fallback_retry_error_events_tag_agent_run_id(self) -> None:
+        # Same-provider model-swap fallback: the SAME client serves both hops.
+        # A 429-style error on the primary advances the chain to the gpt-4o-mini
+        # swap; the swap also 429s, so the chain exhausts and re-raises.
         client, _ = _mock_openai_client()
         client.chat.completions.create.side_effect = [
-            RuntimeError("primary failed"),
-            RuntimeError("fallback failed"),
+            _Status(429, "primary failed"),
+            _Status(429, "fallback failed"),
         ]
-        solwyn = _make_solwyn(client, fallback_model="gpt-4o-mini")
+        solwyn = _make_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
 
         reported_events: list = []
         solwyn._reporter.report = lambda e: reported_events.append(e)
@@ -653,7 +679,7 @@ class TestSyncErrorAgentRunTagging:
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()),
             solwyn_pkg.run("retry-doomed") as run_id,
-            pytest.raises(RuntimeError, match="primary failed"),
+            pytest.raises(_Status, match="fallback failed"),
         ):
             solwyn.chat.completions.create(
                 model="gpt-4o",
@@ -663,6 +689,8 @@ class TestSyncErrorAgentRunTagging:
         assert [event.status for event in reported_events] == ["error", "error"]
         assert all(event.agent_run_id == run_id for event in reported_events)
         assert all(event.agent_run_name == "retry-doomed" for event in reported_events)
+        # Second hop swapped the model on the same client.
+        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-4o-mini"
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
@@ -678,8 +706,6 @@ class TestSyncStreamingInterception:
     """Streaming calls return a wrapped iterator that reports usage on completion."""
 
     def test_streaming_call_returns_wrapper(self) -> None:
-        from solwyn.stream import SyncStreamWrapper
-
         client, _ = _mock_openai_client()
         # Make the provider return an iterable when stream=True
         mock_chunks = [
@@ -870,9 +896,11 @@ class TestSyncStreamingInterception:
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        # Confirm now goes through reporter.report_confirm (not budget.confirm_cost)
-        confirm_calls: list = []
-        solwyn._reporter.report_confirm = lambda request: confirm_calls.append(request)
+        # Confirm now goes through reporter.report_settlement (not budget.confirm_cost)
+        settlement_calls: list = []
+        solwyn._reporter.report_settlement = lambda request, event: settlement_calls.append(
+            (request, event)
+        )
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             stream = solwyn.chat.completions.create(
@@ -881,12 +909,12 @@ class TestSyncStreamingInterception:
                 stream=True,
             )
             # Before exhaustion — no confirm yet
-            assert len(confirm_calls) == 0
+            assert len(settlement_calls) == 0
             list(stream)
 
-        # After exhaustion — reporter.report_confirm called once with the reservation_id
-        assert len(confirm_calls) == 1
-        assert confirm_calls[0].reservation_id == "res_123"
+        # After exhaustion -- reporter.report_settlement called once with the reservation_id
+        assert len(settlement_calls) == 1
+        assert settlement_calls[0][0].reservation_id == "res_123"
         # budget.confirm_cost must NOT have been called directly
         assert not hasattr(solwyn._budget, "_direct_confirm_calls")
 
@@ -921,6 +949,7 @@ class TestSyncStreamingInterception:
         """Google models.generate_content_stream() wraps and reports after exhaustion."""
         client = MagicMock()
         client.__class__.__module__ = "google.genai._client"
+        client.with_options.return_value = client
 
         mock_chunks = [
             SimpleNamespace(
@@ -978,6 +1007,7 @@ class TestSyncStreamingInterception:
         """Anthropic messages.create(stream=True) wraps and reports after exhaustion."""
         client = MagicMock()
         client.__class__.__module__ = "anthropic._client"
+        client.with_options.return_value = client
 
         mock_events = [
             SimpleNamespace(
@@ -1048,6 +1078,11 @@ def _make_async_solwyn(client, **overrides):
     }
     defaults.update(overrides)
     solwyn = AsyncSolwyn(client, **defaults)
+
+    def report_settlement(_request, event):
+        solwyn._reporter.report(event)
+
+    solwyn._reporter.report_settlement = report_settlement
     return solwyn
 
 
@@ -1058,8 +1093,6 @@ class TestAsyncStreamingInterception:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_async_streaming_reports_metadata(self) -> None:
-        from solwyn.stream import AsyncStreamWrapper
-
         client, _ = _mock_openai_client()
 
         async def async_stream():
@@ -1202,6 +1235,7 @@ class TestAsyncStreamingInterception:
         """Async Google models.generate_content_stream() wraps and reports."""
         client = MagicMock()
         client.__class__.__module__ = "google.genai._client"
+        client.with_options.return_value = client
 
         async def async_google_stream():
             yield SimpleNamespace(
@@ -1246,6 +1280,7 @@ class TestAsyncStreamingInterception:
         """Async Anthropic messages.create(stream=True) wraps and reports."""
         client = MagicMock()
         client.__class__.__module__ = "anthropic._client"
+        client.with_options.return_value = client
 
         async def async_anthropic_stream():
             yield SimpleNamespace(
@@ -1353,6 +1388,7 @@ class TestAsyncNonStreamingInterception:
             current_usage=10.0,
             mode=BudgetMode.HARD_DENY,
             reservation_id=None,
+            price_hints=None,
         )
 
         with patch.object(
@@ -1464,15 +1500,16 @@ class TestAsyncNonStreamingInterception:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_async_fallback_retry_error_events_tag_agent_run_id(self) -> None:
+        # Same-provider model-swap fallback on the SAME client; both hops 429.
         client, _ = _mock_openai_client()
         client.chat.completions.create = AsyncMockFn(
             side_effect=[
-                RuntimeError("primary failed"),
-                RuntimeError("fallback failed"),
+                _Status(429, "primary failed"),
+                _Status(429, "fallback failed"),
             ]
         )
 
-        solwyn = _make_async_solwyn(client, fallback_model="gpt-4o-mini")
+        solwyn = _make_async_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
         reported_events: list = []
         solwyn._reporter.report = lambda e: reported_events.append(e)
 
@@ -1482,7 +1519,7 @@ class TestAsyncNonStreamingInterception:
             new=AsyncMockFn(return_value=_allow_budget_result()),
         ):
             async with solwyn_pkg.run("async-retry-doomed") as run_id:
-                with pytest.raises(RuntimeError, match="primary failed"):
+                with pytest.raises(_Status, match="fallback failed"):
                     await solwyn.chat.completions.create(
                         model="gpt-4o",
                         messages=[{"role": "user", "content": "Hello"}],
@@ -1491,6 +1528,7 @@ class TestAsyncNonStreamingInterception:
         assert [event.status for event in reported_events] == ["error", "error"]
         assert all(event.agent_run_id == run_id for event in reported_events)
         assert all(event.agent_run_name == "async-retry-doomed" for event in reported_events)
+        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-4o-mini"
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

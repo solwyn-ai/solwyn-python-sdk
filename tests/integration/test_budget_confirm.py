@@ -27,6 +27,8 @@ class TestBudgetConfirmRoundTrip:
             reservation_id=result.reservation_id,
             model="gpt-4o",
             token_details=SAMPLE_TOKEN_DETAILS,
+            provider="openai",
+            call_id="call_integration_confirm_valid",
         )
 
     @pytest.mark.integration
@@ -38,4 +40,6 @@ class TestBudgetConfirmRoundTrip:
             reservation_id="res_nonexistent_000",
             model="gpt-4o",
             token_details=SAMPLE_TOKEN_DETAILS,
+            provider="openai",
+            call_id="call_integration_confirm_invalid",
         )

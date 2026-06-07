@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 from pydantic import (
     BaseModel,
@@ -18,6 +18,7 @@ from pydantic import (
     SerializationInfo,
     SerializerFunctionWrapHandler,
     model_serializer,
+    model_validator,
 )
 
 # TokenDetails lives in a separate module to avoid a circular import:
@@ -63,6 +64,36 @@ class CallStatus(StrEnum):
     BUDGET_DENIED = "budget_denied"
 
 
+class FailoverReason(StrEnum):
+    """Why the router advanced past the requested primary target."""
+
+    CIRCUIT_OPEN = "circuit_open"  # primary breaker was OPEN — never attempted
+    PRIMARY_ERROR = "primary_error"  # primary attempt raised before success
+    MODEL_FALLBACK = "model_fallback"  # same-provider model swap
+
+
+# ── Config models ───────────────────────────────────────────────────────
+
+
+class ProviderEntry(BaseModel):
+    """One link in the configured provider/model failover chain.
+
+    Deliberately carries NO ``api_key`` / ``base_url``. Solwyn
+    never accepts, stores, or logs a provider credential — credentials live
+    only in the caller's client objects. ``extra="forbid"`` makes any attempt
+    to smuggle one in a hard error.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: ProviderName = Field(..., description="Target LLM provider")
+    model: str = Field(..., max_length=100, description="Model name for this provider")
+    default_params: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Fill-absent default request params for this entry",
+    )
+
+
 # ── Wire-format models ──────────────────────────────────────────────────
 
 
@@ -97,8 +128,31 @@ class MetadataEvent(BaseModel):
     )
     latency_ms: float = Field(..., description="End-to-end call latency in ms")
     status: CallStatus = Field(..., description="Call outcome")
-    is_model_fallback: bool = Field(
-        ..., description="Whether this call used fallback_model after the primary failed"
+    is_model_fallback: bool = Field(..., description="same-provider model swap ONLY")
+    is_provider_fallback: bool = Field(default=False, description="served provider != requested")
+    requested_provider: ProviderName | None = Field(default=None)
+    requested_model: str | None = Field(default=None, max_length=100)
+    failover_reason: FailoverReason | None = Field(default=None)
+    failover_error_class: str | None = Field(
+        default=None,
+        max_length=64,
+        description="type(exc).__name__ ONLY — never str(exc)",
+    )
+    attempt_index: int = Field(default=0, ge=0, description="0=primary, 1=first fallback")
+    call_id: str = Field(
+        ...,
+        description=(
+            "uuid per intercepted call; join key for cache-hit spend reconciliation. "
+            "Always present on the wire — it is NOT content."
+        ),
+    )
+    possibly_succeeded: bool | None = Field(
+        default=None,
+        description=(
+            "post-send-ambiguous abort flag for reconciliation; True only on a "
+            "correctly-not-failed-over post-send-ambiguous abort. None default keeps "
+            "every non-abort event clean on the wire."
+        ),
     )
     service_tier: str | None = Field(
         default=None,
@@ -133,6 +187,22 @@ class BudgetCheckRequest(BaseModel):
     )
     model: str = Field(..., max_length=100, description="LLM model name")
     provider: ProviderName = Field(..., description="Target provider")
+    fallback_providers: list[ProviderName] = Field(
+        default_factory=list,
+        description="Configured failover providers, in attempt order (chain hint)",
+    )
+    fallback_models: list[Annotated[str, Field(max_length=100)]] = Field(
+        default_factory=list,
+        max_length=8,
+        description="Failover models aligned element-for-element with fallback_providers",
+    )
+
+    @model_validator(mode="after")
+    def _check_chain_hint_alignment(self) -> BudgetCheckRequest:
+        """fallback_providers and fallback_models must align element-for-element."""
+        if len(self.fallback_models) != len(self.fallback_providers):
+            raise ValueError("fallback_models and fallback_providers must have equal length")
+        return self
 
 
 class BudgetCheckResponse(BaseModel):
@@ -152,6 +222,13 @@ class BudgetCheckResponse(BaseModel):
         ..., description="Which budget period triggered denial (e.g. 'daily')"
     )
     project_id: str = Field(..., description="Project identifier resolved from the API key")
+    price_hints: dict[ProviderName, float] | None = Field(
+        default=None,
+        description=(
+            "Server-provided RELATIVE price signal per provider for cost routing; "
+            "SDK never computes price"
+        ),
+    )
 
 
 class BudgetConfirmRequest(BaseModel):
@@ -163,6 +240,16 @@ class BudgetConfirmRequest(BaseModel):
         ..., description="Budget reservation ID returned by BudgetCheckResponse"
     )
     model: str = Field(..., max_length=100, description="LLM model name used for the call")
+    provider: ProviderName = Field(
+        ..., description="Provider that actually served the call (required)"
+    )
+    is_provider_fallback: bool = Field(
+        default=False, description="served provider != requested provider"
+    )
+    call_id: str = Field(
+        ...,
+        description=("uuid per intercepted call; dedups confirm vs metadata reconciliation"),
+    )
     token_details: TokenDetails = Field(
         ..., description="Actual token breakdown from the provider adapter"
     )

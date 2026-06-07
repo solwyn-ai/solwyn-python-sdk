@@ -137,6 +137,22 @@ class TestCloudAllow:
         assert result.reservation_id == "res_123"
         assert result.warning is None
 
+    def test_shared_allow_fixture_propagates_non_none_price_hints(self) -> None:
+        enforcer = _make_enforcer()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            **ALLOW_BUDGET_RESPONSE,
+            "price_hints": {"openai": 10.0, "anthropic": 2.0},
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(enforcer._http, "post", return_value=mock_response):
+            result = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            )
+
+        assert result.price_hints == {"openai": 10.0, "anthropic": 2.0}
+
 
 # ---------------------------------------------------------------------------
 # Cloud deny: hard_deny
@@ -388,7 +404,13 @@ class TestConfirmCost:
         token_details = TokenDetails(input_tokens=100, output_tokens=50)
 
         with patch.object(enforcer._http, "post", return_value=mock_response) as mock_post:
-            enforcer.confirm_cost("res_123", "gpt-4o", token_details)
+            enforcer.confirm_cost(
+                "res_123",
+                "gpt-4o",
+                token_details,
+                provider="openai",
+                call_id="call_budget_confirm",
+            )
 
         mock_post.assert_called_once()
         call_kwargs = mock_post.call_args
@@ -400,7 +422,13 @@ class TestConfirmCost:
 
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
             # Should not raise
-            enforcer.confirm_cost("res_123", "gpt-4o", token_details)
+            enforcer.confirm_cost(
+                "res_123",
+                "gpt-4o",
+                token_details,
+                provider="openai",
+                call_id="call_budget_confirm",
+            )
 
 
 def test_budget_check_result_is_pydantic_model() -> None:

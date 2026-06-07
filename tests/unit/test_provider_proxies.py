@@ -15,12 +15,16 @@ import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 
 from solwyn.client import AsyncSolwyn, Solwyn
+from solwyn.exceptions import BudgetExceededError
 
 
 def _mock_anthropic_client():
     """Create a mock that looks like anthropic.Anthropic."""
     client = MagicMock()
     client.__class__.__module__ = "anthropic._client"
+    # Per-hop with_options(timeout, max_retries) must return the same client so
+    # the configured .messages.create mock is the one actually invoked.
+    client.with_options.return_value = client
     client.messages.create.return_value = SimpleNamespace(
         content=[SimpleNamespace(text="Hello")],
         usage=SimpleNamespace(
@@ -36,6 +40,8 @@ def _mock_google_client():
     """Create a mock that looks like google.genai.Client."""
     client = MagicMock()
     client.__class__.__module__ = "google.genai._client"
+    # Per-hop with_options must return the same client (see _mock_anthropic_client).
+    client.with_options.return_value = client
     client.models.generate_content.return_value = SimpleNamespace(
         text="Hello",
         usage_metadata=SimpleNamespace(
@@ -97,8 +103,6 @@ class TestAnthropicMessagesProxy:
         solwyn.close()
 
     def test_messages_create_checks_budget(self) -> None:
-        from solwyn.exceptions import BudgetExceededError
-
         client = _mock_anthropic_client()
         solwyn = _make_solwyn(client, budget_mode="hard_deny")
 
@@ -160,8 +164,16 @@ class TestGoogleModelsProxy:
     def test_generate_content_stream_dispatches_correctly(self) -> None:
         """generate_content_stream() calls the correct underlying method via _force_stream."""
         client = _mock_google_client()
-        mock_response = SimpleNamespace(
-            text="Hello",
+        # A real generate_content_stream yields chunk objects (not a single
+        # complete response). First-chunk materialization iterates it, so
+        # the mock must be an ITERABLE of chunks.
+        chunk = SimpleNamespace(
+            candidates=[
+                SimpleNamespace(
+                    content=SimpleNamespace(parts=[SimpleNamespace(text="Hello")]),
+                    finish_reason="STOP",
+                )
+            ],
             usage_metadata=SimpleNamespace(
                 prompt_token_count=100,
                 candidates_token_count=50,
@@ -170,7 +182,7 @@ class TestGoogleModelsProxy:
                 tool_use_prompt_token_count=0,
             ),
         )
-        client.models.generate_content_stream.return_value = mock_response
+        client.models.generate_content_stream.return_value = iter([chunk])
 
         solwyn = _make_solwyn(client)
         reported: list = []

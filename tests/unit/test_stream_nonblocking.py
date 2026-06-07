@@ -17,7 +17,7 @@ SDK_SRC = Path(__file__).resolve().parent.parent.parent / "src" / "solwyn"
 @pytest.mark.unit
 def test_sync_on_complete_does_not_call_confirm_cost() -> None:
     """The sync on_complete closure in Solwyn._intercepted_call must NOT
-    call budget.confirm_cost() — it must use reporter.report_confirm()."""
+    call budget.confirm_cost() -- it must use reporter.report_settlement()."""
     client_py = (SDK_SRC / "client.py").read_text()
 
     tree = ast.parse(client_py)
@@ -32,15 +32,43 @@ def test_sync_on_complete_does_not_call_confirm_cost() -> None:
                     assert "confirm_cost(" not in fn_text, (
                         "Solwyn._intercepted_call's on_complete closure must NOT "
                         "call budget.confirm_cost() — it blocks on httpx. "
-                        "Use reporter.report_confirm() instead."
+                        "Use reporter.report_settlement() instead."
                     )
-                    assert "report_confirm(" in fn_text, (
+                    assert "report_settlement(" in fn_text, (
                         "Solwyn._intercepted_call's on_complete closure must "
-                        "call reporter.report_confirm() for fire-and-forget."
+                        "call reporter.report_settlement() for fire-and-forget."
                     )
                     return
 
     raise AssertionError("Could not find on_complete in Solwyn._intercepted_call")
+
+
+@pytest.mark.unit
+def test_async_on_complete_does_not_call_confirm_cost() -> None:
+    """The async on_complete closure must also enqueue confirm fire-and-forget."""
+    client_py = (SDK_SRC / "client.py").read_text()
+
+    tree = ast.parse(client_py)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "AsyncSolwyn":
+            for item in ast.walk(node):
+                if isinstance(item, ast.AsyncFunctionDef) and item.name == "on_complete":
+                    source_lines = client_py.splitlines()
+                    fn_lines = source_lines[item.lineno - 1 : item.end_lineno]
+                    fn_text = "\n".join(fn_lines)
+                    assert "confirm_cost(" not in fn_text, (
+                        "AsyncSolwyn._wrap_stream_async's on_complete closure must "
+                        "not await budget.confirm_cost(); it blocks stream settlement. "
+                        "Use reporter.report_settlement() instead."
+                    )
+                    assert "report_settlement(" in fn_text, (
+                        "AsyncSolwyn._wrap_stream_async's on_complete closure must "
+                        "call reporter.report_settlement() for fire-and-forget."
+                    )
+                    return
+
+    raise AssertionError("Could not find on_complete in AsyncSolwyn._wrap_stream_async")
 
 
 @pytest.mark.unit
@@ -66,8 +94,11 @@ def test_build_confirm_request_returns_pydantic_model() -> None:
         reservation_id="r_test_123",
         model="gpt-4o",
         token_details=token_details,
+        provider="openai",
+        call_id="call_stream_confirm",
     )
     assert isinstance(request, BudgetConfirmRequest)
     assert request.reservation_id == "r_test_123"
     assert request.model == "gpt-4o"
+    assert request.provider == "openai"
     enforcer.close()

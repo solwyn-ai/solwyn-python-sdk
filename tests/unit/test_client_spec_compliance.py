@@ -1,8 +1,8 @@
 """Spec-derived tests for Solwyn client wrapper.
 
 These tests verify that BudgetExceededError carries correct field values
-when raised by the client interception flow.  Derived from the design
-doc Section 5.3 (Budget Check: Atomic Reservation).
+when raised by the client interception flow, covering atomic reservation
+via the Cloud API.
 
 Would have caught Bug 1.1 where budget_limit was set to
 remaining_budget and current_usage was hardcoded to 0.0.

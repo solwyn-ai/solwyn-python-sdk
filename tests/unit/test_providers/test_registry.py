@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from solwyn._types import ProviderName
 from solwyn.providers import get_adapter_by_name, get_adapter_for_client, get_adapter_for_model
 from solwyn.providers._protocol import ProviderAdapter
 from solwyn.providers.anthropic import AnthropicAdapter
@@ -159,3 +160,9 @@ class TestAllAdaptersRegistered:
         for name in ("openai", "anthropic", "google"):
             adapter = get_adapter_by_name(name)
             assert adapter.name == name
+
+    def test_adapter_names_are_provider_name_values(self) -> None:
+        """CostPolicy price hints key by ProviderName value; adapter names must match."""
+        for name in ("openai", "anthropic", "google"):
+            adapter = get_adapter_by_name(name)
+            assert ProviderName(adapter.name) is ProviderName(name)

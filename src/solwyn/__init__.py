@@ -12,7 +12,17 @@ try:
 except PackageNotFoundError:
     __version__ = "0.0.0-dev"
 
+from solwyn._routing import (
+    CostPolicy,
+    HealthBasedPolicy,
+    LatencyPolicy,
+    ProviderCandidate,
+    RoutingRequest,
+    SelectionPolicy,
+)
 from solwyn._run import current_run, run, run_in_executor
+from solwyn._types import CircuitState, FailoverReason, ProviderEntry, ProviderName
+from solwyn.circuit_breaker import CircuitBreakerState
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.config import SolwynConfig
 from solwyn.exceptions import (
@@ -20,6 +30,8 @@ from solwyn.exceptions import (
     ConfigurationError,
     ProviderUnavailableError,
     SolwynError,
+    UntranslatableModelError,
+    UntranslatableRequestError,
 )
 
 __all__ = [
@@ -31,6 +43,20 @@ __all__ = [
     "BudgetExceededError",
     "ProviderUnavailableError",
     "ConfigurationError",
+    "UntranslatableRequestError",
+    "UntranslatableModelError",
+    "ProviderEntry",
+    "ProviderName",
+    "FailoverReason",
+    "RoutingRequest",
+    "ProviderCandidate",
+    "CircuitState",
+    "CircuitBreakerState",
+    # Selection policies (constructor selection_policy= arg).
+    "SelectionPolicy",
+    "HealthBasedPolicy",
+    "LatencyPolicy",
+    "CostPolicy",
     "run",
     "run_in_executor",
     "current_run",

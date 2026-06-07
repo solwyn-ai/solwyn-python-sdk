@@ -48,4 +48,4 @@ _SolwynBase          # Shared sans-I/O logic (config, token estimation, metadata
 
 ## Privacy
 
-`_privacy.py` is the ONLY module that touches customer prompt content. Never log, store, or concatenate prompt text outside this module. CI-enforced by `tests/unit/test_privacy_firewall.py`.
+`_privacy.py` and every module under `providers/_translation/` are the ONLY modules that touch customer prompt content (the content-privileged allowlist). Never log, store, or concatenate prompt text outside these modules. CI-enforced by `tests/unit/test_privacy_firewall.py` (path-based: the allowlist covers `_privacy.py` plus the whole `providers/_translation/` package).

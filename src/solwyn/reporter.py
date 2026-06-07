@@ -48,6 +48,8 @@ class _ReporterBase:
         # Bounded deque: drops oldest events when full
         self._queue: collections.deque[MetadataEvent] = collections.deque(maxlen=max_queue_size)
         self._in_flight = 0
+        self._consecutive_confirm_failures = 0
+        self._confirm_failure_threshold = 10
 
     def _enqueue(self, event: MetadataEvent) -> None:
         """Add an event to the queue.  Drop-oldest semantics on overflow."""
@@ -69,6 +71,26 @@ class _ReporterBase:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+
+    def _record_confirm_success(self) -> None:
+        """Reset the confirm failure counter after a successful confirm POST."""
+        self._consecutive_confirm_failures = 0
+
+    def _record_confirm_failure(self, exc: Exception) -> None:
+        """Track confirm send failures and escalate persistent outages."""
+        self._consecutive_confirm_failures += 1
+        count = self._consecutive_confirm_failures
+        if count >= self._confirm_failure_threshold:
+            logger.error(
+                "reporter.confirm_send_persistent_failure: exc_type=%s consecutive_failures=%d",
+                type(exc).__name__,
+                count,
+            )
+        else:
+            logger.warning(
+                "reporter.confirm_send_failed: exc_type=%s",
+                type(exc).__name__,
+            )
 
 
 class MetadataReporter(_ReporterBase):
@@ -114,6 +136,9 @@ class MetadataReporter(_ReporterBase):
         self._confirm_queue: collections.deque[BudgetConfirmRequest] = collections.deque(
             maxlen=1000
         )
+        self._settlement_queue: collections.deque[tuple[BudgetConfirmRequest, MetadataEvent]] = (
+            collections.deque(maxlen=1000)
+        )
         self._thread = threading.Thread(
             target=self._flush_loop,
             daemon=True,
@@ -146,7 +171,10 @@ class MetadataReporter(_ReporterBase):
             self._flush_remaining()
 
     def _flush_remaining(self) -> None:
-        """Flush all queued events in batches."""
+        """Flush queued confirms, settlements, then metadata events in batches."""
+        while self._confirm_queue:
+            self._send_confirm(self._confirm_queue.popleft())
+        self._flush_settlements()
         while len(self._queue) > 0:
             with self._in_flight_lock:
                 if self._in_flight >= self.max_in_flight:
@@ -155,21 +183,33 @@ class MetadataReporter(_ReporterBase):
             if not batch:
                 break
             self._send_batch(batch)
-        # Drain any queued confirm-cost requests
-        while self._confirm_queue:
-            confirm_request = self._confirm_queue.popleft()
-            try:
-                self._http.post(
-                    f"{self.api_url}/api/v1/budgets/confirm",
-                    json=confirm_request.model_dump(mode="json"),
-                    headers=self._auth_headers(),
-                    timeout=5.0,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "reporter.confirm_send_failed: exc_type=%s",
-                    type(exc).__name__,
-                )
+
+    def _send_confirm(self, confirm_request: BudgetConfirmRequest) -> None:
+        """Send one confirm request and update confirm failure accounting."""
+        try:
+            resp = self._http.post(
+                f"{self.api_url}/api/v1/budgets/confirm",
+                json=confirm_request.model_dump(mode="json"),
+                headers=self._auth_headers(),
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            self._record_confirm_success()
+        except Exception as exc:
+            self._record_confirm_failure(exc)
+
+    def _flush_settlements(self) -> None:
+        """Send reservation settlements in confirm-before-metadata order."""
+        batch: list[MetadataEvent] = []
+        while self._settlement_queue:
+            confirm_request, event = self._settlement_queue.popleft()
+            self._send_confirm(confirm_request)
+            batch.append(event)
+            if len(batch) >= self.batch_size:
+                self._send_batch(batch)
+                batch = []
+        if batch:
+            self._send_batch(batch)
 
     def _send_batch(self, batch: list[MetadataEvent]) -> None:
         """Send a batch of events to the cloud API."""
@@ -177,13 +217,21 @@ class MetadataReporter(_ReporterBase):
             self._in_flight += 1
         try:
             payload = [e.model_dump(mode="json") for e in batch]
-            self._http.post(
+            resp = self._http.post(
                 f"{self.api_url}/api/v1/metadata/ingest",
                 json=payload,
                 headers=self._auth_headers(),
             )
+            resp.raise_for_status()
         except Exception as exc:
-            logger.warning("Failed to send metadata batch (%d events): %s", len(batch), exc)
+            # Log only the exception's class name (fix [D]) — the type-name-only
+            # convention every other except-block follows. Safe here even though
+            # the batch is content-free; keeps the privacy contract uniform.
+            logger.warning(
+                "Failed to send metadata batch (%d events): %s",
+                len(batch),
+                type(exc).__name__,
+            )
         finally:
             with self._in_flight_lock:
                 self._in_flight -= 1
@@ -202,6 +250,18 @@ class MetadataReporter(_ReporterBase):
         except Exception as exc:
             logger.warning(
                 "reporter.confirm_enqueue_failed: exc_type=%s",
+                type(exc).__name__,
+            )
+
+    def report_settlement(self, request: BudgetConfirmRequest, event: MetadataEvent) -> None:
+        """Fire-and-forget a stream settlement as one ordered queue item."""
+        if self._shutdown.is_set():
+            return
+        try:
+            self._settlement_queue.append((request, event))
+        except Exception as exc:
+            logger.warning(
+                "reporter.settlement_enqueue_failed: exc_type=%s",
                 type(exc).__name__,
             )
 
@@ -236,6 +296,12 @@ class AsyncMetadataReporter(_ReporterBase):
         self._http = httpx.AsyncClient(timeout=10.0)
         self._shutdown_event: asyncio.Event | None = None
         self._flush_task: asyncio.Task[None] | None = None
+        self._confirm_queue: collections.deque[BudgetConfirmRequest] = collections.deque(
+            maxlen=1000
+        )
+        self._settlement_queue: collections.deque[tuple[BudgetConfirmRequest, MetadataEvent]] = (
+            collections.deque(maxlen=1000)
+        )
 
     def start(self) -> None:
         """Start the background flush loop.  Must be called within an event loop."""
@@ -245,6 +311,30 @@ class AsyncMetadataReporter(_ReporterBase):
     def report(self, event: MetadataEvent) -> None:
         """Enqueue a metadata event for async reporting.  Non-blocking."""
         self._enqueue(event)
+
+    def report_confirm(self, request: BudgetConfirmRequest) -> None:
+        """Fire-and-forget a confirm_cost request onto the async flush queue."""
+        if self._shutdown_event is not None and self._shutdown_event.is_set():
+            return
+        try:
+            self._confirm_queue.append(request)
+        except Exception as exc:
+            logger.warning(
+                "reporter.confirm_enqueue_failed: exc_type=%s",
+                type(exc).__name__,
+            )
+
+    def report_settlement(self, request: BudgetConfirmRequest, event: MetadataEvent) -> None:
+        """Fire-and-forget a stream settlement as one ordered queue item."""
+        if self._shutdown_event is not None and self._shutdown_event.is_set():
+            return
+        try:
+            self._settlement_queue.append((request, event))
+        except Exception as exc:
+            logger.warning(
+                "reporter.settlement_enqueue_failed: exc_type=%s",
+                type(exc).__name__,
+            )
 
     async def close(self) -> None:
         """Flush remaining events and shut down."""
@@ -276,7 +366,10 @@ class AsyncMetadataReporter(_ReporterBase):
             await self._flush_remaining()
 
     async def _flush_remaining(self) -> None:
-        """Flush all queued events in batches."""
+        """Flush queued confirms, settlements, then metadata events in batches."""
+        while self._confirm_queue:
+            await self._send_confirm(self._confirm_queue.popleft())
+        await self._flush_settlements()
         while len(self._queue) > 0:
             if self._in_flight >= self.max_in_flight:
                 break
@@ -285,17 +378,52 @@ class AsyncMetadataReporter(_ReporterBase):
                 break
             await self._send_batch(batch)
 
+    async def _send_confirm(self, confirm_request: BudgetConfirmRequest) -> None:
+        """Send one confirm request and update confirm failure accounting."""
+        try:
+            resp = await self._http.post(
+                f"{self.api_url}/api/v1/budgets/confirm",
+                json=confirm_request.model_dump(mode="json"),
+                headers=self._auth_headers(),
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            self._record_confirm_success()
+        except Exception as exc:
+            self._record_confirm_failure(exc)
+
+    async def _flush_settlements(self) -> None:
+        """Send reservation settlements in confirm-before-metadata order."""
+        batch: list[MetadataEvent] = []
+        while self._settlement_queue:
+            confirm_request, event = self._settlement_queue.popleft()
+            await self._send_confirm(confirm_request)
+            batch.append(event)
+            if len(batch) >= self.batch_size:
+                await self._send_batch(batch)
+                batch = []
+        if batch:
+            await self._send_batch(batch)
+
     async def _send_batch(self, batch: list[MetadataEvent]) -> None:
         """Send a batch of events to the cloud API."""
         self._in_flight += 1
         try:
             payload = [e.model_dump(mode="json") for e in batch]
-            await self._http.post(
+            resp = await self._http.post(
                 f"{self.api_url}/api/v1/metadata/ingest",
                 json=payload,
                 headers=self._auth_headers(),
             )
+            resp.raise_for_status()
         except Exception as exc:
-            logger.warning("Failed to send metadata batch (%d events): %s", len(batch), exc)
+            # Log only the exception's class name (fix [D]) — the type-name-only
+            # convention every other except-block follows. Safe here even though
+            # the batch is content-free; keeps the privacy contract uniform.
+            logger.warning(
+                "Failed to send metadata batch (%d events): %s",
+                len(batch),
+                type(exc).__name__,
+            )
         finally:
             self._in_flight -= 1

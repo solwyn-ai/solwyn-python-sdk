@@ -46,6 +46,9 @@ class BudgetCheckResult(BaseModel):
     warning: str | None = None
     budget_limit: float = 0.0
     current_usage: float = 0.0
+    # Server-provided RELATIVE price signal per provider for cost routing
+    # (CostPolicy). The SDK never computes price. None on the cache path.
+    price_hints: dict[str, float] | None = None
 
 
 class _BudgetEnforcerBase:
@@ -90,12 +93,21 @@ class _BudgetEnforcerBase:
         estimated_input_tokens: int,
         model: str,
         provider: str,
+        fallback_providers: list[str] | None = None,
+        fallback_models: list[str] | None = None,
     ) -> BudgetCheckRequest:
-        """Build a BudgetCheckRequest for the cloud API."""
+        """Build a BudgetCheckRequest for the cloud API.
+
+        ``fallback_providers``/``fallback_models`` describe the configured
+        failover chain (aligned element-for-element) as a hint to the API.
+        Both default to empty lists; the caller's lists are never mutated.
+        """
         return BudgetCheckRequest(
             estimated_input_tokens=estimated_input_tokens,
             model=model,
             provider=ProviderName(provider),
+            fallback_providers=[ProviderName(p) for p in (fallback_providers or [])],
+            fallback_models=list(fallback_models or []),
         )
 
     def _should_use_cache(self) -> bool:
@@ -150,6 +162,15 @@ class _BudgetEnforcerBase:
         - denied + alert_only -> return allowed=True with warning
         - denied + hard_deny -> return allowed=False
         """
+        # Server-provided RELATIVE price hints (cost routing); str-keyed for the
+        # routing layer. None when the server has not provided them. The SDK
+        # never computes price — it only forwards this signal to CostPolicy.
+        price_hints = (
+            {provider.value: hint for provider, hint in response.price_hints.items()}
+            if response.price_hints is not None
+            else None
+        )
+
         if response.allowed:
             return BudgetCheckResult(
                 allowed=True,
@@ -159,6 +180,7 @@ class _BudgetEnforcerBase:
                 mode=response.mode,
                 budget_limit=response.budget_limit,
                 current_usage=response.current_usage,
+                price_hints=price_hints,
             )
 
         # Denied by cloud
@@ -180,6 +202,7 @@ class _BudgetEnforcerBase:
                 ),
                 budget_limit=response.budget_limit,
                 current_usage=response.current_usage,
+                price_hints=price_hints,
             )
 
         # hard_deny
@@ -268,16 +291,27 @@ class _BudgetEnforcerBase:
         reservation_id: str,
         model: str,
         token_details: TokenDetails,
+        *,
+        provider: str,
+        is_provider_fallback: bool = False,
+        call_id: str,
     ) -> BudgetConfirmRequest:
         """Build a validated confirm request for fire-and-forget callers.
 
         Stream completion builds this synchronously (no I/O) and enqueues
-        it on the reporter thread, avoiding a blocking httpx.post.
+        it on the reporter thread, avoiding a blocking httpx.post. ``provider``
+        is the provider that actually served the call (required).
+        ``call_id`` is the required per-call reconciliation join key.
         """
+        if not call_id:
+            raise RuntimeError("call_id is required for budget confirm reconciliation")
         return BudgetConfirmRequest(
             reservation_id=reservation_id,
             model=model,
+            provider=ProviderName(provider),
+            is_provider_fallback=is_provider_fallback,
             token_details=token_details,
+            call_id=call_id,
         )
 
 
@@ -313,8 +347,14 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         estimated_input_tokens: int,
         model: str,
         provider: str,
+        fallback_providers: list[str] = [],  # noqa: B006 — read-only; never mutated
+        fallback_models: list[str] = [],  # noqa: B006 — read-only; never mutated
+        timeout: float | None = None,
     ) -> BudgetCheckResult:
         """Check whether a call is within budget.
+
+        ``fallback_providers``/``fallback_models`` describe the configured
+        failover chain (aligned element-for-element) as a hint to the API.
 
         Behaviour matrix:
         - Cloud reachable + allowed: return allowed=True
@@ -339,14 +379,24 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     current_usage=cached.current_usage,
                 )
 
-        request = self._build_check_request(estimated_input_tokens, model, provider)
+        request = self._build_check_request(
+            estimated_input_tokens, model, provider, fallback_providers, fallback_models
+        )
 
         try:
-            resp = self._http.post(
-                f"{self.api_url}/api/v1/budgets/check",
-                json=request.model_dump(mode="json"),
-                headers=self._auth_headers(),
-            )
+            if timeout is not None:
+                resp = self._http.post(
+                    f"{self.api_url}/api/v1/budgets/check",
+                    json=request.model_dump(mode="json"),
+                    headers=self._auth_headers(),
+                    timeout=timeout,
+                )
+            else:
+                resp = self._http.post(
+                    f"{self.api_url}/api/v1/budgets/check",
+                    json=request.model_dump(mode="json"),
+                    headers=self._auth_headers(),
+                )
             resp.raise_for_status()
 
             cloud_response = BudgetCheckResponse.model_validate(resp.json())
@@ -354,7 +404,10 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             return self._build_result_from_response(cloud_response)
 
         except Exception as exc:
-            logger.warning("Cloud API budget check failed: %s", exc)
+            # Log the exception TYPE only — symmetric with confirm_cost and
+            # defense-in-depth: never interpolate the full exception (which could
+            # carry response/body text) into the log.
+            logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
 
             if self.fail_open:
                 return self._build_fail_open_result(estimated_input_tokens)
@@ -366,24 +419,35 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         reservation_id: str,
         model: str,
         token_details: TokenDetails,
+        *,
+        provider: str,
+        is_provider_fallback: bool = False,
+        call_id: str,
     ) -> None:
         """Confirm actual token usage for a budget reservation.
+
+        ``provider`` is the provider that actually served the call (required).
+        ``call_id`` is the required per-call reconciliation join key.
 
         Best-effort: failures are logged but do not raise.
         Tracks consecutive failures; after _confirm_failure_threshold consecutive
         failures, logs at ERROR level so operators can see a persistent problem.
         """
         try:
-            request = BudgetConfirmRequest(
-                reservation_id=reservation_id,
-                model=model,
-                token_details=token_details,
+            request = self.build_confirm_request(
+                reservation_id,
+                model,
+                token_details,
+                provider=provider,
+                is_provider_fallback=is_provider_fallback,
+                call_id=call_id,
             )
-            self._http.post(
+            resp = self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",
                 json=request.model_dump(mode="json"),
                 headers=self._auth_headers(),
             )
+            resp.raise_for_status()
             with self._state_lock:
                 self._consecutive_confirm_failures = 0
         except Exception as exc:
@@ -438,6 +502,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         estimated_input_tokens: int,
         model: str,
         provider: str,
+        fallback_providers: list[str] = [],  # noqa: B006 — read-only; never mutated
+        fallback_models: list[str] = [],  # noqa: B006 — read-only; never mutated
+        timeout: float | None = None,
     ) -> BudgetCheckResult:
         """Async version of budget check. See BudgetEnforcer.check_budget."""
         if self._should_use_cache():
@@ -454,14 +521,24 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 current_usage=cached.current_usage,
             )
 
-        request = self._build_check_request(estimated_input_tokens, model, provider)
+        request = self._build_check_request(
+            estimated_input_tokens, model, provider, fallback_providers, fallback_models
+        )
 
         try:
-            resp = await self._http.post(
-                f"{self.api_url}/api/v1/budgets/check",
-                json=request.model_dump(mode="json"),
-                headers=self._auth_headers(),
-            )
+            if timeout is not None:
+                resp = await self._http.post(
+                    f"{self.api_url}/api/v1/budgets/check",
+                    json=request.model_dump(mode="json"),
+                    headers=self._auth_headers(),
+                    timeout=timeout,
+                )
+            else:
+                resp = await self._http.post(
+                    f"{self.api_url}/api/v1/budgets/check",
+                    json=request.model_dump(mode="json"),
+                    headers=self._auth_headers(),
+                )
             resp.raise_for_status()
 
             cloud_response = BudgetCheckResponse.model_validate(resp.json())
@@ -469,7 +546,10 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             return self._build_result_from_response(cloud_response)
 
         except Exception as exc:
-            logger.warning("Cloud API budget check failed: %s", exc)
+            # Log the exception TYPE only — symmetric with confirm_cost and
+            # defense-in-depth: never interpolate the full exception (which could
+            # carry response/body text) into the log.
+            logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
 
             if self.fail_open:
                 return self._build_fail_open_result(estimated_input_tokens)
@@ -481,19 +561,27 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         reservation_id: str,
         model: str,
         token_details: TokenDetails,
+        *,
+        provider: str,
+        is_provider_fallback: bool = False,
+        call_id: str,
     ) -> None:
         """Async version of cost confirmation. See BudgetEnforcer.confirm_cost."""
         try:
-            request = BudgetConfirmRequest(
-                reservation_id=reservation_id,
-                model=model,
-                token_details=token_details,
+            request = self.build_confirm_request(
+                reservation_id,
+                model,
+                token_details,
+                provider=provider,
+                is_provider_fallback=is_provider_fallback,
+                call_id=call_id,
             )
-            await self._http.post(
+            resp = await self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",
                 json=request.model_dump(mode="json"),
                 headers=self._auth_headers(),
             )
+            resp.raise_for_status()
             self._consecutive_confirm_failures = 0
         except Exception as exc:
             self._consecutive_confirm_failures += 1
