@@ -14,7 +14,7 @@
 - `_run.py` — `ContextVar`-backed agent-run scope; `run(name)` public entry point, `current_run()` read seam used by `_base.py`
 - `_types.py` — Pydantic models for API request/response contracts
 - `_validation.py` — API key + project ID format validation
-- `providers/` — extraction adapters (OpenAI, Anthropic, Google, Bedrock); `_translation/` is content-privileged for request/response translation only
+- `providers/` — extraction adapters (OpenAI, OpenAI-compatible, Anthropic, Google, Bedrock); `_translation/` is content-privileged for request/response translation only
 
 ## Provider Adapter Notes
 
@@ -22,6 +22,7 @@
 - **OpenAI**: Two response shapes — Chat Completions (`prompt_tokens`/`completion_tokens`) vs Responses API (`input_tokens`/`output_tokens`). Detect via `hasattr(usage, 'prompt_tokens')`
 - **Google**: `output_tokens` = `candidates_token_count` + `thoughts_token_count`. Usage on `response.usage_metadata` not `response.usage`
 - **Bedrock**: Converse responses are DICTS (mapping access, never getattr). `input_tokens` = `inputTokens` + `cacheReadInputTokens` + `cacheWriteInputTokens` (additive — AWS-documented formula). Cache-write TTL split via `usage.cacheDetails` (`[{inputTokens, ttl}]`); aggregate-only falls back to the 5m bucket. Streaming usage arrives in the terminal `metadata` event. Service tier = `serviceTier.type`, else `performanceConfig.latency`. Region from `client.meta.region_name` → `provider_region` (pricing is per model AND region). boto3 never imported; detection = module contains `botocore` + `meta.service_model.service_name == "bedrock-runtime"`. boto3 has no `with_options` — per-hop timeouts cannot be applied; the caller's botocore Config governs
+- **OpenAI-compatible** (`openai_compatible.py`): one adapter class, one `CompatProfile` per provider (hosts/ports/model-prefixes/include_usage flag). `dialect="openai"`, distinct `name` per provider. Detection by `base_url` host (Azure also by client class name; Ollama/vLLM/LM Studio by localhost port 11434/8000/1234; unknown hosts -> generic catch-all). Streaming usage tiers: standard `usage` (last non-None chunk) -> Groq legacy `x_groq.usage` (raw dict!) -> length-based estimate marked `is_estimated=True`. `stream_options include_usage` injected ONLY where documented-safe (xAI/Mistral/Perplexity reject it; OpenRouter deprecates it); unsupported profiles STRIP caller stream_options so failover hops don't 4xx. Azure skips injection when `data_sources` present
 
 ## Client Proxy Patterns
 

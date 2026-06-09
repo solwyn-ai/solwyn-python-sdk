@@ -1,6 +1,6 @@
 # Solwyn Python SDK
 
-Drop-in wrapper for `openai`, `anthropic`, `google.generativeai`, and boto3 `bedrock-runtime` clients. Extracts token details, enforces budgets, handles failover — never computes cost (the API owns pricing).
+Drop-in wrapper for `openai`, `anthropic`, `google.generativeai`, and boto3 `bedrock-runtime` clients — plus OpenAI-compatible providers (xAI, DeepSeek, Mistral, Qwen, Groq, Together, Fireworks, Perplexity, Azure OpenAI, OpenRouter, Ollama, vLLM, LM Studio, generic) via `base_url` detection on `openai` clients. Extracts token details, enforces budgets, handles failover — never computes cost (the API owns pricing).
 
 ## Commands
 
@@ -43,7 +43,9 @@ _SolwynBase          # Shared sans-I/O logic (config, token estimation, metadata
 
 - Pydantic models use `extra="forbid"` — catches typos and contract drift
 - Response models (e.g. `BudgetCheckResponse`) use `Field(...)` for all fields the API returns — no silent defaults that mask contract changes
-- Provider adapter registry lazy-loads concrete adapters on first call
+- Provider adapter registry lazy-loads concrete adapters on first call; ORDER IS LOAD-BEARING — OpenAI-compatible adapters (base_url/host detection) must precede the plain OpenAIAdapter, with the generic catch-all last among them
+- Provider `name` (attribution: budgets, metadata, breakers) is distinct from `dialect` (wire shape: dispatch, translation). Same-dialect failover is native passthrough; cross-dialect runs the translation subset
+- A compat provider that reports no usage gets a length-based estimate explicitly marked `token_details.is_estimated=True` — never silently zero
 - `check_budget(provider=...)` is required and keyword-only
 - Consecutive confirm_cost failures are tracked — after 10, logs at ERROR level
 

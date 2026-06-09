@@ -58,7 +58,7 @@ from solwyn.exceptions import (
     ProviderUnavailableError,
     UntranslatableModelError,
 )
-from solwyn.providers import _translation, get_adapter_for_client
+from solwyn.providers import _translation
 from solwyn.providers._errors import Disposition, classify_exception, retry_after_seconds
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
@@ -117,9 +117,13 @@ _INVOKE_MODEL_GUIDANCE = (
 )
 
 
-def _source_compatible_defaults(provider: str, params: dict[str, Any]) -> dict[str, Any]:
-    """Return target defaults that are also legal in the source dialect."""
-    allowed = _SOURCE_COMPATIBLE_DEFAULT_KEYS.get(provider, frozenset())
+def _source_compatible_defaults(dialect: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Return target defaults that are also legal in the source DIALECT.
+
+    Keyed by dialect, not provider name: every OpenAI-compatible provider
+    shares the ``openai`` key set.
+    """
+    allowed = _SOURCE_COMPATIBLE_DEFAULT_KEYS.get(dialect, frozenset())
     return {key: value for key, value in params.items() if key in allowed}
 
 
@@ -133,8 +137,14 @@ def _with_openai_completion_token_key(
     model: str,
     kwargs: dict[str, object],
 ) -> dict[str, object]:
-    """Rewrite OpenAI max_tokens for models that require max_completion_tokens."""
-    if provider != ProviderName.OPENAI.value or not _openai_uses_max_completion_tokens(model):
+    """Rewrite OpenAI max_tokens for models that require max_completion_tokens.
+
+    Applies to OpenAI itself and Azure OpenAI (which hosts the same models);
+    other OpenAI-compatible providers accept the legacy max_tokens key.
+    """
+    if provider not in (ProviderName.OPENAI.value, ProviderName.AZURE_OPENAI.value):
+        return kwargs
+    if not _openai_uses_max_completion_tokens(model):
         return kwargs
     if "max_tokens" not in kwargs:
         return kwargs
@@ -142,6 +152,26 @@ def _with_openai_completion_token_key(
     if "max_completion_tokens" not in rewritten:
         rewritten["max_completion_tokens"] = rewritten["max_tokens"]
     del rewritten["max_tokens"]
+    return rewritten
+
+
+def _with_legacy_max_tokens_key(provider: str, kwargs: dict[str, object]) -> dict[str, object]:
+    """Rewrite max_completion_tokens back to legacy max_tokens for compat targets.
+
+    The inverse of ``_with_openai_completion_token_key``, applied ONLY on a
+    same-dialect CROSS-PROVIDER failover hop: kwargs authored for an OpenAI
+    model (which REQUIRES max_completion_tokens for o*/gpt-5 families) would
+    otherwise hit a strict compat target as an unknown param, 4xx, and
+    FAIL_FAST-abort the whole chain. Never applied to the caller's own
+    configured target.
+    """
+    if provider in (ProviderName.OPENAI.value, ProviderName.AZURE_OPENAI.value):
+        return kwargs
+    if "max_completion_tokens" not in kwargs:
+        return kwargs
+    rewritten = dict(kwargs)
+    value = rewritten.pop("max_completion_tokens")
+    rewritten.setdefault("max_tokens", value)
     return rewritten
 
 
@@ -392,26 +422,41 @@ def _build_hop_kwargs(
     if not rt.entry.model:
         raise UntranslatableModelError(model=rt.entry.model, provider=rt.adapter.name)
 
-    # Translate via the canonical subset (may RAISE an Untranslatable* error
-    # BEFORE any network call; the caller aborts the chain). Cross-provider
-    # translation starts from SOURCE-dialect values only: the target entry's
-    # default_params may contain target-native keys such as Anthropic top_k.
-    source_defaults = _source_compatible_defaults(primary.adapter.name, rt.entry.default_params)
-    source_kwargs: dict[str, object] = {**global_defaults, **source_defaults, **kwargs}
-    canonical = _translation.to_canonical(primary.adapter.name, source_kwargs)
+    source_dialect = primary.adapter.dialect
+    target_dialect = rt.adapter.dialect
+    if source_dialect == target_dialect:
+        # SAME-DIALECT cross-provider hop (e.g. Groq -> OpenRouter): both ends
+        # speak the same wire shape, so this is native passthrough with a model
+        # swap — no canonical-subset restriction. Tools, structured output, and
+        # streaming all carry over; the served adapter's prepare_streaming
+        # applies its own stream_options policy, and the completion-token key
+        # is rewritten in whichever direction the TARGET requires.
+        hop_kwargs = _with_openai_completion_token_key(
+            rt.adapter.name,
+            rt.entry.model,
+            {**merged_kwargs, "model": rt.entry.model},
+        )
+        return _with_legacy_max_tokens_key(rt.adapter.name, hop_kwargs)
 
-    # CROSS-PROVIDER STREAMING. A PLAIN-TEXT cross-provider
+    # CROSS-DIALECT hop: translate via the canonical subset (may RAISE an
+    # Untranslatable* error BEFORE any network call; the caller aborts the
+    # chain). Translation starts from SOURCE-dialect values only: the target
+    # entry's default_params may contain target-native keys such as Anthropic
+    # top_k.
+    source_defaults = _source_compatible_defaults(source_dialect, rt.entry.default_params)
+    source_kwargs: dict[str, object] = {**global_defaults, **source_defaults, **kwargs}
+    canonical = _translation.to_canonical(source_dialect, source_kwargs)
+
+    # CROSS-DIALECT STREAMING. A PLAIN-TEXT cross-dialect
     # streamed response is normalized per-chunk by the wrapper, so it proceeds. A
-    # TOOL-using streamed response cannot be normalized cross-provider (tool-call
+    # TOOL-using streamed response cannot be normalized cross-dialect (tool-call
     # deltas are out of the v1 streaming subset) — so FAIL LOUD here, BEFORE
     # dispatch, aborting the chain cleanly (no foreign stream returned). Checking
     # the canonical keeps this structural and content-free.
     if is_streaming and canonical.tools is not None:
-        _translation.fail_cross_provider_tool_stream(
-            source=primary.adapter.name, target=rt.adapter.name
-        )
+        _translation.fail_cross_provider_tool_stream(source=source_dialect, target=target_dialect)
 
-    call_kwargs = _translation.from_canonical(rt.adapter.name, canonical, model=rt.entry.model)
+    call_kwargs = _translation.from_canonical(target_dialect, canonical, model=rt.entry.model)
     # Re-apply target entry defaults as fill-absent (e.g. Anthropic max_tokens).
     return {**rt.entry.default_params, **call_kwargs}
 
@@ -444,14 +489,12 @@ class Solwyn(_SolwynBase):
         *,
         api_key: str | None = None,
         model: str | None = None,
+        provider: str | None = None,
         fallback: object = None,
         default_params: dict[str, Any] | None = None,
         selection_policy: SelectionPolicy | None = None,
         **config_kwargs: object,
     ) -> None:
-        # Detect provider and store adapter for usage extraction
-        self._adapter = get_adapter_for_client(client)
-        self._detected_provider = ProviderName(self._adapter.name)
         # self._client is typed Any because each provider SDK has a different
         # public surface (chat/messages/models). A unified Protocol would not
         # match all three. Type safety stops at the _sync_dispatch boundary.
@@ -462,8 +505,16 @@ class Solwyn(_SolwynBase):
 
         # Build the [primary, *fallbacks] runtime chain. All chain clients are
         # constructed up front so the first failover is pure dispatch.
+        # ``provider`` optionally overrides auto-detection for the primary
+        # (e.g. provider="vllm" for a server on a non-default port).
         fallback_specs = _normalize_fallback(fallback)
-        runtimes = build_runtimes(client, model, fallback_specs)
+        runtimes = build_runtimes(client, model, fallback_specs, primary_provider=provider)
+
+        # The primary runtime's adapter is the detected (or overridden)
+        # provider identity for usage extraction and proxy selection.
+        self._adapter = runtimes[0].adapter
+        self._detected_provider = runtimes[0].entry.provider
+        self._dialect = runtimes[0].adapter.dialect
 
         # Build config — SolwynConfig._load_from_env fills missing
         # values from SOLWYN_API_KEY env var.
@@ -518,10 +569,10 @@ class Solwyn(_SolwynBase):
     def messages(self) -> Any:
         """Anthropic-compatible: client.messages.create() goes through interception.
 
-        Cached: _detected_provider is fixed at construction, so the conditional
+        Cached: the dialect is fixed at construction, so the conditional
         result is stable for the lifetime of this client instance.
         """
-        if self._detected_provider == ProviderName.ANTHROPIC:
+        if self._dialect == "anthropic":
             return _SyncMessagesProxy(self)
         return self._client.messages
 
@@ -529,10 +580,10 @@ class Solwyn(_SolwynBase):
     def models(self) -> Any:
         """Google-compatible: client.models.generate_content() goes through interception.
 
-        Cached: _detected_provider is fixed at construction, so the conditional
+        Cached: the dialect is fixed at construction, so the conditional
         result is stable for the lifetime of this client instance.
         """
-        if self._detected_provider == ProviderName.GOOGLE:
+        if self._dialect == "google":
             return _SyncModelsProxy(self)
         return self._client.models
 
@@ -741,7 +792,9 @@ class Solwyn(_SolwynBase):
                 )
                 served_model = requested_model if is_primary else rt.entry.model
                 if is_streaming:
-                    call_kwargs = rt.adapter.prepare_streaming(call_kwargs)
+                    call_kwargs = rt.adapter.prepare_streaming(
+                        call_kwargs, cross_provider=is_provider_fallback
+                    )
             except Exception:
                 cb.release_probe(admission)
                 raise
@@ -768,8 +821,8 @@ class Solwyn(_SolwynBase):
                         timeout=_hop_timeout(deadline, len(candidates) - idx),
                         max_retries=0,
                     )
-                    if is_streaming and provider == ProviderName.GOOGLE.value:
-                        # First-chunk materialization — GOOGLE ONLY (fix
+                    if is_streaming and rt.adapter.dialect == "google":
+                        # First-chunk materialization — GOOGLE DIALECT ONLY (fix
                         # [B]). A Google lazy generator does no network I/O until the
                         # first pull, so we force it INSIDE this try; an establishment
                         # error then falls into the candidate-walk except ->
@@ -884,6 +937,7 @@ class Solwyn(_SolwynBase):
                     primary_errored=primary_errored,
                     call_id=call_id,
                     agent_run=agent_run,
+                    estimated_input_tokens=est_in,
                 )
             cb.record_success()
 
@@ -893,6 +947,15 @@ class Solwyn(_SolwynBase):
             self.record_latency(provider, ctx.elapsed_ms())
 
             token_details = rt.adapter.extract_usage(response)
+            # Explicit-degradation fallback: a compat provider that omitted the
+            # usage block yields a length-based estimate (is_estimated=True)
+            # instead of silently recording zero spend. None when usage was
+            # present or the adapter always reports usage.
+            estimated_details = rt.adapter.estimate_missing_usage(
+                response, estimated_input_tokens=est_in
+            )
+            if estimated_details is not None:
+                token_details = estimated_details
             # Per-region pricing attribution: the SERVED runtime's endpoint
             # region (None for providers without regional pricing).
             provider_region = rt.adapter.extract_region(rt.sdk_client)
@@ -902,13 +965,14 @@ class Solwyn(_SolwynBase):
             # tier-repriced cost diverge.
             service_tier = rt.adapter.extract_service_tier(response)
             result = response
-            if is_provider_fallback:
-                # Cross-provider hop: reshape the served response back to the
-                # caller's native dialect BEFORE confirm/report success. If the
+            if is_provider_fallback and rt.adapter.dialect != primary.adapter.dialect:
+                # Cross-DIALECT hop: reshape the served response back to the
+                # caller's native dialect BEFORE confirm/report success. (A
+                # same-dialect cross-provider hop needs no reshape.) If the
                 # served shape is unexpected, do not mark Solwyn billing settled.
                 result = _translation.normalize_response(
-                    served=rt.adapter.name,
-                    requested=primary.adapter.name,
+                    served=rt.adapter.dialect,
+                    requested=primary.adapter.dialect,
                     response=response,
                 )
             if budget.reservation_id:
@@ -969,6 +1033,7 @@ class Solwyn(_SolwynBase):
         primary_errored: bool,
         call_id: str,
         agent_run: tuple[str | None, str | None],
+        estimated_input_tokens: int = 0,
     ) -> Any:
         """Wrap a streaming response, settling against the SERVED runtime.
 
@@ -981,7 +1046,11 @@ class Solwyn(_SolwynBase):
         provider = runtime.adapter.name
         served_model = ctx.model
         is_provider_fallback = ctx.is_provider_fallback
-        accumulator = runtime.adapter.create_stream_accumulator()
+        # The pre-call input estimate feeds the compat accumulators'
+        # missing-usage fallback; always-reporting providers ignore it.
+        accumulator = runtime.adapter.create_stream_accumulator(
+            estimated_input_tokens=estimated_input_tokens
+        )
         # Per-region pricing attribution for the SERVED runtime (None for
         # providers without regional pricing). Captured once, closed over.
         provider_region = runtime.adapter.extract_region(runtime.sdk_client)
@@ -1053,14 +1122,16 @@ class Solwyn(_SolwynBase):
                 )
             )
 
-        # Cross-provider hop: reshape each served chunk back to the caller's
+        # Cross-DIALECT hop: reshape each served chunk back to the caller's
         # native streaming dialect. Same-dialect (primary / same-provider
-        # model swap) passes None -> zero translation. The accumulator still
-        # observes the RAW served chunk inside the wrapper, so usage settles
-        # against the served provider.
+        # model swap / compat-to-compat failover) passes None -> zero
+        # translation. The accumulator still observes the RAW served chunk
+        # inside the wrapper, so usage settles against the served provider.
         chunk_translator = (
-            _make_chunk_translator(served=provider, requested=primary.adapter.name)
-            if is_provider_fallback
+            _make_chunk_translator(
+                served=runtime.adapter.dialect, requested=primary.adapter.dialect
+            )
+            if is_provider_fallback and runtime.adapter.dialect != primary.adapter.dialect
             else None
         )
         # The SERVED adapter owns its stream nesting (Bedrock wraps the INNER
@@ -1119,14 +1190,12 @@ class AsyncSolwyn(_SolwynBase):
         *,
         api_key: str | None = None,
         model: str | None = None,
+        provider: str | None = None,
         fallback: object = None,
         default_params: dict[str, Any] | None = None,
         selection_policy: SelectionPolicy | None = None,
         **config_kwargs: object,
     ) -> None:
-        # Detect provider and store adapter for usage extraction
-        self._adapter = get_adapter_for_client(client)
-        self._detected_provider = ProviderName(self._adapter.name)
         # See sync Solwyn.__init__ for why _client is typed Any.
         self._client: Any = client
 
@@ -1134,8 +1203,15 @@ class AsyncSolwyn(_SolwynBase):
             raise TypeError("unexpected keyword argument 'project_id'")
 
         # Build the [primary, *fallbacks] runtime chain (constructed up front).
+        # ``provider`` optionally overrides auto-detection for the primary.
         fallback_specs = _normalize_fallback(fallback)
-        runtimes = build_runtimes(client, model, fallback_specs)
+        runtimes = build_runtimes(client, model, fallback_specs, primary_provider=provider)
+
+        # The primary runtime's adapter is the detected (or overridden)
+        # provider identity for usage extraction and proxy selection.
+        self._adapter = runtimes[0].adapter
+        self._detected_provider = runtimes[0].entry.provider
+        self._dialect = runtimes[0].adapter.dialect
 
         # cfg_kwargs stays dict[str, Any]: mypy can't verify Pydantic's **kwargs
         # validation against SolwynConfig's typed fields, so tightening here
@@ -1186,10 +1262,10 @@ class AsyncSolwyn(_SolwynBase):
     def messages(self) -> Any:
         """Anthropic-compatible: client.messages.create() goes through interception.
 
-        Cached: _detected_provider is fixed at construction, so the conditional
+        Cached: the dialect is fixed at construction, so the conditional
         result is stable for the lifetime of this client instance.
         """
-        if self._detected_provider == ProviderName.ANTHROPIC:
+        if self._dialect == "anthropic":
             return _AsyncMessagesProxy(self)
         return self._client.messages
 
@@ -1197,10 +1273,10 @@ class AsyncSolwyn(_SolwynBase):
     def models(self) -> Any:
         """Google-compatible: client.models.generate_content() goes through interception.
 
-        Cached: _detected_provider is fixed at construction, so the conditional
+        Cached: the dialect is fixed at construction, so the conditional
         result is stable for the lifetime of this client instance.
         """
-        if self._detected_provider == ProviderName.GOOGLE:
+        if self._dialect == "google":
             return _AsyncModelsProxy(self)
         return self._client.models
 
@@ -1394,7 +1470,9 @@ class AsyncSolwyn(_SolwynBase):
                 )
                 served_model = requested_model if is_primary else rt.entry.model
                 if is_streaming:
-                    call_kwargs = rt.adapter.prepare_streaming(call_kwargs)
+                    call_kwargs = rt.adapter.prepare_streaming(
+                        call_kwargs, cross_provider=is_provider_fallback
+                    )
             except Exception:
                 cb.release_probe(admission)
                 raise
@@ -1421,8 +1499,8 @@ class AsyncSolwyn(_SolwynBase):
                         timeout=_hop_timeout(deadline, len(candidates) - idx),
                         max_retries=0,
                     )
-                    if is_streaming and provider == ProviderName.GOOGLE.value:
-                        # First-chunk materialization — GOOGLE ONLY (fix
+                    if is_streaming and rt.adapter.dialect == "google":
+                        # First-chunk materialization — GOOGLE DIALECT ONLY (fix
                         # [B]). Awaiting this runs the eager anext, so a Google
                         # lazy-generator establishment error falls into THIS except ->
                         # classify_exception -> failover. OpenAI/Anthropic established
@@ -1530,6 +1608,7 @@ class AsyncSolwyn(_SolwynBase):
                     primary_errored=primary_errored,
                     call_id=call_id,
                     agent_run=agent_run,
+                    estimated_input_tokens=est_in,
                 )
             cb.record_success()
 
@@ -1539,6 +1618,15 @@ class AsyncSolwyn(_SolwynBase):
             self.record_latency(provider, ctx.elapsed_ms())
 
             token_details = rt.adapter.extract_usage(response)
+            # Explicit-degradation fallback: a compat provider that omitted the
+            # usage block yields a length-based estimate (is_estimated=True)
+            # instead of silently recording zero spend. None when usage was
+            # present or the adapter always reports usage.
+            estimated_details = rt.adapter.estimate_missing_usage(
+                response, estimated_input_tokens=est_in
+            )
+            if estimated_details is not None:
+                token_details = estimated_details
             # Per-region pricing attribution: the SERVED runtime's endpoint
             # region (None for providers without regional pricing).
             provider_region = rt.adapter.extract_region(rt.sdk_client)
@@ -1546,13 +1634,14 @@ class AsyncSolwyn(_SolwynBase):
             # metadata must carry the same tier (see the sync path).
             service_tier = rt.adapter.extract_service_tier(response)
             result = response
-            if is_provider_fallback:
-                # Cross-provider hop: reshape the served response back to the
-                # caller's native dialect BEFORE confirm/report success. If the
+            if is_provider_fallback and rt.adapter.dialect != primary.adapter.dialect:
+                # Cross-DIALECT hop: reshape the served response back to the
+                # caller's native dialect BEFORE confirm/report success. (A
+                # same-dialect cross-provider hop needs no reshape.) If the
                 # served shape is unexpected, do not mark Solwyn billing settled.
                 result = _translation.normalize_response(
-                    served=rt.adapter.name,
-                    requested=primary.adapter.name,
+                    served=rt.adapter.dialect,
+                    requested=primary.adapter.dialect,
                     response=response,
                 )
             if budget.reservation_id:
@@ -1613,6 +1702,7 @@ class AsyncSolwyn(_SolwynBase):
         primary_errored: bool,
         call_id: str,
         agent_run: tuple[str | None, str | None],
+        estimated_input_tokens: int = 0,
     ) -> Any:
         """Wrap an async streaming response, settling against the SERVED runtime.
 
@@ -1623,7 +1713,11 @@ class AsyncSolwyn(_SolwynBase):
         provider = runtime.adapter.name
         served_model = ctx.model
         is_provider_fallback = ctx.is_provider_fallback
-        accumulator = runtime.adapter.create_stream_accumulator()
+        # The pre-call input estimate feeds the compat accumulators'
+        # missing-usage fallback; always-reporting providers ignore it.
+        accumulator = runtime.adapter.create_stream_accumulator(
+            estimated_input_tokens=estimated_input_tokens
+        )
         # Per-region pricing attribution for the SERVED runtime (None for
         # providers without regional pricing). Captured once, closed over.
         provider_region = runtime.adapter.extract_region(runtime.sdk_client)
@@ -1695,12 +1789,14 @@ class AsyncSolwyn(_SolwynBase):
                 )
             )
 
-        # Cross-provider hop: reshape each served chunk back to the caller's
+        # Cross-DIALECT hop: reshape each served chunk back to the caller's
         # native streaming dialect. Same-dialect passes None (zero
         # translation). See the sync ``_wrap_stream`` for the accounting note.
         chunk_translator = (
-            _make_chunk_translator(served=provider, requested=primary.adapter.name)
-            if is_provider_fallback
+            _make_chunk_translator(
+                served=runtime.adapter.dialect, requested=primary.adapter.dialect
+            )
+            if is_provider_fallback and runtime.adapter.dialect != primary.adapter.dialect
             else None
         )
         # Stream nesting and caller-dialect result shape are adapter-owned —

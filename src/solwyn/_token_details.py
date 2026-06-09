@@ -47,6 +47,15 @@ class TokenDetails(BaseModel):
     tool_use_input_tokens: int = Field(
         default=0, ge=0, description="Tokens used for tool/function definitions (Google)"
     )
+    is_estimated: bool = Field(
+        default=False,
+        description=(
+            "True when the provider returned no usage data and these counts are "
+            "SDK-side length-based estimates (explicit degradation marker — the "
+            "API can surface estimated costs distinctly). False for "
+            "provider-reported counts."
+        ),
+    )
 
     @property
     def total_tokens(self) -> int:

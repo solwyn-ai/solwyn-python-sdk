@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from solwyn._constants import SERVICE_TIER_MAX_LENGTH
 from solwyn._token_details import TokenDetails
@@ -105,8 +105,17 @@ class OpenAIAdapter:
     def name(self) -> str:
         return "openai"
 
+    @property
+    def dialect(self) -> Literal["openai"]:
+        return "openai"
+
     def detect_client(self, client: Any) -> bool:
-        """Return True if the client's module path contains 'openai'."""
+        """Return True if the client's module path contains 'openai'.
+
+        Registered AFTER the OpenAI-compatible adapters, which claim
+        openai-module clients whose base_url points at another vendor —
+        so reaching this adapter means the client targets OpenAI itself.
+        """
         return "openai" in getattr(type(client), "__module__", "")
 
     def detect_model(self, model: str) -> bool:
@@ -116,6 +125,12 @@ class OpenAIAdapter:
     def extract_usage(self, response: Any) -> TokenDetails:
         """Extract token usage from a Chat Completions or Responses API response."""
         return _extract_openai_usage(response)
+
+    def estimate_missing_usage(
+        self, response: Any, *, estimated_input_tokens: int
+    ) -> TokenDetails | None:
+        """OpenAI itself always reports usage — no estimated fallback."""
+        return None
 
     def extract_service_tier(self, response: Any) -> str | None:
         """Return service_tier from an OpenAI response, or None if absent.
@@ -129,7 +144,9 @@ class OpenAIAdapter:
         """OpenAI pricing is not regional."""
         return None
 
-    def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+    def prepare_streaming(
+        self, kwargs: dict[str, Any], *, cross_provider: bool = False
+    ) -> dict[str, Any]:
         """Inject stream_options so usage appears in the final chunk."""
         kwargs = dict(kwargs)
         stream_options = dict(kwargs.get("stream_options") or {})
@@ -137,7 +154,11 @@ class OpenAIAdapter:
         kwargs["stream_options"] = stream_options
         return kwargs
 
-    def create_stream_accumulator(self) -> OpenAIStreamAccumulator:
+    def create_stream_accumulator(
+        self, *, estimated_input_tokens: int = 0
+    ) -> OpenAIStreamAccumulator:
+        """OpenAI streams always carry usage (include_usage is injected) —
+        the input estimate is not needed."""
         return OpenAIStreamAccumulator()
 
     def prepare_call(

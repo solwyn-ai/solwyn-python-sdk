@@ -20,7 +20,7 @@ The usage data lives on response.usage_metadata (not response.usage).
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from solwyn._token_details import TokenDetails
 
@@ -107,6 +107,10 @@ class GoogleAdapter:
     def name(self) -> str:
         return "google"
 
+    @property
+    def dialect(self) -> Literal["google"]:
+        return "google"
+
     def detect_client(self, client: Any) -> bool:
         """Return True if client module path contains 'google.genai' or 'google.generativeai'."""
         module = getattr(type(client), "__module__", "")
@@ -121,6 +125,12 @@ class GoogleAdapter:
         usage_metadata = getattr(response, "usage_metadata", None)
         return _extract_google_usage(usage_metadata)
 
+    def estimate_missing_usage(
+        self, response: Any, *, estimated_input_tokens: int
+    ) -> TokenDetails | None:
+        """Google always reports usage_metadata — no estimated fallback."""
+        return None
+
     def extract_service_tier(self, response: Any) -> str | None:
         """Google responses do not expose a service tier."""
         return None
@@ -129,11 +139,17 @@ class GoogleAdapter:
         """Gemini API pricing is not regional."""
         return None
 
-    def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+    def prepare_streaming(
+        self, kwargs: dict[str, Any], *, cross_provider: bool = False
+    ) -> dict[str, Any]:
         """Google streams include usage_metadata by default — no changes needed."""
         return dict(kwargs)
 
-    def create_stream_accumulator(self) -> GoogleStreamAccumulator:
+    def create_stream_accumulator(
+        self, *, estimated_input_tokens: int = 0
+    ) -> GoogleStreamAccumulator:
+        """Google chunks carry usage_metadata by default — the input estimate
+        is not needed."""
         return GoogleStreamAccumulator()
 
     def prepare_call(

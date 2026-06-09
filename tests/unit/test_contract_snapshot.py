@@ -95,7 +95,27 @@ _NONE_SKIPPED_CONFIRM_FIELDS = {"provider_region", "service_tier"}
 # Provider identifiers ARE wire values (events/confirms/checks carry them).
 # Adding one is an API-first deploy: the Cloud API must accept it BEFORE any
 # SDK release that can emit it.
-EXPECTED_PROVIDER_NAMES = {"openai", "anthropic", "google", "bedrock"}
+EXPECTED_PROVIDER_NAMES = {
+    "openai",
+    "anthropic",
+    "google",
+    "bedrock",
+    # OpenAI-compatible providers (Chat Completions dialect, distinct names)
+    "xai",
+    "deepseek",
+    "mistral",
+    "qwen",
+    "groq",
+    "together",
+    "fireworks",
+    "perplexity",
+    "azure_openai",
+    "openrouter",
+    "ollama",
+    "vllm",
+    "lmstudio",
+    "openai_compatible",
+}
 
 EXPECTED_METADATA_FIELDS = {
     "model",

@@ -9,8 +9,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from solwyn._types import ProviderName
-
 if TYPE_CHECKING:
     from solwyn.client import AsyncSolwyn, Solwyn
 
@@ -58,16 +56,17 @@ class _SyncChatProxy:
         self.completions = _SyncChatCompletionsProxy(solwyn)
 
     def __getattr__(self, name: str) -> Any:
-        """Pass through non-completions attributes (OpenAI only).
+        """Pass through non-completions attributes (OpenAI dialect only).
 
-        This proxy is only constructed for OpenAI clients. Any attribute
-        that is not ``completions`` (set in __init__) falls through here.
+        This proxy is only useful for OpenAI-dialect clients (OpenAI itself
+        plus every OpenAI-compatible provider). Any attribute that is not
+        ``completions`` (set in __init__) falls through here.
         """
-        if self._solwyn._detected_provider == ProviderName.OPENAI:
+        if self._solwyn._dialect == "openai":
             return getattr(self._solwyn._client.chat, name)
         raise AttributeError(
             f"'chat.{name}' is not supported. "
-            f"The Solwyn chat proxy is OpenAI-specific; Anthropic uses "
+            f"The Solwyn chat proxy is OpenAI-dialect-specific; Anthropic uses "
             f"'messages' and Google uses 'models'."
         )
 
@@ -139,11 +138,11 @@ class _AsyncChatProxy:
         self.completions = _AsyncChatCompletionsProxy(solwyn)
 
     def __getattr__(self, name: str) -> Any:
-        if self._solwyn._detected_provider == ProviderName.OPENAI:
+        if self._solwyn._dialect == "openai":
             return getattr(self._solwyn._client.chat, name)
         raise AttributeError(
             f"'chat.{name}' is not supported. "
-            f"The Solwyn chat proxy is OpenAI-specific; Anthropic uses "
+            f"The Solwyn chat proxy is OpenAI-dialect-specific; Anthropic uses "
             f"'messages' and Google uses 'models'."
         )
 

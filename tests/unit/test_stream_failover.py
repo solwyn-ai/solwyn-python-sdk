@@ -1075,8 +1075,8 @@ class TestNoDoubleEmitThreeChunks:
         real_factory = rt.adapter.create_stream_accumulator
         counting: list[_CountingAccumulator] = []
 
-        def _factory() -> _CountingAccumulator:
-            acc = _CountingAccumulator(real_factory())
+        def _factory(*, estimated_input_tokens: int = 0) -> _CountingAccumulator:
+            acc = _CountingAccumulator(real_factory(estimated_input_tokens=estimated_input_tokens))
             counting.append(acc)
             return acc
 

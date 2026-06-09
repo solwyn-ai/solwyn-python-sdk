@@ -30,8 +30,22 @@ def _ensure_loaded() -> None:
         from solwyn.providers.bedrock import BedrockAdapter
         from solwyn.providers.google import GoogleAdapter
         from solwyn.providers.openai import OpenAIAdapter
+        from solwyn.providers.openai_compatible import build_compat_adapters
 
-        _ADAPTERS = [OpenAIAdapter(), AnthropicAdapter(), GoogleAdapter(), BedrockAdapter()]
+        # ORDER IS LOAD-BEARING for detect_client: OpenAI-compatible adapters
+        # claim openai-module clients whose base_url targets another vendor
+        # (named profiles first, the generic catch-all last among them), so
+        # the plain OpenAIAdapter must come AFTER them — it matches ANY
+        # openai-module client and would otherwise shadow every compat
+        # provider as "openai". Bedrock detection is exact (botocore client
+        # shape), so its position is unconstrained.
+        _ADAPTERS = [
+            *build_compat_adapters(),
+            OpenAIAdapter(),
+            AnthropicAdapter(),
+            GoogleAdapter(),
+            BedrockAdapter(),
+        ]
         _ADAPTER_BY_NAME = {a.name: a for a in _ADAPTERS}
 
 
