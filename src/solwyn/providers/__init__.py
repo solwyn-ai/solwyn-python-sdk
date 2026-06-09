@@ -27,10 +27,11 @@ def _ensure_loaded() -> None:
     global _ADAPTERS, _ADAPTER_BY_NAME
     if _ADAPTERS is None:
         from solwyn.providers.anthropic import AnthropicAdapter
+        from solwyn.providers.bedrock import BedrockAdapter
         from solwyn.providers.google import GoogleAdapter
         from solwyn.providers.openai import OpenAIAdapter
 
-        _ADAPTERS = [OpenAIAdapter(), AnthropicAdapter(), GoogleAdapter()]
+        _ADAPTERS = [OpenAIAdapter(), AnthropicAdapter(), GoogleAdapter(), BedrockAdapter()]
         _ADAPTER_BY_NAME = {a.name: a for a in _ADAPTERS}
 
 

@@ -149,8 +149,10 @@ class TestMetadataEventFailoverFields:
             _metadata_event(failover_error_class="x" * 65)
 
     def test_requested_model_length_bounded(self) -> None:
+        # 2048, not 100: the AWS Converse modelId contract allows ARNs up to
+        # 2048 chars, which must never fail wire-model validation.
         with pytest.raises(ValidationError):
-            _metadata_event(requested_model="m" * 101)
+            _metadata_event(requested_model="m" * 2049)
 
 
 @pytest.mark.unit

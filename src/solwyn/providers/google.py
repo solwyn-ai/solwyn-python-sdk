@@ -83,6 +83,10 @@ class GoogleAdapter:
         """Google responses do not expose a service tier."""
         return None
 
+    def extract_region(self, client: Any) -> str | None:
+        """Gemini API pricing is not regional."""
+        return None
+
     def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Google streams include usage_metadata by default — no changes needed."""
         return dict(kwargs)

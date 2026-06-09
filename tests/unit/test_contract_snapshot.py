@@ -84,7 +84,13 @@ EXPECTED_CONFIRM_FIELDS = {
     "token_details",
     "is_provider_fallback",
     "call_id",
+    "provider_region",
 }
+
+# Provider identifiers ARE wire values (events/confirms/checks carry them).
+# Adding one is an API-first deploy: the Cloud API must accept it BEFORE any
+# SDK release that can emit it.
+EXPECTED_PROVIDER_NAMES = {"openai", "anthropic", "google", "bedrock"}
 
 EXPECTED_METADATA_FIELDS = {
     "model",
@@ -108,6 +114,7 @@ EXPECTED_METADATA_FIELDS = {
     "attempt_index",
     "call_id",
     "possibly_succeeded",
+    "provider_region",
 }
 
 
@@ -129,6 +136,9 @@ class TestWireModelFieldSets:
 
     def test_metadata_event_field_set(self) -> None:
         assert set(MetadataEvent.model_fields) == EXPECTED_METADATA_FIELDS
+
+    def test_provider_name_values(self) -> None:
+        assert {p.value for p in ProviderName} == EXPECTED_PROVIDER_NAMES
 
 
 def _metadata_event(**overrides: object) -> MetadataEvent:
@@ -298,10 +308,11 @@ class TestWireModelFieldConstraints:
 
     def test_metadata_requested_model_max_length_pinned(self) -> None:
         # requested_model is bounded so a malformed/oversized value can't bloat
-        # the wire payload. Pin the exact bound (100).
+        # the wire payload. Pin the exact bound (2048 — the AWS Converse modelId
+        # contract; Bedrock inference-profile ARNs exceed the old 100).
         field = MetadataEvent.model_fields["requested_model"]
         max_lengths = [m.max_length for m in field.metadata if hasattr(m, "max_length")]
-        assert 100 in max_lengths
+        assert 2048 in max_lengths
 
     def test_metadata_failover_error_class_max_length_pinned(self) -> None:
         # failover_error_class carries only type(exc).__name__; the 64 bound caps
@@ -317,8 +328,16 @@ class TestWireModelFieldConstraints:
                 model="gpt-4o",
                 provider=ProviderName.OPENAI,
                 fallback_providers=[ProviderName.ANTHROPIC],
-                fallback_models=["x" * 101],
+                fallback_models=["x" * 2049],
             )
+
+    def test_metadata_provider_region_omitted_when_none_present_when_set(self) -> None:
+        # provider_region rides the None-skipping serializer: absent for the
+        # bearer-key providers (wire bytes unchanged), present for Bedrock where
+        # pricing is keyed by (provider, model, region).
+        assert "provider_region" not in _metadata_event().model_dump(mode="json")
+        dumped = _metadata_event(provider_region="us-east-1").model_dump(mode="json")
+        assert dumped["provider_region"] == "us-east-1"
 
 
 # --------------------------------------------------------------------------- #

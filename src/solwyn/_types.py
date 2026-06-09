@@ -26,6 +26,8 @@ from pydantic import (
 from solwyn._constants import (
     AGENT_RUN_ID_MAX_LENGTH,
     AGENT_RUN_NAME_MAX_LENGTH,
+    MODEL_NAME_MAX_LENGTH,
+    PROVIDER_REGION_MAX_LENGTH,
     SERVICE_TIER_MAX_LENGTH,
 )
 from solwyn._token_details import TokenDetails
@@ -54,6 +56,7 @@ class ProviderName(StrEnum):
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
     GOOGLE = "google"
+    BEDROCK = "bedrock"
 
 
 class CallStatus(StrEnum):
@@ -87,7 +90,9 @@ class ProviderEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: ProviderName = Field(..., description="Target LLM provider")
-    model: str = Field(..., max_length=100, description="Model name for this provider")
+    model: str = Field(
+        ..., max_length=MODEL_NAME_MAX_LENGTH, description="Model name for this provider"
+    )
     default_params: dict[str, Any] = Field(
         default_factory=dict,
         description="Fill-absent default request params for this entry",
@@ -119,7 +124,9 @@ class MetadataEvent(BaseModel):
         serialized = cast(dict[str, Any], data)
         return {key: value for key, value in serialized.items() if value is not None}
 
-    model: str = Field(..., max_length=100, description="LLM model name (e.g. gpt-4o)")
+    model: str = Field(
+        ..., max_length=MODEL_NAME_MAX_LENGTH, description="LLM model name (e.g. gpt-4o)"
+    )
     provider: ProviderName = Field(..., description="LLM provider")
     input_tokens: int = Field(..., ge=0, description="Input token count")
     output_tokens: int = Field(..., ge=0, description="Output token count")
@@ -131,7 +138,7 @@ class MetadataEvent(BaseModel):
     is_model_fallback: bool = Field(..., description="same-provider model swap ONLY")
     is_provider_fallback: bool = Field(default=False, description="served provider != requested")
     requested_provider: ProviderName | None = Field(default=None)
-    requested_model: str | None = Field(default=None, max_length=100)
+    requested_model: str | None = Field(default=None, max_length=MODEL_NAME_MAX_LENGTH)
     failover_reason: FailoverReason | None = Field(default=None)
     failover_error_class: str | None = Field(
         default=None,
@@ -175,6 +182,16 @@ class MetadataEvent(BaseModel):
         max_length=AGENT_RUN_NAME_MAX_LENGTH,
         description="Human-readable label passed to solwyn.run(name).",
     )
+    provider_region: str | None = Field(
+        default=None,
+        max_length=PROVIDER_REGION_MAX_LENGTH,
+        description=(
+            "Cloud region of the endpoint that served the call (e.g. 'us-east-1' "
+            "for Bedrock, whose pricing is keyed per model AND region). None for "
+            "providers without regional pricing — the None-skipping serializer "
+            "keeps their wire bytes unchanged."
+        ),
+    )
 
 
 class BudgetCheckRequest(BaseModel):
@@ -185,13 +202,13 @@ class BudgetCheckRequest(BaseModel):
     estimated_input_tokens: int = Field(
         ..., ge=0, description="Estimated input token count for the pending call"
     )
-    model: str = Field(..., max_length=100, description="LLM model name")
+    model: str = Field(..., max_length=MODEL_NAME_MAX_LENGTH, description="LLM model name")
     provider: ProviderName = Field(..., description="Target provider")
     fallback_providers: list[ProviderName] = Field(
         default_factory=list,
         description="Configured failover providers, in attempt order (chain hint)",
     )
-    fallback_models: list[Annotated[str, Field(max_length=100)]] = Field(
+    fallback_models: list[Annotated[str, Field(max_length=MODEL_NAME_MAX_LENGTH)]] = Field(
         default_factory=list,
         max_length=8,
         description="Failover models aligned element-for-element with fallback_providers",
@@ -239,7 +256,9 @@ class BudgetConfirmRequest(BaseModel):
     reservation_id: str = Field(
         ..., description="Budget reservation ID returned by BudgetCheckResponse"
     )
-    model: str = Field(..., max_length=100, description="LLM model name used for the call")
+    model: str = Field(
+        ..., max_length=MODEL_NAME_MAX_LENGTH, description="LLM model name used for the call"
+    )
     provider: ProviderName = Field(
         ..., description="Provider that actually served the call (required)"
     )
@@ -252,4 +271,12 @@ class BudgetConfirmRequest(BaseModel):
     )
     token_details: TokenDetails = Field(
         ..., description="Actual token breakdown from the provider adapter"
+    )
+    provider_region: str | None = Field(
+        default=None,
+        max_length=PROVIDER_REGION_MAX_LENGTH,
+        description=(
+            "Cloud region of the serving endpoint, for per-region pricing "
+            "(Bedrock). None for providers without regional pricing."
+        ),
     )

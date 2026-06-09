@@ -17,7 +17,7 @@ from typing import Any, Literal, NoReturn
 
 from solwyn.exceptions import UntranslatableRequestError
 
-_PROVIDERS = ("openai", "anthropic", "google")
+_PROVIDERS = ("openai", "anthropic", "google", "bedrock")
 
 # Cross-provider streaming structural labels. A tool-call or non-text media
 # delta is out of the v1 streaming subset and RAISES with one of these; chunk
@@ -197,6 +197,17 @@ _RECOGNIZED_GOOGLE_CONFIG = frozenset(
         "candidate_count",
     }
 )
+# Bedrock Converse kwargs (the proxy has already renamed modelId -> model).
+# Everything else AWS accepts (guardrailConfig, additionalModelRequestFields,
+# promptVariables, requestMetadata, performanceConfig, outputConfig,
+# serviceTier, additionalModelResponseFieldPaths) is outside the canonical
+# subset and fails closed; guardrailConfig gets a dedicated label.
+_RECOGNIZED_BEDROCK_TOP_LEVEL = frozenset(
+    {"model", "messages", "system", "inferenceConfig", "toolConfig", "stream"}
+)
+_RECOGNIZED_BEDROCK_INFERENCE_CONFIG = frozenset(
+    {"maxTokens", "temperature", "topP", "stopSequences"}
+)
 
 
 # Caller-controlled content-part discriminators (a block ``type``) map to FIXED
@@ -287,6 +298,19 @@ def _check_forbidden_keys(provider: str, kwargs: dict[str, Any]) -> None:
         for key in kwargs:
             if key not in _RECOGNIZED_ANTHROPIC_TOP_LEVEL:
                 _raise(provider, "*", f"unsupported_kwarg.{key}")
+    elif provider == "bedrock":
+        # Dedicated label first: guardrails are a load-bearing safety feature a
+        # cross-provider hop would silently strip — name it explicitly.
+        if kwargs.get("guardrailConfig") is not None:
+            _raise(provider, "*", "bedrock.guardrail_config")
+        for key in kwargs:
+            if key not in _RECOGNIZED_BEDROCK_TOP_LEVEL:
+                _raise(provider, "*", f"unsupported_kwarg.{key}")
+        inference_config = kwargs.get("inferenceConfig")
+        if isinstance(inference_config, dict):
+            for key in inference_config:
+                if key not in _RECOGNIZED_BEDROCK_INFERENCE_CONFIG:
+                    _raise(provider, "*", f"unsupported_kwarg.{key}")
     else:  # google
         for key in kwargs:
             if key not in _RECOGNIZED_GOOGLE_TOP_LEVEL:

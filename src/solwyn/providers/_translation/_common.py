@@ -82,6 +82,17 @@ _FINISH_TO_CANONICAL: dict[str, dict[str, str]] = {
         "PROHIBITED_CONTENT": "content_filter",
         "BLOCKLIST": "content_filter",
     },
+    "bedrock": {
+        "end_turn": "stop",
+        "stop_sequence": "stop",
+        "max_tokens": "length",
+        "model_context_window_exceeded": "length",
+        "tool_use": "tool_use",
+        "guardrail_intervened": "content_filter",
+        "content_filtered": "content_filter",
+        # malformed_model_output / malformed_tool_use stay unmapped (None) —
+        # the model misbehaved; no canonical finish reason fits.
+    },
 }
 
 _CANONICAL_TO_FINISH: dict[str, dict[str, str]] = {
@@ -102,6 +113,12 @@ _CANONICAL_TO_FINISH: dict[str, dict[str, str]] = {
         "length": "MAX_TOKENS",
         "tool_use": "STOP",
         "content_filter": "SAFETY",
+    },
+    "bedrock": {
+        "stop": "end_turn",
+        "length": "max_tokens",
+        "tool_use": "tool_use",
+        "content_filter": "content_filtered",
     },
 }
 

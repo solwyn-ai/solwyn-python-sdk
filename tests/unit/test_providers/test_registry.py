@@ -141,15 +141,15 @@ class TestGetAdapterForClient:
 
 @pytest.mark.unit
 class TestAllAdaptersRegistered:
-    def test_all_three_providers_registered(self) -> None:
-        """All three expected provider names resolve without error."""
-        for name in ("openai", "anthropic", "google"):
+    def test_all_four_providers_registered(self) -> None:
+        """All four expected provider names resolve without error."""
+        for name in ("openai", "anthropic", "google", "bedrock"):
             adapter = get_adapter_by_name(name)
             assert adapter is not None
 
     def test_all_adapters_satisfy_provider_adapter_protocol(self) -> None:
         """Every registered adapter is a runtime ProviderAdapter instance."""
-        for name in ("openai", "anthropic", "google"):
+        for name in ("openai", "anthropic", "google", "bedrock"):
             adapter = get_adapter_by_name(name)
             assert isinstance(adapter, ProviderAdapter), (
                 f"Adapter '{name}' does not satisfy ProviderAdapter protocol"
@@ -157,12 +157,40 @@ class TestAllAdaptersRegistered:
 
     def test_adapter_names_match_registry_keys(self) -> None:
         """Each adapter's name property matches the key it was registered under."""
-        for name in ("openai", "anthropic", "google"):
+        for name in ("openai", "anthropic", "google", "bedrock"):
             adapter = get_adapter_by_name(name)
             assert adapter.name == name
 
     def test_adapter_names_are_provider_name_values(self) -> None:
         """CostPolicy price hints key by ProviderName value; adapter names must match."""
-        for name in ("openai", "anthropic", "google"):
+        for name in ("openai", "anthropic", "google", "bedrock"):
             adapter = get_adapter_by_name(name)
             assert ProviderName(adapter.name) is ProviderName(name)
+
+    def test_bedrock_model_id_routes_to_bedrock_adapter(self) -> None:
+        from solwyn.providers import get_adapter_for_model
+
+        adapter = get_adapter_for_model("us.anthropic.claude-3-5-sonnet-20241022-v2:0")
+        assert adapter.name == "bedrock"
+
+    def test_direct_anthropic_model_id_still_routes_to_anthropic(self) -> None:
+        # The Bedrock patterns must never shadow the native adapters.
+        from solwyn.providers import get_adapter_for_model
+
+        assert get_adapter_for_model("claude-3-5-sonnet").name == "anthropic"
+
+    def test_bedrock_runtime_client_routes_to_bedrock_adapter(self) -> None:
+        from types import SimpleNamespace
+
+        from solwyn.providers import get_adapter_for_client
+
+        class FakeBedrockRuntime:
+            pass
+
+        FakeBedrockRuntime.__module__ = "botocore.client"
+        client = FakeBedrockRuntime()
+        client.meta = SimpleNamespace(  # type: ignore[attr-defined]
+            service_model=SimpleNamespace(service_name="bedrock-runtime"),
+            region_name="us-east-1",
+        )
+        assert get_adapter_for_client(client).name == "bedrock"

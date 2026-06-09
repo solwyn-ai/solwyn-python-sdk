@@ -1,6 +1,6 @@
 # Solwyn Python SDK
 
-Budget enforcement, circuit breaking, and usage tracking for OpenAI, Anthropic, and Google LLM clients.
+Budget enforcement, circuit breaking, and usage tracking for OpenAI, Anthropic, Google, and Amazon Bedrock LLM clients.
 
 [![CI](https://github.com/solwyn-ai/solwyn-python/actions/workflows/ci.yml/badge.svg)](https://github.com/solwyn-ai/solwyn-python/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/solwyn)](https://pypi.org/project/solwyn/)
@@ -81,6 +81,50 @@ from solwyn import Solwyn
 client = Solwyn(genai.Client(api_key="..."), api_key="sk_proj_...")
 response = client.models.generate_content(model="gemini-2.0-flash", contents="Hello!")
 ```
+
+### Amazon Bedrock
+
+Wrap a `bedrock-runtime` boto3 client. Solwyn intercepts the [Converse API](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html) (`converse` / `converse_stream`), which works uniformly across every chat model Bedrock hosts — Anthropic Claude, Meta Llama, Mistral, Amazon Nova, Cohere, AI21, DeepSeek, and more. Auth stays entirely on your boto3 client (IAM credentials, profiles, roles, SigV4) — Solwyn never sees it.
+
+```python
+import boto3
+from botocore.config import Config
+from solwyn import Solwyn
+
+bedrock = boto3.client(
+    "bedrock-runtime",
+    region_name="us-east-1",
+    # Recommended: let Solwyn own retries/failover instead of stacking
+    # botocore's default retry layer (legacy mode retries up to 5 times).
+    config=Config(retries={"total_max_attempts": 1}, read_timeout=60),
+)
+
+client = Solwyn(bedrock, api_key="sk_proj_...")
+response = client.converse(
+    modelId="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+    messages=[{"role": "user", "content": [{"text": "Hello!"}]}],
+    inferenceConfig={"maxTokens": 1024},
+)
+```
+
+Streaming preserves the boto3 contract (`response["stream"]`); usage settles from the stream's terminal `metadata` event:
+
+```python
+response = client.converse_stream(
+    modelId="amazon.nova-pro-v1:0",
+    messages=[{"role": "user", "content": [{"text": "Hello!"}]}],
+)
+for event in response["stream"]:
+    ...
+```
+
+Notes:
+
+- Model identity is reported exactly as you pass it — foundation-model ids, cross-region inference profiles (`us.` / `eu.` / `jp.` / `global.` …), or full ARNs — together with the client's region, because Bedrock pricing is keyed per model **and** region. Prompt-cache reads/writes (including the 1h-TTL tier via `usage.cacheDetails`) and the latency/service pricing tier are captured for exact repricing.
+- `invoke_model` / `invoke_model_with_response_stream` raise `ConfigurationError` instead of bypassing budget tracking: their usage is buried in a consume-once body alongside response content. Use Converse, or call the unwrapped boto3 client for deliberately untracked calls.
+- boto3 has no per-call timeout override, so the failover deadline cannot shorten an in-flight Bedrock hop — set `read_timeout` in your botocore `Config`.
+- Async works with [aioboto3](https://github.com/terricain/aioboto3): `AsyncSolwyn(client)` inside `async with session.client("bedrock-runtime") as client`.
+- Bedrock participates in cross-provider failover in both directions (e.g. Bedrock-Claude ⇄ direct Anthropic) via the same canonical translation subset as the other providers.
 
 ## Async
 
@@ -213,7 +257,7 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | Field | Type | Description |
 |-------|------|-------------|
 | `model` | `str` | Model name (e.g., `gpt-4o`) |
-| `provider` | `str` | `openai`, `anthropic`, or `google` |
+| `provider` | `str` | `openai`, `anthropic`, `google`, or `bedrock` |
 | `input_tokens` | `int` | Input token count |
 | `output_tokens` | `int` | Output token count |
 | `token_details` | `object` | Breakdown: cached, reasoning, audio tokens |
@@ -224,12 +268,15 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `timestamp` | `datetime` | When the call completed (UTC) |
 | `agent_run_id` | `str \| None` | Run id from the active `solwyn.run(...)` scope, if any. When omitted, the API creates `_auto-{sdk_instance_id}-{YYYY-MM-DD}` |
 | `agent_run_name` | `str \| None` | Run name passed to `solwyn.run(...)`, if any |
+| `provider_region` | `str \| None` | Cloud region of the serving endpoint (Bedrock — pricing is per model and region); omitted for other providers |
 
 **The SDK never captures, logs, or transmits prompts or responses.** This is enforced by [structural tests](tests/unit/test_privacy_firewall.py) and the [privacy module](src/solwyn/_privacy.py).
 
 ## Release Compatibility
 
 Provider failover confirms include `provider` and `call_id` on `POST /api/v1/budgets/confirm` so Solwyn Cloud can price and deduplicate the served provider. Release this SDK only after Solwyn Cloud accepts those fields; deploy the Cloud API first.
+
+Bedrock support additionally requires the Cloud API to accept (deploy API-first): the `bedrock` provider enum value, the optional `provider_region` field on metadata events and budget confirms, and model identifiers up to 2048 chars (Bedrock ARNs; was 100). PricingService should key Bedrock prices by (model, region) and use `service_tier` for flex/priority/latency-optimized repricing.
 
 ## Requirements
 

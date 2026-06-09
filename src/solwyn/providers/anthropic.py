@@ -94,6 +94,10 @@ class AnthropicAdapter:
         """Anthropic responses do not expose a service tier."""
         return None
 
+    def extract_region(self, client: Any) -> str | None:
+        """Anthropic pricing is not regional."""
+        return None
+
     def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Anthropic streams include usage events by default — no changes needed."""
         return dict(kwargs)

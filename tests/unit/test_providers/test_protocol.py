@@ -52,6 +52,9 @@ class _StubAdapter:
     def extract_service_tier(self, response: Any) -> str | None:
         return None
 
+    def extract_region(self, client: Any) -> str | None:
+        return None
+
     def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         return dict(kwargs)
 
@@ -67,7 +70,39 @@ class _IncompleteAdapter:
         return "incomplete"
 
     # Missing: detect_client, detect_model, extract_usage,
-    # extract_service_tier, prepare_streaming, create_stream_accumulator
+    # extract_service_tier, extract_region, prepare_streaming,
+    # create_stream_accumulator
+
+
+class _NoRegionAdapter:
+    """Implements everything EXCEPT extract_region — must NOT satisfy the protocol.
+
+    Pins extract_region as a required protocol member: region is part of the
+    cost-attribution contract (Bedrock pricing is per model AND region), so an
+    adapter cannot silently opt out of answering the question.
+    """
+
+    @property
+    def name(self) -> str:
+        return "no-region"
+
+    def detect_client(self, client: Any) -> bool:
+        return False
+
+    def detect_model(self, model: str) -> bool:
+        return False
+
+    def extract_usage(self, response: Any) -> TokenDetails:
+        return TokenDetails()
+
+    def extract_service_tier(self, response: Any) -> str | None:
+        return None
+
+    def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        return dict(kwargs)
+
+    def create_stream_accumulator(self) -> StreamUsageAccumulator:
+        return _NoOpAccumulator()
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +149,13 @@ class TestProviderAdapterProtocol:
     def test_extract_service_tier_returns_none(self) -> None:
         adapter = _StubAdapter()
         assert adapter.extract_service_tier(object()) is None
+
+    def test_extract_region_returns_none(self) -> None:
+        adapter = _StubAdapter()
+        assert adapter.extract_region(object()) is None
+
+    def test_adapter_without_extract_region_fails_protocol_check(self) -> None:
+        assert not isinstance(_NoRegionAdapter(), ProviderAdapter)
 
     def test_prepare_streaming_returns_dict(self) -> None:
         adapter = _StubAdapter()

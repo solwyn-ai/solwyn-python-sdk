@@ -295,6 +295,7 @@ class _BudgetEnforcerBase:
         provider: str,
         is_provider_fallback: bool = False,
         call_id: str,
+        provider_region: str | None = None,
     ) -> BudgetConfirmRequest:
         """Build a validated confirm request for fire-and-forget callers.
 
@@ -302,6 +303,8 @@ class _BudgetEnforcerBase:
         it on the reporter thread, avoiding a blocking httpx.post. ``provider``
         is the provider that actually served the call (required).
         ``call_id`` is the required per-call reconciliation join key.
+        ``provider_region`` is the served endpoint's region for per-region
+        pricing (Bedrock); None for providers without regional pricing.
         """
         if not call_id:
             raise RuntimeError("call_id is required for budget confirm reconciliation")
@@ -312,6 +315,7 @@ class _BudgetEnforcerBase:
             is_provider_fallback=is_provider_fallback,
             token_details=token_details,
             call_id=call_id,
+            provider_region=provider_region,
         )
 
 
@@ -423,6 +427,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         provider: str,
         is_provider_fallback: bool = False,
         call_id: str,
+        provider_region: str | None = None,
     ) -> None:
         """Confirm actual token usage for a budget reservation.
 
@@ -441,6 +446,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 provider=provider,
                 is_provider_fallback=is_provider_fallback,
                 call_id=call_id,
+                provider_region=provider_region,
             )
             resp = self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",
@@ -565,6 +571,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         provider: str,
         is_provider_fallback: bool = False,
         call_id: str,
+        provider_region: str | None = None,
     ) -> None:
         """Async version of cost confirmation. See BudgetEnforcer.confirm_cost."""
         try:
@@ -575,6 +582,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 provider=provider,
                 is_provider_fallback=is_provider_fallback,
                 call_id=call_id,
+                provider_region=provider_region,
             )
             resp = await self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",

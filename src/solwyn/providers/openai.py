@@ -124,6 +124,10 @@ class OpenAIAdapter:
         """
         return _extract_service_tier(response)
 
+    def extract_region(self, client: Any) -> str | None:
+        """OpenAI pricing is not regional."""
+        return None
+
     def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Inject stream_options so usage appears in the final chunk."""
         kwargs = dict(kwargs)

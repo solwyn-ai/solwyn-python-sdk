@@ -48,6 +48,15 @@ class ProviderAdapter(Protocol):
         """Extract provider service tier from a response, or None when unavailable."""
         ...
 
+    def extract_region(self, client: Any) -> str | None:
+        """Return the cloud region the client targets, or None.
+
+        Part of the cost-attribution contract: Bedrock pricing is keyed per
+        model AND region, so the served region rides metadata/confirm events.
+        Providers without regional pricing return None.
+        """
+        ...
+
     def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Prepare call kwargs for streaming if needed.
 

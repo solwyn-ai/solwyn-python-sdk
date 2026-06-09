@@ -24,6 +24,14 @@ from ._anthropic import (
     _canonical_to_anthropic,
     _stream_delta_to_anthropic,
 )
+from ._bedrock import (
+    _bedrock_response_to_canonical,
+    _bedrock_stream_chunk_to_deltas,
+    _bedrock_to_canonical,
+    _canonical_response_to_bedrock,
+    _canonical_to_bedrock,
+    _stream_delta_to_bedrock,
+)
 from ._google import (
     _canonical_response_to_google,
     _canonical_to_google,
@@ -69,6 +77,8 @@ def to_canonical(provider: str, kwargs: dict[str, Any]) -> CanonicalRequest:
             return _openai_to_canonical(kwargs)
         if provider == "anthropic":
             return _anthropic_to_canonical(kwargs)
+        if provider == "bedrock":
+            return _bedrock_to_canonical(kwargs)
         return _google_to_canonical(kwargs)
 
 
@@ -84,6 +94,8 @@ def from_canonical(provider: str, canonical: CanonicalRequest, *, model: str) ->
             return _canonical_to_openai(canonical, model)
         if provider == "anthropic":
             return _canonical_to_anthropic(canonical, model)
+        if provider == "bedrock":
+            return _canonical_to_bedrock(canonical, model)
         return _canonical_to_google(canonical, model)
 
 
@@ -112,6 +124,8 @@ def normalize_response(*, served: str, requested: str, response: object) -> obje
             return _canonical_response_to_openai(canonical)
         if requested == "anthropic":
             return _canonical_response_to_anthropic(canonical)
+        if requested == "bedrock":
+            return _canonical_response_to_bedrock(canonical)
         return _canonical_response_to_google(canonical)
 
 
@@ -120,6 +134,8 @@ def _response_to_canonical(served: str, response: object) -> CanonicalResponse:
         return _openai_response_to_canonical(response)
     if served == "anthropic":
         return _anthropic_response_to_canonical(response)
+    if served == "bedrock":
+        return _bedrock_response_to_canonical(response)
     return _google_response_to_canonical(response)
 
 
@@ -158,6 +174,8 @@ def _stream_chunk_to_deltas(served: str, requested: str, chunk: object) -> list[
         return _openai_stream_chunk_to_deltas(served, requested, chunk)
     if served == "anthropic":
         return _anthropic_stream_chunk_to_deltas(served, requested, chunk)
+    if served == "bedrock":
+        return _bedrock_stream_chunk_to_deltas(served, requested, chunk)
     return _google_stream_chunk_to_deltas(served, requested, chunk)
 
 
@@ -167,4 +185,6 @@ def _stream_delta_to_requested(requested: str, delta: _StreamDelta) -> object:
         return _stream_delta_to_openai(delta)
     if requested == "anthropic":
         return _stream_delta_to_anthropic(delta)
+    if requested == "bedrock":
+        return _stream_delta_to_bedrock(delta)
     return _stream_delta_to_google(delta)

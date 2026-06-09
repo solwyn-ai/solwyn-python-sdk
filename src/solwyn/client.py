@@ -36,6 +36,7 @@ from solwyn._proxies import (
     _AsyncChatProxy,
     _AsyncMessagesProxy,
     _AsyncModelsProxy,
+    _bedrock_internal_kwargs,
     _SyncChatProxy,
     _SyncMessagesProxy,
     _SyncModelsProxy,
@@ -99,7 +100,21 @@ _SOURCE_COMPATIBLE_DEFAULT_KEYS = {
         }
     ),
     ProviderName.GOOGLE.value: frozenset({"config", "max_output_tokens", "stream"}),
+    ProviderName.BEDROCK.value: frozenset({"system", "inferenceConfig", "toolConfig", "stream"}),
 }
+
+# Why invoke_model fails loud instead of passing through untracked: it is a
+# PRIMARY completion surface (unlike, say, embeddings), so silent pass-through
+# would be a budget bypass; and its usage lives inside a consume-once response
+# body that also carries response CONTENT, so extracting it would require
+# buffering customer content — off the table by architecture.
+_INVOKE_MODEL_GUIDANCE = (
+    "Solwyn intercepts Bedrock through the Converse API only — use converse() / "
+    "converse_stream(), which work across all Bedrock chat models. invoke_model "
+    "responses carry usage inside a consume-once body, so Solwyn cannot budget-track "
+    "them without buffering response content. To make untracked calls anyway, use "
+    "the unwrapped boto3 client directly."
+)
 
 
 def _source_compatible_defaults(provider: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -562,6 +577,30 @@ class Solwyn(_SolwynBase):
             return _SyncModelsProxy(self)
         return self._client.models
 
+    def converse(self, **kwargs: Any) -> Any:
+        """Bedrock-compatible: client.converse(modelId=...) goes through interception."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            return self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
+        return self._client.converse(**kwargs)
+
+    def converse_stream(self, **kwargs: Any) -> Any:
+        """Bedrock-compatible streaming: returns the boto3 dict with a wrapped stream."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            return self._intercepted_call(_force_stream=True, **_bedrock_internal_kwargs(kwargs))
+        return self._client.converse_stream(**kwargs)
+
+    def invoke_model(self, **kwargs: Any) -> Any:
+        """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        return self._client.invoke_model(**kwargs)
+
+    def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
+        """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        return self._client.invoke_model_with_response_stream(**kwargs)
+
     def _sync_dispatch(
         self,
         runtime: ProviderRuntime,
@@ -597,6 +636,18 @@ class Solwyn(_SolwynBase):
             if is_streaming:
                 kwargs["stream"] = True
             return client.messages.create(**kwargs)
+        if name == ProviderName.BEDROCK.value:
+            # boto3 has no with_options / per-call timeout override; the chain
+            # Deadline plus the caller's botocore Config govern this hop. The
+            # uniform internal ``model`` key renames back to boto3's modelId,
+            # and the streaming intent selects the dedicated method (Converse
+            # takes no ``stream`` kwarg).
+            kwargs = dict(kwargs)
+            kwargs["modelId"] = kwargs.pop("model")
+            kwargs.pop("stream", None)
+            if is_streaming:
+                return client.converse_stream(**kwargs)
+            return client.converse(**kwargs)
         # Google: its generate_content[_stream] methods take no ``stream`` kwarg.
         kwargs = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
         kwargs.pop("stream", None)
@@ -898,6 +949,9 @@ class Solwyn(_SolwynBase):
             self.record_latency(provider, ctx.elapsed_ms())
 
             token_details = rt.adapter.extract_usage(response)
+            # Per-region pricing attribution: the SERVED runtime's endpoint
+            # region (None for providers without regional pricing).
+            provider_region = rt.adapter.extract_region(rt.sdk_client)
             result = response
             if is_provider_fallback:
                 # Cross-provider hop: reshape the served response back to the
@@ -916,6 +970,7 @@ class Solwyn(_SolwynBase):
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
+                    provider_region=provider_region,
                 )
             self._reporter.report(
                 self._build_metadata_event(
@@ -939,6 +994,7 @@ class Solwyn(_SolwynBase):
                     call_id=call_id,
                     service_tier=rt.adapter.extract_service_tier(response),
                     agent_run=agent_run,
+                    provider_region=provider_region,
                 )
             )
             return result
@@ -963,12 +1019,22 @@ class Solwyn(_SolwynBase):
         primary_errored: bool,
         call_id: str,
         agent_run: tuple[str | None, str | None],
-    ) -> SyncStreamWrapper:
-        """Wrap a streaming response, settling against the SERVED runtime."""
+    ) -> Any:
+        """Wrap a streaming response, settling against the SERVED runtime.
+
+        Return shape is dialect-dependent: Bedrock callers get back the boto3
+        contract shape (a dict whose ``"stream"`` value is the wrapped event
+        stream); every other dialect gets the wrapper directly. The wrapped
+        ITERABLE is always the served stream itself — for a served-Bedrock hop
+        that is the inner ``response["stream"]`` event stream, not the dict.
+        """
         provider = runtime.adapter.name
         served_model = ctx.model
         is_provider_fallback = ctx.is_provider_fallback
         accumulator = runtime.adapter.create_stream_accumulator()
+        # Per-region pricing attribution for the SERVED runtime (None for
+        # providers without regional pricing). Captured once, closed over.
+        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
 
         def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             self._get_circuit_breaker(provider).record_success()
@@ -984,6 +1050,7 @@ class Solwyn(_SolwynBase):
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
+                    provider_region=provider_region,
                 )
             event = self._build_metadata_event(
                 model=served_model,
@@ -1006,6 +1073,7 @@ class Solwyn(_SolwynBase):
                 call_id=call_id,
                 service_tier=accumulator.get_service_tier(),
                 agent_run=agent_run,
+                provider_region=provider_region,
             )
             if confirm is not None:
                 self._reporter.report_settlement(confirm, event)
@@ -1040,9 +1108,21 @@ class Solwyn(_SolwynBase):
             if is_provider_fallback
             else None
         )
-        return SyncStreamWrapper(
-            response, accumulator, on_complete, on_error, chunk_translator=chunk_translator
+        # Served-Bedrock streams nest the iterable: converse_stream returns
+        # {"stream": EventStream, ...}. Wrap the INNER event stream (whose
+        # close() releases the connection), not the dict.
+        source = response["stream"] if provider == ProviderName.BEDROCK.value else response
+        wrapper = SyncStreamWrapper(
+            source, accumulator, on_complete, on_error, chunk_translator=chunk_translator
         )
+        if primary.adapter.name == ProviderName.BEDROCK.value:
+            # Bedrock-dialect callers iterate result["stream"] — return the
+            # boto3 contract shape with the wrapped stream swapped in. On a
+            # cross-provider hop there is no served dict to preserve.
+            if provider == ProviderName.BEDROCK.value:
+                return {**response, "stream": wrapper}
+            return {"stream": wrapper}
+        return wrapper
 
     def close(self) -> None:
         """Shut down the reporter and close HTTP clients."""
@@ -1176,6 +1256,32 @@ class AsyncSolwyn(_SolwynBase):
             return _AsyncModelsProxy(self)
         return self._client.models
 
+    async def converse(self, **kwargs: Any) -> Any:
+        """Bedrock-compatible: client.converse(modelId=...) goes through interception."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            return await self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
+        return await self._client.converse(**kwargs)
+
+    async def converse_stream(self, **kwargs: Any) -> Any:
+        """Bedrock-compatible streaming: returns the boto3 dict with a wrapped stream."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            return await self._intercepted_call(
+                _force_stream=True, **_bedrock_internal_kwargs(kwargs)
+            )
+        return await self._client.converse_stream(**kwargs)
+
+    async def invoke_model(self, **kwargs: Any) -> Any:
+        """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        return await self._client.invoke_model(**kwargs)
+
+    async def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
+        """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        return await self._client.invoke_model_with_response_stream(**kwargs)
+
     async def _async_dispatch(
         self,
         runtime: ProviderRuntime,
@@ -1203,6 +1309,16 @@ class AsyncSolwyn(_SolwynBase):
             if is_streaming:
                 kwargs["stream"] = True
             return await client.messages.create(**kwargs)
+        if name == ProviderName.BEDROCK.value:
+            # See the sync dispatch: no per-call timeout on boto3 clients; the
+            # internal ``model`` key renames back to modelId; the streaming
+            # intent selects the dedicated method.
+            kwargs = dict(kwargs)
+            kwargs["modelId"] = kwargs.pop("model")
+            kwargs.pop("stream", None)
+            if is_streaming:
+                return await client.converse_stream(**kwargs)
+            return await client.converse(**kwargs)
         # Google: its generate_content[_stream] methods take no ``stream`` kwarg.
         kwargs = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
         kwargs.pop("stream", None)
@@ -1486,6 +1602,9 @@ class AsyncSolwyn(_SolwynBase):
             self.record_latency(provider, ctx.elapsed_ms())
 
             token_details = rt.adapter.extract_usage(response)
+            # Per-region pricing attribution: the SERVED runtime's endpoint
+            # region (None for providers without regional pricing).
+            provider_region = rt.adapter.extract_region(rt.sdk_client)
             result = response
             if is_provider_fallback:
                 # Cross-provider hop: reshape the served response back to the
@@ -1504,6 +1623,7 @@ class AsyncSolwyn(_SolwynBase):
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
+                    provider_region=provider_region,
                 )
             self._reporter.report(
                 self._build_metadata_event(
@@ -1527,6 +1647,7 @@ class AsyncSolwyn(_SolwynBase):
                     call_id=call_id,
                     service_tier=rt.adapter.extract_service_tier(response),
                     agent_run=agent_run,
+                    provider_region=provider_region,
                 )
             )
             return result
@@ -1551,12 +1672,20 @@ class AsyncSolwyn(_SolwynBase):
         primary_errored: bool,
         call_id: str,
         agent_run: tuple[str | None, str | None],
-    ) -> AsyncStreamWrapper:
-        """Wrap an async streaming response, settling against the SERVED runtime."""
+    ) -> Any:
+        """Wrap an async streaming response, settling against the SERVED runtime.
+
+        Return shape mirrors the sync ``_wrap_stream``: Bedrock-dialect callers
+        get the boto3 contract dict with the wrapped (async) event stream under
+        ``"stream"``; every other dialect gets the wrapper directly.
+        """
         provider = runtime.adapter.name
         served_model = ctx.model
         is_provider_fallback = ctx.is_provider_fallback
         accumulator = runtime.adapter.create_stream_accumulator()
+        # Per-region pricing attribution for the SERVED runtime (None for
+        # providers without regional pricing). Captured once, closed over.
+        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
 
         async def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             self._get_circuit_breaker(provider).record_success()
@@ -1572,6 +1701,7 @@ class AsyncSolwyn(_SolwynBase):
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
+                    provider_region=provider_region,
                 )
             event = self._build_metadata_event(
                 model=served_model,
@@ -1594,6 +1724,7 @@ class AsyncSolwyn(_SolwynBase):
                 call_id=call_id,
                 service_tier=accumulator.get_service_tier(),
                 agent_run=agent_run,
+                provider_region=provider_region,
             )
             if confirm is not None:
                 self._reporter.report_settlement(confirm, event)
@@ -1626,9 +1757,16 @@ class AsyncSolwyn(_SolwynBase):
             if is_provider_fallback
             else None
         )
-        return AsyncStreamWrapper(
-            response, accumulator, on_complete, on_error, chunk_translator=chunk_translator
+        # Served-Bedrock streams nest the iterable (see the sync _wrap_stream).
+        source = response["stream"] if provider == ProviderName.BEDROCK.value else response
+        wrapper = AsyncStreamWrapper(
+            source, accumulator, on_complete, on_error, chunk_translator=chunk_translator
         )
+        if primary.adapter.name == ProviderName.BEDROCK.value:
+            if provider == ProviderName.BEDROCK.value:
+                return {**response, "stream": wrapper}
+            return {"stream": wrapper}
+        return wrapper
 
     async def close(self) -> None:
         """Shut down the reporter and close HTTP clients."""

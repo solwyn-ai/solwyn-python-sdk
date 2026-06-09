@@ -29,8 +29,10 @@ def estimate_content_length(kwargs: dict[str, Any]) -> int:
     safe to log — it is not reversible to prompt content.
 
     Args:
-        kwargs: The LLM call kwargs dict. Handles OpenAI/Anthropic
-            messages, Anthropic system prompt, and Google contents.
+        kwargs: The LLM call kwargs dict. Handles OpenAI/Anthropic/Bedrock
+            messages (Bedrock Converse content blocks are ``{"text": ...}``
+            dicts, covered by the block walk), the Anthropic string system
+            prompt, the Bedrock system block LIST, and Google contents.
 
     Returns:
         Total character count (0 if no recognizable content keys).
@@ -54,6 +56,14 @@ def estimate_content_length(kwargs: dict[str, Any]) -> int:
     system = kwargs.get("system")
     if isinstance(system, str):
         total += len(system)
+    elif isinstance(system, list):
+        # Bedrock Converse: system is a list of SystemContentBlock dicts.
+        # Non-text blocks (cachePoint/guardContent) carry no countable text.
+        for block in system:
+            if isinstance(block, dict):
+                text = block.get("text", "")
+                if isinstance(text, str):
+                    total += len(text)
 
     contents = kwargs.get("contents")
     if isinstance(contents, str):
@@ -79,7 +89,7 @@ def estimate_tokens_from_length(char_count: int, provider: str) -> int:
 
     Args:
         char_count: Number of characters in the prompt content.
-        provider: One of "openai", "anthropic", "google".
+        provider: One of "openai", "anthropic", "google", "bedrock".
 
     Returns:
         Estimated token count.
@@ -88,6 +98,10 @@ def estimate_tokens_from_length(char_count: int, provider: str) -> int:
         "openai": 4.0,
         "anthropic": 3.8,
         "google": 4.0,
+        # Bedrock hosts many model families with different tokenizers; 4.0 is
+        # the deliberate multi-family default (pre-flight estimate only — the
+        # settled cost always comes from provider-reported usage).
+        "bedrock": 4.0,
     }
     ratio = ratio_by_provider.get(provider, 4.0)
     return max(1, int(char_count / ratio))

@@ -226,11 +226,14 @@ class _SolwynBase:
         sdk_instance_id: str | None = None,
         timestamp: datetime | None = None,
         agent_run: tuple[str | None, str | None] | None = None,
+        provider_region: str | None = None,
     ) -> MetadataEvent:
         """Build a MetadataEvent for reporting to the cloud API.
 
         ``call_id`` is the per-call reconciliation join key. ``possibly_succeeded``
         is the post-send-ambiguous abort flag — left None on every non-abort event.
+        ``provider_region`` is the served endpoint's cloud region (Bedrock pricing
+        is per model AND region); None for providers without regional pricing.
         """
         if not call_id:
             raise RuntimeError("call_id is required for metadata reconciliation")
@@ -257,6 +260,7 @@ class _SolwynBase:
             agent_run_id=agent_run_id,
             agent_run_name=agent_run_name,
             call_id=call_id,
+            provider_region=provider_region,
         )
 
     def _build_error_event(
