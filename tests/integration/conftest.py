@@ -54,7 +54,12 @@ def _bootstrap_credentials(api_url: str) -> Credentials:
         # Sign up (fall back to login if user already exists)
         r = http.post(
             "/api/v1/auth/signup",
-            json={"email": email, "password": password},
+            json={
+                "email": email,
+                "password": password,
+                # The Cloud API's verify-first signup requires a name field.
+                "display_name": f"SDK Test {session_id}",
+            },
         )
         if r.status_code == 409:
             r = http.post(
