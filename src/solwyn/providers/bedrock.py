@@ -235,6 +235,11 @@ class BedrockStreamAccumulator:
     def observe(self, chunk: Any) -> None:
         if not isinstance(chunk, Mapping):
             return
+        # Any well-formed event marks stream activity. Setting this for metadata
+        # events too (not only the non-metadata branch) lets finalize() warn when
+        # the terminal metadata event arrives WITHOUT usable usage, instead of
+        # silently settling at zero — preserving the "never silently wrong" count.
+        self._saw_event = True
         metadata = chunk.get("metadata")
         if isinstance(metadata, Mapping):
             usage = metadata.get("usage")
@@ -243,15 +248,14 @@ class BedrockStreamAccumulator:
             tier = _extract_bedrock_service_tier(metadata)
             if tier is not None:
                 self._service_tier = tier
-        else:
-            self._saw_event = True
 
     def finalize(self) -> TokenDetails:
         if self._usage is None:
             if self._saw_event:
                 logger.warning(
-                    "Bedrock stream finalized without a metadata event; "
-                    "token counts settle at zero and may be incomplete"
+                    "Bedrock stream settled at zero tokens: no usage in the "
+                    "terminal metadata event (stream abandoned, or the metadata "
+                    "event carried no usage)"
                 )
             return TokenDetails()
         return _extract_bedrock_usage(self._usage)

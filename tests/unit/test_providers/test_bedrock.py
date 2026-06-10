@@ -416,6 +416,24 @@ class TestBedrockStreamAccumulator:
         assert details.input_tokens == 0
         assert not caplog.records
 
+    def test_finalize_with_usageless_metadata_event_warns(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A terminal metadata event that arrives WITHOUT a usage block must still
+        # settle at zeros LOUDLY, not silently. Regression: _saw_event was set
+        # only on non-metadata events, so a metadata-only stream (or a metadata
+        # event missing usage) returned zero tokens with no warning — a silent
+        # budget undercount that violates the "never silently wrong" invariant.
+        acc = BedrockAdapter().create_stream_accumulator()
+        acc.observe({"metadata": {"metrics": {"latencyMs": 42}}})
+
+        with caplog.at_level(logging.WARNING):
+            details = acc.finalize()
+
+        assert details.input_tokens == 0
+        assert details.output_tokens == 0
+        assert any("metadata" in rec.message for rec in caplog.records)
+
     def test_observe_non_mapping_chunk_does_not_raise(self) -> None:
         acc = BedrockAdapter().create_stream_accumulator()
         acc.observe(object())
