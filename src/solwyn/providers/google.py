@@ -19,6 +19,7 @@ The usage data lives on response.usage_metadata (not response.usage).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from solwyn._token_details import TokenDetails
@@ -58,6 +59,47 @@ def _extract_google_usage(usage_metadata: Any) -> TokenDetails:
     )
 
 
+def _mapping_from_config(value: object) -> dict[str, Any]:
+    """Return a shallow dict view of a provider config object."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump(exclude_none=True)
+        if isinstance(dumped, dict):
+            return dict(dumped)
+    attrs = getattr(value, "__dict__", None)
+    if isinstance(attrs, dict):
+        return dict(attrs)
+    return {}
+
+
+def _with_google_http_bound(
+    kwargs: dict[str, Any], *, timeout: float, max_retries: int
+) -> dict[str, Any]:
+    """Inject google-genai per-request HTTP options without importing the extra.
+
+    google-genai accepts ``config={"http_options": ...}`` for generate_content
+    calls, and its timeout is milliseconds. We preserve caller config/http_options
+    but override the timeout and retry attempts because the chain deadline is a
+    mandatory Solwyn bound.
+    """
+    bounded = dict(kwargs)
+    config = _mapping_from_config(bounded.get("config"))
+    http_options = _mapping_from_config(config.get("http_options"))
+    retry_options = _mapping_from_config(http_options.get("retry_options"))
+
+    timeout_ms = max(1, int(timeout * 1000))
+    retry_options["attempts"] = max(1, max_retries + 1)
+    http_options["timeout"] = timeout_ms
+    http_options["retry_options"] = retry_options
+    config["http_options"] = http_options
+    bounded["config"] = config
+    return bounded
+
+
 class GoogleAdapter:
     """Extracts normalized TokenDetails from Google Gemini API responses."""
 
@@ -93,6 +135,35 @@ class GoogleAdapter:
 
     def create_stream_accumulator(self) -> GoogleStreamAccumulator:
         return GoogleStreamAccumulator()
+
+    def prepare_call(
+        self,
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        is_streaming: bool,
+        timeout: float,
+        max_retries: int,
+    ) -> tuple[Callable[..., Any], dict[str, Any]]:
+        """generate_content hop: streaming selects the dedicated method.
+
+        google-genai has no ``with_options``, so the mandatory per-hop bound is
+        injected as per-request ``config.http_options`` here. Its methods take
+        no ``stream`` kwarg — strip it; streaming intent picks the method.
+        """
+        kwargs = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
+        kwargs.pop("stream", None)
+        if is_streaming:
+            return client.models.generate_content_stream, kwargs
+        return client.models.generate_content, kwargs
+
+    def unwrap_stream_source(self, response: Any) -> Any:
+        """The streaming call returns the iterable itself."""
+        return response
+
+    def wrap_stream_result(self, wrapper: Any, served_response: Any) -> Any:
+        """Google-dialect callers iterate the stream object directly."""
+        return wrapper
 
 
 class GoogleStreamAccumulator:

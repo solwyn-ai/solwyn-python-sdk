@@ -27,8 +27,8 @@
 
 - Proxy properties (`chat`, `messages`, `models`) use `@functools.cached_property`; Bedrock's `converse`/`converse_stream`/`invoke_model*` are plain methods on Solwyn/AsyncSolwyn (boto3 methods live on the client root, not a nested resource)
 - `_force_stream=True` is set by the Google proxy's `generate_content_stream` AND the Bedrock `converse_stream` method; `_intercepted_call` folds it into the dispatch-level `is_streaming` boolean, which (not the original flag) drives the served hop's stream-method selection — so cross-provider failover INTO Google/Bedrock streams via their dedicated methods and OUT via `stream=True`
-- Bedrock model-key rename: the proxy renames boto3's `modelId` → internal `model` at interception; dispatch renames it back. The whole pipeline keys on `kwargs["model"]`
-- Bedrock streaming shape: `converse_stream` returns `{"stream": EventStream, ...}` — `_wrap_stream` wraps the INNER event stream and returns the boto3 dict shape to Bedrock-dialect callers (`{**response, "stream": wrapper}`), the bare wrapper to everyone else
+- Per-provider dispatch quirks (stream kwarg vs dedicated method, Bedrock's `modelId` rename, Google's per-request HTTP bound) live on each adapter's `prepare_call`; `_sync_dispatch`/`_async_dispatch` are provider-agnostic. The Bedrock proxy renames boto3's `modelId` → internal `model` at interception; `BedrockAdapter.prepare_call` renames it back. The whole pipeline keys on `kwargs["model"]`
+- Bedrock streaming shape: `converse_stream` returns `{"stream": EventStream, ...}` — the SERVED adapter's `unwrap_stream_source` hands `_wrap_stream` the INNER event stream, and the PRIMARY adapter's `wrap_stream_result` reshapes the wrapper to the caller dialect (boto3 dict for Bedrock callers, the bare wrapper for everyone else)
 - Bedrock `invoke_model` fails loud (`ConfigurationError`) — usage is buried in a consume-once body with response content; silent pass-through would be a budget bypass
 - Stream `on_complete` fire-and-forgets reservation settlement via `reporter.report_settlement()` -- never blocks user thread
 

@@ -61,6 +61,23 @@ class _StubAdapter:
     def create_stream_accumulator(self) -> StreamUsageAccumulator:
         return _NoOpAccumulator()
 
+    def prepare_call(
+        self,
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        is_streaming: bool,
+        timeout: float,
+        max_retries: int,
+    ) -> tuple[Any, dict[str, Any]]:
+        return client.call, dict(kwargs)
+
+    def unwrap_stream_source(self, response: Any) -> Any:
+        return response
+
+    def wrap_stream_result(self, wrapper: Any, served_response: Any) -> Any:
+        return wrapper
+
 
 class _IncompleteAdapter:
     """Class missing required methods — should NOT satisfy the protocol."""
@@ -96,6 +113,57 @@ class _NoRegionAdapter:
         return TokenDetails()
 
     def extract_service_tier(self, response: Any) -> str | None:
+        return None
+
+    def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        return dict(kwargs)
+
+    def create_stream_accumulator(self) -> StreamUsageAccumulator:
+        return _NoOpAccumulator()
+
+    def prepare_call(
+        self,
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        is_streaming: bool,
+        timeout: float,
+        max_retries: int,
+    ) -> tuple[Any, dict[str, Any]]:
+        return client.call, dict(kwargs)
+
+    def unwrap_stream_source(self, response: Any) -> Any:
+        return response
+
+    def wrap_stream_result(self, wrapper: Any, served_response: Any) -> Any:
+        return wrapper
+
+
+class _NoDispatchSeamsAdapter:
+    """Implements everything EXCEPT the dispatch seams — must NOT conform.
+
+    Pins prepare_call / unwrap_stream_source / wrap_stream_result as required
+    protocol members: dispatch and stream-shape handling are fully
+    adapter-driven, so an adapter cannot silently opt out.
+    """
+
+    @property
+    def name(self) -> str:
+        return "no-dispatch-seams"
+
+    def detect_client(self, client: Any) -> bool:
+        return False
+
+    def detect_model(self, model: str) -> bool:
+        return False
+
+    def extract_usage(self, response: Any) -> TokenDetails:
+        return TokenDetails()
+
+    def extract_service_tier(self, response: Any) -> str | None:
+        return None
+
+    def extract_region(self, client: Any) -> str | None:
         return None
 
     def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -156,6 +224,35 @@ class TestProviderAdapterProtocol:
 
     def test_adapter_without_extract_region_fails_protocol_check(self) -> None:
         assert not isinstance(_NoRegionAdapter(), ProviderAdapter)
+
+    def test_adapter_without_dispatch_seams_fails_protocol_check(self) -> None:
+        assert not isinstance(_NoDispatchSeamsAdapter(), ProviderAdapter)
+
+    def test_prepare_call_returns_method_and_kwargs(self) -> None:
+        adapter = _StubAdapter()
+
+        class StubClient:
+            def call(self, **kwargs: Any) -> dict[str, Any]:
+                return kwargs
+
+        client = StubClient()
+        kwargs = {"model": "stub-v1"}
+        method, prepared = adapter.prepare_call(
+            client, kwargs, is_streaming=False, timeout=30.0, max_retries=0
+        )
+        assert callable(method)
+        assert prepared == kwargs
+        assert prepared is not kwargs  # never mutates / aliases the input
+
+    def test_unwrap_stream_source_default_is_identity(self) -> None:
+        adapter = _StubAdapter()
+        response = object()
+        assert adapter.unwrap_stream_source(response) is response
+
+    def test_wrap_stream_result_default_returns_wrapper(self) -> None:
+        adapter = _StubAdapter()
+        wrapper = object()
+        assert adapter.wrap_stream_result(wrapper, object()) is wrapper
 
     def test_prepare_streaming_returns_dict(self) -> None:
         adapter = _StubAdapter()

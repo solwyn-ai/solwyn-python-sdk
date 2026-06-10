@@ -368,6 +368,75 @@ class TestBedrockAdapterPrepareStreaming:
 
 
 @pytest.mark.unit
+class TestBedrockAdapterDispatchSeams:
+    """The per-hop dispatch contract lives on the adapter, not the client.
+
+    prepare_call renames the uniform internal ``model`` key back to boto3's
+    ``modelId``, strips the ``stream`` kwarg (Converse takes none — streaming
+    intent selects the dedicated method), and never mutates the input.
+    unwrap/wrap own the boto3 nested-stream shape.
+    """
+
+    def _client(self) -> Any:
+        client = _bedrock_client()
+        client.converse = lambda **kw: kw  # type: ignore[attr-defined]
+        client.converse_stream = lambda **kw: kw  # type: ignore[attr-defined]
+        return client
+
+    def test_prepare_call_renames_model_key_and_strips_stream(self) -> None:
+        client = self._client()
+        kwargs: dict[str, Any] = {"model": "amazon.nova-pro-v1:0", "messages": [], "stream": True}
+        original = dict(kwargs)
+
+        method, prepared = BedrockAdapter().prepare_call(
+            client, kwargs, is_streaming=False, timeout=30.0, max_retries=0
+        )
+
+        assert method is client.converse
+        assert prepared["modelId"] == "amazon.nova-pro-v1:0"
+        assert "model" not in prepared
+        assert "stream" not in prepared
+        assert kwargs == original  # input never mutated
+
+    def test_prepare_call_streaming_selects_converse_stream(self) -> None:
+        client = self._client()
+
+        method, prepared = BedrockAdapter().prepare_call(
+            client,
+            {"model": "amazon.nova-pro-v1:0", "messages": []},
+            is_streaming=True,
+            timeout=30.0,
+            max_retries=0,
+        )
+
+        assert method is client.converse_stream
+        assert prepared["modelId"] == "amazon.nova-pro-v1:0"
+
+    def test_unwrap_stream_source_returns_inner_event_stream(self) -> None:
+        inner = iter([])
+        response = {"ResponseMetadata": {"HTTPStatusCode": 200}, "stream": inner}
+        assert BedrockAdapter().unwrap_stream_source(response) is inner
+
+    def test_wrap_stream_result_preserves_boto3_dict_shape(self) -> None:
+        # Same-dialect served hop: the boto3 contract dict is preserved with
+        # the wrapped stream swapped in.
+        wrapper = object()
+        response = {"ResponseMetadata": {"HTTPStatusCode": 200}, "stream": iter([])}
+
+        result = BedrockAdapter().wrap_stream_result(wrapper, response)
+
+        assert result["ResponseMetadata"] == {"HTTPStatusCode": 200}
+        assert result["stream"] is wrapper
+
+    def test_wrap_stream_result_cross_provider_builds_minimal_dict(self) -> None:
+        # Cross-provider hop: the served response is a foreign stream object,
+        # not a boto3 dict — there is nothing to preserve.
+        wrapper = object()
+        result = BedrockAdapter().wrap_stream_result(wrapper, iter([]))
+        assert result == {"stream": wrapper}
+
+
+@pytest.mark.unit
 class TestBedrockStreamAccumulator:
     def test_accumulates_usage_from_metadata_event(self) -> None:
         acc = BedrockAdapter().create_stream_accumulator()

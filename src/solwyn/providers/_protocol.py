@@ -6,6 +6,7 @@ responses. Cost calculation lives in the Cloud API's PricingService.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
 from solwyn._token_details import TokenDetails
@@ -69,4 +70,46 @@ class ProviderAdapter(Protocol):
 
     def create_stream_accumulator(self) -> StreamUsageAccumulator:
         """Create a fresh accumulator for a new streaming response."""
+        ...
+
+    def prepare_call(
+        self,
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        is_streaming: bool,
+        timeout: float,
+        max_retries: int,
+    ) -> tuple[Callable[..., Any], dict[str, Any]]:
+        """Select the provider call method and shape kwargs for one dispatch hop.
+
+        Sans-I/O: returns the bound SDK method (sync OR async client — same
+        attribute path; the caller invokes/awaits it) plus a shaped COPY of
+        kwargs. Owns every provider-specific dispatch quirk: streaming intent
+        (``stream=True`` kwarg vs a dedicated method), per-request HTTP bounds
+        for SDKs without ``with_options`` (timeout/max_retries; others ignore
+        them), and any model-key rename. Must not mutate the input kwargs and
+        must never read prompt content — key-level shaping only.
+        """
+        ...
+
+    def unwrap_stream_source(self, response: Any) -> Any:
+        """Return the iterable to wrap from a streaming-call response.
+
+        Identity for providers whose streaming call returns the iterable
+        itself. Bedrock's ConverseStream nests it (``response["stream"]``) —
+        the INNER event stream (whose close() releases the connection) is
+        what the stream wrapper must own.
+        """
+        ...
+
+    def wrap_stream_result(self, wrapper: Any, served_response: Any) -> Any:
+        """Reshape a wrapped stream into THIS adapter's caller dialect.
+
+        Called on the PRIMARY (caller-dialect) adapter with the wrapper and
+        the SERVED hop's raw response. Identity (return the wrapper) for
+        dialects whose callers iterate the stream object directly; Bedrock
+        callers iterate ``result["stream"]``, so its adapter rebuilds the
+        boto3 contract dict around the wrapper.
+        """
         ...

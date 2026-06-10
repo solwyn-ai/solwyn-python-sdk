@@ -242,3 +242,60 @@ class TestGoogleAdapterNoneHandling:
         response = SimpleNamespace(usage_metadata=None)
         result = GoogleAdapter().extract_usage(response)
         assert result == TokenDetails()
+
+
+@pytest.mark.unit
+class TestGoogleAdapterDispatchSeams:
+    def _client(self) -> Any:
+        return SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content=lambda **kw: kw,
+                generate_content_stream=lambda **kw: kw,
+            )
+        )
+
+    def test_prepare_call_strips_stream_and_applies_http_bound(self) -> None:
+        client = self._client()
+        kwargs: dict[str, Any] = {"model": "gemini-2.0-flash", "stream": True}
+        original = dict(kwargs)
+
+        method, prepared = GoogleAdapter().prepare_call(
+            client, kwargs, is_streaming=False, timeout=12.5, max_retries=2
+        )
+
+        assert method is client.models.generate_content
+        assert "stream" not in prepared
+        # google-genai timeouts are milliseconds; attempts = retries + 1.
+        assert prepared["config"]["http_options"]["timeout"] == 12500
+        assert prepared["config"]["http_options"]["retry_options"]["attempts"] == 3
+        assert kwargs == original  # input never mutated
+
+    def test_prepare_call_streaming_selects_generate_content_stream(self) -> None:
+        client = self._client()
+
+        method, _ = GoogleAdapter().prepare_call(
+            client, {"model": "gemini-2.0-flash"}, is_streaming=True, timeout=30.0, max_retries=0
+        )
+
+        assert method is client.models.generate_content_stream
+
+    def test_prepare_call_preserves_caller_config_keys(self) -> None:
+        client = self._client()
+        kwargs: dict[str, Any] = {
+            "model": "gemini-2.0-flash",
+            "config": {"temperature": 0.2, "http_options": {"headers": {"x-a": "1"}}},
+        }
+
+        _, prepared = GoogleAdapter().prepare_call(
+            client, kwargs, is_streaming=False, timeout=10.0, max_retries=0
+        )
+
+        assert prepared["config"]["temperature"] == 0.2
+        assert prepared["config"]["http_options"]["headers"] == {"x-a": "1"}
+        assert prepared["config"]["http_options"]["timeout"] == 10000
+
+    def test_stream_shape_seams_are_identity(self) -> None:
+        adapter = GoogleAdapter()
+        response, wrapper = object(), object()
+        assert adapter.unwrap_stream_source(response) is response
+        assert adapter.wrap_stream_result(wrapper, response) is wrapper

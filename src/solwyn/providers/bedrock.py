@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from solwyn._constants import SERVICE_TIER_MAX_LENGTH
@@ -215,6 +215,49 @@ class BedrockAdapter:
 
     def create_stream_accumulator(self) -> BedrockStreamAccumulator:
         return BedrockStreamAccumulator()
+
+    def prepare_call(
+        self,
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        is_streaming: bool,
+        timeout: float,
+        max_retries: int,
+    ) -> tuple[Callable[..., Any], dict[str, Any]]:
+        """Converse hop: rename the model key back; streaming picks the method.
+
+        The uniform internal ``model`` key renames back to boto3's ``modelId``,
+        and Converse takes no ``stream`` kwarg — streaming intent selects the
+        dedicated method. timeout/max_retries are unusable: boto3 has no
+        ``with_options`` / per-call timeout override, so the chain Deadline
+        plus the caller's botocore Config govern this hop.
+        """
+        kwargs = dict(kwargs)
+        kwargs["modelId"] = kwargs.pop("model")
+        kwargs.pop("stream", None)
+        if is_streaming:
+            return client.converse_stream, kwargs
+        return client.converse, kwargs
+
+    def unwrap_stream_source(self, response: Any) -> Any:
+        """ConverseStream nests the iterable: wrap the INNER event stream.
+
+        ``response["stream"]`` is the EventStream whose close() releases the
+        connection — that is what the stream wrapper must own, not the dict.
+        """
+        return response["stream"]
+
+    def wrap_stream_result(self, wrapper: Any, served_response: Any) -> Any:
+        """Bedrock-dialect callers iterate ``result["stream"]``.
+
+        Return the boto3 contract shape with the wrapped stream swapped in.
+        On a cross-provider hop the served response is a foreign stream
+        object, not a Converse dict — there is nothing to preserve.
+        """
+        if isinstance(served_response, Mapping):
+            return {**served_response, "stream": wrapper}
+        return {"stream": wrapper}
 
 
 class BedrockStreamAccumulator:

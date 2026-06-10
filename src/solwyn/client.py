@@ -123,47 +123,6 @@ def _source_compatible_defaults(provider: str, params: dict[str, Any]) -> dict[s
     return {key: value for key, value in params.items() if key in allowed}
 
 
-def _mapping_from_config(value: object) -> dict[str, Any]:
-    """Return a shallow dict view of a provider config object."""
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(value)
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        dumped = model_dump(exclude_none=True)
-        if isinstance(dumped, dict):
-            return dict(dumped)
-    attrs = getattr(value, "__dict__", None)
-    if isinstance(attrs, dict):
-        return dict(attrs)
-    return {}
-
-
-def _with_google_http_bound(
-    kwargs: dict[str, object], *, timeout: float, max_retries: int
-) -> dict[str, object]:
-    """Inject google-genai per-request HTTP options without importing the extra.
-
-    google-genai accepts ``config={"http_options": ...}`` for generate_content
-    calls, and its timeout is milliseconds. We preserve caller config/http_options
-    but override the timeout and retry attempts because the chain deadline is a
-    mandatory Solwyn bound.
-    """
-    bounded = dict(kwargs)
-    config = _mapping_from_config(bounded.get("config"))
-    http_options = _mapping_from_config(config.get("http_options"))
-    retry_options = _mapping_from_config(http_options.get("retry_options"))
-
-    timeout_ms = max(1, int(timeout * 1000))
-    retry_options["attempts"] = max(1, max_retries + 1)
-    http_options["timeout"] = timeout_ms
-    http_options["retry_options"] = retry_options
-    config["http_options"] = http_options
-    bounded["config"] = config
-    return bounded
-
-
 def _openai_uses_max_completion_tokens(model: str) -> bool:
     """Return whether an OpenAI model rejects the legacy max_tokens key."""
     return model.startswith(("o1", "o3", "o4", "gpt-5"))
@@ -613,47 +572,28 @@ class Solwyn(_SolwynBase):
         """Dispatch one hop to the runtime's SDK client. Pure I/O — no metrics.
 
         Applies the mandatory per-hop bound via ``with_options`` (kills the
-        600s SDK read default and any internal retry stacking).
+        600s SDK read default and any internal retry stacking); SDKs without
+        ``with_options`` apply their own bound inside ``prepare_call``.
 
         The served hop's stream-method selection is driven by the dispatch-level
         ``is_streaming`` boolean — NOT the original ``_force_stream``/canonical
         flag (fix [A]). A caller who streamed via OpenAI/Anthropic ``stream=True``
-        and fails over to Google must still hit ``generate_content_stream``; a
-        Google streamer that fails over to OpenAI/Anthropic must serve with
-        ``stream=True``. OpenAI/Anthropic stream via ``stream=True`` in kwargs;
-        Google streams via its dedicated method (and the ``stream`` kwarg, which
-        its SDK does not accept, is stripped).
+        and fails over to Google/Bedrock must still hit the dedicated stream
+        method, and vice versa. Every provider-specific quirk (stream kwarg vs
+        dedicated method, model-key rename, HTTP bound) lives on the adapter's
+        ``prepare_call`` — adding a provider never touches this method.
         """
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(timeout=timeout, max_retries=max_retries)
-        name = runtime.adapter.name
-        if name == ProviderName.OPENAI.value:
-            if is_streaming:
-                kwargs["stream"] = True
-            return client.chat.completions.create(**kwargs)
-        if name == ProviderName.ANTHROPIC.value:
-            if is_streaming:
-                kwargs["stream"] = True
-            return client.messages.create(**kwargs)
-        if name == ProviderName.BEDROCK.value:
-            # boto3 has no with_options / per-call timeout override; the chain
-            # Deadline plus the caller's botocore Config govern this hop. The
-            # uniform internal ``model`` key renames back to boto3's modelId,
-            # and the streaming intent selects the dedicated method (Converse
-            # takes no ``stream`` kwarg).
-            kwargs = dict(kwargs)
-            kwargs["modelId"] = kwargs.pop("model")
-            kwargs.pop("stream", None)
-            if is_streaming:
-                return client.converse_stream(**kwargs)
-            return client.converse(**kwargs)
-        # Google: its generate_content[_stream] methods take no ``stream`` kwarg.
-        kwargs = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
-        kwargs.pop("stream", None)
-        if is_streaming:
-            return client.models.generate_content_stream(**kwargs)
-        return client.models.generate_content(**kwargs)
+        method, call_kwargs = runtime.adapter.prepare_call(
+            client,
+            cast("dict[str, Any]", kwargs),
+            is_streaming=is_streaming,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+        return method(**call_kwargs)
 
     def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Core interception logic: the classified candidate walk."""
@@ -1110,21 +1050,14 @@ class Solwyn(_SolwynBase):
             if is_provider_fallback
             else None
         )
-        # Served-Bedrock streams nest the iterable: converse_stream returns
-        # {"stream": EventStream, ...}. Wrap the INNER event stream (whose
-        # close() releases the connection), not the dict.
-        source = response["stream"] if provider == ProviderName.BEDROCK.value else response
+        # The SERVED adapter owns its stream nesting (Bedrock wraps the INNER
+        # event stream); the PRIMARY adapter owns the caller-dialect result
+        # shape (Bedrock callers get the boto3 contract dict back).
+        source = runtime.adapter.unwrap_stream_source(response)
         wrapper = SyncStreamWrapper(
             source, accumulator, on_complete, on_error, chunk_translator=chunk_translator
         )
-        if primary.adapter.name == ProviderName.BEDROCK.value:
-            # Bedrock-dialect callers iterate result["stream"] — return the
-            # boto3 contract shape with the wrapped stream swapped in. On a
-            # cross-provider hop there is no served dict to preserve.
-            if provider == ProviderName.BEDROCK.value:
-                return {**response, "stream": wrapper}
-            return {"stream": wrapper}
-        return wrapper
+        return primary.adapter.wrap_stream_result(wrapper, response)
 
     def close(self) -> None:
         """Shut down the reporter and close HTTP clients."""
@@ -1295,38 +1228,24 @@ class AsyncSolwyn(_SolwynBase):
     ) -> Any:
         """Dispatch one hop to the runtime's async SDK client. Pure I/O.
 
-        Applies the mandatory per-hop bound via ``with_options``. Mirrors
-        ``_sync_dispatch``: the served hop's stream-method selection is driven by
-        the dispatch-level ``is_streaming`` boolean (fix [A]).
+        Mirrors ``_sync_dispatch``: the per-hop bound applies via
+        ``with_options`` where available, every provider-specific quirk lives
+        on the adapter's ``prepare_call``, and the served hop's stream-method
+        selection is driven by the dispatch-level ``is_streaming`` boolean
+        (fix [A]). The adapter returns the same attribute path on an async
+        client — only the await differs here.
         """
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(timeout=timeout, max_retries=max_retries)
-        name = runtime.adapter.name
-        if name == ProviderName.OPENAI.value:
-            if is_streaming:
-                kwargs["stream"] = True
-            return await client.chat.completions.create(**kwargs)
-        if name == ProviderName.ANTHROPIC.value:
-            if is_streaming:
-                kwargs["stream"] = True
-            return await client.messages.create(**kwargs)
-        if name == ProviderName.BEDROCK.value:
-            # See the sync dispatch: no per-call timeout on boto3 clients; the
-            # internal ``model`` key renames back to modelId; the streaming
-            # intent selects the dedicated method.
-            kwargs = dict(kwargs)
-            kwargs["modelId"] = kwargs.pop("model")
-            kwargs.pop("stream", None)
-            if is_streaming:
-                return await client.converse_stream(**kwargs)
-            return await client.converse(**kwargs)
-        # Google: its generate_content[_stream] methods take no ``stream`` kwarg.
-        kwargs = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
-        kwargs.pop("stream", None)
-        if is_streaming:
-            return await client.models.generate_content_stream(**kwargs)
-        return await client.models.generate_content(**kwargs)
+        method, call_kwargs = runtime.adapter.prepare_call(
+            client,
+            cast("dict[str, Any]", kwargs),
+            is_streaming=is_streaming,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+        return await method(**call_kwargs)
 
     async def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Async core interception logic: the classified candidate walk."""
@@ -1761,16 +1680,13 @@ class AsyncSolwyn(_SolwynBase):
             if is_provider_fallback
             else None
         )
-        # Served-Bedrock streams nest the iterable (see the sync _wrap_stream).
-        source = response["stream"] if provider == ProviderName.BEDROCK.value else response
+        # Stream nesting and caller-dialect result shape are adapter-owned —
+        # see the sync ``_wrap_stream``.
+        source = runtime.adapter.unwrap_stream_source(response)
         wrapper = AsyncStreamWrapper(
             source, accumulator, on_complete, on_error, chunk_translator=chunk_translator
         )
-        if primary.adapter.name == ProviderName.BEDROCK.value:
-            if provider == ProviderName.BEDROCK.value:
-                return {**response, "stream": wrapper}
-            return {"stream": wrapper}
-        return wrapper
+        return primary.adapter.wrap_stream_result(wrapper, response)
 
     async def close(self) -> None:
         """Shut down the reporter and close HTTP clients."""

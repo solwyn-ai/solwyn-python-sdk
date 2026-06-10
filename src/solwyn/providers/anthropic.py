@@ -22,6 +22,7 @@ output_tokens and does not report them separately (documented blind spot).
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from solwyn._token_details import TokenDetails
@@ -104,6 +105,33 @@ class AnthropicAdapter:
 
     def create_stream_accumulator(self) -> AnthropicStreamAccumulator:
         return AnthropicStreamAccumulator()
+
+    def prepare_call(
+        self,
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        is_streaming: bool,
+        timeout: float,
+        max_retries: int,
+    ) -> tuple[Callable[..., Any], dict[str, Any]]:
+        """Messages hop: streaming rides the ``stream=True`` kwarg.
+
+        timeout/max_retries are ignored — the dispatcher already applied them
+        via the SDK's ``with_options``.
+        """
+        kwargs = dict(kwargs)
+        if is_streaming:
+            kwargs["stream"] = True
+        return client.messages.create, kwargs
+
+    def unwrap_stream_source(self, response: Any) -> Any:
+        """The streaming call returns the iterable itself."""
+        return response
+
+    def wrap_stream_result(self, wrapper: Any, served_response: Any) -> Any:
+        """Anthropic-dialect callers iterate the stream object directly."""
+        return wrapper
 
 
 class AnthropicStreamAccumulator:
