@@ -407,6 +407,69 @@ class TestBedrockFailover:
 
 
 # ---------------------------------------------------------------------------
+# Error-path provider_region attribution
+# ---------------------------------------------------------------------------
+
+
+def _failing_stream_events() -> Any:
+    yield {"messageStart": {"role": "assistant"}}
+    raise _Status(500)
+
+
+@pytest.mark.unit
+class TestBedrockErrorRegionAttribution:
+    """Error events carry provider_region — the reconciliation-critical path.
+
+    A POST_SEND_AMBIGUOUS abort (possibly_succeeded=True) is exactly where the
+    Cloud API needs the region to reconcile a possibly-landed Bedrock charge
+    against its per-(model, region) price.
+    """
+
+    def test_dispatch_error_event_carries_provider_region(self) -> None:
+        client = _mock_bedrock_client(region="ap-southeast-2")
+        client.converse.side_effect = _Status(500)  # POST_SEND_AMBIGUOUS
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn), pytest.raises(_Status):
+            solwyn.converse(
+                modelId=BEDROCK_MODEL,
+                messages=[{"role": "user", "content": [{"text": "Hello"}]}],
+            )
+
+        errors = [e for e in reported if e.status == "error"]
+        assert len(errors) == 1
+        assert errors[0].possibly_succeeded is True
+        assert errors[0].provider_region == "ap-southeast-2"
+        solwyn.close()
+
+    def test_mid_stream_error_event_carries_provider_region(self) -> None:
+        client = _mock_bedrock_client(region="eu-west-1")
+        client.converse_stream.return_value = {
+            "ResponseMetadata": {"HTTPStatusCode": 200},
+            "stream": _failing_stream_events(),
+        }
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            result = solwyn.converse_stream(
+                modelId=BEDROCK_MODEL,
+                messages=[{"role": "user", "content": [{"text": "Hello"}]}],
+            )
+            with pytest.raises(_Status):
+                list(result["stream"])
+
+        errors = [e for e in reported if e.status == "error"]
+        assert len(errors) == 1
+        assert errors[0].possibly_succeeded is True
+        assert errors[0].provider_region == "eu-west-1"
+        solwyn.close()
+
+
+# ---------------------------------------------------------------------------
 # Async variants
 # ---------------------------------------------------------------------------
 
@@ -484,6 +547,67 @@ class TestAsyncBedrockConverse:
         _, event = settlements[0]
         assert event.input_tokens == 9
         assert event.output_tokens == 4
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_dispatch_error_event_carries_provider_region(self) -> None:
+        client = _mock_bedrock_client(region="ap-southeast-2")
+        client.converse = AsyncMockFn(side_effect=_Status(500))  # POST_SEND_AMBIGUOUS
+        solwyn = _make_async_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn), pytest.raises(_Status):
+            await solwyn.converse(
+                modelId=BEDROCK_MODEL,
+                messages=[{"role": "user", "content": [{"text": "Hello"}]}],
+            )
+
+        errors = [e for e in reported if e.status == "error"]
+        assert len(errors) == 1
+        assert errors[0].possibly_succeeded is True
+        assert errors[0].provider_region == "ap-southeast-2"
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_mid_stream_error_event_carries_provider_region(self) -> None:
+        class _FailingAsyncEventStream:
+            def __aiter__(self) -> Any:
+                async def _gen() -> Any:
+                    yield {"messageStart": {"role": "assistant"}}
+                    raise _Status(500)
+
+                return _gen()
+
+        client = _mock_bedrock_client(region="eu-west-1")
+        client.converse_stream = AsyncMockFn(
+            return_value={
+                "ResponseMetadata": {"HTTPStatusCode": 200},
+                "stream": _FailingAsyncEventStream(),
+            }
+        )
+        solwyn = _make_async_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            result = await solwyn.converse_stream(
+                modelId=BEDROCK_MODEL,
+                messages=[{"role": "user", "content": [{"text": "Hello"}]}],
+            )
+            with pytest.raises(_Status):
+                _ = [event async for event in result["stream"]]
+
+        errors = [e for e in reported if e.status == "error"]
+        assert len(errors) == 1
+        assert errors[0].possibly_succeeded is True
+        assert errors[0].provider_region == "eu-west-1"
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

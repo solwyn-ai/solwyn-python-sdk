@@ -901,6 +901,7 @@ class Solwyn(_SolwynBase):
                             call_id=call_id,
                             possibly_succeeded=True if possibly_succeeded else None,
                             agent_run=agent_run,
+                            provider_region=rt.adapter.extract_region(rt.sdk_client),
                         )
                     )
                     if disp is Disposition.FAIL_FAST:
@@ -1095,6 +1096,7 @@ class Solwyn(_SolwynBase):
                     call_id=call_id,
                     possibly_succeeded=True,
                     agent_run=agent_run,
+                    provider_region=provider_region,
                 )
             )
 
@@ -1555,6 +1557,7 @@ class AsyncSolwyn(_SolwynBase):
                             call_id=call_id,
                             possibly_succeeded=True if possibly_succeeded else None,
                             agent_run=agent_run,
+                            provider_region=rt.adapter.extract_region(rt.sdk_client),
                         )
                     )
                     if disp is Disposition.FAIL_FAST:
@@ -1746,6 +1749,7 @@ class AsyncSolwyn(_SolwynBase):
                     call_id=call_id,
                     possibly_succeeded=True,
                     agent_run=agent_run,
+                    provider_region=provider_region,
                 )
             )
 
