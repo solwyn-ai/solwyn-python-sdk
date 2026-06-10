@@ -553,6 +553,34 @@ class TestAsyncBedrockConverse:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
+    async def test_async_invoke_model_raises_loudly(self) -> None:
+        # Mirror of the sync fail-loud test: a regression that let async
+        # invoke_model pass through silently would be a budget bypass.
+        client = _mock_bedrock_client()
+        solwyn = _make_async_solwyn(client)
+
+        with pytest.raises(ConfigurationError, match="converse"):
+            await solwyn.invoke_model(modelId=BEDROCK_MODEL, body=b"{}")
+
+        client.invoke_model.assert_not_called()
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_invoke_model_with_response_stream_raises_loudly(self) -> None:
+        client = _mock_bedrock_client()
+        solwyn = _make_async_solwyn(client)
+
+        with pytest.raises(ConfigurationError, match="converse"):
+            await solwyn.invoke_model_with_response_stream(modelId=BEDROCK_MODEL, body=b"{}")
+
+        client.invoke_model_with_response_stream.assert_not_called()
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
     async def test_async_dispatch_error_event_carries_provider_region(self) -> None:
         client = _mock_bedrock_client(region="ap-southeast-2")
         client.converse = AsyncMockFn(side_effect=_Status(500))  # POST_SEND_AMBIGUOUS
