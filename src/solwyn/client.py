@@ -635,7 +635,9 @@ class Solwyn(_SolwynBase):
 
         if not budget.allowed:
             # Report estimated tokens so the API keeps an accurate running total
-            # even for calls that were blocked by hard-deny.
+            # even for calls that were blocked by hard-deny. The PRIMARY's
+            # endpoint region rides along so denied-Bedrock spend stays
+            # analyzable per region (None-skipped for other providers).
             try:
                 event = self._build_metadata_event(
                     model=requested_model,
@@ -648,6 +650,7 @@ class Solwyn(_SolwynBase):
                     is_model_fallback=False,
                     call_id=call_id,
                     agent_run=agent_run,
+                    provider_region=primary.adapter.extract_region(primary.sdk_client),
                 )
                 self._reporter.report(event)
             except Exception:
@@ -1280,6 +1283,7 @@ class AsyncSolwyn(_SolwynBase):
             self.update_price_hints(budget.price_hints)
 
         if not budget.allowed:
+            # See the sync _intercepted_call: region rides the denied event.
             try:
                 event = self._build_metadata_event(
                     model=requested_model,
@@ -1292,6 +1296,7 @@ class AsyncSolwyn(_SolwynBase):
                     is_model_fallback=False,
                     call_id=call_id,
                     agent_run=agent_run,
+                    provider_region=primary.adapter.extract_region(primary.sdk_client),
                 )
                 self._reporter.report(event)
             except Exception:

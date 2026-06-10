@@ -253,6 +253,7 @@ class _BotoCoreError(Exception):
 _BotocoreConnectionError = type("ConnectionError", (_BotoCoreError,), {})
 _EndpointConnectionError = type("EndpointConnectionError", (_BotocoreConnectionError,), {})
 _ConnectTimeoutError = type("ConnectTimeoutError", (_BotocoreConnectionError,), {})
+_ProxyConnectionError = type("ProxyConnectionError", (_BotocoreConnectionError,), {})
 _HTTPClientError = type("HTTPClientError", (_BotoCoreError,), {})
 _ReadTimeoutError = type("ReadTimeoutError", (_HTTPClientError,), {})
 _ConnectionClosedError = type("ConnectionClosedError", (_HTTPClientError,), {})
@@ -346,6 +347,11 @@ class TestBotocoreTransportClassification:
 
     def test_connect_timeout_error_is_failover(self) -> None:
         assert classify_exception(_ConnectTimeoutError()) is Disposition.FAILOVER
+
+    def test_proxy_connection_error_is_failover(self) -> None:
+        # Provably pre-send: the proxy itself refused — the request never
+        # reached the endpoint.
+        assert classify_exception(_ProxyConnectionError()) is Disposition.FAILOVER
 
     def test_read_timeout_error_is_ambiguous(self) -> None:
         # Post-send: bytes were sent, the model may have run.

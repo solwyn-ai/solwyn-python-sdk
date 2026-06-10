@@ -104,6 +104,32 @@ class _Status(Exception):
         self.status_code = status_code
 
 
+class _ClientError(Exception):
+    """Mirrors botocore.exceptions.ClientError: status lives in a response DICT."""
+
+    def __init__(self, error_response: dict[str, Any], operation_name: str = "Converse") -> None:
+        super().__init__("An error occurred")
+        self.response = error_response
+        self.operation_name = operation_name
+
+
+def _botocore_client_error(code: str, status: int) -> Exception:
+    """Build a fake Bedrock service exception, botocore-shaped.
+
+    botocore generates one ClientError subclass per modeled error shape with
+    the class NAME equal to the error code, and buries the HTTP status in
+    ``response["ResponseMetadata"]["HTTPStatusCode"]`` — no ``status_code``
+    attribute anywhere. Driving these through the client exercises
+    ``_numeric_status``'s dict path end-to-end.
+    """
+    response: dict[str, Any] = {
+        "Error": {"Code": code, "Message": "boom"},
+        "ResponseMetadata": {"HTTPStatusCode": status, "HTTPHeaders": {}},
+    }
+    cls = type(code, (_ClientError,), {})
+    return cls(response)
+
+
 def _make_solwyn(client: Any, **overrides: Any) -> Solwyn:
     defaults: dict[str, Any] = {"api_key": VALID_API_KEY}
     defaults.update(overrides)
@@ -249,7 +275,9 @@ class TestBedrockConverseStream:
 class TestBedrockFailover:
     def test_bedrock_primary_fails_over_to_anthropic(self) -> None:
         bedrock = _mock_bedrock_client()
-        bedrock.converse.side_effect = _Status(429)
+        # A real botocore ThrottlingException (status in the response dict,
+        # not .status_code) must classify FAILOVER through the live dispatch.
+        bedrock.converse.side_effect = _botocore_client_error("ThrottlingException", 429)
         anthropic = _mock_anthropic_client()
         solwyn = _make_solwyn(bedrock, fallback=[(anthropic, "claude-3-5-sonnet")])
         reported: list = []
@@ -358,7 +386,7 @@ class TestBedrockFailover:
         # Anthropic, still get the boto3 contract shape: a dict whose "stream"
         # yields Bedrock-shaped event dicts.
         bedrock = _mock_bedrock_client()
-        bedrock.converse_stream.side_effect = _Status(429)
+        bedrock.converse_stream.side_effect = _botocore_client_error("ThrottlingException", 429)
         anthropic = _mock_anthropic_client()
         anthropic.messages.create.return_value = iter(
             [
@@ -405,6 +433,34 @@ class TestBedrockFailover:
 
         solwyn.close()
 
+    def test_model_timeout_does_not_fail_over_and_reconciles(self) -> None:
+        # ModelTimeoutException is HTTP 408 — by status it looks request-shaped,
+        # but the model RAN. End-to-end through _intercepted_call it must
+        # re-raise the ORIGINAL exception (never failover, even with a fallback
+        # configured) and emit possibly_succeeded=True so the Cloud API
+        # reconciles the possibly-landed charge.
+        bedrock = _mock_bedrock_client()
+        timeout_exc = _botocore_client_error("ModelTimeoutException", 408)
+        bedrock.converse.side_effect = timeout_exc
+        anthropic = _mock_anthropic_client()
+        solwyn = _make_solwyn(bedrock, fallback=[(anthropic, "claude-3-5-sonnet")])
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn), pytest.raises(_ClientError) as excinfo:
+            solwyn.converse(
+                modelId=BEDROCK_MODEL,
+                messages=[{"role": "user", "content": [{"text": "Hello"}]}],
+            )
+
+        assert excinfo.value is timeout_exc  # the ORIGINAL exception, re-raised
+        anthropic.messages.create.assert_not_called()  # no failover
+        errors = [e for e in reported if e.status == "error"]
+        assert len(errors) == 1
+        assert errors[0].possibly_succeeded is True
+        assert errors[0].failover_error_class == "ModelTimeoutException"
+        solwyn.close()
+
 
 # ---------------------------------------------------------------------------
 # Error-path provider_region attribution
@@ -442,6 +498,35 @@ class TestBedrockErrorRegionAttribution:
         assert len(errors) == 1
         assert errors[0].possibly_succeeded is True
         assert errors[0].provider_region == "ap-southeast-2"
+        solwyn.close()
+
+    def test_budget_denied_event_carries_provider_region(self) -> None:
+        # Denied-Bedrock spend must stay analyzable per region: the primary's
+        # endpoint region rides the BUDGET_DENIED event too.
+        from solwyn._types import BudgetMode
+        from solwyn.exceptions import BudgetExceededError
+
+        client = _mock_bedrock_client(region="eu-central-1")
+        solwyn = _make_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+        deny = {
+            **ALLOW_BUDGET_RESPONSE,
+            "allowed": False,
+            "denied_by_period": "daily",
+            "mode": "hard_deny",
+        }
+
+        with _mock_budget(solwyn, response=deny), pytest.raises(BudgetExceededError):
+            solwyn.converse(
+                modelId=BEDROCK_MODEL,
+                messages=[{"role": "user", "content": [{"text": "Hello"}]}],
+            )
+
+        client.converse.assert_not_called()
+        denied = [e for e in reported if e.status == "budget_denied"]
+        assert len(denied) == 1
+        assert denied[0].provider_region == "eu-central-1"
         solwyn.close()
 
     def test_mid_stream_error_event_carries_provider_region(self) -> None:
