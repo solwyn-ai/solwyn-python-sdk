@@ -217,8 +217,29 @@ class TestWireModelDumpSnapshots:
             token_details=TokenDetails(input_tokens=10, output_tokens=5),
             call_id="call-fixed",
         )
-        # BudgetConfirmRequest has no None-skipping serializer; all fields emit.
-        assert set(req.model_dump(mode="json")) == EXPECTED_CONFIRM_FIELDS
+        # The None-skipping serializer drops provider_region (the only optional
+        # field) for the bearer-key providers, so their confirm wire bytes are
+        # unchanged — the deployed Cloud-API model rejects unknown keys.
+        assert set(req.model_dump(mode="json")) == EXPECTED_CONFIRM_FIELDS - {"provider_region"}
+
+    def test_confirm_provider_region_omitted_when_none_present_when_set(self) -> None:
+        # Mirror of test_metadata_provider_region_omitted_when_none_present_when_set:
+        # absent for bearer-key providers, present for Bedrock where pricing is
+        # keyed by (provider, model, region).
+        def _confirm(**overrides: Any) -> BudgetConfirmRequest:
+            base: dict[str, Any] = {
+                "reservation_id": "res_123",
+                "model": "gpt-4o",
+                "provider": ProviderName.OPENAI,
+                "token_details": TokenDetails(input_tokens=10, output_tokens=5),
+                "call_id": "call-fixed",
+            }
+            base.update(overrides)
+            return BudgetConfirmRequest(**base)
+
+        assert "provider_region" not in _confirm().model_dump(mode="json")
+        dumped = _confirm(provider_region="us-east-1").model_dump(mode="json")
+        assert dumped["provider_region"] == "us-east-1"
 
     def test_non_failover_metadata_dump_omits_possibly_succeeded_keeps_call_id(self) -> None:
         # A plain non-failover SUCCESS event: the None-skipping serializer drops

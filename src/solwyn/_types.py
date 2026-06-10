@@ -253,6 +253,24 @@ class BudgetConfirmRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    @model_serializer(mode="wrap")
+    def _serialize_without_none(
+        self,
+        handler: SerializerFunctionWrapHandler,
+        _info: SerializationInfo,
+    ) -> dict[str, Any]:
+        """Serialize confirms without null-valued optional fields.
+
+        provider_region is the only optional field; skipping it when None keeps
+        the bearer-key providers' confirm wire bytes unchanged (the Cloud-API
+        model forbids unknown keys).
+        """
+        data = handler(self)
+        if not isinstance(data, dict):
+            raise RuntimeError("BudgetConfirmRequest serializer expected dict output")
+        serialized = cast(dict[str, Any], data)
+        return {key: value for key, value in serialized.items() if value is not None}
+
     reservation_id: str = Field(
         ..., description="Budget reservation ID returned by BudgetCheckResponse"
     )
