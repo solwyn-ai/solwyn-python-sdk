@@ -67,6 +67,26 @@ def _error_response(status_code: int) -> MagicMock:
     return resp
 
 
+def _accepted_response(body: dict[str, Any]) -> MagicMock:
+    """A 202 httpx.Response stand-in carrying a per-event-disposition body."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 202
+    resp.raise_for_status = MagicMock()
+    resp.json = MagicMock(return_value=body)
+    return resp
+
+
+def _rejection(
+    index: int,
+    *,
+    code: str = "unknown_model",
+    model: str = "vendor-x-1",
+    message: str = "Solwyn does not have pricing for this model. File an issue.",
+) -> dict[str, Any]:
+    """One IngestRejection wire entry, as the server sends it."""
+    return {"index": index, "code": code, "model": model, "message": message}
+
+
 def _quiet_sync_reporter(**kwargs) -> MetadataReporter:
     """Build a sync reporter with its background flush thread stopped."""
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
@@ -435,6 +455,194 @@ class TestMetadataReporter:
         assert "reporter.confirm_send_persistent_failure" in caplog.text
         assert "consecutive_failures=10" in caplog.text
         assert "HTTPStatusError" in caplog.text
+        reporter._http.close()
+
+
+# ---------------------------------------------------------------------------
+# Per-event ingest rejection logging (v0.1.7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestIngestRejectionLogging:
+    """Per-event rejection dispositions in the 202 ingest body.
+
+    The server returns 202 for every well-formed request and lists rejected
+    events in the body. Rejected events are terminal for that flush — they
+    reject identically on every resubmission until a pricing entry lands
+    server-side — so the SDK logs them (aggregated) and drops them.
+    """
+
+    def test_mixed_batch_logs_one_warning_per_distinct_code_and_model(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # 5 submitted, 2 rejected on one (code, model) and 1 on another:
+        # exactly TWO aggregated lines, never one line per rejected event.
+        reporter = _quiet_sync_reporter()
+        body = {
+            "ingested": 2,
+            "rejected": [
+                _rejection(0, code="unknown_model", model="vendor-x-1"),
+                _rejection(2, code="unknown_model", model="vendor-x-1"),
+                _rejection(4, code="unknown_service_tier", model="gpt-4o"),
+            ],
+        }
+
+        with (
+            patch.object(reporter._http, "post", return_value=_accepted_response(body)),
+            caplog.at_level("WARNING"),
+        ):
+            reporter._send_batch([_make_event() for _ in range(5)])
+
+        rejection_logs = [
+            record.getMessage()
+            for record in caplog.records
+            if "reporter.ingest_events_rejected" in record.getMessage()
+            and record.levelname == "WARNING"
+        ]
+        assert len(rejection_logs) == 2
+        assert any("code=unknown_model model=vendor-x-1 count=2" in line for line in rejection_logs)
+        assert any(
+            "code=unknown_service_tier model=gpt-4o count=1" in line for line in rejection_logs
+        )
+        reporter._http.close()
+
+    def test_all_rejected_batch_logs_and_does_not_raise(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # ingested=0 is still a 202 — the flush loop must survive it.
+        reporter = _quiet_sync_reporter()
+        body = {"ingested": 0, "rejected": [_rejection(i) for i in range(3)]}
+
+        with (
+            patch.object(reporter._http, "post", return_value=_accepted_response(body)),
+            caplog.at_level("WARNING"),
+        ):
+            reporter._send_batch([_make_event() for _ in range(3)])
+
+        assert "code=unknown_model model=vendor-x-1 count=3" in caplog.text
+        reporter._http.close()
+
+    def test_empty_rejected_list_logs_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        # The server always sends rejected (possibly []) — the clean-batch
+        # path must stay silent, exactly like pre-v0.1.7.
+        reporter = _quiet_sync_reporter()
+        body = {"ingested": 3, "rejected": []}
+
+        with (
+            patch.object(reporter._http, "post", return_value=_accepted_response(body)),
+            caplog.at_level("WARNING"),
+        ):
+            reporter._send_batch([_make_event() for _ in range(3)])
+
+        assert not caplog.records
+        reporter._http.close()
+
+    def test_rejected_events_are_not_requeued(self) -> None:
+        # Rejected events are terminal for the flush: the queue stays drained
+        # and a second flush has nothing to send.
+        reporter = _quiet_sync_reporter()
+        reporter.report(_make_event())
+        reporter.report(_make_event())
+        body = {"ingested": 1, "rejected": [_rejection(0)]}
+
+        with patch.object(reporter._http, "post", return_value=_accepted_response(body)):
+            reporter._flush_remaining()
+
+        assert len(reporter._queue) == 0
+
+        with patch.object(reporter._http, "post") as mock_post:
+            reporter._flush_remaining()
+        assert mock_post.call_count == 0
+        reporter._http.close()
+
+    def test_rejection_message_logged_verbatim(self, caplog: pytest.LogCaptureFixture) -> None:
+        # The server repr-escapes its message; the SDK logs it verbatim and
+        # never parses or re-interprets it — including %-format specifiers
+        # and escaped control characters.
+        reporter = _quiet_sync_reporter()
+        message = r"service_tier 'spot\x1b[31m\n' is unknown; 100% of cases resolve in %s %d"
+        body = {
+            "ingested": 0,
+            "rejected": [_rejection(0, code="unknown_service_tier", message=message)],
+        }
+
+        with (
+            patch.object(reporter._http, "post", return_value=_accepted_response(body)),
+            caplog.at_level("WARNING"),
+        ):
+            reporter._send_batch([_make_event()])
+
+        assert message in caplog.text
+        reporter._http.close()
+
+    def test_unknown_future_rejection_code_logged_without_crash(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The code enum is server-owned and may grow; an unrecognized code is
+        # logged like any other, never special-cased and never a crash.
+        reporter = _quiet_sync_reporter()
+        body = {"ingested": 0, "rejected": [_rejection(0, code="unknown_pricing_dimension")]}
+
+        with (
+            patch.object(reporter._http, "post", return_value=_accepted_response(body)),
+            caplog.at_level("WARNING"),
+        ):
+            reporter._send_batch([_make_event()])
+
+        assert "code=unknown_pricing_dimension" in caplog.text
+        reporter._http.close()
+
+    @pytest.mark.parametrize(
+        ("body", "expected_exc_type"),
+        [
+            ({"ingested": 3}, "KeyError"),  # rejected key missing
+            ({"ingested": 1, "rejected": ["not-a-dict"]}, "TypeError"),
+            ({"ingested": 1, "rejected": [{"index": 0}]}, "KeyError"),  # entry missing fields
+        ],
+    )
+    def test_malformed_202_body_fails_open_and_logs_once(
+        self,
+        body: dict[str, Any],
+        expected_exc_type: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # Fail-open: a contract-violating body must never raise into the
+        # flush loop — fall back to count-only acknowledgment, one log line.
+        reporter = _quiet_sync_reporter()
+
+        with (
+            patch.object(reporter._http, "post", return_value=_accepted_response(body)),
+            caplog.at_level("WARNING"),
+        ):
+            reporter._send_batch([_make_event()])
+
+        unparseable = [
+            record.getMessage()
+            for record in caplog.records
+            if "reporter.ingest_response_unparseable" in record.getMessage()
+        ]
+        assert len(unparseable) == 1
+        assert f"exc_type={expected_exc_type}" in unparseable[0]
+        reporter._http.close()
+
+    def test_invalid_json_202_body_fails_open(self, caplog: pytest.LogCaptureFixture) -> None:
+        # A body that is not JSON at all (resp.json() raises) takes the same
+        # fail-open path.
+        reporter = _quiet_sync_reporter()
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = 202
+        resp.raise_for_status = MagicMock()
+        resp.json = MagicMock(side_effect=ValueError("not json"))
+
+        with (
+            patch.object(reporter._http, "post", return_value=resp),
+            caplog.at_level("WARNING"),
+        ):
+            reporter._send_batch([_make_event()])
+
+        assert "reporter.ingest_response_unparseable" in caplog.text
+        assert "exc_type=ValueError" in caplog.text
         reporter._http.close()
 
 

@@ -68,6 +68,16 @@ def _error_response(status_code: int) -> MagicMock:
     return resp
 
 
+def _accepted_response(body: dict[str, Any]) -> MagicMock:
+    """A 202 httpx.Response stand-in carrying a per-event-disposition body."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 202
+    resp.raise_for_status = MagicMock()
+    # httpx.Response.json() is sync even on the async client.
+    resp.json = MagicMock(return_value=body)
+    return resp
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle: start -> flush -> close
 # ---------------------------------------------------------------------------
@@ -303,6 +313,73 @@ class TestAsyncReporterSendBatch:
         assert "HTTPStatusError" in caplog.text
         # Privacy: never log the response body — only the exception class name.
         assert "422 Unprocessable" not in caplog.text
+        await reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_send_batch_logs_aggregated_rejections(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Async path shares the sans-I/O rejection parsing: one aggregated
+        # WARNING per distinct (code, model), rejected events stay dropped.
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+        )
+        body = {
+            "ingested": 1,
+            "rejected": [
+                {"index": 0, "code": "unknown_model", "model": "vendor-x-1", "message": "m"},
+                {"index": 2, "code": "unknown_model", "model": "vendor-x-1", "message": "m"},
+            ],
+        }
+
+        with (
+            patch.object(
+                reporter._http,
+                "post",
+                new_callable=AsyncMock,
+                return_value=_accepted_response(body),
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            await reporter._send_batch([_make_event() for _ in range(3)])
+
+        rejection_logs = [
+            record.getMessage()
+            for record in caplog.records
+            if "reporter.ingest_events_rejected" in record.getMessage()
+        ]
+        assert len(rejection_logs) == 1
+        assert "code=unknown_model model=vendor-x-1 count=2" in rejection_logs[0]
+        assert len(reporter._queue) == 0
+        await reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_send_batch_malformed_202_body_fails_open(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Fail-open: a contract-violating body must never raise into the
+        # caller's event loop — fall back to count-only acknowledgment.
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+        )
+
+        with (
+            patch.object(
+                reporter._http,
+                "post",
+                new_callable=AsyncMock,
+                return_value=_accepted_response({"ingested": 1}),
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            await reporter._send_batch([_make_event()])
+
+        assert "reporter.ingest_response_unparseable" in caplog.text
+        assert "exc_type=KeyError" in caplog.text
         await reporter._http.aclose()
 
 

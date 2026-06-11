@@ -92,6 +92,47 @@ class _ReporterBase:
                 type(exc).__name__,
             )
 
+    def _log_ingest_rejections(self, response: httpx.Response) -> None:
+        """Surface per-event rejection dispositions from the 202 ingest body.
+
+        The API returns 202 for every well-formed request; accepted events are
+        already durable and rejected events are terminal — they reject
+        identically on every resubmission until a pricing entry lands
+        server-side — so rejections are logged and dropped, never re-queued.
+        One WARNING per distinct (code, model) per flush keeps a fleet stuck
+        on a single unpriced model from flooding logs. The server's message is
+        logged verbatim (repr-escaped server-side) and never parsed.
+
+        Fail-open: a malformed body must never raise into the flush loop —
+        fall back to the pre-v0.1.7 count-only acknowledgment and log once.
+        """
+        try:
+            rejected = response.json()["rejected"]
+            if not rejected:
+                return
+            # Aggregate before logging so a malformed entry can never leave a
+            # half-logged flush behind. First message per group wins (the
+            # server's message is keyed by the same (code, model) inputs).
+            groups: dict[tuple[str, str], tuple[int, str]] = {}
+            for rejection in rejected:
+                key = (str(rejection["code"]), str(rejection["model"]))
+                count, message = groups.get(key, (0, str(rejection["message"])))
+                groups[key] = (count + 1, message)
+        except Exception as exc:
+            logger.warning(
+                "reporter.ingest_response_unparseable: exc_type=%s",
+                type(exc).__name__,
+            )
+            return
+        for (code, model), (count, message) in groups.items():
+            logger.warning(
+                "reporter.ingest_events_rejected: code=%s model=%s count=%d message=%s",
+                code,
+                model,
+                count,
+                message,
+            )
+
 
 class MetadataReporter(_ReporterBase):
     """Synchronous metadata reporter with a background daemon thread.
@@ -223,6 +264,7 @@ class MetadataReporter(_ReporterBase):
                 headers=self._auth_headers(),
             )
             resp.raise_for_status()
+            self._log_ingest_rejections(resp)
         except Exception as exc:
             # Log only the exception's class name (fix [D]) — the type-name-only
             # convention every other except-block follows. Safe here even though
@@ -416,6 +458,8 @@ class AsyncMetadataReporter(_ReporterBase):
                 headers=self._auth_headers(),
             )
             resp.raise_for_status()
+            # httpx.Response.json() is sync on both clients — shared helper.
+            self._log_ingest_rejections(resp)
         except Exception as exc:
             # Log only the exception's class name (fix [D]) — the type-name-only
             # convention every other except-block follows. Safe here even though
