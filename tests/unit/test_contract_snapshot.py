@@ -85,7 +85,12 @@ EXPECTED_CONFIRM_FIELDS = {
     "is_provider_fallback",
     "call_id",
     "provider_region",
+    "service_tier",
 }
+
+# The optional confirm fields the None-skipping serializer drops when unset —
+# bearer-key providers' confirm wire bytes stay byte-identical to pre-Bedrock.
+_NONE_SKIPPED_CONFIRM_FIELDS = {"provider_region", "service_tier"}
 
 # Provider identifiers ARE wire values (events/confirms/checks carry them).
 # Adding one is an API-first deploy: the Cloud API must accept it BEFORE any
@@ -139,6 +144,18 @@ class TestWireModelFieldSets:
 
     def test_provider_name_values(self) -> None:
         assert {p.value for p in ProviderName} == EXPECTED_PROVIDER_NAMES
+
+
+def _confirm(**overrides: Any) -> BudgetConfirmRequest:
+    base: dict[str, Any] = {
+        "reservation_id": "res_123",
+        "model": "gpt-4o",
+        "provider": ProviderName.OPENAI,
+        "token_details": TokenDetails(input_tokens=10, output_tokens=5),
+        "call_id": "call-fixed",
+    }
+    base.update(overrides)
+    return BudgetConfirmRequest(**base)
 
 
 def _metadata_event(**overrides: object) -> MetadataEvent:
@@ -217,29 +234,43 @@ class TestWireModelDumpSnapshots:
             token_details=TokenDetails(input_tokens=10, output_tokens=5),
             call_id="call-fixed",
         )
-        # The None-skipping serializer drops provider_region (the only optional
-        # field) for the bearer-key providers, so their confirm wire bytes are
-        # unchanged — the deployed Cloud-API model rejects unknown keys.
-        assert set(req.model_dump(mode="json")) == EXPECTED_CONFIRM_FIELDS - {"provider_region"}
+        # The None-skipping serializer drops the unset optional fields for the
+        # bearer-key providers, so their confirm wire bytes are unchanged —
+        # the deployed Cloud-API model rejects unknown keys.
+        assert (
+            set(req.model_dump(mode="json"))
+            == EXPECTED_CONFIRM_FIELDS - _NONE_SKIPPED_CONFIRM_FIELDS
+        )
 
     def test_confirm_provider_region_omitted_when_none_present_when_set(self) -> None:
         # Mirror of test_metadata_provider_region_omitted_when_none_present_when_set:
         # absent for bearer-key providers, present for Bedrock where pricing is
         # keyed by (provider, model, region).
-        def _confirm(**overrides: Any) -> BudgetConfirmRequest:
-            base: dict[str, Any] = {
-                "reservation_id": "res_123",
-                "model": "gpt-4o",
-                "provider": ProviderName.OPENAI,
-                "token_details": TokenDetails(input_tokens=10, output_tokens=5),
-                "call_id": "call-fixed",
-            }
-            base.update(overrides)
-            return BudgetConfirmRequest(**base)
-
         assert "provider_region" not in _confirm().model_dump(mode="json")
         dumped = _confirm(provider_region="us-east-1").model_dump(mode="json")
         assert dumped["provider_region"] == "us-east-1"
+
+    def test_confirm_service_tier_omitted_when_none_present_when_set(self) -> None:
+        # service_tier settles the enforcement counter at the tier-repriced
+        # rate (flex 0.5x / priority 1.75x / optimized 1.25x). The pinned wire
+        # shape is key-ABSENT when None (never "service_tier": null) — the
+        # Cloud API settles key-absent confirms at Standard rates.
+        assert "service_tier" not in _confirm().model_dump(mode="json")
+        dumped = _confirm(service_tier="priority").model_dump(mode="json")
+        assert dumped["service_tier"] == "priority"
+
+    def test_confirm_service_tier_accepts_every_pinned_literal(self) -> None:
+        # The seven values pinned lock-step with the Cloud API's ServiceTier
+        # literal — its confirm model is extra="forbid"-strict on values too.
+        for tier in ("auto", "default", "flex", "scale", "priority", "standard", "optimized"):
+            assert _confirm(service_tier=tier).service_tier == tier
+
+    def test_confirm_service_tier_rejects_unknown_value(self) -> None:
+        # A novel tier echo must never reach the wire: the Cloud API would 422
+        # the confirm and strand the reservation. The model is the backstop;
+        # build_confirm_request narrows unknown echoes to None before this.
+        with pytest.raises(ValidationError):
+            _confirm(service_tier="hyperspeed")
 
     def test_non_failover_metadata_dump_omits_possibly_succeeded_keeps_call_id(self) -> None:
         # A plain non-failover SUCCESS event: the None-skipping serializer drops

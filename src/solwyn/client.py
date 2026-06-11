@@ -896,6 +896,11 @@ class Solwyn(_SolwynBase):
             # Per-region pricing attribution: the SERVED runtime's endpoint
             # region (None for providers without regional pricing).
             provider_region = rt.adapter.extract_region(rt.sdk_client)
+            # The tier echoed on the RAW served response is the billing ground
+            # truth. Extracted ONCE: confirm and metadata for one call_id must
+            # carry the same tier or the enforcement counter and the durable
+            # tier-repriced cost diverge.
+            service_tier = rt.adapter.extract_service_tier(response)
             result = response
             if is_provider_fallback:
                 # Cross-provider hop: reshape the served response back to the
@@ -915,6 +920,7 @@ class Solwyn(_SolwynBase):
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
                     provider_region=provider_region,
+                    service_tier=service_tier,
                 )
             self._reporter.report(
                 self._build_metadata_event(
@@ -936,7 +942,7 @@ class Solwyn(_SolwynBase):
                     ),
                     attempt_index=chain_index,
                     call_id=call_id,
-                    service_tier=rt.adapter.extract_service_tier(response),
+                    service_tier=service_tier,
                     agent_run=agent_run,
                     provider_region=provider_region,
                 )
@@ -985,6 +991,9 @@ class Solwyn(_SolwynBase):
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
             self.record_latency(provider, ctx.elapsed_ms())
+            # Extracted ONCE — confirm and metadata for one call_id must carry
+            # the same tier or the enforcement counter and durable cost diverge.
+            service_tier = accumulator.get_service_tier()
             confirm = None
             if budget.reservation_id:
                 confirm = self._budget.build_confirm_request(
@@ -995,6 +1004,7 @@ class Solwyn(_SolwynBase):
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
                     provider_region=provider_region,
+                    service_tier=service_tier,
                 )
             event = self._build_metadata_event(
                 model=served_model,
@@ -1015,7 +1025,7 @@ class Solwyn(_SolwynBase):
                 ),
                 attempt_index=ctx.attempt_index,
                 call_id=call_id,
-                service_tier=accumulator.get_service_tier(),
+                service_tier=service_tier,
                 agent_run=agent_run,
                 provider_region=provider_region,
             )
@@ -1532,6 +1542,9 @@ class AsyncSolwyn(_SolwynBase):
             # Per-region pricing attribution: the SERVED runtime's endpoint
             # region (None for providers without regional pricing).
             provider_region = rt.adapter.extract_region(rt.sdk_client)
+            # Extracted ONCE from the RAW served response — confirm and
+            # metadata must carry the same tier (see the sync path).
+            service_tier = rt.adapter.extract_service_tier(response)
             result = response
             if is_provider_fallback:
                 # Cross-provider hop: reshape the served response back to the
@@ -1551,6 +1564,7 @@ class AsyncSolwyn(_SolwynBase):
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
                     provider_region=provider_region,
+                    service_tier=service_tier,
                 )
             self._reporter.report(
                 self._build_metadata_event(
@@ -1572,7 +1586,7 @@ class AsyncSolwyn(_SolwynBase):
                     ),
                     attempt_index=chain_index,
                     call_id=call_id,
-                    service_tier=rt.adapter.extract_service_tier(response),
+                    service_tier=service_tier,
                     agent_run=agent_run,
                     provider_region=provider_region,
                 )
@@ -1619,6 +1633,9 @@ class AsyncSolwyn(_SolwynBase):
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
             self.record_latency(provider, ctx.elapsed_ms())
+            # Extracted ONCE — confirm and metadata must carry the same tier
+            # (see the sync on_complete).
+            service_tier = accumulator.get_service_tier()
             confirm = None
             if budget.reservation_id:
                 confirm = self._budget.build_confirm_request(
@@ -1629,6 +1646,7 @@ class AsyncSolwyn(_SolwynBase):
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
                     provider_region=provider_region,
+                    service_tier=service_tier,
                 )
             event = self._build_metadata_event(
                 model=served_model,
@@ -1649,7 +1667,7 @@ class AsyncSolwyn(_SolwynBase):
                 ),
                 attempt_index=ctx.attempt_index,
                 call_id=call_id,
-                service_tier=accumulator.get_service_tier(),
+                service_tier=service_tier,
                 agent_run=agent_run,
                 provider_region=provider_region,
             )

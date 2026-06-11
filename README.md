@@ -276,7 +276,7 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 
 Provider failover confirms include `provider` and `call_id` on `POST /api/v1/budgets/confirm` so Solwyn Cloud can price and deduplicate the served provider. Release this SDK only after Solwyn Cloud accepts those fields; deploy the Cloud API first.
 
-Bedrock support additionally requires the Cloud API to accept (deploy API-first): the `bedrock` provider enum value, the optional `provider_region` field on metadata events and budget confirms, and model identifiers up to 2048 chars (Bedrock ARNs; was 100). PricingService should key Bedrock prices by (model, region) and use `service_tier` for flex/priority/latency-optimized repricing.
+Bedrock support additionally requires the Cloud API to accept (deploy API-first): the `bedrock` provider enum value, the optional `provider_region` and `service_tier` fields on metadata events and budget confirms, and model identifiers up to 2048 chars (Bedrock ARNs; was 100). PricingService keys Bedrock prices by (model, region); `service_tier` on the confirm settles the budget enforcement counter at the tier-repriced rate (flex/priority/latency-optimized) — omitted, it settles at Standard rates. Both optional fields are omitted entirely (never `null`) when unset, so other providers' wire bytes are unchanged.
 
 ## Requirements
 

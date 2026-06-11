@@ -102,3 +102,32 @@ def test_build_confirm_request_returns_pydantic_model() -> None:
     assert request.model == "gpt-4o"
     assert request.provider == "openai"
     enforcer.close()
+
+
+@pytest.mark.unit
+def test_build_confirm_request_narrows_service_tier_to_wire_literals() -> None:
+    """Adapters echo ARBITRARY tier strings; the confirm wire is a strict literal.
+
+    A recognized tier rides the confirm verbatim; a novel echo narrows to None
+    (settles at Standard rates) instead of 422-ing the strict Cloud-API model
+    and stranding the reservation. The raw echo still reaches the API on the
+    MetadataEvent, which is a bounded str.
+    """
+    enforcer = BudgetEnforcer(api_url="http://localhost:8000", api_key="sk_test")
+    token_details = TokenDetails(input_tokens=10, output_tokens=20)
+
+    def _build(tier: str | None) -> BudgetConfirmRequest:
+        return enforcer.build_confirm_request(
+            reservation_id="r_test_123",
+            model="gpt-4o",
+            token_details=token_details,
+            provider="openai",
+            call_id="call_tier",
+            service_tier=tier,
+        )
+
+    assert _build("priority").service_tier == "priority"
+    assert _build("flex").service_tier == "flex"
+    assert _build(None).service_tier is None
+    assert _build("hyperspeed").service_tier is None  # novel echo -> Standard
+    enforcer.close()

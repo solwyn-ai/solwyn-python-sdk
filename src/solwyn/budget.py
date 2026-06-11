@@ -14,6 +14,7 @@ import logging
 import threading
 import time
 from datetime import UTC, datetime
+from typing import cast, get_args
 
 import httpx
 from pydantic import BaseModel, ConfigDict
@@ -25,10 +26,16 @@ from solwyn._types import (
     BudgetConfirmRequest,
     BudgetMode,
     ProviderName,
+    ServiceTier,
 )
 
 # Fallback per-token cost when cloud API is unreachable.
 DEFAULT_COST_PER_TOKEN: float = 0.00003
+
+# The contractual confirm tier values (derived from the ServiceTier literal,
+# never hand-copied). Adapters echo arbitrary bounded strings; only these may
+# ride the value-strict confirm wire.
+_SERVICE_TIER_VALUES: frozenset[str] = frozenset(get_args(ServiceTier))
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +303,7 @@ class _BudgetEnforcerBase:
         is_provider_fallback: bool = False,
         call_id: str,
         provider_region: str | None = None,
+        service_tier: str | None = None,
     ) -> BudgetConfirmRequest:
         """Build a validated confirm request for fire-and-forget callers.
 
@@ -305,9 +313,17 @@ class _BudgetEnforcerBase:
         ``call_id`` is the required per-call reconciliation join key.
         ``provider_region`` is the served endpoint's region for per-region
         pricing (Bedrock); None for providers without regional pricing.
+        ``service_tier`` is the RAW tier echoed by the provider response —
+        recognized values settle the enforcement counter at the tier-repriced
+        rate; a novel echo narrows to None (Standard rates) so the strict
+        Cloud-API confirm model never 422s and strands the reservation. The
+        raw echo still reaches the API on the MetadataEvent.
         """
         if not call_id:
             raise RuntimeError("call_id is required for budget confirm reconciliation")
+        if service_tier is not None and service_tier not in _SERVICE_TIER_VALUES:
+            logger.debug("budget.confirm_service_tier_unrecognized: settling at Standard rates")
+            service_tier = None
         return BudgetConfirmRequest(
             reservation_id=reservation_id,
             model=model,
@@ -316,6 +332,7 @@ class _BudgetEnforcerBase:
             token_details=token_details,
             call_id=call_id,
             provider_region=provider_region,
+            service_tier=cast("ServiceTier | None", service_tier),
         )
 
 
@@ -428,6 +445,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         is_provider_fallback: bool = False,
         call_id: str,
         provider_region: str | None = None,
+        service_tier: str | None = None,
     ) -> None:
         """Confirm actual token usage for a budget reservation.
 
@@ -447,6 +465,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 is_provider_fallback=is_provider_fallback,
                 call_id=call_id,
                 provider_region=provider_region,
+                service_tier=service_tier,
             )
             resp = self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",
@@ -572,6 +591,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         is_provider_fallback: bool = False,
         call_id: str,
         provider_region: str | None = None,
+        service_tier: str | None = None,
     ) -> None:
         """Async version of cost confirmation. See BudgetEnforcer.confirm_cost."""
         try:
@@ -583,6 +603,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 is_provider_fallback=is_provider_fallback,
                 call_id=call_id,
                 provider_region=provider_region,
+                service_tier=service_tier,
             )
             resp = await self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",

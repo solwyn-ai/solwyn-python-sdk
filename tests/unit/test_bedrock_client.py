@@ -197,6 +197,31 @@ class TestBedrockConverseInterception:
         assert confirm_kwargs["provider_region"] == "eu-west-1"
         solwyn.close()
 
+    def test_converse_confirm_and_event_carry_same_service_tier(self) -> None:
+        # The tier echoed on the response settles the enforcement counter at
+        # the tier-repriced rate. Confirm and metadata for one call_id MUST
+        # carry the SAME tier or the counter and durable cost diverge.
+        client = _mock_bedrock_client()
+        response = _converse_response()
+        response["serviceTier"] = {"type": "priority"}
+        client.converse.return_value = response
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._budget.confirm_cost = MagicMock()
+
+        with _mock_budget(solwyn):
+            solwyn.converse(
+                modelId=BEDROCK_MODEL,
+                messages=[{"role": "user", "content": [{"text": "Hello"}]}],
+            )
+
+        confirm_kwargs = solwyn._budget.confirm_cost.call_args.kwargs
+        assert confirm_kwargs["service_tier"] == "priority"
+        assert len(reported) == 1
+        assert reported[0].service_tier == "priority"
+        solwyn.close()
+
     def test_converse_requires_model_id(self) -> None:
         client = _mock_bedrock_client()
         solwyn = _make_solwyn(client)
@@ -263,6 +288,34 @@ class TestBedrockConverseStream:
         assert event.provider_region == "us-east-1"
         assert confirm.provider_region == "us-east-1"
         assert confirm.token_details.input_tokens == 9
+        solwyn.close()
+
+    def test_converse_stream_confirm_and_event_carry_same_service_tier(self) -> None:
+        # Streaming tier arrives on the terminal metadata event; the stream
+        # settlement's confirm and metadata event must carry the same value.
+        events = _converse_stream_events()
+        events[-1]["metadata"]["serviceTier"] = {"type": "flex"}
+        client = _mock_bedrock_client()
+        client.converse_stream.return_value = {
+            "ResponseMetadata": {"HTTPStatusCode": 200},
+            "stream": iter(events),
+        }
+        solwyn = _make_solwyn(client)
+        settlements: list = []
+        solwyn._reporter.report = lambda e: None
+        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+
+        with _mock_budget(solwyn):
+            result = solwyn.converse_stream(
+                modelId=BEDROCK_MODEL,
+                messages=[{"role": "user", "content": [{"text": "Hello"}]}],
+            )
+            list(result["stream"])
+
+        assert len(settlements) == 1
+        confirm, event = settlements[0]
+        assert confirm.service_tier == "flex"
+        assert event.service_tier == "flex"
         solwyn.close()
 
 

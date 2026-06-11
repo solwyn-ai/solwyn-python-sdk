@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -73,6 +73,14 @@ class FailoverReason(StrEnum):
     CIRCUIT_OPEN = "circuit_open"  # primary breaker was OPEN — never attempted
     PRIMARY_ERROR = "primary_error"  # primary attempt raised before success
     MODEL_FALLBACK = "model_fallback"  # same-provider model swap
+
+
+# The CONTRACTUAL tier values, pinned lock-step with the Cloud API's
+# ServiceTier literal — its confirm model rejects anything else. The
+# observational MetadataEvent.service_tier stays a bounded str (any provider
+# echo rides telemetry); only the confirm, which settles the budget
+# enforcement counter at a tier-repriced rate, is value-strict.
+ServiceTier = Literal["auto", "default", "flex", "scale", "priority", "standard", "optimized"]
 
 
 # ── Config models ───────────────────────────────────────────────────────
@@ -296,5 +304,15 @@ class BudgetConfirmRequest(BaseModel):
         description=(
             "Cloud region of the serving endpoint, for per-region pricing "
             "(Bedrock). None for providers without regional pricing."
+        ),
+    )
+    service_tier: ServiceTier | None = Field(
+        default=None,
+        description=(
+            "Service tier echoed by the provider response. Bedrock confirms "
+            "settle the budget enforcement counter at the tier-repriced rate "
+            "(flex 0.5x / priority 1.75x / optimized 1.25x) so hard-deny "
+            "tracks real spend; None settles at Standard rates. Ignored for "
+            "providers without per-tier pricing."
         ),
     )
