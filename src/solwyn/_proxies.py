@@ -15,6 +15,21 @@ if TYPE_CHECKING:
     from solwyn.client import AsyncSolwyn, Solwyn
 
 
+def _bedrock_internal_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Rename boto3's ``modelId`` to the pipeline's uniform ``model`` key.
+
+    The whole interception pipeline (estimation, budget check, candidate walk,
+    translation) keys on ``kwargs["model"]``; dispatch renames it back to
+    ``modelId`` for the actual boto3 call. Raises TypeError (the same class
+    boto3 raises for a missing required kwarg) when ``modelId`` is absent.
+    """
+    if "modelId" not in kwargs:
+        raise TypeError("converse() requires the 'modelId' keyword argument")
+    renamed = dict(kwargs)
+    renamed["model"] = renamed.pop("modelId")
+    return renamed
+
+
 # ---------------------------------------------------------------------------
 # Sync proxies
 # ---------------------------------------------------------------------------

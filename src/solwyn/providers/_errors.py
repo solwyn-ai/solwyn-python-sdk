@@ -22,15 +22,39 @@ and silently double-spend. The same trap exists in ``httpx``: ``ConnectTimeout``
 subclasses ``TimeoutException`` (the generic, ambiguous case), and both
 ``ConnectError`` and ``RemoteProtocolError`` subclass ``TransportError``.
 
+The same duck-typing covers botocore (Bedrock): service errors are
+``ClientError`` subclasses whose class NAME equals the AWS error code and whose
+HTTP status lives at ``exc.response["ResponseMetadata"]["HTTPStatusCode"]`` (a
+dict, not an attribute). Two Bedrock errors carry MISLEADING 4xx statuses:
+``ModelTimeoutException`` (408) and ``ModelErrorException`` (424) both mean the
+request REACHED the model and ran — by status alone they would be FAIL_FAST,
+silently dropping the reservation reconciliation, so their names are matched
+BEFORE the status check. botocore transport errors have no status at all and
+classify purely by name; note ``ReadTimeoutError`` subclasses
+``HTTPClientError``, NOT botocore's ``ConnectionError`` — and botocore's
+``ConnectionError`` shares its NAME with the Python builtin (whose
+``ConnectionResetError`` subclass is post-send-possible), so the bare name
+"ConnectionError" is NEVER matched.
+
 Consequently the checks MUST run in this exact order, narrowest-and-safest
 first:
 
   1. ``APITimeoutError`` (by MRO name)        -> POST_SEND_AMBIGUOUS
-  2. httpx ReadTimeout / WriteTimeout         -> POST_SEND_AMBIGUOUS
+  2. httpx ReadTimeout / WriteTimeout, and
+     botocore ``ReadTimeoutError`` (by name)  -> POST_SEND_AMBIGUOUS
   3. httpx ConnectTimeout / PoolTimeout /
-     ConnectError (provably pre-send)         -> FAILOVER
+     ConnectError (provably pre-send), and
+     botocore ``EndpointConnectionError`` /
+     ``ConnectTimeoutError`` /
+     ``ProxyConnectionError`` (by name)       -> FAILOVER
   4. httpx TimeoutException (any other)       -> POST_SEND_AMBIGUOUS
-  5. numeric status (.status_code, then .code):
+  4b. Bedrock post-send-by-name:
+     ``ModelTimeoutException`` /
+     ``ModelErrorException`` (misleading 4xx
+     statuses — name wins over status), and
+     botocore ``ConnectionClosedError``       -> POST_SEND_AMBIGUOUS
+  5. numeric status (.status_code, then .code,
+     then botocore ``response["ResponseMetadata"]["HTTPStatusCode"]``):
        429 / 529 -> FAILOVER
        4xx       -> FAIL_FAST
        5xx       -> POST_SEND_AMBIGUOUS
@@ -43,23 +67,39 @@ first:
 
 Steps 1 and 2 MUST precede step 3 (timeout-before-connection). Step 3 MUST
 precede step 4 (specific pre-send timeouts before the generic ambiguous
-timeout). Step 6 (bare connection failure) MUST come AFTER the status check so a
-connection error that somehow carries a status is classified by status first.
-The cause-inspection in step 6 closes a subtle double-spend vector: the
-openai/anthropic ``APIConnectionError`` wrapper covers BOTH provably pre-send
-failures AND post-send transport drops (a server disconnect mid-response
-surfaces as ``httpx.RemoteProtocolError``), so the class name alone does not
-prove the request never landed.
+timeout). Step 4b MUST precede step 5 (Bedrock's post-send 408/424 names win
+over their misleading statuses). Step 6 (bare connection failure) MUST come
+AFTER the status check so a connection error that somehow carries a status is
+classified by status first. The cause-inspection in step 6 closes a subtle
+double-spend vector: the openai/anthropic ``APIConnectionError`` wrapper covers
+BOTH provably pre-send failures AND post-send transport drops (a server
+disconnect mid-response surfaces as ``httpx.RemoteProtocolError``), so the
+class name alone does not prove the request never landed.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
 
 import httpx
+
+# botocore transport errors classified purely by MRO name (they carry no
+# status). Pre-send: the connection was never established. Post-send: bytes
+# were sent or the connection dropped before a valid response — the model may
+# have run. The bare name "ConnectionError" is deliberately ABSENT from both
+# sets (it collides with the Python builtin; see the module docstring).
+_BOTOCORE_PRE_SEND_NAMES = frozenset(
+    {"EndpointConnectionError", "ConnectTimeoutError", "ProxyConnectionError"}
+)
+# Bedrock service errors whose NAME must win over their misleading 4xx status
+# (408/424 mean the model ran), plus botocore's mid-response connection drop.
+_POST_SEND_BY_NAME = frozenset(
+    {"ModelTimeoutException", "ModelErrorException", "ConnectionClosedError"}
+)
 
 
 class Disposition(StrEnum):
@@ -76,11 +116,13 @@ class Disposition(StrEnum):
 
 
 def _numeric_status(exc: BaseException) -> int | None:
-    """Return the first int among ``exc.status_code`` then ``exc.code``.
+    """Return the first int among ``exc.status_code``, ``exc.code``, then the
+    botocore ``exc.response["ResponseMetadata"]["HTTPStatusCode"]`` dict path.
 
     OpenAI/Anthropic carry the HTTP status on ``status_code``; Google's
-    ``APIError`` carries it on ``code``. ``bool`` subclasses ``int``, so a
-    truthy ``status_code = True`` would otherwise be misread as HTTP 1 — guard
+    ``APIError`` carries it on ``code``; botocore's ``ClientError`` buries it
+    in the parsed response dict. ``bool`` subclasses ``int``, so a truthy
+    ``status_code = True`` would otherwise be misread as HTTP 1 — guard
     against it explicitly.
     """
     for attr in ("status_code", "code"):
@@ -89,6 +131,13 @@ def _numeric_status(exc: BaseException) -> int | None:
             continue
         if isinstance(value, int):
             return value
+    response = getattr(exc, "response", None)
+    if isinstance(response, Mapping):
+        metadata = response.get("ResponseMetadata")
+        if isinstance(metadata, Mapping):
+            status = metadata.get("HTTPStatusCode")
+            if isinstance(status, int) and not isinstance(status, bool):
+                return status
     return None
 
 
@@ -108,17 +157,33 @@ def classify_exception(exc: BaseException) -> Disposition:
         return Disposition.POST_SEND_AMBIGUOUS
 
     # 2. httpx read/write timeouts are post-send: bytes were already sent.
+    #    botocore's ReadTimeoutError is the same post-send case (note: it
+    #    subclasses HTTPClientError, NOT botocore's ConnectionError).
     if isinstance(exc, httpx.ReadTimeout | httpx.WriteTimeout):
+        return Disposition.POST_SEND_AMBIGUOUS
+    if "ReadTimeoutError" in names:
         return Disposition.POST_SEND_AMBIGUOUS
 
     # 3. Provably pre-send transport failures — safe to failover.
     #    ConnectTimeout subclasses TimeoutException, so it MUST be checked
-    #    before the generic TimeoutException branch (step 4) below.
+    #    before the generic TimeoutException branch (step 4) below. The
+    #    botocore pre-send names are the boto equivalents (never the bare
+    #    "ConnectionError" — that name collides with the Python builtin).
     if isinstance(exc, httpx.ConnectTimeout | httpx.PoolTimeout | httpx.ConnectError):
+        return Disposition.FAILOVER
+    if names & _BOTOCORE_PRE_SEND_NAMES:
         return Disposition.FAILOVER
 
     # 4. Any other timeout we cannot prove pre-send -> ambiguous.
     if isinstance(exc, httpx.TimeoutException):
+        return Disposition.POST_SEND_AMBIGUOUS
+
+    # 4b. Post-send by NAME, before the status check: Bedrock's
+    #     ModelTimeoutException (408) and ModelErrorException (424) carry
+    #     request-shaped statuses but mean the model RAN — classifying them by
+    #     status would skip reservation reconciliation (silent double-count).
+    #     ConnectionClosedError is botocore's mid-response connection drop.
+    if names & _POST_SEND_BY_NAME:
         return Disposition.POST_SEND_AMBIGUOUS
 
     # 5. Numeric status classification (OpenAI/Anthropic .status_code,
@@ -182,15 +247,22 @@ def _retry_after_header(exc: BaseException) -> str | None:
     """Read the ``Retry-After`` header off a transport exception, duck-typed.
 
     Looks for a ``headers`` mapping on ``exc.response`` (the OpenAI/Anthropic
-    shape) and falls back to a ``headers`` attribute on the exception itself.
-    Lookup is case-insensitive: ``httpx.Headers.get`` already is, and a plain
-    dict carrier is scanned case-insensitively. Total by construction — this runs
-    inside the dispatch except-handler on an arbitrary third-party exception, so a
-    pathological ``headers`` object is swallowed and treated as "no header" rather
-    than allowed to raise over the original provider exception.
+    shape), falls back to a ``headers`` attribute on the exception itself, and
+    handles the botocore shape where ``exc.response`` is a parsed DICT carrying
+    headers at ``["ResponseMetadata"]["HTTPHeaders"]`` (botocore lowercases the
+    keys). Lookup is case-insensitive: ``httpx.Headers.get`` already is, and a
+    plain dict carrier is scanned case-insensitively. Total by construction —
+    this runs inside the dispatch except-handler on an arbitrary third-party
+    exception, so a pathological ``headers`` object is swallowed and treated as
+    "no header" rather than allowed to raise over the original provider
+    exception.
     """
     for carrier in (getattr(exc, "response", None), exc):
         headers = getattr(carrier, "headers", None)
+        if headers is None and isinstance(carrier, Mapping):
+            metadata = carrier.get("ResponseMetadata")
+            if isinstance(metadata, Mapping):
+                headers = metadata.get("HTTPHeaders")
         if headers is None:
             continue
         try:

@@ -175,6 +175,28 @@ class TestContentLengthEstimation:
         length = estimate_content_length({"contents": [{"text": "Hello"}]})
         assert length == len("Hello")
 
+    def test_bedrock_converse_message_blocks_length(self) -> None:
+        # Bedrock Converse content blocks are {"text": ...} (no "type" key) —
+        # already covered by the block walk, pinned here explicitly.
+        kwargs = {
+            "messages": [{"role": "user", "content": [{"text": "Hello Bedrock"}]}],
+        }
+        assert estimate_content_length(kwargs) == len("Hello Bedrock")
+
+    def test_bedrock_system_block_list_length(self) -> None:
+        # Bedrock system is a LIST of SystemContentBlock dicts, not a string.
+        kwargs = {
+            "system": [{"text": "You are helpful"}, {"text": "Be brief"}],
+            "messages": [{"role": "user", "content": [{"text": "Hi"}]}],
+        }
+        expected = len("You are helpful") + len("Be brief") + len("Hi")
+        assert estimate_content_length(kwargs) == expected
+
+    def test_bedrock_system_non_text_blocks_are_skipped(self) -> None:
+        # cachePoint/guardContent system blocks carry no countable text.
+        kwargs = {"system": [{"cachePoint": {"type": "default"}}, {"text": "Hi"}]}
+        assert estimate_content_length(kwargs) == len("Hi")
+
 
 # ---------------------------------------------------------------------------
 # Basic wrapping: call goes through

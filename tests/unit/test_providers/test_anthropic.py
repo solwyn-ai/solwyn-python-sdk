@@ -285,3 +285,38 @@ class TestAnthropicAdapterServiceTierScope:
     def test_anthropic_adapter_returns_none_for_service_tier(self) -> None:
         """Anthropic has no service-tier concept."""
         assert AnthropicAdapter().extract_service_tier(SimpleNamespace()) is None
+
+
+@pytest.mark.unit
+class TestAnthropicAdapterDispatchSeams:
+    def test_prepare_call_selects_messages_create(self) -> None:
+        def create(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(messages=SimpleNamespace(create=create))
+        kwargs: dict[str, Any] = {"model": "claude-sonnet-4-6"}
+
+        method, prepared = AnthropicAdapter().prepare_call(
+            client, kwargs, is_streaming=False, timeout=30.0, max_retries=0
+        )
+
+        assert method is create
+        assert prepared == {"model": "claude-sonnet-4-6"}
+        assert prepared is not kwargs  # never mutates / aliases the input
+
+    def test_prepare_call_streaming_sets_stream_kwarg_without_mutation(self) -> None:
+        client = SimpleNamespace(messages=SimpleNamespace(create=lambda **kw: kw))
+        kwargs: dict[str, Any] = {"model": "claude-sonnet-4-6"}
+
+        _, prepared = AnthropicAdapter().prepare_call(
+            client, kwargs, is_streaming=True, timeout=30.0, max_retries=0
+        )
+
+        assert prepared["stream"] is True
+        assert "stream" not in kwargs
+
+    def test_stream_shape_seams_are_identity(self) -> None:
+        adapter = AnthropicAdapter()
+        response, wrapper = object(), object()
+        assert adapter.unwrap_stream_source(response) is response
+        assert adapter.wrap_stream_result(wrapper, response) is wrapper

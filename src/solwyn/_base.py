@@ -226,11 +226,14 @@ class _SolwynBase:
         sdk_instance_id: str | None = None,
         timestamp: datetime | None = None,
         agent_run: tuple[str | None, str | None] | None = None,
+        provider_region: str | None = None,
     ) -> MetadataEvent:
         """Build a MetadataEvent for reporting to the cloud API.
 
         ``call_id`` is the per-call reconciliation join key. ``possibly_succeeded``
         is the post-send-ambiguous abort flag — left None on every non-abort event.
+        ``provider_region`` is the served endpoint's cloud region (Bedrock pricing
+        is per model AND region); None for providers without regional pricing.
         """
         if not call_id:
             raise RuntimeError("call_id is required for metadata reconciliation")
@@ -257,6 +260,7 @@ class _SolwynBase:
             agent_run_id=agent_run_id,
             agent_run_name=agent_run_name,
             call_id=call_id,
+            provider_region=provider_region,
         )
 
     def _build_error_event(
@@ -274,6 +278,7 @@ class _SolwynBase:
         call_id: str,
         possibly_succeeded: bool | None = None,
         agent_run: tuple[str | None, str | None] | None = None,
+        provider_region: str | None = None,
     ) -> MetadataEvent:
         """Build an error-status MetadataEvent with zeroed token counts.
 
@@ -281,6 +286,9 @@ class _SolwynBase:
         token_details is unavailable and status is always ERROR. ``call_id``
         threads the reconciliation join key; ``possibly_succeeded`` is True only
         on a correctly-not-failed-over post-send-ambiguous abort.
+        ``provider_region`` is the FAILED hop's endpoint region — on a
+        possibly-succeeded abort the Cloud API needs it to reconcile a
+        possibly-landed charge per (model, region); None-skipped otherwise.
         """
         return self._build_metadata_event(
             model=model,
@@ -299,4 +307,5 @@ class _SolwynBase:
             call_id=call_id,
             possibly_succeeded=possibly_succeeded,
             agent_run=agent_run,
+            provider_region=provider_region,
         )

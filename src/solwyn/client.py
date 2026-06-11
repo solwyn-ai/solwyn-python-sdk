@@ -36,6 +36,7 @@ from solwyn._proxies import (
     _AsyncChatProxy,
     _AsyncMessagesProxy,
     _AsyncModelsProxy,
+    _bedrock_internal_kwargs,
     _SyncChatProxy,
     _SyncMessagesProxy,
     _SyncModelsProxy,
@@ -99,54 +100,27 @@ _SOURCE_COMPATIBLE_DEFAULT_KEYS = {
         }
     ),
     ProviderName.GOOGLE.value: frozenset({"config", "max_output_tokens", "stream"}),
+    ProviderName.BEDROCK.value: frozenset({"system", "inferenceConfig", "toolConfig", "stream"}),
 }
+
+# Why invoke_model fails loud instead of passing through untracked: it is a
+# PRIMARY completion surface (unlike, say, embeddings), so silent pass-through
+# would be a budget bypass; and its usage lives inside a consume-once response
+# body that also carries response CONTENT, so extracting it would require
+# buffering customer content — off the table by architecture.
+_INVOKE_MODEL_GUIDANCE = (
+    "Solwyn intercepts Bedrock through the Converse API only — use converse() / "
+    "converse_stream(), which work across all Bedrock chat models. invoke_model "
+    "responses carry usage inside a consume-once body, so Solwyn cannot budget-track "
+    "them without buffering response content. To make untracked calls anyway, use "
+    "the unwrapped boto3 client directly."
+)
 
 
 def _source_compatible_defaults(provider: str, params: dict[str, Any]) -> dict[str, Any]:
     """Return target defaults that are also legal in the source dialect."""
     allowed = _SOURCE_COMPATIBLE_DEFAULT_KEYS.get(provider, frozenset())
     return {key: value for key, value in params.items() if key in allowed}
-
-
-def _mapping_from_config(value: object) -> dict[str, Any]:
-    """Return a shallow dict view of a provider config object."""
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(value)
-    model_dump = getattr(value, "model_dump", None)
-    if callable(model_dump):
-        dumped = model_dump(exclude_none=True)
-        if isinstance(dumped, dict):
-            return dict(dumped)
-    attrs = getattr(value, "__dict__", None)
-    if isinstance(attrs, dict):
-        return dict(attrs)
-    return {}
-
-
-def _with_google_http_bound(
-    kwargs: dict[str, object], *, timeout: float, max_retries: int
-) -> dict[str, object]:
-    """Inject google-genai per-request HTTP options without importing the extra.
-
-    google-genai accepts ``config={"http_options": ...}`` for generate_content
-    calls, and its timeout is milliseconds. We preserve caller config/http_options
-    but override the timeout and retry attempts because the chain deadline is a
-    mandatory Solwyn bound.
-    """
-    bounded = dict(kwargs)
-    config = _mapping_from_config(bounded.get("config"))
-    http_options = _mapping_from_config(config.get("http_options"))
-    retry_options = _mapping_from_config(http_options.get("retry_options"))
-
-    timeout_ms = max(1, int(timeout * 1000))
-    retry_options["attempts"] = max(1, max_retries + 1)
-    http_options["timeout"] = timeout_ms
-    http_options["retry_options"] = retry_options
-    config["http_options"] = http_options
-    bounded["config"] = config
-    return bounded
 
 
 def _openai_uses_max_completion_tokens(model: str) -> bool:
@@ -562,6 +536,30 @@ class Solwyn(_SolwynBase):
             return _SyncModelsProxy(self)
         return self._client.models
 
+    def converse(self, **kwargs: Any) -> Any:
+        """Bedrock-compatible: client.converse(modelId=...) goes through interception."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            return self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
+        return self._client.converse(**kwargs)
+
+    def converse_stream(self, **kwargs: Any) -> Any:
+        """Bedrock-compatible streaming: returns the boto3 dict with a wrapped stream."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            return self._intercepted_call(_force_stream=True, **_bedrock_internal_kwargs(kwargs))
+        return self._client.converse_stream(**kwargs)
+
+    def invoke_model(self, **kwargs: Any) -> Any:
+        """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        return self._client.invoke_model(**kwargs)
+
+    def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
+        """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        return self._client.invoke_model_with_response_stream(**kwargs)
+
     def _sync_dispatch(
         self,
         runtime: ProviderRuntime,
@@ -574,35 +572,28 @@ class Solwyn(_SolwynBase):
         """Dispatch one hop to the runtime's SDK client. Pure I/O — no metrics.
 
         Applies the mandatory per-hop bound via ``with_options`` (kills the
-        600s SDK read default and any internal retry stacking).
+        600s SDK read default and any internal retry stacking); SDKs without
+        ``with_options`` apply their own bound inside ``prepare_call``.
 
         The served hop's stream-method selection is driven by the dispatch-level
         ``is_streaming`` boolean — NOT the original ``_force_stream``/canonical
         flag (fix [A]). A caller who streamed via OpenAI/Anthropic ``stream=True``
-        and fails over to Google must still hit ``generate_content_stream``; a
-        Google streamer that fails over to OpenAI/Anthropic must serve with
-        ``stream=True``. OpenAI/Anthropic stream via ``stream=True`` in kwargs;
-        Google streams via its dedicated method (and the ``stream`` kwarg, which
-        its SDK does not accept, is stripped).
+        and fails over to Google/Bedrock must still hit the dedicated stream
+        method, and vice versa. Every provider-specific quirk (stream kwarg vs
+        dedicated method, model-key rename, HTTP bound) lives on the adapter's
+        ``prepare_call`` — adding a provider never touches this method.
         """
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(timeout=timeout, max_retries=max_retries)
-        name = runtime.adapter.name
-        if name == ProviderName.OPENAI.value:
-            if is_streaming:
-                kwargs["stream"] = True
-            return client.chat.completions.create(**kwargs)
-        if name == ProviderName.ANTHROPIC.value:
-            if is_streaming:
-                kwargs["stream"] = True
-            return client.messages.create(**kwargs)
-        # Google: its generate_content[_stream] methods take no ``stream`` kwarg.
-        kwargs = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
-        kwargs.pop("stream", None)
-        if is_streaming:
-            return client.models.generate_content_stream(**kwargs)
-        return client.models.generate_content(**kwargs)
+        method, call_kwargs = runtime.adapter.prepare_call(
+            client,
+            cast("dict[str, Any]", kwargs),
+            is_streaming=is_streaming,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+        return method(**call_kwargs)
 
     def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Core interception logic: the classified candidate walk."""
@@ -644,7 +635,9 @@ class Solwyn(_SolwynBase):
 
         if not budget.allowed:
             # Report estimated tokens so the API keeps an accurate running total
-            # even for calls that were blocked by hard-deny.
+            # even for calls that were blocked by hard-deny. The PRIMARY's
+            # endpoint region rides along so denied-Bedrock spend stays
+            # analyzable per region (None-skipped for other providers).
             try:
                 event = self._build_metadata_event(
                     model=requested_model,
@@ -657,6 +650,7 @@ class Solwyn(_SolwynBase):
                     is_model_fallback=False,
                     call_id=call_id,
                     agent_run=agent_run,
+                    provider_region=primary.adapter.extract_region(primary.sdk_client),
                 )
                 self._reporter.report(event)
             except Exception:
@@ -850,6 +844,7 @@ class Solwyn(_SolwynBase):
                             call_id=call_id,
                             possibly_succeeded=True if possibly_succeeded else None,
                             agent_run=agent_run,
+                            provider_region=rt.adapter.extract_region(rt.sdk_client),
                         )
                     )
                     if disp is Disposition.FAIL_FAST:
@@ -898,6 +893,14 @@ class Solwyn(_SolwynBase):
             self.record_latency(provider, ctx.elapsed_ms())
 
             token_details = rt.adapter.extract_usage(response)
+            # Per-region pricing attribution: the SERVED runtime's endpoint
+            # region (None for providers without regional pricing).
+            provider_region = rt.adapter.extract_region(rt.sdk_client)
+            # The tier echoed on the RAW served response is the billing ground
+            # truth. Extracted ONCE: confirm and metadata for one call_id must
+            # carry the same tier or the enforcement counter and the durable
+            # tier-repriced cost diverge.
+            service_tier = rt.adapter.extract_service_tier(response)
             result = response
             if is_provider_fallback:
                 # Cross-provider hop: reshape the served response back to the
@@ -916,6 +919,8 @@ class Solwyn(_SolwynBase):
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
+                    provider_region=provider_region,
+                    service_tier=service_tier,
                 )
             self._reporter.report(
                 self._build_metadata_event(
@@ -937,8 +942,9 @@ class Solwyn(_SolwynBase):
                     ),
                     attempt_index=chain_index,
                     call_id=call_id,
-                    service_tier=rt.adapter.extract_service_tier(response),
+                    service_tier=service_tier,
                     agent_run=agent_run,
+                    provider_region=provider_region,
                 )
             )
             return result
@@ -963,18 +969,31 @@ class Solwyn(_SolwynBase):
         primary_errored: bool,
         call_id: str,
         agent_run: tuple[str | None, str | None],
-    ) -> SyncStreamWrapper:
-        """Wrap a streaming response, settling against the SERVED runtime."""
+    ) -> Any:
+        """Wrap a streaming response, settling against the SERVED runtime.
+
+        Return shape is dialect-dependent: Bedrock callers get back the boto3
+        contract shape (a dict whose ``"stream"`` value is the wrapped event
+        stream); every other dialect gets the wrapper directly. The wrapped
+        ITERABLE is always the served stream itself — for a served-Bedrock hop
+        that is the inner ``response["stream"]`` event stream, not the dict.
+        """
         provider = runtime.adapter.name
         served_model = ctx.model
         is_provider_fallback = ctx.is_provider_fallback
         accumulator = runtime.adapter.create_stream_accumulator()
+        # Per-region pricing attribution for the SERVED runtime (None for
+        # providers without regional pricing). Captured once, closed over.
+        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
 
         def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             self._get_circuit_breaker(provider).record_success()
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
             self.record_latency(provider, ctx.elapsed_ms())
+            # Extracted ONCE — confirm and metadata for one call_id must carry
+            # the same tier or the enforcement counter and durable cost diverge.
+            service_tier = accumulator.get_service_tier()
             confirm = None
             if budget.reservation_id:
                 confirm = self._budget.build_confirm_request(
@@ -984,6 +1003,8 @@ class Solwyn(_SolwynBase):
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
+                    provider_region=provider_region,
+                    service_tier=service_tier,
                 )
             event = self._build_metadata_event(
                 model=served_model,
@@ -1004,8 +1025,9 @@ class Solwyn(_SolwynBase):
                 ),
                 attempt_index=ctx.attempt_index,
                 call_id=call_id,
-                service_tier=accumulator.get_service_tier(),
+                service_tier=service_tier,
                 agent_run=agent_run,
+                provider_region=provider_region,
             )
             if confirm is not None:
                 self._reporter.report_settlement(confirm, event)
@@ -1027,6 +1049,7 @@ class Solwyn(_SolwynBase):
                     call_id=call_id,
                     possibly_succeeded=True,
                     agent_run=agent_run,
+                    provider_region=provider_region,
                 )
             )
 
@@ -1040,9 +1063,14 @@ class Solwyn(_SolwynBase):
             if is_provider_fallback
             else None
         )
-        return SyncStreamWrapper(
-            response, accumulator, on_complete, on_error, chunk_translator=chunk_translator
+        # The SERVED adapter owns its stream nesting (Bedrock wraps the INNER
+        # event stream); the PRIMARY adapter owns the caller-dialect result
+        # shape (Bedrock callers get the boto3 contract dict back).
+        source = runtime.adapter.unwrap_stream_source(response)
+        wrapper = SyncStreamWrapper(
+            source, accumulator, on_complete, on_error, chunk_translator=chunk_translator
         )
+        return primary.adapter.wrap_stream_result(wrapper, response)
 
     def close(self) -> None:
         """Shut down the reporter and close HTTP clients."""
@@ -1176,6 +1204,32 @@ class AsyncSolwyn(_SolwynBase):
             return _AsyncModelsProxy(self)
         return self._client.models
 
+    async def converse(self, **kwargs: Any) -> Any:
+        """Bedrock-compatible: client.converse(modelId=...) goes through interception."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            return await self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
+        return await self._client.converse(**kwargs)
+
+    async def converse_stream(self, **kwargs: Any) -> Any:
+        """Bedrock-compatible streaming: returns the boto3 dict with a wrapped stream."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            return await self._intercepted_call(
+                _force_stream=True, **_bedrock_internal_kwargs(kwargs)
+            )
+        return await self._client.converse_stream(**kwargs)
+
+    async def invoke_model(self, **kwargs: Any) -> Any:
+        """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        return await self._client.invoke_model(**kwargs)
+
+    async def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
+        """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
+        if self._detected_provider == ProviderName.BEDROCK:
+            raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        return await self._client.invoke_model_with_response_stream(**kwargs)
+
     async def _async_dispatch(
         self,
         runtime: ProviderRuntime,
@@ -1187,28 +1241,24 @@ class AsyncSolwyn(_SolwynBase):
     ) -> Any:
         """Dispatch one hop to the runtime's async SDK client. Pure I/O.
 
-        Applies the mandatory per-hop bound via ``with_options``. Mirrors
-        ``_sync_dispatch``: the served hop's stream-method selection is driven by
-        the dispatch-level ``is_streaming`` boolean (fix [A]).
+        Mirrors ``_sync_dispatch``: the per-hop bound applies via
+        ``with_options`` where available, every provider-specific quirk lives
+        on the adapter's ``prepare_call``, and the served hop's stream-method
+        selection is driven by the dispatch-level ``is_streaming`` boolean
+        (fix [A]). The adapter returns the same attribute path on an async
+        client — only the await differs here.
         """
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(timeout=timeout, max_retries=max_retries)
-        name = runtime.adapter.name
-        if name == ProviderName.OPENAI.value:
-            if is_streaming:
-                kwargs["stream"] = True
-            return await client.chat.completions.create(**kwargs)
-        if name == ProviderName.ANTHROPIC.value:
-            if is_streaming:
-                kwargs["stream"] = True
-            return await client.messages.create(**kwargs)
-        # Google: its generate_content[_stream] methods take no ``stream`` kwarg.
-        kwargs = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
-        kwargs.pop("stream", None)
-        if is_streaming:
-            return await client.models.generate_content_stream(**kwargs)
-        return await client.models.generate_content(**kwargs)
+        method, call_kwargs = runtime.adapter.prepare_call(
+            client,
+            cast("dict[str, Any]", kwargs),
+            is_streaming=is_streaming,
+            timeout=timeout,
+            max_retries=max_retries,
+        )
+        return await method(**call_kwargs)
 
     async def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Async core interception logic: the classified candidate walk."""
@@ -1243,6 +1293,7 @@ class AsyncSolwyn(_SolwynBase):
             self.update_price_hints(budget.price_hints)
 
         if not budget.allowed:
+            # See the sync _intercepted_call: region rides the denied event.
             try:
                 event = self._build_metadata_event(
                     model=requested_model,
@@ -1255,6 +1306,7 @@ class AsyncSolwyn(_SolwynBase):
                     is_model_fallback=False,
                     call_id=call_id,
                     agent_run=agent_run,
+                    provider_region=primary.adapter.extract_region(primary.sdk_client),
                 )
                 self._reporter.report(event)
             except Exception:
@@ -1439,6 +1491,7 @@ class AsyncSolwyn(_SolwynBase):
                             call_id=call_id,
                             possibly_succeeded=True if possibly_succeeded else None,
                             agent_run=agent_run,
+                            provider_region=rt.adapter.extract_region(rt.sdk_client),
                         )
                     )
                     if disp is Disposition.FAIL_FAST:
@@ -1486,6 +1539,12 @@ class AsyncSolwyn(_SolwynBase):
             self.record_latency(provider, ctx.elapsed_ms())
 
             token_details = rt.adapter.extract_usage(response)
+            # Per-region pricing attribution: the SERVED runtime's endpoint
+            # region (None for providers without regional pricing).
+            provider_region = rt.adapter.extract_region(rt.sdk_client)
+            # Extracted ONCE from the RAW served response — confirm and
+            # metadata must carry the same tier (see the sync path).
+            service_tier = rt.adapter.extract_service_tier(response)
             result = response
             if is_provider_fallback:
                 # Cross-provider hop: reshape the served response back to the
@@ -1504,6 +1563,8 @@ class AsyncSolwyn(_SolwynBase):
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
+                    provider_region=provider_region,
+                    service_tier=service_tier,
                 )
             self._reporter.report(
                 self._build_metadata_event(
@@ -1525,8 +1586,9 @@ class AsyncSolwyn(_SolwynBase):
                     ),
                     attempt_index=chain_index,
                     call_id=call_id,
-                    service_tier=rt.adapter.extract_service_tier(response),
+                    service_tier=service_tier,
                     agent_run=agent_run,
+                    provider_region=provider_region,
                 )
             )
             return result
@@ -1551,18 +1613,29 @@ class AsyncSolwyn(_SolwynBase):
         primary_errored: bool,
         call_id: str,
         agent_run: tuple[str | None, str | None],
-    ) -> AsyncStreamWrapper:
-        """Wrap an async streaming response, settling against the SERVED runtime."""
+    ) -> Any:
+        """Wrap an async streaming response, settling against the SERVED runtime.
+
+        Return shape mirrors the sync ``_wrap_stream``: Bedrock-dialect callers
+        get the boto3 contract dict with the wrapped (async) event stream under
+        ``"stream"``; every other dialect gets the wrapper directly.
+        """
         provider = runtime.adapter.name
         served_model = ctx.model
         is_provider_fallback = ctx.is_provider_fallback
         accumulator = runtime.adapter.create_stream_accumulator()
+        # Per-region pricing attribution for the SERVED runtime (None for
+        # providers without regional pricing). Captured once, closed over.
+        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
 
         async def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             self._get_circuit_breaker(provider).record_success()
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
             self.record_latency(provider, ctx.elapsed_ms())
+            # Extracted ONCE — confirm and metadata must carry the same tier
+            # (see the sync on_complete).
+            service_tier = accumulator.get_service_tier()
             confirm = None
             if budget.reservation_id:
                 confirm = self._budget.build_confirm_request(
@@ -1572,6 +1645,8 @@ class AsyncSolwyn(_SolwynBase):
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
+                    provider_region=provider_region,
+                    service_tier=service_tier,
                 )
             event = self._build_metadata_event(
                 model=served_model,
@@ -1592,8 +1667,9 @@ class AsyncSolwyn(_SolwynBase):
                 ),
                 attempt_index=ctx.attempt_index,
                 call_id=call_id,
-                service_tier=accumulator.get_service_tier(),
+                service_tier=service_tier,
                 agent_run=agent_run,
+                provider_region=provider_region,
             )
             if confirm is not None:
                 self._reporter.report_settlement(confirm, event)
@@ -1615,6 +1691,7 @@ class AsyncSolwyn(_SolwynBase):
                     call_id=call_id,
                     possibly_succeeded=True,
                     agent_run=agent_run,
+                    provider_region=provider_region,
                 )
             )
 
@@ -1626,9 +1703,13 @@ class AsyncSolwyn(_SolwynBase):
             if is_provider_fallback
             else None
         )
-        return AsyncStreamWrapper(
-            response, accumulator, on_complete, on_error, chunk_translator=chunk_translator
+        # Stream nesting and caller-dialect result shape are adapter-owned —
+        # see the sync ``_wrap_stream``.
+        source = runtime.adapter.unwrap_stream_source(response)
+        wrapper = AsyncStreamWrapper(
+            source, accumulator, on_complete, on_error, chunk_translator=chunk_translator
         )
+        return primary.adapter.wrap_stream_result(wrapper, response)
 
     async def close(self) -> None:
         """Shut down the reporter and close HTTP clients."""

@@ -1,19 +1,27 @@
 """Tests for status-first, duck-typed transport-error classification.
 
 These tests mirror the real provider-SDK exception subclassing without importing
-any provider SDK (openai/anthropic/google are NOT installed). The critical
+any provider SDK (openai/anthropic/google/boto3 are NOT installed). The critical
 invariant under test is the ORDERING trap: ``APITimeoutError`` subclasses
 ``APIConnectionError`` in both openai and anthropic, so a timeout (post-send,
 unsafe) must be matched BEFORE the bare connection-failure (pre-send, safe)
 branch — otherwise a silent double-spend results.
+
+The botocore fakes mirror botocore/exceptions.py exactly: ``ReadTimeoutError``
+subclasses ``HTTPClientError`` (NOT botocore's ``ConnectionError``);
+``EndpointConnectionError`` / ``ConnectTimeoutError`` subclass botocore's
+``ConnectionError`` — whose class NAME collides with the Python builtin, which
+is why the classifier must never match the bare name "ConnectionError".
 """
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 import pytest
 
-from solwyn.providers._errors import Disposition, classify_exception
+from solwyn.providers._errors import Disposition, classify_exception, retry_after_seconds
 
 # ---------------------------------------------------------------------------
 # Fake provider exceptions — mirror the real subclassing WITHOUT importing SDKs.
@@ -227,7 +235,159 @@ class TestDispositionEnum:
 
 
 # ---------------------------------------------------------------------------
-# 8. APIConnectionError cause-inspection (the subtle post-send double-spend
+# 8. botocore / Bedrock classification (duck-typed; boto3 never imported)
+# ---------------------------------------------------------------------------
+
+
+# Mirror the real botocore hierarchy (verified against botocore/exceptions.py):
+#   ConnectionError(BotoCoreError)            <- name collides with the builtin!
+#   EndpointConnectionError(ConnectionError)
+#   ConnectTimeoutError(ConnectionError)
+#   HTTPClientError(BotoCoreError)
+#   ReadTimeoutError(HTTPClientError)         <- NOT under ConnectionError
+#   ConnectionClosedError(HTTPClientError)
+class _BotoCoreError(Exception):
+    pass
+
+
+_BotocoreConnectionError = type("ConnectionError", (_BotoCoreError,), {})
+_EndpointConnectionError = type("EndpointConnectionError", (_BotocoreConnectionError,), {})
+_ConnectTimeoutError = type("ConnectTimeoutError", (_BotocoreConnectionError,), {})
+_ProxyConnectionError = type("ProxyConnectionError", (_BotocoreConnectionError,), {})
+_HTTPClientError = type("HTTPClientError", (_BotoCoreError,), {})
+_ReadTimeoutError = type("ReadTimeoutError", (_HTTPClientError,), {})
+_ConnectionClosedError = type("ConnectionClosedError", (_HTTPClientError,), {})
+
+
+class _ClientError(Exception):
+    """Mirrors botocore.exceptions.ClientError: status lives in a response DICT."""
+
+    def __init__(self, error_response: dict[str, Any], operation_name: str = "Converse") -> None:
+        super().__init__("An error occurred")
+        self.response = error_response
+        self.operation_name = operation_name
+
+
+def _bedrock_client_error(
+    code: str, status: int, headers: dict[str, str] | None = None
+) -> Exception:
+    """Build a fake Bedrock service exception.
+
+    botocore generates one ClientError subclass per modeled error shape, with
+    the class NAME equal to the error code — mirror that exactly.
+    """
+    response: dict[str, Any] = {
+        "Error": {"Code": code, "Message": "boom"},
+        "ResponseMetadata": {"HTTPStatusCode": status, "HTTPHeaders": headers or {}},
+    }
+    cls = type(code, (_ClientError,), {})
+    return cls(response)
+
+
+@pytest.mark.unit
+class TestBotocoreStatusClassification:
+    """Bedrock service errors carry status in exc.response, not exc.status_code."""
+
+    def test_throttling_exception_429_is_failover(self) -> None:
+        exc = _bedrock_client_error("ThrottlingException", 429)
+        assert classify_exception(exc) is Disposition.FAILOVER
+
+    def test_model_not_ready_429_is_failover(self) -> None:
+        exc = _bedrock_client_error("ModelNotReadyException", 429)
+        assert classify_exception(exc) is Disposition.FAILOVER
+
+    @pytest.mark.parametrize(
+        "code,status",
+        [
+            ("ValidationException", 400),
+            ("AccessDeniedException", 403),
+            ("ResourceNotFoundException", 404),
+        ],
+    )
+    def test_request_shaped_4xx_is_fail_fast(self, code: str, status: int) -> None:
+        assert classify_exception(_bedrock_client_error(code, status)) is Disposition.FAIL_FAST
+
+    @pytest.mark.parametrize(
+        "code,status",
+        [("InternalServerException", 500), ("ServiceUnavailableException", 503)],
+    )
+    def test_5xx_is_ambiguous(self, code: str, status: int) -> None:
+        assert (
+            classify_exception(_bedrock_client_error(code, status))
+            is Disposition.POST_SEND_AMBIGUOUS
+        )
+
+
+@pytest.mark.unit
+class TestBedrockNameOverridesStatus:
+    """Bedrock's post-send errors carry 4xx statuses that would misclassify.
+
+    ModelTimeoutException is HTTP 408 and ModelErrorException is HTTP 424 —
+    by status alone both would be FAIL_FAST (request-shaped), but the request
+    REACHED the model and ran. They must classify POST_SEND_AMBIGUOUS so the
+    reservation reconciles instead of silently double-counting.
+    """
+
+    def test_model_timeout_408_is_ambiguous_not_fail_fast(self) -> None:
+        exc = _bedrock_client_error("ModelTimeoutException", 408)
+        assert classify_exception(exc) is Disposition.POST_SEND_AMBIGUOUS
+
+    def test_model_error_424_is_ambiguous_not_fail_fast(self) -> None:
+        exc = _bedrock_client_error("ModelErrorException", 424)
+        assert classify_exception(exc) is Disposition.POST_SEND_AMBIGUOUS
+
+
+@pytest.mark.unit
+class TestBotocoreTransportClassification:
+    """botocore transport errors classify by MRO name (no status anywhere)."""
+
+    def test_endpoint_connection_error_is_failover(self) -> None:
+        # Provably pre-send: could not connect to the endpoint at all.
+        assert classify_exception(_EndpointConnectionError()) is Disposition.FAILOVER
+
+    def test_connect_timeout_error_is_failover(self) -> None:
+        assert classify_exception(_ConnectTimeoutError()) is Disposition.FAILOVER
+
+    def test_proxy_connection_error_is_failover(self) -> None:
+        # Provably pre-send: the proxy itself refused — the request never
+        # reached the endpoint.
+        assert classify_exception(_ProxyConnectionError()) is Disposition.FAILOVER
+
+    def test_read_timeout_error_is_ambiguous(self) -> None:
+        # Post-send: bytes were sent, the model may have run.
+        assert classify_exception(_ReadTimeoutError()) is Disposition.POST_SEND_AMBIGUOUS
+
+    def test_connection_closed_error_is_ambiguous(self) -> None:
+        # Connection dropped before a valid response — may be mid-response.
+        assert classify_exception(_ConnectionClosedError()) is Disposition.POST_SEND_AMBIGUOUS
+
+    def test_builtin_connection_reset_stays_fail_fast(self) -> None:
+        # The name-collision guard: botocore's ConnectionError shares its NAME
+        # with the builtin, and builtin ConnectionResetError (post-send
+        # possible) has "ConnectionError" in its MRO names. The classifier must
+        # never match the bare name — a reset stays at the safe default.
+        assert classify_exception(ConnectionResetError()) is Disposition.FAIL_FAST
+
+
+@pytest.mark.unit
+class TestBotocoreRetryAfter:
+    def test_retry_after_read_from_response_metadata_http_headers(self) -> None:
+        exc = _bedrock_client_error("ThrottlingException", 429, headers={"retry-after": "2"})
+        assert retry_after_seconds(exc) == 2.0
+
+    def test_no_header_returns_none(self) -> None:
+        exc = _bedrock_client_error("ThrottlingException", 429)
+        assert retry_after_seconds(exc) is None
+
+    def test_non_429_returns_none_even_with_header(self) -> None:
+        exc = _bedrock_client_error(
+            "ServiceUnavailableException", 503, headers={"retry-after": "2"}
+        )
+        assert retry_after_seconds(exc) is None
+
+
+# ---------------------------------------------------------------------------
+# 9. APIConnectionError cause-inspection (the subtle post-send double-spend
 #    vector): the provider wrapper covers BOTH pre-send and post-send transport
 #    failures, so the name alone is NOT proof of pre-send — classify by cause.
 # ---------------------------------------------------------------------------
