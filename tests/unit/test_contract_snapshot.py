@@ -40,6 +40,7 @@ from pydantic import ValidationError
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
+    SERVICE_TIER_MAX_LENGTH,
     BudgetCheckRequest,
     BudgetCheckResponse,
     BudgetConfirmRequest,
@@ -442,6 +443,18 @@ class TestWireModelFieldConstraints:
         field = MetadataEvent.model_fields["requested_model"]
         max_lengths = [m.max_length for m in field.metadata if hasattr(m, "max_length")]
         assert 2048 in max_lengths
+
+    def test_metadata_service_tier_max_length_lock_step_pinned(self) -> None:
+        # SERVICE_TIER_MAX_LENGTH is vendored lock-step with core
+        # shared/constants.py (32). Since the API rejects per-event, an
+        # over-length tier in the ENVELOPE is the remaining whole-batch 422
+        # path — the adapter clamps (tier[:32], pinned in test_providers/) and
+        # this bound are the only guards. Drift here silently re-opens
+        # total batch loss.
+        assert SERVICE_TIER_MAX_LENGTH == 32
+        field = MetadataEvent.model_fields["service_tier"]
+        max_lengths = [m.max_length for m in field.metadata if hasattr(m, "max_length")]
+        assert SERVICE_TIER_MAX_LENGTH in max_lengths
 
     def test_metadata_failover_error_class_max_length_pinned(self) -> None:
         # failover_error_class carries only type(exc).__name__; the 64 bound caps

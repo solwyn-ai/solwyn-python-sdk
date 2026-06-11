@@ -13,6 +13,7 @@ import asyncio
 import collections
 import contextlib
 import logging
+import re
 import threading
 
 import httpx
@@ -20,6 +21,22 @@ import httpx
 from solwyn._types import BudgetConfirmRequest, MetadataEvent
 
 logger = logging.getLogger(__name__)
+
+# Raw C0/DEL/C1 control bytes. A compliant server repr-escapes these before
+# they reach the wire, so the substitution below is a no-op on compliant
+# bodies and verbatim logging is preserved.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _escape_control(value: str) -> str:
+    """Repr-escape raw control bytes in a server-echoed value.
+
+    Defense-in-depth: the server should have escaped these already — a
+    server-side escaping regression (or a misrouted/compromised endpoint)
+    must not be able to inject forged log lines or ANSI sequences into
+    customer logs via echoed model names or rejection messages.
+    """
+    return _CONTROL_CHARS.sub(lambda m: repr(m.group())[1:-1], value)
 
 
 class _ReporterBase:
@@ -50,6 +67,8 @@ class _ReporterBase:
         self._in_flight = 0
         self._consecutive_confirm_failures = 0
         self._confirm_failure_threshold = 10
+        self._consecutive_unparseable_responses = 0
+        self._unparseable_response_threshold = 10
 
     def _enqueue(self, event: MetadataEvent) -> None:
         """Add an event to the queue.  Drop-oldest semantics on overflow."""
@@ -91,6 +110,87 @@ class _ReporterBase:
                 "reporter.confirm_send_failed: exc_type=%s",
                 type(exc).__name__,
             )
+
+    def _record_parseable_response(self) -> None:
+        """Reset the unparseable counter after a successfully parsed ingest body."""
+        self._consecutive_unparseable_responses = 0
+
+    def _record_unparseable_response(self, exc: Exception) -> None:
+        """Track unparseable ingest bodies and escalate persistent contract drift."""
+        self._consecutive_unparseable_responses += 1
+        count = self._consecutive_unparseable_responses
+        if count >= self._unparseable_response_threshold:
+            logger.error(
+                "reporter.ingest_response_unparseable_persistent: "
+                "exc_type=%s consecutive_failures=%d",
+                type(exc).__name__,
+                count,
+            )
+        else:
+            logger.warning(
+                "reporter.ingest_response_unparseable: exc_type=%s",
+                type(exc).__name__,
+            )
+
+    def _log_ingest_rejections(self, response: httpx.Response, batch_size: int) -> None:
+        """Surface per-event rejection dispositions from the 202 ingest body.
+
+        The API returns 202 for every well-formed request; accepted events are
+        already durable and rejected events are terminal — they reject
+        identically on every resubmission until a pricing entry lands
+        server-side — so rejections are logged and dropped, never re-queued.
+        One WARNING per distinct (code, model) per batch keeps a fleet stuck
+        on a single unpriced model from flooding logs. The server's message is
+        logged verbatim (repr-escaped server-side) and never parsed.
+
+        Fail-open: a malformed body must never raise into the flush loop —
+        fall back to the pre-v0.1.7 count-only acknowledgment and log once.
+        """
+        try:
+            rejected = response.json()["rejected"]
+            if not isinstance(rejected, list):
+                # A falsy non-list ("rejected": null) must take the fail-open
+                # path, not masquerade as a clean batch.
+                raise TypeError(f"rejected is {type(rejected).__name__}, expected list")
+            if not rejected:
+                self._record_parseable_response()
+                return
+            if len(rejected) > batch_size:
+                # Contract violation — and a cap: a compromised/misrouted
+                # server cannot flood logs or the groups dict with more
+                # distinct (code, model) pairs than events were submitted.
+                raise ValueError("server rejected more events than were submitted")
+            # Aggregate before logging so a malformed entry can never leave a
+            # half-logged flush behind. First message per group wins (the
+            # server's message is keyed by the same (code, model) inputs).
+            groups: dict[tuple[str, str], tuple[int, str]] = {}
+            for rejection in rejected:
+                key = (
+                    _escape_control(str(rejection["code"])),
+                    _escape_control(str(rejection["model"])),
+                )
+                count, message = groups.get(key, (0, _escape_control(str(rejection["message"]))))
+                groups[key] = (count + 1, message)
+            self._record_parseable_response()
+        except Exception as exc:
+            self._record_unparseable_response(exc)
+            return
+        try:
+            for (code, model), (count, message) in groups.items():
+                logger.warning(
+                    "reporter.ingest_events_rejected: code=%s model=%s count=%d message=%s",
+                    code,
+                    model,
+                    count,
+                    message,
+                )
+        except Exception:
+            # The body parsed fine and the batch IS durable server-side — only
+            # the host's logging stack raised (e.g. a user-installed Filter).
+            # A fallback log would raise again; rejection detail is
+            # best-effort, but letting this propagate would mislabel the batch
+            # as a send failure in _send_batch's accounting.
+            return
 
 
 class MetadataReporter(_ReporterBase):
@@ -223,6 +323,7 @@ class MetadataReporter(_ReporterBase):
                 headers=self._auth_headers(),
             )
             resp.raise_for_status()
+            self._log_ingest_rejections(resp, len(batch))
         except Exception as exc:
             # Log only the exception's class name (fix [D]) — the type-name-only
             # convention every other except-block follows. Safe here even though
@@ -416,6 +517,8 @@ class AsyncMetadataReporter(_ReporterBase):
                 headers=self._auth_headers(),
             )
             resp.raise_for_status()
+            # httpx.Response.json() is sync on both clients — shared helper.
+            self._log_ingest_rejections(resp, len(batch))
         except Exception as exc:
             # Log only the exception's class name (fix [D]) — the type-name-only
             # convention every other except-block follows. Safe here even though

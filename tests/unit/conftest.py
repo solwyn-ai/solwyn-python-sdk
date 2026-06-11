@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock
 
 import httpx
@@ -18,6 +19,16 @@ VALID_PROJECT_ID = "proj_" + "a" * 24
 # A minimal one-link provider chain, enough to satisfy SolwynConfig's
 # required ``providers`` invariant in tests that don't care about routing.
 DEFAULT_PROVIDER_CHAIN = [ProviderEntry(provider=ProviderName.OPENAI, model="gpt-4o")]
+
+
+def _accepted_response(body: dict[str, Any]) -> MagicMock:
+    """A 202 httpx.Response stand-in carrying a per-event-disposition body."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = 202
+    resp.raise_for_status = MagicMock()
+    # httpx.Response.json() is sync even on the async client.
+    resp.json = MagicMock(return_value=body)
+    return resp
 
 
 def make_mock_client(module: str = "openai._client", name: str = "OpenAI") -> MagicMock:
