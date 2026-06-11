@@ -318,6 +318,73 @@ class TestBedrockConverseStream:
         assert event.service_tier == "flex"
         solwyn.close()
 
+    def test_converse_stream_early_abandon_close_settles_exactly_once(self) -> None:
+        # Finding #6: abandoning result["stream"] early strands the budget
+        # reservation unless the caller closes the wrapper — the same
+        # one-level-deep close obligation raw boto3's EventStream imposes.
+        # close() must settle EXACTLY once (the _settled guard) and stay
+        # idempotent on repeat calls. Abandoned before the terminal metadata
+        # event, the settlement carries the zeros the accumulator observed
+        # (the explicit zero-settle warning is pinned in
+        # test_providers/test_bedrock.py).
+        client = _mock_bedrock_client()
+        solwyn = _make_solwyn(client)
+        settlements: list = []
+        solwyn._reporter.report = lambda e: None
+        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+
+        with _mock_budget(solwyn):
+            result = solwyn.converse_stream(
+                modelId=BEDROCK_MODEL,
+                messages=[{"role": "user", "content": [{"text": "Hello"}]}],
+            )
+            consumed = []
+            for event in result["stream"]:
+                consumed.append(event)
+                break  # abandon after the FIRST event
+            result["stream"].close()
+
+        assert consumed == [{"messageStart": {"role": "assistant"}}]
+        assert len(settlements) == 1
+        confirm, event = settlements[0]
+        assert confirm.reservation_id == "res_123"
+        assert event.provider == "bedrock"
+        # No terminal metadata event was consumed — settles at zero usage.
+        assert event.input_tokens == 0
+        assert event.output_tokens == 0
+        assert confirm.token_details.input_tokens == 0
+        assert confirm.token_details.output_tokens == 0
+
+        # close() is idempotent: a second call must NOT double-settle.
+        result["stream"].close()
+        assert len(settlements) == 1
+        solwyn.close()
+
+    def test_converse_stream_early_abandon_context_manager_settles_exactly_once(self) -> None:
+        # The documented `with result["stream"]:` form — __exit__ closes and
+        # settles exactly once after an early break.
+        client = _mock_bedrock_client()
+        solwyn = _make_solwyn(client)
+        settlements: list = []
+        solwyn._reporter.report = lambda e: None
+        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+
+        with _mock_budget(solwyn):
+            result = solwyn.converse_stream(
+                modelId=BEDROCK_MODEL,
+                messages=[{"role": "user", "content": [{"text": "Hello"}]}],
+            )
+            with result["stream"]:
+                for _event in result["stream"]:
+                    break  # abandon after the FIRST event
+
+        assert len(settlements) == 1
+        confirm, event = settlements[0]
+        assert confirm.reservation_id == "res_123"
+        assert event.input_tokens == 0
+        assert event.output_tokens == 0
+        solwyn.close()
+
 
 # ---------------------------------------------------------------------------
 # Cross-provider failover (both directions)
@@ -685,6 +752,53 @@ class TestAsyncBedrockConverse:
         _, event = settlements[0]
         assert event.input_tokens == 9
         assert event.output_tokens == 4
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_converse_stream_early_abandon_close_settles_exactly_once(self) -> None:
+        # Async mirror of finding #6: abandoning result["stream"] early must
+        # settle the reservation via `await result["stream"].close()` — exactly
+        # once (the _settled guard), idempotent on repeat calls, at the zero
+        # usage observed before the terminal metadata event.
+        client = _mock_bedrock_client()
+        client.converse_stream = AsyncMockFn(
+            return_value={
+                "ResponseMetadata": {"HTTPStatusCode": 200},
+                "stream": _AsyncEventStream(_converse_stream_events()),
+            }
+        )
+        solwyn = _make_async_solwyn(client)
+        settlements: list = []
+        solwyn._reporter.report = lambda e: None
+        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+
+        with _mock_budget(solwyn):
+            result = await solwyn.converse_stream(
+                modelId=BEDROCK_MODEL,
+                messages=[{"role": "user", "content": [{"text": "Hello"}]}],
+            )
+            consumed = []
+            async for event in result["stream"]:
+                consumed.append(event)
+                break  # abandon after the FIRST event
+            await result["stream"].close()
+
+        assert consumed == [{"messageStart": {"role": "assistant"}}]
+        assert len(settlements) == 1
+        confirm, event = settlements[0]
+        assert confirm.reservation_id == "res_123"
+        assert event.provider == "bedrock"
+        # No terminal metadata event was consumed — settles at zero usage.
+        assert event.input_tokens == 0
+        assert event.output_tokens == 0
+        assert confirm.token_details.input_tokens == 0
+
+        # close() is idempotent: a second call must NOT double-settle.
+        await result["stream"].close()
+        assert len(settlements) == 1
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

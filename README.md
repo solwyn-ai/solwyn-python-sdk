@@ -118,6 +118,8 @@ for event in response["stream"]:
     ...
 ```
 
+If you stop consuming the stream early, call `response["stream"].close()` (or wrap iteration in `with response["stream"]:`) to settle the budget reservation — the same close obligation raw boto3's `EventStream` has. `close()` settles exactly once with whatever usage was observed and is safe to call repeatedly.
+
 Notes:
 
 - Model identity is reported exactly as you pass it — foundation-model ids, cross-region inference profiles (`us.` / `eu.` / `jp.` / `global.` …), or full ARNs — together with the client's region, because Bedrock pricing is keyed per model **and** region. Prompt-cache reads/writes (including the 1h-TTL tier via `usage.cacheDetails`) and the latency/service pricing tier are captured for exact repricing.
