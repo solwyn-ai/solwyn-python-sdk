@@ -183,9 +183,9 @@ The "never sent" entries above describe Solwyn's own injection policy. A `stream
 
 **Pricing.** The SDK never computes cost. It reports the served `(provider, model)` verbatim — for OpenRouter that's the full model slug (e.g. `anthropic/claude-sonnet-4.5`) — and Solwyn Cloud's PricingService prices it. Models unknown to the catalog are surfaced as unpriced on the dashboard rather than silently costed at $0.
 
-**Failover.** Compat providers participate fully in failover. Between two OpenAI-dialect providers (e.g. Groq → OpenRouter) requests pass through natively — tools, JSON mode, and streaming included (`max_completion_tokens` is rewritten to `max_tokens` for targets that need the legacy key). Across dialects (e.g. Groq → Anthropic) the standard translation subset applies.
+**Failover.** Compat providers participate fully in failover. Between two OpenAI-dialect providers (e.g. Groq → OpenRouter) requests pass through natively — tools, JSON mode, and streaming included (`max_completion_tokens` is rewritten to `max_tokens` for targets that need the legacy key). Per-call `extra_headers`/`extra_query`/`extra_body` are stripped on cross-provider hops — they're endpoint-scoped, authored for the original endpoint — though the fallback entry's own `default_params` versions still apply. Across dialects (e.g. Groq → Anthropic) the standard translation subset applies.
 
-**Known limitation.** Circuit-breaker health, latency signals, and failover labeling key off the provider *name*. Two chain entries that resolve to the same name (two Azure resources, two unnamed gateways both detected as `openai_compatible`) share one health domain and are reported as model fallbacks of each other. Give distinct endpoints distinct provider identities where possible.
+**Known limitation.** Circuit-breaker health, latency signals, and failover labeling key off the provider *name*. Two chain entries that resolve to the same name (two Azure resources, two unnamed gateways both detected as `openai_compatible`) share one health domain and are reported as model fallbacks of each other. For the same reason, a hop between same-name entries skips cross-provider request sanitization — `stream_options` stripping, the `max_completion_tokens` → `max_tokens` rewrite, and endpoint-scoped param stripping (`extra_headers`/`extra_query`/`extra_body`). A `stream_options` or gateway header you authored for the first endpoint reaches the second untouched and can 4xx there. Give distinct endpoints distinct provider identities where possible — explicit `provider=` on the constructor, or the 4th element of a fallback spec.
 
 ## Async
 
@@ -342,7 +342,7 @@ Bedrock support additionally requires the Cloud API to accept (deploy API-first)
 OpenAI-compatible provider support additionally requires the Cloud API to accept (deploy API first):
 
 - the new `provider` enum values on check/confirm/metadata payloads: `xai`, `deepseek`, `mistral`, `qwen`, `groq`, `together`, `fireworks`, `perplexity`, `azure_openai`, `openrouter`, `ollama`, `vllm`, `lmstudio`, `openai_compatible`;
-- the `is_estimated` boolean on `token_details` (marks SDK-side length-based estimates when a provider reports no usage).
+- the `is_estimated` boolean on `token_details` (marks SDK-side length-based estimates when a provider reports no usage). It is serialized only when `true` — i.e. only when the estimation fallback fired — and omitted entirely otherwise (never `is_estimated: false`), so existing-provider payloads are unchanged. Solwyn Cloud must accept the field before this SDK release, same API-first ordering as the `provider` enum additions above.
 
 ## Requirements
 

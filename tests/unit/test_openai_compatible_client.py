@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from conftest import VALID_API_KEY, make_mock_client
 
@@ -183,6 +184,13 @@ class TestProviderOverride:
         with pytest.raises(ConfigurationError, match="dialect"):
             _make_solwyn(client, provider="groq")
 
+    def test_unrecognized_client_with_override_raises_configuration_error(self) -> None:
+        """An override relabels a DETECTED client — it cannot adopt an object
+        from an unknown SDK (distinct from the dialect-mismatch branch)."""
+        UnknownClient = type("UnknownClient", (), {"__module__": "totally_unknown_sdk._client"})
+        with pytest.raises(ConfigurationError, match="not a recognized provider SDK client"):
+            _make_solwyn(UnknownClient(), provider="groq")
+
     def test_fallback_spec_provider_override(self) -> None:
         primary = _compat_client("https://api.groq.com/openai/v1")
         fallback = _compat_client("http://localhost:9999/v1")
@@ -298,6 +306,59 @@ class TestEstimatedUsageFallback:
         event = _reported_events(solwyn)[0]
         assert event.token_details.is_estimated is False
         assert event.input_tokens == 3
+
+    def test_negative_usage_degrades_to_estimate_not_raise(self) -> None:
+        """A misbehaving endpoint reporting negative counts must not raise out
+        of the success path (after record_success, before confirm) — it
+        degrades to the flagged estimation tier and the caller gets the
+        response."""
+        client = _compat_client("http://localhost:1234/v1")
+        client.chat.completions.create.return_value = _response(
+            prompt_tokens=-1, completion_tokens=-1, content="z" * 80
+        )
+        solwyn = _make_solwyn(client)
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            result = solwyn.chat.completions.create(**_REQUEST)
+
+        assert result.choices[0].message.content == "z" * 80
+        event = _reported_events(solwyn)[0]
+        assert event.status == CallStatus.SUCCESS
+        assert event.token_details.is_estimated is True
+        assert event.output_tokens == 20  # 80 chars / 4.0
+
+    def test_non_int_usage_degrades_to_estimate_not_raise(self) -> None:
+        response = _response(content="z" * 80)
+        response.usage.prompt_tokens = "abc"  # value-level garbage
+        response.usage.completion_tokens = "def"
+        client = _compat_client("http://localhost:1234/v1")
+        client.chat.completions.create.return_value = response
+        solwyn = _make_solwyn(client)
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(**_REQUEST)
+
+        event = _reported_events(solwyn)[0]
+        assert event.status == CallStatus.SUCCESS
+        assert event.token_details.is_estimated is True
+        assert event.output_tokens == 20
+
+    def test_streaming_negative_usage_falls_to_estimation_tier(self) -> None:
+        """A streamed usage block with negative counts must not convert a
+        deliverable stream into a settle-as-failure (breaker hit against a
+        content-healthy provider) — it falls to the estimation tier."""
+        client = _compat_client("https://api.groq.com/openai/v1")
+        client.chat.completions.create.return_value = iter(
+            [_text_chunk("x" * 40), _usage_chunk(-1, -2)]
+        )
+        solwyn = _make_solwyn(client)
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            chunks = list(solwyn.chat.completions.create(**_REQUEST, stream=True))
+
+        assert len(chunks) == 2  # the stream was delivered intact
+        events = _reported_events(solwyn)
+        assert len(events) == 1
+        assert events[0].status == CallStatus.SUCCESS
+        assert events[0].token_details.is_estimated is True
+        assert events[0].output_tokens == 10  # 40 chars / 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +478,158 @@ class TestCompatFailover:
         called = fallback.chat.completions.create.call_args.kwargs
         assert "max_completion_tokens" not in called
         assert called["max_tokens"] == 256
+
+    def test_caller_max_completion_tokens_beats_entry_default_max_tokens(self) -> None:
+        """Per-call kwargs > per-entry default_params: the caller's output cap
+        (a cost control) must survive the legacy-key rewrite, not be silently
+        replaced by a larger fallback-entry default."""
+        primary = make_mock_client()
+        fallback = _compat_client("https://api.deepseek.com/v1")
+        fallback.chat.completions.create.return_value = _response()
+        solwyn = _make_solwyn(primary, fallback=[(fallback, "deepseek-chat", {"max_tokens": 4096})])
+        _open_breaker(solwyn, "openai")
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(
+                model="gpt-5",
+                messages=[{"role": "user", "content": "hi"}],
+                max_completion_tokens=256,
+            )
+
+        called = fallback.chat.completions.create.call_args.kwargs
+        assert "max_completion_tokens" not in called
+        assert called["max_tokens"] == 256
+
+    def test_caller_max_tokens_beats_entry_default_max_completion_tokens(self) -> None:
+        """Mirror case of the test above: an entry-default max_completion_tokens
+        must not collapse onto the per-call max_tokens during the legacy-key
+        rewrite and silently raise the caller's output cap. Each kwargs layer
+        is normalized BEFORE the precedence merge, so per-call wins regardless
+        of which key either side used."""
+        primary = make_mock_client()
+        fallback = _compat_client("https://api.deepseek.com/v1")
+        fallback.chat.completions.create.return_value = _response()
+        solwyn = _make_solwyn(
+            primary,
+            fallback=[(fallback, "deepseek-chat", {"max_completion_tokens": 4096})],
+        )
+        _open_breaker(solwyn, "openai")
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(
+                model="gpt-5",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=256,
+            )
+
+        called = fallback.chat.completions.create.call_args.kwargs
+        assert "max_completion_tokens" not in called
+        assert called["max_tokens"] == 256
+
+    def test_both_caps_per_call_modern_key_wins(self) -> None:
+        """Both caps in the SAME source (per-call): max_completion_tokens wins,
+        per the single-source rule documented on _with_legacy_max_tokens_key.
+        OpenAI itself rejects both-present requests, so on a failover hop we
+        keep the modern key's value rather than guess."""
+        primary = make_mock_client()
+        fallback = _compat_client("https://api.deepseek.com/v1")
+        fallback.chat.completions.create.return_value = _response()
+        solwyn = _make_solwyn(primary, fallback=[(fallback, "deepseek-chat")])
+        _open_breaker(solwyn, "openai")
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(
+                model="gpt-5",
+                messages=[{"role": "user", "content": "hi"}],
+                max_completion_tokens=256,
+                max_tokens=512,
+            )
+
+        called = fallback.chat.completions.create.call_args.kwargs
+        assert "max_completion_tokens" not in called
+        assert called["max_tokens"] == 256
+
+    def test_same_dialect_failover_strips_endpoint_scoped_params(self) -> None:
+        """extra_headers/extra_query/extra_body carry gateway credentials and
+        vendor extensions authored for the ORIGINAL target — they must never
+        be forwarded to a different vendor on a same-dialect hop."""
+        primary = _compat_client("https://api.groq.com/openai/v1")
+        fallback = _compat_client("https://openrouter.ai/api/v1")
+        fallback.chat.completions.create.return_value = _response()
+        solwyn = _make_solwyn(primary, fallback=[(fallback, "openrouter/auto")])
+        _open_breaker(solwyn, "groq")
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(
+                **_REQUEST,
+                extra_headers={"Helicone-Auth": "Bearer sk-helicone-secret"},
+                extra_query={"api-version": "2024-06-01"},
+                extra_body={"vendor_knob": 1},
+            )
+
+        called = fallback.chat.completions.create.call_args.kwargs
+        assert "extra_headers" not in called
+        assert "extra_query" not in called
+        assert "extra_body" not in called
+
+    def test_primary_keeps_endpoint_scoped_params(self) -> None:
+        """Drop-in contract: on the caller's own configured target their
+        per-call transport params reach the wire untouched."""
+        client = _compat_client("https://api.groq.com/openai/v1")
+        client.chat.completions.create.return_value = _response()
+        solwyn = _make_solwyn(client)
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(
+                **_REQUEST,
+                extra_headers={"Helicone-Auth": "Bearer sk-helicone-secret"},
+                extra_query={"api-version": "2024-06-01"},
+                extra_body={"vendor_knob": 1},
+            )
+
+        called = client.chat.completions.create.call_args.kwargs
+        assert called["extra_headers"] == {"Helicone-Auth": "Bearer sk-helicone-secret"}
+        assert called["extra_query"] == {"api-version": "2024-06-01"}
+        assert called["extra_body"] == {"vendor_knob": 1}
+
+    def test_same_provider_model_fallback_keeps_endpoint_scoped_params(self) -> None:
+        """A same-provider model swap stays on the caller's own endpoint —
+        their transport params still apply."""
+        primary = _compat_client("https://api.groq.com/openai/v1")
+        swap = _compat_client("https://api.groq.com/openai/v1")
+        primary.chat.completions.create.side_effect = httpx.ConnectError("refused")
+        swap.chat.completions.create.return_value = _response()
+        solwyn = _make_solwyn(primary, fallback=[(swap, "llama-3.1-8b-instant")])
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(
+                **_REQUEST, extra_headers={"Helicone-Auth": "Bearer sk-helicone-secret"}
+            )
+
+        called = swap.chat.completions.create.call_args.kwargs
+        assert called["model"] == "llama-3.1-8b-instant"
+        assert called["extra_headers"] == {"Helicone-Auth": "Bearer sk-helicone-secret"}
+
+    def test_same_dialect_failover_keeps_target_entry_default_extras(self) -> None:
+        """The TARGET entry's own default_params extras were authored for that
+        endpoint (e.g. OpenRouter attribution headers) and still apply."""
+        primary = _compat_client("https://api.groq.com/openai/v1")
+        fallback = _compat_client("https://openrouter.ai/api/v1")
+        fallback.chat.completions.create.return_value = _response()
+        solwyn = _make_solwyn(
+            primary,
+            fallback=[(fallback, "openrouter/auto", {"extra_headers": {"X-Title": "MyApp"}})],
+        )
+        _open_breaker(solwyn, "groq")
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(
+                **_REQUEST, extra_headers={"Helicone-Auth": "Bearer sk-helicone-secret"}
+            )
+
+        called = fallback.chat.completions.create.call_args.kwargs
+        # The caller's primary-scoped headers are gone; the entry's own stay.
+        assert called["extra_headers"] == {"X-Title": "MyApp"}
 
     def test_cross_dialect_tool_stream_still_fails_loud(self) -> None:
         """Tool-using STREAMS still cannot cross dialects — fail before dispatch."""

@@ -272,6 +272,38 @@ class TestOpenAIAdapterExtractUsageNoneHandling:
 
 
 @pytest.mark.unit
+class TestOpenAIAdapterExtractUsageGarbageValues:
+    """Value-level garbage must degrade to 0, never raise (never-raise contract;
+    TokenDetails fields are ge=0, so a passed-through negative would
+    ValidationError out of paths that sit after breaker success accounting)."""
+
+    def test_chat_completions_negative_counts_degrade_to_zeros(self) -> None:
+        response = _chat_response(prompt_tokens=-1, completion_tokens=-5)
+        result = OpenAIAdapter().extract_usage(response)
+        assert result == TokenDetails()
+
+    def test_responses_api_negative_counts_degrade_to_zeros(self) -> None:
+        response = _responses_api_response(input_tokens=-1, output_tokens=-2)
+        result = OpenAIAdapter().extract_usage(response)
+        assert result == TokenDetails()
+
+    def test_non_int_counts_degrade_to_zeros(self) -> None:
+        """`'abc' or 0` would pass the string through; the coercion must not."""
+        response = _chat_response()
+        response.usage.prompt_tokens = "abc"
+        response.usage.completion_tokens = True  # bool is not a count
+        result = OpenAIAdapter().extract_usage(response)
+        assert result == TokenDetails()
+
+    def test_negative_detail_fields_degrade_but_valid_totals_survive(self) -> None:
+        response = _chat_response(prompt_tokens=10, completion_tokens=5, cached_tokens=-3)
+        result = OpenAIAdapter().extract_usage(response)
+        assert result.input_tokens == 10
+        assert result.output_tokens == 5
+        assert result.cached_input_tokens == 0
+
+
+@pytest.mark.unit
 class TestOpenAIServiceTier:
     """OpenAI-only service_tier extraction."""
 

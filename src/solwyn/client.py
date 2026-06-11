@@ -30,7 +30,12 @@ from typing import Any, cast
 
 from pydantic import ValidationError
 
-from solwyn._base import _AttemptContext, _SolwynBase
+from solwyn._base import (
+    _AttemptContext,
+    _SolwynBase,
+    _with_legacy_max_tokens_key,
+    _with_openai_completion_token_key,
+)
 from solwyn._privacy import estimate_content_length, estimate_tokens_from_length
 from solwyn._proxies import (
     _AsyncChatProxy,
@@ -103,6 +108,16 @@ _SOURCE_COMPATIBLE_DEFAULT_KEYS = {
     ProviderName.BEDROCK.value: frozenset({"system", "inferenceConfig", "toolConfig", "stream"}),
 }
 
+# Per-call transport params the openai SDK forwards verbatim onto the HTTP
+# request. They are ENDPOINT-SCOPED: extra_headers routinely carries gateway /
+# observability credentials (e.g. Helicone-Auth, x-portkey-api-key) authored
+# for the caller's own target, and extra_query/extra_body carry vendor
+# extensions. Params authored for the original target must never reach a
+# DIFFERENT vendor on a failover hop — the cross-dialect path excludes them by
+# reconstructing from the canonical subset; the same-dialect passthrough
+# strips them explicitly.
+_ENDPOINT_SCOPED_KEYS = frozenset({"extra_headers", "extra_query", "extra_body"})
+
 # Why invoke_model fails loud instead of passing through untracked: it is a
 # PRIMARY completion surface (unlike, say, embeddings), so silent pass-through
 # would be a budget bypass; and its usage lives inside a consume-once response
@@ -125,54 +140,6 @@ def _source_compatible_defaults(dialect: str, params: dict[str, Any]) -> dict[st
     """
     allowed = _SOURCE_COMPATIBLE_DEFAULT_KEYS.get(dialect, frozenset())
     return {key: value for key, value in params.items() if key in allowed}
-
-
-def _openai_uses_max_completion_tokens(model: str) -> bool:
-    """Return whether an OpenAI model rejects the legacy max_tokens key."""
-    return model.startswith(("o1", "o3", "o4", "gpt-5"))
-
-
-def _with_openai_completion_token_key(
-    provider: str,
-    model: str,
-    kwargs: dict[str, object],
-) -> dict[str, object]:
-    """Rewrite OpenAI max_tokens for models that require max_completion_tokens.
-
-    Applies to OpenAI itself and Azure OpenAI (which hosts the same models);
-    other OpenAI-compatible providers accept the legacy max_tokens key.
-    """
-    if provider not in (ProviderName.OPENAI.value, ProviderName.AZURE_OPENAI.value):
-        return kwargs
-    if not _openai_uses_max_completion_tokens(model):
-        return kwargs
-    if "max_tokens" not in kwargs:
-        return kwargs
-    rewritten = dict(kwargs)
-    if "max_completion_tokens" not in rewritten:
-        rewritten["max_completion_tokens"] = rewritten["max_tokens"]
-    del rewritten["max_tokens"]
-    return rewritten
-
-
-def _with_legacy_max_tokens_key(provider: str, kwargs: dict[str, object]) -> dict[str, object]:
-    """Rewrite max_completion_tokens back to legacy max_tokens for compat targets.
-
-    The inverse of ``_with_openai_completion_token_key``, applied ONLY on a
-    same-dialect CROSS-PROVIDER failover hop: kwargs authored for an OpenAI
-    model (which REQUIRES max_completion_tokens for o*/gpt-5 families) would
-    otherwise hit a strict compat target as an unknown param, 4xx, and
-    FAIL_FAST-abort the whole chain. Never applied to the caller's own
-    configured target.
-    """
-    if provider in (ProviderName.OPENAI.value, ProviderName.AZURE_OPENAI.value):
-        return kwargs
-    if "max_completion_tokens" not in kwargs:
-        return kwargs
-    rewritten = dict(kwargs)
-    value = rewritten.pop("max_completion_tokens")
-    rewritten.setdefault("max_tokens", value)
-    return rewritten
 
 
 def _budget_timeout(deadline: Deadline) -> float:
@@ -431,12 +398,41 @@ def _build_hop_kwargs(
         # streaming all carry over; the served adapter's prepare_streaming
         # applies its own stream_options policy, and the completion-token key
         # is rewritten in whichever direction the TARGET requires.
-        hop_kwargs = _with_openai_completion_token_key(
-            rt.adapter.name,
-            rt.entry.model,
-            {**merged_kwargs, "model": rt.entry.model},
+        # Endpoint-scoped transport params authored for the ORIGINAL target
+        # must not reach a different vendor: strip them from the passthrough,
+        # then re-apply the TARGET entry's own default_params for those keys
+        # (authored for this endpoint — same survival as the cross-dialect
+        # path's trailing default_params merge).
+        #
+        # The legacy-key rewrite is applied PER SOURCE LAYER, before the
+        # precedence merge. Rewriting once on the merged dict is
+        # provenance-blind: an entry-default max_completion_tokens would
+        # collapse onto max_tokens AFTER the merge and silently beat a
+        # per-call max_tokens (a money-relevant output cap). With every layer
+        # normalized to the target's key first, the standard merge order
+        # below enforces per-call > entry default > global regardless of
+        # which key each side used. Do NOT rewrite the merged result again.
+        target_name = rt.adapter.name
+        normalized: dict[str, object] = {
+            **_with_legacy_max_tokens_key(target_name, global_defaults),
+            **_with_legacy_max_tokens_key(target_name, rt.entry.default_params),
+            **_with_legacy_max_tokens_key(target_name, kwargs),
+        }
+        passthrough = {
+            key: value for key, value in normalized.items() if key not in _ENDPOINT_SCOPED_KEYS
+        }
+        passthrough.update(
+            {
+                key: value
+                for key, value in rt.entry.default_params.items()
+                if key in _ENDPOINT_SCOPED_KEYS
+            }
         )
-        return _with_legacy_max_tokens_key(rt.adapter.name, hop_kwargs)
+        return _with_openai_completion_token_key(
+            target_name,
+            rt.entry.model,
+            {**passthrough, "model": rt.entry.model},
+        )
 
     # CROSS-DIALECT hop: translate via the canonical subset (may RAISE an
     # Untranslatable* error BEFORE any network call; the caller aborts the
@@ -513,7 +509,6 @@ class Solwyn(_SolwynBase):
         # The primary runtime's adapter is the detected (or overridden)
         # provider identity for usage extraction and proxy selection.
         self._adapter = runtimes[0].adapter
-        self._detected_provider = runtimes[0].entry.provider
         self._dialect = runtimes[0].adapter.dialect
 
         # Build config — SolwynConfig._load_from_env fills missing
@@ -589,25 +584,25 @@ class Solwyn(_SolwynBase):
 
     def converse(self, **kwargs: Any) -> Any:
         """Bedrock-compatible: client.converse(modelId=...) goes through interception."""
-        if self._detected_provider == ProviderName.BEDROCK:
+        if self._dialect == "bedrock":
             return self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
         return self._client.converse(**kwargs)
 
     def converse_stream(self, **kwargs: Any) -> Any:
         """Bedrock-compatible streaming: returns the boto3 dict with a wrapped stream."""
-        if self._detected_provider == ProviderName.BEDROCK:
+        if self._dialect == "bedrock":
             return self._intercepted_call(_force_stream=True, **_bedrock_internal_kwargs(kwargs))
         return self._client.converse_stream(**kwargs)
 
     def invoke_model(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
-        if self._detected_provider == ProviderName.BEDROCK:
+        if self._dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
         return self._client.invoke_model(**kwargs)
 
     def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
-        if self._detected_provider == ProviderName.BEDROCK:
+        if self._dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
         return self._client.invoke_model_with_response_stream(**kwargs)
 
@@ -1210,7 +1205,6 @@ class AsyncSolwyn(_SolwynBase):
         # The primary runtime's adapter is the detected (or overridden)
         # provider identity for usage extraction and proxy selection.
         self._adapter = runtimes[0].adapter
-        self._detected_provider = runtimes[0].entry.provider
         self._dialect = runtimes[0].adapter.dialect
 
         # cfg_kwargs stays dict[str, Any]: mypy can't verify Pydantic's **kwargs
@@ -1282,13 +1276,13 @@ class AsyncSolwyn(_SolwynBase):
 
     async def converse(self, **kwargs: Any) -> Any:
         """Bedrock-compatible: client.converse(modelId=...) goes through interception."""
-        if self._detected_provider == ProviderName.BEDROCK:
+        if self._dialect == "bedrock":
             return await self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
         return await self._client.converse(**kwargs)
 
     async def converse_stream(self, **kwargs: Any) -> Any:
         """Bedrock-compatible streaming: returns the boto3 dict with a wrapped stream."""
-        if self._detected_provider == ProviderName.BEDROCK:
+        if self._dialect == "bedrock":
             return await self._intercepted_call(
                 _force_stream=True, **_bedrock_internal_kwargs(kwargs)
             )
@@ -1296,13 +1290,13 @@ class AsyncSolwyn(_SolwynBase):
 
     async def invoke_model(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
-        if self._detected_provider == ProviderName.BEDROCK:
+        if self._dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
         return await self._client.invoke_model(**kwargs)
 
     async def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
-        if self._detected_provider == ProviderName.BEDROCK:
+        if self._dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
         return await self._client.invoke_model_with_response_stream(**kwargs)
 

@@ -114,11 +114,14 @@ _HOST_CASES = [
     ("mistral", "https://api.mistral.ai/v1"),
     ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
     ("qwen", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+    ("qwen", "https://dashscope-us.aliyuncs.com/compatible-mode/v1"),
     ("groq", "https://api.groq.com/openai/v1"),
     ("together", "https://api.together.xyz/v1"),
+    ("together", "https://api.together.ai/v1"),
     ("fireworks", "https://api.fireworks.ai/inference/v1"),
     ("perplexity", "https://api.perplexity.ai"),
     ("azure_openai", "https://my-resource.openai.azure.com/openai"),
+    ("azure_openai", "https://my-resource.cognitiveservices.azure.com/openai"),
     ("openrouter", "https://openrouter.ai/api/v1"),
     ("ollama", "http://localhost:11434/v1"),
     ("ollama", "http://127.0.0.1:11434/v1"),
@@ -288,6 +291,39 @@ class TestPrepareStreaming:
         )
         assert "stream_options" not in prepared
 
+    def test_azure_data_sources_preserves_caller_stream_options_on_own_target(self) -> None:
+        """Drop-in contract: even on the data_sources pipeline, an option the
+        caller explicitly chose for THEIR OWN Azure endpoint is untouched."""
+        prepared = _adapter("azure_openai").prepare_streaming(
+            {
+                "model": "m",
+                "data_sources": [{"type": "azure_search"}],
+                "stream_options": {"include_usage": True},
+            }
+        )
+        assert prepared["stream_options"] == {"include_usage": True}
+
+    def test_azure_data_sources_strips_caller_stream_options_on_failover_hop(self) -> None:
+        """On a cross-provider hop the caller's stream_options was authored
+        for the original target — strip it so the Azure pipeline doesn't 422."""
+        prepared = _adapter("azure_openai").prepare_streaming(
+            {
+                "model": "m",
+                "data_sources": [{"type": "azure_search"}],
+                "stream_options": {"include_usage": True},
+            },
+            cross_provider=True,
+        )
+        assert "stream_options" not in prepared
+
+    def test_non_azure_extra_body_data_sources_key_still_injects(self) -> None:
+        """The data_sources caveat is Azure-specific: another injecting profile
+        whose extra_body happens to carry that key keeps normal injection."""
+        prepared = _adapter("groq").prepare_streaming(
+            {"model": "m", "extra_body": {"data_sources": [{"type": "custom"}]}}
+        )
+        assert prepared["stream_options"] == {"include_usage": True}
+
 
 # ---------------------------------------------------------------------------
 # Usage extraction — non-streaming
@@ -305,6 +341,13 @@ class TestExtractUsage:
 
     def test_missing_usage_extracts_zeros(self) -> None:
         details = _adapter("groq").extract_usage(SimpleNamespace(usage=None))
+        assert details.input_tokens == 0
+        assert details.output_tokens == 0
+
+    def test_negative_usage_extracts_zeros_not_raise(self) -> None:
+        """Garbage counts (ge=0 would ValidationError) degrade to zeros."""
+        response = _usage_chunk(prompt_tokens=-1, completion_tokens=-7)
+        details = _adapter("groq").extract_usage(response)
         assert details.input_tokens == 0
         assert details.output_tokens == 0
 
@@ -353,6 +396,26 @@ class TestEstimateMissingUsage:
         assert details.input_tokens == 9
         assert details.output_tokens == 10
 
+    def test_negative_usage_with_content_estimates_not_raise(self) -> None:
+        """Negative counts are garbage, not truth — degrade to the flagged
+        estimate instead of raising ValidationError out of a never-raise path."""
+        response = SimpleNamespace(
+            usage=SimpleNamespace(
+                prompt_tokens=-1,
+                completion_tokens=-7,
+                prompt_tokens_details=None,
+                completion_tokens_details=None,
+            ),
+            choices=[SimpleNamespace(message=SimpleNamespace(content="y" * 40))],
+        )
+        details = _adapter("openai_compatible").estimate_missing_usage(
+            response, estimated_input_tokens=9
+        )
+        assert details is not None
+        assert details.is_estimated is True
+        assert details.input_tokens == 9
+        assert details.output_tokens == 10
+
     def test_zeroed_usage_with_real_content_estimates(self) -> None:
         """All-zero usage alongside visible content is garbage, not truth."""
         response = SimpleNamespace(
@@ -383,6 +446,21 @@ class TestEstimateMissingUsage:
         details = _adapter("ollama").estimate_missing_usage(response, estimated_input_tokens=7)
         assert details is not None
         assert details.output_tokens == 10
+
+    def test_reasoning_content_counts_toward_estimate(self) -> None:
+        """DeepSeek-style reasoning rides a separate field — a reasoning-only
+        response from a usage-less endpoint must not estimate to zero output."""
+        response = SimpleNamespace(
+            usage=None,
+            choices=[
+                SimpleNamespace(message=SimpleNamespace(content=None, reasoning_content="r" * 40))
+            ],
+        )
+        details = _adapter("deepseek").estimate_missing_usage(response, estimated_input_tokens=7)
+        assert details is not None
+        assert details.is_estimated is True
+        assert details.input_tokens == 7
+        assert details.output_tokens == 10  # 40 chars / 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +512,23 @@ class TestCompatStreamAccumulator:
             choices=[],
             usage=None,
             x_groq={"id": "req_1", "usage": {"prompt_tokens": 21, "completion_tokens": 6}},
+        )
+        acc.observe(final)
+        details = acc.finalize()
+        assert details.input_tokens == 21
+        assert details.output_tokens == 6
+        assert details.is_estimated is False
+
+    def test_x_groq_attr_usage_fallback(self) -> None:
+        """x_groq parsed into an attr object (not a raw dict) still extracts."""
+        acc = self._accumulator("groq")
+        acc.observe(_text_chunk("hello"))
+        final = SimpleNamespace(
+            choices=[],
+            usage=None,
+            x_groq=SimpleNamespace(
+                usage=SimpleNamespace(prompt_tokens=21, completion_tokens=6, total_tokens=27)
+            ),
         )
         acc.observe(final)
         details = acc.finalize()
@@ -501,6 +596,43 @@ class TestCompatStreamAccumulator:
         details = acc.finalize()
         assert details.is_estimated is True
 
+    def test_negative_usage_chunk_falls_to_estimation_tier(self) -> None:
+        """Negative counts never latch AND never raise out of observe (a raise
+        would settle a content-healthy stream as a breaker failure)."""
+        acc = self._accumulator("openai_compatible", est_in=15)
+        acc.observe(_text_chunk("z" * 40))
+        acc.observe(_usage_chunk(prompt_tokens=-1, completion_tokens=-2))
+        details = acc.finalize()
+        assert details.is_estimated is True
+        assert details.input_tokens == 15
+        assert details.output_tokens == 10
+
+    def test_non_int_usage_chunk_falls_to_estimation_tier(self) -> None:
+        acc = self._accumulator("openai_compatible", est_in=15)
+        chunk = _usage_chunk()
+        chunk.usage.prompt_tokens = "abc"
+        chunk.usage.completion_tokens = "def"
+        acc.observe(chunk)
+        acc.observe(_text_chunk("z" * 40))
+        details = acc.finalize()
+        assert details.is_estimated is True
+        assert details.output_tokens == 10
+
+    def test_x_groq_negative_usage_falls_to_estimation_tier(self) -> None:
+        acc = self._accumulator("groq", est_in=15)
+        acc.observe(_text_chunk("z" * 40))
+        acc.observe(
+            SimpleNamespace(
+                choices=[],
+                usage=None,
+                x_groq={"usage": {"prompt_tokens": -21, "completion_tokens": -6}},
+            )
+        )
+        details = acc.finalize()
+        assert details.is_estimated is True
+        assert details.input_tokens == 15
+        assert details.output_tokens == 10
+
     def test_stream_tool_call_arguments_count_toward_estimate(self) -> None:
         tool_call = SimpleNamespace(function=SimpleNamespace(arguments="x" * 20))
         chunk = SimpleNamespace(
@@ -517,6 +649,25 @@ class TestCompatStreamAccumulator:
         details = acc.finalize()
         assert details.is_estimated is True
         assert details.output_tokens == 5  # 20 chars / 4.0
+
+    def test_stream_reasoning_content_counts_toward_estimate(self) -> None:
+        """A usage-less stream of reasoning-only deltas (DeepSeek-style
+        reasoning_content field) must estimate from the reasoning text."""
+        chunk = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=None, reasoning_content="r" * 40),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+        )
+        acc = self._accumulator("deepseek", est_in=5)
+        acc.observe(chunk)
+        details = acc.finalize()
+        assert details.is_estimated is True
+        assert details.input_tokens == 5
+        assert details.output_tokens == 10  # 40 chars / 4.0
 
     def test_service_tier_from_usage_chunk(self) -> None:
         acc = self._accumulator("groq")

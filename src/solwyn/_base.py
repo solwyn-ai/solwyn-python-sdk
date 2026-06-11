@@ -41,6 +41,64 @@ _LATENCY_WINDOW = 50
 _LATENCY_MIN_SAMPLES = 3
 
 
+def _openai_uses_max_completion_tokens(model: str) -> bool:
+    """Return whether an OpenAI model rejects the legacy max_tokens key."""
+    return model.startswith(("o1", "o3", "o4", "gpt-5"))
+
+
+def _with_openai_completion_token_key(
+    provider: str,
+    model: str,
+    kwargs: dict[str, object],
+) -> dict[str, object]:
+    """Rewrite OpenAI max_tokens for models that require max_completion_tokens.
+
+    Applies to OpenAI itself and Azure OpenAI (which hosts the same models);
+    other OpenAI-compatible providers accept the legacy max_tokens key.
+    """
+    if provider not in (ProviderName.OPENAI.value, ProviderName.AZURE_OPENAI.value):
+        return kwargs
+    if not _openai_uses_max_completion_tokens(model):
+        return kwargs
+    if "max_tokens" not in kwargs:
+        return kwargs
+    rewritten = dict(kwargs)
+    if "max_completion_tokens" not in rewritten:
+        rewritten["max_completion_tokens"] = rewritten["max_tokens"]
+    del rewritten["max_tokens"]
+    return rewritten
+
+
+def _with_legacy_max_tokens_key(provider: str, kwargs: dict[str, object]) -> dict[str, object]:
+    """Rewrite max_completion_tokens back to legacy max_tokens for compat targets.
+
+    The inverse of ``_with_openai_completion_token_key``, applied ONLY on a
+    same-dialect CROSS-PROVIDER failover hop: kwargs authored for an OpenAI
+    model (which REQUIRES max_completion_tokens for o*/gpt-5 families) would
+    otherwise hit a strict compat target as an unknown param, 4xx, and
+    FAIL_FAST-abort the whole chain. Never applied to the caller's own
+    configured target.
+
+    Pure SINGLE-SOURCE rewrite: within one kwargs dict, max_completion_tokens
+    wins over (overwrites) any max_tokens in the same dict — both-present is
+    input OpenAI itself rejects, so we keep the modern key's value rather
+    than guess. Cross-source precedence (per-call kwargs > per-entry
+    default_params > global defaults) is the CALLER's job: ``_build_hop_kwargs``
+    normalizes each kwargs layer with this function separately BEFORE the
+    precedence merge, so a cap from a defaults layer can never collapse onto
+    the per-call key and beat caller intent. Never apply this to an
+    already-merged dict.
+    """
+    if provider in (ProviderName.OPENAI.value, ProviderName.AZURE_OPENAI.value):
+        return kwargs
+    if "max_completion_tokens" not in kwargs:
+        return kwargs
+    rewritten = dict(kwargs)
+    value = rewritten.pop("max_completion_tokens")
+    rewritten["max_tokens"] = value
+    return rewritten
+
+
 class _AttemptContext(BaseModel):
     """Per-attempt state for one candidate in the dispatch walk.
 

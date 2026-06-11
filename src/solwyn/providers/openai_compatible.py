@@ -241,13 +241,15 @@ def _uses_azure_data_sources(kwargs: dict[str, Any]) -> bool:
 
 
 def _usage_int(usage: Any, key: str) -> int:
-    """Read an int usage field from an attr-object OR a plain dict.
+    """Read a non-negative int usage field from an attr-object OR a plain dict.
 
     The OpenAI SDK preserves unknown response fields (e.g. Groq's ``x_groq``)
     as raw dicts rather than model objects, so both shapes occur in the wild.
+    Negative values are garbage (TokenDetails fields are ``ge=0``) and degrade
+    to 0 — missing — so the estimation fallback takes over.
     """
     value = usage.get(key) if isinstance(usage, dict) else getattr(usage, key, None)
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return 0
     return value
 
@@ -310,8 +312,16 @@ class OpenAICompatibleAdapter:
         return any(model.startswith(prefix) for prefix in self._profile.model_prefixes)
 
     def extract_usage(self, response: Any) -> TokenDetails:
-        """Extract token usage from a Chat Completions-shaped response."""
-        return _extract_openai_usage(response)
+        """Extract token usage from a Chat Completions-shaped response.
+
+        Never raises (protocol contract): value-level garbage from an
+        arbitrary compat endpoint degrades to zeros, which the estimation
+        fallback then treats as a usage gap.
+        """
+        try:
+            return _extract_openai_usage(response)
+        except Exception:
+            return TokenDetails()
 
     def estimate_missing_usage(
         self, response: Any, *, estimated_input_tokens: int
@@ -327,12 +337,15 @@ class OpenAICompatibleAdapter:
         logged once at WARNING.
         """
         output_chars = estimate_response_content_length(response)
-        if getattr(response, "usage", None) is not None:
-            extracted = _extract_openai_usage(response)
-            if extracted.input_tokens or extracted.output_tokens:
-                return None  # provider-reported usage — never overridden
-            if not output_chars:
-                return None  # zero usage on an empty response — provider truth
+        try:
+            if getattr(response, "usage", None) is not None:
+                extracted = _extract_openai_usage(response)
+                if extracted.input_tokens or extracted.output_tokens:
+                    return None  # provider-reported usage — never overridden
+                if not output_chars:
+                    return None  # zero usage on an empty response — provider truth
+        except Exception:
+            pass  # unreadable/garbage usage values — fall through to estimation
         self._warn_missing_usage()
         return TokenDetails(
             input_tokens=estimated_input_tokens,
@@ -364,10 +377,17 @@ class OpenAICompatibleAdapter:
             if cross_provider:
                 kwargs.pop("stream_options", None)
             return kwargs
-        if _uses_azure_data_sources(kwargs):
-            # Azure "on your data" rejects stream_options with a 422 — skip the
-            # injection; the estimation fallback nets the missing usage.
-            kwargs.pop("stream_options", None)
+        if self._profile.name == "azure_openai" and _uses_azure_data_sources(kwargs):
+            # Azure "on your data" rejects stream_options with a 422 — never
+            # INJECT include_usage here (the estimation fallback nets the
+            # missing usage). Azure-only: another profile whose extra_body
+            # happens to carry a data_sources key keeps normal injection.
+            # Mirrors the supports_include_usage=False branch above: a
+            # caller-supplied stream_options is stripped only on a
+            # cross-provider hop; on the caller's own Azure target it passes
+            # through untouched (drop-in contract).
+            if cross_provider:
+                kwargs.pop("stream_options", None)
             return kwargs
         stream_options = dict(kwargs.get("stream_options") or {})
         stream_options["include_usage"] = True
@@ -448,25 +468,35 @@ class CompatStreamAccumulator:
         self._content_chars = 0
 
     def observe(self, chunk: Any) -> None:
-        if getattr(chunk, "usage", None) is not None:
-            extracted = _extract_openai_usage(chunk)
-            if extracted.input_tokens or extracted.output_tokens:
-                self._usage_details = extracted
-        tier = _extract_service_tier(chunk)
-        if tier is not None:
-            self._service_tier = tier
-        x_groq = getattr(chunk, "x_groq", None)
-        if x_groq is not None:
-            x_usage = (
-                x_groq.get("usage") if isinstance(x_groq, dict) else getattr(x_groq, "usage", None)
-            )
-            if x_usage is not None:
-                x_details = TokenDetails(
-                    input_tokens=_usage_int(x_usage, "prompt_tokens"),
-                    output_tokens=_usage_int(x_usage, "completion_tokens"),
+        # Best-effort extraction: value-level garbage from an arbitrary
+        # endpoint must never raise out of observe — the stream wrapper would
+        # settle a deliverable stream as a provider FAILURE (breaker hit
+        # against a content-healthy provider). A failed tier degrades to
+        # estimation; content-length accumulation below always runs.
+        try:
+            if getattr(chunk, "usage", None) is not None:
+                extracted = _extract_openai_usage(chunk)
+                if extracted.input_tokens or extracted.output_tokens:
+                    self._usage_details = extracted
+            tier = _extract_service_tier(chunk)
+            if tier is not None:
+                self._service_tier = tier
+            x_groq = getattr(chunk, "x_groq", None)
+            if x_groq is not None:
+                x_usage = (
+                    x_groq.get("usage")
+                    if isinstance(x_groq, dict)
+                    else getattr(x_groq, "usage", None)
                 )
-                if x_details.input_tokens or x_details.output_tokens:
-                    self._x_groq_details = x_details
+                if x_usage is not None:
+                    x_details = TokenDetails(
+                        input_tokens=_usage_int(x_usage, "prompt_tokens"),
+                        output_tokens=_usage_int(x_usage, "completion_tokens"),
+                    )
+                    if x_details.input_tokens or x_details.output_tokens:
+                        self._x_groq_details = x_details
+        except Exception:
+            pass  # unreadable/garbage usage values — estimation tier covers it
         self._content_chars += estimate_stream_chunk_content_length(chunk)
 
     def finalize(self) -> TokenDetails:

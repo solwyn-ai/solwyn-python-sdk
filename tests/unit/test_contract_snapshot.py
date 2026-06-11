@@ -117,6 +117,26 @@ EXPECTED_PROVIDER_NAMES = {
     "openai_compatible",
 }
 
+# TokenDetails is an EMBEDDED wire object (BudgetConfirmRequest.token_details,
+# MetadataEvent.token_details) — its field set is contract too. is_estimated is
+# omit-when-False on the wire: only estimation-fallback payloads carry it, so
+# provider-reported payloads stay byte-identical and the Cloud API must accept
+# the key BEFORE any SDK release that can emit it (API-first deploy).
+EXPECTED_TOKEN_DETAILS_FIELDS = {
+    "input_tokens",
+    "output_tokens",
+    "cached_input_tokens",
+    "cache_creation_5m_tokens",
+    "cache_creation_1h_tokens",
+    "reasoning_tokens",
+    "audio_input_tokens",
+    "audio_output_tokens",
+    "accepted_prediction_tokens",
+    "rejected_prediction_tokens",
+    "tool_use_input_tokens",
+    "is_estimated",
+}
+
 EXPECTED_METADATA_FIELDS = {
     "model",
     "provider",
@@ -164,6 +184,9 @@ class TestWireModelFieldSets:
 
     def test_provider_name_values(self) -> None:
         assert {p.value for p in ProviderName} == EXPECTED_PROVIDER_NAMES
+
+    def test_token_details_field_set(self) -> None:
+        assert set(TokenDetails.model_fields) == EXPECTED_TOKEN_DETAILS_FIELDS
 
 
 def _confirm(**overrides: Any) -> BudgetConfirmRequest:
@@ -261,6 +284,40 @@ class TestWireModelDumpSnapshots:
             set(req.model_dump(mode="json"))
             == EXPECTED_CONFIRM_FIELDS - _NONE_SKIPPED_CONFIRM_FIELDS
         )
+
+    def test_token_details_default_dump_omits_is_estimated(self) -> None:
+        # Provider-reported (non-estimated) counts: is_estimated stays OFF the
+        # wire entirely — never "is_estimated": false — so every existing
+        # provider's payload is byte-identical to the pre-is_estimated wire.
+        dumped = TokenDetails(input_tokens=10, output_tokens=5).model_dump(mode="json")
+        assert "is_estimated" not in dumped
+        assert set(dumped) == EXPECTED_TOKEN_DETAILS_FIELDS - {"is_estimated"}
+
+    def test_token_details_estimated_dump_includes_is_estimated(self) -> None:
+        # The estimation fallback fired: the degradation marker MUST serialize.
+        dumped = TokenDetails(input_tokens=10, output_tokens=5, is_estimated=True).model_dump(
+            mode="json"
+        )
+        assert dumped["is_estimated"] is True
+        assert set(dumped) == EXPECTED_TOKEN_DETAILS_FIELDS
+
+    def test_confirm_with_default_token_details_carries_no_is_estimated_key(self) -> None:
+        # The deployment-ordering guarantee, enforced on the EXACT dump mode the
+        # reporter posts (model_dump(mode="json")): a confirm carrying
+        # provider-reported counts contains no is_estimated key anywhere, so a
+        # deployed Cloud API that forbids unknown TokenDetails keys never 422s.
+        nested = _confirm().model_dump(mode="json")["token_details"]
+        assert "is_estimated" not in nested
+        # And the estimation-fallback confirm DOES carry it.
+        estimated = _confirm(
+            token_details=TokenDetails(input_tokens=10, output_tokens=5, is_estimated=True)
+        ).model_dump(mode="json")["token_details"]
+        assert estimated["is_estimated"] is True
+
+    def test_metadata_event_with_default_token_details_carries_no_is_estimated_key(self) -> None:
+        # Same guarantee on the metadata-event wire (the other embedding).
+        ev = _metadata_event(token_details=TokenDetails(input_tokens=10, output_tokens=5))
+        assert "is_estimated" not in ev.model_dump(mode="json")["token_details"]
 
     def test_confirm_provider_region_omitted_when_none_present_when_set(self) -> None:
         # Mirror of test_metadata_provider_region_omitted_when_none_present_when_set:
