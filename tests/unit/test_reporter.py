@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, _accepted_response
 from pydantic import ValidationError
 
 from solwyn._token_details import TokenDetails
@@ -64,15 +65,6 @@ def _error_response(status_code: int) -> MagicMock:
             "error", request=MagicMock(spec=httpx.Request), response=resp
         )
     )
-    return resp
-
-
-def _accepted_response(body: dict[str, Any]) -> MagicMock:
-    """A 202 httpx.Response stand-in carrying a per-event-disposition body."""
-    resp = MagicMock(spec=httpx.Response)
-    resp.status_code = 202
-    resp.raise_for_status = MagicMock()
-    resp.json = MagicMock(return_value=body)
     return resp
 
 
@@ -597,6 +589,7 @@ class TestIngestRejectionLogging:
         ("body", "expected_exc_type"),
         [
             ({"ingested": 3}, "KeyError"),  # rejected key missing
+            ({"ingested": 1, "rejected": None}, "TypeError"),  # falsy non-list is not clean
             ({"ingested": 1, "rejected": ["not-a-dict"]}, "TypeError"),
             ({"ingested": 1, "rejected": [{"index": 0}]}, "KeyError"),  # entry missing fields
         ],
@@ -643,6 +636,128 @@ class TestIngestRejectionLogging:
 
         assert "reporter.ingest_response_unparseable" in caplog.text
         assert "exc_type=ValueError" in caplog.text
+        reporter._http.close()
+
+    def test_rejected_longer_than_batch_fails_open(self, caplog: pytest.LogCaptureFixture) -> None:
+        # A server rejecting more events than were submitted is contract-
+        # violating: take the fail-open unparseable path, never emit
+        # per-group warnings from a body that cannot be trusted.
+        reporter = _quiet_sync_reporter()
+        body = {"ingested": 0, "rejected": [_rejection(i) for i in range(3)]}
+
+        with (
+            patch.object(reporter._http, "post", return_value=_accepted_response(body)),
+            caplog.at_level("WARNING"),
+        ):
+            reporter._send_batch([_make_event() for _ in range(2)])
+
+        unparseable = [
+            record.getMessage()
+            for record in caplog.records
+            if "reporter.ingest_response_unparseable" in record.getMessage()
+        ]
+        assert len(unparseable) == 1
+        assert "exc_type=ValueError" in unparseable[0]
+        assert "reporter.ingest_events_rejected" not in caplog.text
+        reporter._http.close()
+
+    def test_raw_control_bytes_in_echoed_values_are_escaped(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A compliant server repr-escapes control characters before echoing
+        # them back; if a regression sends RAW bytes, the SDK escapes them
+        # itself so customer logs carry no ANSI sequences or forged lines.
+        reporter = _quiet_sync_reporter()
+        body = {
+            "ingested": 0,
+            "rejected": [
+                _rejection(0, model="vendor\x1b[31m-x", message="tier 'spot\x1b[31m\n' unknown")
+            ],
+        }
+
+        with (
+            patch.object(reporter._http, "post", return_value=_accepted_response(body)),
+            caplog.at_level("WARNING"),
+        ):
+            reporter._send_batch([_make_event()])
+
+        rejection_logs = [
+            record.getMessage()
+            for record in caplog.records
+            if "reporter.ingest_events_rejected" in record.getMessage()
+        ]
+        assert len(rejection_logs) == 1
+        assert "\\x1b" in rejection_logs[0]
+        assert "\\n" in rejection_logs[0]
+        assert "\x1b" not in rejection_logs[0]
+        assert "\n" not in rejection_logs[0]
+        reporter._http.close()
+
+    def test_persistent_unparseable_bodies_escalate_to_error_then_reset(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Mirrors the confirm-failure escalation: the 10th consecutive
+        # unparseable body logs at ERROR; one parseable body — even a clean
+        # one — resets the counter.
+        reporter = _quiet_sync_reporter()
+
+        with (
+            patch.object(reporter._http, "post", return_value=_accepted_response({"ingested": 1})),
+            caplog.at_level("WARNING"),
+        ):
+            for _ in range(10):
+                reporter._send_batch([_make_event()])
+
+        persistent = [
+            record
+            for record in caplog.records
+            if "reporter.ingest_response_unparseable_persistent" in record.getMessage()
+        ]
+        assert len(persistent) == 1
+        assert persistent[0].levelname == "ERROR"
+        assert "consecutive_failures=10" in persistent[0].getMessage()
+        assert reporter._consecutive_unparseable_responses == 10
+
+        with patch.object(
+            reporter._http,
+            "post",
+            return_value=_accepted_response({"ingested": 1, "rejected": []}),
+        ):
+            reporter._send_batch([_make_event()])
+
+        assert reporter._consecutive_unparseable_responses == 0
+        reporter._http.close()
+
+    def test_raising_logging_stack_does_not_mislabel_durable_batch(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The batch IS durable server-side once the 202 lands — if the host's
+        # logging stack raises during rejection emission (e.g. a
+        # user-installed Filter), _send_batch must neither raise nor report
+        # a send failure for a batch that was sent.
+        reporter = _quiet_sync_reporter()
+        body = {"ingested": 0, "rejected": [_rejection(0)]}
+
+        class _RaisingFilter(logging.Filter):
+            def filter(self, record: logging.LogRecord) -> bool:
+                if "ingest_events_rejected" in record.getMessage():
+                    raise RuntimeError("user filter exploded")
+                return True
+
+        log_filter = _RaisingFilter()
+        reporter_logger = logging.getLogger("solwyn.reporter")
+        reporter_logger.addFilter(log_filter)
+        try:
+            with (
+                patch.object(reporter._http, "post", return_value=_accepted_response(body)),
+                caplog.at_level("WARNING"),
+            ):
+                # Must not raise despite the exploding filter.
+                reporter._send_batch([_make_event()])
+        finally:
+            reporter_logger.removeFilter(log_filter)
+
+        assert "Failed to send metadata batch" not in caplog.text
         reporter._http.close()
 
 
