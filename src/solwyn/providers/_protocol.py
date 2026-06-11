@@ -7,10 +7,17 @@ responses. Cost calculation lives in the Cloud API's PricingService.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from solwyn._token_details import TokenDetails
 from solwyn.providers._accumulator import StreamUsageAccumulator
+
+# The four API shapes the SDK knows how to dispatch and translate.
+# A provider's *dialect* is the wire shape it speaks; its *name* is the
+# attribution identity (budgets, pricing, circuit breaking). All
+# OpenAI-compatible providers share the "openai" dialect under distinct names;
+# Bedrock's Converse API is its own dialect.
+Dialect = Literal["openai", "anthropic", "google", "bedrock"]
 
 
 @runtime_checkable
@@ -26,7 +33,21 @@ class ProviderAdapter(Protocol):
 
     @property
     def name(self) -> str:
-        """Provider name (e.g. 'openai', 'anthropic', 'google')."""
+        """Provider name (e.g. 'openai', 'groq', 'openrouter').
+
+        Always a valid ``ProviderName`` value — this is the attribution
+        identity used for budgets, metadata, and circuit breaking.
+        """
+        ...
+
+    @property
+    def dialect(self) -> Dialect:
+        """API dialect this provider speaks ('openai', 'anthropic', 'google').
+
+        Drives dispatch method selection and cross-provider translation.
+        Distinct from ``name``: every OpenAI-compatible provider returns
+        'openai' here while keeping its own attribution name.
+        """
         ...
 
     def detect_client(self, client: Any) -> bool:
@@ -45,6 +66,19 @@ class ProviderAdapter(Protocol):
         """
         ...
 
+    def estimate_missing_usage(
+        self, response: Any, *, estimated_input_tokens: int
+    ) -> TokenDetails | None:
+        """Estimated TokenDetails when the response carries NO usage block, else None.
+
+        Adapters for providers that always report usage return None
+        unconditionally. OpenAI-compatible adapters return a length-based
+        estimate marked ``is_estimated=True`` when ``response.usage`` is absent —
+        the explicit-degradation fallback that keeps budgets enforcing instead
+        of silently recording zero spend. Must never raise.
+        """
+        ...
+
     def extract_service_tier(self, response: Any) -> str | None:
         """Extract provider service tier from a response, or None when unavailable."""
         ...
@@ -58,18 +92,34 @@ class ProviderAdapter(Protocol):
         """
         ...
 
-    def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+    def prepare_streaming(
+        self, kwargs: dict[str, Any], *, cross_provider: bool = False
+    ) -> dict[str, Any]:
         """Prepare call kwargs for streaming if needed.
 
         For example, OpenAI needs stream_options={"include_usage": True}
         to get usage data in the final streaming chunk.
 
+        ``cross_provider`` is True when this adapter serves a FAILOVER hop for
+        a request authored against a different provider — adapters may then
+        sanitize options that were meant for the original target (e.g. strip
+        stream_options before a provider that rejects it). On the caller's own
+        configured target their explicit options pass through untouched.
+
         Returns a (possibly modified) copy of kwargs. Must not mutate the input.
         """
         ...
 
-    def create_stream_accumulator(self) -> StreamUsageAccumulator:
-        """Create a fresh accumulator for a new streaming response."""
+    def create_stream_accumulator(
+        self, *, estimated_input_tokens: int = 0
+    ) -> StreamUsageAccumulator:
+        """Create a fresh accumulator for a new streaming response.
+
+        ``estimated_input_tokens`` is the pre-call length-based input estimate.
+        Accumulators for providers that always report streaming usage ignore
+        it; OpenAI-compatible accumulators keep it for the missing-usage
+        estimated fallback (marked ``is_estimated=True``).
+        """
         ...
 
     def prepare_call(

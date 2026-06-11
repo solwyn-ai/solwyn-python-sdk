@@ -13,12 +13,25 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from solwyn._constants import SERVICE_TIER_MAX_LENGTH
 from solwyn._token_details import TokenDetails
 
 logger = logging.getLogger(__name__)
+
+
+def _usage_value(value: Any) -> int:
+    """Coerce one usage field to a non-negative int; garbage degrades to 0.
+
+    TokenDetails fields are ``Field(ge=0)``, so a negative or non-int value
+    from a misbehaving endpoint would raise ValidationError out of extraction
+    paths contracted to never raise. Treating garbage as 0 lets the existing
+    zero-usage handling (and the compat estimation fallback) take over.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
 
 
 def _extract_openai_usage(response: Any) -> TokenDetails:
@@ -47,16 +60,18 @@ def _extract_chat_completions(usage: Any) -> TokenDetails:
     completion_details = getattr(usage, "completion_tokens_details", None)
 
     return TokenDetails(
-        input_tokens=getattr(usage, "prompt_tokens", None) or 0,
-        output_tokens=getattr(usage, "completion_tokens", None) or 0,
-        cached_input_tokens=getattr(prompt_details, "cached_tokens", None) or 0,
-        audio_input_tokens=getattr(prompt_details, "audio_tokens", None) or 0,
-        reasoning_tokens=getattr(completion_details, "reasoning_tokens", None) or 0,
-        audio_output_tokens=getattr(completion_details, "audio_tokens", None) or 0,
-        accepted_prediction_tokens=getattr(completion_details, "accepted_prediction_tokens", None)
-        or 0,
-        rejected_prediction_tokens=getattr(completion_details, "rejected_prediction_tokens", None)
-        or 0,
+        input_tokens=_usage_value(getattr(usage, "prompt_tokens", None)),
+        output_tokens=_usage_value(getattr(usage, "completion_tokens", None)),
+        cached_input_tokens=_usage_value(getattr(prompt_details, "cached_tokens", None)),
+        audio_input_tokens=_usage_value(getattr(prompt_details, "audio_tokens", None)),
+        reasoning_tokens=_usage_value(getattr(completion_details, "reasoning_tokens", None)),
+        audio_output_tokens=_usage_value(getattr(completion_details, "audio_tokens", None)),
+        accepted_prediction_tokens=_usage_value(
+            getattr(completion_details, "accepted_prediction_tokens", None)
+        ),
+        rejected_prediction_tokens=_usage_value(
+            getattr(completion_details, "rejected_prediction_tokens", None)
+        ),
     )
 
 
@@ -73,14 +88,18 @@ def _extract_responses_api(usage: Any) -> TokenDetails:
     output_details = getattr(usage, "output_tokens_details", None)
 
     return TokenDetails(
-        input_tokens=getattr(usage, "input_tokens", None) or 0,
-        output_tokens=getattr(usage, "output_tokens", None) or 0,
-        cached_input_tokens=getattr(input_details, "cached_tokens", None) or 0,
-        audio_input_tokens=getattr(input_details, "audio_tokens", None) or 0,
-        reasoning_tokens=getattr(output_details, "reasoning_tokens", None) or 0,
-        audio_output_tokens=getattr(output_details, "audio_tokens", None) or 0,
-        accepted_prediction_tokens=getattr(output_details, "accepted_prediction_tokens", None) or 0,
-        rejected_prediction_tokens=getattr(output_details, "rejected_prediction_tokens", None) or 0,
+        input_tokens=_usage_value(getattr(usage, "input_tokens", None)),
+        output_tokens=_usage_value(getattr(usage, "output_tokens", None)),
+        cached_input_tokens=_usage_value(getattr(input_details, "cached_tokens", None)),
+        audio_input_tokens=_usage_value(getattr(input_details, "audio_tokens", None)),
+        reasoning_tokens=_usage_value(getattr(output_details, "reasoning_tokens", None)),
+        audio_output_tokens=_usage_value(getattr(output_details, "audio_tokens", None)),
+        accepted_prediction_tokens=_usage_value(
+            getattr(output_details, "accepted_prediction_tokens", None)
+        ),
+        rejected_prediction_tokens=_usage_value(
+            getattr(output_details, "rejected_prediction_tokens", None)
+        ),
     )
 
 
@@ -105,8 +124,17 @@ class OpenAIAdapter:
     def name(self) -> str:
         return "openai"
 
+    @property
+    def dialect(self) -> Literal["openai"]:
+        return "openai"
+
     def detect_client(self, client: Any) -> bool:
-        """Return True if the client's module path contains 'openai'."""
+        """Return True if the client's module path contains 'openai'.
+
+        Registered AFTER the OpenAI-compatible adapters, which claim
+        openai-module clients whose base_url points at another vendor —
+        so reaching this adapter means the client targets OpenAI itself.
+        """
         return "openai" in getattr(type(client), "__module__", "")
 
     def detect_model(self, model: str) -> bool:
@@ -116,6 +144,12 @@ class OpenAIAdapter:
     def extract_usage(self, response: Any) -> TokenDetails:
         """Extract token usage from a Chat Completions or Responses API response."""
         return _extract_openai_usage(response)
+
+    def estimate_missing_usage(
+        self, response: Any, *, estimated_input_tokens: int
+    ) -> TokenDetails | None:
+        """OpenAI itself always reports usage — no estimated fallback."""
+        return None
 
     def extract_service_tier(self, response: Any) -> str | None:
         """Return service_tier from an OpenAI response, or None if absent.
@@ -129,7 +163,9 @@ class OpenAIAdapter:
         """OpenAI pricing is not regional."""
         return None
 
-    def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+    def prepare_streaming(
+        self, kwargs: dict[str, Any], *, cross_provider: bool = False
+    ) -> dict[str, Any]:
         """Inject stream_options so usage appears in the final chunk."""
         kwargs = dict(kwargs)
         stream_options = dict(kwargs.get("stream_options") or {})
@@ -137,7 +173,11 @@ class OpenAIAdapter:
         kwargs["stream_options"] = stream_options
         return kwargs
 
-    def create_stream_accumulator(self) -> OpenAIStreamAccumulator:
+    def create_stream_accumulator(
+        self, *, estimated_input_tokens: int = 0
+    ) -> OpenAIStreamAccumulator:
+        """OpenAI streams always carry usage (include_usage is injected) —
+        the input estimate is not needed."""
         return OpenAIStreamAccumulator()
 
     def prepare_call(

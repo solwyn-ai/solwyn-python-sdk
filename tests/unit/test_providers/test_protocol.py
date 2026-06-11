@@ -40,6 +40,10 @@ class _StubAdapter:
     def name(self) -> str:
         return "stub"
 
+    @property
+    def dialect(self) -> str:
+        return "openai"
+
     def detect_client(self, client: Any) -> bool:
         return type(client).__name__ == "StubClient"
 
@@ -49,16 +53,25 @@ class _StubAdapter:
     def extract_usage(self, response: Any) -> TokenDetails:
         return TokenDetails()
 
+    def estimate_missing_usage(
+        self, response: Any, *, estimated_input_tokens: int
+    ) -> TokenDetails | None:
+        return None
+
     def extract_service_tier(self, response: Any) -> str | None:
         return None
 
     def extract_region(self, client: Any) -> str | None:
         return None
 
-    def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+    def prepare_streaming(
+        self, kwargs: dict[str, Any], *, cross_provider: bool = False
+    ) -> dict[str, Any]:
         return dict(kwargs)
 
-    def create_stream_accumulator(self) -> StreamUsageAccumulator:
+    def create_stream_accumulator(
+        self, *, estimated_input_tokens: int = 0
+    ) -> StreamUsageAccumulator:
         return _NoOpAccumulator()
 
     def prepare_call(
@@ -86,9 +99,10 @@ class _IncompleteAdapter:
     def name(self) -> str:
         return "incomplete"
 
-    # Missing: detect_client, detect_model, extract_usage,
-    # extract_service_tier, extract_region, prepare_streaming,
-    # create_stream_accumulator
+    # Missing: dialect, detect_client, detect_model, extract_usage,
+    # estimate_missing_usage, extract_service_tier, extract_region,
+    # prepare_streaming, create_stream_accumulator, prepare_call,
+    # unwrap_stream_source, wrap_stream_result
 
 
 class _NoRegionAdapter:
@@ -103,6 +117,10 @@ class _NoRegionAdapter:
     def name(self) -> str:
         return "no-region"
 
+    @property
+    def dialect(self) -> str:
+        return "openai"
+
     def detect_client(self, client: Any) -> bool:
         return False
 
@@ -112,13 +130,22 @@ class _NoRegionAdapter:
     def extract_usage(self, response: Any) -> TokenDetails:
         return TokenDetails()
 
+    def estimate_missing_usage(
+        self, response: Any, *, estimated_input_tokens: int
+    ) -> TokenDetails | None:
+        return None
+
     def extract_service_tier(self, response: Any) -> str | None:
         return None
 
-    def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+    def prepare_streaming(
+        self, kwargs: dict[str, Any], *, cross_provider: bool = False
+    ) -> dict[str, Any]:
         return dict(kwargs)
 
-    def create_stream_accumulator(self) -> StreamUsageAccumulator:
+    def create_stream_accumulator(
+        self, *, estimated_input_tokens: int = 0
+    ) -> StreamUsageAccumulator:
         return _NoOpAccumulator()
 
     def prepare_call(
@@ -151,6 +178,10 @@ class _NoDispatchSeamsAdapter:
     def name(self) -> str:
         return "no-dispatch-seams"
 
+    @property
+    def dialect(self) -> str:
+        return "openai"
+
     def detect_client(self, client: Any) -> bool:
         return False
 
@@ -160,16 +191,25 @@ class _NoDispatchSeamsAdapter:
     def extract_usage(self, response: Any) -> TokenDetails:
         return TokenDetails()
 
+    def estimate_missing_usage(
+        self, response: Any, *, estimated_input_tokens: int
+    ) -> TokenDetails | None:
+        return None
+
     def extract_service_tier(self, response: Any) -> str | None:
         return None
 
     def extract_region(self, client: Any) -> str | None:
         return None
 
-    def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+    def prepare_streaming(
+        self, kwargs: dict[str, Any], *, cross_provider: bool = False
+    ) -> dict[str, Any]:
         return dict(kwargs)
 
-    def create_stream_accumulator(self) -> StreamUsageAccumulator:
+    def create_stream_accumulator(
+        self, *, estimated_input_tokens: int = 0
+    ) -> StreamUsageAccumulator:
         return _NoOpAccumulator()
 
 

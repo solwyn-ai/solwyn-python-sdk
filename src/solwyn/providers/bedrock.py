@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, Literal
 
 from solwyn._constants import SERVICE_TIER_MAX_LENGTH
 from solwyn._token_details import TokenDetails
@@ -162,6 +162,10 @@ class BedrockAdapter:
     def name(self) -> str:
         return "bedrock"
 
+    @property
+    def dialect(self) -> Literal["bedrock"]:
+        return "bedrock"
+
     def detect_client(self, client: Any) -> bool:
         """Return True for a boto3/aioboto3 ``bedrock-runtime`` client.
 
@@ -198,6 +202,12 @@ class BedrockAdapter:
             return TokenDetails()
         return _extract_bedrock_usage(response.get("usage"))
 
+    def estimate_missing_usage(
+        self, response: Any, *, estimated_input_tokens: int
+    ) -> TokenDetails | None:
+        """Converse responses contractually carry usage — no estimated fallback."""
+        return None
+
     def extract_service_tier(self, response: Any) -> str | None:
         """Return the Bedrock pricing tier echoed on the response, or None."""
         return _extract_bedrock_service_tier(response)
@@ -209,11 +219,17 @@ class BedrockAdapter:
             return region
         return None
 
-    def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+    def prepare_streaming(
+        self, kwargs: dict[str, Any], *, cross_provider: bool = False
+    ) -> dict[str, Any]:
         """ConverseStream always emits the terminal metadata event — no changes."""
         return dict(kwargs)
 
-    def create_stream_accumulator(self) -> BedrockStreamAccumulator:
+    def create_stream_accumulator(
+        self, *, estimated_input_tokens: int = 0
+    ) -> BedrockStreamAccumulator:
+        """Converse streams always carry the terminal usage event — the input
+        estimate is not needed."""
         return BedrockStreamAccumulator()
 
     def prepare_call(

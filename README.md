@@ -1,6 +1,6 @@
 # Solwyn Python SDK
 
-Budget enforcement, circuit breaking, and usage tracking for OpenAI, Anthropic, Google, and Amazon Bedrock LLM clients.
+Budget enforcement, circuit breaking, and usage tracking for OpenAI, Anthropic, Google, and Amazon Bedrock LLM clients — plus any provider that speaks the OpenAI Chat Completions dialect (xAI, DeepSeek, Mistral, Qwen, Groq, Together, Fireworks, Perplexity, Azure OpenAI, OpenRouter, Ollama, vLLM, LM Studio, …).
 
 [![CI](https://github.com/solwyn-ai/solwyn-python/actions/workflows/ci.yml/badge.svg)](https://github.com/solwyn-ai/solwyn-python/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/solwyn)](https://pypi.org/project/solwyn/)
@@ -127,6 +127,65 @@ Notes:
 - boto3 has no per-call timeout override, so the failover deadline cannot shorten an in-flight Bedrock hop — set `read_timeout` in your botocore `Config`.
 - Async works with [aioboto3](https://github.com/terricain/aioboto3): `AsyncSolwyn(client)` inside `async with session.client("bedrock-runtime") as client`.
 - Bedrock participates in cross-provider failover in both directions (e.g. Bedrock-Claude ⇄ direct Anthropic) via the same canonical translation subset as the other providers.
+
+### OpenAI-compatible providers
+
+Point an `openai.OpenAI` client at any OpenAI-compatible endpoint via `base_url` and wrap it as usual. Solwyn detects the provider from the URL, so budgets, per-agent attribution, failover, and the cost dashboard all see the *real* provider (e.g. `groq`), not "openai":
+
+```python
+from openai import OpenAI
+from solwyn import Solwyn
+
+client = Solwyn(
+    OpenAI(base_url="https://api.groq.com/openai/v1", api_key="gsk_..."),
+    api_key="sk_proj_...",
+)
+response = client.chat.completions.create(
+    model="llama-3.3-70b-versatile",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+```
+
+Auto-detected providers:
+
+| Provider | Detected from | Streaming usage |
+|----------|--------------|-----------------|
+| xAI (Grok) | `api.x.ai` | automatic (final chunk); `stream_options` is never sent — xAI rejects it |
+| DeepSeek | `api.deepseek.com` | `include_usage` injected |
+| Mistral | `api.mistral.ai` | `stream_options` never sent (strict validation); final-chunk usage or estimate |
+| Qwen (DashScope compat) | `dashscope*.aliyuncs.com` | `include_usage` injected |
+| Groq | `api.groq.com` | `include_usage` injected; legacy `x_groq.usage` also handled |
+| Together AI | `api.together.xyz` / `api.together.ai` | automatic (final chunk) |
+| Fireworks | `api.fireworks.ai` | automatic (final chunk) |
+| Perplexity (Sonar) | `api.perplexity.ai` | usage on streamed chunks; `stream_options` never sent |
+| Azure OpenAI | `*.openai.azure.com` or `AzureOpenAI` client class | `include_usage` injected (skipped for "on your data" `data_sources` requests, which reject it) |
+| OpenRouter | `openrouter.ai` | automatic (final chunk); `stream_options` is deprecated there |
+| Ollama | `localhost:11434` | `include_usage` injected (older versions ignore it → estimate) |
+| vLLM | `localhost:8000` | `include_usage` injected |
+| LM Studio | `localhost:1234` | `include_usage` injected (pre-0.3.18 omits usage → estimate) |
+| Anything else | any non-OpenAI `base_url` | generic `openai_compatible`; `stream_options` never sent |
+
+For endpoints auto-detection can't name (e.g. vLLM on a non-default port), pass the provider explicitly — on the constructor for the primary, or as the 4th element of a fallback spec:
+
+```python
+client = Solwyn(
+    OpenAI(base_url="http://gpu-box:8080/v1", api_key="-"),
+    api_key="sk_proj_...",
+    provider="vllm",
+    fallback=[(OpenAI(base_url="https://openrouter.ai/api/v1", api_key="sk-or-..."), "openrouter/auto"),
+              (other_client, "my-model", {}, "ollama")],
+)
+```
+
+**Token accounting.** Budgets and attribution depend on accurate per-call usage, and "OpenAI-compatible" endpoints differ most in exactly that. Solwyn requests streaming usage only from providers where that's documented-safe, reads it from the final chunk where it arrives automatically, and — when a provider reports no usage at all (or reports an unparseable/zeroed block alongside real content) — falls back to a length-based estimate that is **explicitly marked** (`token_details.is_estimated = true` on the wire, plus a one-time SDK warning). Degraded accounting is loud and flagged, never silently zero.
+
+The "never sent" entries above describe Solwyn's own injection policy. A `stream_options` you pass explicitly always reaches your configured provider untouched (drop-in contract); it is only stripped when a *failover hop* lands on a provider known to reject it.
+
+**Pricing.** The SDK never computes cost. It reports the served `(provider, model)` verbatim — for OpenRouter that's the full model slug (e.g. `anthropic/claude-sonnet-4.5`) — and Solwyn Cloud's PricingService prices it. Models unknown to the catalog are surfaced as unpriced on the dashboard rather than silently costed at $0.
+
+**Failover.** Compat providers participate fully in failover. Between two OpenAI-dialect providers (e.g. Groq → OpenRouter) requests pass through natively — tools, JSON mode, and streaming included (`max_completion_tokens` is rewritten to `max_tokens` for targets that need the legacy key). Per-call `extra_headers`/`extra_query`/`extra_body` are stripped on cross-provider hops — they're endpoint-scoped, authored for the original endpoint — though the fallback entry's own `default_params` versions still apply. Across dialects (e.g. Groq → Anthropic) the standard translation subset applies.
+
+**Known limitation.** Circuit-breaker health, latency signals, and failover labeling key off the provider *name*. Two chain entries that resolve to the same name (two Azure resources, two unnamed gateways both detected as `openai_compatible`) share one health domain and are reported as model fallbacks of each other. For the same reason, a hop between same-name entries skips cross-provider request sanitization — `stream_options` stripping, the `max_completion_tokens` → `max_tokens` rewrite, and endpoint-scoped param stripping (`extra_headers`/`extra_query`/`extra_body`). A `stream_options` or gateway header you authored for the first endpoint reaches the second untouched and can 4xx there. Give distinct endpoints distinct provider identities where possible — explicit `provider=` on the constructor, or the 4th element of a fallback spec.
 
 ## Async
 
@@ -259,10 +318,10 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | Field | Type | Description |
 |-------|------|-------------|
 | `model` | `str` | Model name (e.g., `gpt-4o`) |
-| `provider` | `str` | `openai`, `anthropic`, `google`, or `bedrock` |
+| `provider` | `str` | Provider identifier (`openai`, `anthropic`, `google`, `bedrock`, `groq`, `openrouter`, …) |
 | `input_tokens` | `int` | Input token count |
 | `output_tokens` | `int` | Output token count |
-| `token_details` | `object` | Breakdown: cached, reasoning, audio tokens |
+| `token_details` | `object` | Breakdown: cached, reasoning, audio tokens; `is_estimated` flags length-based estimates when a provider reports no usage |
 | `latency_ms` | `float` | Call duration in milliseconds |
 | `status` | `str` | `success`, `error`, or `budget_denied` |
 | `is_model_fallback` | `bool` | Whether the call used `fallback_model` after the primary model failed |
@@ -279,6 +338,11 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 Provider failover confirms include `provider` and `call_id` on `POST /api/v1/budgets/confirm` so Solwyn Cloud can price and deduplicate the served provider. Release this SDK only after Solwyn Cloud accepts those fields; deploy the Cloud API first.
 
 Bedrock support additionally requires the Cloud API to accept (deploy API-first): the `bedrock` provider enum value, the optional `provider_region` and `service_tier` fields on metadata events and budget confirms, and model identifiers up to 2048 chars (Bedrock ARNs; was 100). PricingService keys Bedrock prices by (model, region); `service_tier` on the confirm settles the budget enforcement counter at the tier-repriced rate (flex/priority/latency-optimized) — omitted, it settles at Standard rates. Both optional fields are omitted entirely (never `null`) when unset, so other providers' wire bytes are unchanged.
+
+OpenAI-compatible provider support additionally requires the Cloud API to accept (deploy API first):
+
+- the new `provider` enum values on check/confirm/metadata payloads: `xai`, `deepseek`, `mistral`, `qwen`, `groq`, `together`, `fireworks`, `perplexity`, `azure_openai`, `openrouter`, `ollama`, `vllm`, `lmstudio`, `openai_compatible`;
+- the `is_estimated` boolean on `token_details` (marks SDK-side length-based estimates when a provider reports no usage). It is serialized only when `true` — i.e. only when the estimation fallback fired — and omitted entirely otherwise (never `is_estimated: false`), so existing-provider payloads are unchanged. Solwyn Cloud must accept the field before this SDK release, same API-first ordering as the `provider` enum additions above.
 
 ## Requirements
 

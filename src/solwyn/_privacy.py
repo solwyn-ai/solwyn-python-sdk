@@ -105,3 +105,66 @@ def estimate_tokens_from_length(char_count: int, provider: str) -> int:
     }
     ratio = ratio_by_provider.get(provider, 4.0)
     return max(1, int(char_count / ratio))
+
+
+def _part_text_length(part: Any) -> int:
+    """Sum string lengths of one delta/message part: content, reasoning text,
+    and tool-call function arguments. Length-only; nothing is concatenated,
+    stored, or returned beyond an integer."""
+    total = 0
+    content = getattr(part, "content", None)
+    if isinstance(content, str):
+        total += len(content)
+    # DeepSeek-style reasoning text rides on a separate field.
+    reasoning = getattr(part, "reasoning_content", None)
+    if isinstance(reasoning, str):
+        total += len(reasoning)
+    # Tool-calling output lives entirely in function arguments — without this,
+    # a tool-only response from a usage-less endpoint would estimate to zero.
+    tool_calls = getattr(part, "tool_calls", None) or []
+    for tool_call in tool_calls:
+        arguments = getattr(getattr(tool_call, "function", None), "arguments", None)
+        if isinstance(arguments, str):
+            total += len(arguments)
+    return total
+
+
+def estimate_stream_chunk_content_length(chunk: Any) -> int:
+    """Return the character length of an OpenAI-dialect stream chunk's delta text.
+
+    Length-only measurement for the missing-streaming-usage fallback: when an
+    OpenAI-compatible provider never emits a usage block, accumulated delta
+    lengths (text + reasoning + tool-call arguments) estimate output tokens.
+    Sums string lengths WITHOUT concatenating or storing the text. The
+    returned integer is not reversible to content.
+
+    Returns the total so far for any unexpected chunk shape. Never raises —
+    this runs inside the live stream path on arbitrary endpoint output, and a
+    malformed chunk must not convert a deliverable stream into a failure.
+    """
+    total = 0
+    try:
+        for choice in getattr(chunk, "choices", None) or []:
+            total += _part_text_length(getattr(choice, "delta", None))
+    except Exception:
+        return total
+    return total
+
+
+def estimate_response_content_length(response: Any) -> int:
+    """Return the character length of an OpenAI-dialect response's message text.
+
+    Length-only measurement for the missing-usage fallback on NON-streaming
+    responses from OpenAI-compatible providers. Counts message text, reasoning
+    text, and tool-call arguments. Sums string lengths WITHOUT concatenating
+    or storing the text. The returned integer is not reversible to content.
+
+    Returns the total so far for any unexpected response shape. Never raises.
+    """
+    total = 0
+    try:
+        for choice in getattr(response, "choices", None) or []:
+            total += _part_text_length(getattr(choice, "message", None))
+    except Exception:
+        return total
+    return total

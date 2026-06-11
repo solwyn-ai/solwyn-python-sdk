@@ -3,7 +3,16 @@
 Normalized token usage breakdown for one LLM call.
 """
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Any, cast
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializationInfo,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+)
 
 
 class TokenDetails(BaseModel):
@@ -15,6 +24,28 @@ class TokenDetails(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_default_is_estimated(
+        self,
+        handler: SerializerFunctionWrapHandler,
+        _info: SerializationInfo,
+    ) -> dict[str, Any]:
+        """Omit ``is_estimated`` from the wire when False (the default).
+
+        Optional wire additions are OMITTED when absent, never emitted as
+        defaults — so provider-reported (non-estimated) payloads stay
+        byte-identical to the pre-``is_estimated`` wire, and the Cloud-API
+        change is isolated to the estimation-fallback calls that need it.
+        ``is_estimated=True`` (estimation fallback fired) still serializes.
+        """
+        data = handler(self)
+        if not isinstance(data, dict):
+            raise RuntimeError("TokenDetails serializer expected dict output")
+        serialized = cast(dict[str, Any], data)
+        if not self.is_estimated:
+            serialized.pop("is_estimated", None)
+        return serialized
 
     input_tokens: int = Field(default=0, ge=0, description="Total input tokens (normalized)")
     output_tokens: int = Field(default=0, ge=0, description="Total output tokens (normalized)")
@@ -46,6 +77,15 @@ class TokenDetails(BaseModel):
     )
     tool_use_input_tokens: int = Field(
         default=0, ge=0, description="Tokens used for tool/function definitions (Google)"
+    )
+    is_estimated: bool = Field(
+        default=False,
+        description=(
+            "True when the provider returned no usage data and these counts are "
+            "SDK-side length-based estimates (explicit degradation marker — the "
+            "API can surface estimated costs distinctly). False for "
+            "provider-reported counts."
+        ),
     )
 
     @property

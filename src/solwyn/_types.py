@@ -51,12 +51,39 @@ class CircuitState(StrEnum):
 
 
 class ProviderName(StrEnum):
-    """Supported LLM provider identifiers."""
+    """Supported LLM provider identifiers.
+
+    The first four are native API dialects (Bedrock's Converse API is its
+    own dialect). The rest are OpenAI-compatible
+    providers: they speak the Chat Completions dialect but are distinct
+    providers for attribution, pricing, budget enforcement, and circuit
+    breaking. ``OPENAI_COMPATIBLE`` is the generic catch-all for any
+    unrecognized OpenAI-compatible endpoint (custom proxies, new vendors).
+
+    Wire contract: the Cloud API must accept every value here on
+    MetadataEvent/BudgetCheckRequest/BudgetConfirmRequest before an SDK
+    carrying it is released (API deploys first).
+    """
 
     OPENAI = "openai"
     ANTHROPIC = "anthropic"
     GOOGLE = "google"
     BEDROCK = "bedrock"
+    # OpenAI-compatible providers (Chat Completions dialect)
+    XAI = "xai"
+    DEEPSEEK = "deepseek"
+    MISTRAL = "mistral"
+    QWEN = "qwen"
+    GROQ = "groq"
+    TOGETHER = "together"
+    FIREWORKS = "fireworks"
+    PERPLEXITY = "perplexity"
+    AZURE_OPENAI = "azure_openai"
+    OPENROUTER = "openrouter"
+    OLLAMA = "ollama"
+    VLLM = "vllm"
+    LMSTUDIO = "lmstudio"
+    OPENAI_COMPATIBLE = "openai_compatible"
 
 
 class CallStatus(StrEnum):

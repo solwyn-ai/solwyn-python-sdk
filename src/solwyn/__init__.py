@@ -1,8 +1,11 @@
 """Solwyn -- AI Agent Control Plane SDK.
 
-Drop-in wrapper for ``openai.OpenAI`` and ``anthropic.Anthropic`` clients
-that adds hard spending caps, automatic provider failover, and per-agent
-cost attribution -- without ever seeing customer prompts.
+Drop-in wrapper for ``openai.OpenAI``, ``anthropic.Anthropic``, and
+``google.genai`` clients -- plus any OpenAI-compatible endpoint (xAI,
+DeepSeek, Mistral, Qwen, Groq, Together, Fireworks, Perplexity, Azure
+OpenAI, OpenRouter, Ollama, vLLM, LM Studio, ...) via ``base_url``
+detection -- adding hard spending caps, automatic provider failover, and
+per-agent cost attribution without ever seeing customer prompts.
 """
 
 from importlib.metadata import PackageNotFoundError, version

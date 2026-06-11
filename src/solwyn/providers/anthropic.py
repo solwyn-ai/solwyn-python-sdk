@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from solwyn._token_details import TokenDetails
 
@@ -47,6 +47,10 @@ class AnthropicAdapter:
 
     @property
     def name(self) -> str:
+        return "anthropic"
+
+    @property
+    def dialect(self) -> Literal["anthropic"]:
         return "anthropic"
 
     def detect_client(self, client: Any) -> bool:
@@ -91,6 +95,12 @@ class AnthropicAdapter:
             cache_creation_1h_tokens=cache_1h,
         )
 
+    def estimate_missing_usage(
+        self, response: Any, *, estimated_input_tokens: int
+    ) -> TokenDetails | None:
+        """Anthropic always reports usage — no estimated fallback."""
+        return None
+
     def extract_service_tier(self, response: Any) -> str | None:
         """Anthropic responses do not expose a service tier."""
         return None
@@ -99,11 +109,17 @@ class AnthropicAdapter:
         """Anthropic pricing is not regional."""
         return None
 
-    def prepare_streaming(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+    def prepare_streaming(
+        self, kwargs: dict[str, Any], *, cross_provider: bool = False
+    ) -> dict[str, Any]:
         """Anthropic streams include usage events by default — no changes needed."""
         return dict(kwargs)
 
-    def create_stream_accumulator(self) -> AnthropicStreamAccumulator:
+    def create_stream_accumulator(
+        self, *, estimated_input_tokens: int = 0
+    ) -> AnthropicStreamAccumulator:
+        """Anthropic streams always carry usage events — the input estimate
+        is not needed."""
         return AnthropicStreamAccumulator()
 
     def prepare_call(
