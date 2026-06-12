@@ -2,10 +2,10 @@
 
 Budget enforcement, circuit breaking, and usage tracking for OpenAI, Anthropic, Google, and Amazon Bedrock LLM clients — plus any provider that speaks the OpenAI Chat Completions dialect (xAI, DeepSeek, Mistral, Qwen, Groq, Together, Fireworks, Perplexity, Azure OpenAI, OpenRouter, Ollama, vLLM, LM Studio, …).
 
-[![CI](https://github.com/solwyn-ai/solwyn-python/actions/workflows/ci.yml/badge.svg)](https://github.com/solwyn-ai/solwyn-python/actions/workflows/ci.yml)
+[![CI](https://github.com/solwyn-ai/solwyn-python-sdk/actions/workflows/ci.yml/badge.svg)](https://github.com/solwyn-ai/solwyn-python-sdk/actions/workflows/ci.yml)
 [![PyPI version](https://img.shields.io/pypi/v/solwyn)](https://pypi.org/project/solwyn/)
 [![Python 3.11+](https://img.shields.io/pypi/pyversions/solwyn)](https://pypi.org/project/solwyn/)
-[![License](https://img.shields.io/github/license/solwyn-ai/solwyn-python)](LICENSE)
+[![License](https://img.shields.io/github/license/solwyn-ai/solwyn-python-sdk)](LICENSE)
 
 Solwyn wraps your existing LLM client. Calls go directly to the provider — the SDK only reports metadata (token counts, latency, model name) to the Solwyn API. **Prompts and responses never leave your application.**
 
@@ -15,11 +15,13 @@ Solwyn wraps your existing LLM client. Calls go directly to the provider — the
 pip install solwyn
 ```
 
-For improved token estimation with OpenAI models:
+Optional extras pin tested provider-SDK floors — `solwyn[openai]` (also enables tiktoken-based token estimation), `solwyn[anthropic]`, `solwyn[google]`, `solwyn[bedrock]` (convenience only — the SDK never imports boto3), or `solwyn[all]`:
 
 ```sh
 pip install solwyn[openai]
 ```
+
+OpenAI-compatible endpoints (Groq, OpenRouter, vLLM, …) ride the `openai` extra; no extra of their own.
 
 ## Quick Start
 
@@ -287,7 +289,8 @@ except BudgetExceededError as e:
 | `api_url` | `SOLWYN_API_URL` | `https://api.solwyn.ai` | Solwyn API endpoint |
 | `fail_open` | `SOLWYN_FAIL_OPEN` | `True` | Allow LLM calls when Solwyn API is unreachable |
 | `budget_mode` | `SOLWYN_BUDGET_MODE` | `alert_only` | Budget enforcement mode |
-| `fallback_model` | `SOLWYN_FALLBACK_MODEL` | `None` | Model name to retry with when the primary call fails (same provider, same client) |
+
+Failover and routing (`model=`, `fallback=`, `provider=`, `default_params=`, `selection_policy=`, and the failover tuning knobs) are configured in code only — they take client objects and policies, not strings. See [Provider Failover](https://docs.solwyn.ai/docs/sdk/guides/provider-failover) and [Configuration](https://docs.solwyn.ai/docs/sdk/guides/configuration).
 
 Use env vars to avoid passing credentials in code:
 
@@ -306,8 +309,10 @@ All SDK errors inherit from `SolwynError`:
 | Exception | Raised when |
 |-----------|-------------|
 | `BudgetExceededError` | Budget exceeded in `hard_deny` mode |
-| `ProviderUnavailableError` | Circuit breaker is open |
-| `ConfigurationError` | Invalid API key format |
+| `ProviderUnavailableError` | Circuit breaker is open, or the failover chain is exhausted |
+| `ConfigurationError` | Invalid API key format, invalid `provider=` override, or an untracked call surface (e.g. Bedrock `invoke_model`) |
+| `UntranslatableRequestError` | A cross-provider failover hop cannot represent the request (structural labels only — never content) |
+| `UntranslatableModelError` | No model mapping exists for a cross-provider failover hop |
 
 Provider errors (e.g., `openai.RateLimitError`) pass through unmodified.
 
@@ -324,7 +329,7 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `token_details` | `object` | Breakdown: cached, reasoning, audio tokens; `is_estimated` flags length-based estimates when a provider reports no usage |
 | `latency_ms` | `float` | Call duration in milliseconds |
 | `status` | `str` | `success`, `error`, or `budget_denied` |
-| `is_model_fallback` | `bool` | Whether the call used `fallback_model` after the primary model failed |
+| `is_model_fallback` | `bool` | Whether the call was served by a same-provider entry in the `fallback=` chain after the primary model failed |
 | `sdk_instance_id` | `str` | Per-process UUID for deduplication |
 | `timestamp` | `datetime` | When the call completed (UTC) |
 | `agent_run_id` | `str \| None` | Run id from the active `solwyn.run(...)` scope, if any. When omitted, the API creates `_auto-{sdk_instance_id}-{YYYY-MM-DD}` |
@@ -335,14 +340,7 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 
 ## Release Compatibility
 
-Provider failover confirms include `provider` and `call_id` on `POST /api/v1/budgets/confirm` so Solwyn Cloud can price and deduplicate the served provider. Release this SDK only after Solwyn Cloud accepts those fields; deploy the Cloud API first.
-
-Bedrock support additionally requires the Cloud API to accept (deploy API-first): the `bedrock` provider enum value, the optional `provider_region` and `service_tier` fields on metadata events and budget confirms, and model identifiers up to 2048 chars (Bedrock ARNs; was 100). PricingService keys Bedrock prices by (model, region); `service_tier` on the confirm settles the budget enforcement counter at the tier-repriced rate (flex/priority/latency-optimized) — omitted, it settles at Standard rates. Both optional fields are omitted entirely (never `null`) when unset, so other providers' wire bytes are unchanged.
-
-OpenAI-compatible provider support additionally requires the Cloud API to accept (deploy API first):
-
-- the new `provider` enum values on check/confirm/metadata payloads: `xai`, `deepseek`, `mistral`, `qwen`, `groq`, `together`, `fireworks`, `perplexity`, `azure_openai`, `openrouter`, `ollama`, `vllm`, `lmstudio`, `openai_compatible`;
-- the `is_estimated` boolean on `token_details` (marks SDK-side length-based estimates when a provider reports no usage). It is serialized only when `true` — i.e. only when the estimation fallback fired — and omitted entirely otherwise (never `is_estimated: false`), so existing-provider payloads are unchanged. Solwyn Cloud must accept the field before this SDK release, same API-first ordering as the `provider` enum additions above.
+Wire-contract changes are API-first: Solwyn Cloud must accept new fields and enum values before an SDK release ships them. As of v0.1.7 the Cloud API accepts the full current wire contract — the Bedrock and OpenAI-compatible `provider` values, `provider_region`, `service_tier` on budget confirms, `token_details.is_estimated`, 2048-char model identifiers, and per-event ingest dispositions. Optional fields are omitted entirely (never `null`) when unset, so payloads for providers that don't use them are byte-identical to earlier releases.
 
 ## Requirements
 
