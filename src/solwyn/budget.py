@@ -95,6 +95,11 @@ class _BudgetEnforcerBase:
         self._cached_response: BudgetCheckResponse | None = None
         self._cache_expires_at: float = 0.0
 
+        # Sticky hard-deny state from the last authoritative cloud denial.
+        # This is not a cache substitute: live cloud checks still run, but an
+        # outage after a hard deny must not reopen spending.
+        self._last_hard_deny_response: BudgetCheckResponse | None = None
+
     def _build_check_request(
         self,
         estimated_input_tokens: int,
@@ -138,9 +143,35 @@ class _BudgetEnforcerBase:
             self._last_known_current_usage = response.current_usage
 
             if response.allowed:
+                self._last_hard_deny_response = None
                 self._cached_response = response
                 self._cache_expires_at = time.monotonic() + self.cache_ttl
-            # Deny responses are never cached
+            else:
+                self._cached_response = None
+                self._cache_expires_at = 0.0
+                self._last_hard_deny_response = (
+                    response if self.budget_mode == BudgetMode.HARD_DENY else None
+                )
+            # Deny responses are never cached as freshness-skipping allows/denies.
+
+    def _build_prior_hard_deny_unavailable_result(self) -> BudgetCheckResult | None:
+        """Return a denial if cloud is down after an authoritative hard deny."""
+        with self._state_lock:
+            response = self._last_hard_deny_response
+        if response is None:
+            return None
+        return BudgetCheckResult(
+            allowed=False,
+            remaining_budget=response.remaining_budget,
+            project_id=response.project_id,
+            mode=response.mode,
+            warning=(
+                "Cloud API unreachable; preserving prior hard deny: "
+                f"${response.current_usage:.2f}/${response.budget_limit:.2f} used"
+            ),
+            budget_limit=response.budget_limit,
+            current_usage=response.current_usage,
+        )
 
     def _track_local_cost(self, cost: float) -> None:
         """Track a cost in the local fallback dict."""
@@ -381,6 +412,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         - Cloud reachable + allowed: return allowed=True
         - Cloud reachable + denied + alert_only: return allowed=True + warning
         - Cloud reachable + denied + hard_deny: return allowed=False
+        - Cloud unreachable after hard_deny: return allowed=False
         - Cloud unreachable + fail_open=True: return allowed=True + warning
         - Cloud unreachable + fail_open=False: enforce locally
         """
@@ -429,6 +461,10 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             # defense-in-depth: never interpolate the full exception (which could
             # carry response/body text) into the log.
             logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
+
+            prior_hard_deny = self._build_prior_hard_deny_unavailable_result()
+            if prior_hard_deny is not None:
+                return prior_hard_deny
 
             if self.fail_open:
                 return self._build_fail_open_result(estimated_input_tokens)
@@ -575,6 +611,10 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             # defense-in-depth: never interpolate the full exception (which could
             # carry response/body text) into the log.
             logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
+
+            prior_hard_deny = self._build_prior_hard_deny_unavailable_result()
+            if prior_hard_deny is not None:
+                return prior_hard_deny
 
             if self.fail_open:
                 return self._build_fail_open_result(estimated_input_tokens)

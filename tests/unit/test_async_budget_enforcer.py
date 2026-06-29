@@ -166,6 +166,70 @@ class TestAsyncFailOpen:
         assert "fail-open" in result.warning.lower()
         await enforcer.close()
 
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_prior_hard_deny_blocks_when_cloud_later_unreachable(self) -> None:
+        enforcer = _make_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        mock_response = MagicMock()
+        mock_response.json.return_value = _DENY_RESPONSE
+        mock_response.raise_for_status = MagicMock()
+        enforcer._http.post = AsyncMock(
+            side_effect=[mock_response, httpx.ConnectError("unreachable")]
+        )
+
+        denied = await enforcer.check_budget(
+            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+        )
+        result = await enforcer.check_budget(
+            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+        )
+
+        assert denied.allowed is False
+        assert result.allowed is False
+        assert result.budget_limit == _DENY_RESPONSE["budget_limit"]
+        assert result.current_usage == _DENY_RESPONSE["current_usage"]
+        assert result.warning is not None
+        assert "cloud api unreachable" in result.warning.lower()
+        assert enforcer._http.post.call_count == 2
+        await enforcer.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_cloud_allow_clears_prior_hard_deny_before_later_outage(self) -> None:
+        enforcer = _make_async_enforcer(
+            fail_open=True, budget_mode=BudgetMode.HARD_DENY, cache_ttl=0
+        )
+        deny_response = MagicMock()
+        deny_response.json.return_value = _DENY_RESPONSE
+        deny_response.raise_for_status = MagicMock()
+        allow_response = MagicMock()
+        allow_response.json.return_value = ALLOW_BUDGET_RESPONSE
+        allow_response.raise_for_status = MagicMock()
+        enforcer._http.post = AsyncMock(
+            side_effect=[
+                deny_response,
+                allow_response,
+                httpx.ConnectError("unreachable"),
+            ]
+        )
+
+        denied = await enforcer.check_budget(
+            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+        )
+        allowed = await enforcer.check_budget(
+            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+        )
+        outage = await enforcer.check_budget(
+            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+        )
+
+        assert denied.allowed is False
+        assert allowed.allowed is True
+        assert outage.allowed is True
+        assert outage.warning is not None
+        assert "fail-open" in outage.warning.lower()
+        await enforcer.close()
+
 
 # ---------------------------------------------------------------------------
 # confirm_cost

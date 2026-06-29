@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 
@@ -285,6 +286,45 @@ class TestBudgetCheckBeforeCall:
 
         # LLM client should NOT have been called
         client.chat.completions.create.assert_not_called()
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_prior_hard_deny_still_blocks_provider_call_when_cloud_unreachable(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
+
+        deny_response = {
+            "allowed": False,
+            "remaining_budget": 0.0,
+            "reservation_id": None,
+            "mode": "hard_deny",
+            "budget_limit": 10.0,
+            "current_usage": 10.0,
+            "denied_by_period": "monthly",
+            "project_id": VALID_PROJECT_ID,
+        }
+        mock_budget_response = MagicMock()
+        mock_budget_response.json.return_value = deny_response
+        mock_budget_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            solwyn._budget._http,
+            "post",
+            side_effect=[mock_budget_response, httpx.ConnectError("unreachable")],
+        ) as mock_post:
+            with pytest.raises(BudgetExceededError):
+                solwyn.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{"role": "user", "content": "Hello"}],
+                )
+            with pytest.raises(BudgetExceededError):
+                solwyn.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[{"role": "user", "content": "Hello again"}],
+                )
+
+        client.chat.completions.create.assert_not_called()
+        assert mock_post.call_count == 2
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
@@ -1430,6 +1470,50 @@ class TestAsyncNonStreamingInterception:
         assert reported_events[0].status == "budget_denied"
         assert reported_events[0].agent_run_id == run_id
         assert reported_events[0].agent_run_name == "async-expensive-job"
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_prior_hard_deny_blocks_provider_call_when_cloud_unreachable(
+        self,
+    ) -> None:
+        client, _ = _mock_openai_client()
+        client.chat.completions.create = AsyncMockFn()
+
+        solwyn = _make_async_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
+
+        deny_response = {
+            "allowed": False,
+            "remaining_budget": 0.0,
+            "reservation_id": None,
+            "mode": "hard_deny",
+            "budget_limit": 10.0,
+            "current_usage": 10.0,
+            "denied_by_period": "monthly",
+            "project_id": VALID_PROJECT_ID,
+        }
+        mock_budget_response = MagicMock()
+        mock_budget_response.json.return_value = deny_response
+        mock_budget_response.raise_for_status = MagicMock()
+        solwyn._budget._http.post = AsyncMockFn(
+            side_effect=[mock_budget_response, httpx.ConnectError("unreachable")]
+        )
+
+        with pytest.raises(BudgetExceededError):
+            await solwyn.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+        with pytest.raises(BudgetExceededError):
+            await solwyn.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "Hello again"}],
+            )
+
+        client.chat.completions.create.assert_not_called()
+        assert solwyn._budget._http.post.call_count == 2
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()
