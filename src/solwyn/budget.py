@@ -150,7 +150,7 @@ class _BudgetEnforcerBase:
                 self._cached_response = None
                 self._cache_expires_at = 0.0
                 self._last_hard_deny_response = (
-                    response if self.budget_mode == BudgetMode.HARD_DENY else None
+                    response if response.mode == BudgetMode.HARD_DENY else None
                 )
             # Deny responses are never cached as freshness-skipping allows/denies.
 
@@ -195,7 +195,7 @@ class _BudgetEnforcerBase:
     def _build_result_from_response(self, response: BudgetCheckResponse) -> BudgetCheckResult:
         """Convert a cloud API response into a BudgetCheckResult.
 
-        Applies budget_mode logic:
+        Applies cloud response mode logic:
         - allowed -> return allowed=True
         - denied + alert_only -> return allowed=True with warning
         - denied + hard_deny -> return allowed=False
@@ -222,7 +222,7 @@ class _BudgetEnforcerBase:
             )
 
         # Denied by cloud
-        if self.budget_mode == BudgetMode.ALERT_ONLY:
+        if response.mode == BudgetMode.ALERT_ONLY:
             logger.warning(
                 "Budget limit reached (alert_only mode): limit=$%.2f, usage=$%.2f",
                 response.budget_limit,

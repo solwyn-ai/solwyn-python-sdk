@@ -302,6 +302,7 @@ class TestBudgetCheckBeforeCall:
             "current_usage": 10.0,
             "denied_by_period": "monthly",
             "project_id": VALID_PROJECT_ID,
+            "price_hints": None,
         }
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = deny_response
@@ -1493,6 +1494,7 @@ class TestAsyncNonStreamingInterception:
             "current_usage": 10.0,
             "denied_by_period": "monthly",
             "project_id": VALID_PROJECT_ID,
+            "price_hints": None,
         }
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = deny_response
