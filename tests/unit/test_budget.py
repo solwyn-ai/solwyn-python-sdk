@@ -32,6 +32,11 @@ _DENY_RESPONSE = {
     "project_id": VALID_PROJECT_ID,
 }
 
+_ALERT_ONLY_DENY_RESPONSE = {
+    **_DENY_RESPONSE,
+    "mode": "alert_only",
+}
+
 
 def _make_enforcer(**overrides):
     """Create a BudgetEnforcer with sensible test defaults."""
@@ -191,7 +196,7 @@ class TestCloudDenyAlertOnly:
     def test_allowed_with_warning(self) -> None:
         enforcer = _make_enforcer(budget_mode=BudgetMode.ALERT_ONLY)
         mock_response = MagicMock()
-        mock_response.json.return_value = _DENY_RESPONSE
+        mock_response.json.return_value = _ALERT_ONLY_DENY_RESPONSE
         mock_response.raise_for_status = MagicMock()
 
         with patch.object(enforcer._http, "post", return_value=mock_response):
@@ -224,6 +229,146 @@ class TestFailOpen:
         assert result.allowed is True
         assert result.warning is not None
         assert "fail-open" in result.warning.lower()
+
+    def test_prior_hard_deny_blocks_when_cloud_later_unreachable(self) -> None:
+        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        mock_response = MagicMock()
+        mock_response.json.return_value = _DENY_RESPONSE
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[mock_response, httpx.ConnectError("unreachable")],
+        ) as mock_post:
+            denied = enforcer.check_budget(
+                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            )
+            result = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            )
+
+        assert denied.allowed is False
+        assert result.allowed is False
+        assert result.budget_limit == _DENY_RESPONSE["budget_limit"]
+        assert result.current_usage == _DENY_RESPONSE["current_usage"]
+        assert result.warning is not None
+        assert "cloud api unreachable" in result.warning.lower()
+        assert mock_post.call_count == 2
+
+    def test_cloud_hard_deny_overrides_local_alert_only_when_cloud_later_unreachable(
+        self,
+    ) -> None:
+        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.ALERT_ONLY)
+        mock_response = MagicMock()
+        mock_response.json.return_value = _DENY_RESPONSE
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[mock_response, httpx.ConnectError("unreachable")],
+        ):
+            denied = enforcer.check_budget(
+                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            )
+            result = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            )
+
+        assert denied.allowed is False
+        assert denied.mode == BudgetMode.HARD_DENY
+        assert result.allowed is False
+        assert result.mode == BudgetMode.HARD_DENY
+        assert result.warning is not None
+        assert "preserving prior hard deny" in result.warning.lower()
+
+    def test_cloud_alert_only_deny_does_not_stick_when_local_hard_deny(
+        self,
+    ) -> None:
+        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        mock_response = MagicMock()
+        mock_response.json.return_value = _ALERT_ONLY_DENY_RESPONSE
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[mock_response, httpx.ConnectError("unreachable")],
+        ):
+            denied = enforcer.check_budget(
+                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            )
+            result = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            )
+
+        assert denied.allowed is True
+        assert denied.mode == BudgetMode.ALERT_ONLY
+        assert denied.warning is not None
+        assert "limit" in denied.warning.lower()
+        assert result.allowed is True
+        assert result.warning is not None
+        assert "fail-open" in result.warning.lower()
+
+    def test_cloud_allow_clears_prior_hard_deny_before_later_outage(self) -> None:
+        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY, cache_ttl=0)
+        deny_response = MagicMock()
+        deny_response.json.return_value = _DENY_RESPONSE
+        deny_response.raise_for_status = MagicMock()
+        allow_response = MagicMock()
+        allow_response.json.return_value = ALLOW_BUDGET_RESPONSE
+        allow_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[
+                deny_response,
+                allow_response,
+                httpx.ConnectError("unreachable"),
+            ],
+        ):
+            denied = enforcer.check_budget(
+                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            )
+            allowed = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            )
+            outage = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            )
+
+        assert denied.allowed is False
+        assert allowed.allowed is True
+        assert outage.allowed is True
+        assert outage.warning is not None
+        assert "fail-open" in outage.warning.lower()
+
+    def test_prior_hard_deny_overrides_local_enforcement_when_cloud_unreachable(self) -> None:
+        enforcer = _make_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY)
+        mock_response = MagicMock()
+        mock_response.json.return_value = _DENY_RESPONSE
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[mock_response, httpx.ConnectError("unreachable")],
+        ):
+            denied = enforcer.check_budget(
+                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            )
+            result = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            )
+
+        assert denied.allowed is False
+        assert result.allowed is False
+        assert result.budget_limit == _DENY_RESPONSE["budget_limit"]
+        assert result.current_usage == _DENY_RESPONSE["current_usage"]
+        assert result.warning is not None
+        assert "preserving prior hard deny" in result.warning.lower()
 
 
 # ---------------------------------------------------------------------------
