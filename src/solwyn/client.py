@@ -699,8 +699,11 @@ class Solwyn(_SolwynBase):
                     provider_region=primary.adapter.extract_region(primary.sdk_client),
                 )
                 self._reporter.report(event)
-            except Exception:
-                logger.warning("Failed to report budget_denied metadata event", exc_info=True)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to report budget_denied metadata event: %s",
+                    type(exc).__name__,
+                )
 
             raise BudgetExceededError(
                 project_id=budget.project_id,
@@ -1379,8 +1382,11 @@ class AsyncSolwyn(_SolwynBase):
                     provider_region=primary.adapter.extract_region(primary.sdk_client),
                 )
                 self._reporter.report(event)
-            except Exception:
-                logger.warning("Failed to report budget_denied metadata event", exc_info=True)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to report budget_denied metadata event: %s",
+                    type(exc).__name__,
+                )
 
             raise BudgetExceededError(
                 project_id=budget.project_id,

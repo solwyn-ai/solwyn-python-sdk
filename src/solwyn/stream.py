@@ -72,7 +72,7 @@ class SyncStreamWrapper:
         try:
             self._on_complete(token_details, elapsed_ms)
         except Exception as cb_exc:
-            # Log only the CALLBACK failure's class name — no traceback/exc_info
+            # Log only the CALLBACK failure's class name — never a traceback
             # (which would capture the live exception context, possibly a provider
             # mid-stream exception whose str() embeds streamed content; fix [D]).
             logger.warning(
@@ -89,7 +89,7 @@ class SyncStreamWrapper:
         try:
             self._on_error(exc)
         except Exception as cb_exc:
-            # Structural-only log of the CALLBACK failure; never exc_info (which,
+            # Structural-only log of the CALLBACK failure; never a traceback (which,
             # during error settlement, holds the provider exception ``exc``; fix [D]).
             logger.warning(
                 "on_error raised during stream settlement; suppressing (%s)",
@@ -139,7 +139,7 @@ class SyncStreamWrapper:
             # __exit__ (if any).
             self.close()
         except Exception as cb_exc:
-            # Structural-only: log the suppressed callback class, never exc_info
+            # Structural-only: log the suppressed callback class, never a traceback
             # (fix [D]).
             logger.warning(
                 "on_complete raised during __exit__; suppressing (%s)", type(cb_exc).__name__
@@ -194,7 +194,7 @@ class AsyncStreamWrapper:
         try:
             await self._on_complete(token_details, elapsed_ms)
         except Exception as cb_exc:
-            # Structural-only log of the CALLBACK failure; never exc_info (fix [D]).
+            # Structural-only log of the CALLBACK failure; never a traceback (fix [D]).
             logger.warning(
                 "on_complete raised during async stream settlement; suppressing (%s)",
                 type(cb_exc).__name__,
@@ -208,7 +208,7 @@ class AsyncStreamWrapper:
         try:
             await self._on_error(exc)
         except Exception as cb_exc:
-            # Structural-only log; never exc_info (which holds provider ``exc``
+            # Structural-only log; never a traceback (which holds provider ``exc``
             # during error settlement; fix [D]).
             logger.warning(
                 "on_error raised during async stream settlement; suppressing (%s)",
@@ -260,7 +260,7 @@ class AsyncStreamWrapper:
             # __aexit__ (if any).
             await self.close()
         except Exception as cb_exc:
-            # Structural-only: log the suppressed callback class, never exc_info
+            # Structural-only: log the suppressed callback class, never a traceback
             # (fix [D]).
             logger.warning(
                 "on_complete raised during __aexit__; suppressing (%s)", type(cb_exc).__name__
