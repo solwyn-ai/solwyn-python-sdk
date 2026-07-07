@@ -292,6 +292,8 @@ except BudgetExceededError as e:
 
 Failover and routing (`model=`, `fallback=`, `provider=`, `default_params=`, `selection_policy=`, and the failover tuning knobs) are configured in code only — they take client objects and policies, not strings. See [Provider Failover](https://docs.solwyn.ai/docs/sdk/guides/provider-failover) and [Configuration](https://docs.solwyn.ai/docs/sdk/guides/configuration).
 
+`CostPolicy` is not yet active: the API does not send price hints yet, so selecting it currently falls back to health-based ordering (it logs a one-time warning when it does).
+
 Use env vars to avoid passing credentials in code:
 
 ```sh
