@@ -18,12 +18,15 @@ Also covers the two signal seams that feed those policies:
 
 from __future__ import annotations
 
+import logging
 import threading
+from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import VALID_API_KEY
 
+from solwyn import _base
 from solwyn._base import _LATENCY_WINDOW
 from solwyn._routing import (
     CostPolicy,
@@ -457,3 +460,118 @@ def test_select_candidates_preserves_policy_order_for_valid_subset() -> None:
         assert names == ["anthropic", "openai"]
     finally:
         _close(solwyn)
+
+
+# ── 6: CostPolicy-inert warning (selected but no server price hints) ──────────
+
+_WARN_MSG = "CostPolicy selected but no price hints available; using health-based order"
+
+
+@pytest.fixture
+def reset_cost_policy_warning() -> Iterator[None]:
+    """Reset the module-level once-per-process guard around each test.
+
+    The warning fires at most once per process; without this reset, whichever
+    test selected CostPolicy-without-hints first would consume the single firing
+    and leave the others unable to observe it.
+    """
+    _base._cost_policy_inactive_warned = False
+    yield
+    _base._cost_policy_inactive_warned = False
+
+
+@pytest.mark.unit
+def test_cost_policy_warns_once_when_no_price_hints(
+    reset_cost_policy_warning: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Arrange — CostPolicy selected but the server has provided NO hints.
+    solwyn = _make_solwyn(
+        _openai_client(),
+        model="gpt-4o",
+        fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+        selection_policy=CostPolicy(),
+    )
+    try:
+        # Act — many routed selections in the same process.
+        with caplog.at_level(logging.WARNING):
+            order = ["", ""]
+            for _ in range(3):
+                order = _ordered_providers(solwyn)
+
+        # Assert — degrades to health/config order, and warns EXACTLY once across
+        # all three selections (not once per call).
+        assert order == ["openai", "anthropic"]
+        warnings = [r.getMessage() for r in caplog.records if _WARN_MSG in r.getMessage()]
+        assert warnings == [_WARN_MSG]
+    finally:
+        _close(solwyn)
+
+
+@pytest.mark.unit
+def test_cost_policy_warning_suppressed_when_price_hints_present(
+    reset_cost_policy_warning: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Arrange — CostPolicy WITH server hints: the policy is active, not inert.
+    solwyn = _make_solwyn(
+        _openai_client(),
+        model="gpt-4o",
+        fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+        selection_policy=CostPolicy(),
+    )
+    try:
+        solwyn.update_price_hints({"openai": 10.0, "anthropic": 2.0})
+
+        # Act
+        with caplog.at_level(logging.WARNING):
+            order = _ordered_providers(solwyn)
+
+        # Assert — hints consumed (cheaper first) and NO inert-warning emitted.
+        assert order == ["anthropic", "openai"]
+        assert _WARN_MSG not in caplog.text
+    finally:
+        _close(solwyn)
+
+
+@pytest.mark.unit
+def test_cost_policy_warning_not_emitted_for_other_policies(
+    reset_cost_policy_warning: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Arrange — neither the default health policy nor LatencyPolicy is CostPolicy,
+    # so the CostPolicy-inert warning must never fire, hints or not.
+    chain = dict(model="gpt-4o", fallback=[(_anthropic_client(), "claude-3-5-sonnet")])
+    health = _make_solwyn(_openai_client(), **chain)
+    latency = _make_solwyn(_openai_client(), selection_policy=LatencyPolicy(), **chain)
+    try:
+        # Act
+        with caplog.at_level(logging.WARNING):
+            _ordered_providers(health)
+            _ordered_providers(latency)
+
+        # Assert
+        assert _WARN_MSG not in caplog.text
+    finally:
+        _close(health)
+        _close(latency)
+
+
+@pytest.mark.unit
+def test_cost_policy_warning_fires_once_across_multiple_clients(
+    reset_cost_policy_warning: None, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Arrange — the guard is per-PROCESS, not per-client: two separate CostPolicy
+    # clients each routing must still yield a single warning in total.
+    chain = dict(model="gpt-4o", fallback=[(_anthropic_client(), "claude-3-5-sonnet")])
+    first = _make_solwyn(_openai_client(), selection_policy=CostPolicy(), **chain)
+    second = _make_solwyn(_openai_client(), selection_policy=CostPolicy(), **chain)
+    try:
+        # Act
+        with caplog.at_level(logging.WARNING):
+            _ordered_providers(first)
+            _ordered_providers(second)
+
+        # Assert
+        warnings = [r.getMessage() for r in caplog.records if _WARN_MSG in r.getMessage()]
+        assert warnings == [_WARN_MSG]
+    finally:
+        _close(first)
+        _close(second)

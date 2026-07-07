@@ -7,6 +7,7 @@ from this and add their own HTTP layer.
 
 from __future__ import annotations
 
+import logging
 import statistics
 import threading
 import time
@@ -18,6 +19,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, ConfigDict
 
 from solwyn._routing import (
+    CostPolicy,
     HealthBasedPolicy,
     ProviderCandidate,
     RoutingRequest,
@@ -33,12 +35,31 @@ from solwyn.tokenizer import TokenizerManager
 if TYPE_CHECKING:
     from solwyn._registry import ProviderRuntime
 
+logger = logging.getLogger(__name__)
+
 # Bounded rolling window of recent SUCCESS latencies kept per provider, and the
 # minimum sample count before observed_p50 reports a value. Until that many
 # samples accrue, observed_p50 returns None so an under-sampled provider's
 # latency never jumps the LatencyPolicy queue (it sorts AFTER known-p50 peers).
 _LATENCY_WINDOW = 50
 _LATENCY_MIN_SAMPLES = 3
+
+# CostPolicy is inert until the server sends a relative price hint: with no hint
+# on any candidate it degrades to health-based ordering. Warn ONCE per process
+# when that fallback is in effect so the no-op is visible without logging on
+# every routed call. Lock-guarded because the sync client is multi-threaded.
+_cost_policy_inactive_warned = False
+_cost_policy_warn_lock = threading.Lock()
+
+
+def _warn_cost_policy_inactive_once() -> None:
+    """Emit the CostPolicy-inert warning at most once per process."""
+    global _cost_policy_inactive_warned
+    with _cost_policy_warn_lock:
+        if _cost_policy_inactive_warned:
+            return
+        _cost_policy_inactive_warned = True
+    logger.warning("CostPolicy selected but no price hints available; using health-based order")
 
 
 def _openai_uses_max_completion_tokens(model: str) -> bool:
@@ -253,6 +274,12 @@ class _SolwynBase:
                 )
             )
         ordered = self._policy.order(candidates, req)
+        if isinstance(self._policy, CostPolicy) and not any(
+            c.price_hint is not None for c in candidates
+        ):
+            # CostPolicy was selected but no candidate carries a server price
+            # hint, so it degraded to health-based order — surface the no-op once.
+            _warn_cost_policy_inactive_once()
         # Defensive: a custom (possibly misbehaving) injected policy must not be
         # able to inject a runtime that was never in the configured chain into the
         # dispatch walk. Keep ONLY candidates whose runtime is one of our own
