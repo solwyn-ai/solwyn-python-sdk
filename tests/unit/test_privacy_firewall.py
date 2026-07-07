@@ -439,6 +439,26 @@ def test_stream_settlement_logs_only_callback_exception_class_name() -> None:
     )
 
 
+@pytest.mark.unit
+def test_no_exc_info_token_anywhere_in_sdk_source() -> None:
+    """The ``exc_info`` token may not appear ANYWHERE under src/ — not in a log
+    call, not in a comment. ``logger.*(..., exc_info=True)`` renders the live
+    exception (whose str()/.body can embed request or response content) into the
+    log record, so every module follows the type-name-only convention. Banning
+    the bare token — as the translation package bans the ``logger`` token —
+    keeps that convention from silently regressing."""
+    violations: list[str] = []
+    for path in SDK_SRC.rglob("*.py"):
+        source = path.read_text()
+        for line_no, line in enumerate(source.splitlines(), start=1):
+            if "exc_info" in line:
+                violations.append(f"{path.relative_to(SDK_SRC)}:{line_no}: {line.strip()}")
+    assert not violations, (
+        "SDK source must not name exc_info anywhere — log type(exc).__name__ only, "
+        "never a traceback (which can embed prompt/response content):\n" + "\n".join(violations)
+    )
+
+
 # --------------------------------------------------------------------------- #
 # THE authoritative backstop — behavioral, end-to-end                         #
 # --------------------------------------------------------------------------- #
