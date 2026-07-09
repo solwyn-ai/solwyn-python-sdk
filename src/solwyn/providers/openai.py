@@ -21,7 +21,7 @@ from solwyn._token_details import TokenDetails
 logger = logging.getLogger(__name__)
 
 
-def _usage_value(value: Any) -> int:
+def _usage_value(value: object) -> int:
     """Coerce one usage field to a non-negative int; garbage degrades to 0.
 
     TokenDetails fields are ``Field(ge=0)``, so a negative or non-int value
