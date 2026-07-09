@@ -1,6 +1,6 @@
 # Solwyn Python SDK
 
-Drop-in wrapper for `openai`, `anthropic`, `google.generativeai`, and boto3 `bedrock-runtime` clients — plus OpenAI-compatible providers (xAI, DeepSeek, Mistral, Qwen, Groq, Together, Fireworks, Perplexity, Azure OpenAI, OpenRouter, Ollama, vLLM, LM Studio, generic) via `base_url` detection on `openai` clients. Extracts token details, enforces budgets, handles failover — never computes cost (the API owns pricing).
+Drop-in wrapper for `openai`, `anthropic`, `google.generativeai`, and boto3 `bedrock-runtime` clients — plus OpenAI-compatible providers (xAI, DeepSeek, Mistral, Qwen, Z.ai, Groq, Together, Fireworks, Perplexity, Azure OpenAI, OpenRouter, Ollama, vLLM, LM Studio, generic) via `base_url` detection on `openai` clients. Extracts token details, enforces budgets, handles failover — never computes cost (the API owns pricing).
 
 ## Commands
 

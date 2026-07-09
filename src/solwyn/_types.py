@@ -74,6 +74,7 @@ class ProviderName(StrEnum):
     DEEPSEEK = "deepseek"
     MISTRAL = "mistral"
     QWEN = "qwen"
+    ZAI = "zai"
     GROQ = "groq"
     TOGETHER = "together"
     FIREWORKS = "fireworks"

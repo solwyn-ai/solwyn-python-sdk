@@ -106,6 +106,7 @@ EXPECTED_PROVIDER_NAMES = {
     "deepseek",
     "mistral",
     "qwen",
+    "zai",
     "groq",
     "together",
     "fireworks",
