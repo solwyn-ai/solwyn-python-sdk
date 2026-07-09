@@ -43,7 +43,11 @@ def _make_client(
 
 
 def _usage_chunk(
-    *, prompt_tokens: int = 0, completion_tokens: int = 0, service_tier: str | None = None
+    *,
+    prompt_tokens: int = 0,
+    completion_tokens: int = 0,
+    cached_tokens: int = 0,
+    service_tier: str | None = None,
 ) -> Any:
     """A final stream chunk carrying a standard usage block."""
     chunk = SimpleNamespace(
@@ -51,7 +55,7 @@ def _usage_chunk(
         usage=SimpleNamespace(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            prompt_tokens_details=None,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
             completion_tokens_details=None,
         ),
     )
@@ -115,6 +119,8 @@ _HOST_CASES = [
     ("qwen", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
     ("qwen", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
     ("qwen", "https://dashscope-us.aliyuncs.com/compatible-mode/v1"),
+    ("zai", "https://api.z.ai/api/paas/v4"),
+    ("zai", "https://API.Z.AI/api/paas/v4"),
     ("groq", "https://api.groq.com/openai/v1"),
     ("together", "https://api.together.xyz/v1"),
     ("together", "https://api.together.ai/v1"),
@@ -207,6 +213,7 @@ class TestDetectModel:
             ("codestral-2405", "mistral"),
             ("qwen-max", "qwen"),
             ("qwq-32b", "qwen"),
+            ("glm-4.6", "zai"),
             ("sonar-pro", "perplexity"),
             ("accounts/fireworks/models/llama-v3p1-70b-instruct", "fireworks"),
         ],
@@ -233,6 +240,7 @@ _INJECTING = ["deepseek", "qwen", "groq", "azure_openai", "ollama", "vllm", "lms
 _NON_INJECTING = [
     "xai",
     "mistral",
+    "zai",
     "together",
     "fireworks",
     "perplexity",
@@ -338,6 +346,12 @@ class TestExtractUsage:
         assert details.input_tokens == 10
         assert details.output_tokens == 5
         assert details.is_estimated is False
+
+    def test_zai_cached_tokens_extract_without_reasoning_tokens(self) -> None:
+        response = _usage_chunk(prompt_tokens=10, completion_tokens=5, cached_tokens=4)
+        details = _adapter("zai").extract_usage(response)
+        assert details.cached_input_tokens == 4
+        assert details.reasoning_tokens == 0
 
     def test_missing_usage_extracts_zeros(self) -> None:
         details = _adapter("groq").extract_usage(SimpleNamespace(usage=None))

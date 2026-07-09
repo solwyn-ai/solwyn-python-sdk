@@ -32,6 +32,26 @@ def _compat_client(base_url: str) -> MagicMock:
     return client
 
 
+def _create_completion(**kwargs: object) -> object:
+    raise NotImplementedError
+
+
+class _ZaiClient:
+    """Real client shell with spec'd mocks only at the OpenAI call boundary."""
+
+    __module__ = "openai._client"
+
+    def __init__(self, base_url: str = "https://api.z.ai/api/paas/v4") -> None:
+        self.base_url = base_url
+        self.chat = SimpleNamespace(
+            completions=SimpleNamespace(create=MagicMock(spec=_create_completion))
+        )
+        self.with_options = MagicMock(spec=self._with_options, return_value=self)
+
+    def _with_options(self, **kwargs: object) -> _ZaiClient:
+        return self
+
+
 def _allow_budget(reservation_id: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(allowed=True, reservation_id=reservation_id, price_hints=None)
 
@@ -49,7 +69,11 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
 
 
 def _response(
-    *, prompt_tokens: int | None = 11, completion_tokens: int | None = 7, content: str = "ok"
+    *,
+    prompt_tokens: int | None = 11,
+    completion_tokens: int | None = 7,
+    cached_tokens: int = 0,
+    content: str = "ok",
 ) -> SimpleNamespace:
     """A Chat Completions-shaped non-streaming response.
 
@@ -60,7 +84,7 @@ def _response(
         usage = SimpleNamespace(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            prompt_tokens_details=None,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
             completion_tokens_details=None,
         )
     return SimpleNamespace(
@@ -128,6 +152,19 @@ class TestCompatAttribution:
         assert events[0].input_tokens == 11
         assert events[0].token_details.is_estimated is False
 
+    def test_zai_base_url_attributes_usage_to_zai(self) -> None:
+        client = _ZaiClient()
+        client.chat.completions.create.return_value = _response(cached_tokens=4)
+        solwyn = _make_solwyn(client)
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()) as check:
+            solwyn.chat.completions.create(**_REQUEST)
+
+        assert check.call_args.kwargs["provider"] == "zai"
+        event = _reported_events(solwyn)[0]
+        assert event.provider == "zai"
+        assert event.token_details.cached_input_tokens == 4
+
     def test_openrouter_model_slug_passes_through_verbatim(self) -> None:
         """Pricing identity: the API receives (openrouter, vendor/model)."""
         client = _compat_client("https://openrouter.ai/api/v1")
@@ -173,6 +210,16 @@ class TestProviderOverride:
             solwyn.chat.completions.create(**_REQUEST)
 
         assert _reported_events(solwyn)[0].provider == ProviderName.VLLM
+
+    def test_zai_override_relabels_generic_compat_client(self) -> None:
+        client = _ZaiClient("https://api.some-new-vendor.example/v1")
+        client.chat.completions.create.return_value = _response()
+        solwyn = _make_solwyn(client, provider="zai")
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(**_REQUEST)
+
+        assert _reported_events(solwyn)[0].provider == "zai"
 
     def test_unknown_override_raises_configuration_error(self) -> None:
         client = _compat_client("http://localhost:9999/v1")
@@ -234,6 +281,10 @@ class TestStreamingUsagePolicy:
         kwargs = self._stream_call_kwargs("https://api.mistral.ai/v1")
         assert "stream_options" not in kwargs
 
+    def test_zai_stream_sends_no_stream_options(self) -> None:
+        kwargs = self._stream_call_kwargs("https://api.z.ai/api/paas/v4")
+        assert "stream_options" not in kwargs
+
     def test_stream_usage_settles_from_final_chunk(self) -> None:
         client = _compat_client("https://api.groq.com/openai/v1")
         client.chat.completions.create.return_value = iter(
@@ -293,6 +344,21 @@ class TestEstimatedUsageFallback:
         assert event.token_details.is_estimated is True
         assert event.input_tokens > 0  # pre-call estimate, not zero
         assert event.output_tokens == 10  # 40 chars / 4.0
+
+    def test_zai_streaming_missing_usage_reports_flagged_estimate(self) -> None:
+        client = _ZaiClient()
+        client.chat.completions.create.return_value = iter(
+            [_text_chunk("a" * 30), _text_chunk("b" * 10)]
+        )
+        solwyn = _make_solwyn(client)
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            list(solwyn.chat.completions.create(**_REQUEST, stream=True))
+
+        event = _reported_events(solwyn)[0]
+        assert event.provider == "zai"
+        assert event.token_details.is_estimated is True
+        assert event.input_tokens > 0
+        assert event.output_tokens == 10
 
     def test_provider_reported_usage_is_never_overridden(self) -> None:
         client = _compat_client("http://localhost:1234/v1")
