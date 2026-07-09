@@ -106,9 +106,10 @@ class CompatProfile:
 # first (most-specific hosts), the catch-all last, and the plain OpenAIAdapter
 # after all of these.
 #
-# supports_include_usage follows each provider's verified behavior (June 2026):
+# supports_include_usage follows each provider's verified behavior (July 2026):
 # the ecosystem-wide failure mode is strict request validation rejecting
-# stream_options with a 4xx, so the flag is True ONLY where documented-safe.
+# stream_options with a 4xx, so the flag is True ONLY where documented-safe or
+# successfully live-probed.
 # Providers that auto-include usage in the final stream chunk don't need it;
 # anything that ends up usage-less falls back to flagged estimation.
 COMPAT_PROFILES: tuple[CompatProfile, ...] = (
@@ -150,13 +151,12 @@ COMPAT_PROFILES: tuple[CompatProfile, ...] = (
         ),
         model_prefixes=("qwen", "qwq-", "qvq-"),
     ),
-    # Z.ai: OpenAI-compatible usage shape; include_usage support is not yet
-    # documented, so rely on provider usage or the flagged estimation fallback.
+    # Z.ai: live probe verified include_usage support on 2026-07-09.
     CompatProfile(
         name="zai",
         hosts=("api.z.ai",),
         model_prefixes=("glm-",),
-        supports_include_usage=False,
+        supports_include_usage=True,
     ),
     # Groq: include_usage documented; legacy x_groq.usage handled by the
     # accumulator for older response formats.

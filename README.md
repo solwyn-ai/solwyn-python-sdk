@@ -156,7 +156,7 @@ Auto-detected providers:
 | DeepSeek | `api.deepseek.com` | `include_usage` injected |
 | Mistral | `api.mistral.ai` | `stream_options` never sent (strict validation); final-chunk usage or estimate |
 | Qwen (DashScope compat) | `dashscope*.aliyuncs.com` | `include_usage` injected |
-| Z.ai (`zai`) | `api.z.ai` | `stream_options` never sent; final-chunk usage or estimate |
+| Z.ai (`zai`) | `api.z.ai` | `include_usage` injected |
 | Groq | `api.groq.com` | `include_usage` injected; legacy `x_groq.usage` also handled |
 | Together AI | `api.together.xyz` / `api.together.ai` | automatic (final chunk) |
 | Fireworks | `api.fireworks.ai` | automatic (final chunk) |

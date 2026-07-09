@@ -236,11 +236,10 @@ class TestDetectModel:
 # prepare_streaming — the include_usage policy
 # ---------------------------------------------------------------------------
 
-_INJECTING = ["deepseek", "qwen", "groq", "azure_openai", "ollama", "vllm", "lmstudio"]
+_INJECTING = ["deepseek", "qwen", "zai", "groq", "azure_openai", "ollama", "vllm", "lmstudio"]
 _NON_INJECTING = [
     "xai",
     "mistral",
-    "zai",
     "together",
     "fireworks",
     "perplexity",

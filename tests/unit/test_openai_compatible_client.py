@@ -281,9 +281,9 @@ class TestStreamingUsagePolicy:
         kwargs = self._stream_call_kwargs("https://api.mistral.ai/v1")
         assert "stream_options" not in kwargs
 
-    def test_zai_stream_sends_no_stream_options(self) -> None:
+    def test_zai_stream_injects_include_usage(self) -> None:
         kwargs = self._stream_call_kwargs("https://api.z.ai/api/paas/v4")
-        assert "stream_options" not in kwargs
+        assert kwargs["stream_options"] == {"include_usage": True}
 
     def test_stream_usage_settles_from_final_chunk(self) -> None:
         client = _compat_client("https://api.groq.com/openai/v1")
