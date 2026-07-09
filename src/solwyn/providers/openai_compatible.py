@@ -150,13 +150,12 @@ COMPAT_PROFILES: tuple[CompatProfile, ...] = (
         ),
         model_prefixes=("qwen", "qwq-", "qvq-"),
     ),
-    # Z.ai: OpenAI-compatible usage shape; include_usage support is not yet
-    # documented, so rely on provider usage or the flagged estimation fallback.
+    # Z.ai: live probe verified include_usage support on 2026-07-09.
     CompatProfile(
         name="zai",
         hosts=("api.z.ai",),
         model_prefixes=("glm-",),
-        supports_include_usage=False,
+        supports_include_usage=True,
     ),
     # Groq: include_usage documented; legacy x_groq.usage handled by the
     # accumulator for older response formats.
