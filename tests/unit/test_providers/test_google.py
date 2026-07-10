@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from solwyn._token_details import TokenDetails
+from solwyn.exceptions import UnsupportedSurfaceError
 from solwyn.providers.google import GoogleAdapter
 
 # ---------------------------------------------------------------------------
@@ -251,6 +252,7 @@ class TestGoogleAdapterDispatchSeams:
             models=SimpleNamespace(
                 generate_content=lambda **kw: kw,
                 generate_content_stream=lambda **kw: kw,
+                embed_content=lambda **kw: kw,
             )
         )
 
@@ -299,3 +301,35 @@ class TestGoogleAdapterDispatchSeams:
         response, wrapper = object(), object()
         assert adapter.unwrap_stream_source(response) is response
         assert adapter.wrap_stream_result(wrapper, response) is wrapper
+
+    def test_prepare_media_call_embeddings_selects_embed_content(self) -> None:
+        # P1.8: embeddings routes to client.models.embed_content. google-genai
+        # has no with_options, so the per-hop bound rides config.http_options —
+        # injected here (like prepare_call) as a defensive COPY of kwargs.
+        client = self._client()
+        kwargs: dict[str, Any] = {"model": "gemini-embedding-001", "contents": "hi"}
+        original = dict(kwargs)
+
+        method, prepared = GoogleAdapter().prepare_media_call(
+            "embeddings", client, kwargs, timeout=12.5, max_retries=2
+        )
+
+        assert method is client.models.embed_content
+        assert prepared["model"] == "gemini-embedding-001"
+        assert prepared["contents"] == "hi"
+        # google-genai timeouts are milliseconds; attempts = retries + 1.
+        assert prepared["config"]["http_options"]["timeout"] == 12500
+        assert prepared["config"]["http_options"]["retry_options"]["attempts"] == 3
+        assert kwargs == original  # input never mutated
+
+    def test_prepare_media_call_raises_unsupported_surface_for_unwired(self) -> None:
+        # Only embeddings is wired (P1.8); images/audio/video still fail loud
+        # with the structural, content-free UnsupportedSurfaceError.
+        adapter = GoogleAdapter()
+        for surface in ("images", "audio", "video"):
+            with pytest.raises(UnsupportedSurfaceError) as excinfo:
+                adapter.prepare_media_call(
+                    surface, object(), {"model": "m"}, timeout=30.0, max_retries=0
+                )
+            assert excinfo.value.surface == surface
+            assert excinfo.value.provider == "google"
