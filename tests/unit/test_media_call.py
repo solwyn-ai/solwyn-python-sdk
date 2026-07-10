@@ -30,9 +30,11 @@ def _extract_prompt_tokens(response: object) -> TokenDetails | None:
     return TokenDetails(input_tokens=usage.prompt_tokens)
 
 
-def _spec(*, extract=_extract_prompt_tokens, measure=lambda _kwargs: None) -> MediaSurfaceSpec:
+def _spec(
+    *, surface="embeddings", extract=_extract_prompt_tokens, measure=lambda _kwargs: None
+) -> MediaSurfaceSpec:
     return MediaSurfaceSpec(
-        surface="embeddings",
+        surface=surface,
         modality="text-embedding",
         extract_usage=extract,
         measure_request=measure,
@@ -178,13 +180,14 @@ class TestMediaCallSync:
     def test_unsupported_surface_reports_error_then_raises(self) -> None:
         client, _ = _sync_client()
         solwyn = _build_sync(client)
-        # No prepare_media_call patch -> the real OpenAI adapter raises (foundation).
+        # No prepare_media_call patch -> the real OpenAI adapter serves embeddings
+        # (P1.7) but still raises for an unwired surface like images.
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()),
             patch.object(solwyn._reporter, "report") as report,
             pytest.raises(UnsupportedSurfaceError),
         ):
-            solwyn._media_call(_spec(), model="text-embedding-3-small", input="hi")
+            solwyn._media_call(_spec(surface="images"), model="gpt-image-1", input="hi")
 
         event = report.call_args.args[0]
         assert event.status == CallStatus.ERROR

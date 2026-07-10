@@ -216,15 +216,17 @@ class OpenAIAdapter:
     ) -> tuple[Callable[..., Any], dict[str, Any]]:
         """Per-surface dispatch seam for non-chat media surfaces.
 
-        FOUNDATION: no media surface is wired yet, so every surface raises
-        ``UnsupportedSurfaceError``. Later batches add branches here, each
-        returning ``(client.<surface>.<method>, shaped_kwargs)`` exactly as
-        ``prepare_call`` does for chat (P1.7 ``client.embeddings.create``, P2
-        ``client.images.generate``, P3 ``client.audio.*``, P4 videos).
-        timeout/max_retries are ignored for SDKs with ``with_options`` (the
-        dispatcher already applied them); a branch for an SDK without it applies
-        them itself, like ``prepare_call``.
+        Embeddings (P1.7) route to ``client.embeddings.create`` — the same
+        ``(method, shaped_kwargs)`` shape ``prepare_call`` returns for chat, with
+        a defensive COPY of kwargs (never mutate/alias the caller's dict). The
+        remaining surfaces (P2 images, P3 audio, P4 video) are not wired yet and
+        fail loud with ``UnsupportedSurfaceError``. timeout/max_retries are
+        ignored for SDKs with ``with_options`` (the dispatcher already applied
+        them); a branch for an SDK without it applies them itself, like
+        ``prepare_call``.
         """
+        if surface == "embeddings":
+            return client.embeddings.create, dict(kwargs)
         raise UnsupportedSurfaceError(surface=surface, provider=self.name)
 
     def unwrap_stream_source(self, response: Any) -> Any:

@@ -37,9 +37,10 @@ DECLARED_UNMETERED_SURFACES = frozenset({"completions", "rerank", "code_interpre
 CENTRAL_OPENAI_SURFACES = frozenset({"images", "audio", "videos"})
 # Every surface that warns-once for a Together (openai-dialect) client.
 WARNING_SURFACES = DECLARED_UNMETERED_SURFACES | CENTRAL_OPENAI_SURFACES
-# Surfaces Together bills that Solwyn now passes through SILENTLY: embeddings
-# (P1.7 intercepts it on this branch) and truly-unrelated resources.
-SILENT_SURFACES = frozenset({"embeddings", "batches", "fine_tuning"})
+# Together-billed surfaces Solwyn passes through SILENTLY (truly-unrelated
+# resources, not warned). embeddings is NOT here: P1.7 intercepts it, so it
+# returns the media proxy rather than passing through.
+SILENT_SURFACES = frozenset({"batches", "fine_tuning"})
 
 
 @pytest.fixture(autouse=True)
@@ -245,16 +246,20 @@ def test_sync_unmetered_surface_warns_and_passes_through(caplog: pytest.LogCaptu
 def test_sync_curated_silent_surfaces_pass_through_without_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # embeddings (P1.7 intercepts it), batches and fine_tuning (truly-unrelated
-    # resources) were dropped from Together's warn set: they pass through SILENTLY.
+    # batches and fine_tuning (truly-unrelated resources) were dropped from
+    # Together's warn set: they pass through SILENTLY. embeddings is intercepted
+    # (P1.7) -> it returns the media proxy, not the raw attribute, and is silent too.
     client = FakeTogetherClient(_completion_response())
     for surface in SILENT_SURFACES:
         setattr(client, surface, object())
+    client.embeddings = object()
     solwyn = _make_solwyn(client)
 
     with caplog.at_level(logging.WARNING, logger="solwyn._base"):
         for surface in SILENT_SURFACES:
             assert getattr(solwyn, surface) is getattr(client, surface)
+        # embeddings is intercepted, not passed through to the raw client.
+        assert solwyn.embeddings is not client.embeddings
 
     assert caplog.records == []
     solwyn.close()

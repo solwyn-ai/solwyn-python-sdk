@@ -63,6 +63,21 @@ def _mock_google_client():
     return client
 
 
+def _mock_openai_embeddings_client(*, prompt_tokens: int = 42, usage: bool = True):
+    """Create a mock that looks like openai.OpenAI() with an embeddings surface."""
+    client = MagicMock()
+    client.__class__.__module__ = "openai._client"
+    client.__class__.__name__ = "OpenAI"
+    # Per-hop with_options must return the same client (see _mock_anthropic_client).
+    client.with_options.return_value = client
+    usage_block = SimpleNamespace(prompt_tokens=prompt_tokens, total_tokens=prompt_tokens)
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.1, 0.2], index=0)],
+        usage=usage_block if usage else None,
+    )
+    return client
+
+
 def _make_solwyn(client, **overrides):
     defaults = {"api_key": VALID_API_KEY}
     defaults.update(overrides)
@@ -279,6 +294,88 @@ class TestGoogleModelsProxy:
 
 
 # ---------------------------------------------------------------------------
+# OpenAI dialect: client.embeddings.create()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestEmbeddingsProxy:
+    """client.embeddings.create() routes through the media lifecycle (_media_call)."""
+
+    def test_embeddings_create_is_intercepted_and_reports_prompt_tokens(self) -> None:
+        client = _mock_openai_embeddings_client(prompt_tokens=42)
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            result = solwyn.embeddings.create(
+                model="text-embedding-3-small",
+                input="hello world",
+            )
+
+        # Routed to the underlying embeddings surface, not the raw passthrough.
+        client.embeddings.create.assert_called_once()
+        assert len(reported) == 1
+        assert reported[0].status == "success"
+        # Billable basis is usage.prompt_tokens; embeddings emit NO output tokens
+        # (a TRUE zero, not a zero-as-default) and the count is provider-reported.
+        assert reported[0].input_tokens == 42
+        assert reported[0].output_tokens == 0
+        assert reported[0].token_details.is_estimated is False
+        assert result.usage.prompt_tokens == 42
+        solwyn.close()
+
+    def test_embeddings_create_checks_budget_and_denies(self) -> None:
+        client = _mock_openai_embeddings_client()
+        solwyn = _make_solwyn(client, budget_mode="hard_deny")
+
+        deny_response = {
+            **ALLOW_BUDGET_RESPONSE,
+            "allowed": False,
+            "remaining_budget": 0.0,
+            "mode": "hard_deny",
+            "denied_by_period": "monthly",
+            "project_id": VALID_PROJECT_ID,
+        }
+        with _mock_budget(solwyn, deny_response), pytest.raises(BudgetExceededError):
+            solwyn.embeddings.create(model="text-embedding-3-small", input="hi")
+
+        # Hard-deny short-circuits before the provider call.
+        client.embeddings.create.assert_not_called()
+        solwyn.close()
+
+    def test_embeddings_missing_usage_falls_back_to_estimated(self) -> None:
+        # A compat-style response with no usage block -> request-derived estimate,
+        # explicitly flagged is_estimated=True (never a silent zero).
+        client = _mock_openai_embeddings_client(usage=False)
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            solwyn.embeddings.create(
+                model="text-embedding-3-small",
+                input="a" * 40,  # 40 chars / 4.0 openai ratio -> 10 tokens
+            )
+
+        event = reported[0]
+        assert event.status == "success"
+        assert event.token_details.is_estimated is True
+        assert event.input_tokens == 10
+        assert event.output_tokens == 0
+        solwyn.close()
+
+    def test_embeddings_getattr_passthrough(self) -> None:
+        """Non-create attributes pass through to the underlying embeddings surface."""
+        client = _mock_openai_embeddings_client()
+        client.embeddings.some_helper = MagicMock(return_value="ok")
+        solwyn = _make_solwyn(client)
+        assert solwyn.embeddings.some_helper() == "ok"
+        solwyn.close()
+
+
+# ---------------------------------------------------------------------------
 # Async variants
 # ---------------------------------------------------------------------------
 
@@ -394,6 +491,42 @@ class TestAsyncGoogleModelsProxy:
         assert "google" in message
         assert "surface 'generate_videos'" in message
         assert "tracking for this surface is coming" in message.lower()
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+
+@pytest.mark.unit
+class TestAsyncEmbeddingsProxy:
+    """Async client.embeddings.create() routes through the async media lifecycle."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_embeddings_create_is_intercepted(self) -> None:
+        client = _mock_openai_embeddings_client(prompt_tokens=99)
+        client.__class__.__name__ = "AsyncOpenAI"
+        client.embeddings.create = AsyncMockFn(
+            return_value=SimpleNamespace(
+                data=[SimpleNamespace(embedding=[0.1, 0.2], index=0)],
+                usage=SimpleNamespace(prompt_tokens=99, total_tokens=99),
+            )
+        )
+        solwyn = _make_async_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_async_budget(solwyn):
+            result = await solwyn.embeddings.create(
+                model="text-embedding-3-small",
+                input="hello",
+            )
+
+        client.embeddings.create.assert_awaited_once()
+        assert len(reported) == 1
+        assert reported[0].status == "success"
+        assert reported[0].input_tokens == 99
+        assert reported[0].output_tokens == 0
+        assert result.usage.prompt_tokens == 99
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

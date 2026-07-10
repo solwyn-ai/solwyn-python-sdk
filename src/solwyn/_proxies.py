@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from solwyn._base import _warn_unmetered_spend_surface_once
+from solwyn._base import MediaSurfaceSpec, _warn_unmetered_spend_surface_once
+from solwyn._privacy import estimate_embedding_input_tokens
+from solwyn._token_details import TokenDetails
 
 if TYPE_CHECKING:
     from solwyn.client import AsyncSolwyn, Solwyn
@@ -28,6 +30,62 @@ def _bedrock_internal_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     renamed = dict(kwargs)
     renamed["model"] = renamed.pop("modelId")
     return renamed
+
+
+# ---------------------------------------------------------------------------
+# Embeddings surface (openai dialect: native OpenAI + all compat profiles)
+# ---------------------------------------------------------------------------
+
+
+def _extract_embedding_usage(response: Any) -> TokenDetails | None:
+    """Pull the billable input quantity from an embeddings response's usage block.
+
+    Embeddings emit NO output tokens, so ``usage.prompt_tokens`` is the entire
+    billable basis (output stays a TRUE zero, priced at rate 0.0 server-side).
+    Native OpenAI always reports it; a compat endpoint that omits, zeroes, or
+    garbles it yields None so the request-side estimator takes over rather than
+    settling a silent $0. Never raises — the media lifecycle then falls back to
+    ``measure_request``.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    if isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int) or prompt_tokens <= 0:
+        return None
+    return TokenDetails(input_tokens=prompt_tokens)
+
+
+def _measure_embedding_request(kwargs: dict[str, Any], provider: str) -> TokenDetails | None:
+    """Request-derived input-token estimate for a usage-less embeddings response.
+
+    Length-only measurement via the privacy-firewall recognizer, marked
+    ``is_estimated=True`` (explicit degradation, mirroring the compat chat
+    missing-usage fallback). Returns None when nothing measurable is present so
+    the billable quantity stays None — never a zero-as-default.
+    """
+    estimate = estimate_embedding_input_tokens(kwargs, provider)
+    if estimate <= 0:
+        return None
+    return TokenDetails(input_tokens=estimate, is_estimated=True)
+
+
+def _embeddings_spec(solwyn: Solwyn | AsyncSolwyn) -> MediaSurfaceSpec:
+    """Build the embeddings ``MediaSurfaceSpec`` for one client.
+
+    ``surface="embeddings"`` is the adapter dispatch key; ``modality="embedding"``
+    is the server billing modality. One spec covers native OpenAI plus all 14
+    compat profiles — they share the openai dialect and the
+    ``usage.prompt_tokens`` response shape. The request-side estimator binds the
+    primary provider name so the char->token ratio matches it.
+    """
+    provider = solwyn._adapter.name
+    return MediaSurfaceSpec(
+        surface="embeddings",
+        modality="embedding",
+        extract_usage=_extract_embedding_usage,
+        measure_request=lambda kwargs: _measure_embedding_request(kwargs, provider),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +129,29 @@ class _SyncChatProxy:
             f"The Solwyn chat proxy is OpenAI-dialect-specific; Anthropic uses "
             f"'messages' and Google uses 'models'."
         )
+
+
+class _SyncEmbeddingsProxy:
+    """Proxy for client.embeddings that routes create() through the media lifecycle.
+
+    ``client.embeddings.create()`` (OpenAI's embeddings API, shared by every
+    OpenAI-compatible provider) flows through ``_media_call`` instead of the raw
+    client, so embeddings spend is budget-checked, confirmed, and reported. Every
+    other ``embeddings`` attribute passes through to the underlying client. The
+    per-client spec is built once at construction (provider is fixed then).
+    """
+
+    def __init__(self, solwyn: Solwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _embeddings_spec(solwyn)
+
+    def create(self, **kwargs: Any) -> Any:
+        """Intercept embeddings.create() with budget/confirm/reporting."""
+        return self._solwyn._media_call(self._spec, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through non-create attributes to the client's embeddings."""
+        return getattr(self._solwyn._client.embeddings, name)
 
 
 class _SyncMessagesProxy:
@@ -156,6 +237,27 @@ class _AsyncChatProxy:
             f"The Solwyn chat proxy is OpenAI-dialect-specific; Anthropic uses "
             f"'messages' and Google uses 'models'."
         )
+
+
+class _AsyncEmbeddingsProxy:
+    """Async proxy for client.embeddings that routes create() through the media lifecycle.
+
+    Mirror of ``_SyncEmbeddingsProxy``: ``client.embeddings.create()`` flows
+    through the async ``_media_call``; every other attribute passes through to
+    the underlying client's embeddings.
+    """
+
+    def __init__(self, solwyn: AsyncSolwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _embeddings_spec(solwyn)
+
+    async def create(self, **kwargs: Any) -> Any:
+        """Intercept embeddings.create() with budget/confirm/reporting."""
+        return await self._solwyn._media_call(self._spec, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through non-create attributes to the client's embeddings."""
+        return getattr(self._solwyn._client.embeddings, name)
 
 
 class _AsyncMessagesProxy:

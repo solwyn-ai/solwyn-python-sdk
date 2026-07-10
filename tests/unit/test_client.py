@@ -582,15 +582,19 @@ class TestUnshippedSpendSurfacePosture:
     def test_intercepted_and_unrelated_surfaces_are_silent(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        # embeddings graduates to interception (P1.7); moderations/files are
-        # truly-unrelated resources. None of them warn.
+        # embeddings graduates to interception (P1.7) -> it returns the media
+        # proxy, NOT the raw client attribute; moderations/files are
+        # truly-unrelated resources that pass through. None of them warn.
         client, _ = _mock_openai_client()
         for surface in ("embeddings", "moderations", "files"):
             setattr(client, surface, object())
         solwyn = _make_solwyn(client)
 
         with caplog.at_level(logging.WARNING, logger="solwyn._base"):
-            for surface in ("embeddings", "moderations", "files"):
+            # embeddings is intercepted: the proxy replaces the raw attribute.
+            assert solwyn.embeddings is not client.embeddings
+            # unrelated resources still pass through untouched.
+            for surface in ("moderations", "files"):
                 assert getattr(solwyn, surface) is getattr(client, surface)
 
         assert caplog.records == []

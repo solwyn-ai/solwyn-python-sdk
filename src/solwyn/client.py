@@ -41,10 +41,12 @@ from solwyn._base import (
 from solwyn._privacy import estimate_content_length, estimate_tokens_from_length
 from solwyn._proxies import (
     _AsyncChatProxy,
+    _AsyncEmbeddingsProxy,
     _AsyncMessagesProxy,
     _AsyncModelsProxy,
     _bedrock_internal_kwargs,
     _SyncChatProxy,
+    _SyncEmbeddingsProxy,
     _SyncMessagesProxy,
     _SyncModelsProxy,
 )
@@ -606,6 +608,18 @@ class Solwyn(_SolwynBase):
         Cached: provider is fixed at construction so this is safe to create once.
         """
         return _SyncChatProxy(self)
+
+    @functools.cached_property
+    def embeddings(self) -> _SyncEmbeddingsProxy:
+        """Return a proxy that routes embeddings.create() through the media lifecycle.
+
+        Unconditional (like ``chat``): the embeddings surface is the openai
+        dialect, shared by native OpenAI and every OpenAI-compatible provider.
+        On a non-openai client ``.create()`` fails loud with
+        ``UnsupportedSurfaceError`` (that adapter serves no embeddings seam).
+        Cached: provider is fixed at construction so this is safe to create once.
+        """
+        return _SyncEmbeddingsProxy(self)
 
     @functools.cached_property
     def messages(self) -> Any:
@@ -1478,6 +1492,17 @@ class AsyncSolwyn(_SolwynBase):
         Cached: provider is fixed at construction so this is safe to create once.
         """
         return _AsyncChatProxy(self)
+
+    @functools.cached_property
+    def embeddings(self) -> _AsyncEmbeddingsProxy:
+        """Return an async proxy that routes embeddings.create() through the media lifecycle.
+
+        Unconditional (like ``chat``): the embeddings surface is the openai
+        dialect, shared by native OpenAI and every OpenAI-compatible provider.
+        On a non-openai client ``.create()`` fails loud with
+        ``UnsupportedSurfaceError``. Cached: provider is fixed at construction.
+        """
+        return _AsyncEmbeddingsProxy(self)
 
     @functools.cached_property
     def messages(self) -> Any:
