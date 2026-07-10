@@ -111,6 +111,14 @@ class FailoverReason(StrEnum):
 ServiceTier = Literal["auto", "default", "flex", "scale", "priority", "standard", "optimized"]
 
 
+# Call modality discriminator. Window 1 of the modality program adds ONLY this
+# field to the wire (default "text" so every pre-modality SDK omits it safely —
+# API deploys FIRST). The SERVER's pricing card unit — not this label alone —
+# selects the billing basis; core bills text tokens only until per-modality
+# cards land. Vendored lock-step with core shared/models.py's Modality.
+Modality = Literal["text", "image", "audio", "video", "embedding"]
+
+
 # ── Config models ───────────────────────────────────────────────────────
 
 
@@ -164,6 +172,15 @@ class MetadataEvent(BaseModel):
         ..., max_length=MODEL_NAME_MAX_LENGTH, description="LLM model name (e.g. gpt-4o)"
     )
     provider: ProviderName = Field(..., description="LLM provider")
+    modality: Modality = Field(
+        default="text",
+        description=(
+            "Call modality. Defaults to 'text' so pre-modality SDKs omit it "
+            "safely (API-first). The pricing card's unit — not this label alone "
+            "— selects the billing basis; core bills text tokens only until "
+            "per-modality cards land."
+        ),
+    )
     input_tokens: int = Field(..., ge=0, description="Input token count")
     output_tokens: int = Field(..., ge=0, description="Output token count")
     token_details: TokenDetails | None = Field(
@@ -240,6 +257,15 @@ class BudgetCheckRequest(BaseModel):
     )
     model: str = Field(..., max_length=MODEL_NAME_MAX_LENGTH, description="LLM model name")
     provider: ProviderName = Field(..., description="Target provider")
+    modality: Modality = Field(
+        default="text",
+        description=(
+            "Call modality of the pending request. Defaults to 'text' so "
+            "pre-modality SDKs omit it safely (API-first). The pricing card's "
+            "unit selects the billing basis; core bills text tokens only until "
+            "per-modality cards land."
+        ),
+    )
     fallback_providers: list[ProviderName] = Field(
         default_factory=list,
         description="Configured failover providers, in attempt order (chain hint)",
@@ -315,6 +341,15 @@ class BudgetConfirmRequest(BaseModel):
     )
     provider: ProviderName = Field(
         ..., description="Provider that actually served the call (required)"
+    )
+    modality: Modality = Field(
+        default="text",
+        description=(
+            "Call modality of the served call. Defaults to 'text' so pre-modality "
+            "SDKs omit it safely (API-first). The pricing card's unit settles the "
+            "budget counter on the right basis; core bills text tokens only until "
+            "per-modality cards land."
+        ),
     )
     is_provider_fallback: bool = Field(
         default=False, description="served provider != requested provider"

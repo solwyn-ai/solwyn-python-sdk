@@ -62,6 +62,7 @@ EXPECTED_CHECK_FIELDS = {
     "estimated_input_tokens",
     "model",
     "provider",
+    "modality",
     "fallback_providers",
     "fallback_models",
 }
@@ -82,6 +83,7 @@ EXPECTED_CONFIRM_FIELDS = {
     "reservation_id",
     "model",
     "provider",
+    "modality",
     "token_details",
     "is_provider_fallback",
     "call_id",
@@ -142,6 +144,7 @@ EXPECTED_TOKEN_DETAILS_FIELDS = {
 EXPECTED_METADATA_FIELDS = {
     "model",
     "provider",
+    "modality",
     "input_tokens",
     "output_tokens",
     "token_details",

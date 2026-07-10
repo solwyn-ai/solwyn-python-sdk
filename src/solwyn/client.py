@@ -772,6 +772,7 @@ class Solwyn(_SolwynBase):
             model=requested_model,
             provider=provider,
             timeout=_budget_timeout(deadline),
+            modality=spec.modality,
         )
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
@@ -792,7 +793,7 @@ class Solwyn(_SolwynBase):
                         call_id=call_id,
                         agent_run=agent_run,
                         provider_region=provider_region,
-                        # spec.modality rides this payload once _types vendors it (P1.11).
+                        modality=spec.modality,
                     )
                 )
             except Exception as exc:
@@ -853,7 +854,7 @@ class Solwyn(_SolwynBase):
                 call_id=call_id,
                 provider_region=provider_region,
                 service_tier=service_tier,
-                # spec.modality rides this payload once _types vendors it (P1.11).
+                modality=spec.modality,
             )
         self._reporter.report(
             self._build_metadata_event(
@@ -870,7 +871,7 @@ class Solwyn(_SolwynBase):
                 service_tier=service_tier,
                 agent_run=agent_run,
                 provider_region=provider_region,
-                # spec.modality rides this payload once _types vendors it (P1.11).
+                modality=spec.modality,
             )
         )
         return response
@@ -1636,6 +1637,7 @@ class AsyncSolwyn(_SolwynBase):
             model=requested_model,
             provider=provider,
             timeout=_budget_timeout(deadline),
+            modality=spec.modality,
         )
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
@@ -1656,7 +1658,7 @@ class AsyncSolwyn(_SolwynBase):
                         call_id=call_id,
                         agent_run=agent_run,
                         provider_region=provider_region,
-                        # spec.modality rides this payload once _types vendors it (P1.11).
+                        modality=spec.modality,
                     )
                 )
             except Exception as exc:
@@ -1713,7 +1715,7 @@ class AsyncSolwyn(_SolwynBase):
                 call_id=call_id,
                 provider_region=provider_region,
                 service_tier=service_tier,
-                # spec.modality rides this payload once _types vendors it (P1.11).
+                modality=spec.modality,
             )
         self._reporter.report(
             self._build_metadata_event(
@@ -1730,7 +1732,7 @@ class AsyncSolwyn(_SolwynBase):
                 service_tier=service_tier,
                 agent_run=agent_run,
                 provider_region=provider_region,
-                # spec.modality rides this payload once _types vendors it (P1.11).
+                modality=spec.modality,
             )
         )
         return response

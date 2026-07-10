@@ -29,7 +29,7 @@ from solwyn._routing import (
 )
 from solwyn._run import current_run
 from solwyn._token_details import TokenDetails
-from solwyn._types import CallStatus, FailoverReason, MetadataEvent, ProviderName
+from solwyn._types import CallStatus, FailoverReason, MetadataEvent, Modality, ProviderName
 from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.config import SolwynConfig
 from solwyn.tokenizer import TokenizerManager
@@ -204,10 +204,10 @@ class MediaSurfaceSpec:
     - ``surface``: the dispatch key handed to ``adapter.prepare_media_call``
       (a ``MediaSurface`` value, e.g. ``"embeddings"``).
     - ``modality``: the billing modality carried through the lifecycle so the
-      server's card unit can select it. The vendored wire types do not carry a
-      ``modality`` field yet (P1.11 vendors it); until then this attribute rides
-      on the spec and is referenced at the confirm/metadata sites, so P1.11 only
-      has to add the field and connect ``spec.modality`` to the payloads.
+      server's card unit can select it. The vendored wire types carry a
+      ``modality`` field (P1.11); ``_media_call`` connects ``spec.modality`` onto
+      the budget check, the confirm, and the SUCCESS / BUDGET_DENIED metadata
+      events. The chat pipeline never sets it and rides the ``"text"`` default.
     - ``extract_usage``: pulls the billable quantity from the RESPONSE's usage
       block, or None when the response reports none.
     - ``measure_request``: derives the billable quantity from the REQUEST when
@@ -221,7 +221,7 @@ class MediaSurfaceSpec:
     """
 
     surface: str
-    modality: str
+    modality: Modality
     extract_usage: Callable[[Any], TokenDetails | None]
     measure_request: Callable[[dict[str, Any]], TokenDetails | None]
 
@@ -418,6 +418,7 @@ class _SolwynBase:
         timestamp: datetime | None = None,
         agent_run: tuple[str | None, str | None] | None = None,
         provider_region: str | None = None,
+        modality: Modality = "text",
     ) -> MetadataEvent:
         """Build a MetadataEvent for reporting to the cloud API.
 
@@ -425,6 +426,8 @@ class _SolwynBase:
         is the post-send-ambiguous abort flag — left None on every non-abort event.
         ``provider_region`` is the served endpoint's cloud region (Bedrock pricing
         is per model AND region); None for providers without regional pricing.
+        ``modality`` is the call modality — ``"text"`` for every chat event; the
+        media lifecycle passes the surface's modality (e.g. ``"embedding"``).
         """
         if not call_id:
             raise RuntimeError("call_id is required for metadata reconciliation")
@@ -432,6 +435,7 @@ class _SolwynBase:
         return MetadataEvent(
             model=model,
             provider=ProviderName(provider),
+            modality=modality,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             token_details=token_details,

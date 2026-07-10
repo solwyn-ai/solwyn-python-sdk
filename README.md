@@ -125,7 +125,7 @@ If you stop consuming the stream early, call `response["stream"].close()` (or wr
 Notes:
 
 - Model identity is reported exactly as you pass it — foundation-model ids, cross-region inference profiles (`us.` / `eu.` / `jp.` / `global.` …), or full ARNs — together with the client's region, because Bedrock pricing is keyed per model **and** region. Prompt-cache reads/writes (including the 1h-TTL tier via `usage.cacheDetails`) and the latency/service pricing tier are captured for exact repricing.
-- `invoke_model` / `invoke_model_with_response_stream` raise `ConfigurationError` instead of bypassing budget tracking: their usage is buried in a consume-once body alongside response content. Use Converse, or call the unwrapped boto3 client for deliberately untracked calls.
+- `invoke_model` / `invoke_model_with_response_stream` / `start_async_invoke` raise `ConfigurationError` instead of bypassing budget tracking: their usage is buried in a consume-once body (or lands out-of-band in S3, for `start_async_invoke`) alongside response content. Use Converse, or call the unwrapped boto3 client for deliberately untracked calls.
 - boto3 has no per-call timeout override, so the failover deadline cannot shorten an in-flight Bedrock hop — set `read_timeout` in your botocore `Config`.
 - Async works with [aioboto3](https://github.com/terricain/aioboto3): `AsyncSolwyn(client)` inside `async with session.client("bedrock-runtime") as client`.
 - Bedrock participates in cross-provider failover in both directions (e.g. Bedrock-Claude ⇄ direct Anthropic) via the same canonical translation subset as the other providers.
@@ -361,6 +361,7 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 |-------|------|-------------|
 | `model` | `str` | Model name (e.g., `gpt-4o`) |
 | `provider` | `str` | Provider identifier (`openai`, `anthropic`, `google`, `bedrock`, `groq`, `openrouter`, …) |
+| `modality` | `str` | Call modality (`text`, `image`, `audio`, `video`, `embedding`); `text` for chat, `embedding` for embeddings calls |
 | `input_tokens` | `int` | Input token count |
 | `output_tokens` | `int` | Output token count |
 | `token_details` | `object` | Breakdown: cached, reasoning, audio tokens; `is_estimated` flags length-based estimates when a provider reports no usage |

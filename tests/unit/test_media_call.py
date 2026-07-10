@@ -35,7 +35,7 @@ def _spec(
 ) -> MediaSurfaceSpec:
     return MediaSurfaceSpec(
         surface=surface,
-        modality="text-embedding",
+        modality="embedding",
         extract_usage=extract,
         measure_request=measure,
     )
@@ -98,22 +98,27 @@ class TestMediaCallSync:
         assert result is resp
         client.embeddings.create.assert_called_once()
 
-        # Budget checked against the PRIMARY only — no failover chain hinted.
+        # Budget checked against the PRIMARY only — no failover chain hinted;
+        # the spec's modality rides the check so the API prices the pending call.
         assert check.call_args.kwargs["provider"] == "openai"
+        assert check.call_args.kwargs["modality"] == "embedding"
         assert "fallback_providers" not in check.call_args.kwargs
         assert "fallback_models" not in check.call_args.kwargs
 
-        # Confirmed with the extractor's quantity, never a provider fallback.
+        # Confirmed with the extractor's quantity, never a provider fallback;
+        # the confirm carries the surface modality so the API settles on it.
         confirm.assert_called_once()
         assert confirm.call_args.args[2].input_tokens == 42
         assert confirm.call_args.kwargs["is_provider_fallback"] is False
+        assert confirm.call_args.kwargs["modality"] == "embedding"
 
-        # Metadata: SUCCESS, foundation flags off.
+        # Metadata: SUCCESS, foundation flags off, modality carried.
         event = report.call_args.args[0]
         assert event.status == CallStatus.SUCCESS
         assert event.is_model_fallback is False
         assert event.is_provider_fallback is False
         assert event.input_tokens == 42
+        assert event.modality == "embedding"
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
@@ -172,7 +177,9 @@ class TestMediaCallSync:
             solwyn._media_call(_spec(), model="text-embedding-3-small", input="hi")
 
         client.embeddings.create.assert_not_called()
-        assert report.call_args.args[0].status == CallStatus.BUDGET_DENIED
+        denied = report.call_args.args[0]
+        assert denied.status == CallStatus.BUDGET_DENIED
+        assert denied.modality == "embedding"  # the denied event carries it too
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
@@ -228,11 +235,14 @@ class TestMediaCallAsync:
         assert result is resp
         client.embeddings.create.assert_awaited_once()
         assert check.call_args.kwargs["provider"] == "openai"
+        assert check.call_args.kwargs["modality"] == "embedding"
         confirm.assert_awaited_once()
         assert confirm.call_args.args[2].input_tokens == 99
+        assert confirm.call_args.kwargs["modality"] == "embedding"
         event = report.call_args.args[0]
         assert event.status == CallStatus.SUCCESS
         assert event.is_model_fallback is False
+        assert event.modality == "embedding"
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()
