@@ -33,12 +33,13 @@ def _ensure_loaded() -> None:
         from solwyn.providers.openai_compatible import build_compat_adapters
 
         # ORDER IS LOAD-BEARING for detect_client: OpenAI-compatible adapters
-        # claim openai-module clients whose base_url targets another vendor
-        # (named profiles first, the generic catch-all last among them), so
-        # the plain OpenAIAdapter must come AFTER them — it matches ANY
-        # openai-module client and would otherwise shadow every compat
-        # provider as "openai". Bedrock detection is exact (botocore client
-        # shape), so its position is unconstrained.
+        # claim openai-module clients whose base_url targets another vendor;
+        # the together slot also admits clients from the native together
+        # module. Named profiles come first, with the generic catch-all last
+        # among them, so the plain OpenAIAdapter must come AFTER them — it
+        # matches ANY openai-module client and would otherwise shadow every
+        # compat provider as "openai". Bedrock detection is exact (botocore
+        # client shape), so its position is unconstrained.
         _ADAPTERS = [
             *build_compat_adapters(),
             OpenAIAdapter(),

@@ -197,6 +197,7 @@ class TestDetectClientByBaseUrl:
         assert isinstance(adapter, OpenAIAdapter)
 
     def test_non_openai_module_client_never_matches_compat(self) -> None:
+        """Non-OpenAI clients never match compat, except native Together clients."""
         client = _make_client(module_path="anthropic._client", base_url="https://api.groq.com/v1")
         for adapter in build_compat_adapters():
             assert adapter.detect_client(client) is False

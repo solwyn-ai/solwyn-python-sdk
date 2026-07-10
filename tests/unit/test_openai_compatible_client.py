@@ -235,8 +235,13 @@ class TestProviderOverride:
         """An override relabels a DETECTED client — it cannot adopt an object
         from an unknown SDK (distinct from the dialect-mismatch branch)."""
         UnknownClient = type("UnknownClient", (), {"__module__": "totally_unknown_sdk._client"})
-        with pytest.raises(ConfigurationError, match="not a recognized provider SDK client"):
+        expected = (
+            "not a recognized provider SDK client "
+            "(openai / anthropic / google-genai / bedrock / together)"
+        )
+        with pytest.raises(ConfigurationError) as exc_info:
             _make_solwyn(UnknownClient(), provider="groq")
+        assert expected in str(exc_info.value)
 
     def test_fallback_spec_provider_override(self) -> None:
         primary = _compat_client("https://api.groq.com/openai/v1")
