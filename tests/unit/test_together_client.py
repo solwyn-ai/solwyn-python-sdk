@@ -9,6 +9,7 @@ provider SDK.
 from __future__ import annotations
 
 import inspect
+import logging
 from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
@@ -19,8 +20,28 @@ from conftest import VALID_API_KEY
 
 from solwyn._types import CallStatus, ProviderName
 from solwyn.client import AsyncSolwyn, Solwyn
+from solwyn.providers.together import TogetherAdapter
 
 MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+UNMETERED_SPEND_SURFACES = frozenset(
+    {
+        "completions",
+        "embeddings",
+        "images",
+        "videos",
+        "audio",
+        "rerank",
+        "code_interpreter",
+        "batches",
+        "fine_tuning",
+        "evals",
+    }
+)
+
+
+@pytest.mark.unit
+def test_together_adapter_declares_unmetered_spend_surfaces() -> None:
+    assert TogetherAdapter().unmetered_spend_surfaces == UNMETERED_SPEND_SURFACES
 
 
 def _completion_response() -> SimpleNamespace:
@@ -151,6 +172,165 @@ def _make_solwyn(client: object) -> Solwyn:
 
 def _make_async_solwyn(client: object) -> AsyncSolwyn:
     return AsyncSolwyn(client, api_key=VALID_API_KEY)
+
+
+@pytest.mark.unit
+def test_sync_unmetered_surface_warns_and_passes_through(caplog: pytest.LogCaptureFixture) -> None:
+    client = FakeTogetherClient(_completion_response())
+    resource = MagicMock()
+    resource.create.return_value = object()
+    client.embeddings = resource
+    solwyn = _make_solwyn(client)
+    check_budget = MagicMock()
+    report = MagicMock()
+    report_settlement = MagicMock()
+
+    with (
+        caplog.at_level(logging.WARNING, logger="solwyn.client"),
+        patch.object(solwyn._budget, "check_budget", new=check_budget),
+        patch.object(solwyn._reporter, "report", new=report),
+        patch.object(solwyn._reporter, "report_settlement", new=report_settlement),
+    ):
+        result = solwyn.embeddings.create(model=MODEL, input="private-input-marker")
+
+    assert result is resource.create.return_value
+    assert resource.create.call_count == 1
+    check_budget.assert_not_called()
+    report.assert_not_called()
+    report_settlement.assert_not_called()
+    assert len(caplog.records) == 1
+    warning = caplog.records[0].getMessage()
+    assert "together" in warning
+    assert "embeddings" in warning
+    assert "no budget check" in warning
+    assert "no cost event" in warning
+    assert "private-input-marker" not in warning
+    solwyn.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_unmetered_surface_warns_and_passes_through(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = AsyncTogether(_completion_response())
+    resource = SimpleNamespace(create=AsyncMock(return_value=object()))
+    client.images = resource
+    solwyn = _make_async_solwyn(client)
+    check_budget = AsyncMock()
+    report = MagicMock()
+    report_settlement = MagicMock()
+
+    with (
+        caplog.at_level(logging.WARNING, logger="solwyn.client"),
+        patch.object(solwyn._budget, "check_budget", new=check_budget),
+        patch.object(solwyn._reporter, "report", new=report),
+        patch.object(solwyn._reporter, "report_settlement", new=report_settlement),
+    ):
+        result = await solwyn.images.create(model=MODEL, prompt="private-input-marker")
+
+    assert result is resource.create.return_value
+    resource.create.assert_awaited_once()
+    check_budget.assert_not_awaited()
+    report.assert_not_called()
+    report_settlement.assert_not_called()
+    assert len(caplog.records) == 1
+    warning = caplog.records[0].getMessage()
+    assert "together" in warning
+    assert "images" in warning
+    assert "no budget check" in warning
+    assert "no cost event" in warning
+    assert "private-input-marker" not in warning
+    await solwyn.close()
+
+
+@pytest.mark.unit
+def test_sync_warns_once_for_each_declared_unmetered_surface(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = FakeTogetherClient(_completion_response())
+    resources: dict[str, MagicMock] = {}
+    for surface in UNMETERED_SPEND_SURFACES:
+        resource = MagicMock()
+        resource.create.return_value = surface
+        setattr(client, surface, resource)
+        resources[surface] = resource
+    solwyn = _make_solwyn(client)
+
+    with caplog.at_level(logging.WARNING, logger="solwyn.client"):
+        for surface, resource in resources.items():
+            first = getattr(solwyn, surface)
+            second = getattr(solwyn, surface)
+            assert first is resource
+            assert second is resource
+            assert first.create() == surface
+            assert second.create() == surface
+
+    assert len(caplog.records) == len(UNMETERED_SPEND_SURFACES)
+    warning_messages = [record.getMessage() for record in caplog.records]
+    for surface in UNMETERED_SPEND_SURFACES:
+        assert sum(f"surface '{surface}'" in message for message in warning_messages) == 1
+        assert resources[surface].create.call_count == 2
+    solwyn.close()
+
+
+@pytest.mark.unit
+def test_missing_unmetered_surface_does_not_warn_or_consume_latch(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = FakeTogetherClient(_completion_response())
+    solwyn = _make_solwyn(client)
+
+    with caplog.at_level(logging.WARNING, logger="solwyn.client"):
+        with pytest.raises(AttributeError):
+            _ = solwyn.images
+        assert caplog.records == []
+
+        resource = object()
+        client.images = resource
+        assert solwyn.images is resource
+
+    assert len(caplog.records) == 1
+    assert "surface 'images'" in caplog.records[0].getMessage()
+    solwyn.close()
+
+
+@pytest.mark.unit
+def test_unmetered_surface_warning_latch_is_per_wrapper_instance(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = FakeTogetherClient(_completion_response())
+    resource = object()
+    client.images = resource
+    first = _make_solwyn(client)
+    second = _make_solwyn(client)
+
+    with caplog.at_level(logging.WARNING, logger="solwyn.client"):
+        assert first.images is resource
+        assert first.images is resource
+        assert second.images is resource
+
+    assert len(caplog.records) == 2
+    assert all("surface 'images'" in record.getMessage() for record in caplog.records)
+    first.close()
+    second.close()
+
+
+@pytest.mark.unit
+def test_provider_without_unmetered_surface_declaration_passes_through_silently(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    OpenAI = type("OpenAI", (), {"__module__": "openai._client"})
+    client = OpenAI()
+    resource = object()
+    client.images = resource
+    solwyn = _make_solwyn(client)
+
+    with caplog.at_level(logging.WARNING, logger="solwyn.client"):
+        assert solwyn.images is resource
+
+    assert caplog.records == []
+    solwyn.close()
 
 
 def _capture_settlements(

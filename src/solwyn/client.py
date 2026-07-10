@@ -495,6 +495,7 @@ class Solwyn(_SolwynBase):
         # public surface (chat/messages/models). A unified Protocol would not
         # match all three. Type safety stops at the _sync_dispatch boundary.
         self._client: Any = client
+        self._warned_unmetered_spend_surfaces: set[str] = set()
 
         if "project_id" in config_kwargs:
             raise TypeError("unexpected keyword argument 'project_id'")
@@ -1154,7 +1155,19 @@ class Solwyn(_SolwynBase):
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-intercepted attributes to the underlying client."""
-        return getattr(self._client, name)
+        attribute = getattr(self._client, name)
+        unmetered_surfaces: frozenset[str] = getattr(
+            self._adapter, "unmetered_spend_surfaces", frozenset()
+        )
+        if name in unmetered_surfaces and name not in self._warned_unmetered_spend_surfaces:
+            self._warned_unmetered_spend_surfaces.add(name)
+            logger.warning(
+                "Provider '%s' surface '%s' is passed through untracked: "
+                "no budget check and no cost event will be emitted",
+                self._adapter.name,
+                name,
+            )
+        return attribute
 
 
 # ---------------------------------------------------------------------------
@@ -1196,6 +1209,7 @@ class AsyncSolwyn(_SolwynBase):
     ) -> None:
         # See sync Solwyn.__init__ for why _client is typed Any.
         self._client: Any = client
+        self._warned_unmetered_spend_surfaces: set[str] = set()
 
         if "project_id" in config_kwargs:
             raise TypeError("unexpected keyword argument 'project_id'")
@@ -1821,4 +1835,16 @@ class AsyncSolwyn(_SolwynBase):
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-intercepted attributes to the underlying client."""
-        return getattr(self._client, name)
+        attribute = getattr(self._client, name)
+        unmetered_surfaces: frozenset[str] = getattr(
+            self._adapter, "unmetered_spend_surfaces", frozenset()
+        )
+        if name in unmetered_surfaces and name not in self._warned_unmetered_spend_surfaces:
+            self._warned_unmetered_spend_surfaces.add(name)
+            logger.warning(
+                "Provider '%s' surface '%s' is passed through untracked: "
+                "no budget check and no cost event will be emitted",
+                self._adapter.name,
+                name,
+            )
+        return attribute

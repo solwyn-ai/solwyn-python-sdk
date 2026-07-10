@@ -17,6 +17,21 @@ _TOGETHER_PROFILE = next(profile for profile in COMPAT_PROFILES if profile.name 
 class TogetherAdapter(OpenAICompatibleAdapter):
     """Together adapter with duck-typed native client detection."""
 
+    unmetered_spend_surfaces = frozenset(
+        {
+            "completions",
+            "embeddings",
+            "images",
+            "videos",
+            "audio",
+            "rerank",
+            "code_interpreter",
+            "batches",
+            "fine_tuning",
+            "evals",
+        }
+    )
+
     def __init__(self) -> None:
         super().__init__(_TOGETHER_PROFILE)
 
