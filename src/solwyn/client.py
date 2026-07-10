@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -32,18 +31,22 @@ from typing import Any, cast
 from pydantic import ValidationError
 
 from solwyn._base import (
+    MediaSurfaceSpec,
     _AttemptContext,
     _SolwynBase,
+    _warn_unmetered_spend_surface_once,
     _with_legacy_max_tokens_key,
     _with_openai_completion_token_key,
 )
 from solwyn._privacy import estimate_content_length, estimate_tokens_from_length
 from solwyn._proxies import (
     _AsyncChatProxy,
+    _AsyncEmbeddingsProxy,
     _AsyncMessagesProxy,
     _AsyncModelsProxy,
     _bedrock_internal_kwargs,
     _SyncChatProxy,
+    _SyncEmbeddingsProxy,
     _SyncMessagesProxy,
     _SyncModelsProxy,
 )
@@ -62,6 +65,7 @@ from solwyn.exceptions import (
     BudgetExceededError,
     ConfigurationError,
     ProviderUnavailableError,
+    UnsupportedSurfaceError,
     UntranslatableModelError,
 )
 from solwyn.providers import _translation
@@ -132,31 +136,21 @@ _INVOKE_MODEL_GUIDANCE = (
     "the unwrapped boto3 client directly."
 )
 
-
-def _warn_unmetered_spend_surface_once(
-    *,
-    adapter: Any,
-    surface: str,
-    warned_surfaces: set[str],
-    warning_lock: threading.Lock,
-) -> None:
-    """Warn once when an adapter-declared spend surface passes through untracked."""
-    unmetered_surfaces: frozenset[str] = getattr(adapter, "unmetered_spend_surfaces", frozenset())
-    if surface not in unmetered_surfaces:
-        return
-
-    with warning_lock:
-        if surface in warned_surfaces:
-            return
-        warned_surfaces.add(surface)
-
-    # Logging handlers may execute arbitrary code; keep them outside the lock.
-    logger.warning(
-        "Provider '%s' surface '%s' is passed through untracked: "
-        "no budget check and no cost event will be emitted",
-        adapter.name,
-        surface,
-    )
+# Why start_async_invoke fails loud, joining invoke_model: it is a PRIMARY spend
+# surface (Bedrock's asynchronous, video-scale invocation path — e.g. Nova Reel),
+# so silent pass-through would be a budget bypass at the highest per-call cost of
+# any surface. Unlike invoke_model the usage is not even in-band — the call returns
+# only an invocationArn and the output/usage land later in an S3 object the SDK
+# never sees — so there is nothing to extract without out-of-band polling. Failing
+# loud (rather than passing through untracked) closes that silent hole.
+_START_ASYNC_INVOKE_GUIDANCE = (
+    "Solwyn does not budget-track Bedrock's asynchronous invocation surface "
+    "(start_async_invoke) — the call returns only an invocationArn and its usage "
+    "lands out-of-band in S3, so Solwyn can neither enforce a budget nor emit a "
+    "cost event for it. Rather than pass this video-scale spend through untracked, "
+    "Solwyn refuses it. To make untracked async-invoke calls anyway, use the "
+    "unwrapped boto3 client directly."
+)
 
 
 def _source_compatible_defaults(dialect: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -484,6 +478,34 @@ def _build_hop_kwargs(
     return {**rt.entry.default_params, **call_kwargs}
 
 
+def _media_prepare(
+    adapter: Any,
+    surface: str,
+    client: Any,
+    kwargs: dict[str, object],
+    *,
+    timeout: float,
+    max_retries: int,
+) -> tuple[Callable[..., Any], dict[str, Any]]:
+    """Resolve the media SDK method + shaped kwargs, or raise UnsupportedSurfaceError.
+
+    The per-surface dispatch seam lives on adapters that serve media surfaces
+    (``MediaSurfaceAdapter.prepare_media_call``); it is intentionally absent
+    from the base ``ProviderAdapter`` protocol, so it is discovered duck-typed
+    here. An adapter that never grew the seam — or whose seam has no branch for
+    this surface — is a surface the SDK cannot serve, so fail loud with the
+    structural (content-free) ``UnsupportedSurfaceError``. Shared by the sync
+    and async media dispatchers (only the invoke/await differs).
+    """
+    prepare = getattr(adapter, "prepare_media_call", None)
+    if prepare is None:
+        raise UnsupportedSurfaceError(surface=surface, provider=adapter.name)
+    return cast(
+        "tuple[Callable[..., Any], dict[str, Any]]",
+        prepare(surface, client, kwargs, timeout=timeout, max_retries=max_retries),
+    )
+
+
 class Solwyn(_SolwynBase):
     """Synchronous Solwyn client wrapper.
 
@@ -522,8 +544,6 @@ class Solwyn(_SolwynBase):
         # public surface (chat/messages/models). A unified Protocol would not
         # match all three. Type safety stops at the _sync_dispatch boundary.
         self._client: Any = client
-        self._warned_unmetered_spend_surfaces: set[str] = set()
-        self._unmetered_spend_warning_lock = threading.Lock()
 
         if "project_id" in config_kwargs:
             raise TypeError("unexpected keyword argument 'project_id'")
@@ -590,6 +610,18 @@ class Solwyn(_SolwynBase):
         return _SyncChatProxy(self)
 
     @functools.cached_property
+    def embeddings(self) -> _SyncEmbeddingsProxy:
+        """Return a proxy that routes embeddings.create() through the media lifecycle.
+
+        Unconditional (like ``chat``): the embeddings surface is the openai
+        dialect, shared by native OpenAI and every OpenAI-compatible provider.
+        On a non-openai client ``.create()`` fails loud with
+        ``UnsupportedSurfaceError`` (that adapter serves no embeddings seam).
+        Cached: provider is fixed at construction so this is safe to create once.
+        """
+        return _SyncEmbeddingsProxy(self)
+
+    @functools.cached_property
     def messages(self) -> Any:
         """Anthropic-compatible: client.messages.create() goes through interception.
 
@@ -635,6 +667,12 @@ class Solwyn(_SolwynBase):
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
         return self._client.invoke_model_with_response_stream(**kwargs)
 
+    def start_async_invoke(self, **kwargs: Any) -> Any:
+        """Fail loud on Bedrock's async invocation surface (untracked video-scale spend)."""
+        if self._dialect == "bedrock":
+            raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
+        return self._client.start_async_invoke(**kwargs)
+
     def _sync_dispatch(
         self,
         runtime: ProviderRuntime,
@@ -669,6 +707,174 @@ class Solwyn(_SolwynBase):
             max_retries=max_retries,
         )
         return method(**call_kwargs)
+
+    def _media_dispatch(
+        self,
+        runtime: ProviderRuntime,
+        surface: str,
+        kwargs: dict[str, object],
+        *,
+        timeout: float,
+        max_retries: int,
+    ) -> Any:
+        """Dispatch one media hop to the runtime's SDK client. Pure I/O — no metrics.
+
+        The media analogue of ``_sync_dispatch``: applies the per-hop bound via
+        ``with_options`` where available, then hands off to the adapter's
+        ``prepare_media_call`` seam. No streaming and no candidate walk — a media
+        call is served by the primary runtime alone.
+        """
+        client = runtime.sdk_client
+        if hasattr(client, "with_options"):
+            client = client.with_options(timeout=timeout, max_retries=max_retries)
+        method, call_kwargs = _media_prepare(
+            runtime.adapter, surface, client, kwargs, timeout=timeout, max_retries=max_retries
+        )
+        return method(**call_kwargs)
+
+    def _media_call(self, spec: MediaSurfaceSpec, **kwargs: object) -> Any:
+        """Lean lifecycle for a non-chat media surface (embeddings/images/audio/video).
+
+        estimate -> budget check -> provider call -> extract/measure -> confirm +
+        report. Deliberately NOT the chat pipeline: embedding vectors (and image
+        / audio / video outputs) are not interchangeable across providers, so
+        there is no candidate walk, no cross-dialect translation, and no model
+        fallback (``is_model_fallback`` is always False). The call is served by
+        the PRIMARY runtime alone.
+
+        Billable quantity is per-surface via the spec hooks: response usage where
+        it exists (``extract_usage``), request-derived where it does not
+        (``measure_request``). An unobservable quantity stays None — never a
+        zero-filled default — so a real $0 price is never settled.
+        """
+        requested_model = cast(str, kwargs["model"])
+        agent_run = current_run()
+        call_id = str(uuid.uuid4())
+        runtime = self._runtimes[0]
+        provider = runtime.adapter.name
+        deadline = Deadline(self._config.failover_total_timeout)
+
+        # 1. Estimate input quantity (length-only; never materializes content).
+        char_count = estimate_content_length(kwargs)
+        est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
+
+        # 2. Budget check against the primary (no failover chain to hint).
+        #    Posture on 422-for-unbilled-model: if the server deliberately does not
+        #    price this model/modality it answers /budgets/check with a 422. The
+        #    enforcer treats that like any non-2xx — it raises inside check_budget,
+        #    is caught there, and (absent a prior hard-deny) resolves via the
+        #    standard fail-open path: allowed=True with a warning. So an
+        #    unbilled-model media call proceeds untracked rather than being denied;
+        #    fail-open is intentional here — Solwyn never blocks a call just because
+        #    it cannot yet price it. (Full matrix documented in the P5.2 posture doc.)
+        budget = self._budget.check_budget(
+            estimated_input_tokens=est_in,
+            model=requested_model,
+            provider=provider,
+            timeout=_budget_timeout(deadline),
+            modality=spec.modality,
+        )
+        if budget.price_hints is not None:
+            self.update_price_hints(budget.price_hints)
+
+        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
+        if not budget.allowed:
+            try:
+                self._reporter.report(
+                    self._build_metadata_event(
+                        model=requested_model,
+                        provider=provider,
+                        input_tokens=est_in,
+                        output_tokens=0,
+                        token_details=None,
+                        latency_ms=0.0,
+                        status=CallStatus.BUDGET_DENIED,
+                        is_model_fallback=False,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                        provider_region=provider_region,
+                        modality=spec.modality,
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to report budget_denied metadata event: %s",
+                    type(exc).__name__,
+                )
+            raise BudgetExceededError(
+                project_id=budget.project_id,
+                budget_limit=budget.budget_limit,
+                current_usage=budget.current_usage,
+                estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
+                budget_period="unknown",
+                mode=budget.mode.value,
+            )
+
+        # 3. Provider call — PRIMARY only. A dispatch error is reported (parity
+        #    with the chat error path) then re-raised unchanged (drop-in contract).
+        start = time.monotonic()
+        try:
+            response = self._media_dispatch(
+                runtime,
+                spec.surface,
+                kwargs,
+                timeout=_hop_timeout(deadline, 1),
+                max_retries=0,
+            )
+        except Exception as exc:
+            self._reporter.report(
+                self._build_error_event(
+                    model=requested_model,
+                    provider=provider,
+                    latency_ms=(time.monotonic() - start) * 1000,
+                    is_model_fallback=False,
+                    failover_error_class=type(exc).__name__,
+                    call_id=call_id,
+                    agent_run=agent_run,
+                    provider_region=provider_region,
+                )
+            )
+            raise
+        latency_ms = (time.monotonic() - start) * 1000
+
+        # 4. Billable quantity: response usage first, request-derived fallback.
+        token_details = spec.extract_usage(response)
+        if token_details is None:
+            token_details = spec.measure_request(kwargs)
+
+        # 5. Confirm + report the served call (is_model_fallback=False, primary-only).
+        service_tier = runtime.adapter.extract_service_tier(response)
+        if budget.reservation_id and token_details is not None:
+            self._budget.confirm_cost(
+                budget.reservation_id,
+                requested_model,
+                token_details,
+                provider=provider,
+                is_provider_fallback=False,
+                call_id=call_id,
+                provider_region=provider_region,
+                service_tier=service_tier,
+                modality=spec.modality,
+            )
+        self._reporter.report(
+            self._build_metadata_event(
+                model=requested_model,
+                provider=provider,
+                input_tokens=token_details.input_tokens if token_details is not None else 0,
+                output_tokens=token_details.output_tokens if token_details is not None else 0,
+                token_details=token_details,
+                latency_ms=latency_ms,
+                status=CallStatus.SUCCESS,
+                is_model_fallback=False,
+                attempt_index=0,
+                call_id=call_id,
+                service_tier=service_tier,
+                agent_run=agent_run,
+                provider_region=provider_region,
+                modality=spec.modality,
+            )
+        )
+        return response
 
     def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Core interception logic: the classified candidate walk."""
@@ -1185,10 +1391,7 @@ class Solwyn(_SolwynBase):
         """Pass through non-intercepted attributes to the underlying client."""
         attribute = getattr(self._client, name)
         _warn_unmetered_spend_surface_once(
-            adapter=self._adapter,
-            surface=name,
-            warned_surfaces=self._warned_unmetered_spend_surfaces,
-            warning_lock=self._unmetered_spend_warning_lock,
+            adapter=self._adapter, dialect=self._dialect, surface=name
         )
         return attribute
 
@@ -1232,8 +1435,6 @@ class AsyncSolwyn(_SolwynBase):
     ) -> None:
         # See sync Solwyn.__init__ for why _client is typed Any.
         self._client: Any = client
-        self._warned_unmetered_spend_surfaces: set[str] = set()
-        self._unmetered_spend_warning_lock = threading.Lock()
 
         if "project_id" in config_kwargs:
             raise TypeError("unexpected keyword argument 'project_id'")
@@ -1294,6 +1495,17 @@ class AsyncSolwyn(_SolwynBase):
         return _AsyncChatProxy(self)
 
     @functools.cached_property
+    def embeddings(self) -> _AsyncEmbeddingsProxy:
+        """Return an async proxy that routes embeddings.create() through the media lifecycle.
+
+        Unconditional (like ``chat``): the embeddings surface is the openai
+        dialect, shared by native OpenAI and every OpenAI-compatible provider.
+        On a non-openai client ``.create()`` fails loud with
+        ``UnsupportedSurfaceError``. Cached: provider is fixed at construction.
+        """
+        return _AsyncEmbeddingsProxy(self)
+
+    @functools.cached_property
     def messages(self) -> Any:
         """Anthropic-compatible: client.messages.create() goes through interception.
 
@@ -1341,6 +1553,12 @@ class AsyncSolwyn(_SolwynBase):
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
         return await self._client.invoke_model_with_response_stream(**kwargs)
 
+    async def start_async_invoke(self, **kwargs: Any) -> Any:
+        """Fail loud on Bedrock's async invocation surface (untracked video-scale spend)."""
+        if self._dialect == "bedrock":
+            raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
+        return await self._client.start_async_invoke(**kwargs)
+
     async def _async_dispatch(
         self,
         runtime: ProviderRuntime,
@@ -1370,6 +1588,154 @@ class AsyncSolwyn(_SolwynBase):
             max_retries=max_retries,
         )
         return await method(**call_kwargs)
+
+    async def _media_dispatch(
+        self,
+        runtime: ProviderRuntime,
+        surface: str,
+        kwargs: dict[str, object],
+        *,
+        timeout: float,
+        max_retries: int,
+    ) -> Any:
+        """Dispatch one media hop to the runtime's async SDK client. Pure I/O.
+
+        Mirrors the sync ``_media_dispatch``: the per-hop bound applies via
+        ``with_options`` where available, then the adapter's ``prepare_media_call``
+        seam returns the same attribute path on the async client — only the await
+        differs here. No streaming and no candidate walk (primary-only).
+        """
+        client = runtime.sdk_client
+        if hasattr(client, "with_options"):
+            client = client.with_options(timeout=timeout, max_retries=max_retries)
+        method, call_kwargs = _media_prepare(
+            runtime.adapter, surface, client, kwargs, timeout=timeout, max_retries=max_retries
+        )
+        return await method(**call_kwargs)
+
+    async def _media_call(self, spec: MediaSurfaceSpec, **kwargs: object) -> Any:
+        """Async lean lifecycle for a non-chat media surface.
+
+        Mirror of the sync ``_media_call``: estimate -> budget check -> provider
+        call -> extract/measure -> confirm + report. No candidate walk, no
+        translation, ``is_model_fallback`` always False; served by the PRIMARY
+        runtime alone. Billable quantity comes from the spec hooks (response
+        usage first, request-derived fallback) and stays None when unobservable.
+        """
+        requested_model = cast(str, kwargs["model"])
+        agent_run = current_run()
+        call_id = str(uuid.uuid4())
+        runtime = self._runtimes[0]
+        provider = runtime.adapter.name
+        deadline = Deadline(self._config.failover_total_timeout)
+
+        char_count = estimate_content_length(kwargs)
+        est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
+
+        budget = await self._budget.check_budget(
+            estimated_input_tokens=est_in,
+            model=requested_model,
+            provider=provider,
+            timeout=_budget_timeout(deadline),
+            modality=spec.modality,
+        )
+        if budget.price_hints is not None:
+            self.update_price_hints(budget.price_hints)
+
+        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
+        if not budget.allowed:
+            try:
+                self._reporter.report(
+                    self._build_metadata_event(
+                        model=requested_model,
+                        provider=provider,
+                        input_tokens=est_in,
+                        output_tokens=0,
+                        token_details=None,
+                        latency_ms=0.0,
+                        status=CallStatus.BUDGET_DENIED,
+                        is_model_fallback=False,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                        provider_region=provider_region,
+                        modality=spec.modality,
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to report budget_denied metadata event: %s",
+                    type(exc).__name__,
+                )
+            raise BudgetExceededError(
+                project_id=budget.project_id,
+                budget_limit=budget.budget_limit,
+                current_usage=budget.current_usage,
+                estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
+                budget_period="unknown",
+                mode=budget.mode.value,
+            )
+
+        start = time.monotonic()
+        try:
+            response = await self._media_dispatch(
+                runtime,
+                spec.surface,
+                kwargs,
+                timeout=_hop_timeout(deadline, 1),
+                max_retries=0,
+            )
+        except Exception as exc:
+            self._reporter.report(
+                self._build_error_event(
+                    model=requested_model,
+                    provider=provider,
+                    latency_ms=(time.monotonic() - start) * 1000,
+                    is_model_fallback=False,
+                    failover_error_class=type(exc).__name__,
+                    call_id=call_id,
+                    agent_run=agent_run,
+                    provider_region=provider_region,
+                )
+            )
+            raise
+        latency_ms = (time.monotonic() - start) * 1000
+
+        token_details = spec.extract_usage(response)
+        if token_details is None:
+            token_details = spec.measure_request(kwargs)
+
+        service_tier = runtime.adapter.extract_service_tier(response)
+        if budget.reservation_id and token_details is not None:
+            await self._budget.confirm_cost(
+                budget.reservation_id,
+                requested_model,
+                token_details,
+                provider=provider,
+                is_provider_fallback=False,
+                call_id=call_id,
+                provider_region=provider_region,
+                service_tier=service_tier,
+                modality=spec.modality,
+            )
+        self._reporter.report(
+            self._build_metadata_event(
+                model=requested_model,
+                provider=provider,
+                input_tokens=token_details.input_tokens if token_details is not None else 0,
+                output_tokens=token_details.output_tokens if token_details is not None else 0,
+                token_details=token_details,
+                latency_ms=latency_ms,
+                status=CallStatus.SUCCESS,
+                is_model_fallback=False,
+                attempt_index=0,
+                call_id=call_id,
+                service_tier=service_tier,
+                agent_run=agent_run,
+                provider_region=provider_region,
+                modality=spec.modality,
+            )
+        )
+        return response
 
     async def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Async core interception logic: the classified candidate walk."""
@@ -1861,9 +2227,6 @@ class AsyncSolwyn(_SolwynBase):
         """Pass through non-intercepted attributes to the underlying client."""
         attribute = getattr(self._client, name)
         _warn_unmetered_spend_surface_once(
-            adapter=self._adapter,
-            surface=name,
-            warned_surfaces=self._warned_unmetered_spend_surfaces,
-            warning_lock=self._unmetered_spend_warning_lock,
+            adapter=self._adapter, dialect=self._dialect, surface=name
         )
         return attribute

@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY
 
+from solwyn._privacy import estimate_embedding_input_tokens
 from solwyn._types import BudgetCheckRequest, BudgetConfirmRequest, MetadataEvent
 from solwyn.client import Solwyn
 
@@ -686,3 +687,59 @@ def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
 
     solwyn._budget._http.close()
     solwyn._reporter._http.close()
+
+
+# --------------------------------------------------------------------------- #
+# Embeddings input recognizer (P1.9) — length-only, content-free              #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestEstimateEmbeddingInputTokens:
+    """estimate_embedding_input_tokens measures LENGTHS of ``input=`` only.
+
+    It reshapes customer content (it lives in the content-privileged _privacy
+    module) but retains none: it returns a single non-reversible integer.
+    """
+
+    def test_str_input_uses_char_count_over_provider_ratio(self) -> None:
+        # 40 chars / 4.0 (openai) -> 10 tokens.
+        assert estimate_embedding_input_tokens({"input": "a" * 40}, "openai") == 10
+
+    def test_str_input_ratio_is_provider_specific(self) -> None:
+        # Same chars, anthropic ratio 3.8 -> int(38/3.8) = 10 vs openai int(38/4)=9.
+        assert estimate_embedding_input_tokens({"input": "a" * 38}, "anthropic") == 10
+        assert estimate_embedding_input_tokens({"input": "a" * 38}, "openai") == 9
+
+    def test_list_of_str_sums_char_counts(self) -> None:
+        # (40 + 40) chars / 4.0 -> 20 tokens.
+        assert estimate_embedding_input_tokens({"input": ["a" * 40, "b" * 40]}, "openai") == 20
+
+    def test_list_of_int_uses_len_directly(self) -> None:
+        # Pre-tokenized: five token ids IS five tokens — NOT chars/ratio (which
+        # would undercount to 1). This is the core correctness guarantee.
+        assert estimate_embedding_input_tokens({"input": [11, 22, 33, 44, 55]}, "openai") == 5
+
+    def test_list_of_list_of_int_sums_inner_lengths(self) -> None:
+        # Batch of pre-tokenized sequences: 3 + 2 = 5 tokens.
+        assert estimate_embedding_input_tokens({"input": [[1, 2, 3], [4, 5]]}, "openai") == 5
+
+    def test_absent_input_is_zero(self) -> None:
+        assert estimate_embedding_input_tokens({"model": "text-embedding-3-small"}, "openai") == 0
+
+    def test_empty_string_is_zero_not_floored_to_one(self) -> None:
+        # The chars->tokens floor of 1 must not fabricate a token for empty input.
+        assert estimate_embedding_input_tokens({"input": ""}, "openai") == 0
+
+    def test_empty_list_is_zero(self) -> None:
+        assert estimate_embedding_input_tokens({"input": []}, "openai") == 0
+
+    def test_unrecognized_shape_is_zero(self) -> None:
+        # A non-str/non-list input (e.g. a mapping) is unobservable -> 0, so the
+        # caller keeps the quantity None rather than settling a zero-as-default.
+        assert estimate_embedding_input_tokens({"input": {"weird": "shape"}}, "openai") == 0
+
+    def test_returns_bare_int_retaining_no_content(self) -> None:
+        # The only thing that leaves the recognizer is a non-reversible length.
+        secret = "SUPER-SECRET-EMBEDDING-INPUT-abcdefghij"
+        result = estimate_embedding_input_tokens({"input": secret}, "openai")
+        assert isinstance(result, int)
+        assert result == len(secret) // 4  # 39 // 4 -> 9, content unrecoverable

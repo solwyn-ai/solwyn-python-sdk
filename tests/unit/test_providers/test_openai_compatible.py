@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from solwyn._types import ProviderName
+from solwyn.exceptions import UnsupportedSurfaceError
 from solwyn.providers import get_adapter_by_name, get_adapter_for_client, get_adapter_for_model
 from solwyn.providers._protocol import ProviderAdapter
 from solwyn.providers.openai import OpenAIAdapter
@@ -107,6 +108,37 @@ class TestProfileTable:
     def test_all_adapters_speak_openai_dialect(self) -> None:
         for adapter in build_compat_adapters():
             assert adapter.dialect == "openai"
+
+    def test_prepare_media_call_embeddings_selects_embeddings_create_for_every_profile(
+        self,
+    ) -> None:
+        # P1.7: one embeddings branch covers every compat adapter (incl. the
+        # first-class Together adapter, which inherits it) since they share the
+        # openai dialect. Each routes to client.embeddings.create with a COPY.
+        def create(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(embeddings=SimpleNamespace(create=create))
+        for adapter in build_compat_adapters():
+            kwargs: dict[str, Any] = {"model": "m", "input": "hi"}
+            method, prepared = adapter.prepare_media_call(
+                "embeddings", client, kwargs, timeout=30.0, max_retries=0
+            )
+            assert method is create, adapter.name
+            assert prepared == {"model": "m", "input": "hi"}, adapter.name
+            assert prepared is not kwargs, adapter.name  # never mutates / aliases input
+
+    def test_prepare_media_call_raises_unsupported_surface_for_unwired_every_profile(self) -> None:
+        # Only embeddings is wired (P1.7); images/audio/video still fail loud
+        # with the provider's own name attached.
+        for adapter in build_compat_adapters():
+            for surface in ("images", "audio", "video"):
+                with pytest.raises(UnsupportedSurfaceError) as excinfo:
+                    adapter.prepare_media_call(
+                        surface, object(), {"model": "m"}, timeout=30.0, max_retries=0
+                    )
+                assert excinfo.value.surface == surface
+                assert excinfo.value.provider == adapter.name
 
     def test_together_profile_slot_uses_first_class_adapter(self) -> None:
         adapters = build_compat_adapters()

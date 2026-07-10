@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -10,12 +11,19 @@ import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 
 import solwyn as solwyn_pkg
+from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn._privacy import estimate_content_length
 from solwyn._types import BudgetMode, ProviderName
 from solwyn.client import Solwyn
 from solwyn.exceptions import BudgetExceededError, ProviderUnavailableError
 from solwyn.providers import get_adapter_for_client
 from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
+
+
+@pytest.fixture(autouse=True)
+def _reset_spend_surface_latch() -> None:
+    """Reset the per-process warn-once latch so warn tests stay order-independent."""
+    _reset_unmetered_spend_warnings()
 
 
 def _mock_openai_client():
@@ -513,6 +521,100 @@ class TestGetAttrPassThrough:
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
+
+
+@pytest.mark.unit
+class TestUnshippedSpendSurfacePosture:
+    """Posture: recognized-but-unshipped openai spend surfaces warn-once then pass through.
+
+    images (P2), audio (P3) and videos (P4) are billable surfaces whose
+    interception phase has not shipped. Accessing them on any openai-dialect
+    client logs exactly one warning per surface per process, then passes the
+    attribute through untracked. embeddings is deliberately silent: it is
+    intercepted (P1.7), not warned.
+    """
+
+    def _close(self, solwyn: Solwyn) -> None:
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_openai_media_surfaces_warn_once_and_pass_through(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        for surface in ("images", "audio", "videos"):
+            _reset_unmetered_spend_warnings()
+            client, _ = _mock_openai_client()
+            resource = object()
+            setattr(client, surface, resource)
+            solwyn = _make_solwyn(client)
+
+            with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+                caplog.clear()
+                first = getattr(solwyn, surface)
+                second = getattr(solwyn, surface)
+
+            assert first is resource
+            assert second is resource  # pass-through, unchanged
+            assert len(caplog.records) == 1  # once per process, not per access
+            message = caplog.records[0].getMessage()
+            assert "openai" in message
+            assert f"surface '{surface}'" in message
+            assert "untracked" in message
+            assert "tracking for this surface is coming" in message.lower()
+            self._close(solwyn)
+
+    def test_warn_is_per_process_across_instances(self, caplog: pytest.LogCaptureFixture) -> None:
+        first_client, _ = _mock_openai_client()
+        first_client.images = object()
+        second_client, _ = _mock_openai_client()
+        second_client.images = object()
+        first = _make_solwyn(first_client)
+        second = _make_solwyn(second_client)
+
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+            _ = first.images
+            _ = second.images  # different instance, same process -> no re-warn
+
+        assert len(caplog.records) == 1
+        self._close(first)
+        self._close(second)
+
+    def test_intercepted_and_unrelated_surfaces_are_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # embeddings graduates to interception (P1.7) -> it returns the media
+        # proxy, NOT the raw client attribute; moderations/files are
+        # truly-unrelated resources that pass through. None of them warn.
+        client, _ = _mock_openai_client()
+        for surface in ("embeddings", "moderations", "files"):
+            setattr(client, surface, object())
+        solwyn = _make_solwyn(client)
+
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+            # embeddings is intercepted: the proxy replaces the raw attribute.
+            assert solwyn.embeddings is not client.embeddings
+            # unrelated resources still pass through untouched.
+            for surface in ("moderations", "files"):
+                assert getattr(solwyn, surface) is getattr(client, surface)
+
+        assert caplog.records == []
+        self._close(solwyn)
+
+    def test_warning_message_carries_no_request_content(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The warning fires at attribute access and interpolates only structural
+        # identifiers (provider name, surface name) — never request/media data.
+        client, _ = _mock_openai_client()
+        client.images = object()
+        solwyn = _make_solwyn(client)
+
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+            _ = solwyn.images
+
+        record = caplog.records[0]
+        assert record.args == ("openai", "images")
+        self._close(solwyn)
 
 
 # ---------------------------------------------------------------------------

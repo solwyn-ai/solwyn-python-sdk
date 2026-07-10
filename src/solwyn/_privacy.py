@@ -107,6 +107,74 @@ def estimate_tokens_from_length(char_count: int, provider: str) -> int:
     return max(1, int(char_count / ratio))
 
 
+def _chars_to_embedding_tokens(char_count: int, provider: str) -> int:
+    """Chars -> tokens via the provider ratio, with 0 chars staying 0.
+
+    ``estimate_tokens_from_length`` floors at 1 token for any positive char
+    count; that floor is wrong for a purely pre-tokenized batch (0 text chars),
+    which would otherwise gain a spurious 1-token estimate. Guard the zero case.
+    """
+    if char_count <= 0:
+        return 0
+    return estimate_tokens_from_length(char_count, provider)
+
+
+def _estimate_embedding_list_tokens(items: list[Any], provider: str) -> int:
+    """Token estimate for a list-valued embeddings ``input=`` (lengths only).
+
+    Element type disambiguates the three list shapes without materializing any
+    text — nothing is concatenated, stored, or returned beyond the integer:
+
+    - ``str`` items: a text batch; character lengths summed then ratio-converted.
+    - ``int`` items: token ids of ONE pre-tokenized sequence — each counts as a
+      single token (``len()`` of the list IS the token count; running
+      chars/ratio over token ids would be wrong).
+    - ``list`` items: a batch of pre-tokenized sequences — each inner list
+      contributes its own length.
+    """
+    char_total = 0
+    token_total = 0
+    for item in items:
+        if isinstance(item, str):
+            char_total += len(item)
+        elif isinstance(item, bool):
+            # bool is an int subclass but is never a token id — ignore it.
+            continue
+        elif isinstance(item, int):
+            # list[int]: one pre-tokenized sequence; each int is one token id.
+            token_total += 1
+        elif isinstance(item, list):
+            # list[list[int]]: this inner sequence's length is its token count.
+            token_total += len(item)
+    return token_total + _chars_to_embedding_tokens(char_total, provider)
+
+
+def estimate_embedding_input_tokens(kwargs: dict[str, Any], provider: str) -> int:
+    """Estimate input tokens for an embeddings request's ``input=`` (lengths only).
+
+    The request-side fallback used when an embeddings response reports no usable
+    usage (``measure_request`` in the embeddings ``MediaSurfaceSpec``). Recognizes
+    the four ``input=`` shapes the OpenAI embeddings API accepts, measuring
+    LENGTHS only — the input text/ids are never retained, logged, or concatenated:
+
+    - ``str``: one text; character count converted to tokens via the provider ratio.
+    - ``list[str]``: a batch of texts; summed character count ratio-converted.
+    - ``list[int]``: ONE pre-tokenized sequence; ``len()`` IS the token count.
+    - ``list[list[int]]``: a batch of pre-tokenized sequences; summed inner lengths.
+
+    Pre-tokenized ids map to tokens 1:1 — dividing their count by the char/token
+    ratio would undercount. Returns 0 when ``input=`` is absent or an unrecognized
+    shape, so the caller keeps the billable quantity None rather than settling a
+    zero-as-default price.
+    """
+    input_value = kwargs.get("input")
+    if isinstance(input_value, str):
+        return _chars_to_embedding_tokens(len(input_value), provider)
+    if isinstance(input_value, list):
+        return _estimate_embedding_list_tokens(input_value, provider)
+    return 0
+
+
 def _part_text_length(part: Any) -> int:
     """Sum string lengths of one delta/message part: content, reasoning text,
     and tool-call function arguments. Length-only; nothing is concatenated,

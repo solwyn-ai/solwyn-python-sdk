@@ -13,8 +13,10 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -27,7 +29,7 @@ from solwyn._routing import (
 )
 from solwyn._run import current_run
 from solwyn._token_details import TokenDetails
-from solwyn._types import CallStatus, FailoverReason, MetadataEvent, ProviderName
+from solwyn._types import CallStatus, FailoverReason, MetadataEvent, Modality, ProviderName
 from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.config import SolwynConfig
 from solwyn.tokenizer import TokenizerManager
@@ -60,6 +62,77 @@ def _warn_cost_policy_inactive_once() -> None:
             return
         _cost_policy_inactive_warned = True
     logger.warning("CostPolicy selected but no price hints available; using health-based order")
+
+
+# Recognized spend surfaces whose interception phase has not shipped yet: they
+# warn ONCE per process, then pass through untracked. Keyed by DIALECT because
+# the same posture spans every provider that speaks it — OpenAI itself and every
+# OpenAI-compatible provider share the "openai" set. Embeddings is deliberately
+# ABSENT: P1.7 intercepts it on this branch, so it graduates to tracking rather
+# than warning (a surface that is about to be metered must not advertise itself
+# as untracked). Attribute shapes differ by dialect: OpenAI exposes top-level
+# resources (``client.images``), Google exposes methods on ``client.models``
+# (``client.models.generate_images``).
+_UNSHIPPED_SPEND_SURFACES: dict[str, frozenset[str]] = {
+    "openai": frozenset({"images", "audio", "videos"}),
+    "google": frozenset({"generate_images", "generate_videos"}),
+}
+
+# Per-PROCESS warn-once latch for untracked spend surfaces (NOT per-instance): a
+# recognized surface logs exactly one warning per process however many client
+# instances or calls touch it — quiet logs for the create-a-client-per-request
+# pattern. Module-level so the latch spans instances; lock-guarded for the
+# multi-threaded sync client. Keyed by surface name to honor "one warning per
+# surface per process". Tests reset it via ``_reset_unmetered_spend_warnings``.
+_warned_spend_surfaces: set[str] = set()
+_spend_surface_warn_lock = threading.Lock()
+
+
+def _recognized_unshipped_surfaces(adapter: Any, dialect: str) -> frozenset[str]:
+    """Untracked spend surfaces that warn for this adapter.
+
+    The union of the central per-dialect map (modality surfaces whose
+    interception phase has not shipped) and the adapter's own opt-in
+    ``unmetered_spend_surfaces`` (a provider that declares extra untracked
+    billable surfaces — e.g. Together's rerank/code_interpreter/evals). Adapters
+    that declare nothing get only the central map.
+    """
+    central = _UNSHIPPED_SPEND_SURFACES.get(dialect, frozenset())
+    declared: frozenset[str] = getattr(adapter, "unmetered_spend_surfaces", frozenset())
+    return central | declared
+
+
+def _warn_unmetered_spend_surface_once(*, adapter: Any, dialect: str, surface: str) -> None:
+    """Warn once per process when a recognized spend surface passes through untracked.
+
+    Fires for surfaces in ``_recognized_unshipped_surfaces`` only; every other
+    attribute (files, moderations, models.list, …) passes through silently. The
+    surface itself still passes through after the warning — this is the
+    warn-once pass-through posture, not a refusal. Content-free by construction:
+    only the provider ``name`` and ``surface`` (both structural identifiers) are
+    logged, never request or media data.
+    """
+    if surface not in _recognized_unshipped_surfaces(adapter, dialect):
+        return
+
+    with _spend_surface_warn_lock:
+        if surface in _warned_spend_surfaces:
+            return
+        _warned_spend_surfaces.add(surface)
+
+    # Logging handlers may execute arbitrary code; keep them outside the lock.
+    logger.warning(
+        "Provider '%s' surface '%s' is passed through untracked: no budget check "
+        "and no cost event will be emitted. Tracking for this surface is coming.",
+        adapter.name,
+        surface,
+    )
+
+
+def _reset_unmetered_spend_warnings() -> None:
+    """Clear the per-process warn-once latch. Test-support hook only."""
+    with _spend_surface_warn_lock:
+        _warned_spend_surfaces.clear()
 
 
 def _openai_uses_max_completion_tokens(model: str) -> bool:
@@ -118,6 +191,39 @@ def _with_legacy_max_tokens_key(provider: str, kwargs: dict[str, object]) -> dic
     value = rewritten.pop("max_completion_tokens")
     rewritten["max_tokens"] = value
     return rewritten
+
+
+@dataclass(frozen=True)
+class MediaSurfaceSpec:
+    """Per-surface wiring for the ``_media_call`` lifecycle.
+
+    A non-chat media surface (embeddings, images, audio, video) is fully
+    described here, so the lifecycle stays surface-agnostic and later batches
+    add a surface by constructing one of these — never by editing the lifecycle:
+
+    - ``surface``: the dispatch key handed to ``adapter.prepare_media_call``
+      (a ``MediaSurface`` value, e.g. ``"embeddings"``).
+    - ``modality``: the billing modality carried through the lifecycle so the
+      server's card unit can select it. The vendored wire types carry a
+      ``modality`` field (P1.11); ``_media_call`` connects ``spec.modality`` onto
+      the budget check, the confirm, and the SUCCESS / BUDGET_DENIED metadata
+      events. The chat pipeline never sets it and rides the ``"text"`` default.
+    - ``extract_usage``: pulls the billable quantity from the RESPONSE's usage
+      block, or None when the response reports none.
+    - ``measure_request``: derives the billable quantity from the REQUEST when
+      the response reports none (request-side measurement lands in
+      ``solwyn._privacy`` per P1.9). Returns None when the quantity is
+      unobservable.
+
+    Both hooks return ``TokenDetails`` (the quantity carrier) or None — never a
+    zero-filled default, so an unobservable quantity is never settled as a real
+    $0 price.
+    """
+
+    surface: str
+    modality: Modality
+    extract_usage: Callable[[Any], TokenDetails | None]
+    measure_request: Callable[[dict[str, Any]], TokenDetails | None]
 
 
 class _AttemptContext(BaseModel):
@@ -312,6 +418,7 @@ class _SolwynBase:
         timestamp: datetime | None = None,
         agent_run: tuple[str | None, str | None] | None = None,
         provider_region: str | None = None,
+        modality: Modality = "text",
     ) -> MetadataEvent:
         """Build a MetadataEvent for reporting to the cloud API.
 
@@ -319,6 +426,8 @@ class _SolwynBase:
         is the post-send-ambiguous abort flag — left None on every non-abort event.
         ``provider_region`` is the served endpoint's cloud region (Bedrock pricing
         is per model AND region); None for providers without regional pricing.
+        ``modality`` is the call modality — ``"text"`` for every chat event; the
+        media lifecycle passes the surface's modality (e.g. ``"embedding"``).
         """
         if not call_id:
             raise RuntimeError("call_id is required for metadata reconciliation")
@@ -326,6 +435,7 @@ class _SolwynBase:
         return MetadataEvent(
             model=model,
             provider=ProviderName(provider),
+            modality=modality,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             token_details=token_details,

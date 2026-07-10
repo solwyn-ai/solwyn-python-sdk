@@ -7,15 +7,24 @@ not __getattr__ pass-through.
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock as AsyncMockFn
 from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 
+from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import BudgetExceededError
+
+
+@pytest.fixture(autouse=True)
+def _reset_spend_surface_latch() -> None:
+    """Reset the per-process warn-once latch so warn tests stay order-independent."""
+    _reset_unmetered_spend_warnings()
 
 
 def _mock_anthropic_client():
@@ -51,6 +60,40 @@ def _mock_google_client():
             cached_content_token_count=0,
             tool_use_prompt_token_count=0,
         ),
+    )
+    return client
+
+
+def _mock_google_embeddings_client(*, prompt_token_count: int = 55, usage: bool = True):
+    """Create a mock that looks like google.genai.Client for embed_content.
+
+    With ``usage=True`` the response carries ``usage_metadata.prompt_token_count``
+    (the snake_case attribute the SDK would expose); with ``usage=False`` it omits
+    usage entirely, mirroring today's real ``EmbedContentResponse`` (which surfaces
+    no usage) so the request-side estimator drives billing.
+    """
+    client = MagicMock()
+    client.__class__.__module__ = "google.genai._client"
+    # Per-hop with_options must return the same client (see _mock_anthropic_client).
+    client.with_options.return_value = client
+    fields: dict[str, Any] = {"embeddings": [SimpleNamespace(values=[0.1, 0.2])]}
+    if usage:
+        fields["usage_metadata"] = SimpleNamespace(prompt_token_count=prompt_token_count)
+    client.models.embed_content.return_value = SimpleNamespace(**fields)
+    return client
+
+
+def _mock_openai_embeddings_client(*, prompt_tokens: int = 42, usage: bool = True):
+    """Create a mock that looks like openai.OpenAI() with an embeddings surface."""
+    client = MagicMock()
+    client.__class__.__module__ = "openai._client"
+    client.__class__.__name__ = "OpenAI"
+    # Per-hop with_options must return the same client (see _mock_anthropic_client).
+    client.with_options.return_value = client
+    usage_block = SimpleNamespace(prompt_tokens=prompt_tokens, total_tokens=prompt_tokens)
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.1, 0.2], index=0)],
+        usage=usage_block if usage else None,
     )
     return client
 
@@ -207,6 +250,123 @@ class TestGoogleModelsProxy:
         assert solwyn.models.list() == ["gemini-pro"]
         solwyn.close()
 
+    def test_generate_media_surfaces_posture_warn_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Google's image/video generation ride client.models methods, so they
+        # arrive on the models proxy's __getattr__ — warn-once pass-through per
+        # the P1.10 posture (P1.8 delegates this warn to P1.10).
+        for surface in ("generate_images", "generate_videos"):
+            _reset_unmetered_spend_warnings()
+            client = _mock_google_client()
+            generator = MagicMock(return_value="rendered")
+            setattr(client.models, surface, generator)
+            solwyn = _make_solwyn(client)
+
+            with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+                caplog.clear()
+                first = getattr(solwyn.models, surface)
+                second = getattr(solwyn.models, surface)
+
+            assert first is generator
+            assert second is generator  # pass-through
+            assert first() == "rendered"
+            assert len(caplog.records) == 1  # once per surface per process
+            message = caplog.records[0].getMessage()
+            assert "google" in message
+            assert f"surface '{surface}'" in message
+            assert "tracking for this surface is coming" in message.lower()
+            solwyn.close()
+
+    def test_embed_content_is_intercepted_and_reports_prompt_tokens(self) -> None:
+        # embed_content routes through the media lifecycle (P1.8), NOT the
+        # __getattr__ warn-once pass-through: budget-checked, confirmed, reported.
+        client = _mock_google_embeddings_client(prompt_token_count=55)
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            result = solwyn.models.embed_content(
+                model="gemini-embedding-001",
+                contents="hello world",
+            )
+
+        client.models.embed_content.assert_called_once()
+        assert len(reported) == 1
+        assert reported[0].status == "success"
+        # Billable basis is usage_metadata.prompt_token_count; embeddings emit NO
+        # output tokens (a TRUE zero) and the count is provider-reported.
+        assert reported[0].input_tokens == 55
+        assert reported[0].output_tokens == 0
+        assert reported[0].token_details.is_estimated is False
+        assert result.embeddings[0].values == [0.1, 0.2]
+        solwyn.close()
+
+    def test_embed_content_missing_usage_falls_back_to_estimated(self) -> None:
+        # Today's EmbedContentResponse surfaces no usage — request-derived estimate
+        # off contents= (google 4.0 char/token ratio), explicitly is_estimated=True.
+        client = _mock_google_embeddings_client(usage=False)
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            solwyn.models.embed_content(
+                model="gemini-embedding-001",
+                contents="a" * 40,  # 40 chars / 4.0 google ratio -> 10 tokens
+            )
+
+        event = reported[0]
+        assert event.status == "success"
+        assert event.token_details.is_estimated is True
+        assert event.input_tokens == 10
+        assert event.output_tokens == 0
+        solwyn.close()
+
+    def test_embed_content_checks_budget_and_denies(self) -> None:
+        client = _mock_google_embeddings_client()
+        solwyn = _make_solwyn(client, budget_mode="hard_deny")
+
+        deny_response = {
+            **ALLOW_BUDGET_RESPONSE,
+            "allowed": False,
+            "remaining_budget": 0.0,
+            "mode": "hard_deny",
+            "denied_by_period": "monthly",
+            "project_id": VALID_PROJECT_ID,
+        }
+        with _mock_budget(solwyn, deny_response), pytest.raises(BudgetExceededError):
+            solwyn.models.embed_content(model="gemini-embedding-001", contents="hi")
+
+        # Hard-deny short-circuits before the provider call.
+        client.models.embed_content.assert_not_called()
+        solwyn.close()
+
+    def test_embed_content_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        # embed_content is intercepted, not an untracked pass-through — it must
+        # never emit the warn-once "coming soon" surface warning.
+        client = _mock_google_embeddings_client()
+        solwyn = _make_solwyn(client)
+
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"), _mock_budget(solwyn):
+            solwyn.models.embed_content(model="gemini-embedding-001", contents="hi")
+
+        assert caplog.records == []
+        solwyn.close()
+
+    def test_list_passthrough_is_silent(self, caplog: pytest.LogCaptureFixture) -> None:
+        # models.list is an unrelated surface — passes through with no warning.
+        client = _mock_google_client()
+        client.models.list = MagicMock(return_value=["gemini-pro"])
+        solwyn = _make_solwyn(client)
+
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+            assert solwyn.models.list() == ["gemini-pro"]
+
+        assert caplog.records == []
+        solwyn.close()
+
     def test_openai_models_is_not_proxied(self) -> None:
         """For OpenAI clients, .models passes through to the raw client."""
         client = MagicMock()
@@ -224,6 +384,88 @@ class TestGoogleModelsProxy:
         solwyn = _make_solwyn(client)
         # Should pass through to OpenAI's models.list(), not our proxy
         assert solwyn.models.list() == ["gpt-4o"]
+        solwyn.close()
+
+
+# ---------------------------------------------------------------------------
+# OpenAI dialect: client.embeddings.create()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestEmbeddingsProxy:
+    """client.embeddings.create() routes through the media lifecycle (_media_call)."""
+
+    def test_embeddings_create_is_intercepted_and_reports_prompt_tokens(self) -> None:
+        client = _mock_openai_embeddings_client(prompt_tokens=42)
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            result = solwyn.embeddings.create(
+                model="text-embedding-3-small",
+                input="hello world",
+            )
+
+        # Routed to the underlying embeddings surface, not the raw passthrough.
+        client.embeddings.create.assert_called_once()
+        assert len(reported) == 1
+        assert reported[0].status == "success"
+        # Billable basis is usage.prompt_tokens; embeddings emit NO output tokens
+        # (a TRUE zero, not a zero-as-default) and the count is provider-reported.
+        assert reported[0].input_tokens == 42
+        assert reported[0].output_tokens == 0
+        assert reported[0].token_details.is_estimated is False
+        assert result.usage.prompt_tokens == 42
+        solwyn.close()
+
+    def test_embeddings_create_checks_budget_and_denies(self) -> None:
+        client = _mock_openai_embeddings_client()
+        solwyn = _make_solwyn(client, budget_mode="hard_deny")
+
+        deny_response = {
+            **ALLOW_BUDGET_RESPONSE,
+            "allowed": False,
+            "remaining_budget": 0.0,
+            "mode": "hard_deny",
+            "denied_by_period": "monthly",
+            "project_id": VALID_PROJECT_ID,
+        }
+        with _mock_budget(solwyn, deny_response), pytest.raises(BudgetExceededError):
+            solwyn.embeddings.create(model="text-embedding-3-small", input="hi")
+
+        # Hard-deny short-circuits before the provider call.
+        client.embeddings.create.assert_not_called()
+        solwyn.close()
+
+    def test_embeddings_missing_usage_falls_back_to_estimated(self) -> None:
+        # A compat-style response with no usage block -> request-derived estimate,
+        # explicitly flagged is_estimated=True (never a silent zero).
+        client = _mock_openai_embeddings_client(usage=False)
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            solwyn.embeddings.create(
+                model="text-embedding-3-small",
+                input="a" * 40,  # 40 chars / 4.0 openai ratio -> 10 tokens
+            )
+
+        event = reported[0]
+        assert event.status == "success"
+        assert event.token_details.is_estimated is True
+        assert event.input_tokens == 10
+        assert event.output_tokens == 0
+        solwyn.close()
+
+    def test_embeddings_getattr_passthrough(self) -> None:
+        """Non-create attributes pass through to the underlying embeddings surface."""
+        client = _mock_openai_embeddings_client()
+        client.embeddings.some_helper = MagicMock(return_value="ok")
+        solwyn = _make_solwyn(client)
+        assert solwyn.embeddings.some_helper() == "ok"
         solwyn.close()
 
 
@@ -316,6 +558,99 @@ class TestAsyncGoogleModelsProxy:
         client.models.generate_content.assert_called_once()
         assert len(reported) == 1
         assert result.text == "Hello"
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_generate_media_surfaces_posture_warn_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Attribute access on the async models proxy is synchronous; the media
+        # generation methods warn-once pass-through just like the sync proxy.
+        client = _mock_google_client()
+        generator = MagicMock(return_value="rendered")
+        client.models.generate_videos = generator
+        solwyn = _make_async_solwyn(client)
+
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+            first = solwyn.models.generate_videos
+            second = solwyn.models.generate_videos
+
+        assert first is generator
+        assert second is generator
+        assert len(caplog.records) == 1
+        message = caplog.records[0].getMessage()
+        assert "google" in message
+        assert "surface 'generate_videos'" in message
+        assert "tracking for this surface is coming" in message.lower()
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_embed_content_is_intercepted(self) -> None:
+        client = _mock_google_embeddings_client(prompt_token_count=77)
+        client.models.embed_content = AsyncMockFn(
+            return_value=SimpleNamespace(
+                embeddings=[SimpleNamespace(values=[0.1, 0.2])],
+                usage_metadata=SimpleNamespace(prompt_token_count=77),
+            )
+        )
+        solwyn = _make_async_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_async_budget(solwyn):
+            result = await solwyn.models.embed_content(
+                model="gemini-embedding-001",
+                contents="hello",
+            )
+
+        client.models.embed_content.assert_awaited_once()
+        assert len(reported) == 1
+        assert reported[0].status == "success"
+        assert reported[0].input_tokens == 77
+        assert reported[0].output_tokens == 0
+        assert result.embeddings[0].values == [0.1, 0.2]
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+
+@pytest.mark.unit
+class TestAsyncEmbeddingsProxy:
+    """Async client.embeddings.create() routes through the async media lifecycle."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_embeddings_create_is_intercepted(self) -> None:
+        client = _mock_openai_embeddings_client(prompt_tokens=99)
+        client.__class__.__name__ = "AsyncOpenAI"
+        client.embeddings.create = AsyncMockFn(
+            return_value=SimpleNamespace(
+                data=[SimpleNamespace(embedding=[0.1, 0.2], index=0)],
+                usage=SimpleNamespace(prompt_tokens=99, total_tokens=99),
+            )
+        )
+        solwyn = _make_async_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_async_budget(solwyn):
+            result = await solwyn.embeddings.create(
+                model="text-embedding-3-small",
+                input="hello",
+            )
+
+        client.embeddings.create.assert_awaited_once()
+        assert len(reported) == 1
+        assert reported[0].status == "success"
+        assert reported[0].input_tokens == 99
+        assert reported[0].output_tokens == 0
+        assert result.usage.prompt_tokens == 99
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

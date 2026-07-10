@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from solwyn._token_details import TokenDetails
+from solwyn.exceptions import UnsupportedSurfaceError
 from solwyn.providers.openai import OpenAIAdapter
 
 # ---------------------------------------------------------------------------
@@ -409,3 +410,32 @@ class TestOpenAIAdapterDispatchSeams:
         response, wrapper = object(), object()
         assert adapter.unwrap_stream_source(response) is response
         assert adapter.wrap_stream_result(wrapper, response) is wrapper
+
+    def test_prepare_media_call_embeddings_selects_embeddings_create(self) -> None:
+        # P1.7: embeddings routes to client.embeddings.create with a COPY of
+        # kwargs — the same (method, shaped_kwargs) shape prepare_call gives chat.
+        def create(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(embeddings=SimpleNamespace(create=create))
+        kwargs: dict[str, Any] = {"model": "text-embedding-3-small", "input": "hi"}
+
+        method, prepared = OpenAIAdapter().prepare_media_call(
+            "embeddings", client, kwargs, timeout=30.0, max_retries=0
+        )
+
+        assert method is create
+        assert prepared == {"model": "text-embedding-3-small", "input": "hi"}
+        assert prepared is not kwargs  # never mutates / aliases the input
+
+    def test_prepare_media_call_raises_unsupported_surface_for_unwired(self) -> None:
+        # Only embeddings is wired (P1.7); images/audio/video still fail loud
+        # with the structural, content-free UnsupportedSurfaceError.
+        adapter = OpenAIAdapter()
+        for surface in ("images", "audio", "video"):
+            with pytest.raises(UnsupportedSurfaceError) as excinfo:
+                adapter.prepare_media_call(
+                    surface, object(), {"model": "m"}, timeout=30.0, max_retries=0
+                )
+            assert excinfo.value.surface == surface
+            assert excinfo.value.provider == "openai"

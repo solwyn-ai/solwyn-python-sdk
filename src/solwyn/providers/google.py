@@ -23,6 +23,7 @@ from collections.abc import Callable
 from typing import Any, Literal
 
 from solwyn._token_details import TokenDetails
+from solwyn.exceptions import UnsupportedSurfaceError
 
 
 def _extract_google_usage(usage_metadata: Any) -> TokenDetails:
@@ -172,6 +173,31 @@ class GoogleAdapter:
         if is_streaming:
             return client.models.generate_content_stream, kwargs
         return client.models.generate_content, kwargs
+
+    def prepare_media_call(
+        self,
+        surface: str,
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        timeout: float,
+        max_retries: int,
+    ) -> tuple[Callable[..., Any], dict[str, Any]]:
+        """Per-surface dispatch seam for non-chat media surfaces.
+
+        Embeddings (P1.8) route to ``client.models.embed_content``. Unlike the
+        openai seam — where the dispatcher already applied the per-hop bound via
+        ``with_options`` — google-genai has no ``with_options``, so (exactly as
+        ``prepare_call`` does for chat) the mandatory bound is injected here as
+        per-request ``config.http_options`` via ``_with_google_http_bound``,
+        which also returns a defensive COPY (never mutates the caller's kwargs).
+        Images/video are not wired yet and fail loud with the structural,
+        content-free ``UnsupportedSurfaceError``.
+        """
+        if surface == "embeddings":
+            bounded = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
+            return client.models.embed_content, bounded
+        raise UnsupportedSurfaceError(surface=surface, provider=self.name)
 
     def unwrap_stream_source(self, response: Any) -> Any:
         """The streaming call returns the iterable itself."""
