@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import inspect
 import logging
+import threading
+import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -37,6 +40,16 @@ UNMETERED_SPEND_SURFACES = frozenset(
         "evals",
     }
 )
+
+
+class _YieldingSet(set[str]):
+    """Yield after an absent membership check to expose check/insert races."""
+
+    def __contains__(self, item: object) -> bool:
+        present = super().__contains__(item)
+        if not present:
+            time.sleep(0.05)
+        return present
 
 
 @pytest.mark.unit
@@ -271,6 +284,34 @@ def test_sync_warns_once_for_each_declared_unmetered_surface(
     for surface in UNMETERED_SPEND_SURFACES:
         assert sum(f"surface '{surface}'" in message for message in warning_messages) == 1
         assert resources[surface].create.call_count == 2
+    solwyn.close()
+
+
+@pytest.mark.unit
+def test_sync_concurrent_unmetered_surface_access_warns_exactly_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    worker_count = 8
+    client = FakeTogetherClient(_completion_response())
+    resource = object()
+    client.images = resource
+    solwyn = _make_solwyn(client)
+    solwyn._warned_unmetered_spend_surfaces = _YieldingSet()
+    start = threading.Barrier(worker_count)
+
+    def access_surface(_: int) -> object:
+        start.wait(timeout=5)
+        return solwyn.images
+
+    with (
+        caplog.at_level(logging.WARNING, logger="solwyn.client"),
+        ThreadPoolExecutor(max_workers=worker_count) as executor,
+    ):
+        results = list(executor.map(access_surface, range(worker_count)))
+
+    assert all(result is resource for result in results)
+    assert len(caplog.records) == 1
+    assert "surface 'images'" in caplog.records[0].getMessage()
     solwyn.close()
 
 

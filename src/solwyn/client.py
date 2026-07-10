@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -130,6 +131,32 @@ _INVOKE_MODEL_GUIDANCE = (
     "them without buffering response content. To make untracked calls anyway, use "
     "the unwrapped boto3 client directly."
 )
+
+
+def _warn_unmetered_spend_surface_once(
+    *,
+    adapter: Any,
+    surface: str,
+    warned_surfaces: set[str],
+    warning_lock: threading.Lock,
+) -> None:
+    """Warn once when an adapter-declared spend surface passes through untracked."""
+    unmetered_surfaces: frozenset[str] = getattr(adapter, "unmetered_spend_surfaces", frozenset())
+    if surface not in unmetered_surfaces:
+        return
+
+    with warning_lock:
+        if surface in warned_surfaces:
+            return
+        warned_surfaces.add(surface)
+
+    # Logging handlers may execute arbitrary code; keep them outside the lock.
+    logger.warning(
+        "Provider '%s' surface '%s' is passed through untracked: "
+        "no budget check and no cost event will be emitted",
+        adapter.name,
+        surface,
+    )
 
 
 def _source_compatible_defaults(dialect: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -496,6 +523,7 @@ class Solwyn(_SolwynBase):
         # match all three. Type safety stops at the _sync_dispatch boundary.
         self._client: Any = client
         self._warned_unmetered_spend_surfaces: set[str] = set()
+        self._unmetered_spend_warning_lock = threading.Lock()
 
         if "project_id" in config_kwargs:
             raise TypeError("unexpected keyword argument 'project_id'")
@@ -1156,17 +1184,12 @@ class Solwyn(_SolwynBase):
     def __getattr__(self, name: str) -> Any:
         """Pass through non-intercepted attributes to the underlying client."""
         attribute = getattr(self._client, name)
-        unmetered_surfaces: frozenset[str] = getattr(
-            self._adapter, "unmetered_spend_surfaces", frozenset()
+        _warn_unmetered_spend_surface_once(
+            adapter=self._adapter,
+            surface=name,
+            warned_surfaces=self._warned_unmetered_spend_surfaces,
+            warning_lock=self._unmetered_spend_warning_lock,
         )
-        if name in unmetered_surfaces and name not in self._warned_unmetered_spend_surfaces:
-            self._warned_unmetered_spend_surfaces.add(name)
-            logger.warning(
-                "Provider '%s' surface '%s' is passed through untracked: "
-                "no budget check and no cost event will be emitted",
-                self._adapter.name,
-                name,
-            )
         return attribute
 
 
@@ -1210,6 +1233,7 @@ class AsyncSolwyn(_SolwynBase):
         # See sync Solwyn.__init__ for why _client is typed Any.
         self._client: Any = client
         self._warned_unmetered_spend_surfaces: set[str] = set()
+        self._unmetered_spend_warning_lock = threading.Lock()
 
         if "project_id" in config_kwargs:
             raise TypeError("unexpected keyword argument 'project_id'")
@@ -1836,15 +1860,10 @@ class AsyncSolwyn(_SolwynBase):
     def __getattr__(self, name: str) -> Any:
         """Pass through non-intercepted attributes to the underlying client."""
         attribute = getattr(self._client, name)
-        unmetered_surfaces: frozenset[str] = getattr(
-            self._adapter, "unmetered_spend_surfaces", frozenset()
+        _warn_unmetered_spend_surface_once(
+            adapter=self._adapter,
+            surface=name,
+            warned_surfaces=self._warned_unmetered_spend_surfaces,
+            warning_lock=self._unmetered_spend_warning_lock,
         )
-        if name in unmetered_surfaces and name not in self._warned_unmetered_spend_surfaces:
-            self._warned_unmetered_spend_surfaces.add(name)
-            logger.warning(
-                "Provider '%s' surface '%s' is passed through untracked: "
-                "no budget check and no cost event will be emitted",
-                self._adapter.name,
-                name,
-            )
         return attribute
