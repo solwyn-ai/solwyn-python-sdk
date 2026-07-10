@@ -15,22 +15,33 @@ from typing import Any
 
 import pytest
 
+import solwyn.providers as provider_registry
 from solwyn._types import ProviderName
 from solwyn.providers import get_adapter_by_name, get_adapter_for_client, get_adapter_for_model
 from solwyn.providers._protocol import ProviderAdapter
 from solwyn.providers.anthropic import AnthropicAdapter
+from solwyn.providers.bedrock import BedrockAdapter
 from solwyn.providers.google import GoogleAdapter
 from solwyn.providers.openai import OpenAIAdapter
+from solwyn.providers.openai_compatible import COMPAT_PROFILES
 from solwyn.providers.together import TogetherAdapter
 
 
-def _make_client(module_path: str) -> Any:
-    """Return an instance of a dynamically-created class with the given __module__.
+def _make_client(
+    module_path: str,
+    *,
+    class_name: str = "FakeClient",
+    base_url: str | None = None,
+) -> Any:
+    """Return a fake client with controlled type metadata and optional base URL.
 
     This lets us test detect_client() without installing the real SDK packages.
     """
-    FakeClient = type("FakeClient", (), {"__module__": module_path})
-    return FakeClient()
+    FakeClient = type(class_name, (), {"__module__": module_path})
+    client = FakeClient()
+    if base_url is not None:
+        client.base_url = base_url  # type: ignore[attr-defined]
+    return client
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +157,46 @@ class TestGetAdapterForClient:
 
 @pytest.mark.unit
 class TestAllAdaptersRegistered:
+    def test_registry_preserves_together_singleton_and_detection_order(self) -> None:
+        together_by_name = get_adapter_by_name("together")
+        assert provider_registry._ADAPTERS is not None
+        assert provider_registry._ADAPTER_BY_NAME is not None
+        adapters = provider_registry._ADAPTERS
+
+        together_adapters = [
+            adapter for adapter in adapters if isinstance(adapter, TogetherAdapter)
+        ]
+        assert len(together_adapters) == 1
+        together_adapter = together_adapters[0]
+        assert provider_registry._ADAPTER_BY_NAME["together"] is together_adapter
+        assert together_by_name is together_adapter
+
+        compat_names = [profile.name for profile in COMPAT_PROFILES]
+        assert COMPAT_PROFILES[-1].catch_all is True
+        assert all(not profile.catch_all for profile in COMPAT_PROFILES[:-1])
+        assert [adapter.name for adapter in adapters] == [
+            *compat_names,
+            "openai",
+            "anthropic",
+            "google",
+            "bedrock",
+        ]
+        assert [type(adapter) for adapter in adapters[len(COMPAT_PROFILES) :]] == [
+            OpenAIAdapter,
+            AnthropicAdapter,
+            GoogleAdapter,
+            BedrockAdapter,
+        ]
+
+        native_client = _make_client("together", class_name="Together")
+        openai_client = _make_client(
+            "openai._client",
+            class_name="OpenAI",
+            base_url="https://api.together.xyz/v1",
+        )
+        assert get_adapter_for_client(native_client) is together_adapter
+        assert get_adapter_for_client(openai_client) is together_adapter
+
     def test_all_four_providers_registered(self) -> None:
         """All four expected provider names resolve without error."""
         for name in ("openai", "anthropic", "google", "bedrock"):
