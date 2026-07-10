@@ -69,9 +69,10 @@ def _usage_chunk() -> SimpleNamespace:
 
 
 class _TogetherCompletions:
-    def __init__(self, response: object) -> None:
+    def __init__(self, response: object, order_log: list[str] | None = None) -> None:
         self.response = response
         self.calls: list[dict[str, object]] = []
+        self._order_log = order_log
 
     def create(
         self,
@@ -80,6 +81,8 @@ class _TogetherCompletions:
         messages: list[dict[str, object]],
         stream: bool = False,
     ) -> object:
+        if self._order_log is not None:
+            self._order_log.append("dispatch")
         self.calls.append({"model": model, "messages_identity": id(messages), "stream": stream})
         return self.response
 
@@ -89,8 +92,8 @@ class Together:
 
     __module__ = "together"
 
-    def __init__(self, response: object) -> None:
-        self.completions = _TogetherCompletions(response)
+    def __init__(self, response: object, order_log: list[str] | None = None) -> None:
+        self.completions = _TogetherCompletions(response, order_log)
         self.chat = SimpleNamespace(completions=self.completions)
 
 
@@ -98,9 +101,10 @@ FakeTogetherClient = Together
 
 
 class _AsyncTogetherCompletions:
-    def __init__(self, response: object) -> None:
+    def __init__(self, response: object, order_log: list[str] | None = None) -> None:
         self.response = response
         self.calls: list[dict[str, object]] = []
+        self._order_log = order_log
 
     async def create(
         self,
@@ -109,6 +113,8 @@ class _AsyncTogetherCompletions:
         messages: list[dict[str, object]],
         stream: bool = False,
     ) -> object:
+        if self._order_log is not None:
+            self._order_log.append("dispatch")
         self.calls.append({"model": model, "messages_identity": id(messages), "stream": stream})
         return self.response
 
@@ -118,8 +124,8 @@ class AsyncTogether:
 
     __module__ = "together"
 
-    def __init__(self, response: object) -> None:
-        self.completions = _AsyncTogetherCompletions(response)
+    def __init__(self, response: object, order_log: list[str] | None = None) -> None:
+        self.completions = _AsyncTogetherCompletions(response, order_log)
         self.chat = SimpleNamespace(completions=self.completions)
 
 
@@ -156,17 +162,28 @@ def _capture_settlements(
     return capture
 
 
+def _record_budget_check(
+    order_log: list[str], response: SimpleNamespace
+) -> Callable[..., SimpleNamespace]:
+    def check(**_: object) -> SimpleNamespace:
+        order_log.append("budget")
+        return response
+
+    return check
+
+
 @pytest.mark.unit
 def test_sync_together_runs_budget_dispatch_usage_and_success_pipeline() -> None:
     # Arrange
+    order: list[str] = []
     response = _completion_response()
-    client = FakeTogetherClient(response)
+    client = FakeTogetherClient(response, order)
     messages: list[dict[str, object]] = [{"role": "user", "content": "hello"}]
     solwyn = _make_solwyn(client)
     reported: list[Any] = []
     check_budget = MagicMock(
         spec=solwyn._budget.check_budget,
-        return_value=_allow_budget(),
+        side_effect=_record_budget_check(order, _allow_budget()),
     )
 
     # Act
@@ -178,6 +195,7 @@ def test_sync_together_runs_budget_dispatch_usage_and_success_pipeline() -> None
 
     # Assert
     assert result is response
+    assert order == ["budget", "dispatch"]
     assert check_budget.call_args.kwargs["provider"] == "together"
     assert check_budget.call_args.kwargs["model"] == MODEL
     assert check_budget.call_args.kwargs["estimated_input_tokens"] > 0
@@ -199,14 +217,15 @@ def test_sync_together_runs_budget_dispatch_usage_and_success_pipeline() -> None
 @pytest.mark.asyncio
 async def test_async_together_runs_budget_dispatch_usage_and_success_pipeline() -> None:
     # Arrange
+    order: list[str] = []
     response = _completion_response()
-    client = AsyncTogether(response)
+    client = AsyncTogether(response, order)
     messages: list[dict[str, object]] = [{"role": "user", "content": "hello"}]
     solwyn = _make_async_solwyn(client)
     reported: list[Any] = []
     check_budget = AsyncMock(
         spec=solwyn._budget.check_budget,
-        return_value=_allow_budget(),
+        side_effect=_record_budget_check(order, _allow_budget()),
     )
 
     # Act
@@ -218,6 +237,7 @@ async def test_async_together_runs_budget_dispatch_usage_and_success_pipeline() 
 
     # Assert
     assert result is response
+    assert order == ["budget", "dispatch"]
     assert check_budget.call_args.kwargs["provider"] == "together"
     assert check_budget.call_args.kwargs["model"] == MODEL
     assert check_budget.call_args.kwargs["estimated_input_tokens"] > 0
