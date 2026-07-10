@@ -59,7 +59,7 @@ def _resolve_adapter(client: Any, provider_override: str | None) -> ProviderAdap
         raise ConfigurationError(
             f"provider override '{provider_override}' was given, but the client "
             f"type '{type(client).__name__}' is not a recognized provider SDK "
-            "client (openai / anthropic / google-genai)",
+            "client (openai / anthropic / google-genai / bedrock / together)",
             field="provider",
         ) from exc
     if detected.dialect != adapter.dialect:

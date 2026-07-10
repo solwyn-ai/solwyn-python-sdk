@@ -153,6 +153,36 @@ class TestOpenAIAdapterExtractUsageChatCompletions:
         result = OpenAIAdapter().extract_usage(response)
         assert result.cached_input_tokens == 400
 
+    def test_flat_cached_tokens_when_prompt_details_absent(self) -> None:
+        response = SimpleNamespace(
+            usage=SimpleNamespace(
+                prompt_tokens=1000,
+                completion_tokens=500,
+                cached_tokens=400,
+            )
+        )
+
+        result = OpenAIAdapter().extract_usage(response)
+
+        assert result.cached_input_tokens == 400
+
+    @pytest.mark.parametrize("nested_cached_tokens", [0, None])
+    def test_prompt_details_cached_tokens_wins_over_flat_fallback(
+        self, nested_cached_tokens: int | None
+    ) -> None:
+        response = SimpleNamespace(
+            usage=SimpleNamespace(
+                prompt_tokens=1000,
+                completion_tokens=500,
+                cached_tokens=400,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=nested_cached_tokens),
+            )
+        )
+
+        result = OpenAIAdapter().extract_usage(response)
+
+        assert result.cached_input_tokens == 0
+
     def test_audio_input_tokens(self) -> None:
         response = _chat_response(prompt_tokens=100, audio_input_tokens=50)
         result = OpenAIAdapter().extract_usage(response)

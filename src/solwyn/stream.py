@@ -8,6 +8,7 @@ and report metadata.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 import time
@@ -245,7 +246,9 @@ class AsyncStreamWrapper:
         if hasattr(self._stream, "aclose"):
             await self._stream.aclose()
         elif hasattr(self._stream, "close"):
-            self._stream.close()
+            close_result = self._stream.close()
+            if inspect.isawaitable(close_result):
+                await close_result
 
     async def __aenter__(self) -> Self:
         if hasattr(self._stream, "__aenter__"):
