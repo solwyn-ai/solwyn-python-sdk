@@ -13,8 +13,10 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict
 
@@ -118,6 +120,39 @@ def _with_legacy_max_tokens_key(provider: str, kwargs: dict[str, object]) -> dic
     value = rewritten.pop("max_completion_tokens")
     rewritten["max_tokens"] = value
     return rewritten
+
+
+@dataclass(frozen=True)
+class MediaSurfaceSpec:
+    """Per-surface wiring for the ``_media_call`` lifecycle.
+
+    A non-chat media surface (embeddings, images, audio, video) is fully
+    described here, so the lifecycle stays surface-agnostic and later batches
+    add a surface by constructing one of these — never by editing the lifecycle:
+
+    - ``surface``: the dispatch key handed to ``adapter.prepare_media_call``
+      (a ``MediaSurface`` value, e.g. ``"embeddings"``).
+    - ``modality``: the billing modality carried through the lifecycle so the
+      server's card unit can select it. The vendored wire types do not carry a
+      ``modality`` field yet (P1.11 vendors it); until then this attribute rides
+      on the spec and is referenced at the confirm/metadata sites, so P1.11 only
+      has to add the field and connect ``spec.modality`` to the payloads.
+    - ``extract_usage``: pulls the billable quantity from the RESPONSE's usage
+      block, or None when the response reports none.
+    - ``measure_request``: derives the billable quantity from the REQUEST when
+      the response reports none (request-side measurement lands in
+      ``solwyn._privacy`` per P1.9). Returns None when the quantity is
+      unobservable.
+
+    Both hooks return ``TokenDetails`` (the quantity carrier) or None — never a
+    zero-filled default, so an unobservable quantity is never settled as a real
+    $0 price.
+    """
+
+    surface: str
+    modality: str
+    extract_usage: Callable[[Any], TokenDetails | None]
+    measure_request: Callable[[dict[str, Any]], TokenDetails | None]
 
 
 class _AttemptContext(BaseModel):

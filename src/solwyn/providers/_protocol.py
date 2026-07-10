@@ -19,6 +19,12 @@ from solwyn.providers._accumulator import StreamUsageAccumulator
 # Bedrock's Converse API is its own dialect.
 Dialect = Literal["openai", "anthropic", "google", "bedrock"]
 
+# Non-chat billable SURFACES the SDK can dispatch through the media lifecycle.
+# "chat" is not listed: it flows through ``ProviderAdapter.prepare_call`` (the
+# always-present chat seam). These are the surfaces later batches wire onto
+# ``prepare_media_call`` (P1.7 embeddings, P2 images, P3 audio, P4 video).
+MediaSurface = Literal["embeddings", "images", "audio", "video"]
+
 
 @runtime_checkable
 class ProviderAdapter(Protocol):
@@ -131,7 +137,13 @@ class ProviderAdapter(Protocol):
         timeout: float,
         max_retries: int,
     ) -> tuple[Callable[..., Any], dict[str, Any]]:
-        """Select the provider call method and shape kwargs for one dispatch hop.
+        """Select the provider call method and shape kwargs for one CHAT hop.
+
+        This is the CHAT surface seam — hardcoded to the provider's chat
+        completion method. Non-chat media surfaces (embeddings, images, audio,
+        video) dispatch through ``prepare_media_call`` on ``MediaSurfaceAdapter``
+        instead; keeping them separate is what lets this method stay the stable,
+        always-present chat entry point.
 
         Sans-I/O: returns the bound SDK method (sync OR async client — same
         attribute path; the caller invokes/awaits it) plus a shaped COPY of
@@ -161,5 +173,48 @@ class ProviderAdapter(Protocol):
         dialects whose callers iterate the stream object directly; Bedrock
         callers iterate ``result["stream"]``, so its adapter rebuilds the
         boto3 contract dict around the wrapper.
+        """
+        ...
+
+
+class MediaSurfaceAdapter(Protocol):
+    """Optional extension: adapters that serve non-chat media SURFACES.
+
+    ``ProviderAdapter.prepare_call`` dispatches the CHAT surface only. An
+    adapter that also serves media surfaces (embeddings, images, audio, video)
+    implements ``prepare_media_call`` — the per-surface dispatch seam the media
+    lifecycle (``_media_call``) consumes.
+
+    Deliberately kept OUT of the base ``ProviderAdapter`` protocol (and NOT
+    ``@runtime_checkable``): chat-only adapters, and adapters whose media
+    surfaces land in later batches, must still satisfy ``ProviderAdapter``
+    without being forced to grow this method before they serve any surface.
+    The lifecycle discovers it duck-typed and raises ``UnsupportedSurfaceError``
+    when it is absent or the requested surface has no branch yet.
+    """
+
+    def prepare_media_call(
+        self,
+        surface: str,
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        timeout: float,
+        max_retries: int,
+    ) -> tuple[Callable[..., Any], dict[str, Any]]:
+        """Select the SDK method and shape kwargs for one NON-chat media hop.
+
+        The per-surface analogue of ``prepare_call``: given a ``surface`` key
+        (a ``MediaSurface`` value), returns the bound SDK method (sync OR async
+        client — same attribute path; the caller invokes/awaits it) plus a
+        shaped COPY of kwargs. Owns the same provider-specific quirks as
+        ``prepare_call`` (per-request HTTP bounds for SDKs without
+        ``with_options``, any key rename) but for the media method path (e.g.
+        ``client.embeddings.create``). Media surfaces do not stream in v1, so
+        there is no ``is_streaming`` axis here.
+
+        Raises ``UnsupportedSurfaceError`` for a surface this adapter does not
+        serve. Must not mutate the input kwargs and must never read prompt or
+        media content — key-level shaping only.
         """
         ...

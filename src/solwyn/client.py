@@ -32,6 +32,7 @@ from typing import Any, cast
 from pydantic import ValidationError
 
 from solwyn._base import (
+    MediaSurfaceSpec,
     _AttemptContext,
     _SolwynBase,
     _with_legacy_max_tokens_key,
@@ -62,6 +63,7 @@ from solwyn.exceptions import (
     BudgetExceededError,
     ConfigurationError,
     ProviderUnavailableError,
+    UnsupportedSurfaceError,
     UntranslatableModelError,
 )
 from solwyn.providers import _translation
@@ -484,6 +486,34 @@ def _build_hop_kwargs(
     return {**rt.entry.default_params, **call_kwargs}
 
 
+def _media_prepare(
+    adapter: Any,
+    surface: str,
+    client: Any,
+    kwargs: dict[str, object],
+    *,
+    timeout: float,
+    max_retries: int,
+) -> tuple[Callable[..., Any], dict[str, Any]]:
+    """Resolve the media SDK method + shaped kwargs, or raise UnsupportedSurfaceError.
+
+    The per-surface dispatch seam lives on adapters that serve media surfaces
+    (``MediaSurfaceAdapter.prepare_media_call``); it is intentionally absent
+    from the base ``ProviderAdapter`` protocol, so it is discovered duck-typed
+    here. An adapter that never grew the seam — or whose seam has no branch for
+    this surface — is a surface the SDK cannot serve, so fail loud with the
+    structural (content-free) ``UnsupportedSurfaceError``. Shared by the sync
+    and async media dispatchers (only the invoke/await differs).
+    """
+    prepare = getattr(adapter, "prepare_media_call", None)
+    if prepare is None:
+        raise UnsupportedSurfaceError(surface=surface, provider=adapter.name)
+    return cast(
+        "tuple[Callable[..., Any], dict[str, Any]]",
+        prepare(surface, client, kwargs, timeout=timeout, max_retries=max_retries),
+    )
+
+
 class Solwyn(_SolwynBase):
     """Synchronous Solwyn client wrapper.
 
@@ -669,6 +699,165 @@ class Solwyn(_SolwynBase):
             max_retries=max_retries,
         )
         return method(**call_kwargs)
+
+    def _media_dispatch(
+        self,
+        runtime: ProviderRuntime,
+        surface: str,
+        kwargs: dict[str, object],
+        *,
+        timeout: float,
+        max_retries: int,
+    ) -> Any:
+        """Dispatch one media hop to the runtime's SDK client. Pure I/O — no metrics.
+
+        The media analogue of ``_sync_dispatch``: applies the per-hop bound via
+        ``with_options`` where available, then hands off to the adapter's
+        ``prepare_media_call`` seam. No streaming and no candidate walk — a media
+        call is served by the primary runtime alone.
+        """
+        client = runtime.sdk_client
+        if hasattr(client, "with_options"):
+            client = client.with_options(timeout=timeout, max_retries=max_retries)
+        method, call_kwargs = _media_prepare(
+            runtime.adapter, surface, client, kwargs, timeout=timeout, max_retries=max_retries
+        )
+        return method(**call_kwargs)
+
+    def _media_call(self, spec: MediaSurfaceSpec, **kwargs: object) -> Any:
+        """Lean lifecycle for a non-chat media surface (embeddings/images/audio/video).
+
+        estimate -> budget check -> provider call -> extract/measure -> confirm +
+        report. Deliberately NOT the chat pipeline: embedding vectors (and image
+        / audio / video outputs) are not interchangeable across providers, so
+        there is no candidate walk, no cross-dialect translation, and no model
+        fallback (``is_model_fallback`` is always False). The call is served by
+        the PRIMARY runtime alone.
+
+        Billable quantity is per-surface via the spec hooks: response usage where
+        it exists (``extract_usage``), request-derived where it does not
+        (``measure_request``). An unobservable quantity stays None — never a
+        zero-filled default — so a real $0 price is never settled.
+        """
+        requested_model = cast(str, kwargs["model"])
+        agent_run = current_run()
+        call_id = str(uuid.uuid4())
+        runtime = self._runtimes[0]
+        provider = runtime.adapter.name
+        deadline = Deadline(self._config.failover_total_timeout)
+
+        # 1. Estimate input quantity (length-only; never materializes content).
+        char_count = estimate_content_length(kwargs)
+        est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
+
+        # 2. Budget check against the primary (no failover chain to hint).
+        budget = self._budget.check_budget(
+            estimated_input_tokens=est_in,
+            model=requested_model,
+            provider=provider,
+            timeout=_budget_timeout(deadline),
+        )
+        if budget.price_hints is not None:
+            self.update_price_hints(budget.price_hints)
+
+        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
+        if not budget.allowed:
+            try:
+                self._reporter.report(
+                    self._build_metadata_event(
+                        model=requested_model,
+                        provider=provider,
+                        input_tokens=est_in,
+                        output_tokens=0,
+                        token_details=None,
+                        latency_ms=0.0,
+                        status=CallStatus.BUDGET_DENIED,
+                        is_model_fallback=False,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                        provider_region=provider_region,
+                        # spec.modality rides this payload once _types vendors it (P1.11).
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to report budget_denied metadata event: %s",
+                    type(exc).__name__,
+                )
+            raise BudgetExceededError(
+                project_id=budget.project_id,
+                budget_limit=budget.budget_limit,
+                current_usage=budget.current_usage,
+                estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
+                budget_period="unknown",
+                mode=budget.mode.value,
+            )
+
+        # 3. Provider call — PRIMARY only. A dispatch error is reported (parity
+        #    with the chat error path) then re-raised unchanged (drop-in contract).
+        start = time.monotonic()
+        try:
+            response = self._media_dispatch(
+                runtime,
+                spec.surface,
+                kwargs,
+                timeout=_hop_timeout(deadline, 1),
+                max_retries=0,
+            )
+        except Exception as exc:
+            self._reporter.report(
+                self._build_error_event(
+                    model=requested_model,
+                    provider=provider,
+                    latency_ms=(time.monotonic() - start) * 1000,
+                    is_model_fallback=False,
+                    failover_error_class=type(exc).__name__,
+                    call_id=call_id,
+                    agent_run=agent_run,
+                    provider_region=provider_region,
+                )
+            )
+            raise
+        latency_ms = (time.monotonic() - start) * 1000
+
+        # 4. Billable quantity: response usage first, request-derived fallback.
+        token_details = spec.extract_usage(response)
+        if token_details is None:
+            token_details = spec.measure_request(kwargs)
+
+        # 5. Confirm + report the served call (is_model_fallback=False, primary-only).
+        service_tier = runtime.adapter.extract_service_tier(response)
+        if budget.reservation_id and token_details is not None:
+            self._budget.confirm_cost(
+                budget.reservation_id,
+                requested_model,
+                token_details,
+                provider=provider,
+                is_provider_fallback=False,
+                call_id=call_id,
+                provider_region=provider_region,
+                service_tier=service_tier,
+                # spec.modality rides this payload once _types vendors it (P1.11).
+            )
+        self._reporter.report(
+            self._build_metadata_event(
+                model=requested_model,
+                provider=provider,
+                input_tokens=token_details.input_tokens if token_details is not None else 0,
+                output_tokens=token_details.output_tokens if token_details is not None else 0,
+                token_details=token_details,
+                latency_ms=latency_ms,
+                status=CallStatus.SUCCESS,
+                is_model_fallback=False,
+                attempt_index=0,
+                call_id=call_id,
+                service_tier=service_tier,
+                agent_run=agent_run,
+                provider_region=provider_region,
+                # spec.modality rides this payload once _types vendors it (P1.11).
+            )
+        )
+        return response
 
     def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Core interception logic: the classified candidate walk."""
@@ -1370,6 +1559,153 @@ class AsyncSolwyn(_SolwynBase):
             max_retries=max_retries,
         )
         return await method(**call_kwargs)
+
+    async def _media_dispatch(
+        self,
+        runtime: ProviderRuntime,
+        surface: str,
+        kwargs: dict[str, object],
+        *,
+        timeout: float,
+        max_retries: int,
+    ) -> Any:
+        """Dispatch one media hop to the runtime's async SDK client. Pure I/O.
+
+        Mirrors the sync ``_media_dispatch``: the per-hop bound applies via
+        ``with_options`` where available, then the adapter's ``prepare_media_call``
+        seam returns the same attribute path on the async client — only the await
+        differs here. No streaming and no candidate walk (primary-only).
+        """
+        client = runtime.sdk_client
+        if hasattr(client, "with_options"):
+            client = client.with_options(timeout=timeout, max_retries=max_retries)
+        method, call_kwargs = _media_prepare(
+            runtime.adapter, surface, client, kwargs, timeout=timeout, max_retries=max_retries
+        )
+        return await method(**call_kwargs)
+
+    async def _media_call(self, spec: MediaSurfaceSpec, **kwargs: object) -> Any:
+        """Async lean lifecycle for a non-chat media surface.
+
+        Mirror of the sync ``_media_call``: estimate -> budget check -> provider
+        call -> extract/measure -> confirm + report. No candidate walk, no
+        translation, ``is_model_fallback`` always False; served by the PRIMARY
+        runtime alone. Billable quantity comes from the spec hooks (response
+        usage first, request-derived fallback) and stays None when unobservable.
+        """
+        requested_model = cast(str, kwargs["model"])
+        agent_run = current_run()
+        call_id = str(uuid.uuid4())
+        runtime = self._runtimes[0]
+        provider = runtime.adapter.name
+        deadline = Deadline(self._config.failover_total_timeout)
+
+        char_count = estimate_content_length(kwargs)
+        est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
+
+        budget = await self._budget.check_budget(
+            estimated_input_tokens=est_in,
+            model=requested_model,
+            provider=provider,
+            timeout=_budget_timeout(deadline),
+        )
+        if budget.price_hints is not None:
+            self.update_price_hints(budget.price_hints)
+
+        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
+        if not budget.allowed:
+            try:
+                self._reporter.report(
+                    self._build_metadata_event(
+                        model=requested_model,
+                        provider=provider,
+                        input_tokens=est_in,
+                        output_tokens=0,
+                        token_details=None,
+                        latency_ms=0.0,
+                        status=CallStatus.BUDGET_DENIED,
+                        is_model_fallback=False,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                        provider_region=provider_region,
+                        # spec.modality rides this payload once _types vendors it (P1.11).
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to report budget_denied metadata event: %s",
+                    type(exc).__name__,
+                )
+            raise BudgetExceededError(
+                project_id=budget.project_id,
+                budget_limit=budget.budget_limit,
+                current_usage=budget.current_usage,
+                estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
+                budget_period="unknown",
+                mode=budget.mode.value,
+            )
+
+        start = time.monotonic()
+        try:
+            response = await self._media_dispatch(
+                runtime,
+                spec.surface,
+                kwargs,
+                timeout=_hop_timeout(deadline, 1),
+                max_retries=0,
+            )
+        except Exception as exc:
+            self._reporter.report(
+                self._build_error_event(
+                    model=requested_model,
+                    provider=provider,
+                    latency_ms=(time.monotonic() - start) * 1000,
+                    is_model_fallback=False,
+                    failover_error_class=type(exc).__name__,
+                    call_id=call_id,
+                    agent_run=agent_run,
+                    provider_region=provider_region,
+                )
+            )
+            raise
+        latency_ms = (time.monotonic() - start) * 1000
+
+        token_details = spec.extract_usage(response)
+        if token_details is None:
+            token_details = spec.measure_request(kwargs)
+
+        service_tier = runtime.adapter.extract_service_tier(response)
+        if budget.reservation_id and token_details is not None:
+            await self._budget.confirm_cost(
+                budget.reservation_id,
+                requested_model,
+                token_details,
+                provider=provider,
+                is_provider_fallback=False,
+                call_id=call_id,
+                provider_region=provider_region,
+                service_tier=service_tier,
+                # spec.modality rides this payload once _types vendors it (P1.11).
+            )
+        self._reporter.report(
+            self._build_metadata_event(
+                model=requested_model,
+                provider=provider,
+                input_tokens=token_details.input_tokens if token_details is not None else 0,
+                output_tokens=token_details.output_tokens if token_details is not None else 0,
+                token_details=token_details,
+                latency_ms=latency_ms,
+                status=CallStatus.SUCCESS,
+                is_model_fallback=False,
+                attempt_index=0,
+                call_id=call_id,
+                service_tier=service_tier,
+                agent_run=agent_run,
+                provider_region=provider_region,
+                # spec.modality rides this payload once _types vendors it (P1.11).
+            )
+        )
+        return response
 
     async def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Async core interception logic: the classified candidate walk."""

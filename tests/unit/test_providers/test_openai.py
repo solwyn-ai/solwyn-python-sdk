@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from solwyn._token_details import TokenDetails
+from solwyn.exceptions import UnsupportedSurfaceError
 from solwyn.providers.openai import OpenAIAdapter
 
 # ---------------------------------------------------------------------------
@@ -409,3 +410,18 @@ class TestOpenAIAdapterDispatchSeams:
         response, wrapper = object(), object()
         assert adapter.unwrap_stream_source(response) is response
         assert adapter.wrap_stream_result(wrapper, response) is wrapper
+
+    def test_prepare_media_call_raises_unsupported_surface_for_now(self) -> None:
+        # FOUNDATION: no media surface is wired yet — the seam exists and fails
+        # loud (structural, content-free) rather than pretending to serve one.
+        adapter = OpenAIAdapter()
+        with pytest.raises(UnsupportedSurfaceError) as excinfo:
+            adapter.prepare_media_call(
+                "embeddings",
+                object(),
+                {"model": "text-embedding-3-small"},
+                timeout=30.0,
+                max_retries=0,
+            )
+        assert excinfo.value.surface == "embeddings"
+        assert excinfo.value.provider == "openai"

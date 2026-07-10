@@ -40,6 +40,7 @@ from solwyn._privacy import (
     estimate_tokens_from_length,
 )
 from solwyn._token_details import TokenDetails
+from solwyn.exceptions import UnsupportedSurfaceError
 from solwyn.providers.openai import _extract_openai_usage, _extract_service_tier
 
 logger = logging.getLogger(__name__)
@@ -431,6 +432,27 @@ class OpenAICompatibleAdapter:
         if is_streaming:
             kwargs["stream"] = True
         return client.chat.completions.create, kwargs
+
+    def prepare_media_call(
+        self,
+        surface: str,
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        timeout: float,
+        max_retries: int,
+    ) -> tuple[Callable[..., Any], dict[str, Any]]:
+        """Per-surface dispatch seam for non-chat media surfaces.
+
+        FOUNDATION: no media surface is wired yet, so every surface raises
+        ``UnsupportedSurfaceError``. Later batches add branches here (P1.7 wires
+        ``client.embeddings.create`` for this adapter — one branch covers all 14
+        compat profiles since they share the openai dialect), each returning
+        ``(method, shaped_kwargs)`` exactly as ``prepare_call`` does for chat.
+        timeout/max_retries are ignored — the dispatcher already applied them
+        via the openai SDK's ``with_options``.
+        """
+        raise UnsupportedSurfaceError(surface=surface, provider=self.name)
 
     def unwrap_stream_source(self, response: Any) -> Any:
         """The streaming call returns the iterable itself."""

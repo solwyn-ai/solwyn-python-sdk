@@ -5,6 +5,7 @@ ProviderUnavailableError -- raised when all providers are circuit-broken.
 ConfigurationError -- raised when configuration is invalid.
 UntranslatableRequestError -- raised when a cross-provider hop cannot translate a request.
 UntranslatableModelError -- raised when a model id is not configured for a target provider.
+UnsupportedSurfaceError -- raised when an adapter does not serve a requested media surface.
 """
 
 from __future__ import annotations
@@ -138,6 +139,28 @@ class UntranslatableModelError(SolwynError):
 
     def __repr__(self) -> str:
         return f"UntranslatableModelError(model={self.model!r}, provider={self.provider!r})"
+
+
+class UnsupportedSurfaceError(SolwynError):
+    """Raised when a provider adapter does not serve a requested media surface.
+
+    Non-chat media surfaces (embeddings, images, audio, video) are dispatched
+    through ``prepare_media_call``; an adapter with no branch for the requested
+    surface raises this. Both identifiers are configuration values — a surface
+    name and a provider name — never prompt content.
+
+    Attributes:
+        surface: The media surface that was requested (e.g. ``"embeddings"``).
+        provider: The provider whose adapter does not serve it.
+    """
+
+    def __init__(self, *, surface: str, provider: str) -> None:
+        super().__init__(f"provider {provider} does not support the {surface} surface")
+        self.surface = surface
+        self.provider = provider
+
+    def __repr__(self) -> str:
+        return f"UnsupportedSurfaceError(surface={self.surface!r}, provider={self.provider!r})"
 
 
 class ConfigurationError(SolwynError):

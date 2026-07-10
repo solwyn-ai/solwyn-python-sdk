@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from solwyn._types import ProviderName
+from solwyn.exceptions import UnsupportedSurfaceError
 from solwyn.providers import get_adapter_by_name, get_adapter_for_client, get_adapter_for_model
 from solwyn.providers._protocol import ProviderAdapter
 from solwyn.providers.openai import OpenAIAdapter
@@ -107,6 +108,18 @@ class TestProfileTable:
     def test_all_adapters_speak_openai_dialect(self) -> None:
         for adapter in build_compat_adapters():
             assert adapter.dialect == "openai"
+
+    def test_prepare_media_call_raises_unsupported_surface_for_every_profile(self) -> None:
+        # FOUNDATION: the per-surface seam exists on every compat adapter (incl.
+        # the first-class Together adapter, which inherits it) but wires no
+        # surface yet, so it fails loud with the provider's own name attached.
+        for adapter in build_compat_adapters():
+            with pytest.raises(UnsupportedSurfaceError) as excinfo:
+                adapter.prepare_media_call(
+                    "embeddings", object(), {"model": "m"}, timeout=30.0, max_retries=0
+                )
+            assert excinfo.value.surface == "embeddings"
+            assert excinfo.value.provider == adapter.name
 
     def test_together_profile_slot_uses_first_class_adapter(self) -> None:
         adapters = build_compat_adapters()
