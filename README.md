@@ -15,13 +15,13 @@ Solwyn wraps your existing LLM client. Calls go directly to the provider — the
 pip install solwyn
 ```
 
-Optional extras pin tested provider-SDK floors — `solwyn[openai]` (also enables tiktoken-based token estimation), `solwyn[anthropic]`, `solwyn[google]`, `solwyn[bedrock]` (convenience only — the SDK never imports boto3), or `solwyn[all]`:
+Optional extras pin tested provider-SDK floors — `solwyn[openai]` (also enables tiktoken-based token estimation), `solwyn[anthropic]`, `solwyn[google]`, `solwyn[bedrock]` (convenience only — the SDK never imports boto3), `solwyn[together]` (Together SDK 2.0+), or `solwyn[all]`:
 
 ```sh
 pip install solwyn[openai]
 ```
 
-OpenAI-compatible endpoints (Groq, OpenRouter, vLLM, …) ride the `openai` extra; no extra of their own.
+Other OpenAI-compatible endpoints (Groq, OpenRouter, vLLM, …) ride the `openai` extra. Together can use that path too; `solwyn[together]` supplies its native SDK instead.
 
 ## Quick Start
 
@@ -130,6 +130,40 @@ Notes:
 - Async works with [aioboto3](https://github.com/terricain/aioboto3): `AsyncSolwyn(client)` inside `async with session.client("bedrock-runtime") as client`.
 - Bedrock participates in cross-provider failover in both directions (e.g. Bedrock-Claude ⇄ direct Anthropic) via the same canonical translation subset as the other providers.
 
+### Together AI
+
+Solwyn supports the native Together SDK at `together>=2.0`. Install the convenience extra, then wrap the client directly:
+
+```sh
+pip install "solwyn[together]"
+```
+
+```python
+from solwyn import Solwyn
+from together import Together
+
+client = Solwyn(Together(api_key="..."), api_key="sk_proj_...")
+response = client.chat.completions.create(
+    model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+```
+
+Pair sync and async client types: use `Solwyn` with `Together`, and `AsyncSolwyn` with `AsyncTogether`:
+
+```python
+from solwyn import AsyncSolwyn
+from together import AsyncTogether
+
+async with AsyncSolwyn(AsyncTogether(api_key="..."), api_key="sk_proj_...") as client:
+    response = await client.chat.completions.create(
+        model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        messages=[{"role": "user", "content": "Hello!"}],
+    )
+```
+
+The optional extra is bring-your-own convenience only: Solwyn core never imports Together. An `openai.OpenAI` client pointed at Together's compatible endpoint remains supported as described below.
+
 ### OpenAI-compatible providers
 
 Point an `openai.OpenAI` client at any OpenAI-compatible endpoint via `base_url` and wrap it as usual. Solwyn detects the provider from the URL, so budgets, per-agent attribution, failover, and the cost dashboard all see the *real* provider (e.g. `groq`), not "openai":
@@ -158,7 +192,7 @@ Auto-detected providers:
 | Qwen (DashScope compat) | `dashscope*.aliyuncs.com` | `include_usage` injected |
 | Z.ai (`zai`) | `api.z.ai` | `include_usage` injected |
 | Groq | `api.groq.com` | `include_usage` injected; legacy `x_groq.usage` also handled |
-| Together AI | `api.together.xyz` / `api.together.ai` | automatic (final chunk) |
+| Together AI | native `Together` / `AsyncTogether`, or `api.together.xyz` / `api.together.ai` | automatic (final chunk) |
 | Fireworks | `api.fireworks.ai` | automatic (final chunk) |
 | Perplexity (Sonar) | `api.perplexity.ai` | usage on streamed chunks; `stream_options` never sent |
 | Azure OpenAI | `*.openai.azure.com` or `AzureOpenAI` client class | `include_usage` injected (skipped for "on your data" `data_sources` requests, which reject it) |
