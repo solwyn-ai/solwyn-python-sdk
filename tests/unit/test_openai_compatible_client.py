@@ -20,6 +20,7 @@ from conftest import VALID_API_KEY, make_mock_client
 from solwyn._types import CallStatus, ProviderName
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import ConfigurationError, UntranslatableRequestError
+from solwyn.providers._errors import Disposition, classify_exception
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -50,6 +51,33 @@ class _ZaiClient:
 
     def _with_options(self, **kwargs: object) -> _ZaiClient:
         return self
+
+
+class _TypedTogetherCompletions:
+    """Together v2-shaped call boundary with a deliberately strict signature."""
+
+    def __init__(self, response: object) -> None:
+        self.response = response
+        self.calls: list[dict[str, object]] = []
+
+    def create(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, object]],
+        stream: bool = False,
+    ) -> object:
+        self.calls.append({"model": model, "messages": messages, "stream": stream})
+        return self.response
+
+
+def _native_together_client(response: object) -> tuple[object, _TypedTogetherCompletions]:
+    """Duck-typed native Together client without importing the provider SDK."""
+    client_type = type("Together", (), {"__module__": "together"})
+    completions = _TypedTogetherCompletions(response)
+    client = client_type()
+    client.chat = SimpleNamespace(completions=completions)
+    return client, completions
 
 
 def _allow_budget(reservation_id: str | None = None) -> SimpleNamespace:
@@ -439,6 +467,86 @@ class TestEstimatedUsageFallback:
 
 @pytest.mark.unit
 class TestCompatFailover:
+    def test_native_together_target_serves_same_dialect_model_swap(self) -> None:
+        primary = _compat_client("https://api.groq.com/openai/v1")
+        response = _response()
+        together, completions = _native_together_client(response)
+        solwyn = _make_solwyn(
+            primary,
+            fallback=[(together, "meta-llama/Llama-3.3-70B-Instruct-Turbo")],
+        )
+        _open_breaker(solwyn, "groq")
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            result = solwyn.chat.completions.create(**_REQUEST)
+
+        assert result is response
+        assert primary.chat.completions.create.call_count == 0
+        assert completions.calls == [
+            {
+                "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                "messages": _REQUEST["messages"],
+                "stream": False,
+            }
+        ]
+        event = _reported_events(solwyn)[0]
+        assert event.provider == ProviderName.TOGETHER
+        assert event.is_provider_fallback is True
+
+    def test_native_together_failover_strips_caller_stream_options(self) -> None:
+        primary = _compat_client("https://api.groq.com/openai/v1")
+        together, completions = _native_together_client(iter([_usage_chunk(5, 2)]))
+        solwyn = _make_solwyn(
+            primary,
+            fallback=[(together, "meta-llama/Llama-3.3-70B-Instruct-Turbo")],
+        )
+        _open_breaker(solwyn, "groq")
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            chunks = list(
+                solwyn.chat.completions.create(
+                    **_REQUEST,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                )
+            )
+
+        assert len(chunks) == 1
+        assert completions.calls == [
+            {
+                "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+                "messages": _REQUEST["messages"],
+                "stream": True,
+            }
+        ]
+        event = _reported_events(solwyn)[0]
+        assert event.provider == ProviderName.TOGETHER
+        assert event.input_tokens == 5
+
+    def test_native_together_rejects_openai_only_kwarg_and_stops_chain(self) -> None:
+        primary = _compat_client("https://api.groq.com/openai/v1")
+        primary.chat.completions.create.side_effect = httpx.ConnectError("refused")
+        together, completions = _native_together_client(_response())
+        later = _compat_client("https://openrouter.ai/api/v1")
+        later.chat.completions.create.return_value = _response()
+        solwyn = _make_solwyn(
+            primary,
+            fallback=[
+                (together, "meta-llama/Llama-3.3-70B-Instruct-Turbo"),
+                (later, "openrouter/auto"),
+            ],
+        )
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            pytest.raises(TypeError, match="store") as exc_info,
+        ):
+            solwyn.chat.completions.create(**_REQUEST, store=True)
+
+        assert classify_exception(exc_info.value) is Disposition.FAIL_FAST
+        assert completions.calls == []
+        later.chat.completions.create.assert_not_called()
+
     def test_same_dialect_failover_passes_tools_through(self) -> None:
         """Groq -> OpenRouter is native passthrough: tools survive, no
         canonical-subset restriction, even when streaming."""
