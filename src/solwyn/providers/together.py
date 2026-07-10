@@ -17,17 +17,21 @@ _TOGETHER_PROFILE = next(profile for profile in COMPAT_PROFILES if profile.name 
 class TogetherAdapter(OpenAICompatibleAdapter):
     """Together adapter with duck-typed native client detection."""
 
+    # Together-specific untracked spend surfaces that the central per-dialect map
+    # (_base._UNSHIPPED_SPEND_SURFACES) does NOT already cover. The warn-once
+    # posture unions this with that map (Together speaks the "openai" dialect):
+    #   - images / audio / videos: omitted here — covered centrally for every
+    #     openai-dialect provider, so declaring them again would be redundant.
+    #   - embeddings: omitted — P1.7 intercepts it on this branch, so it must NOT
+    #     advertise itself as untracked (a surface about to be metered).
+    #   - batches / fine_tuning: omitted — per the P1.10 posture taxonomy these
+    #     are truly-unrelated resources that pass through SILENTLY, not warn-once.
+    # What remains are Together's genuinely-billable, not-yet-tracked extras.
     unmetered_spend_surfaces = frozenset(
         {
             "completions",
-            "embeddings",
-            "images",
-            "videos",
-            "audio",
             "rerank",
             "code_interpreter",
-            "batches",
-            "fine_tuning",
             "evals",
         }
     )

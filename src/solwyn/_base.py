@@ -64,6 +64,77 @@ def _warn_cost_policy_inactive_once() -> None:
     logger.warning("CostPolicy selected but no price hints available; using health-based order")
 
 
+# Recognized spend surfaces whose interception phase has not shipped yet: they
+# warn ONCE per process, then pass through untracked. Keyed by DIALECT because
+# the same posture spans every provider that speaks it — OpenAI itself and every
+# OpenAI-compatible provider share the "openai" set. Embeddings is deliberately
+# ABSENT: P1.7 intercepts it on this branch, so it graduates to tracking rather
+# than warning (a surface that is about to be metered must not advertise itself
+# as untracked). Attribute shapes differ by dialect: OpenAI exposes top-level
+# resources (``client.images``), Google exposes methods on ``client.models``
+# (``client.models.generate_images``).
+_UNSHIPPED_SPEND_SURFACES: dict[str, frozenset[str]] = {
+    "openai": frozenset({"images", "audio", "videos"}),
+    "google": frozenset({"generate_images", "generate_videos"}),
+}
+
+# Per-PROCESS warn-once latch for untracked spend surfaces (NOT per-instance): a
+# recognized surface logs exactly one warning per process however many client
+# instances or calls touch it — quiet logs for the create-a-client-per-request
+# pattern. Module-level so the latch spans instances; lock-guarded for the
+# multi-threaded sync client. Keyed by surface name to honor "one warning per
+# surface per process". Tests reset it via ``_reset_unmetered_spend_warnings``.
+_warned_spend_surfaces: set[str] = set()
+_spend_surface_warn_lock = threading.Lock()
+
+
+def _recognized_unshipped_surfaces(adapter: Any, dialect: str) -> frozenset[str]:
+    """Untracked spend surfaces that warn for this adapter.
+
+    The union of the central per-dialect map (modality surfaces whose
+    interception phase has not shipped) and the adapter's own opt-in
+    ``unmetered_spend_surfaces`` (a provider that declares extra untracked
+    billable surfaces — e.g. Together's rerank/code_interpreter/evals). Adapters
+    that declare nothing get only the central map.
+    """
+    central = _UNSHIPPED_SPEND_SURFACES.get(dialect, frozenset())
+    declared: frozenset[str] = getattr(adapter, "unmetered_spend_surfaces", frozenset())
+    return central | declared
+
+
+def _warn_unmetered_spend_surface_once(*, adapter: Any, dialect: str, surface: str) -> None:
+    """Warn once per process when a recognized spend surface passes through untracked.
+
+    Fires for surfaces in ``_recognized_unshipped_surfaces`` only; every other
+    attribute (files, moderations, models.list, …) passes through silently. The
+    surface itself still passes through after the warning — this is the
+    warn-once pass-through posture, not a refusal. Content-free by construction:
+    only the provider ``name`` and ``surface`` (both structural identifiers) are
+    logged, never request or media data.
+    """
+    if surface not in _recognized_unshipped_surfaces(adapter, dialect):
+        return
+
+    with _spend_surface_warn_lock:
+        if surface in _warned_spend_surfaces:
+            return
+        _warned_spend_surfaces.add(surface)
+
+    # Logging handlers may execute arbitrary code; keep them outside the lock.
+    logger.warning(
+        "Provider '%s' surface '%s' is passed through untracked: no budget check "
+        "and no cost event will be emitted. Tracking for this surface is coming.",
+        adapter.name,
+        surface,
+    )
+
+
+def _reset_unmetered_spend_warnings() -> None:
+    """Clear the per-process warn-once latch. Test-support hook only."""
+    with _spend_surface_warn_lock:
+        _warned_spend_surfaces.clear()
+
+
 def _openai_uses_max_completion_tokens(model: str) -> bool:
     """Return whether an OpenAI model rejects the legacy max_tokens key."""
     return model.startswith(("o1", "o3", "o4", "gpt-5"))

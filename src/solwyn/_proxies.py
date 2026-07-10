@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from solwyn._base import _warn_unmetered_spend_surface_once
+
 if TYPE_CHECKING:
     from solwyn.client import AsyncSolwyn, Solwyn
 
@@ -107,7 +109,16 @@ class _SyncModelsProxy:
         return self._solwyn._intercepted_call(_force_stream=True, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._solwyn._client.models, name)
+        # Google's non-chat media surfaces (generate_images/generate_videos) are
+        # methods on client.models, so they arrive here rather than on
+        # Solwyn.__getattr__ — warn-once pass-through per the P1.10 posture (P1.8
+        # delegates this warn to P1.10). embed_content is silent here: P1.8 gives
+        # it its own interception path.
+        attribute = getattr(self._solwyn._client.models, name)
+        _warn_unmetered_spend_surface_once(
+            adapter=self._solwyn._adapter, dialect=self._solwyn._dialect, surface=name
+        )
+        return attribute
 
 
 # ---------------------------------------------------------------------------
@@ -176,4 +187,10 @@ class _AsyncModelsProxy:
         return await self._solwyn._intercepted_call(_force_stream=True, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._solwyn._client.models, name)
+        # See _SyncModelsProxy.__getattr__: Google media surfaces (generate_images/
+        # generate_videos) warn-once pass-through per the P1.10 posture.
+        attribute = getattr(self._solwyn._client.models, name)
+        _warn_unmetered_spend_surface_once(
+            adapter=self._solwyn._adapter, dialect=self._solwyn._dialect, surface=name
+        )
+        return attribute

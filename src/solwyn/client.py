@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -35,6 +34,7 @@ from solwyn._base import (
     MediaSurfaceSpec,
     _AttemptContext,
     _SolwynBase,
+    _warn_unmetered_spend_surface_once,
     _with_legacy_max_tokens_key,
     _with_openai_completion_token_key,
 )
@@ -134,31 +134,21 @@ _INVOKE_MODEL_GUIDANCE = (
     "the unwrapped boto3 client directly."
 )
 
-
-def _warn_unmetered_spend_surface_once(
-    *,
-    adapter: Any,
-    surface: str,
-    warned_surfaces: set[str],
-    warning_lock: threading.Lock,
-) -> None:
-    """Warn once when an adapter-declared spend surface passes through untracked."""
-    unmetered_surfaces: frozenset[str] = getattr(adapter, "unmetered_spend_surfaces", frozenset())
-    if surface not in unmetered_surfaces:
-        return
-
-    with warning_lock:
-        if surface in warned_surfaces:
-            return
-        warned_surfaces.add(surface)
-
-    # Logging handlers may execute arbitrary code; keep them outside the lock.
-    logger.warning(
-        "Provider '%s' surface '%s' is passed through untracked: "
-        "no budget check and no cost event will be emitted",
-        adapter.name,
-        surface,
-    )
+# Why start_async_invoke fails loud, joining invoke_model: it is a PRIMARY spend
+# surface (Bedrock's asynchronous, video-scale invocation path — e.g. Nova Reel),
+# so silent pass-through would be a budget bypass at the highest per-call cost of
+# any surface. Unlike invoke_model the usage is not even in-band — the call returns
+# only an invocationArn and the output/usage land later in an S3 object the SDK
+# never sees — so there is nothing to extract without out-of-band polling. Failing
+# loud (rather than passing through untracked) closes that silent hole.
+_START_ASYNC_INVOKE_GUIDANCE = (
+    "Solwyn does not budget-track Bedrock's asynchronous invocation surface "
+    "(start_async_invoke) — the call returns only an invocationArn and its usage "
+    "lands out-of-band in S3, so Solwyn can neither enforce a budget nor emit a "
+    "cost event for it. Rather than pass this video-scale spend through untracked, "
+    "Solwyn refuses it. To make untracked async-invoke calls anyway, use the "
+    "unwrapped boto3 client directly."
+)
 
 
 def _source_compatible_defaults(dialect: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -552,8 +542,6 @@ class Solwyn(_SolwynBase):
         # public surface (chat/messages/models). A unified Protocol would not
         # match all three. Type safety stops at the _sync_dispatch boundary.
         self._client: Any = client
-        self._warned_unmetered_spend_surfaces: set[str] = set()
-        self._unmetered_spend_warning_lock = threading.Lock()
 
         if "project_id" in config_kwargs:
             raise TypeError("unexpected keyword argument 'project_id'")
@@ -665,6 +653,12 @@ class Solwyn(_SolwynBase):
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
         return self._client.invoke_model_with_response_stream(**kwargs)
 
+    def start_async_invoke(self, **kwargs: Any) -> Any:
+        """Fail loud on Bedrock's async invocation surface (untracked video-scale spend)."""
+        if self._dialect == "bedrock":
+            raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
+        return self._client.start_async_invoke(**kwargs)
+
     def _sync_dispatch(
         self,
         runtime: ProviderRuntime,
@@ -751,6 +745,14 @@ class Solwyn(_SolwynBase):
         est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
 
         # 2. Budget check against the primary (no failover chain to hint).
+        #    Posture on 422-for-unbilled-model: if the server deliberately does not
+        #    price this model/modality it answers /budgets/check with a 422. The
+        #    enforcer treats that like any non-2xx — it raises inside check_budget,
+        #    is caught there, and (absent a prior hard-deny) resolves via the
+        #    standard fail-open path: allowed=True with a warning. So an
+        #    unbilled-model media call proceeds untracked rather than being denied;
+        #    fail-open is intentional here — Solwyn never blocks a call just because
+        #    it cannot yet price it. (Full matrix documented in the P5.2 posture doc.)
         budget = self._budget.check_budget(
             estimated_input_tokens=est_in,
             model=requested_model,
@@ -1374,10 +1376,7 @@ class Solwyn(_SolwynBase):
         """Pass through non-intercepted attributes to the underlying client."""
         attribute = getattr(self._client, name)
         _warn_unmetered_spend_surface_once(
-            adapter=self._adapter,
-            surface=name,
-            warned_surfaces=self._warned_unmetered_spend_surfaces,
-            warning_lock=self._unmetered_spend_warning_lock,
+            adapter=self._adapter, dialect=self._dialect, surface=name
         )
         return attribute
 
@@ -1421,8 +1420,6 @@ class AsyncSolwyn(_SolwynBase):
     ) -> None:
         # See sync Solwyn.__init__ for why _client is typed Any.
         self._client: Any = client
-        self._warned_unmetered_spend_surfaces: set[str] = set()
-        self._unmetered_spend_warning_lock = threading.Lock()
 
         if "project_id" in config_kwargs:
             raise TypeError("unexpected keyword argument 'project_id'")
@@ -1529,6 +1526,12 @@ class AsyncSolwyn(_SolwynBase):
         if self._dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
         return await self._client.invoke_model_with_response_stream(**kwargs)
+
+    async def start_async_invoke(self, **kwargs: Any) -> Any:
+        """Fail loud on Bedrock's async invocation surface (untracked video-scale spend)."""
+        if self._dialect == "bedrock":
+            raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
+        return await self._client.start_async_invoke(**kwargs)
 
     async def _async_dispatch(
         self,
@@ -2197,9 +2200,6 @@ class AsyncSolwyn(_SolwynBase):
         """Pass through non-intercepted attributes to the underlying client."""
         attribute = getattr(self._client, name)
         _warn_unmetered_spend_surface_once(
-            adapter=self._adapter,
-            surface=name,
-            warned_surfaces=self._warned_unmetered_spend_surfaces,
-            warning_lock=self._unmetered_spend_warning_lock,
+            adapter=self._adapter, dialect=self._dialect, surface=name
         )
         return attribute

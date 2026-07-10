@@ -247,6 +247,17 @@ class TestBedrockConverseInterception:
             solwyn.invoke_model_with_response_stream(modelId=BEDROCK_MODEL, body=b"{}")
         solwyn.close()
 
+    def test_start_async_invoke_raises_loudly(self) -> None:
+        # start_async_invoke joins the invoke_model guard: it is Bedrock's
+        # async, video-scale spend surface whose usage lands out-of-band in S3,
+        # so silent pass-through would be a budget bypass at the highest cost.
+        client = _mock_bedrock_client()
+        solwyn = _make_solwyn(client)
+        with pytest.raises(ConfigurationError, match="start_async_invoke"):
+            solwyn.start_async_invoke(modelId=BEDROCK_MODEL, modelInput={})
+        client.start_async_invoke.assert_not_called()
+        solwyn.close()
+
 
 # ---------------------------------------------------------------------------
 # Streaming interception
@@ -828,6 +839,21 @@ class TestAsyncBedrockConverse:
             await solwyn.invoke_model_with_response_stream(modelId=BEDROCK_MODEL, body=b"{}")
 
         client.invoke_model_with_response_stream.assert_not_called()
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_start_async_invoke_raises_loudly(self) -> None:
+        # Mirror of the sync fail-loud test: async start_async_invoke passing
+        # through silently would be a video-scale budget bypass.
+        client = _mock_bedrock_client()
+        solwyn = _make_async_solwyn(client)
+
+        with pytest.raises(ConfigurationError, match="start_async_invoke"):
+            await solwyn.start_async_invoke(modelId=BEDROCK_MODEL, modelInput={})
+
+        client.start_async_invoke.assert_not_called()
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()
 
