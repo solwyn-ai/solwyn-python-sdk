@@ -163,6 +163,16 @@ class AsyncTogether:
         self.chat = SimpleNamespace(completions=self.completions)
 
 
+class _SyncResource:
+    def create(self, **_kwargs: object) -> object:
+        raise NotImplementedError
+
+
+class _AsyncResource:
+    async def create(self, **_kwargs: object) -> object:
+        raise NotImplementedError
+
+
 def _async_iter(chunks: list[object]) -> Any:
     async def _gen() -> Any:
         for chunk in chunks:
@@ -190,13 +200,13 @@ def _make_async_solwyn(client: object) -> AsyncSolwyn:
 @pytest.mark.unit
 def test_sync_unmetered_surface_warns_and_passes_through(caplog: pytest.LogCaptureFixture) -> None:
     client = FakeTogetherClient(_completion_response())
-    resource = MagicMock()
+    resource = MagicMock(spec=_SyncResource)
     resource.create.return_value = object()
     client.embeddings = resource
     solwyn = _make_solwyn(client)
-    check_budget = MagicMock()
-    report = MagicMock()
-    report_settlement = MagicMock()
+    check_budget = MagicMock(spec=solwyn._budget.check_budget)
+    report = MagicMock(spec=solwyn._reporter.report)
+    report_settlement = MagicMock(spec=solwyn._reporter.report_settlement)
 
     with (
         caplog.at_level(logging.WARNING, logger="solwyn.client"),
@@ -227,12 +237,13 @@ async def test_async_unmetered_surface_warns_and_passes_through(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     client = AsyncTogether(_completion_response())
-    resource = SimpleNamespace(create=AsyncMock(return_value=object()))
+    resource = MagicMock(spec=_AsyncResource)
+    resource.create.return_value = object()
     client.images = resource
     solwyn = _make_async_solwyn(client)
-    check_budget = AsyncMock()
-    report = MagicMock()
-    report_settlement = MagicMock()
+    check_budget = AsyncMock(spec=solwyn._budget.check_budget)
+    report = MagicMock(spec=solwyn._reporter.report)
+    report_settlement = MagicMock(spec=solwyn._reporter.report_settlement)
 
     with (
         caplog.at_level(logging.WARNING, logger="solwyn.client"),
@@ -264,7 +275,7 @@ def test_sync_warns_once_for_each_declared_unmetered_surface(
     client = FakeTogetherClient(_completion_response())
     resources: dict[str, MagicMock] = {}
     for surface in UNMETERED_SPEND_SURFACES:
-        resource = MagicMock()
+        resource = MagicMock(spec=_SyncResource)
         resource.create.return_value = surface
         setattr(client, surface, resource)
         resources[surface] = resource

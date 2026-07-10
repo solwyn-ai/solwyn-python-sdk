@@ -957,3 +957,47 @@ class TestAsyncStreamWrapperInnerClose:
         await wrapper.close()
 
         assert inner.close_called == 1
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_close_awaits_async_close_when_no_aclose(self) -> None:
+        """await wrapper.close() awaits an awaitable returned by inner.close()."""
+        from solwyn.stream import AsyncStreamWrapper
+
+        class AsyncCloseOnlyStream:
+            """Matches Together AsyncStream: async close() but no aclose()."""
+
+            def __init__(self) -> None:
+                self.close_called = 0
+
+            async def __aiter__(self):
+                yield SimpleNamespace()
+                yield SimpleNamespace()
+
+            async def close(self) -> None:
+                self.close_called += 1
+
+        inner = AsyncCloseOnlyStream()
+        completion_count = 0
+
+        async def on_complete(_token_details: TokenDetails, _elapsed_ms: float) -> None:
+            nonlocal completion_count
+            completion_count += 1
+
+        async def on_error(_exc: Exception) -> None:
+            raise AssertionError("early close must not settle as an error")
+
+        wrapper = AsyncStreamWrapper(
+            stream=inner,
+            accumulator=FakeAccumulator(),
+            on_complete=on_complete,
+            on_error=on_error,
+        )
+        iterator = wrapper.__aiter__()
+        await iterator.__anext__()
+
+        await wrapper.close()
+        await iterator.aclose()
+
+        assert inner.close_called == 1
+        assert completion_count == 1
