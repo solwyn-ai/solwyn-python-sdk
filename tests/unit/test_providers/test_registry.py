@@ -21,6 +21,7 @@ from solwyn.providers._protocol import ProviderAdapter
 from solwyn.providers.anthropic import AnthropicAdapter
 from solwyn.providers.google import GoogleAdapter
 from solwyn.providers.openai import OpenAIAdapter
+from solwyn.providers.together import TogetherAdapter
 
 
 def _make_client(module_path: str) -> Any:
@@ -50,6 +51,10 @@ class TestGetAdapterByName:
     def test_returns_google_adapter_for_google(self) -> None:
         adapter = get_adapter_by_name("google")
         assert isinstance(adapter, GoogleAdapter)
+
+    def test_returns_together_adapter_for_together(self) -> None:
+        adapter = get_adapter_by_name("together")
+        assert isinstance(adapter, TogetherAdapter)
 
     def test_unknown_name_raises_value_error(self) -> None:
         with pytest.raises(ValueError, match="unknown_provider"):

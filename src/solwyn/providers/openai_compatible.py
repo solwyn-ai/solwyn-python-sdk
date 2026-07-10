@@ -530,4 +530,9 @@ class CompatStreamAccumulator:
 
 def build_compat_adapters() -> list[OpenAICompatibleAdapter]:
     """One adapter instance per profile, in detection-priority order."""
-    return [OpenAICompatibleAdapter(profile) for profile in COMPAT_PROFILES]
+    from solwyn.providers.together import TogetherAdapter
+
+    return [
+        TogetherAdapter() if profile.name == "together" else OpenAICompatibleAdapter(profile)
+        for profile in COMPAT_PROFILES
+    ]

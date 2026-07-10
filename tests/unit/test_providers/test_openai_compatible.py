@@ -23,6 +23,7 @@ from solwyn.providers.openai_compatible import (
     OpenAICompatibleAdapter,
     build_compat_adapters,
 )
+from solwyn.providers.together import TogetherAdapter
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -106,6 +107,20 @@ class TestProfileTable:
     def test_all_adapters_speak_openai_dialect(self) -> None:
         for adapter in build_compat_adapters():
             assert adapter.dialect == "openai"
+
+    def test_together_profile_slot_uses_first_class_adapter(self) -> None:
+        adapters = build_compat_adapters()
+
+        assert [adapter.name for adapter in adapters] == [
+            profile.name for profile in COMPAT_PROFILES
+        ]
+        assert sum(isinstance(adapter, TogetherAdapter) for adapter in adapters) == 1
+        assert all(
+            isinstance(adapter, TogetherAdapter)
+            if adapter.name == "together"
+            else type(adapter) is OpenAICompatibleAdapter
+            for adapter in adapters
+        )
 
 
 # ---------------------------------------------------------------------------
