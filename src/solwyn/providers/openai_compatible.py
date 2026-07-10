@@ -161,8 +161,10 @@ COMPAT_PROFILES: tuple[CompatProfile, ...] = (
     # Groq: include_usage documented; legacy x_groq.usage handled by the
     # accumulator for older response formats.
     CompatProfile(name="groq", hosts=("api.groq.com",)),
-    # Together: usage arrives in the final chunk; stream_options undocumented —
-    # don't send (estimation nets any gap).
+    # Together: live probe 2026-07-10 (SDK 2.22.1) verified terminal-chunk usage
+    # for sync and async streams. It also verified nested (GLM-5.2) and flat
+    # (Llama 3.3 70B) cached-token shapes, both as prompt-token subsets.
+    # stream_options remains undocumented — don't send (estimation nets any gap).
     CompatProfile(
         name="together",
         hosts=("api.together.xyz", "api.together.ai"),

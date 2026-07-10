@@ -7,6 +7,10 @@ from typing import Any
 from solwyn.providers.openai_compatible import COMPAT_PROFILES, OpenAICompatibleAdapter
 
 _TOGETHER_CLIENT_NAMES = frozenset({"Together", "AsyncTogether"})
+# Live probe 2026-07-10 (Together SDK 2.22.1): sync and async streams carried
+# usage on the terminal chunk. GLM-5.2 reported cached prompt tokens at
+# prompt_tokens_details.cached_tokens (5,440 of 5,471), while Llama 3.3 70B
+# reported usage.cached_tokens (4,608 of 4,701); both were prompt-token subsets.
 _TOGETHER_PROFILE = next(profile for profile in COMPAT_PROFILES if profile.name == "together")
 
 
