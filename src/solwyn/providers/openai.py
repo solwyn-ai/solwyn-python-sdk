@@ -58,11 +58,16 @@ def _extract_chat_completions(usage: Any) -> TokenDetails:
     """Extract from Chat Completions API usage object."""
     prompt_details = getattr(usage, "prompt_tokens_details", None)
     completion_details = getattr(usage, "completion_tokens_details", None)
+    cached_tokens = getattr(
+        prompt_details if prompt_details is not None else usage,
+        "cached_tokens",
+        None,
+    )
 
     return TokenDetails(
         input_tokens=_usage_value(getattr(usage, "prompt_tokens", None)),
         output_tokens=_usage_value(getattr(usage, "completion_tokens", None)),
-        cached_input_tokens=_usage_value(getattr(prompt_details, "cached_tokens", None)),
+        cached_input_tokens=_usage_value(cached_tokens),
         audio_input_tokens=_usage_value(getattr(prompt_details, "audio_tokens", None)),
         reasoning_tokens=_usage_value(getattr(completion_details, "reasoning_tokens", None)),
         audio_output_tokens=_usage_value(getattr(completion_details, "audio_tokens", None)),

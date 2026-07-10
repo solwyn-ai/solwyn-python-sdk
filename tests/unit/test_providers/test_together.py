@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -63,3 +64,22 @@ def test_together_adapter_identity() -> None:
     assert isinstance(adapter, OpenAICompatibleAdapter)
     assert adapter.name == "together"
     assert adapter.dialect == "openai"
+
+
+@pytest.mark.unit
+def test_together_stream_extracts_flat_cached_tokens() -> None:
+    accumulator = _adapter().create_stream_accumulator()
+    accumulator.observe(
+        SimpleNamespace(
+            choices=[],
+            usage=SimpleNamespace(
+                prompt_tokens=1000,
+                completion_tokens=500,
+                cached_tokens=400,
+            ),
+        )
+    )
+
+    result = accumulator.finalize()
+
+    assert result.cached_input_tokens == 400
