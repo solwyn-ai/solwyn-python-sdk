@@ -56,6 +56,37 @@ class _GoogleErr(Exception):
         self.code = code
 
 
+# Together v2 2.22.1 hierarchy, mirrored without importing the provider SDK:
+#   APITimeoutError -> APIConnectionError -> APIError -> TogetherError
+#   <status error> -> APIStatusError -> APIError -> TogetherError
+_TogetherError = type("TogetherError", (Exception,), {})
+_TogetherAPIError = type("APIError", (_TogetherError,), {})
+_TogetherAPIConnectionError = type("APIConnectionError", (_TogetherAPIError,), {})
+_TogetherAPITimeoutError = type("APITimeoutError", (_TogetherAPIConnectionError,), {})
+_TogetherAPIStatusError = type("APIStatusError", (_TogetherAPIError,), {})
+_TogetherBadRequestError = type("BadRequestError", (_TogetherAPIStatusError,), {})
+_TogetherAuthenticationError = type("AuthenticationError", (_TogetherAPIStatusError,), {})
+_TogetherPermissionDeniedError = type("PermissionDeniedError", (_TogetherAPIStatusError,), {})
+_TogetherNotFoundError = type("NotFoundError", (_TogetherAPIStatusError,), {})
+_TogetherConflictError = type("ConflictError", (_TogetherAPIStatusError,), {})
+_TogetherUnprocessableEntityError = type("UnprocessableEntityError", (_TogetherAPIStatusError,), {})
+_TogetherRateLimitError = type("RateLimitError", (_TogetherAPIStatusError,), {})
+_TogetherInternalServerError = type("InternalServerError", (_TogetherAPIStatusError,), {})
+
+# Legacy Together v1 exceptions did not carry the v2 status_code contract.
+# Unknown members of that family must stay on the classifier's safe default.
+_TogetherException = type("TogetherException", (Exception,), {})
+_TogetherInvalidRequestError = type("InvalidRequestError", (_TogetherException,), {})
+_TogetherResponseError = type("ResponseError", (_TogetherException,), {})
+
+
+def _together_status_error(error_type: type[Exception], status_code: int) -> Exception:
+    """Build a Together v2-shaped status exception without the provider SDK."""
+    exc = error_type("Together API status error")
+    exc.status_code = status_code  # type: ignore[attr-defined]
+    return exc
+
+
 # ---------------------------------------------------------------------------
 # 1. The double-spend ordering trap (APITimeoutError ⊂ APIConnectionError)
 # ---------------------------------------------------------------------------
@@ -421,3 +452,56 @@ class TestApiConnectionErrorCauseInspection:
         exc = APIConnectionError("server disconnected")
         exc.__context__ = httpx.RemoteProtocolError("peer closed connection")
         assert classify_exception(exc) is Disposition.POST_SEND_AMBIGUOUS
+
+
+# ---------------------------------------------------------------------------
+# 10. Together v2 and legacy v1 exception hierarchy (provider SDK never imported)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestTogetherExceptionClassification:
+    def test_v2_api_timeout_is_ambiguous_despite_connection_error_base(self) -> None:
+        assert issubclass(_TogetherAPITimeoutError, _TogetherAPIConnectionError)
+        assert (
+            classify_exception(_TogetherAPITimeoutError("request timed out"))
+            is Disposition.POST_SEND_AMBIGUOUS
+        )
+
+    def test_v2_rate_limit_is_failover(self) -> None:
+        exc = _together_status_error(_TogetherRateLimitError, 429)
+        assert classify_exception(exc) is Disposition.FAILOVER
+
+    @pytest.mark.parametrize(
+        "error_type,status_code",
+        [
+            (_TogetherBadRequestError, 400),
+            (_TogetherAuthenticationError, 401),
+            (_TogetherPermissionDeniedError, 403),
+            (_TogetherNotFoundError, 404),
+            (_TogetherConflictError, 409),
+            (_TogetherUnprocessableEntityError, 422),
+        ],
+    )
+    def test_v2_request_errors_are_fail_fast(
+        self, error_type: type[Exception], status_code: int
+    ) -> None:
+        exc = _together_status_error(error_type, status_code)
+        assert classify_exception(exc) is Disposition.FAIL_FAST
+
+    @pytest.mark.parametrize("status_code", [500, 503])
+    def test_v2_internal_server_errors_are_ambiguous(self, status_code: int) -> None:
+        exc = _together_status_error(_TogetherInternalServerError, status_code)
+        assert classify_exception(exc) is Disposition.POST_SEND_AMBIGUOUS
+
+    def test_v2_connection_error_with_connect_error_cause_is_failover(self) -> None:
+        exc = _TogetherAPIConnectionError("connection failed")
+        exc.__cause__ = httpx.ConnectError("connection refused")
+        assert classify_exception(exc) is Disposition.FAILOVER
+
+    @pytest.mark.parametrize(
+        "error_type",
+        [_TogetherException, _TogetherInvalidRequestError, _TogetherResponseError],
+    )
+    def test_legacy_v1_unknown_error_family_is_fail_fast(self, error_type: type[Exception]) -> None:
+        assert classify_exception(error_type("legacy Together error")) is Disposition.FAIL_FAST
