@@ -14,6 +14,7 @@ from solwyn._privacy import (
     estimate_content_length,
     estimate_embedding_input_tokens,
     estimate_tokens_from_length,
+    measure_google_image_media,
     measure_image_media,
 )
 from solwyn._token_details import TokenDetails
@@ -209,6 +210,50 @@ def _images_spec() -> MediaSurfaceSpec:
 
 
 # ---------------------------------------------------------------------------
+# Images surface (google dialect: client.models.generate_images — imagen)
+# ---------------------------------------------------------------------------
+
+
+def _measure_google_image_media(kwargs: dict[str, Any], _response: Any) -> MediaUsage:
+    """Settled request-derived image ``MediaUsage`` for a Google generate_images call.
+
+    The response is intentionally IGNORED: imagen exposes NO usage, so the
+    billable quantity is request-DETERMINED (``config.number_of_images``). Because
+    the estimate is EXACT for images, this settled measurement and the pre-flight
+    estimate share the same firewall builder.
+    """
+    return measure_google_image_media(kwargs)
+
+
+def _google_images_spec() -> MediaSurfaceSpec:
+    """Build the Google images ``MediaSurfaceSpec`` (imagen: request-derived per-image).
+
+    ``surface="images"`` is the adapter dispatch key (``GoogleAdapter`` routes it
+    to ``client.models.generate_images``); ``modality="image"`` is the server
+    billing modality. imagen models are token-usage-less and priced on flat
+    per-image cards, so:
+
+    - ``extract_usage`` returns None: imagen responses carry no token usage. (The
+      TOKEN-billed google image model, gemini-3-pro-image, rides the CHAT surface
+      ``generate_content`` instead — its image tokens flow via the usageMetadata
+      modality buckets, NOT this seam.)
+    - ``measure_request`` returns None: no request-derived TOKEN estimate exists.
+    - ``measure_media`` / ``estimate_media`` build the request-derived
+      ``MediaUsage`` (``config.number_of_images`` -> ``image_count``) so the
+      per-image quantity is the sole billable basis — an EXACT count, never a
+      silent $0.
+    """
+    return MediaSurfaceSpec(
+        surface="images",
+        modality="image",
+        extract_usage=lambda _response: None,
+        measure_request=lambda _kwargs: None,
+        measure_media=_measure_google_image_media,
+        estimate_media=measure_google_image_media,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Sync proxies
 # ---------------------------------------------------------------------------
 
@@ -330,19 +375,20 @@ class _SyncMessagesProxy:
 
 class _SyncModelsProxy:
     """Proxy for client.models that intercepts generate_content(), generate_content_stream(),
-    and embed_content().
+    embed_content(), and generate_images().
 
     Enables ``client.models.generate_content()`` (Google's documented API)
     to go through _intercepted_call. The generate_content_stream() method
     passes _force_stream=True so _intercepted_call dispatches to the correct
-    underlying SDK method. ``embed_content()`` routes through the media
-    lifecycle (``_media_call``) so embeddings spend is budget-checked,
-    confirmed, and reported.
+    underlying SDK method. ``embed_content()`` and ``generate_images()`` route
+    through the media lifecycle (``_media_call``) so their spend is
+    budget-checked, confirmed, and reported.
     """
 
     def __init__(self, solwyn: Solwyn) -> None:
         self._solwyn = solwyn
         self._embeddings_spec = _google_embeddings_spec()
+        self._images_spec = _google_images_spec()
 
     def generate_content(self, **kwargs: Any) -> Any:
         return self._solwyn._intercepted_call(**kwargs)
@@ -356,17 +402,29 @@ class _SyncModelsProxy:
         An EXPLICIT method (not __getattr__) so embeddings spend is
         budget-checked, confirmed, and reported instead of passing through
         untracked. Because it is defined on the class, it never reaches
-        __getattr__ — generate_images/generate_videos keep riding that
-        warn-once pass-through until their interception phase ships.
+        __getattr__ — generate_videos keeps riding that warn-once pass-through
+        until its interception phase (P4) ships.
         """
         return self._solwyn._media_call(self._embeddings_spec, **kwargs)
 
+    def generate_images(self, **kwargs: Any) -> Any:
+        """Intercept models.generate_images() (imagen) through the media lifecycle.
+
+        An EXPLICIT method (not __getattr__) so image spend is budget-checked,
+        confirmed, and reported. imagen exposes no token usage; the billable
+        basis is the request-derived per-image ``MediaUsage``
+        (``config.number_of_images``). Being defined on the class, it never
+        reaches __getattr__ — it has graduated OUT of the warn-once pass-through
+        (P2.9), leaving only generate_videos warning there.
+        """
+        return self._solwyn._media_call(self._images_spec, **kwargs)
+
     def __getattr__(self, name: str) -> Any:
-        # Google's non-chat media surfaces (generate_images/generate_videos) are
-        # methods on client.models, so they arrive here rather than on
-        # Solwyn.__getattr__ — warn-once pass-through per the P1.10 posture (P1.8
-        # delegates this warn to P1.10). embed_content never reaches here: the
-        # explicit method above intercepts it (P1.8).
+        # Google's remaining unshipped media surface (generate_videos) is a method
+        # on client.models, so it arrives here rather than on Solwyn.__getattr__ —
+        # warn-once pass-through per the P1.10 posture. embed_content and
+        # generate_images never reach here: the explicit methods above intercept
+        # them (P1.8 / P2.9).
         attribute = getattr(self._solwyn._client.models, name)
         _warn_unmetered_spend_surface_once(
             adapter=self._solwyn._adapter, dialect=self._solwyn._dialect, surface=name
@@ -473,12 +531,14 @@ class _AsyncMessagesProxy:
 class _AsyncModelsProxy:
     """Async proxy for client.models.
 
-    Intercepts generate_content(), generate_content_stream(), and embed_content().
+    Intercepts generate_content(), generate_content_stream(), embed_content(),
+    and generate_images().
     """
 
     def __init__(self, solwyn: AsyncSolwyn) -> None:
         self._solwyn = solwyn
         self._embeddings_spec = _google_embeddings_spec()
+        self._images_spec = _google_images_spec()
 
     async def generate_content(self, **kwargs: Any) -> Any:
         return await self._solwyn._intercepted_call(**kwargs)
@@ -492,14 +552,25 @@ class _AsyncModelsProxy:
         Mirror of ``_SyncModelsProxy.embed_content``: an EXPLICIT method (not
         __getattr__) so embeddings spend is budget-checked, confirmed, and
         reported. Being defined on the class, it never reaches __getattr__ —
-        generate_images/generate_videos keep their warn-once pass-through.
+        generate_videos keeps its warn-once pass-through.
         """
         return await self._solwyn._media_call(self._embeddings_spec, **kwargs)
 
+    async def generate_images(self, **kwargs: Any) -> Any:
+        """Intercept models.generate_images() (imagen) through the async media lifecycle.
+
+        Mirror of ``_SyncModelsProxy.generate_images``: an EXPLICIT method (not
+        __getattr__) so image spend is budget-checked, confirmed, and reported on
+        the request-derived per-image ``MediaUsage`` basis. Graduated OUT of the
+        warn-once pass-through (P2.9); only generate_videos still warns there.
+        """
+        return await self._solwyn._media_call(self._images_spec, **kwargs)
+
     def __getattr__(self, name: str) -> Any:
-        # See _SyncModelsProxy.__getattr__: Google media surfaces (generate_images/
-        # generate_videos) warn-once pass-through per the P1.10 posture.
-        # embed_content never reaches here — the explicit method above intercepts it.
+        # See _SyncModelsProxy.__getattr__: Google's remaining unshipped media
+        # surface (generate_videos) warn-once pass-through per the P1.10 posture.
+        # embed_content and generate_images never reach here — the explicit
+        # methods above intercept them.
         attribute = getattr(self._solwyn._client.models, name)
         _warn_unmetered_spend_surface_once(
             adapter=self._solwyn._adapter, dialect=self._solwyn._dialect, surface=name

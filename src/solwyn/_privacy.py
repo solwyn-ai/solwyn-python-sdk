@@ -225,6 +225,42 @@ def measure_image_media(kwargs: dict[str, Any]) -> MediaUsage:
     )
 
 
+def _google_image_count(config: object) -> int:
+    """Requested image count from a ``generate_images`` ``config``, defaulting to 1.
+
+    google-genai carries ``number_of_images`` INSIDE the ``config=`` argument
+    (unlike the openai images API's top-level ``n``): either a
+    ``GenerateImagesConfig`` object (attribute access) or a plain dict — both
+    handled duck-typed, no provider SDK import. ``number_of_images`` is a COUNT,
+    not prompt content. The imagen API contract defaults it to 1 when omitted, so
+    a missing value is a TRUE known quantity (1 image), never a zero-as-default.
+    A non-int / bool / <1 value is garbage and also degrades to the documented
+    default of 1.
+    """
+    if isinstance(config, dict):
+        value = config.get("number_of_images")
+    else:
+        value = getattr(config, "number_of_images", None)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return 1
+    return value
+
+
+def measure_google_image_media(kwargs: dict[str, Any]) -> MediaUsage:
+    """Request-derived ``MediaUsage`` for a Google ``generate_images`` call.
+
+    CONFIG values only — ``config.number_of_images`` -> ``image_count``. The
+    customer's ``prompt=`` is NEVER read, logged, or retained; only this
+    non-content count is measured. imagen responses expose NO usage, so this
+    request-derived count is the SOLE billable basis (imagen cards are flat
+    per-image). ``is_estimated`` stays False: this is the EXACT request parameter
+    that determines billing, not a length-based approximation — so the same
+    builder serves both the pre-flight ``estimated_media`` and the settled
+    ``media_usage``.
+    """
+    return MediaUsage(image_count=_google_image_count(kwargs.get("config")))
+
+
 def _part_text_length(part: Any) -> int:
     """Sum string lengths of one delta/message part: content, reasoning text,
     and tool-call function arguments. Length-only; nothing is concatenated,

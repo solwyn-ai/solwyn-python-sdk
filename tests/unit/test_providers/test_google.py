@@ -24,6 +24,11 @@ from solwyn.providers.google import GoogleAdapter
 # ---------------------------------------------------------------------------
 
 
+def _modality_bucket(modality: Any, token_count: int) -> Any:
+    """One ModalityTokenCount entry (snake_case ``modality`` / ``token_count``)."""
+    return SimpleNamespace(modality=modality, token_count=token_count)
+
+
 def _google_response(
     *,
     prompt_token_count: int = 0,
@@ -31,6 +36,8 @@ def _google_response(
     thoughts_token_count: int | None = None,
     cached_content_token_count: int | None = None,
     tool_use_prompt_token_count: int | None = None,
+    prompt_tokens_details: list[Any] | None = None,
+    candidates_tokens_details: list[Any] | None = None,
     include_usage: bool = True,
 ) -> Any:
     """Build a fake Google GenerateContentResponse.
@@ -39,7 +46,9 @@ def _google_response(
     responses without usage_metadata (returns all zeros).
 
     Optional fields are absent from the namespace when not provided, simulating
-    older or simpler API responses that omit them entirely.
+    older or simpler API responses that omit them entirely. The
+    ``prompt_tokens_details`` / ``candidates_tokens_details`` lists (per-modality
+    ModalityTokenCount buckets) are likewise absent unless supplied.
     """
     if not include_usage:
         return SimpleNamespace()
@@ -55,6 +64,10 @@ def _google_response(
         kwargs["cached_content_token_count"] = cached_content_token_count
     if tool_use_prompt_token_count is not None:
         kwargs["tool_use_prompt_token_count"] = tool_use_prompt_token_count
+    if prompt_tokens_details is not None:
+        kwargs["prompt_tokens_details"] = prompt_tokens_details
+    if candidates_tokens_details is not None:
+        kwargs["candidates_tokens_details"] = candidates_tokens_details
 
     usage_metadata = SimpleNamespace(**kwargs)
     return SimpleNamespace(usage_metadata=usage_metadata)
@@ -232,6 +245,118 @@ class TestGoogleAdapterExtractUsage:
 
 
 @pytest.mark.unit
+class TestGoogleAdapterModalityBuckets:
+    """usageMetadata per-modality buckets map to image/audio token fields.
+
+    ``prompt_tokens_details`` (input side) and ``candidates_tokens_details``
+    (output side) are lists of ModalityTokenCount {modality, token_count}. IMAGE
+    buckets map to image_input/image_output; AUDIO buckets to
+    audio_input/audio_output. TEXT buckets need no field (they are the remainder).
+    """
+
+    def test_no_details_leaves_modality_fields_zero(self) -> None:
+        # A plain chat response with no per-modality details: fields stay 0
+        # exactly as before this mapping existed.
+        response = _google_response(prompt_token_count=100, candidates_token_count=50)
+        result = GoogleAdapter().extract_usage(response)
+        assert result.image_input_tokens == 0
+        assert result.image_output_tokens == 0
+        assert result.audio_input_tokens == 0
+        assert result.audio_output_tokens == 0
+
+    def test_image_output_bucket_maps_to_image_output_tokens(self) -> None:
+        # gemini-3-pro-image on the chat path: candidates carry an IMAGE bucket so
+        # the server prices the image output at the image rate.
+        response = _google_response(
+            prompt_token_count=20,
+            candidates_token_count=1300,
+            candidates_tokens_details=[
+                _modality_bucket("TEXT", 4),
+                _modality_bucket("IMAGE", 1290),
+            ],
+        )
+        result = GoogleAdapter().extract_usage(response)
+        assert result.image_output_tokens == 1290
+        assert result.image_input_tokens == 0
+        # Total output is unchanged — the bucket is a SUBSET of output_tokens.
+        assert result.output_tokens == 1300
+
+    def test_image_input_bucket_maps_to_image_input_tokens(self) -> None:
+        # A multimodal prompt with image parts: prompt details carry an IMAGE bucket.
+        response = _google_response(
+            prompt_token_count=558,
+            candidates_token_count=30,
+            prompt_tokens_details=[
+                _modality_bucket("TEXT", 300),
+                _modality_bucket("IMAGE", 258),
+            ],
+        )
+        result = GoogleAdapter().extract_usage(response)
+        assert result.image_input_tokens == 258
+        assert result.image_output_tokens == 0
+        assert result.input_tokens == 558
+
+    def test_audio_buckets_map_to_audio_fields_both_sides(self) -> None:
+        response = _google_response(
+            prompt_token_count=400,
+            candidates_token_count=200,
+            prompt_tokens_details=[_modality_bucket("AUDIO", 150)],
+            candidates_tokens_details=[_modality_bucket("AUDIO", 80)],
+        )
+        result = GoogleAdapter().extract_usage(response)
+        assert result.audio_input_tokens == 150
+        assert result.audio_output_tokens == 80
+
+    def test_enum_like_modality_is_read_via_value(self) -> None:
+        # MediaModality is a str-enum; a non-str enum-like object exposing .value
+        # must still be recognized (duck-typed, no provider SDK import).
+        response = _google_response(
+            prompt_token_count=10,
+            candidates_token_count=500,
+            candidates_tokens_details=[_modality_bucket(SimpleNamespace(value="IMAGE"), 480)],
+        )
+        result = GoogleAdapter().extract_usage(response)
+        assert result.image_output_tokens == 480
+
+    def test_multiple_same_modality_buckets_sum(self) -> None:
+        response = _google_response(
+            prompt_token_count=10,
+            candidates_token_count=300,
+            candidates_tokens_details=[
+                _modality_bucket("IMAGE", 100),
+                _modality_bucket("IMAGE", 150),
+            ],
+        )
+        result = GoogleAdapter().extract_usage(response)
+        assert result.image_output_tokens == 250
+
+    def test_garbage_bucket_count_is_skipped(self) -> None:
+        # A malformed entry (non-int / negative / bool count) contributes 0 and
+        # never raises out of extraction.
+        response = _google_response(
+            prompt_token_count=10,
+            candidates_token_count=300,
+            candidates_tokens_details=[
+                _modality_bucket("IMAGE", 200),
+                SimpleNamespace(modality="IMAGE", token_count="oops"),
+                SimpleNamespace(modality="IMAGE"),  # no token_count at all
+            ],
+        )
+        result = GoogleAdapter().extract_usage(response)
+        assert result.image_output_tokens == 200
+
+    def test_non_list_details_ignored(self) -> None:
+        response = _google_response(
+            prompt_token_count=10,
+            candidates_token_count=50,
+            candidates_tokens_details=[],
+        )
+        # Empty list -> no buckets, fields stay 0.
+        result = GoogleAdapter().extract_usage(response)
+        assert result.image_output_tokens == 0
+
+
+@pytest.mark.unit
 class TestGoogleAdapterNoneHandling:
     def test_no_usage_metadata_attr_returns_zeros(self) -> None:
         """When response has no usage_metadata attribute, return all-zero TokenDetails."""
@@ -253,6 +378,7 @@ class TestGoogleAdapterDispatchSeams:
                 generate_content=lambda **kw: kw,
                 generate_content_stream=lambda **kw: kw,
                 embed_content=lambda **kw: kw,
+                generate_images=lambda **kw: kw,
             )
         )
 
@@ -322,11 +448,36 @@ class TestGoogleAdapterDispatchSeams:
         assert prepared["config"]["http_options"]["retry_options"]["attempts"] == 3
         assert kwargs == original  # input never mutated
 
+    def test_prepare_media_call_images_selects_generate_images(self) -> None:
+        # P2.9: images routes to client.models.generate_images (imagen). The
+        # per-hop bound rides config.http_options (google-genai has no
+        # with_options), injected here as a defensive COPY that preserves the
+        # caller's own config keys (e.g. number_of_images).
+        client = self._client()
+        kwargs: dict[str, Any] = {
+            "model": "imagen-3.0-generate-002",
+            "prompt": "a cat",
+            "config": {"number_of_images": 3},
+        }
+        original = dict(kwargs)
+
+        method, prepared = GoogleAdapter().prepare_media_call(
+            "images", client, kwargs, timeout=12.5, max_retries=2
+        )
+
+        assert method is client.models.generate_images
+        assert prepared["model"] == "imagen-3.0-generate-002"
+        # The caller's config key is preserved alongside the injected http bound.
+        assert prepared["config"]["number_of_images"] == 3
+        assert prepared["config"]["http_options"]["timeout"] == 12500
+        assert prepared["config"]["http_options"]["retry_options"]["attempts"] == 3
+        assert kwargs == original  # input never mutated
+
     def test_prepare_media_call_raises_unsupported_surface_for_unwired(self) -> None:
-        # Only embeddings is wired (P1.8); images/audio/video still fail loud
-        # with the structural, content-free UnsupportedSurfaceError.
+        # embeddings (P1.8) and images (P2.9) are wired; audio/video still fail
+        # loud with the structural, content-free UnsupportedSurfaceError.
         adapter = GoogleAdapter()
-        for surface in ("images", "audio", "video"):
+        for surface in ("audio", "video"):
             with pytest.raises(UnsupportedSurfaceError) as excinfo:
                 adapter.prepare_media_call(
                     surface, object(), {"model": "m"}, timeout=30.0, max_retries=0

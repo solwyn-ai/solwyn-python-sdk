@@ -74,16 +74,17 @@ def _warn_cost_policy_inactive_once() -> None:
 # Recognized spend surfaces whose interception phase has not shipped yet: they
 # warn ONCE per process, then pass through untracked. Keyed by DIALECT because
 # the same posture spans every provider that speaks it — OpenAI itself and every
-# OpenAI-compatible provider share the "openai" set. Embeddings (P1.7) and images
-# (P2.8) are deliberately ABSENT: they are intercepted on this branch, so they
-# graduate to tracking rather than warning (a surface that is metered must not
-# advertise itself as untracked). audio (P3) and videos (P4) remain until their
-# interception phase ships. Attribute shapes differ by dialect: OpenAI exposes
-# top-level resources (``client.audio``), Google exposes methods on
-# ``client.models`` (``client.models.generate_videos``).
+# OpenAI-compatible provider share the "openai" set. Embeddings (P1.7), openai
+# images (P2.8), and google ``generate_images`` (P2.9) are deliberately ABSENT:
+# they are intercepted on this branch, so they graduate to tracking rather than
+# warning (a surface that is metered must not advertise itself as untracked).
+# audio (P3) and videos (P4 — openai ``videos``, google ``generate_videos``)
+# remain until their interception phase ships. Attribute shapes differ by
+# dialect: OpenAI exposes top-level resources (``client.audio``), Google exposes
+# methods on ``client.models`` (``client.models.generate_videos``).
 _UNSHIPPED_SPEND_SURFACES: dict[str, frozenset[str]] = {
     "openai": frozenset({"audio", "videos"}),
-    "google": frozenset({"generate_images", "generate_videos"}),
+    "google": frozenset({"generate_videos"}),
 }
 
 # Per-PROCESS warn-once latch for untracked spend surfaces (NOT per-instance): a

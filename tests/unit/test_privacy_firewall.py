@@ -24,7 +24,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY
 
-from solwyn._privacy import estimate_embedding_input_tokens, measure_image_media
+from solwyn._privacy import (
+    estimate_embedding_input_tokens,
+    measure_google_image_media,
+    measure_image_media,
+)
 from solwyn._types import BudgetCheckRequest, BudgetConfirmRequest, MetadataEvent
 from solwyn.client import Solwyn
 
@@ -795,4 +799,49 @@ class TestMeasureImageMedia:
         usage = measure_image_media(
             {"n": 1, "size": "1024x1024", "prompt": secret, "image": b"binary-bytes"}
         )
+        assert secret not in json.dumps(usage.model_dump(mode="json"))
+
+
+# --------------------------------------------------------------------------- #
+# Google images request recognizer (P2.9) — config count only, content-free    #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestMeasureGoogleImageMedia:
+    """measure_google_image_media reads ONLY config.number_of_images.
+
+    google-genai carries the count INSIDE ``config=`` (dict or config object);
+    the customer's ``prompt=`` is never read. imagen exposes no usage, so this
+    request-derived count is the sole billable basis.
+    """
+
+    def test_reads_number_of_images_from_dict_config(self) -> None:
+        usage = measure_google_image_media({"config": {"number_of_images": 4}})
+        assert usage.image_count == 4
+        # Exact request config, not an approximation.
+        assert usage.is_estimated is False
+
+    def test_reads_number_of_images_from_object_config(self) -> None:
+        usage = measure_google_image_media({"config": SimpleNamespace(number_of_images=2)})
+        assert usage.image_count == 2
+
+    def test_missing_config_defaults_to_one(self) -> None:
+        # imagen's contract defaults number_of_images to 1 — a TRUE known
+        # quantity, never a zero-as-default.
+        assert measure_google_image_media({}).image_count == 1
+
+    def test_missing_number_of_images_defaults_to_one(self) -> None:
+        assert measure_google_image_media({"config": {}}).image_count == 1
+        assert measure_google_image_media({"config": SimpleNamespace()}).image_count == 1
+
+    def test_garbage_number_of_images_degrades_to_one(self) -> None:
+        for bad in (0, -4, True, "two", None, 1.5):
+            assert (
+                measure_google_image_media({"config": {"number_of_images": bad}}).image_count == 1
+            )
+
+    def test_prompt_content_is_never_read(self) -> None:
+        # The prompt is present alongside the config but MUST NOT surface in the
+        # returned MediaUsage (content-free by construction).
+        secret = "SUPER_SECRET_IMAGEN_PROMPT_z9y8x7"
+        usage = measure_google_image_media({"prompt": secret, "config": {"number_of_images": 1}})
         assert secret not in json.dumps(usage.model_dump(mode="json"))
