@@ -28,6 +28,7 @@ from solwyn._privacy import (
     estimate_embedding_input_tokens,
     measure_google_image_media,
     measure_image_media,
+    measure_speech_media,
 )
 from solwyn._types import BudgetCheckRequest, BudgetConfirmRequest, MetadataEvent
 from solwyn.client import Solwyn
@@ -844,4 +845,48 @@ class TestMeasureGoogleImageMedia:
         # returned MediaUsage (content-free by construction).
         secret = "SUPER_SECRET_IMAGEN_PROMPT_z9y8x7"
         usage = measure_google_image_media({"prompt": secret, "config": {"number_of_images": 1}})
+        assert secret not in json.dumps(usage.model_dump(mode="json"))
+
+
+# --------------------------------------------------------------------------- #
+# TTS speech request recognizer — input LENGTH only, content-free             #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestMeasureSpeechMedia:
+    """measure_speech_media reads ONLY the LENGTH of the TTS ``input`` text.
+
+    It lives in the content-privileged _privacy module but touches no customer
+    content: the ``input`` TEXT is never retained or returned — only its exact
+    character count reaches the MediaUsage. TTS responses carry no usage, so this
+    request-derived count is the sole billable basis.
+    """
+
+    def test_reads_input_character_count(self) -> None:
+        usage = measure_speech_media({"model": "tts-1", "input": "hello world"})
+        assert usage is not None
+        assert usage.input_characters == len("hello world")
+        # An exact character count, not a length-based approximation.
+        assert usage.is_estimated is False
+
+    def test_empty_string_is_zero_characters(self) -> None:
+        # An empty str is still a str: the exact (degenerate) count is 0, not None.
+        usage = measure_speech_media({"input": ""})
+        assert usage is not None
+        assert usage.input_characters == 0
+
+    def test_absent_input_yields_none(self) -> None:
+        # No observable quantity -> None (never a zero-as-default MediaUsage).
+        assert measure_speech_media({"model": "tts-1"}) is None
+
+    def test_non_str_input_yields_none(self) -> None:
+        for bad in (b"bytes", 123, ["a", "b"], {"text": "x"}, None, True):
+            assert measure_speech_media({"input": bad}) is None
+
+    def test_input_text_is_never_read(self) -> None:
+        # The input text is present but MUST NOT surface anywhere in the returned
+        # MediaUsage — only its length does (content-free by construction).
+        secret = "SUPER_SECRET_TTS_INPUT_q7w8e9"
+        usage = measure_speech_media({"model": "tts-1", "input": secret})
+        assert usage is not None
+        assert usage.input_characters == len(secret)
         assert secret not in json.dumps(usage.model_dump(mode="json"))

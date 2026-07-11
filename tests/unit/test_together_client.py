@@ -29,15 +29,15 @@ from solwyn.providers.together import TogetherAdapter
 
 MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 # Together's adapter-DECLARED untracked spend surfaces: provider-specific extras
-# the central per-dialect map does not cover. speech/translations/videos live in
-# the central openai map; embeddings/images/audio.transcriptions (intercepted) and
-# batches/fine_tuning are no longer warned.
+# the central per-dialect map does not cover. translations/videos live in the
+# central openai map; embeddings/images/audio.transcriptions/audio.speech
+# (intercepted) and batches/fine_tuning are no longer warned.
 DECLARED_UNMETERED_SURFACES = frozenset({"completions", "rerank", "code_interpreter", "evals"})
 # Central openai-dialect surfaces every openai-dialect provider (Together
 # included) warns for, sourced from _base._UNSHIPPED_SPEND_SURFACES["openai"].
-# images and audio.transcriptions are intercepted; the audio proxy's still-unwired
-# speech/translations sub-surfaces plus videos remain.
-CENTRAL_OPENAI_SURFACES = frozenset({"speech", "translations", "videos"})
+# images, audio.transcriptions, and audio.speech are intercepted; the audio
+# proxy's still-unwired translations sub-surface plus videos remain.
+CENTRAL_OPENAI_SURFACES = frozenset({"translations", "videos"})
 # Every surface that warns-once for a Together (openai-dialect) client.
 WARNING_SURFACES = DECLARED_UNMETERED_SURFACES | CENTRAL_OPENAI_SURFACES
 # Together-billed surfaces Solwyn passes through SILENTLY (truly-unrelated
@@ -64,9 +64,9 @@ class _YieldingSet(set[str]):
 
 @pytest.mark.unit
 def test_together_adapter_declares_unmetered_spend_surfaces() -> None:
-    # Provider-specific extras only; speech/translations/videos ride the central
-    # openai dialect map, and embeddings/images/audio.transcriptions (intercepted)
-    # + batches/fine_tuning are not warned.
+    # Provider-specific extras only; translations/videos ride the central openai
+    # dialect map, and embeddings/images/audio.transcriptions/audio.speech
+    # (intercepted) + batches/fine_tuning are not warned.
     assert TogetherAdapter().unmetered_spend_surfaces == DECLARED_UNMETERED_SURFACES
 
 

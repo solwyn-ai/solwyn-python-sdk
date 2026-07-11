@@ -17,7 +17,7 @@ from solwyn._types import ProviderName
 from solwyn.exceptions import UnsupportedSurfaceError
 from solwyn.providers import get_adapter_by_name, get_adapter_for_client, get_adapter_for_model
 from solwyn.providers._protocol import ProviderAdapter
-from solwyn.providers.openai import _IMAGE_OP_KEY, OpenAIAdapter
+from solwyn.providers.openai import _AUDIO_OP_KEY, _IMAGE_OP_KEY, OpenAIAdapter
 from solwyn.providers.openai_compatible import (
     COMPAT_PROFILES,
     CompatStreamAccumulator,
@@ -174,6 +174,30 @@ class TestProfileTable:
             )
             assert method is create, adapter.name
             assert prepared == {"model": "whisper-large-v3", "file": b"x"}, adapter.name
+
+    def test_prepare_media_call_audio_speech_marker_selects_speech_for_every_profile(self) -> None:
+        # The audio op marker routes speech.create on the shared "audio" surface
+        # for every compat profile and is stripped before the SDK call.
+        def speech_create(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(
+            audio=SimpleNamespace(
+                transcriptions=SimpleNamespace(create=lambda **k: k),
+                speech=SimpleNamespace(create=speech_create),
+            )
+        )
+        for adapter in build_compat_adapters():
+            method, prepared = adapter.prepare_media_call(
+                "audio",
+                client,
+                {"model": "tts-x", "input": "hi", _AUDIO_OP_KEY: "speech"},
+                timeout=30.0,
+                max_retries=0,
+            )
+            assert method is speech_create, adapter.name
+            assert _AUDIO_OP_KEY not in prepared, adapter.name  # marker stripped
+            assert prepared == {"model": "tts-x", "input": "hi"}, adapter.name
 
     def test_prepare_media_call_raises_unsupported_surface_for_unwired_every_profile(self) -> None:
         # embeddings + images + audio are wired; video still fails loud

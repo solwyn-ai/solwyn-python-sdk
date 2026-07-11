@@ -4,7 +4,8 @@
 token-billed models (gpt-4o-transcribe family) settle on ``audio_input_tokens``,
 the duration-billed model (whisper-1) on ``audio_seconds``, and a non-JSON
 response_format (text/srt/vtt) is tracked UNPRICED with a one-time hint. The
-sibling audio sub-surfaces (speech / translations) warn-once and pass through.
+sibling ``speech`` sub-surface is intercepted too (see test_audio_speech.py);
+``translations`` warns-once and passes through.
 """
 
 from __future__ import annotations
@@ -310,23 +311,6 @@ class TestAudioTranscriptionsProxy:
         assert denied.modality == "audio"
         _close_sync(solwyn)
 
-    def test_speech_warns_once_and_passes_through(self, caplog: pytest.LogCaptureFixture) -> None:
-        client = _mock_transcription_client(_token_response())
-        client.audio.speech = MagicMock()
-        solwyn = _build_sync(client)
-        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
-            first = solwyn.audio.speech
-            second = solwyn.audio.speech
-
-        assert first is client.audio.speech
-        assert second is client.audio.speech  # pass-through
-        assert len(caplog.records) == 1
-        message = caplog.records[0].getMessage()
-        assert "openai" in message
-        assert "surface 'speech'" in message
-        assert "tracking for this surface is coming" in message.lower()
-        _close_sync(solwyn)
-
     def test_translations_warns_once_and_passes_through(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -347,12 +331,13 @@ class TestAudioTranscriptionsProxy:
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         # The audio attribute is intercepted machinery now: touching it (and its
-        # transcriptions sub-proxy) is silent; only speech/translations warn.
+        # transcriptions/speech sub-proxies) is silent; only translations warns.
         client = _mock_transcription_client(_token_response())
         solwyn = _build_sync(client)
         with caplog.at_level(logging.WARNING, logger="solwyn._base"):
             _ = solwyn.audio
             _ = solwyn.audio.transcriptions
+            _ = solwyn.audio.speech
         assert caplog.records == []
         _close_sync(solwyn)
 
@@ -409,23 +394,5 @@ class TestAsyncAudioTranscriptionsProxy:
         event = report.call_args.args[0]
         assert event.modality == "audio"
         assert event.media_usage.audio_seconds == 7.0
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
-
-    @pytest.mark.asyncio
-    async def test_async_speech_warns_and_passes_through(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        client = _mock_async_transcription_client(_token_response())
-        client.audio.speech = MagicMock()
-        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY)
-        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
-            first = solwyn.audio.speech
-            second = solwyn.audio.speech
-
-        assert first is client.audio.speech
-        assert second is client.audio.speech
-        assert len(caplog.records) == 1
-        assert "surface 'speech'" in caplog.records[0].getMessage()
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

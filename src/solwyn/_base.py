@@ -75,18 +75,18 @@ def _warn_cost_policy_inactive_once() -> None:
 # warn ONCE per process, then pass through untracked. Keyed by DIALECT because
 # the same posture spans every provider that speaks it — OpenAI itself and every
 # OpenAI-compatible provider share the "openai" set. Embeddings, openai
-# images, openai ``audio.transcriptions``, and google ``generate_images`` are
-# deliberately ABSENT: they are intercepted, so they are tracked rather than
-# warned (a surface that is metered must not advertise itself as untracked). The
-# openai ``audio`` attribute is now intercepted machinery (its proxy exposes
-# transcriptions), so its still-unwired SUB-surfaces are what warn here:
-# ``speech`` (TTS) and ``translations`` — plus ``videos``. Google's still-unwired
+# images, openai ``audio.transcriptions``, openai ``audio.speech``, and google
+# ``generate_images`` are deliberately ABSENT: they are intercepted, so they are
+# tracked rather than warned (a surface that is metered must not advertise itself
+# as untracked). The openai ``audio`` attribute is now intercepted machinery (its
+# proxy exposes transcriptions AND speech), so its one still-unwired SUB-surface
+# is what warns here: ``translations`` — plus ``videos``. Google's still-unwired
 # ``generate_videos`` warns on its side. Attribute shapes differ by dialect:
 # OpenAI exposes top-level resources (``client.videos``) and audio sub-resources
-# (``client.audio.speech``), Google exposes methods on ``client.models``
+# (``client.audio.translations``), Google exposes methods on ``client.models``
 # (``client.models.generate_videos``).
 _UNSHIPPED_SPEND_SURFACES: dict[str, frozenset[str]] = {
-    "openai": frozenset({"speech", "translations", "videos"}),
+    "openai": frozenset({"translations", "videos"}),
     "google": frozenset({"generate_videos"}),
 }
 

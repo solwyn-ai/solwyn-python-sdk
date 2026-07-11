@@ -44,8 +44,8 @@ from solwyn.exceptions import UnsupportedSurfaceError
 from solwyn.providers.openai import (
     _extract_openai_usage,
     _extract_service_tier,
+    _prepare_audio_media_call,
     _prepare_image_media_call,
-    _prepare_transcription_media_call,
 )
 
 logger = logging.getLogger(__name__)
@@ -451,28 +451,30 @@ class OpenAICompatibleAdapter:
 
         Embeddings route to ``client.embeddings.create``, images to
         ``client.images.generate`` / ``.edit``, and audio to
-        ``client.audio.transcriptions.create`` — one branch each covers all 14
-        compat profiles (and the first-class Together adapter that inherits this
-        method) since they share the openai dialect and its ``client.embeddings``
-        / ``client.images`` / ``client.audio`` surfaces. Returns the same
-        ``(method, shaped_kwargs)`` shape ``prepare_call`` gives chat, with a
-        defensive COPY of kwargs. The remaining surface (video) is not wired yet
-        and fails loud with ``UnsupportedSurfaceError``. timeout/max_retries are
-        ignored — the dispatcher already applied them via the openai SDK's
-        ``with_options``.
+        ``client.audio.transcriptions.create`` (or ``.speech.create`` when the op
+        marker selects it) — one branch each covers all 14 compat profiles (and
+        the first-class Together adapter that inherits this method) since they
+        share the openai dialect and its ``client.embeddings`` / ``client.images``
+        / ``client.audio`` surfaces. Returns the same ``(method, shaped_kwargs)``
+        shape ``prepare_call`` gives chat, with a defensive COPY of kwargs. The
+        remaining surface (video) is not wired yet and fails loud with
+        ``UnsupportedSurfaceError``. timeout/max_retries are ignored — the
+        dispatcher already applied them via the openai SDK's ``with_options``.
 
         Compat images endpoints (e.g. Together FLUX) return ``usage: null`` — the
         images spec's request-derived ``MediaUsage`` (n/size/quality) is then the
         sole billable basis, so a per-image card still prices the call. A compat
         transcription (e.g. Groq whisper) whose response carries no usable usage
-        shape is tracked UNPRICED rather than guessed.
+        shape is tracked UNPRICED rather than guessed. A compat TTS speech call is
+        priced server-side by whatever card the model has, on the request's
+        ``input`` character count the SDK measures in the firewall.
         """
         if surface == "embeddings":
             return client.embeddings.create, dict(kwargs)
         if surface == "images":
             return _prepare_image_media_call(client, kwargs)
         if surface == "audio":
-            return _prepare_transcription_media_call(client, kwargs)
+            return _prepare_audio_media_call(client, kwargs)
         raise UnsupportedSurfaceError(surface=surface, provider=self.name)
 
     def unwrap_stream_source(self, response: Any) -> Any:

@@ -292,16 +292,89 @@ def _measure_transcription_media(_kwargs: dict[str, Any], response: Any) -> Medi
     return _transcription_usage_basis(response)[1]
 
 
-def _prepare_transcription_media_call(
+# Private marker the audio proxies set so speech.create vs transcriptions.create
+# can ride the ONE "audio" media surface through the shared lifecycle (mirrors the
+# images ``_IMAGE_OP_KEY``). The surface key is just "audio", so the operation
+# rides kwargs and is STRIPPED here before the SDK call. Default is transcriptions.
+_AUDIO_OP_KEY = "_solwyn_audio_op"
+
+
+def _prepare_audio_media_call(
     client: Any, kwargs: dict[str, Any]
 ) -> tuple[Callable[..., Any], dict[str, Any]]:
-    """Select ``client.audio.transcriptions.create`` and shape a COPY of kwargs.
+    """Select ``client.audio.transcriptions.create`` / ``.speech.create`` and shape a COPY.
 
     Shared by the OpenAI adapter and every OpenAI-compatible adapter (same
-    ``client.audio.transcriptions`` surface, incl. Groq whisper). NEVER reads the
-    ``file`` bytes or ``prompt`` — only re-shapes keys into a defensive copy.
+    ``client.audio`` surface, incl. Groq whisper). Pops the private
+    ``_AUDIO_OP_KEY`` marker (default ``"transcriptions"``) — never sends it to the
+    SDK — and routes ``"speech"`` to ``client.audio.speech.create``. NEVER reads
+    the ``file`` bytes / ``input`` text / ``prompt``, only re-shapes keys into a
+    defensive copy.
     """
-    return client.audio.transcriptions.create, dict(kwargs)
+    shaped = dict(kwargs)
+    operation = shaped.pop(_AUDIO_OP_KEY, "transcriptions")
+    if operation == "speech":
+        return client.audio.speech.create, shaped
+    return client.audio.transcriptions.create, shaped
+
+
+# Token-billed TTS models publish NO usage metadata whatsoever — their
+# audio-output tokens are unobservable, so these calls cannot be priced and are
+# passed through UNTRACKED (a WARNED pass-through, never a silent $0) by product
+# decision. A prefix match keeps the carve-out narrow (today exactly
+# ``gpt-4o-mini-tts`` and its dated snapshots) and trivially removable if such a
+# model ever begins reporting usage. Sanctioned exception to the
+# no-hardcoded-model-names norm; keyed on the model string so it applies on the
+# native OpenAI adapter and every OpenAI-compatible adapter alike.
+_UNTRACKED_TTS_MODEL_PREFIXES = ("gpt-4o-mini-tts",)
+
+
+def _is_untracked_tts_model(model: Any) -> bool:
+    """True when a TTS model is token-billed with no observable usage (untracked).
+
+    Prefix match on the model string (covers dated snapshots such as
+    ``gpt-4o-mini-tts-2026-01-01``). A non-str model is never matched — the media
+    lifecycle then handles it normally.
+    """
+    if not isinstance(model, str):
+        return False
+    return model.startswith(_UNTRACKED_TTS_MODEL_PREFIXES)
+
+
+# Per-process warn-once latch for an untracked token-billed TTS model. Lock-guarded
+# for the multi-threaded sync client; reset in tests via
+# ``_reset_untracked_tts_warning``.
+_untracked_tts_warned = False
+_untracked_tts_warn_lock = threading.Lock()
+
+
+def _warn_untracked_tts_model_once() -> None:
+    """Warn once that a token-billed TTS model's call is passed through untracked.
+
+    Fires when ``audio.speech.create`` is called with a token-billed TTS model
+    whose audio-output tokens no usage block reports: the call cannot be priced,
+    so it passes through UNTRACKED (no budget check, no cost event) rather than
+    settling a silent $0. Content-free: the message names no request or response
+    data.
+    """
+    global _untracked_tts_warned
+    with _untracked_tts_warn_lock:
+        if _untracked_tts_warned:
+            return
+        _untracked_tts_warned = True
+    # Logging handlers may run arbitrary code; keep them outside the lock.
+    logger.warning(
+        "Audio speech model publishes no usage metadata; its audio-output tokens "
+        "are unobservable, so this call is passed through UNTRACKED — no budget "
+        "check and no cost event will be emitted."
+    )
+
+
+def _reset_untracked_tts_warning() -> None:
+    """Clear the per-process untracked-TTS warn latch. Test-support hook only."""
+    global _untracked_tts_warned
+    with _untracked_tts_warn_lock:
+        _untracked_tts_warned = False
 
 
 def _extract_service_tier(response: Any) -> str | None:
@@ -413,20 +486,21 @@ class OpenAIAdapter:
 
         Embeddings route to ``client.embeddings.create``; images route to
         ``client.images.generate`` / ``.edit``; audio routes to
-        ``client.audio.transcriptions.create`` — the same ``(method,
-        shaped_kwargs)`` shape ``prepare_call`` returns for chat, with a defensive
-        COPY of kwargs (never mutate/alias the caller's dict). The remaining
-        surface (video) is not wired yet and fails loud with
-        ``UnsupportedSurfaceError``. timeout/max_retries are ignored for SDKs with
-        ``with_options`` (the dispatcher already applied them); a branch for an SDK
-        without it applies them itself, like ``prepare_call``.
+        ``client.audio.transcriptions.create`` (or ``.speech.create`` when the op
+        marker selects it) — the same ``(method, shaped_kwargs)`` shape
+        ``prepare_call`` returns for chat, with a defensive COPY of kwargs (never
+        mutate/alias the caller's dict). The remaining surface (video) is not wired
+        yet and fails loud with ``UnsupportedSurfaceError``. timeout/max_retries
+        are ignored for SDKs with ``with_options`` (the dispatcher already applied
+        them); a branch for an SDK without it applies them itself, like
+        ``prepare_call``.
         """
         if surface == "embeddings":
             return client.embeddings.create, dict(kwargs)
         if surface == "images":
             return _prepare_image_media_call(client, kwargs)
         if surface == "audio":
-            return _prepare_transcription_media_call(client, kwargs)
+            return _prepare_audio_media_call(client, kwargs)
         raise UnsupportedSurfaceError(surface=surface, provider=self.name)
 
     def unwrap_stream_source(self, response: Any) -> Any:

@@ -225,6 +225,25 @@ def measure_image_media(kwargs: dict[str, Any]) -> MediaUsage:
     )
 
 
+def measure_speech_media(kwargs: dict[str, Any]) -> MediaUsage | None:
+    """Request-derived ``MediaUsage`` for a TTS ``audio.speech.create`` call.
+
+    The ONLY billable basis for text-to-speech is the request's ``input`` text
+    LENGTH — the response is raw audio bytes with no usage metadata of any kind.
+    Measures ``len(input)`` in the firewall: the input TEXT is never retained,
+    logged, or concatenated, only its character count (which is not reversible to
+    content). A non-str or absent ``input`` yields None so an unobservable
+    quantity stays None rather than a zero-as-default. ``is_estimated`` stays
+    False: a character count is EXACT, not a length-based approximation — so the
+    same builder serves both the pre-flight ``estimated_media`` (a precise check)
+    and the settled ``media_usage`` (chars/1e6 x rate priced server-side).
+    """
+    value = kwargs.get("input")
+    if not isinstance(value, str):
+        return None
+    return MediaUsage(input_characters=len(value))
+
+
 def _google_image_count(config: object) -> int:
     """Requested image count from a ``generate_images`` ``config``, defaulting to 1.
 

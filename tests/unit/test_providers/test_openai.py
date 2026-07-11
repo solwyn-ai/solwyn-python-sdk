@@ -10,6 +10,7 @@ import pytest
 from solwyn._token_details import TokenDetails
 from solwyn.exceptions import UnsupportedSurfaceError
 from solwyn.providers.openai import (
+    _AUDIO_OP_KEY,
     _IMAGE_OP_KEY,
     OpenAIAdapter,
     _extract_image_usage,
@@ -465,7 +466,8 @@ class TestOpenAIAdapterDispatchSeams:
         assert prepared == {"model": "gpt-image-1", "prompt": "a cat"}
 
     def test_prepare_media_call_audio_selects_transcriptions_create(self) -> None:
-        # audio routes to client.audio.transcriptions.create with a COPY of kwargs.
+        # audio routes to client.audio.transcriptions.create by default (no op
+        # marker) with a COPY of kwargs.
         def create(**kwargs: Any) -> dict[str, Any]:
             return kwargs
 
@@ -481,6 +483,28 @@ class TestOpenAIAdapterDispatchSeams:
         assert method is create
         assert prepared == {"model": "whisper-1", "file": b"audio-bytes"}
         assert prepared is not kwargs  # never mutates / aliases the input
+
+    def test_prepare_media_call_audio_speech_marker_selects_speech_and_is_stripped(self) -> None:
+        # The audio op marker routes speech vs transcriptions on the ONE "audio"
+        # surface and is NEVER sent to the SDK.
+        def speech_create(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(
+            audio=SimpleNamespace(
+                transcriptions=SimpleNamespace(create=lambda **k: k),
+                speech=SimpleNamespace(create=speech_create),
+            )
+        )
+        kwargs: dict[str, Any] = {"model": "tts-1", "input": "hello", _AUDIO_OP_KEY: "speech"}
+
+        method, prepared = OpenAIAdapter().prepare_media_call(
+            "audio", client, kwargs, timeout=30.0, max_retries=0
+        )
+
+        assert method is speech_create
+        assert _AUDIO_OP_KEY not in prepared  # marker stripped before the SDK call
+        assert prepared == {"model": "tts-1", "input": "hello"}
 
     def test_prepare_media_call_raises_unsupported_surface_for_unwired(self) -> None:
         # embeddings + images + audio are wired; video still fails loud

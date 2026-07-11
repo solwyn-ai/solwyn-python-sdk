@@ -640,16 +640,16 @@ class Solwyn(_SolwynBase):
 
     @functools.cached_property
     def audio(self) -> _SyncAudioProxy:
-        """Return a proxy that routes audio.transcriptions.create() through the lifecycle.
+        """Return a proxy that routes audio transcriptions/speech through the lifecycle.
 
         Unconditional (like ``chat`` / ``embeddings`` / ``images``): the audio
-        transcriptions surface is the openai dialect, shared by native OpenAI and
-        every OpenAI-compatible provider (incl. Groq whisper). On a non-openai
-        client ``.transcriptions.create()`` fails loud with
-        ``UnsupportedSurfaceError`` (that adapter serves no audio seam). The proxy's
-        ``speech`` / ``translations`` sub-surfaces warn-once then pass through
-        untracked. Cached: provider is fixed at construction so this is safe to
-        create once.
+        transcriptions AND speech (TTS) surfaces are the openai dialect, shared by
+        native OpenAI and every OpenAI-compatible provider (incl. Groq whisper). On
+        a non-openai client ``.transcriptions.create()`` / ``.speech.create()``
+        fail loud with ``UnsupportedSurfaceError`` (that adapter serves no audio
+        seam). The proxy's ``translations`` sub-surface warns-once then passes
+        through untracked. Cached: provider is fixed at construction so this is safe
+        to create once.
         """
         return _SyncAudioProxy(self)
 
@@ -1570,14 +1570,14 @@ class AsyncSolwyn(_SolwynBase):
 
     @functools.cached_property
     def audio(self) -> _AsyncAudioProxy:
-        """Return an async proxy that routes audio.transcriptions.create() through the lifecycle.
+        """Return an async proxy that routes audio transcriptions/speech through the lifecycle.
 
         Unconditional (like ``chat`` / ``embeddings`` / ``images``): the audio
-        transcriptions surface is the openai dialect, shared by native OpenAI and
-        every OpenAI-compatible provider (incl. Groq whisper). On a non-openai
-        client ``.transcriptions.create()`` fails loud with
-        ``UnsupportedSurfaceError``. The proxy's ``speech`` / ``translations``
-        sub-surfaces warn-once then pass through untracked. Cached: provider is
+        transcriptions AND speech (TTS) surfaces are the openai dialect, shared by
+        native OpenAI and every OpenAI-compatible provider (incl. Groq whisper). On
+        a non-openai client ``.transcriptions.create()`` / ``.speech.create()``
+        fail loud with ``UnsupportedSurfaceError``. The proxy's ``translations``
+        sub-surface warns-once then passes through untracked. Cached: provider is
         fixed at construction.
         """
         return _AsyncAudioProxy(self)

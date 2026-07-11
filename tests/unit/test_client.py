@@ -527,11 +527,11 @@ class TestGetAttrPassThrough:
 class TestUnshippedSpendSurfacePosture:
     """Posture: recognized-but-unshipped openai spend surfaces warn-once then pass through.
 
-    The still-unwired openai spend surfaces (``speech`` / ``translations``
-    audio sub-resources, plus ``videos``) log exactly one warning per surface per
-    process, then pass through untracked. embeddings, images, and
-    audio.transcriptions are deliberately silent: they are intercepted, not warned
-    (the ``audio`` attribute itself now returns the intercepting proxy).
+    The still-unwired openai spend surfaces (the ``translations`` audio
+    sub-resource, plus ``videos``) log exactly one warning per surface per process,
+    then pass through untracked. embeddings, images, audio.transcriptions, and
+    audio.speech are deliberately silent: they are intercepted, not warned (the
+    ``audio`` attribute itself now returns the intercepting proxy).
     """
 
     def _close(self, solwyn: Solwyn) -> None:
@@ -593,7 +593,7 @@ class TestUnshippedSpendSurfacePosture:
         with caplog.at_level(logging.WARNING, logger="solwyn._base"):
             # embeddings + images + audio are intercepted: the proxy replaces the
             # raw attribute. (Accessing audio does not warn; only its still-unwired
-            # speech/translations sub-surfaces do.)
+            # translations sub-surface does.)
             assert solwyn.embeddings is not client.embeddings
             assert solwyn.images is not client.images
             assert solwyn.audio is not client.audio
