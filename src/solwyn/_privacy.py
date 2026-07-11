@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from solwyn._types import MediaUsage
+
 
 def estimate_content_length(kwargs: dict[str, Any]) -> int:
     """Return the total character length of prompt content in kwargs.
@@ -173,6 +175,90 @@ def estimate_embedding_input_tokens(kwargs: dict[str, Any], provider: str) -> in
     if isinstance(input_value, list):
         return _estimate_embedding_list_tokens(input_value, provider)
     return 0
+
+
+def _image_count(kwargs: dict[str, Any]) -> int:
+    """Requested image count from ``n=``, defaulting to 1 (config value only).
+
+    ``n`` is a COUNT, not prompt content. The OpenAI images API contract
+    defaults ``n`` to 1 when omitted, so a missing ``n`` is a TRUE known
+    quantity (1 image), never a zero-as-default. A non-int / bool / <1 value is
+    garbage and also degrades to the documented default of 1.
+    """
+    n = kwargs.get("n")
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        return 1
+    return n
+
+
+def _image_selector(value: Any) -> str | None:
+    """A request variant selector (``size`` / ``quality``) as a bounded string.
+
+    Both are CONFIG enums (e.g. ``"1024x1024"``, ``"hd"``), never prompt
+    content, matched server-side against the pricing card's variant grid. A
+    non-str or over-length (the ``MediaUsage`` cap is 32) value degrades to None
+    so a garbage selector neither raises out of the builder nor mismatches the
+    grid — it simply carries no selector.
+    """
+    if not isinstance(value, str):
+        return None
+    if len(value) > 32:
+        return None
+    return value
+
+
+def measure_image_media(kwargs: dict[str, Any]) -> MediaUsage:
+    """Request-derived ``MediaUsage`` for an images.generate/edit call.
+
+    CONFIG values only — ``n`` -> ``image_count``, ``size`` -> ``resolution``,
+    ``quality`` -> ``quality``. The customer's ``prompt=`` (and the ``image=`` /
+    ``mask=`` bytes on an edit) are NEVER read, logged, or retained; only these
+    non-content request parameters are measured. ``is_estimated`` stays False:
+    these are the EXACT request parameters that determine billing, not
+    length-based approximations — so the same builder serves both the pre-flight
+    ``estimated_media`` (a precise check) and the settled ``media_usage``.
+    """
+    return MediaUsage(
+        image_count=_image_count(kwargs),
+        resolution=_image_selector(kwargs.get("size")),
+        quality=_image_selector(kwargs.get("quality")),
+    )
+
+
+def _google_image_count(config: object) -> int:
+    """Requested image count from a ``generate_images`` ``config``, defaulting to 1.
+
+    google-genai carries ``number_of_images`` INSIDE the ``config=`` argument
+    (unlike the openai images API's top-level ``n``): either a
+    ``GenerateImagesConfig`` object (attribute access) or a plain dict — both
+    handled duck-typed, no provider SDK import. ``number_of_images`` is a COUNT,
+    not prompt content. The imagen API contract defaults it to 1 when omitted, so
+    a missing value is a TRUE known quantity (1 image), never a zero-as-default.
+    A non-int / bool / <1 value is garbage and also degrades to the documented
+    default of 1.
+    """
+    if isinstance(config, dict):
+        value = config.get("number_of_images")
+    else:
+        value = getattr(config, "number_of_images", None)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return 1
+    return value
+
+
+def measure_google_image_media(kwargs: dict[str, Any]) -> MediaUsage:
+    """Request-derived ``MediaUsage`` for a Google ``generate_images`` call.
+
+    CONFIG values only — ``config.number_of_images`` -> ``image_count``. The
+    customer's ``prompt=`` is NEVER read, logged, or retained; only this
+    non-content count is measured. imagen responses expose NO usage, so this
+    request-derived count is the SOLE billable basis (imagen cards are flat
+    per-image). ``is_estimated`` stays False: this is the EXACT request parameter
+    that determines billing, not a length-based approximation — so the same
+    builder serves both the pre-flight ``estimated_media`` and the settled
+    ``media_usage``.
+    """
+    return MediaUsage(image_count=_google_image_count(kwargs.get("config")))
 
 
 def _part_text_length(part: Any) -> int:

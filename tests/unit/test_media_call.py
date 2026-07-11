@@ -17,7 +17,7 @@ from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
 from solwyn._base import MediaSurfaceSpec
 from solwyn._token_details import TokenDetails
-from solwyn._types import BudgetMode, CallStatus
+from solwyn._types import BudgetMode, CallStatus, MediaUsage
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import BudgetExceededError, UnsupportedSurfaceError
 
@@ -41,9 +41,32 @@ def _spec(
     )
 
 
+def _media_spec(
+    *,
+    extract=lambda _r: None,
+    measure=lambda _kwargs: None,
+    measure_media=None,
+    estimate_media=None,
+) -> MediaSurfaceSpec:
+    """A spec with the optional non-token media hooks wired (P2.8)."""
+    return MediaSurfaceSpec(
+        surface="images",
+        modality="image",
+        extract_usage=extract,
+        measure_request=measure,
+        measure_media=measure_media,
+        estimate_media=estimate_media,
+    )
+
+
 def _route_to_embeddings(surface, client, kwargs, *, timeout, max_retries):
     """Stand-in ``prepare_media_call``: route the embeddings surface to the SDK."""
     return client.embeddings.create, dict(kwargs)
+
+
+def _route_to_images(surface, client, kwargs, *, timeout, max_retries):
+    """Stand-in ``prepare_media_call``: route the images surface to the SDK."""
+    return client.images.generate, dict(kwargs)
 
 
 def _allow(reservation_id: str | None = "res_media") -> SimpleNamespace:
@@ -166,6 +189,84 @@ class TestMediaCallSync:
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
+    def test_both_bases_flow_when_token_and_media_observable(self) -> None:
+        # Native gpt-image: token usage (with image buckets) AND request-derived
+        # MediaUsage BOTH ride the call. estimated_media rides the CHECK; both
+        # bases ride the confirm + event. The server's card unit picks.
+        client, _ = _sync_client()
+        client.images.generate.return_value = SimpleNamespace(service_tier=None)
+        solwyn = _build_sync(client)
+        spec = _media_spec(
+            extract=lambda _r: TokenDetails(
+                input_tokens=222,
+                image_input_tokens=194,
+                output_tokens=1024,
+                image_output_tokens=1024,
+            ),
+            measure_media=lambda _kwargs, _response: MediaUsage(
+                image_count=2, resolution="1024x1024", quality="low"
+            ),
+            estimate_media=lambda _kwargs: MediaUsage(image_count=2, resolution="1024x1024"),
+        )
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow()) as check,
+            patch.object(solwyn._budget, "confirm_cost") as confirm,
+            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_images),
+        ):
+            solwyn._media_call(spec, model="gpt-image-1", prompt="a cat", n=2)
+
+        client.images.generate.assert_called_once()
+        # estimated_media rides the CHECK (precise per-unit pre-flight).
+        assert check.call_args.kwargs["estimated_media"].image_count == 2
+        assert check.call_args.kwargs["modality"] == "image"
+        # BOTH bases ride the confirm: token usage (image buckets) AND MediaUsage.
+        confirm.assert_called_once()
+        assert confirm.call_args.args[2].image_input_tokens == 194
+        assert confirm.call_args.kwargs["media_usage"].image_count == 2
+        assert confirm.call_args.kwargs["modality"] == "image"
+        # And the metadata event carries both.
+        event = report.call_args.args[0]
+        assert event.status == CallStatus.SUCCESS
+        assert event.modality == "image"
+        assert event.token_details.image_output_tokens == 1024
+        assert event.media_usage.image_count == 2
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_media_only_quantity_confirms_with_zeroed_token_details(self) -> None:
+        # Compat image (Together FLUX): usage: null, so no TOKEN basis — but the
+        # request-derived per-image MediaUsage IS observable. Confirm still fires
+        # (never a silent $0) with a zeroed TokenDetails carrier + the MediaUsage.
+        client, _ = _sync_client()
+        client.images.generate.return_value = SimpleNamespace(usage=None, service_tier=None)
+        solwyn = _build_sync(client)
+        spec = _media_spec(
+            extract=lambda _r: None,
+            measure=lambda _kwargs: None,
+            measure_media=lambda _kwargs, _response: MediaUsage(image_count=1),
+            estimate_media=lambda _kwargs: MediaUsage(image_count=1),
+        )
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow()),
+            patch.object(solwyn._budget, "confirm_cost") as confirm,
+            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_images),
+        ):
+            solwyn._media_call(spec, model="black-forest-labs/FLUX.1-schnell", prompt="a cat")
+
+        confirm.assert_called_once()
+        assert confirm.call_args.args[2] == TokenDetails()  # zeroed token carrier
+        assert confirm.call_args.kwargs["media_usage"].image_count == 1
+        event = report.call_args.args[0]
+        assert event.token_details is None  # no token basis observed
+        assert event.input_tokens == 0
+        assert event.media_usage.image_count == 1
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
     def test_budget_denied_raises_and_reports_without_dispatch(self) -> None:
         client, _ = _sync_client()
         solwyn = _build_sync(client, budget_mode=BudgetMode.HARD_DENY)
@@ -188,13 +289,13 @@ class TestMediaCallSync:
         client, _ = _sync_client()
         solwyn = _build_sync(client)
         # No prepare_media_call patch -> the real OpenAI adapter serves embeddings
-        # (P1.7) but still raises for an unwired surface like images.
+        # (P1.7) and images (P2.8) but still raises for an unwired surface like audio.
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()),
             patch.object(solwyn._reporter, "report") as report,
             pytest.raises(UnsupportedSurfaceError),
         ):
-            solwyn._media_call(_spec(surface="images"), model="gpt-image-1", input="hi")
+            solwyn._media_call(_spec(surface="audio"), model="whisper-1", input="hi")
 
         event = report.call_args.args[0]
         assert event.status == CallStatus.ERROR
@@ -243,6 +344,38 @@ class TestMediaCallAsync:
         assert event.status == CallStatus.SUCCESS
         assert event.is_model_fallback is False
         assert event.modality == "embedding"
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_both_bases_flow_when_token_and_media_observable(self) -> None:
+        client, _ = _async_client()
+        client.images.generate = AsyncMock(return_value=SimpleNamespace(service_tier=None))
+        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY)
+        spec = _media_spec(
+            extract=lambda _r: TokenDetails(input_tokens=222, image_input_tokens=194),
+            measure_media=lambda _kwargs, _response: MediaUsage(image_count=2),
+            estimate_media=lambda _kwargs: MediaUsage(image_count=2),
+        )
+        with (
+            patch.object(
+                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow())
+            ) as check,
+            patch.object(solwyn._budget, "confirm_cost", new=AsyncMock()) as confirm,
+            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_images),
+        ):
+            await solwyn._media_call(spec, model="gpt-image-1", prompt="a cat", n=2)
+
+        client.images.generate.assert_awaited_once()
+        assert check.call_args.kwargs["estimated_media"].image_count == 2
+        confirm.assert_awaited_once()
+        assert confirm.call_args.args[2].image_input_tokens == 194
+        assert confirm.call_args.kwargs["media_usage"].image_count == 2
+        event = report.call_args.args[0]
+        assert event.modality == "image"
+        assert event.media_usage.image_count == 2
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

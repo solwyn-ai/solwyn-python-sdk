@@ -42,11 +42,13 @@ from solwyn._privacy import estimate_content_length, estimate_tokens_from_length
 from solwyn._proxies import (
     _AsyncChatProxy,
     _AsyncEmbeddingsProxy,
+    _AsyncImagesProxy,
     _AsyncMessagesProxy,
     _AsyncModelsProxy,
     _bedrock_internal_kwargs,
     _SyncChatProxy,
     _SyncEmbeddingsProxy,
+    _SyncImagesProxy,
     _SyncMessagesProxy,
     _SyncModelsProxy,
 )
@@ -622,6 +624,19 @@ class Solwyn(_SolwynBase):
         return _SyncEmbeddingsProxy(self)
 
     @functools.cached_property
+    def images(self) -> _SyncImagesProxy:
+        """Return a proxy that routes images.generate()/edit() through the media lifecycle.
+
+        Unconditional (like ``chat`` / ``embeddings``): the images surface is the
+        openai dialect, shared by native OpenAI (token-billed gpt-image) and every
+        OpenAI-compatible provider (per-image). On a non-openai client
+        ``.generate()`` / ``.edit()`` fails loud with ``UnsupportedSurfaceError``
+        (that adapter serves no images seam). Cached: provider is fixed at
+        construction so this is safe to create once.
+        """
+        return _SyncImagesProxy(self)
+
+    @functools.cached_property
     def messages(self) -> Any:
         """Anthropic-compatible: client.messages.create() goes through interception.
 
@@ -754,11 +769,17 @@ class Solwyn(_SolwynBase):
         provider = runtime.adapter.name
         deadline = Deadline(self._config.failover_total_timeout)
 
-        # 1. Estimate input quantity (length-only; never materializes content).
+        # 1. Estimate quantities (length/config-only; never materializes content).
+        #    Token estimate from request length; media estimate (non-token
+        #    quantities like image count) from the spec's request-derived hook.
         char_count = estimate_content_length(kwargs)
         est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
+        estimated_media = spec.estimate_media(kwargs) if spec.estimate_media is not None else None
 
-        # 2. Budget check against the primary (no failover chain to hint).
+        # 2. Budget check against the primary (no failover chain to hint). The
+        #    surface's estimated_media rides the check so the server prices a
+        #    precise per-unit pre-flight cost (precise pre-flight denial is the
+        #    product story for images).
         #    Posture on 422-for-unbilled-model: if the server deliberately does not
         #    price this model/modality it answers /budgets/check with a 422. The
         #    enforcer treats that like any non-2xx — it raises inside check_budget,
@@ -773,6 +794,7 @@ class Solwyn(_SolwynBase):
             provider=provider,
             timeout=_budget_timeout(deadline),
             modality=spec.modality,
+            estimated_media=estimated_media,
         )
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
@@ -837,24 +859,35 @@ class Solwyn(_SolwynBase):
             raise
         latency_ms = (time.monotonic() - start) * 1000
 
-        # 4. Billable quantity: response usage first, request-derived fallback.
+        # 4. Billable quantities: TOKEN basis (response usage first, request-
+        #    derived fallback) AND, when the surface has a media channel, the
+        #    non-token MediaUsage basis. BOTH ride the confirm when observable —
+        #    the server's pricing card unit picks (e.g. native gpt-image sends
+        #    token usage with image buckets AND request-derived image quantities).
         token_details = spec.extract_usage(response)
         if token_details is None:
             token_details = spec.measure_request(kwargs)
+        media_usage = (
+            spec.measure_media(kwargs, response) if spec.measure_media is not None else None
+        )
 
         # 5. Confirm + report the served call (is_model_fallback=False, primary-only).
+        #    Confirm fires when EITHER basis is observable; skipped only when both
+        #    are None (never settle a real $0 price). When only media is observed,
+        #    a zeroed TokenDetails carries the confirm's required token field.
         service_tier = runtime.adapter.extract_service_tier(response)
-        if budget.reservation_id and token_details is not None:
+        if budget.reservation_id and (token_details is not None or media_usage is not None):
             self._budget.confirm_cost(
                 budget.reservation_id,
                 requested_model,
-                token_details,
+                token_details if token_details is not None else TokenDetails(),
                 provider=provider,
                 is_provider_fallback=False,
                 call_id=call_id,
                 provider_region=provider_region,
                 service_tier=service_tier,
                 modality=spec.modality,
+                media_usage=media_usage,
             )
         self._reporter.report(
             self._build_metadata_event(
@@ -872,6 +905,7 @@ class Solwyn(_SolwynBase):
                 agent_run=agent_run,
                 provider_region=provider_region,
                 modality=spec.modality,
+                media_usage=media_usage,
             )
         )
         return response
@@ -1506,6 +1540,18 @@ class AsyncSolwyn(_SolwynBase):
         return _AsyncEmbeddingsProxy(self)
 
     @functools.cached_property
+    def images(self) -> _AsyncImagesProxy:
+        """Return an async proxy that routes images.generate()/edit() through the lifecycle.
+
+        Unconditional (like ``chat`` / ``embeddings``): the images surface is the
+        openai dialect, shared by native OpenAI (token-billed gpt-image) and every
+        OpenAI-compatible provider (per-image). On a non-openai client
+        ``.generate()`` / ``.edit()`` fails loud with ``UnsupportedSurfaceError``.
+        Cached: provider is fixed at construction.
+        """
+        return _AsyncImagesProxy(self)
+
+    @functools.cached_property
     def messages(self) -> Any:
         """Anthropic-compatible: client.messages.create() goes through interception.
 
@@ -1631,6 +1677,7 @@ class AsyncSolwyn(_SolwynBase):
 
         char_count = estimate_content_length(kwargs)
         est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
+        estimated_media = spec.estimate_media(kwargs) if spec.estimate_media is not None else None
 
         budget = await self._budget.check_budget(
             estimated_input_tokens=est_in,
@@ -1638,6 +1685,7 @@ class AsyncSolwyn(_SolwynBase):
             provider=provider,
             timeout=_budget_timeout(deadline),
             modality=spec.modality,
+            estimated_media=estimated_media,
         )
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
@@ -1703,19 +1751,25 @@ class AsyncSolwyn(_SolwynBase):
         token_details = spec.extract_usage(response)
         if token_details is None:
             token_details = spec.measure_request(kwargs)
+        media_usage = (
+            spec.measure_media(kwargs, response) if spec.measure_media is not None else None
+        )
 
+        # Confirm fires when EITHER basis is observable (both ride the confirm
+        # when both are); skipped only when both are None. See the sync mirror.
         service_tier = runtime.adapter.extract_service_tier(response)
-        if budget.reservation_id and token_details is not None:
+        if budget.reservation_id and (token_details is not None or media_usage is not None):
             await self._budget.confirm_cost(
                 budget.reservation_id,
                 requested_model,
-                token_details,
+                token_details if token_details is not None else TokenDetails(),
                 provider=provider,
                 is_provider_fallback=False,
                 call_id=call_id,
                 provider_region=provider_region,
                 service_tier=service_tier,
                 modality=spec.modality,
+                media_usage=media_usage,
             )
         self._reporter.report(
             self._build_metadata_event(
@@ -1733,6 +1787,7 @@ class AsyncSolwyn(_SolwynBase):
                 agent_run=agent_run,
                 provider_region=provider_region,
                 modality=spec.modality,
+                media_usage=media_usage,
             )
         )
         return response

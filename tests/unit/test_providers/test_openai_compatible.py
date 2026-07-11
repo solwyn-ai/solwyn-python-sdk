@@ -17,7 +17,7 @@ from solwyn._types import ProviderName
 from solwyn.exceptions import UnsupportedSurfaceError
 from solwyn.providers import get_adapter_by_name, get_adapter_for_client, get_adapter_for_model
 from solwyn.providers._protocol import ProviderAdapter
-from solwyn.providers.openai import OpenAIAdapter
+from solwyn.providers.openai import _IMAGE_OP_KEY, OpenAIAdapter
 from solwyn.providers.openai_compatible import (
     COMPAT_PROFILES,
     CompatStreamAccumulator,
@@ -128,11 +128,38 @@ class TestProfileTable:
             assert prepared == {"model": "m", "input": "hi"}, adapter.name
             assert prepared is not kwargs, adapter.name  # never mutates / aliases input
 
+    def test_prepare_media_call_images_selects_images_method_for_every_profile(self) -> None:
+        # P2.8: one images branch covers every compat adapter (incl. Together) —
+        # generate() by default, edit() via the marker (stripped before the call).
+        def generate(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        def edit(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(images=SimpleNamespace(generate=generate, edit=edit))
+        for adapter in build_compat_adapters():
+            gen_method, gen_prepared = adapter.prepare_media_call(
+                "images", client, {"model": "flux", "n": 2}, timeout=30.0, max_retries=0
+            )
+            assert gen_method is generate, adapter.name
+            assert gen_prepared == {"model": "flux", "n": 2}, adapter.name
+
+            edit_method, edit_prepared = adapter.prepare_media_call(
+                "images",
+                client,
+                {"model": "flux", "prompt": "x", _IMAGE_OP_KEY: "edit"},
+                timeout=30.0,
+                max_retries=0,
+            )
+            assert edit_method is edit, adapter.name
+            assert _IMAGE_OP_KEY not in edit_prepared, adapter.name  # marker stripped
+
     def test_prepare_media_call_raises_unsupported_surface_for_unwired_every_profile(self) -> None:
-        # Only embeddings is wired (P1.7); images/audio/video still fail loud
+        # embeddings (P1.7) + images (P2.8) are wired; audio/video still fail loud
         # with the provider's own name attached.
         for adapter in build_compat_adapters():
-            for surface in ("images", "audio", "video"):
+            for surface in ("audio", "video"):
                 with pytest.raises(UnsupportedSurfaceError) as excinfo:
                     adapter.prepare_media_call(
                         surface, object(), {"model": "m"}, timeout=30.0, max_retries=0

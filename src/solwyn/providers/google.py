@@ -26,6 +26,47 @@ from solwyn._token_details import TokenDetails
 from solwyn.exceptions import UnsupportedSurfaceError
 
 
+def _modality_label(value: Any) -> str | None:
+    """Normalize a ModalityTokenCount ``modality`` field to an UPPERCASE string.
+
+    google-genai's ``MediaModality`` is a ``str`` enum whose value is the label
+    ("TEXT", "IMAGE", "AUDIO", ...); a plain string is handled too. Duck-typed
+    (``.value`` then ``.name``) so no provider SDK import is needed. Returns None
+    for an unreadable shape so the caller simply skips that bucket. Never raises.
+    """
+    if isinstance(value, str):
+        label: Any = value
+    else:
+        label = getattr(value, "value", None)
+        if not isinstance(label, str):
+            label = getattr(value, "name", None)
+    if not isinstance(label, str):
+        return None
+    return label.upper()
+
+
+def _modality_token_sum(details: Any, modality: str) -> int:
+    """Sum ``token_count`` across a per-modality details list for one label.
+
+    ``prompt_tokens_details`` / ``candidates_tokens_details`` are lists of
+    ModalityTokenCount ``{modality, token_count}`` (snake_case SDK attrs — never
+    the camelCase wire names). Absent (None) or non-list details, or entries with
+    a garbage count, contribute 0 — so a response WITHOUT per-modality details
+    leaves every mapped field at 0 exactly as before. Never raises.
+    """
+    if not isinstance(details, (list, tuple)):
+        return 0
+    total = 0
+    for entry in details:
+        if _modality_label(getattr(entry, "modality", None)) != modality:
+            continue
+        count = getattr(entry, "token_count", None)
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            continue
+        total += count
+    return total
+
+
 def _extract_google_usage(usage_metadata: Any) -> TokenDetails:
     """Extract token usage from a Google usage_metadata object.
 
@@ -41,6 +82,16 @@ def _extract_google_usage(usage_metadata: Any) -> TokenDetails:
     - reasoning_tokens = thoughts_token_count
     - cached_input_tokens = cached_content_token_count
     - tool_use_input_tokens = tool_use_prompt_token_count
+
+    Per-modality buckets (when present) map from the ModalityTokenCount lists
+    ``prompt_tokens_details`` (input side) and ``candidates_tokens_details``
+    (output side):
+    - IMAGE -> image_input_tokens / image_output_tokens (a SUBSET of input /
+      output; this is what makes a gemini-3-pro-image ``generate_content`` call
+      carry image-output tokens so the server prices them at the image rate).
+    - AUDIO -> audio_input_tokens / audio_output_tokens (P3 groundwork).
+    TEXT buckets need no field — they are the remainder. Absent details leave
+    these fields at 0.
     """
     if usage_metadata is None:
         return TokenDetails()
@@ -51,12 +102,19 @@ def _extract_google_usage(usage_metadata: Any) -> TokenDetails:
     cached = getattr(usage_metadata, "cached_content_token_count", None) or 0
     tool_use = getattr(usage_metadata, "tool_use_prompt_token_count", None) or 0
 
+    prompt_details = getattr(usage_metadata, "prompt_tokens_details", None)
+    candidates_details = getattr(usage_metadata, "candidates_tokens_details", None)
+
     return TokenDetails(
         input_tokens=input_tokens,
         output_tokens=candidates + thoughts,
         reasoning_tokens=thoughts,
         cached_input_tokens=cached,
         tool_use_input_tokens=tool_use,
+        image_input_tokens=_modality_token_sum(prompt_details, "IMAGE"),
+        image_output_tokens=_modality_token_sum(candidates_details, "IMAGE"),
+        audio_input_tokens=_modality_token_sum(prompt_details, "AUDIO"),
+        audio_output_tokens=_modality_token_sum(candidates_details, "AUDIO"),
     )
 
 
@@ -185,18 +243,24 @@ class GoogleAdapter:
     ) -> tuple[Callable[..., Any], dict[str, Any]]:
         """Per-surface dispatch seam for non-chat media surfaces.
 
-        Embeddings (P1.8) route to ``client.models.embed_content``. Unlike the
-        openai seam — where the dispatcher already applied the per-hop bound via
+        Embeddings (P1.8) route to ``client.models.embed_content``; images (P2.9)
+        route to ``client.models.generate_images`` (imagen). Unlike the openai
+        seam — where the dispatcher already applied the per-hop bound via
         ``with_options`` — google-genai has no ``with_options``, so (exactly as
         ``prepare_call`` does for chat) the mandatory bound is injected here as
         per-request ``config.http_options`` via ``_with_google_http_bound``,
         which also returns a defensive COPY (never mutates the caller's kwargs).
-        Images/video are not wired yet and fail loud with the structural,
-        content-free ``UnsupportedSurfaceError``.
+        Note the bound rides ``config.http_options`` alongside the caller's own
+        ``config`` keys (e.g. ``number_of_images``) — those are preserved. Video
+        (P4) is not wired yet and fails loud with the structural, content-free
+        ``UnsupportedSurfaceError``.
         """
         if surface == "embeddings":
             bounded = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
             return client.models.embed_content, bounded
+        if surface == "images":
+            bounded = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
+            return client.models.generate_images, bounded
         raise UnsupportedSurfaceError(surface=surface, provider=self.name)
 
     def unwrap_stream_source(self, response: Any) -> Any:

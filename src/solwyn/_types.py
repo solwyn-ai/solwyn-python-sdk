@@ -146,6 +146,74 @@ class ProviderEntry(BaseModel):
 # ── Wire-format models ──────────────────────────────────────────────────
 
 
+class MediaUsage(BaseModel):
+    """Non-token billable quantities + variant selectors for a media call.
+
+    Window 2 of the modality program. ``TokenDetails`` is int-only by design
+    (a normalized TOKEN breakdown); the non-token quantities a per-unit priced
+    surface bills on — image counts, media seconds, character counts — live
+    here instead, so the token channel stays doubly int-locked and media
+    quantities are never shoehorned into it.
+
+    Every quantity is ``None`` when the SDK cannot observe it — never a
+    zero-as-default. A known-unit pricing card with a ``None`` quantity routes
+    to the server's ``is_unpriced``/$0 lane (never $0-priced-as-real), so an
+    unobservable quantity is never silently settled as a real $0 price. The
+    server's pricing card unit — not any single field here — selects which
+    quantity is the billing basis.
+
+    Vendored lock-step with core ``shared/solwyn_shared/models.py``'s
+    ``MediaUsage`` (SDK is self-contained — mirrored inline, no
+    ``solwyn_shared`` import).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    image_count: int | None = Field(
+        default=None, ge=0, description="Images generated/edited (per_image unit)"
+    )
+    generation_count: int | None = Field(
+        default=None,
+        ge=0,
+        description="Discrete generations for per_video / per_generation / per_song units",
+    )
+    video_seconds: float | None = Field(
+        default=None, ge=0, description="Video duration in seconds (per_second / per_minute units)"
+    )
+    audio_seconds: float | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Audio duration in seconds (fractional; e.g. whisper verbose_json usage.seconds)"
+        ),
+    )
+    input_characters: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "TTS input character count (per_*_chars units; length measured in the firewall)"
+        ),
+    )
+    resolution: str | None = Field(
+        default=None,
+        max_length=32,
+        description="Variant selector matched against the pricing card's grid (e.g. '1024x1024')",
+    )
+    quality: str | None = Field(
+        default=None,
+        max_length=32,
+        description="Variant selector matched against the pricing card's grid (e.g. 'hd', 'low')",
+    )
+    is_estimated: bool = Field(
+        default=False,
+        description=(
+            "True when these quantities are SDK-side estimates rather than "
+            "provider-reported. False for exact request-derived quantities (an "
+            "image count from n= is a true known quantity, not an approximation)."
+        ),
+    )
+
+
 class MetadataEvent(BaseModel):
     """Telemetry event sent from SDK to API after each LLM call.
 
@@ -185,6 +253,15 @@ class MetadataEvent(BaseModel):
     output_tokens: int = Field(..., ge=0, description="Output token count")
     token_details: TokenDetails | None = Field(
         None, description="Full token breakdown from provider adapter"
+    )
+    media_usage: MediaUsage | None = Field(
+        default=None,
+        description=(
+            "Non-token billable quantities (image counts, media seconds, "
+            "character counts) + variant selectors for non-text modalities. "
+            "None for chat/text calls — the None-skipping serializer keeps their "
+            "wire bytes unchanged."
+        ),
     )
     latency_ms: float = Field(..., description="End-to-end call latency in ms")
     status: CallStatus = Field(..., description="Call outcome")
@@ -252,6 +329,26 @@ class BudgetCheckRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    @model_serializer(mode="wrap")
+    def _serialize_without_none(
+        self,
+        handler: SerializerFunctionWrapHandler,
+        _info: SerializationInfo,
+    ) -> dict[str, Any]:
+        """Serialize checks without null-valued optional fields.
+
+        ``estimated_media`` is the only optional (None-able) field; skipping it
+        when None keeps every text/chat check's wire bytes byte-identical to the
+        pre-window-2 wire (the deployed Cloud-API model forbids unknown keys and
+        accepts the field absent). The always-present fields (modality, the
+        fallback-chain lists) never go None, so they always serialize.
+        """
+        data = handler(self)
+        if not isinstance(data, dict):
+            raise RuntimeError("BudgetCheckRequest serializer expected dict output")
+        serialized = cast(dict[str, Any], data)
+        return {key: value for key, value in serialized.items() if value is not None}
+
     estimated_input_tokens: int = Field(
         ..., ge=0, description="Estimated input token count for the pending call"
     )
@@ -264,6 +361,16 @@ class BudgetCheckRequest(BaseModel):
             "pre-modality SDKs omit it safely (API-first). The pricing card's "
             "unit selects the billing basis; core bills text tokens only until "
             "per-modality cards land."
+        ),
+    )
+    estimated_media: MediaUsage | None = Field(
+        default=None,
+        description=(
+            "Pre-flight non-token quantities (image counts, media seconds, "
+            "character counts) + variant selectors for a non-text pending call, "
+            "so the server prices a precise check-time cost. None for text/chat "
+            "checks — the None-skipping serializer keeps their wire bytes "
+            "unchanged."
         ),
     )
     fallback_providers: list[ProviderName] = Field(
@@ -360,6 +467,16 @@ class BudgetConfirmRequest(BaseModel):
     )
     token_details: TokenDetails = Field(
         ..., description="Actual token breakdown from the provider adapter"
+    )
+    media_usage: MediaUsage | None = Field(
+        default=None,
+        description=(
+            "Actual non-token billable quantities (image counts, media seconds, "
+            "character counts) + variant selectors for a non-text served call, so "
+            "the server settles the enforcement counter on the right basis. None "
+            "for chat/text confirms — the None-skipping serializer keeps their "
+            "wire bytes unchanged."
+        ),
     )
     provider_region: str | None = Field(
         default=None,

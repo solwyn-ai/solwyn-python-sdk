@@ -29,17 +29,19 @@ from solwyn.providers.together import TogetherAdapter
 
 MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 # Together's adapter-DECLARED untracked spend surfaces: provider-specific extras
-# the central per-dialect map does not cover. images/audio/videos moved to the
-# central openai map; embeddings/batches/fine_tuning are no longer warned.
+# the central per-dialect map does not cover. audio/videos moved to the central
+# openai map; embeddings/images (intercepted) and batches/fine_tuning are no
+# longer warned.
 DECLARED_UNMETERED_SURFACES = frozenset({"completions", "rerank", "code_interpreter", "evals"})
 # Central openai-dialect surfaces every openai-dialect provider (Together
 # included) warns for, sourced from _base._UNSHIPPED_SPEND_SURFACES["openai"].
-CENTRAL_OPENAI_SURFACES = frozenset({"images", "audio", "videos"})
+# images graduated to interception (P2.8), so only audio/videos remain.
+CENTRAL_OPENAI_SURFACES = frozenset({"audio", "videos"})
 # Every surface that warns-once for a Together (openai-dialect) client.
 WARNING_SURFACES = DECLARED_UNMETERED_SURFACES | CENTRAL_OPENAI_SURFACES
 # Together-billed surfaces Solwyn passes through SILENTLY (truly-unrelated
-# resources, not warned). embeddings is NOT here: P1.7 intercepts it, so it
-# returns the media proxy rather than passing through.
+# resources, not warned). embeddings (P1.7) and images (P2.8) are NOT here:
+# they are intercepted, so they return the media proxy rather than passing through.
 SILENT_SURFACES = frozenset({"batches", "fine_tuning"})
 
 
@@ -61,8 +63,8 @@ class _YieldingSet(set[str]):
 
 @pytest.mark.unit
 def test_together_adapter_declares_unmetered_spend_surfaces() -> None:
-    # Provider-specific extras only; images/audio/videos ride the central openai
-    # dialect map, and embeddings/batches/fine_tuning are no longer warned.
+    # Provider-specific extras only; audio/videos ride the central openai dialect
+    # map, and embeddings/images (intercepted) + batches/fine_tuning are not warned.
     assert TogetherAdapter().unmetered_spend_surfaces == DECLARED_UNMETERED_SURFACES
 
 
@@ -247,19 +249,22 @@ def test_sync_curated_silent_surfaces_pass_through_without_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     # batches and fine_tuning (truly-unrelated resources) were dropped from
-    # Together's warn set: they pass through SILENTLY. embeddings is intercepted
-    # (P1.7) -> it returns the media proxy, not the raw attribute, and is silent too.
+    # Together's warn set: they pass through SILENTLY. embeddings (P1.7) and
+    # images (P2.8) are intercepted -> they return the media proxy, not the raw
+    # attribute, and are silent too.
     client = FakeTogetherClient(_completion_response())
     for surface in SILENT_SURFACES:
         setattr(client, surface, object())
     client.embeddings = object()
+    client.images = object()
     solwyn = _make_solwyn(client)
 
     with caplog.at_level(logging.WARNING, logger="solwyn._base"):
         for surface in SILENT_SURFACES:
             assert getattr(solwyn, surface) is getattr(client, surface)
-        # embeddings is intercepted, not passed through to the raw client.
+        # embeddings + images are intercepted, not passed through to the raw client.
         assert solwyn.embeddings is not client.embeddings
+        assert solwyn.images is not client.images
 
     assert caplog.records == []
     solwyn.close()
@@ -270,10 +275,12 @@ def test_sync_curated_silent_surfaces_pass_through_without_warning(
 async def test_async_unmetered_surface_warns_and_passes_through(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    # audio is a still-unshipped central openai surface (P3): warn-once, pass
+    # through. (images graduated to interception in P2.8 and no longer warns.)
     client = AsyncTogether(_completion_response())
     resource = MagicMock(spec=_AsyncResource)
     resource.create.return_value = object()
-    client.images = resource
+    client.audio = resource
     solwyn = _make_async_solwyn(client)
     check_budget = AsyncMock(spec=solwyn._budget.check_budget)
     report = MagicMock(spec=solwyn._reporter.report)
@@ -285,7 +292,7 @@ async def test_async_unmetered_surface_warns_and_passes_through(
         patch.object(solwyn._reporter, "report", new=report),
         patch.object(solwyn._reporter, "report_settlement", new=report_settlement),
     ):
-        result = await solwyn.images.create(model=MODEL, prompt="private-input-marker")
+        result = await solwyn.audio.create(model=MODEL, prompt="private-input-marker")
 
     assert result is resource.create.return_value
     resource.create.assert_awaited_once()
@@ -295,7 +302,7 @@ async def test_async_unmetered_surface_warns_and_passes_through(
     assert len(caplog.records) == 1
     warning = caplog.records[0].getMessage()
     assert "together" in warning
-    assert "images" in warning
+    assert "audio" in warning
     assert "no budget check" in warning
     assert "no cost event" in warning
     assert "tracking for this surface is coming" in warning.lower()
@@ -343,7 +350,7 @@ def test_sync_concurrent_unmetered_surface_access_warns_exactly_once(
     worker_count = 8
     client = FakeTogetherClient(_completion_response())
     resource = object()
-    client.images = resource
+    client.audio = resource
     solwyn = _make_solwyn(client)
     # Swap the module-level latch for one that yields on an absent membership
     # check, exposing any check-then-insert race; the surrounding lock must still
@@ -353,7 +360,7 @@ def test_sync_concurrent_unmetered_surface_access_warns_exactly_once(
 
     def access_surface(_: int) -> object:
         start.wait(timeout=5)
-        return solwyn.images
+        return solwyn.audio
 
     with (
         caplog.at_level(logging.WARNING, logger="solwyn._base"),
@@ -363,7 +370,7 @@ def test_sync_concurrent_unmetered_surface_access_warns_exactly_once(
 
     assert all(result is resource for result in results)
     assert len(caplog.records) == 1
-    assert "surface 'images'" in caplog.records[0].getMessage()
+    assert "surface 'audio'" in caplog.records[0].getMessage()
     solwyn.close()
 
 
@@ -376,15 +383,15 @@ def test_missing_unmetered_surface_does_not_warn_or_consume_latch(
 
     with caplog.at_level(logging.WARNING, logger="solwyn._base"):
         with pytest.raises(AttributeError):
-            _ = solwyn.images
+            _ = solwyn.audio
         assert caplog.records == []
 
         resource = object()
-        client.images = resource
-        assert solwyn.images is resource
+        client.audio = resource
+        assert solwyn.audio is resource
 
     assert len(caplog.records) == 1
-    assert "surface 'images'" in caplog.records[0].getMessage()
+    assert "surface 'audio'" in caplog.records[0].getMessage()
     solwyn.close()
 
 
@@ -396,17 +403,17 @@ def test_unmetered_surface_warning_latch_is_per_process(
     # NOT re-warn a surface already warned this process.
     client = FakeTogetherClient(_completion_response())
     resource = object()
-    client.images = resource
+    client.audio = resource
     first = _make_solwyn(client)
     second = _make_solwyn(client)
 
     with caplog.at_level(logging.WARNING, logger="solwyn._base"):
-        assert first.images is resource
-        assert first.images is resource
-        assert second.images is resource
+        assert first.audio is resource
+        assert first.audio is resource
+        assert second.audio is resource
 
     assert len(caplog.records) == 1
-    assert "surface 'images'" in caplog.records[0].getMessage()
+    assert "surface 'audio'" in caplog.records[0].getMessage()
     first.close()
     second.close()
 
