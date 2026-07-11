@@ -10,6 +10,7 @@ import pytest
 from solwyn._token_details import TokenDetails
 from solwyn.exceptions import UnsupportedSurfaceError
 from solwyn.providers.openai import (
+    _AUDIO_OP_KEY,
     _IMAGE_OP_KEY,
     OpenAIAdapter,
     _extract_image_usage,
@@ -416,7 +417,7 @@ class TestOpenAIAdapterDispatchSeams:
         assert adapter.wrap_stream_result(wrapper, response) is wrapper
 
     def test_prepare_media_call_embeddings_selects_embeddings_create(self) -> None:
-        # P1.7: embeddings routes to client.embeddings.create with a COPY of
+        # embeddings routes to client.embeddings.create with a COPY of
         # kwargs — the same (method, shaped_kwargs) shape prepare_call gives chat.
         def create(**kwargs: Any) -> dict[str, Any]:
             return kwargs
@@ -433,7 +434,7 @@ class TestOpenAIAdapterDispatchSeams:
         assert prepared is not kwargs  # never mutates / aliases the input
 
     def test_prepare_media_call_images_selects_generate_by_default(self) -> None:
-        # P2.8: images routes to client.images.generate with a COPY of kwargs.
+        # images routes to client.images.generate with a COPY of kwargs.
         def generate(**kwargs: Any) -> dict[str, Any]:
             return kwargs
 
@@ -464,11 +465,52 @@ class TestOpenAIAdapterDispatchSeams:
         assert _IMAGE_OP_KEY not in prepared  # marker stripped before the SDK call
         assert prepared == {"model": "gpt-image-1", "prompt": "a cat"}
 
+    def test_prepare_media_call_audio_selects_transcriptions_create(self) -> None:
+        # audio routes to client.audio.transcriptions.create by default (no op
+        # marker) with a COPY of kwargs.
+        def create(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(
+            audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create))
+        )
+        kwargs: dict[str, Any] = {"model": "whisper-1", "file": b"audio-bytes"}
+
+        method, prepared = OpenAIAdapter().prepare_media_call(
+            "audio", client, kwargs, timeout=30.0, max_retries=0
+        )
+
+        assert method is create
+        assert prepared == {"model": "whisper-1", "file": b"audio-bytes"}
+        assert prepared is not kwargs  # never mutates / aliases the input
+
+    def test_prepare_media_call_audio_speech_marker_selects_speech_and_is_stripped(self) -> None:
+        # The audio op marker routes speech vs transcriptions on the ONE "audio"
+        # surface and is NEVER sent to the SDK.
+        def speech_create(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(
+            audio=SimpleNamespace(
+                transcriptions=SimpleNamespace(create=lambda **k: k),
+                speech=SimpleNamespace(create=speech_create),
+            )
+        )
+        kwargs: dict[str, Any] = {"model": "tts-1", "input": "hello", _AUDIO_OP_KEY: "speech"}
+
+        method, prepared = OpenAIAdapter().prepare_media_call(
+            "audio", client, kwargs, timeout=30.0, max_retries=0
+        )
+
+        assert method is speech_create
+        assert _AUDIO_OP_KEY not in prepared  # marker stripped before the SDK call
+        assert prepared == {"model": "tts-1", "input": "hello"}
+
     def test_prepare_media_call_raises_unsupported_surface_for_unwired(self) -> None:
-        # embeddings (P1.7) + images (P2.8) are wired; audio/video still fail loud
+        # embeddings + images + audio are wired; video still fails loud
         # with the structural, content-free UnsupportedSurfaceError.
         adapter = OpenAIAdapter()
-        for surface in ("audio", "video"):
+        for surface in ("video",):
             with pytest.raises(UnsupportedSurfaceError) as excinfo:
                 adapter.prepare_media_call(
                     surface, object(), {"model": "m"}, timeout=30.0, max_retries=0
@@ -479,7 +521,7 @@ class TestOpenAIAdapterDispatchSeams:
 
 @pytest.mark.unit
 class TestExtractImageUsage:
-    """gpt-image images.generate/edit usage extraction (P2.8)."""
+    """gpt-image images.generate/edit usage extraction."""
 
     def _image_response(
         self,

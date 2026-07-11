@@ -20,11 +20,12 @@ class TogetherAdapter(OpenAICompatibleAdapter):
     # Together-specific untracked spend surfaces that the central per-dialect map
     # (_base._UNSHIPPED_SPEND_SURFACES) does NOT already cover. The warn-once
     # posture unions this with that map (Together speaks the "openai" dialect):
-    #   - images / audio / videos: omitted here — covered centrally for every
-    #     openai-dialect provider, so declaring them again would be redundant.
-    #   - embeddings: omitted — P1.7 intercepts it on this branch, so it must NOT
-    #     advertise itself as untracked (a surface about to be metered).
-    #   - batches / fine_tuning: omitted — per the P1.10 posture taxonomy these
+    #   - images / speech / translations / videos: omitted here — covered
+    #     centrally for every openai-dialect provider, so declaring them again
+    #     would be redundant.
+    #   - embeddings / audio.transcriptions: omitted — they are intercepted, so
+    #     they must NOT advertise themselves as untracked (metered surfaces).
+    #   - batches / fine_tuning: omitted — per the posture taxonomy these
     #     are truly-unrelated resources that pass through SILENTLY, not warn-once.
     # What remains are Together's genuinely-billable, not-yet-tracked extras.
     unmetered_spend_surfaces = frozenset(

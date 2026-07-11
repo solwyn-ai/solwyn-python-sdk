@@ -16,10 +16,19 @@ from solwyn._privacy import (
     estimate_tokens_from_length,
     measure_google_image_media,
     measure_image_media,
+    measure_speech_media,
 )
 from solwyn._token_details import TokenDetails
 from solwyn._types import MediaUsage
-from solwyn.providers.openai import _IMAGE_OP_KEY, _extract_image_usage
+from solwyn.providers.openai import (
+    _AUDIO_OP_KEY,
+    _IMAGE_OP_KEY,
+    _extract_image_usage,
+    _extract_transcription_usage,
+    _is_untracked_tts_model,
+    _measure_transcription_media,
+    _warn_untracked_tts_model_once,
+)
 
 if TYPE_CHECKING:
     from solwyn.client import AsyncSolwyn, Solwyn
@@ -254,6 +263,87 @@ def _google_images_spec() -> MediaSurfaceSpec:
 
 
 # ---------------------------------------------------------------------------
+# Audio transcriptions surface (openai dialect: native + all compat incl. Groq)
+# ---------------------------------------------------------------------------
+
+
+def _transcriptions_spec() -> MediaSurfaceSpec:
+    """Build the audio-transcriptions ``MediaSurfaceSpec`` (openai dialect).
+
+    ``surface="audio"`` is the adapter dispatch key (routes to
+    ``client.audio.transcriptions.create``); ``modality="audio"`` is the server
+    billing modality. ONE spec covers both billable shapes the transcription
+    models report — the shared extractor discriminates on ``usage.type``:
+
+    - ``extract_usage`` returns the TOKEN basis for the token-billed models
+      (gpt-4o-transcribe / gpt-4o-mini-transcribe), whose ``audio_tokens`` ride
+      ``audio_input_tokens``; None for the duration-billed model (whisper-1) and
+      for a non-JSON response with no usage.
+    - ``measure_request`` returns None: audio duration is not derivable from the
+      request (the SDK never touches the file bytes).
+    - ``measure_media`` returns the DURATION basis (``usage.seconds`` ->
+      ``audio_seconds``) for whisper-1; None otherwise.
+
+    A non-JSON response_format (text/srt/vtt) carries no usage → both bases None →
+    the call is tracked UNPRICED, with a one-time hint (emitted by the extractor)
+    to use a JSON response_format for priced tracking.
+    """
+    return MediaSurfaceSpec(
+        surface="audio",
+        modality="audio",
+        extract_usage=_extract_transcription_usage,
+        measure_request=lambda _kwargs: None,
+        measure_media=_measure_transcription_media,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Audio speech (TTS) surface (openai dialect: native + all compat)
+# ---------------------------------------------------------------------------
+
+
+def _measure_speech_media(kwargs: dict[str, Any], _response: Any) -> MediaUsage | None:
+    """Settled request-derived TTS ``MediaUsage`` (input character count only).
+
+    The response is intentionally IGNORED: a TTS response is raw audio bytes with
+    NO usage metadata, so the SOLE billable basis is the request's ``input`` text
+    LENGTH, measured in the firewall (``input_characters``). Because the character
+    count is EXACT, this settled measurement and the pre-flight estimate share the
+    same firewall builder. Returns None when ``input`` is non-str/absent so an
+    unobservable quantity stays None rather than a zero-as-default.
+    """
+    return measure_speech_media(kwargs)
+
+
+def _speech_spec() -> MediaSurfaceSpec:
+    """Build the audio-speech (TTS) ``MediaSurfaceSpec`` (openai dialect).
+
+    ``surface="audio"`` is the adapter dispatch key (the op marker routes it to
+    ``client.audio.speech.create``); ``modality="audio"`` is the server billing
+    modality. TTS responses carry ZERO usage metadata, so:
+
+    - ``extract_usage`` returns None: there is no response TOKEN basis to read.
+    - ``measure_request`` returns None: TTS has no request-derived TOKEN estimate
+      (audio-output tokens exist only in a response this surface never receives).
+    - ``measure_media`` / ``estimate_media`` build the request-derived
+      ``MediaUsage`` (``input`` length -> ``input_characters``) so the exact
+      character count is the sole billable basis on BOTH the pre-flight check and
+      the settled confirm — a char-priced card prices chars/1e6 x rate server-side.
+
+    Token-billed TTS models (gpt-4o-mini-tts) publish no usage at all; those calls
+    are carved out UPSTREAM (in the speech proxy) and never reach this spec.
+    """
+    return MediaSurfaceSpec(
+        surface="audio",
+        modality="audio",
+        extract_usage=lambda _response: None,
+        measure_request=lambda _kwargs: None,
+        measure_media=_measure_speech_media,
+        estimate_media=measure_speech_media,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Sync proxies
 # ---------------------------------------------------------------------------
 
@@ -356,6 +446,102 @@ class _SyncImagesProxy:
         return getattr(self._solwyn._client.images, name)
 
 
+class _SyncAudioTranscriptionsProxy:
+    """Proxy for client.audio.transcriptions that routes create() through the media lifecycle.
+
+    ``client.audio.transcriptions.create()`` (OpenAI's transcription API, shared by
+    every OpenAI-compatible provider incl. Groq whisper) flows through
+    ``_media_call`` so transcription spend is budget-checked, confirmed, and
+    reported. The billable basis is per-model: token usage for the
+    gpt-4o-transcribe family (``audio_input_tokens``), duration usage for whisper-1
+    (``audio_seconds``); a non-JSON response_format yields no usage and is tracked
+    UNPRICED. Every other ``transcriptions`` attribute passes through untracked.
+    The per-client spec is built once (it is provider-agnostic; the adapter
+    dispatch differs).
+    """
+
+    def __init__(self, solwyn: Solwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _transcriptions_spec()
+
+    def create(self, **kwargs: Any) -> Any:
+        """Intercept audio.transcriptions.create() with budget/confirm/reporting."""
+        return self._solwyn._media_call(self._spec, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through non-create attributes to the client's audio.transcriptions."""
+        return getattr(self._solwyn._client.audio.transcriptions, name)
+
+
+class _SyncAudioSpeechProxy:
+    """Proxy for client.audio.speech that routes create() through the media lifecycle.
+
+    ``client.audio.speech.create()`` (OpenAI's TTS API, shared by every
+    OpenAI-compatible provider) flows through ``_media_call`` so speech spend is
+    budget-checked, confirmed, and reported. TTS responses carry NO usage
+    metadata, so the sole billable basis is the request's ``input`` character
+    count, measured in the firewall (``input_characters``) and priced server-side.
+
+    Token-billed TTS models (``gpt-4o-mini-tts`` and its dated snapshots) publish
+    no usage of any kind, so their audio-output tokens are unobservable: those
+    calls are CARVED OUT — one warning per process, then a direct pass-through to
+    the raw client (untracked, a warned pass-through, never a silent $0). Every
+    other ``speech`` attribute passes through untracked. On a non-openai client
+    the media seam raises ``UnsupportedSurfaceError`` (that adapter serves no audio
+    seam). The per-client spec is built once (it is provider-agnostic; the adapter
+    dispatch differs).
+    """
+
+    def __init__(self, solwyn: Solwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _speech_spec()
+
+    def create(self, **kwargs: Any) -> Any:
+        """Intercept audio.speech.create(); carve out untracked token-billed TTS models.
+
+        A token-billed TTS model has no observable usage, so it cannot be priced:
+        warn once, then pass through to the raw client untracked. Every other model
+        rides the media lifecycle with the ``audio`` op marker selecting speech.
+        """
+        if _is_untracked_tts_model(kwargs.get("model")):
+            _warn_untracked_tts_model_once()
+            return self._solwyn._client.audio.speech.create(**kwargs)
+        return self._solwyn._media_call(self._spec, **{**kwargs, _AUDIO_OP_KEY: "speech"})
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through non-create attributes to the client's audio.speech."""
+        return getattr(self._solwyn._client.audio.speech, name)
+
+
+class _SyncAudioProxy:
+    """Proxy for client.audio: intercepts transcriptions + speech; translations warns once.
+
+    ``transcriptions`` and ``speech`` are the intercepted audio sub-surfaces (their
+    ``create`` routes through the media lifecycle). ``translations`` remains a
+    still-unwired recognized spend surface: it warns-once then passes through
+    untracked. Every other ``audio`` attribute passes through silently. On a
+    non-openai client the media seams raise ``UnsupportedSurfaceError`` (that
+    adapter serves no audio seam).
+    """
+
+    def __init__(self, solwyn: Solwyn) -> None:
+        self._solwyn = solwyn
+        self.transcriptions = _SyncAudioTranscriptionsProxy(solwyn)
+        self.speech = _SyncAudioSpeechProxy(solwyn)
+
+    @property
+    def translations(self) -> Any:
+        """Warn-once, then pass through to the client's audio.translations (untracked)."""
+        _warn_unmetered_spend_surface_once(
+            adapter=self._solwyn._adapter, dialect=self._solwyn._dialect, surface="translations"
+        )
+        return self._solwyn._client.audio.translations
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through other audio attributes (e.g. with_raw_response) to the client."""
+        return getattr(self._solwyn._client.audio, name)
+
+
 class _SyncMessagesProxy:
     """Proxy for client.messages that intercepts create().
 
@@ -403,7 +589,7 @@ class _SyncModelsProxy:
         budget-checked, confirmed, and reported instead of passing through
         untracked. Because it is defined on the class, it never reaches
         __getattr__ — generate_videos keeps riding that warn-once pass-through
-        until its interception phase (P4) ships.
+        until it is intercepted.
         """
         return self._solwyn._media_call(self._embeddings_spec, **kwargs)
 
@@ -414,17 +600,17 @@ class _SyncModelsProxy:
         confirmed, and reported. imagen exposes no token usage; the billable
         basis is the request-derived per-image ``MediaUsage``
         (``config.number_of_images``). Being defined on the class, it never
-        reaches __getattr__ — it has graduated OUT of the warn-once pass-through
-        (P2.9), leaving only generate_videos warning there.
+        reaches __getattr__ — it is intercepted, not part of the warn-once
+        pass-through, leaving only generate_videos warning there.
         """
         return self._solwyn._media_call(self._images_spec, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         # Google's remaining unshipped media surface (generate_videos) is a method
         # on client.models, so it arrives here rather than on Solwyn.__getattr__ —
-        # warn-once pass-through per the P1.10 posture. embed_content and
+        # warn-once pass-through per the posture taxonomy. embed_content and
         # generate_images never reach here: the explicit methods above intercept
-        # them (P1.8 / P2.9).
+        # them.
         attribute = getattr(self._solwyn._client.models, name)
         _warn_unmetered_spend_surface_once(
             adapter=self._solwyn._adapter, dialect=self._solwyn._dialect, surface=name
@@ -515,6 +701,80 @@ class _AsyncImagesProxy:
         return getattr(self._solwyn._client.images, name)
 
 
+class _AsyncAudioTranscriptionsProxy:
+    """Async proxy for client.audio.transcriptions that routes create() through the lifecycle.
+
+    Mirror of ``_SyncAudioTranscriptionsProxy``: ``client.audio.transcriptions
+    .create()`` flows through the async ``_media_call``; every other attribute
+    passes through to the underlying client's audio.transcriptions.
+    """
+
+    def __init__(self, solwyn: AsyncSolwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _transcriptions_spec()
+
+    async def create(self, **kwargs: Any) -> Any:
+        """Intercept audio.transcriptions.create() with budget/confirm/reporting."""
+        return await self._solwyn._media_call(self._spec, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through non-create attributes to the client's audio.transcriptions."""
+        return getattr(self._solwyn._client.audio.transcriptions, name)
+
+
+class _AsyncAudioSpeechProxy:
+    """Async proxy for client.audio.speech that routes create() through the lifecycle.
+
+    Mirror of ``_SyncAudioSpeechProxy``: ``client.audio.speech.create()`` flows
+    through the async ``_media_call`` (billed on the request's ``input`` character
+    count; TTS responses carry no usage). The untracked token-billed carve-out
+    (``gpt-4o-mini-tts``) warns once then awaits a direct pass-through to the raw
+    client; every other attribute passes through to the underlying audio.speech.
+    """
+
+    def __init__(self, solwyn: AsyncSolwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _speech_spec()
+
+    async def create(self, **kwargs: Any) -> Any:
+        """Intercept audio.speech.create(); carve out untracked token-billed TTS models."""
+        if _is_untracked_tts_model(kwargs.get("model")):
+            _warn_untracked_tts_model_once()
+            return await self._solwyn._client.audio.speech.create(**kwargs)
+        return await self._solwyn._media_call(self._spec, **{**kwargs, _AUDIO_OP_KEY: "speech"})
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through non-create attributes to the client's audio.speech."""
+        return getattr(self._solwyn._client.audio.speech, name)
+
+
+class _AsyncAudioProxy:
+    """Async proxy for client.audio: intercepts transcriptions + speech; translations warns.
+
+    Mirror of ``_SyncAudioProxy``: attribute access is synchronous, so the
+    ``translations`` warn-once pass-through and the intercepted ``transcriptions``
+    / ``speech`` sub-proxies behave exactly as on the sync proxy; only their
+    ``create`` differs (it awaits the async ``_media_call``).
+    """
+
+    def __init__(self, solwyn: AsyncSolwyn) -> None:
+        self._solwyn = solwyn
+        self.transcriptions = _AsyncAudioTranscriptionsProxy(solwyn)
+        self.speech = _AsyncAudioSpeechProxy(solwyn)
+
+    @property
+    def translations(self) -> Any:
+        """Warn-once, then pass through to the client's audio.translations (untracked)."""
+        _warn_unmetered_spend_surface_once(
+            adapter=self._solwyn._adapter, dialect=self._solwyn._dialect, surface="translations"
+        )
+        return self._solwyn._client.audio.translations
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through other audio attributes to the client."""
+        return getattr(self._solwyn._client.audio, name)
+
+
 class _AsyncMessagesProxy:
     """Async proxy for client.messages that intercepts create()."""
 
@@ -561,14 +821,14 @@ class _AsyncModelsProxy:
 
         Mirror of ``_SyncModelsProxy.generate_images``: an EXPLICIT method (not
         __getattr__) so image spend is budget-checked, confirmed, and reported on
-        the request-derived per-image ``MediaUsage`` basis. Graduated OUT of the
-        warn-once pass-through (P2.9); only generate_videos still warns there.
+        the request-derived per-image ``MediaUsage`` basis. Intercepted, not part
+        of the warn-once pass-through; only generate_videos still warns there.
         """
         return await self._solwyn._media_call(self._images_spec, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         # See _SyncModelsProxy.__getattr__: Google's remaining unshipped media
-        # surface (generate_videos) warn-once pass-through per the P1.10 posture.
+        # surface (generate_videos) warn-once pass-through per the posture taxonomy.
         # embed_content and generate_images never reach here — the explicit
         # methods above intercept them.
         attribute = getattr(self._solwyn._client.models, name)

@@ -85,7 +85,7 @@ Solwyn Cloud accepts every field below before this SDK releases.
   extractor now maps the `prompt_tokens_details` (input side) and
   `candidates_tokens_details` (output side) `ModalityTokenCount` lists: IMAGE
   buckets → `image_input_tokens` / `image_output_tokens`; AUDIO buckets →
-  `audio_input_tokens` / `audio_output_tokens` (P3 groundwork). This lets a
+  `audio_input_tokens` / `audio_output_tokens`. This lets a
   `generate_content` call to a token-billed image model (e.g. gemini-3-pro-image)
   carry its image-output tokens so the server prices them at the image rate.
   Duck-typed with None-safety throughout; a response without per-modality details
@@ -108,5 +108,48 @@ Solwyn Cloud accepts every field below before this SDK releases.
   intercepted.** Both leave the unshipped-spend-surface warn-once set — a metered
   surface must not advertise itself as untracked (superseding the merge-1
   warn-once posture entry for those two surfaces). Remaining warn-once
-  pass-throughs: OpenAI-dialect `audio` (P3) / `videos` (P4) and Google
-  `generate_videos` (P4).
+  pass-throughs: OpenAI-dialect `audio` / `videos` and Google
+  `generate_videos`.
+
+---
+
+Non-text modality support — SDK merge 3. Audio surfaces reuse the wire contract
+shipped in merge 2 (`modality="audio"`, `MediaUsage.audio_seconds` /
+`input_characters`, `TokenDetails.audio_input_tokens`) — no new wire fields.
+
+### Added
+
+- **Audio transcription is now budget-tracked.**
+  `client.audio.transcriptions.create` (native OpenAI and every
+  OpenAI-compatible profile, including Groq whisper) is intercepted through the
+  media-call lifecycle, emitting `modality="audio"`. One extractor discriminates
+  on `usage.type`: the token-billed models (the gpt-4o-transcribe family) settle
+  on their audio-input token bucket (`audio_input_tokens`), while whisper reports
+  an integer whole-second count (`usage.seconds`, present on any JSON
+  `response_format`) that rides `MediaUsage.audio_seconds` — the fractional
+  top-level `duration` field is never read. A non-JSON `response_format`
+  (`text` / `srt` / `vtt`) returns a plain string with no usage, so the call is
+  tracked UNPRICED with a one-time hint to pass a JSON `response_format` for
+  priced tracking. The audio file bytes are never read.
+- **Text-to-speech is now budget-tracked.** `client.audio.speech.create` (native
+  OpenAI and every OpenAI-compatible profile) is intercepted through the same
+  lifecycle, emitting `modality="audio"`. TTS responses carry no usage, so the
+  sole billable basis is the request's `input` text length, measured in the
+  privacy firewall as an exact character count (`MediaUsage.input_characters`)
+  that rides both the pre-flight budget check and the settled confirm; the input
+  text itself is never read, logged, or transmitted (tts-1 / tts-1-hd price from
+  this character count server-side). Token-billed TTS models (`gpt-4o-mini-tts`
+  and its dated snapshots) publish no usage of any kind — their audio-output
+  tokens are unobservable, so by product decision those calls are warned once per
+  process and passed through UNTRACKED rather than settled at an estimated or
+  silent $0.
+
+### Changed
+
+- **`audio` graduated from warn-once to intercepted.** The `audio` attribute now
+  returns intercepting machinery — its `transcriptions` and `speech` sub-surfaces
+  are metered — leaving the unshipped-spend-surface warn-once set (a metered
+  surface must not advertise itself as untracked, superseding the merge-1
+  warn-once posture entry for `audio`). Its `translations` sub-surface stays
+  recognized-but-untracked and warns once per process. Remaining warn-once
+  pass-throughs: OpenAI-dialect `videos` and Google `generate_videos`.

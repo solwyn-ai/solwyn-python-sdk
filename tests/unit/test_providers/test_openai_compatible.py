@@ -17,7 +17,7 @@ from solwyn._types import ProviderName
 from solwyn.exceptions import UnsupportedSurfaceError
 from solwyn.providers import get_adapter_by_name, get_adapter_for_client, get_adapter_for_model
 from solwyn.providers._protocol import ProviderAdapter
-from solwyn.providers.openai import _IMAGE_OP_KEY, OpenAIAdapter
+from solwyn.providers.openai import _AUDIO_OP_KEY, _IMAGE_OP_KEY, OpenAIAdapter
 from solwyn.providers.openai_compatible import (
     COMPAT_PROFILES,
     CompatStreamAccumulator,
@@ -112,7 +112,7 @@ class TestProfileTable:
     def test_prepare_media_call_embeddings_selects_embeddings_create_for_every_profile(
         self,
     ) -> None:
-        # P1.7: one embeddings branch covers every compat adapter (incl. the
+        # one embeddings branch covers every compat adapter (incl. the
         # first-class Together adapter, which inherits it) since they share the
         # openai dialect. Each routes to client.embeddings.create with a COPY.
         def create(**kwargs: Any) -> dict[str, Any]:
@@ -129,7 +129,7 @@ class TestProfileTable:
             assert prepared is not kwargs, adapter.name  # never mutates / aliases input
 
     def test_prepare_media_call_images_selects_images_method_for_every_profile(self) -> None:
-        # P2.8: one images branch covers every compat adapter (incl. Together) —
+        # one images branch covers every compat adapter (incl. Together) —
         # generate() by default, edit() via the marker (stripped before the call).
         def generate(**kwargs: Any) -> dict[str, Any]:
             return kwargs
@@ -155,11 +155,55 @@ class TestProfileTable:
             assert edit_method is edit, adapter.name
             assert _IMAGE_OP_KEY not in edit_prepared, adapter.name  # marker stripped
 
+    def test_prepare_media_call_audio_selects_transcriptions_for_every_profile(self) -> None:
+        # one audio branch covers every compat adapter (incl. Together / Groq
+        # whisper): it routes to client.audio.transcriptions.create with a COPY.
+        def create(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(
+            audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create))
+        )
+        for adapter in build_compat_adapters():
+            method, prepared = adapter.prepare_media_call(
+                "audio",
+                client,
+                {"model": "whisper-large-v3", "file": b"x"},
+                timeout=30.0,
+                max_retries=0,
+            )
+            assert method is create, adapter.name
+            assert prepared == {"model": "whisper-large-v3", "file": b"x"}, adapter.name
+
+    def test_prepare_media_call_audio_speech_marker_selects_speech_for_every_profile(self) -> None:
+        # The audio op marker routes speech.create on the shared "audio" surface
+        # for every compat profile and is stripped before the SDK call.
+        def speech_create(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(
+            audio=SimpleNamespace(
+                transcriptions=SimpleNamespace(create=lambda **k: k),
+                speech=SimpleNamespace(create=speech_create),
+            )
+        )
+        for adapter in build_compat_adapters():
+            method, prepared = adapter.prepare_media_call(
+                "audio",
+                client,
+                {"model": "tts-x", "input": "hi", _AUDIO_OP_KEY: "speech"},
+                timeout=30.0,
+                max_retries=0,
+            )
+            assert method is speech_create, adapter.name
+            assert _AUDIO_OP_KEY not in prepared, adapter.name  # marker stripped
+            assert prepared == {"model": "tts-x", "input": "hi"}, adapter.name
+
     def test_prepare_media_call_raises_unsupported_surface_for_unwired_every_profile(self) -> None:
-        # embeddings (P1.7) + images (P2.8) are wired; audio/video still fail loud
+        # embeddings + images + audio are wired; video still fails loud
         # with the provider's own name attached.
         for adapter in build_compat_adapters():
-            for surface in ("audio", "video"):
+            for surface in ("video",):
                 with pytest.raises(UnsupportedSurfaceError) as excinfo:
                     adapter.prepare_media_call(
                         surface, object(), {"model": "m"}, timeout=30.0, max_retries=0

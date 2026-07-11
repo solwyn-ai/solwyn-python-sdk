@@ -111,9 +111,9 @@ class FailoverReason(StrEnum):
 ServiceTier = Literal["auto", "default", "flex", "scale", "priority", "standard", "optimized"]
 
 
-# Call modality discriminator. Window 1 of the modality program adds ONLY this
-# field to the wire (default "text" so every pre-modality SDK omits it safely —
-# API deploys FIRST). The SERVER's pricing card unit — not this label alone —
+# Call modality discriminator. This is the ONLY modality field on the wire; its
+# default "text" lets an SDK that predates the field omit it safely (the API
+# deploys the field FIRST). The SERVER's pricing card unit — not this label alone —
 # selects the billing basis; core bills text tokens only until per-modality
 # cards land. Vendored lock-step with core shared/models.py's Modality.
 Modality = Literal["text", "image", "audio", "video", "embedding"]
@@ -149,7 +149,7 @@ class ProviderEntry(BaseModel):
 class MediaUsage(BaseModel):
     """Non-token billable quantities + variant selectors for a media call.
 
-    Window 2 of the modality program. ``TokenDetails`` is int-only by design
+    ``TokenDetails`` is int-only by design
     (a normalized TOKEN breakdown); the non-token quantities a per-unit priced
     surface bills on — image counts, media seconds, character counts — live
     here instead, so the token channel stays doubly int-locked and media

@@ -429,7 +429,7 @@ class TestGoogleAdapterDispatchSeams:
         assert adapter.wrap_stream_result(wrapper, response) is wrapper
 
     def test_prepare_media_call_embeddings_selects_embed_content(self) -> None:
-        # P1.8: embeddings routes to client.models.embed_content. google-genai
+        # embeddings routes to client.models.embed_content. google-genai
         # has no with_options, so the per-hop bound rides config.http_options —
         # injected here (like prepare_call) as a defensive COPY of kwargs.
         client = self._client()
@@ -449,7 +449,7 @@ class TestGoogleAdapterDispatchSeams:
         assert kwargs == original  # input never mutated
 
     def test_prepare_media_call_images_selects_generate_images(self) -> None:
-        # P2.9: images routes to client.models.generate_images (imagen). The
+        # images routes to client.models.generate_images (imagen). The
         # per-hop bound rides config.http_options (google-genai has no
         # with_options), injected here as a defensive COPY that preserves the
         # caller's own config keys (e.g. number_of_images).
@@ -474,7 +474,7 @@ class TestGoogleAdapterDispatchSeams:
         assert kwargs == original  # input never mutated
 
     def test_prepare_media_call_raises_unsupported_surface_for_unwired(self) -> None:
-        # embeddings (P1.8) and images (P2.9) are wired; audio/video still fail
+        # embeddings and images are wired; audio/video still fail
         # loud with the structural, content-free UnsupportedSurfaceError.
         adapter = GoogleAdapter()
         for surface in ("audio", "video"):

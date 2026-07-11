@@ -40,12 +40,14 @@ from solwyn._base import (
 )
 from solwyn._privacy import estimate_content_length, estimate_tokens_from_length
 from solwyn._proxies import (
+    _AsyncAudioProxy,
     _AsyncChatProxy,
     _AsyncEmbeddingsProxy,
     _AsyncImagesProxy,
     _AsyncMessagesProxy,
     _AsyncModelsProxy,
     _bedrock_internal_kwargs,
+    _SyncAudioProxy,
     _SyncChatProxy,
     _SyncEmbeddingsProxy,
     _SyncImagesProxy,
@@ -637,6 +639,21 @@ class Solwyn(_SolwynBase):
         return _SyncImagesProxy(self)
 
     @functools.cached_property
+    def audio(self) -> _SyncAudioProxy:
+        """Return a proxy that routes audio transcriptions/speech through the lifecycle.
+
+        Unconditional (like ``chat`` / ``embeddings`` / ``images``): the audio
+        transcriptions AND speech (TTS) surfaces are the openai dialect, shared by
+        native OpenAI and every OpenAI-compatible provider (incl. Groq whisper). On
+        a non-openai client ``.transcriptions.create()`` / ``.speech.create()``
+        fail loud with ``UnsupportedSurfaceError`` (that adapter serves no audio
+        seam). The proxy's ``translations`` sub-surface warns-once then passes
+        through untracked. Cached: provider is fixed at construction so this is safe
+        to create once.
+        """
+        return _SyncAudioProxy(self)
+
+    @functools.cached_property
     def messages(self) -> Any:
         """Anthropic-compatible: client.messages.create() goes through interception.
 
@@ -787,7 +804,7 @@ class Solwyn(_SolwynBase):
         #    standard fail-open path: allowed=True with a warning. So an
         #    unbilled-model media call proceeds untracked rather than being denied;
         #    fail-open is intentional here — Solwyn never blocks a call just because
-        #    it cannot yet price it. (Full matrix documented in the P5.2 posture doc.)
+        #    it cannot yet price it.
         budget = self._budget.check_budget(
             estimated_input_tokens=est_in,
             model=requested_model,
@@ -1550,6 +1567,20 @@ class AsyncSolwyn(_SolwynBase):
         Cached: provider is fixed at construction.
         """
         return _AsyncImagesProxy(self)
+
+    @functools.cached_property
+    def audio(self) -> _AsyncAudioProxy:
+        """Return an async proxy that routes audio transcriptions/speech through the lifecycle.
+
+        Unconditional (like ``chat`` / ``embeddings`` / ``images``): the audio
+        transcriptions AND speech (TTS) surfaces are the openai dialect, shared by
+        native OpenAI and every OpenAI-compatible provider (incl. Groq whisper). On
+        a non-openai client ``.transcriptions.create()`` / ``.speech.create()``
+        fail loud with ``UnsupportedSurfaceError``. The proxy's ``translations``
+        sub-surface warns-once then passes through untracked. Cached: provider is
+        fixed at construction.
+        """
+        return _AsyncAudioProxy(self)
 
     @functools.cached_property
     def messages(self) -> Any:
