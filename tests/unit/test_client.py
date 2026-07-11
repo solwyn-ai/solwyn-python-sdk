@@ -527,53 +527,56 @@ class TestGetAttrPassThrough:
 class TestUnshippedSpendSurfacePosture:
     """Posture: recognized-but-unshipped openai spend surfaces warn-once then pass through.
 
-    The still-unwired openai spend surfaces (the ``translations`` audio
-    sub-resource, plus ``videos``) log exactly one warning per surface per process,
-    then pass through untracked. embeddings, images, audio.transcriptions, and
-    audio.speech are deliberately silent: they are intercepted, not warned (the
-    ``audio`` attribute itself now returns the intercepting proxy).
+    After the media program, ``translations`` (reached via ``client.audio
+    .translations``) is the LAST recognized-but-unwired openai spend surface: it
+    logs exactly one warning per process, then passes through untracked.
+    embeddings, images, audio (transcriptions + speech), and videos are
+    deliberately silent: they are intercepted, not warned (each attribute returns
+    the intercepting proxy).
     """
 
     def _close(self, solwyn: Solwyn) -> None:
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
-    def test_openai_media_surfaces_warn_once_and_pass_through(
+    def test_translations_warns_once_and_passes_through(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        for surface in ("videos",):
-            _reset_unmetered_spend_warnings()
-            client, _ = _mock_openai_client()
-            resource = object()
-            setattr(client, surface, resource)
-            solwyn = _make_solwyn(client)
+        # translations is the last recognized-but-unwired openai spend surface,
+        # reached via the audio proxy; it warns exactly once per process then
+        # passes through untracked.
+        _reset_unmetered_spend_warnings()
+        client, _ = _mock_openai_client()
+        resource = object()
+        client.audio.translations = resource
+        solwyn = _make_solwyn(client)
 
-            with caplog.at_level(logging.WARNING, logger="solwyn._base"):
-                caplog.clear()
-                first = getattr(solwyn, surface)
-                second = getattr(solwyn, surface)
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+            caplog.clear()
+            first = solwyn.audio.translations
+            second = solwyn.audio.translations
 
-            assert first is resource
-            assert second is resource  # pass-through, unchanged
-            assert len(caplog.records) == 1  # once per process, not per access
-            message = caplog.records[0].getMessage()
-            assert "openai" in message
-            assert f"surface '{surface}'" in message
-            assert "untracked" in message
-            assert "tracking for this surface is coming" in message.lower()
-            self._close(solwyn)
+        assert first is resource
+        assert second is resource  # pass-through, unchanged
+        assert len(caplog.records) == 1  # once per process, not per access
+        message = caplog.records[0].getMessage()
+        assert "openai" in message
+        assert "surface 'translations'" in message
+        assert "untracked" in message
+        assert "tracking for this surface is coming" in message.lower()
+        self._close(solwyn)
 
     def test_warn_is_per_process_across_instances(self, caplog: pytest.LogCaptureFixture) -> None:
         first_client, _ = _mock_openai_client()
-        first_client.videos = object()
+        first_client.audio.translations = object()
         second_client, _ = _mock_openai_client()
-        second_client.videos = object()
+        second_client.audio.translations = object()
         first = _make_solwyn(first_client)
         second = _make_solwyn(second_client)
 
         with caplog.at_level(logging.WARNING, logger="solwyn._base"):
-            _ = first.videos
-            _ = second.videos  # different instance, same process -> no re-warn
+            _ = first.audio.translations
+            _ = second.audio.translations  # different instance, same process -> no re-warn
 
         assert len(caplog.records) == 1
         self._close(first)
@@ -582,21 +585,22 @@ class TestUnshippedSpendSurfacePosture:
     def test_intercepted_and_unrelated_surfaces_are_silent(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        # embeddings, images, and audio are intercepted -> they return the media
-        # proxy, NOT the raw client attribute; moderations/files are
+        # embeddings, images, audio, and videos are intercepted -> they return the
+        # media proxy, NOT the raw client attribute; moderations/files are
         # truly-unrelated resources that pass through. None of them warn.
         client, _ = _mock_openai_client()
-        for surface in ("embeddings", "images", "audio", "moderations", "files"):
+        for surface in ("embeddings", "images", "audio", "videos", "moderations", "files"):
             setattr(client, surface, object())
         solwyn = _make_solwyn(client)
 
         with caplog.at_level(logging.WARNING, logger="solwyn._base"):
-            # embeddings + images + audio are intercepted: the proxy replaces the
-            # raw attribute. (Accessing audio does not warn; only its still-unwired
-            # translations sub-surface does.)
+            # embeddings + images + audio + videos are intercepted: the proxy
+            # replaces the raw attribute. (Accessing audio does not warn; only its
+            # still-unwired translations sub-surface does.)
             assert solwyn.embeddings is not client.embeddings
             assert solwyn.images is not client.images
             assert solwyn.audio is not client.audio
+            assert solwyn.videos is not client.videos
             # unrelated resources still pass through untouched.
             for surface in ("moderations", "files"):
                 assert getattr(solwyn, surface) is getattr(client, surface)
@@ -607,17 +611,17 @@ class TestUnshippedSpendSurfacePosture:
     def test_warning_message_carries_no_request_content(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        # The warning fires at attribute access and interpolates only structural
-        # identifiers (provider name, surface name) — never request/media data.
+        # The warning interpolates only structural identifiers (provider name,
+        # surface name) — never request/media data.
         client, _ = _mock_openai_client()
-        client.videos = object()
+        client.audio.translations = object()
         solwyn = _make_solwyn(client)
 
         with caplog.at_level(logging.WARNING, logger="solwyn._base"):
-            _ = solwyn.videos
+            _ = solwyn.audio.translations
 
         record = caplog.records[0]
-        assert record.args == ("openai", "videos")
+        assert record.args == ("openai", "translations")
         self._close(solwyn)
 
 

@@ -280,6 +280,182 @@ def measure_google_image_media(kwargs: dict[str, Any]) -> MediaUsage:
     return MediaUsage(image_count=_google_image_count(kwargs.get("config")))
 
 
+def _video_duration_seconds(config: object) -> float | None:
+    """Requested video duration in seconds from a ``generate_videos`` ``config``.
+
+    google-genai carries ``duration_seconds`` INSIDE the ``config=`` argument
+    (a ``GenerateVideosConfig`` object or a plain dict — both handled duck-typed,
+    no provider SDK import). It is a DURATION, not prompt content. The field has
+    NO SDK-level default (the SDK sends nothing when it is omitted) and the
+    provider's per-model default is not uniformly published, so an absent value
+    stays None (the call is tracked UNPRICED) rather than settling a guessed
+    duration — a per-second billed surface must never bill a duration the caller
+    did not request. A non-numeric / bool / negative value is garbage and also
+    degrades to None. ``bool`` is excluded explicitly (it is an ``int`` subclass).
+    """
+    if isinstance(config, dict):
+        value = config.get("duration_seconds")
+    else:
+        value = getattr(config, "duration_seconds", None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return float(value)
+
+
+def _video_resolution(config: object) -> str | None:
+    """Video resolution variant selector (e.g. ``"720p"``) from a ``config``.
+
+    A CONFIG enum, never prompt content, matched server-side against the pricing
+    card's per-second variant grid. Read duck-typed from the dict or object
+    ``config``; a non-str or over-length value degrades to None via the shared
+    bounded-selector guard (an absent selector simply carries no variant).
+    """
+    if isinstance(config, dict):
+        value = config.get("resolution")
+    else:
+        value = getattr(config, "resolution", None)
+    return _image_selector(value)
+
+
+def measure_video_media(kwargs: dict[str, Any]) -> MediaUsage:
+    """Request-derived ``MediaUsage`` for a Google ``generate_videos`` call.
+
+    CONFIG values only — ``config.duration_seconds`` -> ``video_seconds``,
+    ``config.resolution`` -> ``resolution``. The customer's ``prompt=`` (and any
+    seed ``image=`` bytes) are NEVER read, logged, or retained; only these
+    non-content request parameters are measured. ``is_estimated`` is ALWAYS True:
+    generate_videos returns immediately with a long-running operation that carries
+    no usage, so billing settles at INITIATION from the request parameters — a
+    deliberate, conservative over-count until completion-observation exists (the
+    provider does not charge for failed/blocked generations). The same builder
+    serves both the pre-flight ``estimated_media`` (a precise per-second check —
+    an oversized request is denied before the provider is called) and the settled
+    ``media_usage`` (the operation object carries nothing better). ``video_seconds``
+    stays None when duration is absent, so the call is tracked unpriced rather
+    than billed on a guessed duration.
+    """
+    config = kwargs.get("config")
+    return MediaUsage(
+        video_seconds=_video_duration_seconds(config),
+        resolution=_video_resolution(config),
+        is_estimated=True,
+    )
+
+
+# OpenAI's videos.create (Sora) documents stable defaults in its API reference:
+# ``seconds`` defaults to "4" and ``size`` to "720x1280". Unlike google-genai's
+# generate_videos (no published default → absent stays unpriced), these are
+# published-and-stable, so an omitted param settles the documented default —
+# billing the value the provider itself applies is faithful, not a guess.
+_OPENAI_VIDEO_DEFAULT_SECONDS = 4.0
+_OPENAI_VIDEO_DEFAULT_SIZE = "720x1280"
+
+
+def _coerce_video_seconds(value: object) -> float | None:
+    """Coerce a videos.create ``seconds`` value to a non-negative float, or None.
+
+    OpenAI carries ``seconds`` as a DIGIT STRING ("4"/"8"/"12" per the API
+    reference); a numeric int/float is accepted duck-typed. It is a DURATION, not
+    prompt content. A non-digit string, a negative, ``bool`` (an ``int`` subclass,
+    excluded explicitly), or any other shape is garbage → None (tracked unpriced),
+    never a guessed duration. Never raises.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        return float(value) if value.isdigit() else None
+    if isinstance(value, (int, float)) and value >= 0:
+        return float(value)
+    return None
+
+
+def _openai_video_seconds(kwargs: dict[str, Any]) -> float | None:
+    """Requested clip duration from a TOP-LEVEL ``seconds`` param (defaulting to 4).
+
+    OpenAI's videos.create takes ``seconds`` at the TOP LEVEL of the request (not
+    inside a ``config=`` object like google-genai). An absent (or ``None``) value
+    settles the API's documented default of 4 seconds — billing the value the
+    provider applies is faithful. A present-but-garbage value degrades to None
+    (tracked unpriced) rather than a guessed duration; see ``_coerce_video_seconds``.
+    """
+    if kwargs.get("seconds") is None:
+        return _OPENAI_VIDEO_DEFAULT_SECONDS
+    return _coerce_video_seconds(kwargs.get("seconds"))
+
+
+def _video_size_label(size: str) -> str | None:
+    """Normalize a ``"WIDTHxHEIGHT"`` size string to a resolution LABEL, or None.
+
+    The server's per-second video pricing variants are keyed by resolution LABELS
+    ("720p", "1024p", "1080p"), so the request's pixel ``size`` is reduced to
+    ``min(width, height) + "p"`` — orientation-independent: "1280x720" and
+    "720x1280" both yield "720p", "1792x1024"/"1024x1792" → "1024p",
+    "1920x1080"/"1080x1920" → "1080p". Parsing is case-insensitive on the ``x``
+    separator. A string that is not exactly two digit parts is UNPARSEABLE and
+    yields None so the caller passes the raw string through as the selector (the
+    server fails loud on a selector miss rather than mispricing). Never raises.
+    """
+    parts = size.lower().split("x")
+    if len(parts) != 2:
+        return None
+    width, height = parts
+    if not width.isdigit() or not height.isdigit():
+        return None
+    return f"{min(int(width), int(height))}p"
+
+
+def _normalize_video_size(value: object) -> str | None:
+    """Resolution LABEL from a videos.create ``size`` selector, or None.
+
+    A parseable ``"WIDTHxHEIGHT"`` size normalizes to its ``min(w, h) + "p"``
+    label; an unparseable STRING passes through raw (the server fails loud on a
+    selector miss rather than mispricing). Both paths run through the shared
+    bounded-selector guard (``_image_selector``), so a non-str or over-length
+    value degrades to None and never raises out of the builder.
+    """
+    if not isinstance(value, str):
+        return None
+    label = _video_size_label(value)
+    return _image_selector(label if label is not None else value)
+
+
+def _openai_video_size(kwargs: dict[str, Any]) -> str | None:
+    """Resolution LABEL from a TOP-LEVEL ``size`` param (defaulting to 720x1280).
+
+    OpenAI's videos.create takes ``size`` at the TOP LEVEL of the request. An
+    absent (or ``None``) value settles the API's documented default of "720x1280"
+    (→ "720p"); a present value normalizes via ``_normalize_video_size``.
+    """
+    value = kwargs.get("size")
+    if value is None:
+        value = _OPENAI_VIDEO_DEFAULT_SIZE
+    return _normalize_video_size(value)
+
+
+def measure_openai_video_media(kwargs: dict[str, Any]) -> MediaUsage:
+    """Request-derived ``MediaUsage`` for an OpenAI ``videos.create`` (Sora) call.
+
+    TOP-LEVEL request params only — ``seconds`` → ``video_seconds``, ``size``
+    (normalized to a resolution label) → ``resolution``. The customer's
+    ``prompt=`` (and any ``input_reference`` bytes) are NEVER read, logged, or
+    retained; only these non-content request parameters are measured.
+    ``is_estimated`` is ALWAYS True: videos.create returns immediately with an
+    async video job that carries no usage, so billing settles at INITIATION from
+    the request parameters — a deliberate, conservative over-count until
+    completion-observation exists. The same builder serves both the pre-flight
+    ``estimated_media`` (a precise per-second check — an oversized request is
+    denied before the provider is called) and the settled ``media_usage`` (the
+    job object carries nothing better). ``seconds`` and ``size`` default to
+    OpenAI's documented values when absent (billing the value the provider
+    applies), so a bare call is priced, not silently $0.
+    """
+    return MediaUsage(
+        video_seconds=_openai_video_seconds(kwargs),
+        resolution=_openai_video_size(kwargs),
+        is_estimated=True,
+    )
+
+
 def _part_text_length(part: Any) -> int:
     """Sum string lengths of one delta/message part: content, reasoning text,
     and tool-call function arguments. Length-only; nothing is concatenated,

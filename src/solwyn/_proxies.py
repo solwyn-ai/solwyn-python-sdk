@@ -16,7 +16,9 @@ from solwyn._privacy import (
     estimate_tokens_from_length,
     measure_google_image_media,
     measure_image_media,
+    measure_openai_video_media,
     measure_speech_media,
+    measure_video_media,
 )
 from solwyn._token_details import TokenDetails
 from solwyn._types import MediaUsage
@@ -263,6 +265,55 @@ def _google_images_spec() -> MediaSurfaceSpec:
 
 
 # ---------------------------------------------------------------------------
+# Video surface (google dialect: client.models.generate_videos — veo)
+# ---------------------------------------------------------------------------
+
+
+def _measure_video_media(kwargs: dict[str, Any], _response: Any) -> MediaUsage:
+    """Settled request-derived video ``MediaUsage`` for a Google generate_videos call.
+
+    The response is intentionally IGNORED: generate_videos returns a long-running
+    operation with no usage, so the billable quantity is request-DETERMINED
+    (``config.duration_seconds`` at the ``config.resolution`` variant). Video always
+    settles at INITIATION marked ``is_estimated=True`` — the same firewall builder
+    serves both the pre-flight estimate and this settled measurement.
+    """
+    return measure_video_media(kwargs)
+
+
+def _google_videos_spec() -> MediaSurfaceSpec:
+    """Build the Google video ``MediaSurfaceSpec`` (veo: request-derived per-second).
+
+    ``surface="video"`` is the adapter dispatch key (``GoogleAdapter`` routes it
+    to ``client.models.generate_videos``); ``modality="video"`` is the server
+    billing modality. Video generation is asynchronous — the call returns a
+    long-running operation carrying no usage — so quantities are request-derived
+    and billing settles at INITIATION:
+
+    - ``extract_usage`` returns None: the operation object carries no token usage.
+    - ``measure_request`` returns None: no request-derived TOKEN estimate exists.
+    - ``measure_media`` / ``estimate_media`` build the request-derived
+      ``MediaUsage`` (``config.duration_seconds`` -> ``video_seconds`` at the
+      ``config.resolution`` variant), ALWAYS ``is_estimated=True``. The pre-flight
+      estimate is precise (seconds x the resolution variant's per-second rate
+      server-side, so an oversized request is denied before the provider is
+      called); the settle reuses the same builder because the returned operation
+      offers nothing better. The over-count is deliberate and conservative — the
+      provider does not charge for failed/blocked generations. An absent duration
+      leaves ``video_seconds`` None so the call is tracked unpriced, never a
+      guessed duration and never a silent $0.
+    """
+    return MediaSurfaceSpec(
+        surface="video",
+        modality="video",
+        extract_usage=lambda _response: None,
+        measure_request=lambda _kwargs: None,
+        measure_media=_measure_video_media,
+        estimate_media=measure_video_media,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Audio transcriptions surface (openai dialect: native + all compat incl. Groq)
 # ---------------------------------------------------------------------------
 
@@ -340,6 +391,53 @@ def _speech_spec() -> MediaSurfaceSpec:
         measure_request=lambda _kwargs: None,
         measure_media=_measure_speech_media,
         estimate_media=measure_speech_media,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Video surface (openai dialect: client.videos.create — Sora)
+# ---------------------------------------------------------------------------
+
+
+def _measure_openai_video_media(kwargs: dict[str, Any], _response: Any) -> MediaUsage:
+    """Settled request-derived video ``MediaUsage`` for an OpenAI videos.create call.
+
+    The response is intentionally IGNORED: videos.create returns an async video
+    job with no usage, so the billable quantity is request-DETERMINED (top-level
+    ``seconds`` at the ``size``-derived resolution label). Video always settles at
+    INITIATION marked ``is_estimated=True`` — the same firewall builder serves both
+    the pre-flight estimate and this settled measurement.
+    """
+    return measure_openai_video_media(kwargs)
+
+
+def _openai_videos_spec() -> MediaSurfaceSpec:
+    """Build the OpenAI video ``MediaSurfaceSpec`` (Sora: request-derived per-second).
+
+    ``surface="video"`` is the adapter dispatch key (``OpenAIAdapter`` routes it to
+    ``client.videos.create``); ``modality="video"`` is the server billing modality.
+    Video generation is asynchronous — the call returns a video job carrying no
+    usage — so quantities are request-derived and billing settles at INITIATION:
+
+    - ``extract_usage`` returns None: the job object carries no token usage.
+    - ``measure_request`` returns None: no request-derived TOKEN estimate exists.
+    - ``measure_media`` / ``estimate_media`` build the request-derived
+      ``MediaUsage`` (top-level ``seconds`` → ``video_seconds`` at the
+      ``size``-derived resolution label), ALWAYS ``is_estimated=True``. The
+      pre-flight estimate is precise (seconds × the resolution variant's
+      per-second rate server-side, so an oversized request is denied before the
+      provider is called); the settle reuses the same builder because the returned
+      job offers nothing better. The over-count is deliberate and conservative.
+      ``seconds`` / ``size`` default to OpenAI's documented values when absent, so
+      a bare call is priced, never a silent $0.
+    """
+    return MediaSurfaceSpec(
+        surface="video",
+        modality="video",
+        extract_usage=lambda _response: None,
+        measure_request=lambda _kwargs: None,
+        measure_media=_measure_openai_video_media,
+        estimate_media=measure_openai_video_media,
     )
 
 
@@ -542,6 +640,37 @@ class _SyncAudioProxy:
         return getattr(self._solwyn._client.audio, name)
 
 
+class _SyncVideosProxy:
+    """Proxy for client.videos that routes create() through the media lifecycle.
+
+    ``client.videos.create()`` (OpenAI's Sora video API) flows through
+    ``_media_call`` so video spend is budget-checked, confirmed, and reported.
+    Video generation is asynchronous — the call returns a video job carrying no
+    usage — so the sole billable basis is the request-derived per-second
+    ``MediaUsage`` (top-level ``seconds`` at the ``size``-derived resolution
+    label), settled at INITIATION with ``is_estimated=True``. The returned job
+    object is passed back untouched: callers poll it themselves; the SDK never
+    wraps or polls it. Every other ``videos`` attribute (``retrieve``,
+    ``download_content``, …) passes through untracked. Sora is OpenAI-only, so on
+    a non-openai client (including OpenAI-compatible profiles) ``.create()`` fails
+    loud with ``UnsupportedSurfaceError`` (that adapter serves no video seam). The
+    per-client spec is built once (it is provider-agnostic; the adapter dispatch
+    differs).
+    """
+
+    def __init__(self, solwyn: Solwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _openai_videos_spec()
+
+    def create(self, **kwargs: Any) -> Any:
+        """Intercept videos.create() with budget/confirm/reporting."""
+        return self._solwyn._media_call(self._spec, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through non-create attributes to the client's videos."""
+        return getattr(self._solwyn._client.videos, name)
+
+
 class _SyncMessagesProxy:
     """Proxy for client.messages that intercepts create().
 
@@ -561,20 +690,21 @@ class _SyncMessagesProxy:
 
 class _SyncModelsProxy:
     """Proxy for client.models that intercepts generate_content(), generate_content_stream(),
-    embed_content(), and generate_images().
+    embed_content(), generate_images(), and generate_videos().
 
     Enables ``client.models.generate_content()`` (Google's documented API)
     to go through _intercepted_call. The generate_content_stream() method
     passes _force_stream=True so _intercepted_call dispatches to the correct
-    underlying SDK method. ``embed_content()`` and ``generate_images()`` route
-    through the media lifecycle (``_media_call``) so their spend is
-    budget-checked, confirmed, and reported.
+    underlying SDK method. ``embed_content()``, ``generate_images()``, and
+    ``generate_videos()`` route through the media lifecycle (``_media_call``) so
+    their spend is budget-checked, confirmed, and reported.
     """
 
     def __init__(self, solwyn: Solwyn) -> None:
         self._solwyn = solwyn
         self._embeddings_spec = _google_embeddings_spec()
         self._images_spec = _google_images_spec()
+        self._videos_spec = _google_videos_spec()
 
     def generate_content(self, **kwargs: Any) -> Any:
         return self._solwyn._intercepted_call(**kwargs)
@@ -588,8 +718,7 @@ class _SyncModelsProxy:
         An EXPLICIT method (not __getattr__) so embeddings spend is
         budget-checked, confirmed, and reported instead of passing through
         untracked. Because it is defined on the class, it never reaches
-        __getattr__ — generate_videos keeps riding that warn-once pass-through
-        until it is intercepted.
+        __getattr__.
         """
         return self._solwyn._media_call(self._embeddings_spec, **kwargs)
 
@@ -600,17 +729,30 @@ class _SyncModelsProxy:
         confirmed, and reported. imagen exposes no token usage; the billable
         basis is the request-derived per-image ``MediaUsage``
         (``config.number_of_images``). Being defined on the class, it never
-        reaches __getattr__ — it is intercepted, not part of the warn-once
-        pass-through, leaving only generate_videos warning there.
+        reaches __getattr__.
         """
         return self._solwyn._media_call(self._images_spec, **kwargs)
 
+    def generate_videos(self, **kwargs: Any) -> Any:
+        """Intercept models.generate_videos() (veo) through the media lifecycle.
+
+        An EXPLICIT method (not __getattr__) so video spend is budget-checked,
+        confirmed, and reported. Video generation is asynchronous — the call
+        returns a long-running operation carrying no usage — so the billable
+        basis is the request-derived per-second ``MediaUsage``
+        (``config.duration_seconds`` at ``config.resolution``), settled at
+        INITIATION with ``is_estimated=True``. The returned operation object is
+        passed back untouched: callers poll it themselves; the SDK never wraps or
+        polls it.
+        """
+        return self._solwyn._media_call(self._videos_spec, **kwargs)
+
     def __getattr__(self, name: str) -> Any:
-        # Google's remaining unshipped media surface (generate_videos) is a method
-        # on client.models, so it arrives here rather than on Solwyn.__getattr__ —
-        # warn-once pass-through per the posture taxonomy. embed_content and
-        # generate_images never reach here: the explicit methods above intercept
-        # them.
+        # An unrecognized client.models method arrives here rather than on
+        # Solwyn.__getattr__ — warn-once pass-through per the posture taxonomy for
+        # a recognized-but-untracked spend surface, silent otherwise.
+        # embed_content, generate_images, and generate_videos never reach here:
+        # the explicit methods above intercept them.
         attribute = getattr(self._solwyn._client.models, name)
         _warn_unmetered_spend_surface_once(
             adapter=self._solwyn._adapter, dialect=self._solwyn._dialect, surface=name
@@ -775,6 +917,32 @@ class _AsyncAudioProxy:
         return getattr(self._solwyn._client.audio, name)
 
 
+class _AsyncVideosProxy:
+    """Async proxy for client.videos that routes create() through the lifecycle.
+
+    Mirror of ``_SyncVideosProxy``: ``client.videos.create()`` (OpenAI's Sora
+    video API) flows through the async ``_media_call``, settled on the
+    request-derived per-second ``MediaUsage`` (top-level ``seconds`` at the
+    ``size``-derived resolution label) with ``is_estimated=True`` (the async video
+    job carries no usage). The returned job is passed back untouched — callers
+    poll it themselves. Every other ``videos`` attribute passes through to the
+    underlying client's videos; on a non-openai client ``.create()`` fails loud
+    with ``UnsupportedSurfaceError`` (Sora is OpenAI-only).
+    """
+
+    def __init__(self, solwyn: AsyncSolwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _openai_videos_spec()
+
+    async def create(self, **kwargs: Any) -> Any:
+        """Intercept videos.create() with budget/confirm/reporting."""
+        return await self._solwyn._media_call(self._spec, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through non-create attributes to the client's videos."""
+        return getattr(self._solwyn._client.videos, name)
+
+
 class _AsyncMessagesProxy:
     """Async proxy for client.messages that intercepts create()."""
 
@@ -792,13 +960,14 @@ class _AsyncModelsProxy:
     """Async proxy for client.models.
 
     Intercepts generate_content(), generate_content_stream(), embed_content(),
-    and generate_images().
+    generate_images(), and generate_videos().
     """
 
     def __init__(self, solwyn: AsyncSolwyn) -> None:
         self._solwyn = solwyn
         self._embeddings_spec = _google_embeddings_spec()
         self._images_spec = _google_images_spec()
+        self._videos_spec = _google_videos_spec()
 
     async def generate_content(self, **kwargs: Any) -> Any:
         return await self._solwyn._intercepted_call(**kwargs)
@@ -811,8 +980,7 @@ class _AsyncModelsProxy:
 
         Mirror of ``_SyncModelsProxy.embed_content``: an EXPLICIT method (not
         __getattr__) so embeddings spend is budget-checked, confirmed, and
-        reported. Being defined on the class, it never reaches __getattr__ —
-        generate_videos keeps its warn-once pass-through.
+        reported. Being defined on the class, it never reaches __getattr__.
         """
         return await self._solwyn._media_call(self._embeddings_spec, **kwargs)
 
@@ -821,15 +989,26 @@ class _AsyncModelsProxy:
 
         Mirror of ``_SyncModelsProxy.generate_images``: an EXPLICIT method (not
         __getattr__) so image spend is budget-checked, confirmed, and reported on
-        the request-derived per-image ``MediaUsage`` basis. Intercepted, not part
-        of the warn-once pass-through; only generate_videos still warns there.
+        the request-derived per-image ``MediaUsage`` basis.
         """
         return await self._solwyn._media_call(self._images_spec, **kwargs)
 
+    async def generate_videos(self, **kwargs: Any) -> Any:
+        """Intercept models.generate_videos() (veo) through the async media lifecycle.
+
+        Mirror of ``_SyncModelsProxy.generate_videos``: an EXPLICIT method (not
+        __getattr__) so video spend is budget-checked, confirmed, and reported on
+        the request-derived per-second ``MediaUsage`` basis, settled at INITIATION
+        with ``is_estimated=True``. The returned long-running operation is passed
+        back untouched — callers poll it themselves.
+        """
+        return await self._solwyn._media_call(self._videos_spec, **kwargs)
+
     def __getattr__(self, name: str) -> Any:
-        # See _SyncModelsProxy.__getattr__: Google's remaining unshipped media
-        # surface (generate_videos) warn-once pass-through per the posture taxonomy.
-        # embed_content and generate_images never reach here — the explicit
+        # See _SyncModelsProxy.__getattr__: an unrecognized client.models method
+        # is a warn-once pass-through per the posture taxonomy for a
+        # recognized-but-untracked spend surface, silent otherwise. embed_content,
+        # generate_images, and generate_videos never reach here — the explicit
         # methods above intercept them.
         attribute = getattr(self._solwyn._client.models, name)
         _warn_unmetered_spend_surface_once(

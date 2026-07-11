@@ -46,6 +46,7 @@ from solwyn._proxies import (
     _AsyncImagesProxy,
     _AsyncMessagesProxy,
     _AsyncModelsProxy,
+    _AsyncVideosProxy,
     _bedrock_internal_kwargs,
     _SyncAudioProxy,
     _SyncChatProxy,
@@ -53,6 +54,7 @@ from solwyn._proxies import (
     _SyncImagesProxy,
     _SyncMessagesProxy,
     _SyncModelsProxy,
+    _SyncVideosProxy,
 )
 from solwyn._registry import ProviderRuntime, build_runtimes
 from solwyn._routing import RoutingRequest, SelectionPolicy
@@ -652,6 +654,20 @@ class Solwyn(_SolwynBase):
         to create once.
         """
         return _SyncAudioProxy(self)
+
+    @functools.cached_property
+    def videos(self) -> _SyncVideosProxy:
+        """Return a proxy that routes videos.create() (Sora) through the media lifecycle.
+
+        Unconditional (like ``chat`` / ``embeddings`` / ``images`` / ``audio``):
+        the video surface is the openai dialect. Sora is OpenAI-only, so on a
+        non-openai client (including OpenAI-compatible profiles) ``.create()`` fails
+        loud with ``UnsupportedSurfaceError`` (that adapter serves no video seam).
+        The returned async video job is passed back untouched — callers poll it
+        themselves. Cached: provider is fixed at construction so this is safe to
+        create once.
+        """
+        return _SyncVideosProxy(self)
 
     @functools.cached_property
     def messages(self) -> Any:
@@ -1581,6 +1597,19 @@ class AsyncSolwyn(_SolwynBase):
         fixed at construction.
         """
         return _AsyncAudioProxy(self)
+
+    @functools.cached_property
+    def videos(self) -> _AsyncVideosProxy:
+        """Return an async proxy that routes videos.create() (Sora) through the lifecycle.
+
+        Unconditional (like ``chat`` / ``embeddings`` / ``images`` / ``audio``):
+        the video surface is the openai dialect. Sora is OpenAI-only, so on a
+        non-openai client (including OpenAI-compatible profiles) ``.create()`` fails
+        loud with ``UnsupportedSurfaceError``. The returned async video job is
+        passed back untouched — callers poll it themselves. Cached: provider is
+        fixed at construction.
+        """
+        return _AsyncVideosProxy(self)
 
     @functools.cached_property
     def messages(self) -> Any:

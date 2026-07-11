@@ -100,6 +100,23 @@ def _mock_google_images_client():
     return client
 
 
+def _mock_google_videos_client():
+    """Create a mock that looks like google.genai.Client for generate_videos.
+
+    generate_videos is asynchronous: it returns a long-running OPERATION object
+    (no usage), which the SDK passes back untouched for the caller to poll. The
+    billable per-second quantity is derived from ``config.duration_seconds`` at
+    ``config.resolution``.
+    """
+    client = MagicMock()
+    client.__class__.__module__ = "google.genai._client"
+    client.with_options.return_value = client
+    client.models.generate_videos.return_value = SimpleNamespace(
+        name="operations/veo-123", done=False, response=None
+    )
+    return client
+
+
 def _mock_openai_embeddings_client(*, prompt_tokens: int = 42, usage: bool = True):
     """Create a mock that looks like openai.OpenAI() with an embeddings surface."""
     client = MagicMock()
@@ -144,6 +161,22 @@ def _mock_openai_images_client(*, native: bool = True):
     )
     client.images.generate.return_value = response
     client.images.edit.return_value = response
+    return client
+
+
+def _mock_openai_videos_client():
+    """Mock openai.OpenAI() exposing a videos surface (Sora).
+
+    videos.create is asynchronous: it returns a video JOB object (no usage) which
+    the SDK passes back untouched for the caller to poll. The billable per-second
+    quantity is derived from the top-level ``seconds`` at the ``size``-derived
+    resolution label.
+    """
+    client = MagicMock()
+    client.__class__.__module__ = "openai._client"
+    client.__class__.__name__ = "OpenAI"
+    client.with_options.return_value = client
+    client.videos.create.return_value = SimpleNamespace(id="video_123", status="queued", progress=0)
     return client
 
 
@@ -299,29 +332,116 @@ class TestGoogleModelsProxy:
         assert solwyn.models.list() == ["gemini-pro"]
         solwyn.close()
 
-    def test_generate_videos_posture_warn_once(self, caplog: pytest.LogCaptureFixture) -> None:
-        # Google's still-unshipped video generation rides a client.models method,
-        # so it arrives on the models proxy's __getattr__ — warn-once pass-through
-        # per the posture taxonomy. (generate_images is intercepted and no longer
-        # warns — see test_generate_images_* below.)
-        client = _mock_google_client()
-        generator = MagicMock(return_value="rendered")
-        client.models.generate_videos = generator
+    def test_generate_videos_is_intercepted_and_reports_video_seconds(self) -> None:
+        # generate_videos (veo) routes through the media lifecycle, NOT the
+        # __getattr__ warn-once pass-through. The call returns a long-running
+        # operation with no usage, so the billable basis is the request-derived
+        # per-second MediaUsage, ALWAYS is_estimated=True (settles at initiation).
+        client = _mock_google_videos_client()
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            result = solwyn.models.generate_videos(
+                model="veo-3.0-generate-001",
+                prompt="a cat",
+                config={"duration_seconds": 8, "resolution": "720p"},
+            )
+
+        client.models.generate_videos.assert_called_once()
+        assert len(reported) == 1
+        event = reported[0]
+        assert event.status == "success"
+        assert event.modality == "video"
+        # veo reports no token usage — media is the sole billable basis.
+        assert event.token_details is None
+        assert event.input_tokens == 0
+        assert event.media_usage.video_seconds == 8.0
+        assert event.media_usage.resolution == "720p"
+        assert event.media_usage.is_estimated is True
+        # The long-running operation object is passed back untouched.
+        assert result.name == "operations/veo-123"
+        assert result.done is False
+        solwyn.close()
+
+    def test_generate_videos_reads_config_object_shape(self) -> None:
+        # google-genai callers pass a GenerateVideosConfig OBJECT; duration_seconds
+        # and resolution are read duck-typed via attribute access (not only dict).
+        client = _mock_google_videos_client()
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            solwyn.models.generate_videos(
+                model="veo-3.0-generate-001",
+                prompt="a dog",
+                config=SimpleNamespace(duration_seconds=6, resolution="1080p"),
+            )
+
+        assert reported[0].media_usage.video_seconds == 6.0
+        assert reported[0].media_usage.resolution == "1080p"
+        solwyn.close()
+
+    def test_generate_videos_absent_duration_tracked_unpriced(self) -> None:
+        # No documented default duration -> absent stays None (unpriced-tracked),
+        # never a guessed duration. The call is still tracked (modality=video).
+        client = _mock_google_videos_client()
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            solwyn.models.generate_videos(model="veo-3.0-generate-001", prompt="a bird")
+
+        event = reported[0]
+        assert event.status == "success"
+        assert event.modality == "video"
+        assert event.media_usage.video_seconds is None
+        assert event.media_usage.is_estimated is True
+        solwyn.close()
+
+    def test_generate_videos_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        # generate_videos is intercepted, not an untracked pass-through —
+        # it must never emit the warn-once "coming soon" surface warning.
+        client = _mock_google_videos_client()
         solwyn = _make_solwyn(client)
 
-        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
-            caplog.clear()
-            first = solwyn.models.generate_videos
-            second = solwyn.models.generate_videos
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"), _mock_budget(solwyn):
+            solwyn.models.generate_videos(
+                model="veo-3.0-generate-001",
+                prompt="a cat",
+                config={"duration_seconds": 8},
+            )
 
-        assert first is generator
-        assert second is generator  # pass-through
-        assert first() == "rendered"
-        assert len(caplog.records) == 1  # once per surface per process
-        message = caplog.records[0].getMessage()
-        assert "google" in message
-        assert "surface 'generate_videos'" in message
-        assert "tracking for this surface is coming" in message.lower()
+        assert caplog.records == []
+        solwyn.close()
+
+    def test_generate_videos_checks_budget_and_denies(self) -> None:
+        # An oversized video request is denied BEFORE the provider call: the
+        # precise per-second pre-flight cost (duration x resolution rate) is
+        # priced server-side, so hard-deny short-circuits generate_videos.
+        client = _mock_google_videos_client()
+        solwyn = _make_solwyn(client, budget_mode="hard_deny")
+
+        deny_response = {
+            **ALLOW_BUDGET_RESPONSE,
+            "allowed": False,
+            "remaining_budget": 0.0,
+            "mode": "hard_deny",
+            "denied_by_period": "monthly",
+            "project_id": VALID_PROJECT_ID,
+        }
+        with _mock_budget(solwyn, deny_response), pytest.raises(BudgetExceededError):
+            solwyn.models.generate_videos(
+                model="veo-3.0-generate-001",
+                prompt="a cat",
+                config={"duration_seconds": 8, "resolution": "4k"},
+            )
+
+        # Hard-deny short-circuits before the provider call.
+        client.models.generate_videos.assert_not_called()
         solwyn.close()
 
     def test_embed_content_is_intercepted_and_reports_prompt_tokens(self) -> None:
@@ -718,6 +838,109 @@ class TestImagesProxy:
 
 
 # ---------------------------------------------------------------------------
+# OpenAI dialect: client.videos.create() (Sora)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestVideosProxy:
+    """client.videos.create() (Sora) routes through the media lifecycle (_media_call)."""
+
+    def test_videos_create_is_intercepted_and_reports_video_seconds(self) -> None:
+        # videos.create (Sora) routes through the media lifecycle, NOT a warn-once
+        # pass-through. The call returns an async video job with no usage, so the
+        # billable basis is the request-derived per-second MediaUsage, ALWAYS
+        # is_estimated=True (settles at initiation). size normalizes to a label.
+        client = _mock_openai_videos_client()
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            result = solwyn.videos.create(
+                model="sora-2", prompt="a cat", seconds="8", size="1280x720"
+            )
+
+        client.videos.create.assert_called_once()
+        assert len(reported) == 1
+        event = reported[0]
+        assert event.status == "success"
+        assert event.modality == "video"
+        # Sora reports no token usage — media is the sole billable basis.
+        assert event.token_details is None
+        assert event.input_tokens == 0
+        assert event.media_usage.video_seconds == 8.0
+        assert event.media_usage.resolution == "720p"
+        assert event.media_usage.is_estimated is True
+        # The async video job object is passed back untouched.
+        assert result.id == "video_123"
+        assert result.status == "queued"
+        solwyn.close()
+
+    def test_videos_create_defaults_seconds_and_size(self) -> None:
+        # A bare call (no seconds/size) settles OpenAI's documented defaults
+        # (4 seconds at 720p) — priced, never a silent $0.
+        client = _mock_openai_videos_client()
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            solwyn.videos.create(model="sora-2", prompt="a dog")
+
+        event = reported[0]
+        assert event.status == "success"
+        assert event.modality == "video"
+        assert event.media_usage.video_seconds == 4.0
+        assert event.media_usage.resolution == "720p"
+        assert event.media_usage.is_estimated is True
+        solwyn.close()
+
+    def test_videos_create_checks_budget_and_denies(self) -> None:
+        # An oversized video request is denied BEFORE the provider call: the
+        # precise per-second pre-flight cost (seconds x resolution rate) is priced
+        # server-side, so hard-deny short-circuits videos.create.
+        client = _mock_openai_videos_client()
+        solwyn = _make_solwyn(client, budget_mode="hard_deny")
+
+        deny_response = {
+            **ALLOW_BUDGET_RESPONSE,
+            "allowed": False,
+            "remaining_budget": 0.0,
+            "mode": "hard_deny",
+            "denied_by_period": "monthly",
+            "project_id": VALID_PROJECT_ID,
+        }
+        with _mock_budget(solwyn, deny_response), pytest.raises(BudgetExceededError):
+            solwyn.videos.create(model="sora-2", prompt="a cat", seconds="12", size="1792x1024")
+
+        # Hard-deny short-circuits before the provider call.
+        client.videos.create.assert_not_called()
+        solwyn.close()
+
+    def test_videos_create_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        # videos is intercepted, not an untracked pass-through — it must never emit
+        # the warn-once "coming soon" surface warning (it graduated out of the
+        # openai unshipped-spend set).
+        client = _mock_openai_videos_client()
+        solwyn = _make_solwyn(client)
+
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"), _mock_budget(solwyn):
+            solwyn.videos.create(model="sora-2", prompt="a cat", seconds="4")
+
+        assert caplog.records == []
+        solwyn.close()
+
+    def test_videos_non_create_passes_through(self) -> None:
+        # retrieve is not create -> passes through untracked to the client's videos.
+        client = _mock_openai_videos_client()
+        client.videos.retrieve = MagicMock(return_value="job")
+        solwyn = _make_solwyn(client)
+        assert solwyn.videos.retrieve() == "job"
+        solwyn.close()
+
+
+# ---------------------------------------------------------------------------
 # Async variants
 # ---------------------------------------------------------------------------
 
@@ -812,27 +1035,33 @@ class TestAsyncGoogleModelsProxy:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_async_generate_media_surfaces_posture_warn_once(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        # Attribute access on the async models proxy is synchronous; the media
-        # generation methods warn-once pass-through just like the sync proxy.
-        client = _mock_google_client()
-        generator = MagicMock(return_value="rendered")
-        client.models.generate_videos = generator
+    async def test_async_generate_videos_is_intercepted(self) -> None:
+        # Mirror of the sync generate_videos interception: veo returns a
+        # long-running operation with no usage, so the per-second MediaUsage is
+        # the sole billable basis, ALWAYS is_estimated=True (settles at initiation).
+        client = _mock_google_videos_client()
+        operation = SimpleNamespace(name="operations/veo-async", done=False, response=None)
+        client.models.generate_videos = AsyncMockFn(return_value=operation)
         solwyn = _make_async_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
 
-        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
-            first = solwyn.models.generate_videos
-            second = solwyn.models.generate_videos
+        with _mock_async_budget(solwyn):
+            result = await solwyn.models.generate_videos(
+                model="veo-3.0-generate-001",
+                prompt="a cat",
+                config={"duration_seconds": 4, "resolution": "720p"},
+            )
 
-        assert first is generator
-        assert second is generator
-        assert len(caplog.records) == 1
-        message = caplog.records[0].getMessage()
-        assert "google" in message
-        assert "surface 'generate_videos'" in message
-        assert "tracking for this surface is coming" in message.lower()
+        client.models.generate_videos.assert_awaited_once()
+        event = reported[0]
+        assert event.status == "success"
+        assert event.modality == "video"
+        assert event.token_details is None
+        assert event.media_usage.video_seconds == 4.0
+        assert event.media_usage.is_estimated is True
+        # The long-running operation is passed back untouched.
+        assert result is operation
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()
@@ -982,6 +1211,44 @@ class TestAsyncImagesProxy:
         client.images.edit.assert_awaited_once()
         assert _IMAGE_OP_KEY not in client.images.edit.call_args.kwargs
         assert reported[0].media_usage.image_count == 1
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+
+@pytest.mark.unit
+class TestAsyncVideosProxy:
+    """Async client.videos.create() (Sora) routes through the async media lifecycle."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_videos_create_is_intercepted(self) -> None:
+        # Mirror of the sync videos interception: Sora returns an async video job
+        # with no usage, so the per-second MediaUsage is the sole billable basis,
+        # ALWAYS is_estimated=True (settles at initiation).
+        client = _mock_openai_videos_client()
+        client.__class__.__name__ = "AsyncOpenAI"
+        job = SimpleNamespace(id="video_async", status="queued", progress=0)
+        client.videos.create = AsyncMockFn(return_value=job)
+        solwyn = _make_async_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_async_budget(solwyn):
+            result = await solwyn.videos.create(
+                model="sora-2", prompt="a cat", seconds="4", size="720x1280"
+            )
+
+        client.videos.create.assert_awaited_once()
+        event = reported[0]
+        assert event.status == "success"
+        assert event.modality == "video"
+        assert event.token_details is None
+        assert event.media_usage.video_seconds == 4.0
+        assert event.media_usage.resolution == "720p"
+        assert event.media_usage.is_estimated is True
+        # The async video job is passed back untouched.
+        assert result is job
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

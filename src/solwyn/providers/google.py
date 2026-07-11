@@ -243,17 +243,18 @@ class GoogleAdapter:
     ) -> tuple[Callable[..., Any], dict[str, Any]]:
         """Per-surface dispatch seam for non-chat media surfaces.
 
-        Embeddings route to ``client.models.embed_content``; images
-        route to ``client.models.generate_images`` (imagen). Unlike the openai
-        seam — where the dispatcher already applied the per-hop bound via
-        ``with_options`` — google-genai has no ``with_options``, so (exactly as
-        ``prepare_call`` does for chat) the mandatory bound is injected here as
-        per-request ``config.http_options`` via ``_with_google_http_bound``,
-        which also returns a defensive COPY (never mutates the caller's kwargs).
-        Note the bound rides ``config.http_options`` alongside the caller's own
-        ``config`` keys (e.g. ``number_of_images``) — those are preserved. Video
-        is not wired yet and fails loud with the structural, content-free
-        ``UnsupportedSurfaceError``.
+        Embeddings route to ``client.models.embed_content``; images route to
+        ``client.models.generate_images`` (imagen); video routes to
+        ``client.models.generate_videos`` (veo). Unlike the openai seam — where
+        the dispatcher already applied the per-hop bound via ``with_options`` —
+        google-genai has no ``with_options``, so (exactly as ``prepare_call``
+        does for chat) the mandatory bound is injected here as per-request
+        ``config.http_options`` via ``_with_google_http_bound``, which also
+        returns a defensive COPY (never mutates the caller's kwargs). Note the
+        bound rides ``config.http_options`` alongside the caller's own ``config``
+        keys (e.g. ``number_of_images``, ``duration_seconds``) — those are
+        preserved. Audio is not wired and fails loud with the structural,
+        content-free ``UnsupportedSurfaceError``.
         """
         if surface == "embeddings":
             bounded = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
@@ -261,6 +262,9 @@ class GoogleAdapter:
         if surface == "images":
             bounded = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
             return client.models.generate_images, bounded
+        if surface == "video":
+            bounded = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
+            return client.models.generate_videos, bounded
         raise UnsupportedSurfaceError(surface=surface, provider=self.name)
 
     def unwrap_stream_source(self, response: Any) -> Any:

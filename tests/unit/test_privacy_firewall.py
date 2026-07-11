@@ -28,7 +28,9 @@ from solwyn._privacy import (
     estimate_embedding_input_tokens,
     measure_google_image_media,
     measure_image_media,
+    measure_openai_video_media,
     measure_speech_media,
+    measure_video_media,
 )
 from solwyn._types import BudgetCheckRequest, BudgetConfirmRequest, MetadataEvent
 from solwyn.client import Solwyn
@@ -889,4 +891,184 @@ class TestMeasureSpeechMedia:
         usage = measure_speech_media({"model": "tts-1", "input": secret})
         assert usage is not None
         assert usage.input_characters == len(secret)
+        assert secret not in json.dumps(usage.model_dump(mode="json"))
+
+
+# --------------------------------------------------------------------------- #
+# Video request recognizer — duration/resolution CONFIG only, content-free     #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestMeasureVideoMedia:
+    """measure_video_media reads ONLY config.duration_seconds / config.resolution.
+
+    google-genai carries both INSIDE ``config=`` (dict or config object); the
+    customer's ``prompt=`` is never read. generate_videos returns a long-running
+    operation with no usage, so these request-derived values are the sole billable
+    basis and ``is_estimated`` is ALWAYS True (billing settles at initiation).
+    """
+
+    def test_reads_duration_and_resolution_from_dict_config(self) -> None:
+        usage = measure_video_media({"config": {"duration_seconds": 6, "resolution": "1080p"}})
+        assert usage.video_seconds == 6.0
+        assert usage.resolution == "1080p"
+        # Video always settles at initiation as an estimate.
+        assert usage.is_estimated is True
+
+    def test_reads_duration_from_object_config(self) -> None:
+        usage = measure_video_media(
+            {"config": SimpleNamespace(duration_seconds=8, resolution="720p")}
+        )
+        assert usage.video_seconds == 8.0
+        assert usage.resolution == "720p"
+
+    def test_float_duration_is_preserved(self) -> None:
+        usage = measure_video_media({"config": {"duration_seconds": 5.5}})
+        assert usage.video_seconds == 5.5
+
+    def test_absent_duration_stays_none_unpriced(self) -> None:
+        # No documented SDK/API default duration -> absent stays None (tracked
+        # unpriced), never a guessed duration. is_estimated stays True regardless.
+        usage = measure_video_media({"config": {"resolution": "720p"}})
+        assert usage.video_seconds is None
+        assert usage.resolution == "720p"
+        assert usage.is_estimated is True
+
+    def test_missing_config_yields_none_duration(self) -> None:
+        usage = measure_video_media({})
+        assert usage.video_seconds is None
+        assert usage.resolution is None
+        assert usage.is_estimated is True
+
+    def test_garbage_duration_degrades_to_none(self) -> None:
+        for bad in (-1, True, "eight", None, [8], {"s": 8}):
+            usage = measure_video_media({"config": {"duration_seconds": bad}})
+            assert usage.video_seconds is None
+
+    def test_zero_duration_is_kept(self) -> None:
+        # 0 is a valid non-negative quantity (ge=0), distinct from absent/None.
+        usage = measure_video_media({"config": {"duration_seconds": 0}})
+        assert usage.video_seconds == 0.0
+
+    def test_non_string_or_overlong_resolution_degrades_to_none(self) -> None:
+        usage = measure_video_media({"config": {"duration_seconds": 8, "resolution": "x" * 33}})
+        assert usage.resolution is None
+        usage = measure_video_media({"config": {"duration_seconds": 8, "resolution": 720}})
+        assert usage.resolution is None
+
+    def test_prompt_content_is_never_read(self) -> None:
+        # The prompt is present alongside the config but MUST NOT surface in the
+        # returned MediaUsage (content-free by construction).
+        secret = "SUPER_SECRET_VEO_PROMPT_k3l4m5"
+        usage = measure_video_media(
+            {"prompt": secret, "config": {"duration_seconds": 8, "resolution": "720p"}}
+        )
+        assert secret not in json.dumps(usage.model_dump(mode="json"))
+
+
+# --------------------------------------------------------------------------- #
+# OpenAI video request recognizer — TOP-LEVEL seconds/size, size normalization  #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestMeasureOpenAIVideoMedia:
+    """measure_openai_video_media reads ONLY top-level ``seconds`` / ``size``.
+
+    OpenAI's videos.create (Sora) carries both at the TOP LEVEL of the request
+    (not inside ``config=`` like google-genai); the customer's ``prompt=`` is never
+    read. videos.create returns an async job with no usage, so these request-derived
+    values are the sole billable basis and ``is_estimated`` is ALWAYS True (billing
+    settles at initiation). ``size`` is normalized to a resolution LABEL
+    (``min(w, h) + "p"``) matched against the server's per-second variant grid.
+    """
+
+    def test_reads_seconds_and_normalizes_size(self) -> None:
+        usage = measure_openai_video_media({"seconds": "8", "size": "1280x720"})
+        assert usage.video_seconds == 8.0
+        assert usage.resolution == "720p"
+        # Video always settles at initiation as an estimate.
+        assert usage.is_estimated is True
+
+    def test_seconds_accepts_int_duck_typed(self) -> None:
+        usage = measure_openai_video_media({"seconds": 12, "size": "1024x1792"})
+        assert usage.video_seconds == 12.0
+        assert usage.resolution == "1024p"
+
+    def test_absent_seconds_uses_documented_default_of_four(self) -> None:
+        # OpenAI's API reference documents a stable default of "4" seconds, so an
+        # omitted value settles the default (billing what the provider applies is
+        # faithful — unlike the google veo surface, whose default is unpublished).
+        usage = measure_openai_video_media({"size": "1280x720"})
+        assert usage.video_seconds == 4.0
+        assert usage.resolution == "720p"
+        assert usage.is_estimated is True
+
+    def test_absent_size_uses_documented_default_720p(self) -> None:
+        # Documented default size "720x1280" -> "720p".
+        usage = measure_openai_video_media({"seconds": "8"})
+        assert usage.video_seconds == 8.0
+        assert usage.resolution == "720p"
+
+    def test_bare_call_prices_both_documented_defaults(self) -> None:
+        # No seconds and no size -> both documented defaults (never a silent $0).
+        usage = measure_openai_video_media({})
+        assert usage.video_seconds == 4.0
+        assert usage.resolution == "720p"
+        assert usage.is_estimated is True
+
+    def test_explicit_none_falls_back_to_defaults(self) -> None:
+        usage = measure_openai_video_media({"seconds": None, "size": None})
+        assert usage.video_seconds == 4.0
+        assert usage.resolution == "720p"
+
+    @pytest.mark.parametrize(
+        ("size", "label"),
+        [
+            ("1280x720", "720p"),
+            ("720x1280", "720p"),
+            ("1792x1024", "1024p"),
+            ("1024x1792", "1024p"),
+            ("1920x1080", "1080p"),
+            ("1080x1920", "1080p"),
+            # Case-insensitive on the separator.
+            ("1280X720", "720p"),
+        ],
+    )
+    def test_size_normalization_is_orientation_independent(self, size: str, label: str) -> None:
+        usage = measure_openai_video_media({"seconds": "4", "size": size})
+        assert usage.resolution == label
+
+    @pytest.mark.parametrize("garbage", ["720p", "big", "1280", "1280x720x30", "1280x", "x720", ""])
+    def test_unparseable_size_passes_raw_string_through(self, garbage: str) -> None:
+        # An unparseable size is NOT normalized — the raw string passes through as
+        # the selector so the server fails loud on a miss rather than mispricing.
+        usage = measure_openai_video_media({"seconds": "4", "size": garbage})
+        assert usage.resolution == garbage
+
+    def test_non_string_size_degrades_to_none(self) -> None:
+        usage = measure_openai_video_media({"seconds": "4", "size": 720})
+        assert usage.resolution is None
+
+    def test_overlong_raw_size_degrades_to_none(self) -> None:
+        # The bounded-selector guard caps raw pass-through at 32 chars.
+        usage = measure_openai_video_media({"seconds": "4", "size": "z" * 33})
+        assert usage.resolution is None
+
+    @pytest.mark.parametrize("garbage", [-1, True, "eight", "4.5", "-4", [8], {"s": 8}])
+    def test_garbage_seconds_degrades_to_none_unpriced(self, garbage: object) -> None:
+        # A present-but-garbage seconds is unpriced-tracked (None), never the
+        # documented default (that would bill a duration the caller did not request).
+        usage = measure_openai_video_media({"seconds": garbage, "size": "1280x720"})
+        assert usage.video_seconds is None
+
+    def test_zero_seconds_is_kept(self) -> None:
+        # 0 is a valid non-negative quantity (ge=0), distinct from absent/None.
+        usage = measure_openai_video_media({"seconds": 0})
+        assert usage.video_seconds == 0.0
+
+    def test_prompt_content_is_never_read(self) -> None:
+        # The prompt (and reference-image bytes) sit alongside the params but MUST
+        # NOT surface in the returned MediaUsage (content-free by construction).
+        secret = "SUPER_SECRET_SORA_PROMPT_p9q8r7"
+        usage = measure_openai_video_media(
+            {"prompt": secret, "input_reference": b"png-bytes", "seconds": "8", "size": "1280x720"}
+        )
         assert secret not in json.dumps(usage.model_dump(mode="json"))
