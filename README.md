@@ -7,7 +7,7 @@ Budget enforcement, circuit breaking, and usage tracking for OpenAI, Anthropic, 
 [![Python 3.11+](https://img.shields.io/pypi/pyversions/solwyn)](https://pypi.org/project/solwyn/)
 [![License](https://img.shields.io/github/license/solwyn-ai/solwyn-python-sdk)](LICENSE)
 
-Solwyn wraps your existing LLM client. Calls go directly to the provider — the SDK only reports metadata (token counts, latency, model name) to the Solwyn API. **Prompts and responses never leave your application.**
+Solwyn wraps your existing LLM client. Calls go directly to the provider — the SDK only reports metadata (token counts, media quantities, latency, model name) to the Solwyn API. **Prompts and responses never leave your application.**
 
 ## Installation
 
@@ -224,6 +224,26 @@ The "never sent" entries above describe Solwyn's own injection policy. A `stream
 
 **Known limitation.** Circuit-breaker health, latency signals, and failover labeling key off the provider *name*. Two chain entries that resolve to the same name (two Azure resources, two unnamed gateways both detected as `openai_compatible`) share one health domain and are reported as model fallbacks of each other. For the same reason, a hop between same-name entries skips cross-provider request sanitization — `stream_options` stripping, the `max_completion_tokens` → `max_tokens` rewrite, and endpoint-scoped param stripping (`extra_headers`/`extra_query`/`extra_body`). A `stream_options` or gateway header you authored for the first endpoint reaches the second untouched and can 4xx there. Give distinct endpoints distinct provider identities where possible — explicit `provider=` on the constructor, or the 4th element of a fallback spec.
 
+## Media surfaces
+
+Beyond chat, Solwyn tracks the non-text surfaces that spend money. Each rides the same budget-check → provider call → confirm lifecycle as a chat call, tagged with its modality (`embedding`, `image`, `audio`, `video`) so Solwyn Cloud's PricingService prices it on the right card. There is no cross-provider failover for these surfaces — an embedding vector or a generated image isn't interchangeable across providers.
+
+| Surface | OpenAI dialect (native + compatible) | Google (Gemini) |
+|---------|--------------------------------------|-----------------|
+| Embeddings | `client.embeddings.create` | `client.models.embed_content` |
+| Images | `client.images.generate` / `client.images.edit` | `client.models.generate_images` (Imagen) |
+| Audio — transcription | `client.audio.transcriptions.create` (incl. Groq whisper) | — |
+| Audio — speech (TTS) | `client.audio.speech.create` | — |
+| Video | `client.videos.create` (Sora) | `client.models.generate_videos` (Veo) |
+
+Billable quantities are read from the response's usage block where it exists (gpt-image token buckets, whisper duration) and derived from the request where a provider reports none — image counts from `n=`, TTS character counts from `input=`, video seconds from the request. Whatever the SDK can't observe stays `None`, and the call is tracked **unpriced** rather than settled at a silent $0. Only lengths, counts, durations, and variant selectors are ever measured — never the media itself.
+
+**Posture notes.**
+
+- **Whisper needs a JSON `response_format` to be priced.** `whisper-1` reports its billable duration only under a JSON response format. A non-JSON `response_format` (`text` / `srt` / `vtt`) carries no usage, so the call is tracked unpriced with a one-time hint to pass `response_format="json"` (or `"verbose_json"`) for priced tracking.
+- **`gpt-4o-mini-tts` is passed through untracked.** Token-billed TTS models publish no usage metadata, so their audio-output tokens are unobservable. Rather than settle a silent $0, the call passes through untracked (no budget check, no cost event) after a one-time warning.
+- **`audio.translations` is passed through untracked.** The translations sub-surface isn't intercepted yet; it warns once, then passes through untracked.
+
 ## Async
 
 ```python
@@ -364,7 +384,8 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `modality` | `str` | Call modality (`text`, `image`, `audio`, `video`, `embedding`); `text` for chat, `embedding` for embeddings calls |
 | `input_tokens` | `int` | Input token count |
 | `output_tokens` | `int` | Output token count |
-| `token_details` | `object` | Breakdown: cached, reasoning, audio tokens; `is_estimated` flags length-based estimates when a provider reports no usage |
+| `token_details` | `object` | Breakdown: cached, reasoning, audio, and image token buckets; `is_estimated` flags length-based estimates when a provider reports no usage |
+| `media_usage` | `object \| None` | Non-token billable quantities for media calls — image counts, media durations in seconds, TTS character counts — plus `resolution`/`quality` variant selectors. Each quantity is `None` when the SDK can't observe it (never a zero-as-default), and the whole object is omitted for text/chat calls |
 | `latency_ms` | `float` | Call duration in milliseconds |
 | `status` | `str` | `success`, `error`, or `budget_denied` |
 | `is_model_fallback` | `bool` | Whether the call was served by a same-provider entry in the `fallback=` chain after the primary model failed |
@@ -378,7 +399,7 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 
 ## Release Compatibility
 
-Wire-contract changes are API-first: Solwyn Cloud must accept new fields and enum values before an SDK release ships them. As of v0.1.7 the Cloud API accepts the full current wire contract — the Bedrock and OpenAI-compatible `provider` values, `provider_region`, `service_tier` on budget confirms, `token_details.is_estimated`, 2048-char model identifiers, and per-event ingest dispositions. Optional fields are omitted entirely (never `null`) when unset, so payloads for providers that don't use them are byte-identical to earlier releases.
+Wire-contract changes are API-first: Solwyn Cloud must accept new fields and enum values before an SDK release ships them. As of the current release line the Cloud API accepts the full wire contract — the `modality` discriminator, the `media_usage` quantities (image counts, media durations, character counts, and resolution/quality selectors), the image and audio `token_details` buckets, the Bedrock and OpenAI-compatible `provider` values, `provider_region`, `service_tier` on budget confirms, `token_details.is_estimated`, 2048-char model identifiers, and per-event ingest dispositions. Optional fields are omitted entirely (never `null`) when unset, so payloads for providers that don't use them are byte-identical to earlier releases.
 
 ## Requirements
 
