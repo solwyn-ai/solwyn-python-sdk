@@ -694,7 +694,7 @@ def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Embeddings input recognizer (P1.9) — length-only, content-free              #
+# Embeddings input recognizer — length-only, content-free                     #
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
 class TestEstimateEmbeddingInputTokens:
@@ -750,7 +750,7 @@ class TestEstimateEmbeddingInputTokens:
 
 
 # --------------------------------------------------------------------------- #
-# Images request recognizer (P2.8) — config values only, content-free          #
+# Images request recognizer — config values only, content-free                #
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
 class TestMeasureImageMedia:
@@ -803,7 +803,7 @@ class TestMeasureImageMedia:
 
 
 # --------------------------------------------------------------------------- #
-# Google images request recognizer (P2.9) — config count only, content-free    #
+# Google images request recognizer — config count only, content-free          #
 # --------------------------------------------------------------------------- #
 @pytest.mark.unit
 class TestMeasureGoogleImageMedia:

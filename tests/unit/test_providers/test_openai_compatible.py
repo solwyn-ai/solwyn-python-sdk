@@ -112,7 +112,7 @@ class TestProfileTable:
     def test_prepare_media_call_embeddings_selects_embeddings_create_for_every_profile(
         self,
     ) -> None:
-        # P1.7: one embeddings branch covers every compat adapter (incl. the
+        # one embeddings branch covers every compat adapter (incl. the
         # first-class Together adapter, which inherits it) since they share the
         # openai dialect. Each routes to client.embeddings.create with a COPY.
         def create(**kwargs: Any) -> dict[str, Any]:
@@ -129,7 +129,7 @@ class TestProfileTable:
             assert prepared is not kwargs, adapter.name  # never mutates / aliases input
 
     def test_prepare_media_call_images_selects_images_method_for_every_profile(self) -> None:
-        # P2.8: one images branch covers every compat adapter (incl. Together) —
+        # one images branch covers every compat adapter (incl. Together) —
         # generate() by default, edit() via the marker (stripped before the call).
         def generate(**kwargs: Any) -> dict[str, Any]:
             return kwargs
@@ -156,7 +156,7 @@ class TestProfileTable:
             assert _IMAGE_OP_KEY not in edit_prepared, adapter.name  # marker stripped
 
     def test_prepare_media_call_raises_unsupported_surface_for_unwired_every_profile(self) -> None:
-        # embeddings (P1.7) + images (P2.8) are wired; audio/video still fail loud
+        # embeddings + images are wired; audio/video still fail loud
         # with the provider's own name attached.
         for adapter in build_compat_adapters():
             for surface in ("audio", "video"):

@@ -21,8 +21,9 @@ Dialect = Literal["openai", "anthropic", "google", "bedrock"]
 
 # Non-chat billable SURFACES the SDK can dispatch through the media lifecycle.
 # "chat" is not listed: it flows through ``ProviderAdapter.prepare_call`` (the
-# always-present chat seam). These are the surfaces later batches wire onto
-# ``prepare_media_call`` (P1.7 embeddings, P2 images, P3 audio, P4 video).
+# always-present chat seam). These are the surfaces wired onto
+# ``prepare_media_call``: embeddings and images are wired; audio and video fail
+# loud until wired.
 MediaSurface = Literal["embeddings", "images", "audio", "video"]
 
 
@@ -187,7 +188,7 @@ class MediaSurfaceAdapter(Protocol):
 
     Deliberately kept OUT of the base ``ProviderAdapter`` protocol (and NOT
     ``@runtime_checkable``): chat-only adapters, and adapters whose media
-    surfaces land in later batches, must still satisfy ``ProviderAdapter``
+    surfaces are added later, must still satisfy ``ProviderAdapter``
     without being forced to grow this method before they serve any surface.
     The lifecycle discovers it duck-typed and raises ``UnsupportedSurfaceError``
     when it is absent or the requested surface has no branch yet.

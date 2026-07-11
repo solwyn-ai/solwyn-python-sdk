@@ -89,7 +89,7 @@ def _extract_google_usage(usage_metadata: Any) -> TokenDetails:
     - IMAGE -> image_input_tokens / image_output_tokens (a SUBSET of input /
       output; this is what makes a gemini-3-pro-image ``generate_content`` call
       carry image-output tokens so the server prices them at the image rate).
-    - AUDIO -> audio_input_tokens / audio_output_tokens (P3 groundwork).
+    - AUDIO -> audio_input_tokens / audio_output_tokens.
     TEXT buckets need no field — they are the remainder. Absent details leave
     these fields at 0.
     """
@@ -243,7 +243,7 @@ class GoogleAdapter:
     ) -> tuple[Callable[..., Any], dict[str, Any]]:
         """Per-surface dispatch seam for non-chat media surfaces.
 
-        Embeddings (P1.8) route to ``client.models.embed_content``; images (P2.9)
+        Embeddings route to ``client.models.embed_content``; images
         route to ``client.models.generate_images`` (imagen). Unlike the openai
         seam — where the dispatcher already applied the per-hop bound via
         ``with_options`` — google-genai has no ``with_options``, so (exactly as
@@ -252,7 +252,7 @@ class GoogleAdapter:
         which also returns a defensive COPY (never mutates the caller's kwargs).
         Note the bound rides ``config.http_options`` alongside the caller's own
         ``config`` keys (e.g. ``number_of_images``) — those are preserved. Video
-        (P4) is not wired yet and fails loud with the structural, content-free
+        is not wired yet and fails loud with the structural, content-free
         ``UnsupportedSurfaceError``.
         """
         if surface == "embeddings":

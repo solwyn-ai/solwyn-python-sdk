@@ -71,15 +71,15 @@ def _warn_cost_policy_inactive_once() -> None:
     logger.warning("CostPolicy selected but no price hints available; using health-based order")
 
 
-# Recognized spend surfaces whose interception phase has not shipped yet: they
+# Recognized spend surfaces that are not yet intercepted: they
 # warn ONCE per process, then pass through untracked. Keyed by DIALECT because
 # the same posture spans every provider that speaks it — OpenAI itself and every
-# OpenAI-compatible provider share the "openai" set. Embeddings (P1.7), openai
-# images (P2.8), and google ``generate_images`` (P2.9) are deliberately ABSENT:
-# they are intercepted on this branch, so they graduate to tracking rather than
-# warning (a surface that is metered must not advertise itself as untracked).
-# audio (P3) and videos (P4 — openai ``videos``, google ``generate_videos``)
-# remain until their interception phase ships. Attribute shapes differ by
+# OpenAI-compatible provider share the "openai" set. Embeddings, openai
+# images, and google ``generate_images`` are deliberately ABSENT:
+# they are intercepted, so they are tracked rather than
+# warned (a surface that is metered must not advertise itself as untracked).
+# audio and videos (openai ``videos``, google ``generate_videos``)
+# remain here until they too are intercepted. Attribute shapes differ by
 # dialect: OpenAI exposes top-level resources (``client.audio``), Google exposes
 # methods on ``client.models`` (``client.models.generate_videos``).
 _UNSHIPPED_SPEND_SURFACES: dict[str, frozenset[str]] = {
@@ -100,8 +100,8 @@ _spend_surface_warn_lock = threading.Lock()
 def _recognized_unshipped_surfaces(adapter: Any, dialect: str) -> frozenset[str]:
     """Untracked spend surfaces that warn for this adapter.
 
-    The union of the central per-dialect map (modality surfaces whose
-    interception phase has not shipped) and the adapter's own opt-in
+    The union of the central per-dialect map (modality surfaces that are
+    not yet intercepted) and the adapter's own opt-in
     ``unmetered_spend_surfaces`` (a provider that declares extra untracked
     billable surfaces — e.g. Together's rerank/code_interpreter/evals). Adapters
     that declare nothing get only the central map.
@@ -207,30 +207,30 @@ class MediaSurfaceSpec:
     """Per-surface wiring for the ``_media_call`` lifecycle.
 
     A non-chat media surface (embeddings, images, audio, video) is fully
-    described here, so the lifecycle stays surface-agnostic and later batches
-    add a surface by constructing one of these — never by editing the lifecycle:
+    described here, so the lifecycle stays surface-agnostic and a new surface
+    is added by constructing one of these — never by editing the lifecycle:
 
     - ``surface``: the dispatch key handed to ``adapter.prepare_media_call``
       (a ``MediaSurface`` value, e.g. ``"embeddings"``).
     - ``modality``: the billing modality carried through the lifecycle so the
       server's card unit can select it. The vendored wire types carry a
-      ``modality`` field (P1.11); ``_media_call`` connects ``spec.modality`` onto
+      ``modality`` field; ``_media_call`` connects ``spec.modality`` onto
       the budget check, the confirm, and the SUCCESS / BUDGET_DENIED metadata
       events. The chat pipeline never sets it and rides the ``"text"`` default.
     - ``extract_usage``: pulls the billable TOKEN quantity from the RESPONSE's
       usage block, or None when the response reports none.
     - ``measure_request``: derives the billable TOKEN quantity from the REQUEST
-      when the response reports none (request-side measurement lands in
-      ``solwyn._privacy`` per P1.9). Returns None when the quantity is
+      when the response reports none (request-side measurement lives in
+      ``solwyn._privacy``). Returns None when the quantity is
       unobservable.
-    - ``measure_media``: OPTIONAL non-token quantity channel (P2.8). Derives the
+    - ``measure_media``: OPTIONAL non-token quantity channel. Derives the
       settled ``MediaUsage`` (image counts, media seconds, character counts,
       variant selectors) from the REQUEST and RESPONSE for a per-unit priced
       surface. None (the default) for token-only surfaces like embeddings, which
       carry no ``MediaUsage``. Kept SEPARATE from the token hooks so media
-      quantities are never shoehorned into ``TokenDetails`` (P1.6). Returns None
+      quantities are never shoehorned into ``TokenDetails``. Returns None
       when unobservable.
-    - ``estimate_media``: OPTIONAL pre-flight non-token quantity (P2.8). Derives
+    - ``estimate_media``: OPTIONAL pre-flight non-token quantity. Derives
       the ``estimated_media`` from the REQUEST alone so the budget CHECK carries
       a precise per-unit pre-flight cost. None (the default) for token-only
       surfaces. Returns None when unobservable.

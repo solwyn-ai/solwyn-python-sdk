@@ -280,11 +280,11 @@ class OpenAIAdapter:
     ) -> tuple[Callable[..., Any], dict[str, Any]]:
         """Per-surface dispatch seam for non-chat media surfaces.
 
-        Embeddings (P1.7) route to ``client.embeddings.create``; images (P2.8)
+        Embeddings route to ``client.embeddings.create``; images
         route to ``client.images.generate`` / ``.edit`` — the same
         ``(method, shaped_kwargs)`` shape ``prepare_call`` returns for chat, with
         a defensive COPY of kwargs (never mutate/alias the caller's dict). The
-        remaining surfaces (P3 audio, P4 video) are not wired yet and fail loud
+        remaining surfaces (audio, video) are not wired yet and fail loud
         with ``UnsupportedSurfaceError``. timeout/max_retries are ignored for
         SDKs with ``with_options`` (the dispatcher already applied them); a branch
         for an SDK without it applies them itself, like ``prepare_call``.

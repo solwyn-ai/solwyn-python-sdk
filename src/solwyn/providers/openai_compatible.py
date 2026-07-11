@@ -448,7 +448,7 @@ class OpenAICompatibleAdapter:
     ) -> tuple[Callable[..., Any], dict[str, Any]]:
         """Per-surface dispatch seam for non-chat media surfaces.
 
-        Embeddings (P1.7) route to ``client.embeddings.create`` and images (P2.8)
+        Embeddings route to ``client.embeddings.create`` and images
         to ``client.images.generate`` / ``.edit`` — one branch each covers all 14
         compat profiles (and the first-class Together adapter that inherits this
         method) since they share the openai dialect and its ``client.embeddings``

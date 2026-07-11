@@ -302,8 +302,8 @@ class TestGoogleModelsProxy:
     def test_generate_videos_posture_warn_once(self, caplog: pytest.LogCaptureFixture) -> None:
         # Google's still-unshipped video generation rides a client.models method,
         # so it arrives on the models proxy's __getattr__ — warn-once pass-through
-        # per the P1.10 posture. (generate_images has GRADUATED to interception in
-        # P2.9 and no longer warns — see test_generate_images_* below.)
+        # per the posture taxonomy. (generate_images is intercepted and no longer
+        # warns — see test_generate_images_* below.)
         client = _mock_google_client()
         generator = MagicMock(return_value="rendered")
         client.models.generate_videos = generator
@@ -325,7 +325,7 @@ class TestGoogleModelsProxy:
         solwyn.close()
 
     def test_embed_content_is_intercepted_and_reports_prompt_tokens(self) -> None:
-        # embed_content routes through the media lifecycle (P1.8), NOT the
+        # embed_content routes through the media lifecycle, NOT the
         # __getattr__ warn-once pass-through: budget-checked, confirmed, reported.
         client = _mock_google_embeddings_client(prompt_token_count=55)
         solwyn = _make_solwyn(client)
@@ -402,7 +402,7 @@ class TestGoogleModelsProxy:
         solwyn.close()
 
     def test_generate_images_is_intercepted_and_reports_image_count(self) -> None:
-        # generate_images (imagen) routes through the media lifecycle (P2.9), NOT
+        # generate_images (imagen) routes through the media lifecycle, NOT
         # the __getattr__ warn-once pass-through. imagen has no token usage, so the
         # billable basis is the request-derived per-image MediaUsage.
         client = _mock_google_images_client()
@@ -463,7 +463,7 @@ class TestGoogleModelsProxy:
         solwyn.close()
 
     def test_generate_images_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
-        # generate_images is intercepted (P2.9), not an untracked pass-through —
+        # generate_images is intercepted, not an untracked pass-through —
         # it must never emit the warn-once "coming soon" surface warning.
         client = _mock_google_images_client()
         solwyn = _make_solwyn(client)
@@ -870,7 +870,7 @@ class TestAsyncGoogleModelsProxy:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_async_generate_images_is_intercepted(self) -> None:
-        # Mirror of the sync generate_images interception (P2.9): imagen carries
+        # Mirror of the sync generate_images interception: imagen carries
         # no token usage, so the per-image MediaUsage is the sole billable basis.
         client = _mock_google_images_client()
         client.models.generate_images = AsyncMockFn(

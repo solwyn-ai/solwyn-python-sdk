@@ -48,7 +48,7 @@ def _media_spec(
     measure_media=None,
     estimate_media=None,
 ) -> MediaSurfaceSpec:
-    """A spec with the optional non-token media hooks wired (P2.8)."""
+    """A spec with the optional non-token media hooks wired."""
     return MediaSurfaceSpec(
         surface="images",
         modality="image",
@@ -289,7 +289,7 @@ class TestMediaCallSync:
         client, _ = _sync_client()
         solwyn = _build_sync(client)
         # No prepare_media_call patch -> the real OpenAI adapter serves embeddings
-        # (P1.7) and images (P2.8) but still raises for an unwired surface like audio.
+        # and images but still raises for an unwired surface like audio.
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()),
             patch.object(solwyn._reporter, "report") as report,

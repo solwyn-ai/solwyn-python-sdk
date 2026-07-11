@@ -527,10 +527,10 @@ class TestGetAttrPassThrough:
 class TestUnshippedSpendSurfacePosture:
     """Posture: recognized-but-unshipped openai spend surfaces warn-once then pass through.
 
-    audio (P3) and videos (P4) are billable surfaces whose interception phase
-    has not shipped. Accessing them on any openai-dialect client logs exactly one
+    audio and videos are billable surfaces that are not yet intercepted.
+    Accessing them on any openai-dialect client logs exactly one
     warning per surface per process, then passes the attribute through untracked.
-    embeddings (P1.7) and images (P2.8) are deliberately silent: they are
+    embeddings and images are deliberately silent: they are
     intercepted, not warned.
     """
 
@@ -582,7 +582,7 @@ class TestUnshippedSpendSurfacePosture:
     def test_intercepted_and_unrelated_surfaces_are_silent(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        # embeddings (P1.7) and images (P2.8) graduate to interception -> they
+        # embeddings and images are intercepted -> they
         # return the media proxy, NOT the raw client attribute; moderations/files
         # are truly-unrelated resources that pass through. None of them warn.
         client, _ = _mock_openai_client()

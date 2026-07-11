@@ -35,12 +35,12 @@ MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 DECLARED_UNMETERED_SURFACES = frozenset({"completions", "rerank", "code_interpreter", "evals"})
 # Central openai-dialect surfaces every openai-dialect provider (Together
 # included) warns for, sourced from _base._UNSHIPPED_SPEND_SURFACES["openai"].
-# images graduated to interception (P2.8), so only audio/videos remain.
+# images are intercepted, so only audio/videos remain.
 CENTRAL_OPENAI_SURFACES = frozenset({"audio", "videos"})
 # Every surface that warns-once for a Together (openai-dialect) client.
 WARNING_SURFACES = DECLARED_UNMETERED_SURFACES | CENTRAL_OPENAI_SURFACES
 # Together-billed surfaces Solwyn passes through SILENTLY (truly-unrelated
-# resources, not warned). embeddings (P1.7) and images (P2.8) are NOT here:
+# resources, not warned). embeddings and images are NOT here:
 # they are intercepted, so they return the media proxy rather than passing through.
 SILENT_SURFACES = frozenset({"batches", "fine_tuning"})
 
@@ -249,8 +249,8 @@ def test_sync_curated_silent_surfaces_pass_through_without_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     # batches and fine_tuning (truly-unrelated resources) were dropped from
-    # Together's warn set: they pass through SILENTLY. embeddings (P1.7) and
-    # images (P2.8) are intercepted -> they return the media proxy, not the raw
+    # Together's warn set: they pass through SILENTLY. embeddings and
+    # images are intercepted -> they return the media proxy, not the raw
     # attribute, and are silent too.
     client = FakeTogetherClient(_completion_response())
     for surface in SILENT_SURFACES:
@@ -275,8 +275,8 @@ def test_sync_curated_silent_surfaces_pass_through_without_warning(
 async def test_async_unmetered_surface_warns_and_passes_through(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # audio is a still-unshipped central openai surface (P3): warn-once, pass
-    # through. (images graduated to interception in P2.8 and no longer warns.)
+    # audio is a still-unshipped central openai surface: warn-once, pass
+    # through. (images are intercepted and no longer warn.)
     client = AsyncTogether(_completion_response())
     resource = MagicMock(spec=_AsyncResource)
     resource.create.return_value = object()

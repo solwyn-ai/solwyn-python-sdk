@@ -787,7 +787,7 @@ class Solwyn(_SolwynBase):
         #    standard fail-open path: allowed=True with a warning. So an
         #    unbilled-model media call proceeds untracked rather than being denied;
         #    fail-open is intentional here — Solwyn never blocks a call just because
-        #    it cannot yet price it. (Full matrix documented in the P5.2 posture doc.)
+        #    it cannot yet price it.
         budget = self._budget.check_budget(
             estimated_input_tokens=est_in,
             model=requested_model,

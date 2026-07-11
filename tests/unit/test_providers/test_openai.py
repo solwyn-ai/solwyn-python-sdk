@@ -416,7 +416,7 @@ class TestOpenAIAdapterDispatchSeams:
         assert adapter.wrap_stream_result(wrapper, response) is wrapper
 
     def test_prepare_media_call_embeddings_selects_embeddings_create(self) -> None:
-        # P1.7: embeddings routes to client.embeddings.create with a COPY of
+        # embeddings routes to client.embeddings.create with a COPY of
         # kwargs — the same (method, shaped_kwargs) shape prepare_call gives chat.
         def create(**kwargs: Any) -> dict[str, Any]:
             return kwargs
@@ -433,7 +433,7 @@ class TestOpenAIAdapterDispatchSeams:
         assert prepared is not kwargs  # never mutates / aliases the input
 
     def test_prepare_media_call_images_selects_generate_by_default(self) -> None:
-        # P2.8: images routes to client.images.generate with a COPY of kwargs.
+        # images routes to client.images.generate with a COPY of kwargs.
         def generate(**kwargs: Any) -> dict[str, Any]:
             return kwargs
 
@@ -465,7 +465,7 @@ class TestOpenAIAdapterDispatchSeams:
         assert prepared == {"model": "gpt-image-1", "prompt": "a cat"}
 
     def test_prepare_media_call_raises_unsupported_surface_for_unwired(self) -> None:
-        # embeddings (P1.7) + images (P2.8) are wired; audio/video still fail loud
+        # embeddings + images are wired; audio/video still fail loud
         # with the structural, content-free UnsupportedSurfaceError.
         adapter = OpenAIAdapter()
         for surface in ("audio", "video"):
@@ -479,7 +479,7 @@ class TestOpenAIAdapterDispatchSeams:
 
 @pytest.mark.unit
 class TestExtractImageUsage:
-    """gpt-image images.generate/edit usage extraction (P2.8)."""
+    """gpt-image images.generate/edit usage extraction."""
 
     def _image_response(
         self,

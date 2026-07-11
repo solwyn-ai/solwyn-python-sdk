@@ -85,7 +85,7 @@ Solwyn Cloud accepts every field below before this SDK releases.
   extractor now maps the `prompt_tokens_details` (input side) and
   `candidates_tokens_details` (output side) `ModalityTokenCount` lists: IMAGE
   buckets → `image_input_tokens` / `image_output_tokens`; AUDIO buckets →
-  `audio_input_tokens` / `audio_output_tokens` (P3 groundwork). This lets a
+  `audio_input_tokens` / `audio_output_tokens`. This lets a
   `generate_content` call to a token-billed image model (e.g. gemini-3-pro-image)
   carry its image-output tokens so the server prices them at the image rate.
   Duck-typed with None-safety throughout; a response without per-modality details
@@ -108,5 +108,5 @@ Solwyn Cloud accepts every field below before this SDK releases.
   intercepted.** Both leave the unshipped-spend-surface warn-once set — a metered
   surface must not advertise itself as untracked (superseding the merge-1
   warn-once posture entry for those two surfaces). Remaining warn-once
-  pass-throughs: OpenAI-dialect `audio` (P3) / `videos` (P4) and Google
-  `generate_videos` (P4).
+  pass-throughs: OpenAI-dialect `audio` / `videos` and Google
+  `generate_videos`.

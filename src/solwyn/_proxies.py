@@ -403,7 +403,7 @@ class _SyncModelsProxy:
         budget-checked, confirmed, and reported instead of passing through
         untracked. Because it is defined on the class, it never reaches
         __getattr__ — generate_videos keeps riding that warn-once pass-through
-        until its interception phase (P4) ships.
+        until it is intercepted.
         """
         return self._solwyn._media_call(self._embeddings_spec, **kwargs)
 
@@ -414,17 +414,17 @@ class _SyncModelsProxy:
         confirmed, and reported. imagen exposes no token usage; the billable
         basis is the request-derived per-image ``MediaUsage``
         (``config.number_of_images``). Being defined on the class, it never
-        reaches __getattr__ — it has graduated OUT of the warn-once pass-through
-        (P2.9), leaving only generate_videos warning there.
+        reaches __getattr__ — it is intercepted, not part of the warn-once
+        pass-through, leaving only generate_videos warning there.
         """
         return self._solwyn._media_call(self._images_spec, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         # Google's remaining unshipped media surface (generate_videos) is a method
         # on client.models, so it arrives here rather than on Solwyn.__getattr__ —
-        # warn-once pass-through per the P1.10 posture. embed_content and
+        # warn-once pass-through per the posture taxonomy. embed_content and
         # generate_images never reach here: the explicit methods above intercept
-        # them (P1.8 / P2.9).
+        # them.
         attribute = getattr(self._solwyn._client.models, name)
         _warn_unmetered_spend_surface_once(
             adapter=self._solwyn._adapter, dialect=self._solwyn._dialect, surface=name
@@ -561,14 +561,14 @@ class _AsyncModelsProxy:
 
         Mirror of ``_SyncModelsProxy.generate_images``: an EXPLICIT method (not
         __getattr__) so image spend is budget-checked, confirmed, and reported on
-        the request-derived per-image ``MediaUsage`` basis. Graduated OUT of the
-        warn-once pass-through (P2.9); only generate_videos still warns there.
+        the request-derived per-image ``MediaUsage`` basis. Intercepted, not part
+        of the warn-once pass-through; only generate_videos still warns there.
         """
         return await self._solwyn._media_call(self._images_spec, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         # See _SyncModelsProxy.__getattr__: Google's remaining unshipped media
-        # surface (generate_videos) warn-once pass-through per the P1.10 posture.
+        # surface (generate_videos) warn-once pass-through per the posture taxonomy.
         # embed_content and generate_images never reach here — the explicit
         # methods above intercept them.
         attribute = getattr(self._solwyn._client.models, name)
