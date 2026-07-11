@@ -379,6 +379,7 @@ class TestGoogleAdapterDispatchSeams:
                 generate_content_stream=lambda **kw: kw,
                 embed_content=lambda **kw: kw,
                 generate_images=lambda **kw: kw,
+                generate_videos=lambda **kw: kw,
             )
         )
 
@@ -473,11 +474,37 @@ class TestGoogleAdapterDispatchSeams:
         assert prepared["config"]["http_options"]["retry_options"]["attempts"] == 3
         assert kwargs == original  # input never mutated
 
+    def test_prepare_media_call_video_selects_generate_videos(self) -> None:
+        # video routes to client.models.generate_videos (veo). The per-hop bound
+        # rides config.http_options (google-genai has no with_options), injected
+        # here as a defensive COPY that preserves the caller's own config keys
+        # (e.g. duration_seconds, resolution).
+        client = self._client()
+        kwargs: dict[str, Any] = {
+            "model": "veo-3.0-generate-001",
+            "prompt": "a cat",
+            "config": {"duration_seconds": 8, "resolution": "720p"},
+        }
+        original = {**kwargs, "config": dict(kwargs["config"])}
+
+        method, prepared = GoogleAdapter().prepare_media_call(
+            "video", client, kwargs, timeout=12.5, max_retries=2
+        )
+
+        assert method is client.models.generate_videos
+        assert prepared["model"] == "veo-3.0-generate-001"
+        # The caller's config keys are preserved alongside the injected http bound.
+        assert prepared["config"]["duration_seconds"] == 8
+        assert prepared["config"]["resolution"] == "720p"
+        assert prepared["config"]["http_options"]["timeout"] == 12500
+        assert prepared["config"]["http_options"]["retry_options"]["attempts"] == 3
+        assert kwargs == original  # input never mutated
+
     def test_prepare_media_call_raises_unsupported_surface_for_unwired(self) -> None:
-        # embeddings and images are wired; audio/video still fail
-        # loud with the structural, content-free UnsupportedSurfaceError.
+        # embeddings, images, and video are wired; audio still fails loud with
+        # the structural, content-free UnsupportedSurfaceError.
         adapter = GoogleAdapter()
-        for surface in ("audio", "video"):
+        for surface in ("audio",):
             with pytest.raises(UnsupportedSurfaceError) as excinfo:
                 adapter.prepare_media_call(
                     surface, object(), {"model": "m"}, timeout=30.0, max_retries=0

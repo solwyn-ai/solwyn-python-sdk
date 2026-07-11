@@ -29,6 +29,7 @@ from solwyn._privacy import (
     measure_google_image_media,
     measure_image_media,
     measure_speech_media,
+    measure_video_media,
 )
 from solwyn._types import BudgetCheckRequest, BudgetConfirmRequest, MetadataEvent
 from solwyn.client import Solwyn
@@ -889,4 +890,75 @@ class TestMeasureSpeechMedia:
         usage = measure_speech_media({"model": "tts-1", "input": secret})
         assert usage is not None
         assert usage.input_characters == len(secret)
+        assert secret not in json.dumps(usage.model_dump(mode="json"))
+
+
+# --------------------------------------------------------------------------- #
+# Video request recognizer — duration/resolution CONFIG only, content-free     #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestMeasureVideoMedia:
+    """measure_video_media reads ONLY config.duration_seconds / config.resolution.
+
+    google-genai carries both INSIDE ``config=`` (dict or config object); the
+    customer's ``prompt=`` is never read. generate_videos returns a long-running
+    operation with no usage, so these request-derived values are the sole billable
+    basis and ``is_estimated`` is ALWAYS True (billing settles at initiation).
+    """
+
+    def test_reads_duration_and_resolution_from_dict_config(self) -> None:
+        usage = measure_video_media({"config": {"duration_seconds": 6, "resolution": "1080p"}})
+        assert usage.video_seconds == 6.0
+        assert usage.resolution == "1080p"
+        # Video always settles at initiation as an estimate.
+        assert usage.is_estimated is True
+
+    def test_reads_duration_from_object_config(self) -> None:
+        usage = measure_video_media(
+            {"config": SimpleNamespace(duration_seconds=8, resolution="720p")}
+        )
+        assert usage.video_seconds == 8.0
+        assert usage.resolution == "720p"
+
+    def test_float_duration_is_preserved(self) -> None:
+        usage = measure_video_media({"config": {"duration_seconds": 5.5}})
+        assert usage.video_seconds == 5.5
+
+    def test_absent_duration_stays_none_unpriced(self) -> None:
+        # No documented SDK/API default duration -> absent stays None (tracked
+        # unpriced), never a guessed duration. is_estimated stays True regardless.
+        usage = measure_video_media({"config": {"resolution": "720p"}})
+        assert usage.video_seconds is None
+        assert usage.resolution == "720p"
+        assert usage.is_estimated is True
+
+    def test_missing_config_yields_none_duration(self) -> None:
+        usage = measure_video_media({})
+        assert usage.video_seconds is None
+        assert usage.resolution is None
+        assert usage.is_estimated is True
+
+    def test_garbage_duration_degrades_to_none(self) -> None:
+        for bad in (-1, True, "eight", None, [8], {"s": 8}):
+            usage = measure_video_media({"config": {"duration_seconds": bad}})
+            assert usage.video_seconds is None
+
+    def test_zero_duration_is_kept(self) -> None:
+        # 0 is a valid non-negative quantity (ge=0), distinct from absent/None.
+        usage = measure_video_media({"config": {"duration_seconds": 0}})
+        assert usage.video_seconds == 0.0
+
+    def test_non_string_or_overlong_resolution_degrades_to_none(self) -> None:
+        usage = measure_video_media({"config": {"duration_seconds": 8, "resolution": "x" * 33}})
+        assert usage.resolution is None
+        usage = measure_video_media({"config": {"duration_seconds": 8, "resolution": 720}})
+        assert usage.resolution is None
+
+    def test_prompt_content_is_never_read(self) -> None:
+        # The prompt is present alongside the config but MUST NOT surface in the
+        # returned MediaUsage (content-free by construction).
+        secret = "SUPER_SECRET_VEO_PROMPT_k3l4m5"
+        usage = measure_video_media(
+            {"prompt": secret, "config": {"duration_seconds": 8, "resolution": "720p"}}
+        )
         assert secret not in json.dumps(usage.model_dump(mode="json"))

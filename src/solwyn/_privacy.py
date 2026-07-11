@@ -280,6 +280,68 @@ def measure_google_image_media(kwargs: dict[str, Any]) -> MediaUsage:
     return MediaUsage(image_count=_google_image_count(kwargs.get("config")))
 
 
+def _video_duration_seconds(config: object) -> float | None:
+    """Requested video duration in seconds from a ``generate_videos`` ``config``.
+
+    google-genai carries ``duration_seconds`` INSIDE the ``config=`` argument
+    (a ``GenerateVideosConfig`` object or a plain dict — both handled duck-typed,
+    no provider SDK import). It is a DURATION, not prompt content. The field has
+    NO SDK-level default (the SDK sends nothing when it is omitted) and the
+    provider's per-model default is not uniformly published, so an absent value
+    stays None (the call is tracked UNPRICED) rather than settling a guessed
+    duration — a per-second billed surface must never bill a duration the caller
+    did not request. A non-numeric / bool / negative value is garbage and also
+    degrades to None. ``bool`` is excluded explicitly (it is an ``int`` subclass).
+    """
+    if isinstance(config, dict):
+        value = config.get("duration_seconds")
+    else:
+        value = getattr(config, "duration_seconds", None)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return float(value)
+
+
+def _video_resolution(config: object) -> str | None:
+    """Video resolution variant selector (e.g. ``"720p"``) from a ``config``.
+
+    A CONFIG enum, never prompt content, matched server-side against the pricing
+    card's per-second variant grid. Read duck-typed from the dict or object
+    ``config``; a non-str or over-length value degrades to None via the shared
+    bounded-selector guard (an absent selector simply carries no variant).
+    """
+    if isinstance(config, dict):
+        value = config.get("resolution")
+    else:
+        value = getattr(config, "resolution", None)
+    return _image_selector(value)
+
+
+def measure_video_media(kwargs: dict[str, Any]) -> MediaUsage:
+    """Request-derived ``MediaUsage`` for a Google ``generate_videos`` call.
+
+    CONFIG values only — ``config.duration_seconds`` -> ``video_seconds``,
+    ``config.resolution`` -> ``resolution``. The customer's ``prompt=`` (and any
+    seed ``image=`` bytes) are NEVER read, logged, or retained; only these
+    non-content request parameters are measured. ``is_estimated`` is ALWAYS True:
+    generate_videos returns immediately with a long-running operation that carries
+    no usage, so billing settles at INITIATION from the request parameters — a
+    deliberate, conservative over-count until completion-observation exists (the
+    provider does not charge for failed/blocked generations). The same builder
+    serves both the pre-flight ``estimated_media`` (a precise per-second check —
+    an oversized request is denied before the provider is called) and the settled
+    ``media_usage`` (the operation object carries nothing better). ``video_seconds``
+    stays None when duration is absent, so the call is tracked unpriced rather
+    than billed on a guessed duration.
+    """
+    config = kwargs.get("config")
+    return MediaUsage(
+        video_seconds=_video_duration_seconds(config),
+        resolution=_video_resolution(config),
+        is_estimated=True,
+    )
+
+
 def _part_text_length(part: Any) -> int:
     """Sum string lengths of one delta/message part: content, reasoning text,
     and tool-call function arguments. Length-only; nothing is concatenated,
