@@ -288,14 +288,14 @@ class TestMediaCallSync:
     def test_unsupported_surface_reports_error_then_raises(self) -> None:
         client, _ = _sync_client()
         solwyn = _build_sync(client)
-        # No prepare_media_call patch -> the real OpenAI adapter serves embeddings
-        # and images but still raises for an unwired surface like audio.
+        # No prepare_media_call patch -> the real OpenAI adapter serves embeddings,
+        # images, and audio but still raises for an unwired surface like video.
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()),
             patch.object(solwyn._reporter, "report") as report,
             pytest.raises(UnsupportedSurfaceError),
         ):
-            solwyn._media_call(_spec(surface="audio"), model="whisper-1", input="hi")
+            solwyn._media_call(_spec(surface="video"), model="sora", input="hi")
 
         event = report.call_args.args[0]
         assert event.status == CallStatus.ERROR

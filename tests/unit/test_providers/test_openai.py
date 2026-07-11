@@ -464,11 +464,29 @@ class TestOpenAIAdapterDispatchSeams:
         assert _IMAGE_OP_KEY not in prepared  # marker stripped before the SDK call
         assert prepared == {"model": "gpt-image-1", "prompt": "a cat"}
 
+    def test_prepare_media_call_audio_selects_transcriptions_create(self) -> None:
+        # audio routes to client.audio.transcriptions.create with a COPY of kwargs.
+        def create(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(
+            audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create))
+        )
+        kwargs: dict[str, Any] = {"model": "whisper-1", "file": b"audio-bytes"}
+
+        method, prepared = OpenAIAdapter().prepare_media_call(
+            "audio", client, kwargs, timeout=30.0, max_retries=0
+        )
+
+        assert method is create
+        assert prepared == {"model": "whisper-1", "file": b"audio-bytes"}
+        assert prepared is not kwargs  # never mutates / aliases the input
+
     def test_prepare_media_call_raises_unsupported_surface_for_unwired(self) -> None:
-        # embeddings + images are wired; audio/video still fail loud
+        # embeddings + images + audio are wired; video still fails loud
         # with the structural, content-free UnsupportedSurfaceError.
         adapter = OpenAIAdapter()
-        for surface in ("audio", "video"):
+        for surface in ("video",):
             with pytest.raises(UnsupportedSurfaceError) as excinfo:
                 adapter.prepare_media_call(
                     surface, object(), {"model": "m"}, timeout=30.0, max_retries=0

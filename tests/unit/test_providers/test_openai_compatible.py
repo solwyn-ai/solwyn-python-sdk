@@ -155,11 +155,31 @@ class TestProfileTable:
             assert edit_method is edit, adapter.name
             assert _IMAGE_OP_KEY not in edit_prepared, adapter.name  # marker stripped
 
+    def test_prepare_media_call_audio_selects_transcriptions_for_every_profile(self) -> None:
+        # one audio branch covers every compat adapter (incl. Together / Groq
+        # whisper): it routes to client.audio.transcriptions.create with a COPY.
+        def create(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(
+            audio=SimpleNamespace(transcriptions=SimpleNamespace(create=create))
+        )
+        for adapter in build_compat_adapters():
+            method, prepared = adapter.prepare_media_call(
+                "audio",
+                client,
+                {"model": "whisper-large-v3", "file": b"x"},
+                timeout=30.0,
+                max_retries=0,
+            )
+            assert method is create, adapter.name
+            assert prepared == {"model": "whisper-large-v3", "file": b"x"}, adapter.name
+
     def test_prepare_media_call_raises_unsupported_surface_for_unwired_every_profile(self) -> None:
-        # embeddings + images are wired; audio/video still fail loud
+        # embeddings + images + audio are wired; video still fails loud
         # with the provider's own name attached.
         for adapter in build_compat_adapters():
-            for surface in ("audio", "video"):
+            for surface in ("video",):
                 with pytest.raises(UnsupportedSurfaceError) as excinfo:
                     adapter.prepare_media_call(
                         surface, object(), {"model": "m"}, timeout=30.0, max_retries=0

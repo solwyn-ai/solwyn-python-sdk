@@ -12,11 +12,13 @@ or when not requested — all missing fields default to 0.
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from typing import Any, Literal
 
 from solwyn._constants import SERVICE_TIER_MAX_LENGTH
 from solwyn._token_details import TokenDetails
+from solwyn._types import MediaUsage
 from solwyn.exceptions import UnsupportedSurfaceError
 
 logger = logging.getLogger(__name__)
@@ -173,6 +175,135 @@ def _prepare_image_media_call(
     return method, shaped
 
 
+# Per-process warn-once latch for a transcription that returns no billable basis
+# (a non-JSON response_format yields a plain string with no usage). Lock-guarded
+# for the multi-threaded sync client; reset in tests via
+# ``_reset_transcription_unpriced_warning``.
+_transcription_unpriced_warned = False
+_transcription_unpriced_warn_lock = threading.Lock()
+
+
+def _warn_transcription_unpriced_once() -> None:
+    """Hint once that a JSON response_format restores priced transcription tracking.
+
+    Fires when an ``audio.transcriptions`` response carries no usable usage — the
+    non-JSON response formats (``text`` / ``srt`` / ``vtt``) return a plain string
+    with no usage block, so the call is tracked but UNPRICED. Content-free: the
+    message names no request or response data.
+    """
+    global _transcription_unpriced_warned
+    with _transcription_unpriced_warn_lock:
+        if _transcription_unpriced_warned:
+            return
+        _transcription_unpriced_warned = True
+    # Logging handlers may run arbitrary code; keep them outside the lock.
+    logger.warning(
+        "Audio transcription returned no usage data; the call is tracked but "
+        "UNPRICED. A non-JSON response_format (text/srt/vtt) carries no billable "
+        "basis — pass response_format='json' or 'verbose_json' for priced tracking."
+    )
+
+
+def _reset_transcription_unpriced_warning() -> None:
+    """Clear the per-process transcription-unpriced warn latch. Test-support hook only."""
+    global _transcription_unpriced_warned
+    with _transcription_unpriced_warn_lock:
+        _transcription_unpriced_warned = False
+
+
+def _transcription_token_details(usage: Any) -> TokenDetails | None:
+    """TokenDetails from a token-usage transcription block (gpt-4o-transcribe family).
+
+    The token-billed models report ``usage.input_tokens`` / ``usage.output_tokens``
+    with an ``input_token_details`` sub-object carrying ``text_tokens`` and
+    ``audio_tokens``. ``audio_tokens`` maps onto ``audio_input_tokens`` (audio ⊂
+    input, mirroring image ⊂ input); the text side is ``input_tokens −
+    audio_input_tokens``, derived server-side. Returns None when neither side
+    carries a positive count so the media lifecycle never settles a real $0.
+    """
+    input_tokens = _usage_value(getattr(usage, "input_tokens", None))
+    output_tokens = _usage_value(getattr(usage, "output_tokens", None))
+    if input_tokens <= 0 and output_tokens <= 0:
+        return None
+    input_details = getattr(usage, "input_token_details", None)
+    return TokenDetails(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        audio_input_tokens=_usage_value(getattr(input_details, "audio_tokens", None)),
+    )
+
+
+def _transcription_duration_media(usage: Any) -> MediaUsage | None:
+    """MediaUsage from a duration-usage transcription block (whisper-1).
+
+    whisper-1 reports ``usage.seconds`` — an INTEGER whole-second count that is the
+    provider's billed basis, present on BOTH the default ``json`` and
+    ``verbose_json`` formats. It maps onto ``MediaUsage.audio_seconds``; the
+    fractional top-level ``duration`` field is deliberately NOT read (it is not the
+    billed basis). Returns None when ``seconds`` is absent or non-positive so an
+    unobservable quantity stays None rather than a zero-as-default.
+    """
+    seconds = getattr(usage, "seconds", None)
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or seconds <= 0:
+        return None
+    return MediaUsage(audio_seconds=float(seconds))
+
+
+def _transcription_usage_basis(response: Any) -> tuple[TokenDetails | None, MediaUsage | None]:
+    """Discriminate one transcription response's usage into (token, media) bases.
+
+    ONE extractor for both billable shapes: it switches on ``usage.type``. A
+    ``"tokens"`` block yields the TokenDetails basis (gpt-4o-transcribe family); a
+    ``"duration"`` block yields the MediaUsage basis (whisper-1). A response with
+    NO usage block (a non-JSON response_format returns a plain string) yields
+    ``(None, None)`` and hints once that a JSON response_format restores priced
+    tracking. An unrecognized ``type`` also yields ``(None, None)`` — unpriced, but
+    without the JSON hint (that message would misdescribe it). Duck-typed and never
+    raises; both wrapper hooks share this so the discrimination lives in one place.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        _warn_transcription_unpriced_once()
+        return None, None
+    usage_type = getattr(usage, "type", None)
+    if usage_type == "tokens":
+        return _transcription_token_details(usage), None
+    if usage_type == "duration":
+        return None, _transcription_duration_media(usage)
+    return None, None
+
+
+def _extract_transcription_usage(response: Any) -> TokenDetails | None:
+    """Token basis of a transcription response, or None. See ``_transcription_usage_basis``.
+
+    Module-level so the audio ``MediaSurfaceSpec`` (in ``_proxies``) reuses it for
+    native OpenAI and every compat endpoint (incl. Groq) that shares the shape.
+    """
+    return _transcription_usage_basis(response)[0]
+
+
+def _measure_transcription_media(_kwargs: dict[str, Any], response: Any) -> MediaUsage | None:
+    """Duration basis of a transcription response, or None. See ``_transcription_usage_basis``.
+
+    The request is not read: audio duration is only observable in the response's
+    duration-usage block, never derivable from the request (which carries the file
+    bytes this SDK never touches).
+    """
+    return _transcription_usage_basis(response)[1]
+
+
+def _prepare_transcription_media_call(
+    client: Any, kwargs: dict[str, Any]
+) -> tuple[Callable[..., Any], dict[str, Any]]:
+    """Select ``client.audio.transcriptions.create`` and shape a COPY of kwargs.
+
+    Shared by the OpenAI adapter and every OpenAI-compatible adapter (same
+    ``client.audio.transcriptions`` surface, incl. Groq whisper). NEVER reads the
+    ``file`` bytes or ``prompt`` — only re-shapes keys into a defensive copy.
+    """
+    return client.audio.transcriptions.create, dict(kwargs)
+
+
 def _extract_service_tier(response: Any) -> str | None:
     """Return a bounded service_tier value, or None when absent/non-string."""
     tier = getattr(response, "service_tier", None)
@@ -280,19 +411,22 @@ class OpenAIAdapter:
     ) -> tuple[Callable[..., Any], dict[str, Any]]:
         """Per-surface dispatch seam for non-chat media surfaces.
 
-        Embeddings route to ``client.embeddings.create``; images
-        route to ``client.images.generate`` / ``.edit`` — the same
-        ``(method, shaped_kwargs)`` shape ``prepare_call`` returns for chat, with
-        a defensive COPY of kwargs (never mutate/alias the caller's dict). The
-        remaining surfaces (audio, video) are not wired yet and fail loud
-        with ``UnsupportedSurfaceError``. timeout/max_retries are ignored for
-        SDKs with ``with_options`` (the dispatcher already applied them); a branch
-        for an SDK without it applies them itself, like ``prepare_call``.
+        Embeddings route to ``client.embeddings.create``; images route to
+        ``client.images.generate`` / ``.edit``; audio routes to
+        ``client.audio.transcriptions.create`` — the same ``(method,
+        shaped_kwargs)`` shape ``prepare_call`` returns for chat, with a defensive
+        COPY of kwargs (never mutate/alias the caller's dict). The remaining
+        surface (video) is not wired yet and fails loud with
+        ``UnsupportedSurfaceError``. timeout/max_retries are ignored for SDKs with
+        ``with_options`` (the dispatcher already applied them); a branch for an SDK
+        without it applies them itself, like ``prepare_call``.
         """
         if surface == "embeddings":
             return client.embeddings.create, dict(kwargs)
         if surface == "images":
             return _prepare_image_media_call(client, kwargs)
+        if surface == "audio":
+            return _prepare_transcription_media_call(client, kwargs)
         raise UnsupportedSurfaceError(surface=surface, provider=self.name)
 
     def unwrap_stream_source(self, response: Any) -> Any:

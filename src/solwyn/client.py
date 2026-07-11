@@ -40,12 +40,14 @@ from solwyn._base import (
 )
 from solwyn._privacy import estimate_content_length, estimate_tokens_from_length
 from solwyn._proxies import (
+    _AsyncAudioProxy,
     _AsyncChatProxy,
     _AsyncEmbeddingsProxy,
     _AsyncImagesProxy,
     _AsyncMessagesProxy,
     _AsyncModelsProxy,
     _bedrock_internal_kwargs,
+    _SyncAudioProxy,
     _SyncChatProxy,
     _SyncEmbeddingsProxy,
     _SyncImagesProxy,
@@ -635,6 +637,21 @@ class Solwyn(_SolwynBase):
         construction so this is safe to create once.
         """
         return _SyncImagesProxy(self)
+
+    @functools.cached_property
+    def audio(self) -> _SyncAudioProxy:
+        """Return a proxy that routes audio.transcriptions.create() through the lifecycle.
+
+        Unconditional (like ``chat`` / ``embeddings`` / ``images``): the audio
+        transcriptions surface is the openai dialect, shared by native OpenAI and
+        every OpenAI-compatible provider (incl. Groq whisper). On a non-openai
+        client ``.transcriptions.create()`` fails loud with
+        ``UnsupportedSurfaceError`` (that adapter serves no audio seam). The proxy's
+        ``speech`` / ``translations`` sub-surfaces warn-once then pass through
+        untracked. Cached: provider is fixed at construction so this is safe to
+        create once.
+        """
+        return _SyncAudioProxy(self)
 
     @functools.cached_property
     def messages(self) -> Any:
@@ -1550,6 +1567,20 @@ class AsyncSolwyn(_SolwynBase):
         Cached: provider is fixed at construction.
         """
         return _AsyncImagesProxy(self)
+
+    @functools.cached_property
+    def audio(self) -> _AsyncAudioProxy:
+        """Return an async proxy that routes audio.transcriptions.create() through the lifecycle.
+
+        Unconditional (like ``chat`` / ``embeddings`` / ``images``): the audio
+        transcriptions surface is the openai dialect, shared by native OpenAI and
+        every OpenAI-compatible provider (incl. Groq whisper). On a non-openai
+        client ``.transcriptions.create()`` fails loud with
+        ``UnsupportedSurfaceError``. The proxy's ``speech`` / ``translations``
+        sub-surfaces warn-once then pass through untracked. Cached: provider is
+        fixed at construction.
+        """
+        return _AsyncAudioProxy(self)
 
     @functools.cached_property
     def messages(self) -> Any:
