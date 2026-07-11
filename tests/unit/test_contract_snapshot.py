@@ -45,6 +45,7 @@ from solwyn._types import (
     BudgetCheckResponse,
     BudgetConfirmRequest,
     CallStatus,
+    MediaUsage,
     MetadataEvent,
     ProviderName,
 )
@@ -63,9 +64,14 @@ EXPECTED_CHECK_FIELDS = {
     "model",
     "provider",
     "modality",
+    "estimated_media",
     "fallback_providers",
     "fallback_models",
 }
+
+# The optional check field the None-skipping serializer drops when unset —
+# text/chat checks stay byte-identical to the pre-window-2 wire.
+_NONE_SKIPPED_CHECK_FIELDS = {"estimated_media"}
 
 EXPECTED_CHECK_RESPONSE_FIELDS = {
     "allowed",
@@ -85,6 +91,7 @@ EXPECTED_CONFIRM_FIELDS = {
     "provider",
     "modality",
     "token_details",
+    "media_usage",
     "is_provider_fallback",
     "call_id",
     "provider_region",
@@ -92,8 +99,9 @@ EXPECTED_CONFIRM_FIELDS = {
 }
 
 # The optional confirm fields the None-skipping serializer drops when unset —
-# bearer-key providers' confirm wire bytes stay byte-identical to pre-Bedrock.
-_NONE_SKIPPED_CONFIRM_FIELDS = {"provider_region", "service_tier"}
+# bearer-key providers' confirm wire bytes stay byte-identical to pre-Bedrock;
+# media_usage (window 2) is dropped on every chat/token confirm the same way.
+_NONE_SKIPPED_CONFIRM_FIELDS = {"provider_region", "service_tier", "media_usage"}
 
 # Provider identifiers ARE wire values (events/confirms/checks carry them).
 # Adding one is an API-first deploy: the Cloud API must accept it BEFORE any
@@ -138,6 +146,24 @@ EXPECTED_TOKEN_DETAILS_FIELDS = {
     "accepted_prediction_tokens",
     "rejected_prediction_tokens",
     "tool_use_input_tokens",
+    "image_input_tokens",
+    "image_output_tokens",
+    "is_estimated",
+}
+
+# MediaUsage is a NEW embedded wire object (window 2): non-token billable
+# quantities + variant selectors for non-text modalities, carried on
+# BudgetConfirmRequest.media_usage / MetadataEvent.media_usage /
+# BudgetCheckRequest.estimated_media. Its field set is contract too — pin it
+# like TokenDetails so a drift in either direction fails CI loudly.
+EXPECTED_MEDIA_USAGE_FIELDS = {
+    "image_count",
+    "generation_count",
+    "video_seconds",
+    "audio_seconds",
+    "input_characters",
+    "resolution",
+    "quality",
     "is_estimated",
 }
 
@@ -148,6 +174,7 @@ EXPECTED_METADATA_FIELDS = {
     "input_tokens",
     "output_tokens",
     "token_details",
+    "media_usage",
     "latency_ms",
     "status",
     "is_model_fallback",
@@ -193,6 +220,9 @@ class TestWireModelFieldSets:
     def test_token_details_field_set(self) -> None:
         assert set(TokenDetails.model_fields) == EXPECTED_TOKEN_DETAILS_FIELDS
 
+    def test_media_usage_field_set(self) -> None:
+        assert set(MediaUsage.model_fields) == EXPECTED_MEDIA_USAGE_FIELDS
+
 
 def _confirm(**overrides: Any) -> BudgetConfirmRequest:
     base: dict[str, Any] = {
@@ -235,8 +265,27 @@ class TestWireModelDumpSnapshots:
             fallback_providers=[ProviderName.ANTHROPIC],
             fallback_models=["claude-x"],
         )
-        # Every declared field is non-optional / has a value -> all serialize.
-        assert set(req.model_dump(mode="json")) == EXPECTED_CHECK_FIELDS
+        # A text/chat check: the None-skipping serializer drops the unset optional
+        # estimated_media, so the wire stays byte-identical to the pre-window-2
+        # check (the deployed Cloud-API model rejects unknown keys).
+        assert (
+            set(req.model_dump(mode="json")) == EXPECTED_CHECK_FIELDS - _NONE_SKIPPED_CHECK_FIELDS
+        )
+
+    def test_budget_check_request_media_dump_carries_estimated_media(self) -> None:
+        # A non-text check: estimated_media rides the wire so the server prices a
+        # precise per-unit pre-flight cost.
+        req = BudgetCheckRequest(
+            estimated_input_tokens=0,
+            model="gpt-image-1",
+            provider=ProviderName.OPENAI,
+            modality="image",
+            estimated_media=MediaUsage(image_count=2, resolution="1024x1024", quality="low"),
+        )
+        dumped = req.model_dump(mode="json")
+        assert set(dumped) == EXPECTED_CHECK_FIELDS
+        assert dumped["estimated_media"]["image_count"] == 2
+        assert dumped["modality"] == "image"
 
     def test_budget_check_response_dump_keys(self) -> None:
         response = BudgetCheckResponse(
@@ -289,6 +338,27 @@ class TestWireModelDumpSnapshots:
             set(req.model_dump(mode="json"))
             == EXPECTED_CONFIRM_FIELDS - _NONE_SKIPPED_CONFIRM_FIELDS
         )
+
+    def test_confirm_media_usage_omitted_when_none_present_when_set(self) -> None:
+        # media_usage rides the None-skipping serializer: absent for every
+        # chat/token confirm (wire bytes unchanged), present for a non-text
+        # served call so the server settles the enforcement counter per-unit.
+        assert "media_usage" not in _confirm().model_dump(mode="json")
+        dumped = _confirm(
+            token_details=TokenDetails(),
+            media_usage=MediaUsage(image_count=3, resolution="1024x1024"),
+        ).model_dump(mode="json")
+        assert dumped["media_usage"]["image_count"] == 3
+        assert dumped["media_usage"]["resolution"] == "1024x1024"
+
+    def test_metadata_media_usage_omitted_when_none_present_when_set(self) -> None:
+        # Mirror on the metadata-event wire (the other media_usage embedding).
+        assert "media_usage" not in _metadata_event().model_dump(mode="json")
+        dumped = _metadata_event(media_usage=MediaUsage(image_count=1, quality="high")).model_dump(
+            mode="json"
+        )
+        assert dumped["media_usage"]["image_count"] == 1
+        assert dumped["media_usage"]["quality"] == "high"
 
     def test_token_details_default_dump_omits_is_estimated(self) -> None:
         # Provider-reported (non-estimated) counts: is_estimated stays OFF the

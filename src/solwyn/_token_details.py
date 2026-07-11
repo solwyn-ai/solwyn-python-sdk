@@ -78,6 +78,25 @@ class TokenDetails(BaseModel):
     tool_use_input_tokens: int = Field(
         default=0, ge=0, description="Tokens used for tool/function definitions (Google)"
     )
+    image_input_tokens: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Image tokens on the INPUT side, a SUBSET of input_tokens (image ⊂ "
+            "input, mirroring reasoning ⊂ output). Documented, NOT enforced. "
+            "Token-billed image models (e.g. gpt-image-1) price these at their "
+            "own image-input rate; the server derives text input = input − image."
+        ),
+    )
+    image_output_tokens: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Image tokens on the OUTPUT side, a SUBSET of output_tokens "
+            "(image_output ⊂ output). Documented, NOT enforced. Token-billed "
+            "image models price these at their own image-output rate."
+        ),
+    )
     is_estimated: bool = Field(
         default=False,
         description=(
