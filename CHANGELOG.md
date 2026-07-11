@@ -153,3 +153,53 @@ shipped in merge 2 (`modality="audio"`, `MediaUsage.audio_seconds` /
   warn-once posture entry for `audio`). Its `translations` sub-surface stays
   recognized-but-untracked and warns once per process. Remaining warn-once
   pass-throughs: OpenAI-dialect `videos` and Google `generate_videos`.
+
+---
+
+Non-text modality support — SDK merge 4. Video surfaces reuse the wire contract
+shipped in merge 2 (`modality="video"`, `MediaUsage.video_seconds` /
+`resolution`) — no new wire fields.
+
+### Added
+
+- **Google `generate_videos` (veo) is now budget-tracked.**
+  `client.models.generate_videos` is intercepted through the media-call
+  lifecycle, emitting `modality="video"`. Video generation is asynchronous — the
+  call returns a long-running operation carrying no usage — so billing settles at
+  INITIATION from request params: `config.duration_seconds` (read duck-typed from
+  both the config-object and dict shapes) at `config.resolution` →
+  `MediaUsage.video_seconds` / `resolution`, always marked `is_estimated=true`.
+  The pre-flight budget check prices a precise per-second cost, so an oversized
+  request is denied before the provider is called; the estimate is a deliberate,
+  conservative over-count (the provider does not charge for failed or blocked
+  generations). google-genai publishes no default duration, so an absent
+  `duration_seconds` stays `None` (tracked unpriced) rather than a guessed value.
+  The customer `prompt=` and any seed image bytes are never read; the returned
+  operation object passes through untouched — callers poll it themselves.
+- **OpenAI `videos.create` (Sora) is now budget-tracked.** `client.videos.create`
+  is intercepted through the same lifecycle, emitting `modality="video"`. Sora
+  returns an async video job carrying no usage, so billing likewise settles at
+  INITIATION from the top-level request params: `seconds` (a digit string per the
+  API reference, or an int duck-typed) → `MediaUsage.video_seconds`, and `size`
+  normalized to a resolution LABEL — `min(width, height) + "p"`, so
+  `1280x720`/`720x1280` → `720p`, `1792x1024`/`1024x1792` → `1024p`,
+  `1920x1080`/`1080x1920` → `1080p` — matched against the server's per-second
+  variant grid (an unparseable size passes through raw so the server fails loud on
+  a miss rather than mispricing). `is_estimated` is always `true`. OpenAI's API
+  reference documents stable defaults (`seconds` `"4"`, `size` `720x1280`), so an
+  omitted param settles the documented value — billing what the provider applies
+  is faithful — while a present-but-garbage duration stays `None` (tracked
+  unpriced) rather than a guessed value. The customer `prompt=` and reference-image
+  bytes are never read; the returned video job passes through untouched — callers
+  poll it themselves. Sora is OpenAI-only, so `videos.create` on an
+  OpenAI-compatible client fails loud with `UnsupportedSurfaceError`.
+
+### Changed
+
+- **`videos` and Google `generate_videos` graduated from warn-once to
+  intercepted.** Both leave the unshipped-spend-surface warn-once set — a metered
+  surface must not advertise itself as untracked (superseding the merge-1
+  warn-once posture entries and the trailing merge-2/merge-3 mentions of these two
+  surfaces). The Google dialect now carries no unshipped media surface, and the
+  OpenAI-dialect warn-once set holds only `translations` (reached via
+  `client.audio.translations`).

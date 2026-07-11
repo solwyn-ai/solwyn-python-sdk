@@ -16,6 +16,7 @@ from solwyn._privacy import (
     estimate_tokens_from_length,
     measure_google_image_media,
     measure_image_media,
+    measure_openai_video_media,
     measure_speech_media,
     measure_video_media,
 )
@@ -394,6 +395,53 @@ def _speech_spec() -> MediaSurfaceSpec:
 
 
 # ---------------------------------------------------------------------------
+# Video surface (openai dialect: client.videos.create — Sora)
+# ---------------------------------------------------------------------------
+
+
+def _measure_openai_video_media(kwargs: dict[str, Any], _response: Any) -> MediaUsage:
+    """Settled request-derived video ``MediaUsage`` for an OpenAI videos.create call.
+
+    The response is intentionally IGNORED: videos.create returns an async video
+    job with no usage, so the billable quantity is request-DETERMINED (top-level
+    ``seconds`` at the ``size``-derived resolution label). Video always settles at
+    INITIATION marked ``is_estimated=True`` — the same firewall builder serves both
+    the pre-flight estimate and this settled measurement.
+    """
+    return measure_openai_video_media(kwargs)
+
+
+def _openai_videos_spec() -> MediaSurfaceSpec:
+    """Build the OpenAI video ``MediaSurfaceSpec`` (Sora: request-derived per-second).
+
+    ``surface="video"`` is the adapter dispatch key (``OpenAIAdapter`` routes it to
+    ``client.videos.create``); ``modality="video"`` is the server billing modality.
+    Video generation is asynchronous — the call returns a video job carrying no
+    usage — so quantities are request-derived and billing settles at INITIATION:
+
+    - ``extract_usage`` returns None: the job object carries no token usage.
+    - ``measure_request`` returns None: no request-derived TOKEN estimate exists.
+    - ``measure_media`` / ``estimate_media`` build the request-derived
+      ``MediaUsage`` (top-level ``seconds`` → ``video_seconds`` at the
+      ``size``-derived resolution label), ALWAYS ``is_estimated=True``. The
+      pre-flight estimate is precise (seconds × the resolution variant's
+      per-second rate server-side, so an oversized request is denied before the
+      provider is called); the settle reuses the same builder because the returned
+      job offers nothing better. The over-count is deliberate and conservative.
+      ``seconds`` / ``size`` default to OpenAI's documented values when absent, so
+      a bare call is priced, never a silent $0.
+    """
+    return MediaSurfaceSpec(
+        surface="video",
+        modality="video",
+        extract_usage=lambda _response: None,
+        measure_request=lambda _kwargs: None,
+        measure_media=_measure_openai_video_media,
+        estimate_media=measure_openai_video_media,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Sync proxies
 # ---------------------------------------------------------------------------
 
@@ -590,6 +638,37 @@ class _SyncAudioProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through other audio attributes (e.g. with_raw_response) to the client."""
         return getattr(self._solwyn._client.audio, name)
+
+
+class _SyncVideosProxy:
+    """Proxy for client.videos that routes create() through the media lifecycle.
+
+    ``client.videos.create()`` (OpenAI's Sora video API) flows through
+    ``_media_call`` so video spend is budget-checked, confirmed, and reported.
+    Video generation is asynchronous — the call returns a video job carrying no
+    usage — so the sole billable basis is the request-derived per-second
+    ``MediaUsage`` (top-level ``seconds`` at the ``size``-derived resolution
+    label), settled at INITIATION with ``is_estimated=True``. The returned job
+    object is passed back untouched: callers poll it themselves; the SDK never
+    wraps or polls it. Every other ``videos`` attribute (``retrieve``,
+    ``download_content``, …) passes through untracked. Sora is OpenAI-only, so on
+    a non-openai client (including OpenAI-compatible profiles) ``.create()`` fails
+    loud with ``UnsupportedSurfaceError`` (that adapter serves no video seam). The
+    per-client spec is built once (it is provider-agnostic; the adapter dispatch
+    differs).
+    """
+
+    def __init__(self, solwyn: Solwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _openai_videos_spec()
+
+    def create(self, **kwargs: Any) -> Any:
+        """Intercept videos.create() with budget/confirm/reporting."""
+        return self._solwyn._media_call(self._spec, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through non-create attributes to the client's videos."""
+        return getattr(self._solwyn._client.videos, name)
 
 
 class _SyncMessagesProxy:
@@ -836,6 +915,32 @@ class _AsyncAudioProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through other audio attributes to the client."""
         return getattr(self._solwyn._client.audio, name)
+
+
+class _AsyncVideosProxy:
+    """Async proxy for client.videos that routes create() through the lifecycle.
+
+    Mirror of ``_SyncVideosProxy``: ``client.videos.create()`` (OpenAI's Sora
+    video API) flows through the async ``_media_call``, settled on the
+    request-derived per-second ``MediaUsage`` (top-level ``seconds`` at the
+    ``size``-derived resolution label) with ``is_estimated=True`` (the async video
+    job carries no usage). The returned job is passed back untouched — callers
+    poll it themselves. Every other ``videos`` attribute passes through to the
+    underlying client's videos; on a non-openai client ``.create()`` fails loud
+    with ``UnsupportedSurfaceError`` (Sora is OpenAI-only).
+    """
+
+    def __init__(self, solwyn: AsyncSolwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _openai_videos_spec()
+
+    async def create(self, **kwargs: Any) -> Any:
+        """Intercept videos.create() with budget/confirm/reporting."""
+        return await self._solwyn._media_call(self._spec, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through non-create attributes to the client's videos."""
+        return getattr(self._solwyn._client.videos, name)
 
 
 class _AsyncMessagesProxy:

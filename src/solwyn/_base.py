@@ -75,19 +75,17 @@ def _warn_cost_policy_inactive_once() -> None:
 # warn ONCE per process, then pass through untracked. Keyed by DIALECT because
 # the same posture spans every provider that speaks it — OpenAI itself and every
 # OpenAI-compatible provider share the "openai" set. Embeddings, openai
-# images, openai ``audio.transcriptions``, openai ``audio.speech``, and every
-# google media surface (``embed_content``, ``generate_images``,
-# ``generate_videos``) are deliberately ABSENT: they are intercepted, so they are
-# tracked rather than warned (a surface that is metered must not advertise itself
-# as untracked). The openai ``audio`` attribute is now intercepted machinery (its
-# proxy exposes transcriptions AND speech), so its one still-unwired SUB-surface
-# is what warns here: ``translations`` — plus ``videos``. The google dialect has
-# no still-unwired media surface, so it carries no entry (``.get`` yields the
-# empty frozenset). Attribute shapes differ by dialect: OpenAI exposes top-level
-# resources (``client.videos``) and audio sub-resources
-# (``client.audio.translations``), Google exposes methods on ``client.models``.
+# images, openai ``audio.transcriptions``, openai ``audio.speech``, openai
+# ``videos`` (Sora), and every google media surface (``embed_content``,
+# ``generate_images``, ``generate_videos``) are deliberately ABSENT: they are
+# intercepted, so they are tracked rather than warned (a surface that is metered
+# must not advertise itself as untracked). The openai ``audio`` attribute is now
+# intercepted machinery (its proxy exposes transcriptions AND speech), so its one
+# still-unwired SUB-surface is all that warns here: ``translations``, reached via
+# ``client.audio.translations``. The google dialect has no still-unwired media
+# surface, so it carries no entry (``.get`` yields the empty frozenset).
 _UNSHIPPED_SPEND_SURFACES: dict[str, frozenset[str]] = {
-    "openai": frozenset({"translations", "videos"}),
+    "openai": frozenset({"translations"}),
 }
 
 # Per-PROCESS warn-once latch for untracked spend surfaces (NOT per-instance): a

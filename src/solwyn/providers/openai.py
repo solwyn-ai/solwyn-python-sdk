@@ -487,13 +487,13 @@ class OpenAIAdapter:
         Embeddings route to ``client.embeddings.create``; images route to
         ``client.images.generate`` / ``.edit``; audio routes to
         ``client.audio.transcriptions.create`` (or ``.speech.create`` when the op
-        marker selects it) — the same ``(method, shaped_kwargs)`` shape
-        ``prepare_call`` returns for chat, with a defensive COPY of kwargs (never
-        mutate/alias the caller's dict). The remaining surface (video) is not wired
-        yet and fails loud with ``UnsupportedSurfaceError``. timeout/max_retries
-        are ignored for SDKs with ``with_options`` (the dispatcher already applied
-        them); a branch for an SDK without it applies them itself, like
-        ``prepare_call``.
+        marker selects it); video routes to ``client.videos.create`` (Sora) — the
+        same ``(method, shaped_kwargs)`` shape ``prepare_call`` returns for chat,
+        with a defensive COPY of kwargs (never mutate/alias the caller's dict). An
+        unrecognized surface fails loud with ``UnsupportedSurfaceError``.
+        timeout/max_retries are ignored for SDKs with ``with_options`` (the
+        dispatcher already applied them); a branch for an SDK without it applies
+        them itself, like ``prepare_call``.
         """
         if surface == "embeddings":
             return client.embeddings.create, dict(kwargs)
@@ -501,6 +501,8 @@ class OpenAIAdapter:
             return _prepare_image_media_call(client, kwargs)
         if surface == "audio":
             return _prepare_audio_media_call(client, kwargs)
+        if surface == "video":
+            return client.videos.create, dict(kwargs)
         raise UnsupportedSurfaceError(surface=surface, provider=self.name)
 
     def unwrap_stream_source(self, response: Any) -> Any:
