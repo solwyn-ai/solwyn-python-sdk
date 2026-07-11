@@ -109,6 +109,70 @@ def _extract_responses_api(usage: Any) -> TokenDetails:
     )
 
 
+def _extract_image_usage(response: Any) -> TokenDetails | None:
+    """Extract token usage from a gpt-image images.generate / images.edit response.
+
+    Module-level so the images ``MediaSurfaceSpec`` (in ``_proxies``) can reuse
+    it for native OpenAI and any compat endpoint that shares the shape. Token-
+    billed image models (gpt-image-1) report the Responses-style usage shape
+    with per-modality buckets (probe-verified 2026-07-10):
+
+        usage.input_tokens / usage.output_tokens
+        usage.input_tokens_details  = {image_tokens, text_tokens}
+        usage.output_tokens_details = {image_tokens, text_tokens}
+
+    The image buckets map onto ``image_input_tokens`` / ``image_output_tokens``
+    (image ⊂ input, image_output ⊂ output). There is NO cached image-input
+    bucket — the probe confirmed none exists, so this reads none. Returns None
+    when the response carries no usable usage (a compat images endpoint returns
+    ``usage: null``, and dall-e models report no usage) so the request-derived
+    ``MediaUsage`` becomes the sole billable basis rather than a silent $0.
+    Never raises.
+
+    (The Responses-API image-generation TOOL is out of scope here: its usage
+    lands on the chat surface's top-level ``response.tool_usage.image_gen`` and
+    must NOT be intercepted through this images proxy.)
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    input_tokens = _usage_value(getattr(usage, "input_tokens", None))
+    output_tokens = _usage_value(getattr(usage, "output_tokens", None))
+    if input_tokens <= 0 and output_tokens <= 0:
+        return None
+    input_details = getattr(usage, "input_tokens_details", None)
+    output_details = getattr(usage, "output_tokens_details", None)
+    return TokenDetails(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        image_input_tokens=_usage_value(getattr(input_details, "image_tokens", None)),
+        image_output_tokens=_usage_value(getattr(output_details, "image_tokens", None)),
+    )
+
+
+# Private marker the images proxy sets so images.edit vs images.generate can
+# ride the ONE "images" media surface through the shared lifecycle (mirrors the
+# chat ``_force_stream`` marker). The surface key is just "images", so the
+# operation rides kwargs and is STRIPPED here before the SDK call.
+_IMAGE_OP_KEY = "_solwyn_image_op"
+
+
+def _prepare_image_media_call(
+    client: Any, kwargs: dict[str, Any]
+) -> tuple[Callable[..., Any], dict[str, Any]]:
+    """Select client.images.generate / .edit and shape a COPY of kwargs.
+
+    Shared by the OpenAI adapter and every OpenAI-compatible adapter (same
+    ``client.images`` surface). Pops the private ``_IMAGE_OP_KEY`` marker
+    (default ``"generate"``) — never sends it to the SDK — and NEVER reads the
+    ``prompt`` / ``image`` / ``mask`` content, only re-shapes keys.
+    """
+    shaped = dict(kwargs)
+    operation = shaped.pop(_IMAGE_OP_KEY, "generate")
+    method = client.images.edit if operation == "edit" else client.images.generate
+    return method, shaped
+
+
 def _extract_service_tier(response: Any) -> str | None:
     """Return a bounded service_tier value, or None when absent/non-string."""
     tier = getattr(response, "service_tier", None)
@@ -216,17 +280,19 @@ class OpenAIAdapter:
     ) -> tuple[Callable[..., Any], dict[str, Any]]:
         """Per-surface dispatch seam for non-chat media surfaces.
 
-        Embeddings (P1.7) route to ``client.embeddings.create`` — the same
+        Embeddings (P1.7) route to ``client.embeddings.create``; images (P2.8)
+        route to ``client.images.generate`` / ``.edit`` — the same
         ``(method, shaped_kwargs)`` shape ``prepare_call`` returns for chat, with
         a defensive COPY of kwargs (never mutate/alias the caller's dict). The
-        remaining surfaces (P2 images, P3 audio, P4 video) are not wired yet and
-        fail loud with ``UnsupportedSurfaceError``. timeout/max_retries are
-        ignored for SDKs with ``with_options`` (the dispatcher already applied
-        them); a branch for an SDK without it applies them itself, like
-        ``prepare_call``.
+        remaining surfaces (P3 audio, P4 video) are not wired yet and fail loud
+        with ``UnsupportedSurfaceError``. timeout/max_retries are ignored for
+        SDKs with ``with_options`` (the dispatcher already applied them); a branch
+        for an SDK without it applies them itself, like ``prepare_call``.
         """
         if surface == "embeddings":
             return client.embeddings.create, dict(kwargs)
+        if surface == "images":
+            return _prepare_image_media_call(client, kwargs)
         raise UnsupportedSurfaceError(surface=surface, provider=self.name)
 
     def unwrap_stream_source(self, response: Any) -> Any:

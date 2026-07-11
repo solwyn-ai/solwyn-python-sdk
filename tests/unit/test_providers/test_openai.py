@@ -9,7 +9,11 @@ import pytest
 
 from solwyn._token_details import TokenDetails
 from solwyn.exceptions import UnsupportedSurfaceError
-from solwyn.providers.openai import OpenAIAdapter
+from solwyn.providers.openai import (
+    _IMAGE_OP_KEY,
+    OpenAIAdapter,
+    _extract_image_usage,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers — build fake OpenAI response objects
@@ -428,14 +432,125 @@ class TestOpenAIAdapterDispatchSeams:
         assert prepared == {"model": "text-embedding-3-small", "input": "hi"}
         assert prepared is not kwargs  # never mutates / aliases the input
 
+    def test_prepare_media_call_images_selects_generate_by_default(self) -> None:
+        # P2.8: images routes to client.images.generate with a COPY of kwargs.
+        def generate(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(images=SimpleNamespace(generate=generate, edit=lambda **k: k))
+        kwargs: dict[str, Any] = {"model": "gpt-image-1", "prompt": "a cat", "n": 2}
+
+        method, prepared = OpenAIAdapter().prepare_media_call(
+            "images", client, kwargs, timeout=30.0, max_retries=0
+        )
+
+        assert method is generate
+        assert prepared == {"model": "gpt-image-1", "prompt": "a cat", "n": 2}
+        assert prepared is not kwargs  # never mutates / aliases the input
+
+    def test_prepare_media_call_images_edit_marker_selects_edit_and_is_stripped(self) -> None:
+        # The private op marker routes edit vs generate and is NEVER sent to the SDK.
+        def edit(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(images=SimpleNamespace(generate=lambda **k: k, edit=edit))
+        kwargs: dict[str, Any] = {"model": "gpt-image-1", "prompt": "a cat", _IMAGE_OP_KEY: "edit"}
+
+        method, prepared = OpenAIAdapter().prepare_media_call(
+            "images", client, kwargs, timeout=30.0, max_retries=0
+        )
+
+        assert method is edit
+        assert _IMAGE_OP_KEY not in prepared  # marker stripped before the SDK call
+        assert prepared == {"model": "gpt-image-1", "prompt": "a cat"}
+
     def test_prepare_media_call_raises_unsupported_surface_for_unwired(self) -> None:
-        # Only embeddings is wired (P1.7); images/audio/video still fail loud
+        # embeddings (P1.7) + images (P2.8) are wired; audio/video still fail loud
         # with the structural, content-free UnsupportedSurfaceError.
         adapter = OpenAIAdapter()
-        for surface in ("images", "audio", "video"):
+        for surface in ("audio", "video"):
             with pytest.raises(UnsupportedSurfaceError) as excinfo:
                 adapter.prepare_media_call(
                     surface, object(), {"model": "m"}, timeout=30.0, max_retries=0
                 )
             assert excinfo.value.surface == surface
             assert excinfo.value.provider == "openai"
+
+
+@pytest.mark.unit
+class TestExtractImageUsage:
+    """gpt-image images.generate/edit usage extraction (P2.8)."""
+
+    def _image_response(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        input_image_tokens: int = 0,
+        output_image_tokens: int = 0,
+    ) -> Any:
+        return SimpleNamespace(
+            usage=SimpleNamespace(
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=input_tokens + output_tokens,
+                input_tokens_details=SimpleNamespace(
+                    image_tokens=input_image_tokens,
+                    text_tokens=input_tokens - input_image_tokens,
+                ),
+                output_tokens_details=SimpleNamespace(
+                    image_tokens=output_image_tokens,
+                    text_tokens=output_tokens - output_image_tokens,
+                ),
+            )
+        )
+
+    def test_reads_input_output_and_image_buckets(self) -> None:
+        # Probe-observed: input 222 = 194 image + 28 text; output all image.
+        resp = self._image_response(
+            input_tokens=222,
+            output_tokens=1024,
+            input_image_tokens=194,
+            output_image_tokens=1024,
+        )
+        details = _extract_image_usage(resp)
+        assert details is not None
+        assert details.input_tokens == 222
+        assert details.output_tokens == 1024
+        assert details.image_input_tokens == 194  # image ⊂ input
+        assert details.image_output_tokens == 1024  # image_output ⊂ output
+        assert details.is_estimated is False
+
+    def test_none_usage_returns_none(self) -> None:
+        # Compat FLUX returns usage: null -> None so the per-image MediaUsage is
+        # the sole billable basis (never a silent $0).
+        assert _extract_image_usage(SimpleNamespace(usage=None)) is None
+
+    def test_no_usage_attr_returns_none(self) -> None:
+        assert _extract_image_usage(SimpleNamespace()) is None
+
+    def test_zero_token_usage_returns_none(self) -> None:
+        # A usage block with zeroed input/output (dall-e-style / empty) yields None.
+        resp = self._image_response(input_tokens=0, output_tokens=0)
+        assert _extract_image_usage(resp) is None
+
+    def test_missing_detail_buckets_default_to_zero(self) -> None:
+        resp = SimpleNamespace(usage=SimpleNamespace(input_tokens=100, output_tokens=50))
+        details = _extract_image_usage(resp)
+        assert details is not None
+        assert details.input_tokens == 100
+        assert details.output_tokens == 50
+        assert details.image_input_tokens == 0
+        assert details.image_output_tokens == 0
+
+    def test_garbage_counts_degrade_without_raising(self) -> None:
+        resp = SimpleNamespace(
+            usage=SimpleNamespace(
+                input_tokens=-5,
+                output_tokens="abc",
+                input_tokens_details=SimpleNamespace(image_tokens=None),
+                output_tokens_details=None,
+            )
+        )
+        # Both totals degrade to 0 -> no usable usage -> None.
+        assert _extract_image_usage(resp) is None

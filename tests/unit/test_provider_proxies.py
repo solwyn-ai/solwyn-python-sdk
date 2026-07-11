@@ -19,6 +19,7 @@ from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import BudgetExceededError
+from solwyn.providers.openai import _IMAGE_OP_KEY
 
 
 @pytest.fixture(autouse=True)
@@ -95,6 +96,38 @@ def _mock_openai_embeddings_client(*, prompt_tokens: int = 42, usage: bool = Tru
         data=[SimpleNamespace(embedding=[0.1, 0.2], index=0)],
         usage=usage_block if usage else None,
     )
+    return client
+
+
+def _image_usage(*, native: bool):
+    """gpt-image usage block (native) or None (compat/dall-e usage-less)."""
+    if not native:
+        return None
+    return SimpleNamespace(
+        input_tokens=222,
+        output_tokens=1024,
+        total_tokens=1246,
+        input_tokens_details=SimpleNamespace(image_tokens=194, text_tokens=28),
+        output_tokens_details=SimpleNamespace(image_tokens=1024, text_tokens=0),
+    )
+
+
+def _mock_openai_images_client(*, native: bool = True):
+    """Mock openai.OpenAI() exposing an images surface (generate + edit).
+
+    ``native=True`` -> gpt-image token usage carrying image buckets; ``native=
+    False`` -> a compat/dall-e response with ``usage=None`` (per-image only).
+    """
+    client = MagicMock()
+    client.__class__.__module__ = "openai._client"
+    client.__class__.__name__ = "OpenAI"
+    client.with_options.return_value = client
+    response = SimpleNamespace(
+        data=[SimpleNamespace(b64_json="aGVsbG8=", url=None)],
+        usage=_image_usage(native=native),
+    )
+    client.images.generate.return_value = response
+    client.images.edit.return_value = response
     return client
 
 
@@ -470,6 +503,112 @@ class TestEmbeddingsProxy:
 
 
 # ---------------------------------------------------------------------------
+# OpenAI dialect: client.images.generate() / client.images.edit()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestImagesProxy:
+    """client.images.generate()/edit() route through the media lifecycle (_media_call)."""
+
+    def test_native_gpt_image_reports_token_and_media_bases(self) -> None:
+        # Native gpt-image sends BOTH bases: token usage (with image buckets) AND
+        # the request-derived per-image MediaUsage. The server's card unit picks.
+        client = _mock_openai_images_client(native=True)
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            solwyn.images.generate(
+                model="gpt-image-1", prompt="a cat", n=1, size="1024x1024", quality="low"
+            )
+
+        client.images.generate.assert_called_once()
+        client.images.edit.assert_not_called()
+        # The private op marker never reaches the SDK.
+        assert _IMAGE_OP_KEY not in client.images.generate.call_args.kwargs
+        assert len(reported) == 1
+        event = reported[0]
+        assert event.status == "success"
+        assert event.modality == "image"
+        # Token basis with image buckets (image ⊂ input, image_output ⊂ output).
+        assert event.input_tokens == 222
+        assert event.token_details.image_input_tokens == 194
+        assert event.token_details.image_output_tokens == 1024
+        assert event.token_details.is_estimated is False
+        # Media basis: request-derived config quantities.
+        assert event.media_usage.image_count == 1
+        assert event.media_usage.resolution == "1024x1024"
+        assert event.media_usage.quality == "low"
+        solwyn.close()
+
+    def test_compat_or_dalle_image_reports_media_only(self) -> None:
+        # A usage-less image response (compat FLUX / dall-e): no TOKEN basis, but
+        # the per-image MediaUsage IS observed -> reported (never a silent $0).
+        client = _mock_openai_images_client(native=False)
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            solwyn.images.generate(model="dall-e-3", prompt="a cat", n=2, size="1792x1024")
+
+        event = reported[0]
+        assert event.status == "success"
+        assert event.modality == "image"
+        assert event.token_details is None  # no token basis observed
+        assert event.input_tokens == 0
+        assert event.media_usage.image_count == 2
+        assert event.media_usage.resolution == "1792x1024"
+        solwyn.close()
+
+    def test_edit_routes_to_images_edit_with_marker_stripped(self) -> None:
+        client = _mock_openai_images_client(native=True)
+        solwyn = _make_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_budget(solwyn):
+            solwyn.images.edit(model="gpt-image-1", prompt="add a hat", image=b"png-bytes")
+
+        client.images.edit.assert_called_once()
+        client.images.generate.assert_not_called()
+        # The op marker routed the hop but is stripped before the SDK call.
+        assert _IMAGE_OP_KEY not in client.images.edit.call_args.kwargs
+        assert reported[0].status == "success"
+        assert reported[0].media_usage.image_count == 1
+        solwyn.close()
+
+    def test_images_create_variation_passes_through(self) -> None:
+        # create_variation is neither generate nor edit -> passes through untracked.
+        client = _mock_openai_images_client()
+        client.images.create_variation = MagicMock(return_value="varied")
+        solwyn = _make_solwyn(client)
+        assert solwyn.images.create_variation() == "varied"
+        solwyn.close()
+
+    def test_images_generate_checks_budget_and_denies(self) -> None:
+        client = _mock_openai_images_client()
+        solwyn = _make_solwyn(client, budget_mode="hard_deny")
+
+        deny_response = {
+            **ALLOW_BUDGET_RESPONSE,
+            "allowed": False,
+            "remaining_budget": 0.0,
+            "mode": "hard_deny",
+            "denied_by_period": "monthly",
+            "project_id": VALID_PROJECT_ID,
+        }
+        with _mock_budget(solwyn, deny_response), pytest.raises(BudgetExceededError):
+            solwyn.images.generate(model="gpt-image-1", prompt="a cat")
+
+        # Hard-deny short-circuits before the provider call.
+        client.images.generate.assert_not_called()
+        solwyn.close()
+
+
+# ---------------------------------------------------------------------------
 # Async variants
 # ---------------------------------------------------------------------------
 
@@ -651,6 +790,57 @@ class TestAsyncEmbeddingsProxy:
         assert reported[0].input_tokens == 99
         assert reported[0].output_tokens == 0
         assert result.usage.prompt_tokens == 99
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+
+@pytest.mark.unit
+class TestAsyncImagesProxy:
+    """Async client.images.generate()/edit() route through the async media lifecycle."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_native_gpt_image_reports_both_bases(self) -> None:
+        client = _mock_openai_images_client(native=True)
+        client.__class__.__name__ = "AsyncOpenAI"
+        client.images.generate = AsyncMockFn(return_value=client.images.generate.return_value)
+        solwyn = _make_async_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_async_budget(solwyn):
+            await solwyn.images.generate(model="gpt-image-1", prompt="a cat", n=1, size="1024x1024")
+
+        client.images.generate.assert_awaited_once()
+        assert _IMAGE_OP_KEY not in client.images.generate.call_args.kwargs
+        event = reported[0]
+        assert event.status == "success"
+        assert event.modality == "image"
+        assert event.token_details.image_input_tokens == 194
+        assert event.media_usage.image_count == 1
+        assert event.media_usage.resolution == "1024x1024"
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_edit_routes_to_images_edit(self) -> None:
+        client = _mock_openai_images_client(native=True)
+        client.__class__.__name__ = "AsyncOpenAI"
+        edit_response = client.images.edit.return_value
+        client.images.edit = AsyncMockFn(return_value=edit_response)
+        solwyn = _make_async_solwyn(client)
+        reported: list = []
+        solwyn._reporter.report = lambda e: reported.append(e)
+
+        with _mock_async_budget(solwyn):
+            await solwyn.images.edit(model="gpt-image-1", prompt="add a hat", image=b"png")
+
+        client.images.edit.assert_awaited_once()
+        assert _IMAGE_OP_KEY not in client.images.edit.call_args.kwargs
+        assert reported[0].media_usage.image_count == 1
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

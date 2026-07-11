@@ -29,7 +29,14 @@ from solwyn._routing import (
 )
 from solwyn._run import current_run
 from solwyn._token_details import TokenDetails
-from solwyn._types import CallStatus, FailoverReason, MetadataEvent, Modality, ProviderName
+from solwyn._types import (
+    CallStatus,
+    FailoverReason,
+    MediaUsage,
+    MetadataEvent,
+    Modality,
+    ProviderName,
+)
 from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.config import SolwynConfig
 from solwyn.tokenizer import TokenizerManager
@@ -67,14 +74,15 @@ def _warn_cost_policy_inactive_once() -> None:
 # Recognized spend surfaces whose interception phase has not shipped yet: they
 # warn ONCE per process, then pass through untracked. Keyed by DIALECT because
 # the same posture spans every provider that speaks it — OpenAI itself and every
-# OpenAI-compatible provider share the "openai" set. Embeddings is deliberately
-# ABSENT: P1.7 intercepts it on this branch, so it graduates to tracking rather
-# than warning (a surface that is about to be metered must not advertise itself
-# as untracked). Attribute shapes differ by dialect: OpenAI exposes top-level
-# resources (``client.images``), Google exposes methods on ``client.models``
-# (``client.models.generate_images``).
+# OpenAI-compatible provider share the "openai" set. Embeddings (P1.7) and images
+# (P2.8) are deliberately ABSENT: they are intercepted on this branch, so they
+# graduate to tracking rather than warning (a surface that is metered must not
+# advertise itself as untracked). audio (P3) and videos (P4) remain until their
+# interception phase ships. Attribute shapes differ by dialect: OpenAI exposes
+# top-level resources (``client.audio``), Google exposes methods on
+# ``client.models`` (``client.models.generate_videos``).
 _UNSHIPPED_SPEND_SURFACES: dict[str, frozenset[str]] = {
-    "openai": frozenset({"images", "audio", "videos"}),
+    "openai": frozenset({"audio", "videos"}),
     "google": frozenset({"generate_images", "generate_videos"}),
 }
 
@@ -208,22 +216,37 @@ class MediaSurfaceSpec:
       ``modality`` field (P1.11); ``_media_call`` connects ``spec.modality`` onto
       the budget check, the confirm, and the SUCCESS / BUDGET_DENIED metadata
       events. The chat pipeline never sets it and rides the ``"text"`` default.
-    - ``extract_usage``: pulls the billable quantity from the RESPONSE's usage
-      block, or None when the response reports none.
-    - ``measure_request``: derives the billable quantity from the REQUEST when
-      the response reports none (request-side measurement lands in
+    - ``extract_usage``: pulls the billable TOKEN quantity from the RESPONSE's
+      usage block, or None when the response reports none.
+    - ``measure_request``: derives the billable TOKEN quantity from the REQUEST
+      when the response reports none (request-side measurement lands in
       ``solwyn._privacy`` per P1.9). Returns None when the quantity is
       unobservable.
+    - ``measure_media``: OPTIONAL non-token quantity channel (P2.8). Derives the
+      settled ``MediaUsage`` (image counts, media seconds, character counts,
+      variant selectors) from the REQUEST and RESPONSE for a per-unit priced
+      surface. None (the default) for token-only surfaces like embeddings, which
+      carry no ``MediaUsage``. Kept SEPARATE from the token hooks so media
+      quantities are never shoehorned into ``TokenDetails`` (P1.6). Returns None
+      when unobservable.
+    - ``estimate_media``: OPTIONAL pre-flight non-token quantity (P2.8). Derives
+      the ``estimated_media`` from the REQUEST alone so the budget CHECK carries
+      a precise per-unit pre-flight cost. None (the default) for token-only
+      surfaces. Returns None when unobservable.
 
-    Both hooks return ``TokenDetails`` (the quantity carrier) or None — never a
-    zero-filled default, so an unobservable quantity is never settled as a real
-    $0 price.
+    The token hooks return ``TokenDetails`` and the media hooks ``MediaUsage`` —
+    each None (never a zero-filled default) when unobservable, so an unobservable
+    quantity is never settled as a real $0 price. BOTH bases ride the confirm
+    when both are observable (e.g. native gpt-image sends token usage AND
+    request-derived ``MediaUsage``); the server's pricing card unit picks.
     """
 
     surface: str
     modality: Modality
     extract_usage: Callable[[Any], TokenDetails | None]
     measure_request: Callable[[dict[str, Any]], TokenDetails | None]
+    measure_media: Callable[[dict[str, Any], Any], MediaUsage | None] | None = None
+    estimate_media: Callable[[dict[str, Any]], MediaUsage | None] | None = None
 
 
 class _AttemptContext(BaseModel):
@@ -419,6 +442,7 @@ class _SolwynBase:
         agent_run: tuple[str | None, str | None] | None = None,
         provider_region: str | None = None,
         modality: Modality = "text",
+        media_usage: MediaUsage | None = None,
     ) -> MetadataEvent:
         """Build a MetadataEvent for reporting to the cloud API.
 
@@ -428,6 +452,8 @@ class _SolwynBase:
         is per model AND region); None for providers without regional pricing.
         ``modality`` is the call modality — ``"text"`` for every chat event; the
         media lifecycle passes the surface's modality (e.g. ``"embedding"``).
+        ``media_usage`` carries a non-text surface's non-token quantities; None
+        for chat/text events (None-skipped on the wire).
         """
         if not call_id:
             raise RuntimeError("call_id is required for metadata reconciliation")
@@ -439,6 +465,7 @@ class _SolwynBase:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             token_details=token_details,
+            media_usage=media_usage,
             latency_ms=latency_ms,
             status=status,
             is_model_fallback=is_model_fallback,

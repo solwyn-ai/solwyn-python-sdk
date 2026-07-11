@@ -14,8 +14,11 @@ from solwyn._privacy import (
     estimate_content_length,
     estimate_embedding_input_tokens,
     estimate_tokens_from_length,
+    measure_image_media,
 )
 from solwyn._token_details import TokenDetails
+from solwyn._types import MediaUsage
+from solwyn.providers.openai import _IMAGE_OP_KEY, _extract_image_usage
 
 if TYPE_CHECKING:
     from solwyn.client import AsyncSolwyn, Solwyn
@@ -159,6 +162,53 @@ def _google_embeddings_spec() -> MediaSurfaceSpec:
 
 
 # ---------------------------------------------------------------------------
+# Images surface (openai dialect: native gpt-image token-billed + compat per-image)
+# ---------------------------------------------------------------------------
+
+
+def _measure_image_media(kwargs: dict[str, Any], _response: Any) -> MediaUsage:
+    """Settled request-derived image ``MediaUsage`` (config values only).
+
+    The response is intentionally IGNORED: image billing quantities are
+    request-DETERMINED (n images at a given size/quality). gpt-image echoes
+    size/quality at the top level of its response, but the request params are
+    preferred and measured in the firewall — response fields are never read for
+    billing (privacy). Because the estimate is EXACT for images, this settled
+    measurement and the pre-flight estimate use the same firewall builder.
+    """
+    return measure_image_media(kwargs)
+
+
+def _images_spec() -> MediaSurfaceSpec:
+    """Build the images ``MediaSurfaceSpec`` (openai dialect: native + all compat).
+
+    ``surface="images"`` is the adapter dispatch key; ``modality="image"`` is the
+    server billing modality. ONE spec covers native OpenAI (token-billed gpt-image,
+    whose usage carries image buckets) AND every compat profile (per-image,
+    usage-less):
+
+    - ``extract_usage`` reads gpt-image token usage (input/output incl. image
+      buckets), None when the endpoint reports none (compat FLUX returns
+      ``usage: null``; dall-e reports no usage).
+    - ``measure_request`` returns None: images have NO request-derived TOKEN
+      estimate (image tokens exist only in the gpt-image response usage). Image
+      quantities are non-token and ride ``measure_media`` instead.
+    - ``measure_media`` / ``estimate_media`` build the request-derived
+      ``MediaUsage`` (n->image_count, size->resolution, quality->quality) so BOTH
+      bases ride the call when observable; the server's card unit picks (native
+      gpt-image → token card; compat/dall-e → per-image card).
+    """
+    return MediaSurfaceSpec(
+        surface="images",
+        modality="image",
+        extract_usage=_extract_image_usage,
+        measure_request=lambda _kwargs: None,
+        measure_media=_measure_image_media,
+        estimate_media=measure_image_media,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Sync proxies
 # ---------------------------------------------------------------------------
 
@@ -222,6 +272,43 @@ class _SyncEmbeddingsProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's embeddings."""
         return getattr(self._solwyn._client.embeddings, name)
+
+
+class _SyncImagesProxy:
+    """Proxy for client.images that routes generate()/edit() through the media lifecycle.
+
+    ``client.images.generate()`` and ``client.images.edit()`` (OpenAI's images
+    API, shared by every OpenAI-compatible provider) flow through ``_media_call``
+    so image spend is budget-checked, confirmed, and reported. Both carry a
+    billable basis: native gpt-image reports token usage (with image buckets),
+    and every dialect carries the request-derived per-image quantity — BOTH are
+    sent when observable, and the server's card unit picks. Every OTHER
+    ``images`` attribute (``create_variation``, …) passes through untracked. On a
+    non-openai client the media seam raises ``UnsupportedSurfaceError`` (that
+    adapter serves no images seam). The per-client spec is built once (the spec
+    is provider-agnostic; the adapter dispatch differs).
+    """
+
+    def __init__(self, solwyn: Solwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _images_spec()
+
+    def generate(self, **kwargs: Any) -> Any:
+        """Intercept images.generate() with budget/confirm/reporting."""
+        return self._solwyn._media_call(self._spec, **kwargs)
+
+    def edit(self, **kwargs: Any) -> Any:
+        """Intercept images.edit() through the same lifecycle.
+
+        Both images ops share the ONE ``images`` surface; the private op marker
+        (stripped in ``prepare_media_call``) routes this hop to
+        ``client.images.edit`` rather than ``.generate``.
+        """
+        return self._solwyn._media_call(self._spec, **{**kwargs, _IMAGE_OP_KEY: "edit"})
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through non-generate/edit attributes to the client's images."""
+        return getattr(self._solwyn._client.images, name)
 
 
 class _SyncMessagesProxy:
@@ -343,6 +430,31 @@ class _AsyncEmbeddingsProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's embeddings."""
         return getattr(self._solwyn._client.embeddings, name)
+
+
+class _AsyncImagesProxy:
+    """Async proxy for client.images that routes generate()/edit() through the lifecycle.
+
+    Mirror of ``_SyncImagesProxy``: ``client.images.generate()`` and
+    ``client.images.edit()`` flow through the async ``_media_call``; every other
+    attribute passes through to the underlying client's images.
+    """
+
+    def __init__(self, solwyn: AsyncSolwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _images_spec()
+
+    async def generate(self, **kwargs: Any) -> Any:
+        """Intercept images.generate() with budget/confirm/reporting."""
+        return await self._solwyn._media_call(self._spec, **kwargs)
+
+    async def edit(self, **kwargs: Any) -> Any:
+        """Intercept images.edit() through the same async lifecycle (op marker routes it)."""
+        return await self._solwyn._media_call(self._spec, **{**kwargs, _IMAGE_OP_KEY: "edit"})
+
+    def __getattr__(self, name: str) -> Any:
+        """Pass through non-generate/edit attributes to the client's images."""
+        return getattr(self._solwyn._client.images, name)
 
 
 class _AsyncMessagesProxy:

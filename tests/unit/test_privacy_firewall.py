@@ -24,7 +24,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY
 
-from solwyn._privacy import estimate_embedding_input_tokens
+from solwyn._privacy import estimate_embedding_input_tokens, measure_image_media
 from solwyn._types import BudgetCheckRequest, BudgetConfirmRequest, MetadataEvent
 from solwyn.client import Solwyn
 
@@ -743,3 +743,56 @@ class TestEstimateEmbeddingInputTokens:
         result = estimate_embedding_input_tokens({"input": secret}, "openai")
         assert isinstance(result, int)
         assert result == len(secret) // 4  # 39 // 4 -> 9, content unrecoverable
+
+
+# --------------------------------------------------------------------------- #
+# Images request recognizer (P2.8) — config values only, content-free          #
+# --------------------------------------------------------------------------- #
+@pytest.mark.unit
+class TestMeasureImageMedia:
+    """measure_image_media reads ONLY the n/size/quality CONFIG values.
+
+    It lives in the content-privileged _privacy module but touches no customer
+    content: the ``prompt=`` (and ``image=`` / ``mask=`` bytes on an edit) are
+    never read. Only the non-content request parameters that determine billing
+    reach the returned MediaUsage.
+    """
+
+    def test_reads_n_size_quality(self) -> None:
+        usage = measure_image_media({"n": 3, "size": "1024x1024", "quality": "hd"})
+        assert usage.image_count == 3
+        assert usage.resolution == "1024x1024"
+        assert usage.quality == "hd"
+        # Exact request config, not an approximation.
+        assert usage.is_estimated is False
+
+    def test_missing_n_defaults_to_one(self) -> None:
+        # The OpenAI images API contract defaults n=1 — a TRUE known quantity,
+        # never a zero-as-default.
+        usage = measure_image_media({"size": "512x512"})
+        assert usage.image_count == 1
+
+    def test_no_media_selectors_leaves_them_none(self) -> None:
+        usage = measure_image_media({"n": 2})
+        assert usage.image_count == 2
+        assert usage.resolution is None
+        assert usage.quality is None
+
+    def test_garbage_n_degrades_to_one(self) -> None:
+        for bad in (0, -4, True, "two", None, 1.5):
+            assert measure_image_media({"n": bad}).image_count == 1
+
+    def test_non_string_or_overlong_selector_degrades_to_none(self) -> None:
+        # A non-str or >32-char selector neither raises nor mismatches the grid.
+        usage = measure_image_media({"size": 1024, "quality": "x" * 33})
+        assert usage.resolution is None
+        assert usage.quality is None
+
+    def test_prompt_content_is_never_read(self) -> None:
+        # The prompt / image bytes are present but MUST NOT surface anywhere in
+        # the returned MediaUsage (content-free by construction).
+        secret = "SUPER_SECRET_IMAGE_PROMPT_a1b2c3"
+        usage = measure_image_media(
+            {"n": 1, "size": "1024x1024", "prompt": secret, "image": b"binary-bytes"}
+        )
+        assert secret not in json.dumps(usage.model_dump(mode="json"))

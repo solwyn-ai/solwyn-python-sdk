@@ -25,6 +25,7 @@ from solwyn._types import (
     BudgetCheckResponse,
     BudgetConfirmRequest,
     BudgetMode,
+    MediaUsage,
     Modality,
     ProviderName,
     ServiceTier,
@@ -109,6 +110,7 @@ class _BudgetEnforcerBase:
         fallback_providers: list[str] | None = None,
         fallback_models: list[str] | None = None,
         modality: Modality = "text",
+        estimated_media: MediaUsage | None = None,
     ) -> BudgetCheckRequest:
         """Build a BudgetCheckRequest for the cloud API.
 
@@ -117,13 +119,16 @@ class _BudgetEnforcerBase:
         Both default to empty lists; the caller's lists are never mutated.
         ``modality`` is ``"text"`` for chat calls; the media lifecycle passes the
         surface's modality (e.g. ``"embedding"``) so the API prices the pending
-        call on the right basis.
+        call on the right basis. ``estimated_media`` carries a non-text surface's
+        pre-flight non-token quantities (image counts, media seconds, character
+        counts) for a precise check-time cost; None for chat/token calls.
         """
         return BudgetCheckRequest(
             estimated_input_tokens=estimated_input_tokens,
             model=model,
             provider=ProviderName(provider),
             modality=modality,
+            estimated_media=estimated_media,
             fallback_providers=[ProviderName(p) for p in (fallback_providers or [])],
             fallback_models=list(fallback_models or []),
         )
@@ -342,6 +347,7 @@ class _BudgetEnforcerBase:
         provider_region: str | None = None,
         service_tier: str | None = None,
         modality: Modality = "text",
+        media_usage: MediaUsage | None = None,
     ) -> BudgetConfirmRequest:
         """Build a validated confirm request for fire-and-forget callers.
 
@@ -358,6 +364,9 @@ class _BudgetEnforcerBase:
         raw echo still reaches the API on the MetadataEvent. ``modality`` is
         ``"text"`` for chat confirms; the media lifecycle passes the surface's
         modality (e.g. ``"embedding"``) so the API settles on the right basis.
+        ``media_usage`` carries a non-text surface's settled non-token quantities
+        so the API settles the enforcement counter on the per-unit basis; None
+        for chat/token confirms.
         """
         if not call_id:
             raise RuntimeError("call_id is required for budget confirm reconciliation")
@@ -371,6 +380,7 @@ class _BudgetEnforcerBase:
             modality=modality,
             is_provider_fallback=is_provider_fallback,
             token_details=token_details,
+            media_usage=media_usage,
             call_id=call_id,
             provider_region=provider_region,
             service_tier=cast("ServiceTier | None", service_tier),
@@ -413,13 +423,16 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         fallback_models: list[str] = [],  # noqa: B006 — read-only; never mutated
         timeout: float | None = None,
         modality: Modality = "text",
+        estimated_media: MediaUsage | None = None,
     ) -> BudgetCheckResult:
         """Check whether a call is within budget.
 
         ``fallback_providers``/``fallback_models`` describe the configured
         failover chain (aligned element-for-element) as a hint to the API.
         ``modality`` is ``"text"`` for chat; the media lifecycle passes the
-        surface's modality (e.g. ``"embedding"``).
+        surface's modality (e.g. ``"embedding"``). ``estimated_media`` carries a
+        non-text surface's pre-flight non-token quantities for a precise
+        check-time cost; None for chat/token calls.
 
         Behaviour matrix:
         - Cloud reachable + allowed: return allowed=True
@@ -446,7 +459,13 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 )
 
         request = self._build_check_request(
-            estimated_input_tokens, model, provider, fallback_providers, fallback_models, modality
+            estimated_input_tokens,
+            model,
+            provider,
+            fallback_providers,
+            fallback_models,
+            modality,
+            estimated_media,
         )
 
         try:
@@ -496,6 +515,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         provider_region: str | None = None,
         service_tier: str | None = None,
         modality: Modality = "text",
+        media_usage: MediaUsage | None = None,
     ) -> None:
         """Confirm actual token usage for a budget reservation.
 
@@ -517,6 +537,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 provider_region=provider_region,
                 service_tier=service_tier,
                 modality=modality,
+                media_usage=media_usage,
             )
             resp = self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",
@@ -582,6 +603,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         fallback_models: list[str] = [],  # noqa: B006 — read-only; never mutated
         timeout: float | None = None,
         modality: Modality = "text",
+        estimated_media: MediaUsage | None = None,
     ) -> BudgetCheckResult:
         """Async version of budget check. See BudgetEnforcer.check_budget."""
         if self._should_use_cache():
@@ -599,7 +621,13 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             )
 
         request = self._build_check_request(
-            estimated_input_tokens, model, provider, fallback_providers, fallback_models, modality
+            estimated_input_tokens,
+            model,
+            provider,
+            fallback_providers,
+            fallback_models,
+            modality,
+            estimated_media,
         )
 
         try:
@@ -649,6 +677,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         provider_region: str | None = None,
         service_tier: str | None = None,
         modality: Modality = "text",
+        media_usage: MediaUsage | None = None,
     ) -> None:
         """Async version of cost confirmation. See BudgetEnforcer.confirm_cost."""
         try:
@@ -662,6 +691,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 provider_region=provider_region,
                 service_tier=service_tier,
                 modality=modality,
+                media_usage=media_usage,
             )
             resp = await self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",
