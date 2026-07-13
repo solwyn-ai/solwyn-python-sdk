@@ -41,7 +41,11 @@ class TestOpenAIStreamAccumulator:
                 usage=SimpleNamespace(
                     prompt_tokens=150,
                     completion_tokens=83,
-                    prompt_tokens_details=SimpleNamespace(cached_tokens=20, audio_tokens=0),
+                    prompt_tokens_details=SimpleNamespace(
+                        cached_tokens=20,
+                        cache_write_tokens=30,
+                        audio_tokens=0,
+                    ),
                     completion_tokens_details=SimpleNamespace(
                         reasoning_tokens=10,
                         audio_tokens=0,
@@ -57,6 +61,8 @@ class TestOpenAIStreamAccumulator:
         assert result.input_tokens == 150
         assert result.output_tokens == 83
         assert result.cached_input_tokens == 20
+        assert result.cache_creation_5m_tokens == 30
+        assert result.cache_creation_1h_tokens == 0
         assert result.reasoning_tokens == 10
 
     def test_returns_zeros_when_no_usage_chunk(self) -> None:
@@ -78,7 +84,10 @@ class TestOpenAIStreamAccumulator:
                 usage=SimpleNamespace(
                     input_tokens=200,
                     output_tokens=100,
-                    input_tokens_details=SimpleNamespace(cached_tokens=50),
+                    input_tokens_details=SimpleNamespace(
+                        cached_tokens=50,
+                        cache_write_tokens=75,
+                    ),
                     output_tokens_details=SimpleNamespace(reasoning_tokens=15),
                 ),
                 choices=[],
@@ -88,6 +97,8 @@ class TestOpenAIStreamAccumulator:
         assert result.input_tokens == 200
         assert result.output_tokens == 100
         assert result.cached_input_tokens == 50
+        assert result.cache_creation_5m_tokens == 75
+        assert result.cache_creation_1h_tokens == 0
         assert result.reasoning_tokens == 15
 
     def test_responses_api_stream_extracts_full_breakdown(self) -> None:
