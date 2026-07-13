@@ -71,6 +71,9 @@ def _extract_chat_completions(usage: Any) -> TokenDetails:
         input_tokens=_usage_value(getattr(usage, "prompt_tokens", None)),
         output_tokens=_usage_value(getattr(usage, "completion_tokens", None)),
         cached_input_tokens=_usage_value(cached_tokens),
+        # OpenAI's provider-default/minimum 30-minute cache writes use the
+        # dataset's existing cache_write_5m bucket to preserve the wire contract.
+        cache_creation_5m_tokens=_usage_value(getattr(prompt_details, "cache_write_tokens", None)),
         audio_input_tokens=_usage_value(getattr(prompt_details, "audio_tokens", None)),
         reasoning_tokens=_usage_value(getattr(completion_details, "reasoning_tokens", None)),
         audio_output_tokens=_usage_value(getattr(completion_details, "audio_tokens", None)),
@@ -99,6 +102,7 @@ def _extract_responses_api(usage: Any) -> TokenDetails:
         input_tokens=_usage_value(getattr(usage, "input_tokens", None)),
         output_tokens=_usage_value(getattr(usage, "output_tokens", None)),
         cached_input_tokens=_usage_value(getattr(input_details, "cached_tokens", None)),
+        cache_creation_5m_tokens=_usage_value(getattr(input_details, "cache_write_tokens", None)),
         audio_input_tokens=_usage_value(getattr(input_details, "audio_tokens", None)),
         reasoning_tokens=_usage_value(getattr(output_details, "reasoning_tokens", None)),
         audio_output_tokens=_usage_value(getattr(output_details, "audio_tokens", None)),

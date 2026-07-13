@@ -20,6 +20,8 @@ from solwyn.providers.openai import (
 # Helpers — build fake OpenAI response objects
 # ---------------------------------------------------------------------------
 
+_ABSENT = object()
+
 
 def _chat_response(
     *,
@@ -31,6 +33,7 @@ def _chat_response(
     audio_output_tokens: int = 0,
     accepted_prediction_tokens: int = 0,
     rejected_prediction_tokens: int = 0,
+    cache_write_tokens: object = _ABSENT,
     include_details: bool = True,
 ) -> Any:
     """Build a fake Chat Completions API response (prompt_tokens naming)."""
@@ -39,6 +42,8 @@ def _chat_response(
             cached_tokens=cached_tokens,
             audio_tokens=audio_input_tokens,
         )
+        if cache_write_tokens is not _ABSENT:
+            prompt_details.cache_write_tokens = cache_write_tokens
         completion_details = SimpleNamespace(
             reasoning_tokens=reasoning_tokens,
             audio_tokens=audio_output_tokens,
@@ -69,16 +74,21 @@ def _responses_api_response(
     audio_output_tokens: int = 0,
     accepted_prediction_tokens: int = 0,
     rejected_prediction_tokens: int = 0,
+    cache_write_tokens: object = _ABSENT,
 ) -> Any:
     """Build a fake Responses API response with all token sub-fields."""
+    input_details = SimpleNamespace(
+        cached_tokens=cached_tokens,
+        audio_tokens=audio_input_tokens,
+    )
+    if cache_write_tokens is not _ABSENT:
+        input_details.cache_write_tokens = cache_write_tokens
+
     return SimpleNamespace(
         usage=SimpleNamespace(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            input_tokens_details=SimpleNamespace(
-                cached_tokens=cached_tokens,
-                audio_tokens=audio_input_tokens,
-            ),
+            input_tokens_details=input_details,
             output_tokens_details=SimpleNamespace(
                 reasoning_tokens=reasoning_tokens,
                 audio_tokens=audio_output_tokens,
@@ -236,9 +246,27 @@ class TestOpenAIAdapterExtractUsageChatCompletions:
         result = OpenAIAdapter().extract_usage(response)
         assert isinstance(result, TokenDetails)
 
-    def test_cache_creation_split_tokens_always_zero(self) -> None:
-        """OpenAI doesn't have cache creation tokens — both 5m/1h fields stay 0."""
+    def test_cache_write_tokens_absent_stays_zero(self) -> None:
         response = _chat_response(prompt_tokens=100, cached_tokens=50)
+        result = OpenAIAdapter().extract_usage(response)
+        assert result.cache_creation_5m_tokens == 0
+        assert result.cache_creation_1h_tokens == 0
+
+    def test_cache_write_tokens_map_to_existing_5m_bucket(self) -> None:
+        response = _chat_response(prompt_tokens=100, cache_write_tokens=25)
+        result = OpenAIAdapter().extract_usage(response)
+        assert result.cache_creation_5m_tokens == 25
+        assert result.cache_creation_1h_tokens == 0
+
+    @pytest.mark.parametrize(
+        "cache_write_tokens",
+        [None, -1, True, "25", 25.0, object()],
+    )
+    def test_unusable_cache_write_tokens_degrade_to_zero(self, cache_write_tokens: object) -> None:
+        response = _chat_response(
+            prompt_tokens=100,
+            cache_write_tokens=cache_write_tokens,
+        )
         result = OpenAIAdapter().extract_usage(response)
         assert result.cache_creation_5m_tokens == 0
         assert result.cache_creation_1h_tokens == 0
@@ -264,6 +292,31 @@ class TestOpenAIAdapterExtractUsageResponsesAPI:
         response = _responses_api_response(input_tokens=800, cached_tokens=200)
         result = OpenAIAdapter().extract_usage(response)
         assert result.cached_input_tokens == 200
+
+    def test_cache_write_tokens_absent_stays_zero(self) -> None:
+        response = _responses_api_response(input_tokens=800)
+        result = OpenAIAdapter().extract_usage(response)
+        assert result.cache_creation_5m_tokens == 0
+        assert result.cache_creation_1h_tokens == 0
+
+    def test_cache_write_tokens_map_to_existing_5m_bucket(self) -> None:
+        response = _responses_api_response(input_tokens=800, cache_write_tokens=200)
+        result = OpenAIAdapter().extract_usage(response)
+        assert result.cache_creation_5m_tokens == 200
+        assert result.cache_creation_1h_tokens == 0
+
+    @pytest.mark.parametrize(
+        "cache_write_tokens",
+        [None, -1, True, "200", 200.0, object()],
+    )
+    def test_unusable_cache_write_tokens_degrade_to_zero(self, cache_write_tokens: object) -> None:
+        response = _responses_api_response(
+            input_tokens=800,
+            cache_write_tokens=cache_write_tokens,
+        )
+        result = OpenAIAdapter().extract_usage(response)
+        assert result.cache_creation_5m_tokens == 0
+        assert result.cache_creation_1h_tokens == 0
 
     def test_reasoning_tokens(self) -> None:
         response = _responses_api_response(output_tokens=500, reasoning_tokens=150)

@@ -30,6 +30,8 @@ from solwyn.providers.together import TogetherAdapter
 # Helpers
 # ---------------------------------------------------------------------------
 
+_ABSENT = object()
+
 
 def _make_client(
     module_path: str = "openai._client",
@@ -49,15 +51,20 @@ def _usage_chunk(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     cached_tokens: int = 0,
+    cache_write_tokens: object = _ABSENT,
     service_tier: str | None = None,
 ) -> Any:
     """A final stream chunk carrying a standard usage block."""
+    prompt_details = SimpleNamespace(cached_tokens=cached_tokens)
+    if cache_write_tokens is not _ABSENT:
+        prompt_details.cache_write_tokens = cache_write_tokens
+
     chunk = SimpleNamespace(
         choices=[],
         usage=SimpleNamespace(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
+            prompt_tokens_details=prompt_details,
             completion_tokens_details=None,
         ),
     )
@@ -470,6 +477,16 @@ class TestExtractUsage:
         details = _adapter("zai").extract_usage(response)
         assert details.cached_input_tokens == 4
         assert details.reasoning_tokens == 0
+
+    def test_zai_cache_write_tokens_use_shared_openai_extractor(self) -> None:
+        response = _usage_chunk(
+            prompt_tokens=10,
+            completion_tokens=5,
+            cache_write_tokens=3,
+        )
+        details = _adapter("zai").extract_usage(response)
+        assert details.cache_creation_5m_tokens == 3
+        assert details.cache_creation_1h_tokens == 0
 
     def test_missing_usage_extracts_zeros(self) -> None:
         details = _adapter("groq").extract_usage(SimpleNamespace(usage=None))
