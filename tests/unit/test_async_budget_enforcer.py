@@ -28,6 +28,18 @@ _ALERT_ONLY_DENY_RESPONSE = {
     "mode": "alert_only",
 }
 
+_RUN_DENY_RESPONSE = {
+    **_DENY_RESPONSE,
+    "denied_by_period": "agent_run",
+}
+
+
+def _response(payload: dict[str, object]) -> MagicMock:
+    response = MagicMock(spec=httpx.Response)
+    response.json.return_value = payload
+    response.raise_for_status = MagicMock()
+    return response
+
 
 def _error_response(status_code: int) -> MagicMock:
     """A 4xx/5xx httpx.Response stand-in: raise_for_status raises HTTPStatusError.
@@ -170,6 +182,193 @@ class TestAsyncFailOpen:
         assert result.warning is not None
         assert "fail-open" in result.warning.lower()
         await enforcer.close()
+
+
+@pytest.mark.unit
+class TestAsyncScopedCacheAndStickyDenials:
+    """Async mirror of run-scoped cache and sticky-deny behavior."""
+
+    @pytest.mark.asyncio
+    async def test_hot_global_allow_does_not_skip_or_get_overwritten_by_scoped_checks(
+        self,
+    ) -> None:
+        enforcer = _make_async_enforcer()
+        enforcer._http.post = AsyncMock(
+            side_effect=[
+                _response({**ALLOW_BUDGET_RESPONSE, "reservation_id": "res_global"}),
+                _response({**ALLOW_BUDGET_RESPONSE, "reservation_id": "res_run_a"}),
+                _response({**ALLOW_BUDGET_RESPONSE, "reservation_id": "res_run_b"}),
+            ]
+        )
+
+        await enforcer.check_budget(estimated_input_tokens=500, model="gpt-4o", provider="openai")
+        await enforcer.check_budget(
+            estimated_input_tokens=500,
+            model="gpt-4o",
+            provider="openai",
+            agent_run_id="run_a",
+        )
+        await enforcer.check_budget(
+            estimated_input_tokens=500,
+            model="gpt-4o",
+            provider="openai",
+            agent_run_id="run_b",
+        )
+        unscoped = await enforcer.check_budget(
+            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+        )
+
+        assert enforcer._http.post.call_count == 3
+        assert enforcer._http.post.call_args_list[1].kwargs["json"]["agent_run_id"] == "run_a"
+        assert enforcer._http.post.call_args_list[2].kwargs["json"]["agent_run_id"] == "run_b"
+        assert enforcer._cached_response is not None
+        assert enforcer._cached_response.reservation_id == "res_global"
+        assert unscoped.reservation_id is None
+        await enforcer.close()
+
+    @pytest.mark.asyncio
+    async def test_run_deny_is_sticky_only_for_same_run_during_outage(self) -> None:
+        enforcer = _make_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer._http.post = AsyncMock(
+            side_effect=[
+                _response(_RUN_DENY_RESPONSE),
+                httpx.ConnectError("unreachable"),
+                httpx.ConnectError("unreachable"),
+            ]
+        )
+
+        denied_a = await enforcer.check_budget(
+            estimated_input_tokens=500,
+            model="gpt-4o",
+            provider="openai",
+            agent_run_id="run_a",
+        )
+        outage_b = await enforcer.check_budget(
+            estimated_input_tokens=500,
+            model="gpt-4o",
+            provider="openai",
+            agent_run_id="run_b",
+        )
+        outage_a = await enforcer.check_budget(
+            estimated_input_tokens=500,
+            model="gpt-4o",
+            provider="openai",
+            agent_run_id="run_a",
+        )
+
+        assert denied_a.allowed is False
+        assert outage_b.allowed is True
+        assert outage_a.allowed is False
+        await enforcer.close()
+
+    @pytest.mark.asyncio
+    async def test_run_hard_deny_clears_older_global_project_deny_for_other_runs(
+        self,
+    ) -> None:
+        enforcer = _make_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer._http.post = AsyncMock(
+            side_effect=[
+                _response(_DENY_RESPONSE),
+                _response(_RUN_DENY_RESPONSE),
+                httpx.ConnectError("unreachable"),
+            ]
+        )
+
+        project_denied = await enforcer.check_budget(
+            estimated_input_tokens=500,
+            model="gpt-4o",
+            provider="openai",
+        )
+        run_a_denied = await enforcer.check_budget(
+            estimated_input_tokens=500,
+            model="gpt-4o",
+            provider="openai",
+            agent_run_id="run_a",
+        )
+        outage_b = await enforcer.check_budget(
+            estimated_input_tokens=500,
+            model="gpt-4o",
+            provider="openai",
+            agent_run_id="run_b",
+        )
+
+        assert project_denied.allowed is False
+        assert run_a_denied.allowed is False
+        assert outage_b.allowed is True
+        assert outage_b.warning is not None
+        assert "fail-open" in outage_b.warning.lower()
+        await enforcer.close()
+
+    @pytest.mark.asyncio
+    async def test_scoped_project_alert_only_response_clears_older_run_hard_deny(
+        self,
+    ) -> None:
+        enforcer = _make_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer._http.post = AsyncMock(
+            side_effect=[
+                _response(_RUN_DENY_RESPONSE),
+                _response(_ALERT_ONLY_DENY_RESPONSE),
+                httpx.ConnectError("unreachable"),
+            ]
+        )
+
+        hard_denied = await enforcer.check_budget(
+            estimated_input_tokens=500,
+            model="gpt-4o",
+            provider="openai",
+            agent_run_id="run_a",
+        )
+        alert_only = await enforcer.check_budget(
+            estimated_input_tokens=500,
+            model="gpt-4o",
+            provider="openai",
+            agent_run_id="run_a",
+        )
+        outage = await enforcer.check_budget(
+            estimated_input_tokens=500,
+            model="gpt-4o",
+            provider="openai",
+            agent_run_id="run_a",
+        )
+
+        assert hard_denied.allowed is False
+        assert alert_only.allowed is True
+        assert outage.allowed is True
+        assert outage.warning is not None
+        assert "fail-open" in outage.warning.lower()
+        await enforcer.close()
+
+    @pytest.mark.asyncio
+    async def test_project_period_deny_received_in_scope_stays_globally_sticky(self) -> None:
+        enforcer = _make_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer._http.post = AsyncMock(
+            side_effect=[
+                _response(_DENY_RESPONSE),
+                httpx.ConnectError("unreachable"),
+            ]
+        )
+
+        denied = await enforcer.check_budget(
+            estimated_input_tokens=500,
+            model="gpt-4o",
+            provider="openai",
+            agent_run_id="run_a",
+        )
+        outage_b = await enforcer.check_budget(
+            estimated_input_tokens=500,
+            model="gpt-4o",
+            provider="openai",
+            agent_run_id="run_b",
+        )
+
+        assert denied.allowed is False
+        assert outage_b.allowed is False
+        await enforcer.close()
+
+
+@pytest.mark.unit
+class TestAsyncFailOpenSticky:
+    """Legacy global sticky hard-deny behavior during cloud outages."""
 
     @pytest.mark.unit
     @pytest.mark.asyncio

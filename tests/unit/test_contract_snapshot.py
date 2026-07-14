@@ -67,11 +67,12 @@ EXPECTED_CHECK_FIELDS = {
     "estimated_media",
     "fallback_providers",
     "fallback_models",
+    "agent_run_id",
 }
 
 # The optional check field the None-skipping serializer drops when unset —
 # text/chat checks stay byte-identical to the pre-window-2 wire.
-_NONE_SKIPPED_CHECK_FIELDS = {"estimated_media"}
+_NONE_SKIPPED_CHECK_FIELDS = {"estimated_media", "agent_run_id"}
 
 EXPECTED_CHECK_RESPONSE_FIELDS = {
     "allowed",
@@ -271,6 +272,44 @@ class TestWireModelDumpSnapshots:
         assert (
             set(req.model_dump(mode="json")) == EXPECTED_CHECK_FIELDS - _NONE_SKIPPED_CHECK_FIELDS
         )
+        assert req.model_dump(mode="json") == {
+            "estimated_input_tokens": 10,
+            "model": "gpt-4o",
+            "provider": "openai",
+            "modality": "text",
+            "fallback_providers": ["anthropic"],
+            "fallback_models": ["claude-x"],
+        }
+
+    def test_budget_check_request_scoped_dump_carries_agent_run_id(self) -> None:
+        req = BudgetCheckRequest(
+            estimated_input_tokens=10,
+            model="gpt-4o",
+            provider=ProviderName.OPENAI,
+            agent_run_id="run_abc",
+        )
+
+        dumped = req.model_dump(mode="json")
+
+        assert set(dumped) == EXPECTED_CHECK_FIELDS - {"estimated_media"}
+        assert dumped["agent_run_id"] == "run_abc"
+
+    def test_budget_check_request_agent_run_id_length_boundary(self) -> None:
+        accepted = BudgetCheckRequest(
+            estimated_input_tokens=10,
+            model="gpt-4o",
+            provider=ProviderName.OPENAI,
+            agent_run_id="x" * 256,
+        )
+
+        assert accepted.agent_run_id == "x" * 256
+        with pytest.raises(ValidationError):
+            BudgetCheckRequest(
+                estimated_input_tokens=10,
+                model="gpt-4o",
+                provider=ProviderName.OPENAI,
+                agent_run_id="x" * 257,
+            )
 
     def test_budget_check_request_media_dump_carries_estimated_media(self) -> None:
         # A non-text check: estimated_media rides the wire so the server prices a
@@ -283,7 +322,7 @@ class TestWireModelDumpSnapshots:
             estimated_media=MediaUsage(image_count=2, resolution="1024x1024", quality="low"),
         )
         dumped = req.model_dump(mode="json")
-        assert set(dumped) == EXPECTED_CHECK_FIELDS
+        assert set(dumped) == EXPECTED_CHECK_FIELDS - {"agent_run_id"}
         assert dumped["estimated_media"]["image_count"] == 2
         assert dumped["modality"] == "image"
 

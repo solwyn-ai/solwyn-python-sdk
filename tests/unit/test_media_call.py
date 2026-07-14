@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
+import solwyn as solwyn_pkg
 from solwyn._base import MediaSurfaceSpec
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetMode, CallStatus, MediaUsage
@@ -113,6 +114,7 @@ class TestMediaCallSync:
             patch.object(solwyn._budget, "confirm_cost") as confirm,
             patch.object(solwyn._reporter, "report") as report,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            solwyn_pkg.run("sync-media") as run_id,
         ):
             result = solwyn._media_call(
                 _spec(), model="text-embedding-3-small", input="hello world"
@@ -125,6 +127,7 @@ class TestMediaCallSync:
         # the spec's modality rides the check so the API prices the pending call.
         assert check.call_args.kwargs["provider"] == "openai"
         assert check.call_args.kwargs["modality"] == "embedding"
+        assert check.call_args.kwargs["agent_run_id"] == run_id
         assert "fallback_providers" not in check.call_args.kwargs
         assert "fallback_models" not in check.call_args.kwargs
 
@@ -142,6 +145,7 @@ class TestMediaCallSync:
         assert event.is_provider_fallback is False
         assert event.input_tokens == 42
         assert event.modality == "embedding"
+        assert event.agent_run_id == run_id
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
@@ -329,14 +333,16 @@ class TestMediaCallAsync:
             patch.object(solwyn._reporter, "report") as report,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
         ):
-            result = await solwyn._media_call(
-                _spec(), model="text-embedding-3-small", input="hello"
-            )
+            async with solwyn_pkg.run("async-media") as run_id:
+                result = await solwyn._media_call(
+                    _spec(), model="text-embedding-3-small", input="hello"
+                )
 
         assert result is resp
         client.embeddings.create.assert_awaited_once()
         assert check.call_args.kwargs["provider"] == "openai"
         assert check.call_args.kwargs["modality"] == "embedding"
+        assert check.call_args.kwargs["agent_run_id"] == run_id
         confirm.assert_awaited_once()
         assert confirm.call_args.args[2].input_tokens == 99
         assert confirm.call_args.kwargs["modality"] == "embedding"
@@ -344,6 +350,7 @@ class TestMediaCallAsync:
         assert event.status == CallStatus.SUCCESS
         assert event.is_model_fallback is False
         assert event.modality == "embedding"
+        assert event.agent_run_id == run_id
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

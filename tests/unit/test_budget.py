@@ -37,6 +37,18 @@ _ALERT_ONLY_DENY_RESPONSE = {
     "mode": "alert_only",
 }
 
+_RUN_DENY_RESPONSE = {
+    **_DENY_RESPONSE,
+    "denied_by_period": "agent_run",
+}
+
+
+def _response(payload: dict[str, object]) -> MagicMock:
+    response = MagicMock(spec=httpx.Response)
+    response.json.return_value = payload
+    response.raise_for_status = MagicMock()
+    return response
+
 
 def _make_enforcer(**overrides):
     """Create a BudgetEnforcer with sensible test defaults."""
@@ -70,6 +82,21 @@ class TestBudgetEnforcerBase:
         assert req.estimated_input_tokens == 500
         assert req.model == "gpt-4o"
         assert req.provider == "openai"
+
+    def test_build_check_request_carries_agent_run_id(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+
+        req = base._build_check_request(
+            500,
+            "gpt-4o",
+            "openai",
+            agent_run_id="run_abc",
+        )
+
+        assert req.agent_run_id == "run_abc"
 
     def test_local_cost_tracking(self) -> None:
         base = _BudgetEnforcerBase(
@@ -501,6 +528,245 @@ class TestCacheBehaviour:
 
             # Both calls should hit HTTP (deny is never cached)
             assert mock_post.call_count == 2
+
+
+@pytest.mark.unit
+class TestScopedCacheAndStickyDenials:
+    """Run-scoped decisions bypass global allows and preserve deny isolation."""
+
+    def test_hot_global_allow_does_not_skip_or_get_overwritten_by_scoped_checks(self) -> None:
+        enforcer = _make_enforcer()
+        global_allow = _response({**ALLOW_BUDGET_RESPONSE, "reservation_id": "res_global"})
+        run_a_allow = _response({**ALLOW_BUDGET_RESPONSE, "reservation_id": "res_run_a"})
+        run_b_allow = _response({**ALLOW_BUDGET_RESPONSE, "reservation_id": "res_run_b"})
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[global_allow, run_a_allow, run_b_allow],
+        ) as mock_post:
+            enforcer.check_budget(estimated_input_tokens=500, model="gpt-4o", provider="openai")
+            enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+            enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_b",
+            )
+            unscoped = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            )
+
+        assert mock_post.call_count == 3
+        assert mock_post.call_args_list[1].kwargs["json"]["agent_run_id"] == "run_a"
+        assert mock_post.call_args_list[2].kwargs["json"]["agent_run_id"] == "run_b"
+        assert enforcer._cached_response is not None
+        assert enforcer._cached_response.reservation_id == "res_global"
+        assert unscoped.reservation_id is None
+
+    def test_run_deny_is_sticky_only_for_same_run_during_outage(self) -> None:
+        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[
+                _response(_RUN_DENY_RESPONSE),
+                httpx.ConnectError("unreachable"),
+                httpx.ConnectError("unreachable"),
+            ],
+        ):
+            denied_a = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+            outage_b = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_b",
+            )
+            outage_a = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+
+        assert denied_a.allowed is False
+        assert outage_b.allowed is True
+        assert outage_a.allowed is False
+        assert outage_a.warning is not None
+        assert "preserving prior hard deny" in outage_a.warning.lower()
+
+    def test_run_hard_deny_clears_older_global_project_deny_for_other_runs(self) -> None:
+        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[
+                _response(_DENY_RESPONSE),
+                _response(_RUN_DENY_RESPONSE),
+                httpx.ConnectError("unreachable"),
+            ],
+        ):
+            project_denied = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+            )
+            run_a_denied = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+            outage_b = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_b",
+            )
+
+        assert project_denied.allowed is False
+        assert run_a_denied.allowed is False
+        assert outage_b.allowed is True
+        assert outage_b.warning is not None
+        assert "fail-open" in outage_b.warning.lower()
+
+    def test_authoritative_allow_clears_only_same_run_sticky_deny(self) -> None:
+        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[
+                _response(_RUN_DENY_RESPONSE),
+                _response(_RUN_DENY_RESPONSE),
+                _response(ALLOW_BUDGET_RESPONSE),
+                httpx.ConnectError("unreachable"),
+                httpx.ConnectError("unreachable"),
+            ],
+        ):
+            enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+            enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_b",
+            )
+            enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+            outage_a = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+            outage_b = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_b",
+            )
+
+        assert outage_a.allowed is True
+        assert outage_b.allowed is False
+
+    def test_project_period_deny_received_in_scope_stays_globally_sticky(self) -> None:
+        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[
+                _response(_DENY_RESPONSE),
+                httpx.ConnectError("unreachable"),
+            ],
+        ):
+            denied = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+            outage_b = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_b",
+            )
+
+        assert denied.allowed is False
+        assert outage_b.allowed is False
+
+    def test_scoped_project_alert_only_response_clears_older_run_hard_deny(self) -> None:
+        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[
+                _response(_RUN_DENY_RESPONSE),
+                _response(_ALERT_ONLY_DENY_RESPONSE),
+                httpx.ConnectError("unreachable"),
+            ],
+        ):
+            hard_denied = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+            alert_only = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+            outage = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-4o",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+
+        assert hard_denied.allowed is False
+        assert alert_only.allowed is True
+        assert outage.allowed is True
+        assert outage.warning is not None
+        assert "fail-open" in outage.warning.lower()
+
+    def test_run_sticky_denials_are_bounded_and_evict_least_recently_used(self) -> None:
+        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        response = BudgetCheckResponse(**_RUN_DENY_RESPONSE)
+
+        for index in range(128):
+            enforcer._cache_response(response, agent_run_id=f"run_{index}")
+        assert enforcer._build_prior_hard_deny_unavailable_result("run_0") is not None
+        enforcer._cache_response(response, agent_run_id="run_128")
+
+        assert len(enforcer._run_hard_deny_responses) == 128
+        assert "run_0" in enforcer._run_hard_deny_responses
+        assert "run_1" not in enforcer._run_hard_deny_responses
+        assert "run_128" in enforcer._run_hard_deny_responses
 
 
 # ---------------------------------------------------------------------------

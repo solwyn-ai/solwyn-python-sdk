@@ -337,10 +337,9 @@ class BudgetCheckRequest(BaseModel):
     ) -> dict[str, Any]:
         """Serialize checks without null-valued optional fields.
 
-        ``estimated_media`` is the only optional (None-able) field; skipping it
-        when None keeps every text/chat check's wire bytes byte-identical to the
-        pre-window-2 wire (the deployed Cloud-API model forbids unknown keys and
-        accepts the field absent). The always-present fields (modality, the
+        ``estimated_media`` and ``agent_run_id`` are optional fields; skipping
+        them when None keeps unscoped text/chat check wire bytes byte-identical
+        to the legacy wire. The always-present fields (modality and the
         fallback-chain lists) never go None, so they always serialize.
         """
         data = handler(self)
@@ -381,6 +380,11 @@ class BudgetCheckRequest(BaseModel):
         default_factory=list,
         max_length=8,
         description="Failover models aligned element-for-element with fallback_providers",
+    )
+    agent_run_id: str | None = Field(
+        default=None,
+        max_length=AGENT_RUN_ID_MAX_LENGTH,
+        description="Stable id for the active solwyn.run() scope, when present.",
     )
 
     @model_validator(mode="after")

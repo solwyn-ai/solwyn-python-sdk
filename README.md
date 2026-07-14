@@ -327,6 +327,14 @@ client = Solwyn(
 | `alert_only` | Log a warning when budget is exceeded (default) |
 | `hard_deny` | Raise `BudgetExceededError` and block the call |
 
+Inside `solwyn.run(...)`, every preflight check carries the active run ID. Run-scoped
+checks bypass the SDK's global allow cache, so a cached allow for one run cannot
+authorize another run. Cloud usage visibility is asynchronous, however: with the
+defaults, the conservative transition/leak upper bound after a cap is crossed is
+approximately 10 seconds — up to the 5-second global allow-cache TTL plus the
+reporter's 5-second flush interval. This describes pre-existing/global cached work
+and delayed server visibility; it does not mean ingest is synchronous.
+
 ```python
 from solwyn import BudgetExceededError
 
