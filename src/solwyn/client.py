@@ -828,6 +828,7 @@ class Solwyn(_SolwynBase):
             timeout=_budget_timeout(deadline),
             modality=spec.modality,
             estimated_media=estimated_media,
+            agent_run_id=agent_run[0],
         )
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
@@ -972,6 +973,7 @@ class Solwyn(_SolwynBase):
             fallback_providers=[r.entry.provider.value for r in self._runtimes[1:]],
             fallback_models=[r.entry.model for r in self._runtimes[1:]],
             timeout=_budget_timeout(deadline),
+            agent_run_id=agent_run[0],
         )
         # Refresh the CostPolicy signal from the server. Price hints are advisory
         # and slow-moving, so they PERSIST across hint-less responses — a budget
@@ -1746,6 +1748,7 @@ class AsyncSolwyn(_SolwynBase):
             timeout=_budget_timeout(deadline),
             modality=spec.modality,
             estimated_media=estimated_media,
+            agent_run_id=agent_run[0],
         )
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
@@ -1877,6 +1880,7 @@ class AsyncSolwyn(_SolwynBase):
             fallback_providers=[r.entry.provider.value for r in self._runtimes[1:]],
             fallback_models=[r.entry.model for r in self._runtimes[1:]],
             timeout=_budget_timeout(deadline),
+            agent_run_id=agent_run[0],
         )
         # Refresh the CostPolicy signal from the server. Hints PERSIST across
         # hint-less responses (cache hits) until the server sends new ones — see

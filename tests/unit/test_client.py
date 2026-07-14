@@ -389,7 +389,7 @@ class TestBudgetCheckBeforeCall:
             "mode": "hard_deny",
             "budget_limit": 10.0,
             "current_usage": 10.0,
-            "denied_by_period": "monthly",
+            "denied_by_period": "agent_run",
             "project_id": VALID_PROJECT_ID,
         }
         mock_budget_response = MagicMock()
@@ -397,7 +397,9 @@ class TestBudgetCheckBeforeCall:
         mock_budget_response.raise_for_status = MagicMock()
 
         with (
-            patch.object(solwyn._budget._http, "post", return_value=mock_budget_response),
+            patch.object(
+                solwyn._budget._http, "post", return_value=mock_budget_response
+            ) as mock_post,
             patch.object(solwyn._reporter, "report") as mock_report,
             solwyn_pkg.run("expensive-job") as run_id,
             pytest.raises(BudgetExceededError),
@@ -412,6 +414,8 @@ class TestBudgetCheckBeforeCall:
         assert event.status == "budget_denied"
         assert event.agent_run_id == run_id
         assert event.agent_run_name == "expensive-job"
+        assert mock_post.call_args.kwargs["json"]["agent_run_id"] == run_id
+        client.chat.completions.create.assert_not_called()
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
@@ -769,7 +773,9 @@ class TestRichTokenExtraction:
         solwyn._reporter.report = lambda e: reported_events.append(e)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()),
+            patch.object(
+                solwyn._budget, "check_budget", return_value=_allow_budget_result()
+            ) as check,
             solwyn_pkg.run("nightly-batch") as run_id,
         ):
             solwyn.chat.completions.create(
@@ -778,6 +784,7 @@ class TestRichTokenExtraction:
             )
 
         assert len(reported_events) == 1
+        assert check.call_args.kwargs["agent_run_id"] == run_id
         assert reported_events[0].agent_run_id == run_id
         assert reported_events[0].agent_run_name == "nightly-batch"
 
@@ -1568,7 +1575,7 @@ class TestAsyncNonStreamingInterception:
             solwyn._budget,
             "check_budget",
             new=AsyncMockFn(return_value=deny_result),
-        ):
+        ) as check:
             async with solwyn_pkg.run("async-expensive-job") as run_id:
                 with pytest.raises(BudgetExceededError):
                     await solwyn.chat.completions.create(
@@ -1577,6 +1584,7 @@ class TestAsyncNonStreamingInterception:
                     )
 
         client.chat.completions.create.assert_not_called()
+        assert check.call_args.kwargs["agent_run_id"] == run_id
         assert len(reported_events) == 1
         assert reported_events[0].status == "budget_denied"
         assert reported_events[0].agent_run_id == run_id
@@ -1671,7 +1679,7 @@ class TestAsyncNonStreamingInterception:
             solwyn._budget,
             "check_budget",
             new=AsyncMockFn(return_value=_allow_budget_result()),
-        ):
+        ) as check:
             async with solwyn_pkg.run("async-nightly-batch") as run_id:
                 await solwyn.chat.completions.create(
                     model="gpt-4o",
@@ -1679,6 +1687,7 @@ class TestAsyncNonStreamingInterception:
                 )
 
         assert len(reported_events) == 1
+        assert check.call_args.kwargs["agent_run_id"] == run_id
         assert reported_events[0].agent_run_id == run_id
         assert reported_events[0].agent_run_name == "async-nightly-batch"
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import OrderedDict
 from datetime import UTC, datetime
 from typing import cast, get_args
 
@@ -33,6 +34,10 @@ from solwyn._types import (
 
 # Fallback per-token cost when cloud API is unreachable.
 DEFAULT_COST_PER_TOKEN: float = 0.00003
+
+# Sticky run denials protect brief Cloud outages but must not retain an
+# unbounded stream of run UUIDs in a long-lived SDK process.
+_MAX_STICKY_RUN_DENIALS = 128
 
 # The contractual confirm tier values (derived from the ServiceTier literal,
 # never hand-copied). Adapters echo arbitrary bounded strings; only these may
@@ -101,6 +106,7 @@ class _BudgetEnforcerBase:
         # This is not a cache substitute: live cloud checks still run, but an
         # outage after a hard deny must not reopen spending.
         self._last_hard_deny_response: BudgetCheckResponse | None = None
+        self._run_hard_deny_responses: OrderedDict[str, BudgetCheckResponse] = OrderedDict()
 
     def _build_check_request(
         self,
@@ -111,6 +117,7 @@ class _BudgetEnforcerBase:
         fallback_models: list[str] | None = None,
         modality: Modality = "text",
         estimated_media: MediaUsage | None = None,
+        agent_run_id: str | None = None,
     ) -> BudgetCheckRequest:
         """Build a BudgetCheckRequest for the cloud API.
 
@@ -131,6 +138,7 @@ class _BudgetEnforcerBase:
             estimated_media=estimated_media,
             fallback_providers=[ProviderName(p) for p in (fallback_providers or [])],
             fallback_models=list(fallback_models or []),
+            agent_run_id=agent_run_id,
         )
 
     def _should_use_cache(self) -> bool:
@@ -142,11 +150,19 @@ class _BudgetEnforcerBase:
                 and time.monotonic() < self._cache_expires_at
             )
 
-    def _cache_response(self, response: BudgetCheckResponse) -> None:
+    def _cache_response(
+        self,
+        response: BudgetCheckResponse,
+        *,
+        agent_run_id: str | None = None,
+    ) -> None:
         """Cache an allow response. Never cache deny responses.
 
         Always updates the last-known budget limit (from both allow and deny)
         so that local enforcement can use it when the cloud becomes unreachable.
+        Scoped checks never read or populate the global allow cache. Run-specific
+        hard denials are sticky only for their raw run id; project-period hard
+        denials remain global and invalidate a stale global allow.
         """
         with self._state_lock:
             # Always remember the limit for local enforcement fallback
@@ -155,20 +171,47 @@ class _BudgetEnforcerBase:
 
             if response.allowed:
                 self._last_hard_deny_response = None
-                self._cached_response = response
-                self._cache_expires_at = time.monotonic() + self.cache_ttl
-            else:
+                if agent_run_id is not None:
+                    self._run_hard_deny_responses.pop(agent_run_id, None)
+                else:
+                    self._cached_response = response
+                    self._cache_expires_at = time.monotonic() + self.cache_ttl
+                return
+
+            if response.mode != BudgetMode.HARD_DENY:
+                self._last_hard_deny_response = None
+                if agent_run_id is not None:
+                    self._run_hard_deny_responses.pop(agent_run_id, None)
                 self._cached_response = None
                 self._cache_expires_at = 0.0
-                self._last_hard_deny_response = (
-                    response if response.mode == BudgetMode.HARD_DENY else None
-                )
+                return
+
+            if agent_run_id is not None and response.denied_by_period == "agent_run":
+                # The run limit denied, so every project period passed. Replace
+                # stale global state with the denial scoped to this run only.
+                self._last_hard_deny_response = None
+                self._run_hard_deny_responses.pop(agent_run_id, None)
+                self._run_hard_deny_responses[agent_run_id] = response
+                if len(self._run_hard_deny_responses) > _MAX_STICKY_RUN_DENIALS:
+                    self._run_hard_deny_responses.popitem(last=False)
+                return
+
+            self._cached_response = None
+            self._cache_expires_at = 0.0
+            self._last_hard_deny_response = response
             # Deny responses are never cached as freshness-skipping allows/denies.
 
-    def _build_prior_hard_deny_unavailable_result(self) -> BudgetCheckResult | None:
+    def _build_prior_hard_deny_unavailable_result(
+        self,
+        agent_run_id: str | None = None,
+    ) -> BudgetCheckResult | None:
         """Return a denial if cloud is down after an authoritative hard deny."""
         with self._state_lock:
             response = self._last_hard_deny_response
+            if response is None and agent_run_id is not None:
+                response = self._run_hard_deny_responses.get(agent_run_id)
+                if response is not None:
+                    self._run_hard_deny_responses.move_to_end(agent_run_id)
         if response is None:
             return None
         return BudgetCheckResult(
@@ -424,6 +467,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         timeout: float | None = None,
         modality: Modality = "text",
         estimated_media: MediaUsage | None = None,
+        agent_run_id: str | None = None,
     ) -> BudgetCheckResult:
         """Check whether a call is within budget.
 
@@ -445,18 +489,23 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         # Use cache if valid (only allow decisions are cached).
         # Snapshot under the lock to avoid a TOCTOU race between the validity
         # check and reading the cached fields.
-        with self._state_lock:
-            cached = self._cached_response
-            if cached is not None and cached.allowed and time.monotonic() < self._cache_expires_at:
-                return BudgetCheckResult(
-                    allowed=True,
-                    remaining_budget=cached.remaining_budget,
-                    project_id=cached.project_id,
-                    reservation_id=None,  # Don't reuse — each call needs its own reservation
-                    mode=cached.mode,
-                    budget_limit=cached.budget_limit,
-                    current_usage=cached.current_usage,
-                )
+        if agent_run_id is None:
+            with self._state_lock:
+                cached = self._cached_response
+                if (
+                    cached is not None
+                    and cached.allowed
+                    and time.monotonic() < self._cache_expires_at
+                ):
+                    return BudgetCheckResult(
+                        allowed=True,
+                        remaining_budget=cached.remaining_budget,
+                        project_id=cached.project_id,
+                        reservation_id=None,  # each call needs its own reservation
+                        mode=cached.mode,
+                        budget_limit=cached.budget_limit,
+                        current_usage=cached.current_usage,
+                    )
 
         request = self._build_check_request(
             estimated_input_tokens,
@@ -466,6 +515,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             fallback_models,
             modality,
             estimated_media,
+            agent_run_id,
         )
 
         try:
@@ -485,7 +535,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             resp.raise_for_status()
 
             cloud_response = BudgetCheckResponse.model_validate(resp.json())
-            self._cache_response(cloud_response)
+            self._cache_response(cloud_response, agent_run_id=agent_run_id)
             return self._build_result_from_response(cloud_response)
 
         except Exception as exc:
@@ -494,7 +544,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             # carry response/body text) into the log.
             logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
 
-            prior_hard_deny = self._build_prior_hard_deny_unavailable_result()
+            prior_hard_deny = self._build_prior_hard_deny_unavailable_result(agent_run_id)
             if prior_hard_deny is not None:
                 return prior_hard_deny
 
@@ -604,9 +654,10 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         timeout: float | None = None,
         modality: Modality = "text",
         estimated_media: MediaUsage | None = None,
+        agent_run_id: str | None = None,
     ) -> BudgetCheckResult:
         """Async version of budget check. See BudgetEnforcer.check_budget."""
-        if self._should_use_cache():
+        if agent_run_id is None and self._should_use_cache():
             cached = self._cached_response
             if cached is None:
                 raise RuntimeError("_should_use_cache returned True but cache is None")
@@ -628,6 +679,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             fallback_models,
             modality,
             estimated_media,
+            agent_run_id,
         )
 
         try:
@@ -647,7 +699,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             resp.raise_for_status()
 
             cloud_response = BudgetCheckResponse.model_validate(resp.json())
-            self._cache_response(cloud_response)
+            self._cache_response(cloud_response, agent_run_id=agent_run_id)
             return self._build_result_from_response(cloud_response)
 
         except Exception as exc:
@@ -656,7 +708,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             # carry response/body text) into the log.
             logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
 
-            prior_hard_deny = self._build_prior_hard_deny_unavailable_result()
+            prior_hard_deny = self._build_prior_hard_deny_unavailable_result(agent_run_id)
             if prior_hard_deny is not None:
                 return prior_hard_deny
 

@@ -105,8 +105,9 @@ class TestMetadataEventAgentRunFields:
             _make_event(unexpected_field="oops")
 
     def test_agent_run_id_max_length_enforced(self) -> None:
+        assert _make_event(agent_run_id="x" * 256).agent_run_id == "x" * 256
         with pytest.raises(ValidationError):
-            _make_event(agent_run_id="x" * 256)
+            _make_event(agent_run_id="x" * 257)
 
     def test_agent_run_name_max_length_enforced(self) -> None:
         with pytest.raises(ValidationError):
