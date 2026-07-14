@@ -146,6 +146,23 @@ class ProviderEntry(BaseModel):
 # ── Wire-format models ──────────────────────────────────────────────────
 
 
+class BreakerStateReport(BaseModel):
+    """One SDK instance's current provider circuit-breaker snapshot."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: ProviderName = Field(..., description="Provider identifier")
+    state: CircuitState = Field(..., description="Current SDK circuit-breaker state")
+    failure_count: int = Field(..., ge=0, description="Current breaker failure count")
+    success_count: int = Field(..., ge=0, description="Current breaker success count")
+    reported_at: datetime = Field(..., description="Wall-clock time the SDK took the snapshot")
+    sdk_instance_id: str = Field(
+        ...,
+        max_length=100,
+        description="Bounded SDK instance identifier used to isolate Redis snapshots",
+    )
+
+
 class MediaUsage(BaseModel):
     """Non-token billable quantities + variant selectors for a media call.
 

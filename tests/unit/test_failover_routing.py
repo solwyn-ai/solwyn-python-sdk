@@ -20,7 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
 from solwyn._types import CircuitState
 from solwyn.client import AsyncSolwyn, Solwyn
@@ -122,7 +122,12 @@ def _google_chunk() -> SimpleNamespace:
 
 def _allow_budget() -> SimpleNamespace:
     """Allow result with no reservation (skips confirm_cost)."""
-    return SimpleNamespace(allowed=True, reservation_id=None, price_hints=None)
+    return SimpleNamespace(
+        allowed=True,
+        reservation_id=None,
+        project_id=VALID_PROJECT_ID,
+        price_hints=None,
+    )
 
 
 def _make_solwyn(client: object, **overrides: object) -> Solwyn:

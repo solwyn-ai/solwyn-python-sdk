@@ -605,6 +605,9 @@ class Solwyn(_SolwynBase):
             flush_interval=config.reporter_flush_interval,
             max_queue_size=config.reporter_max_queue_size,
             max_in_flight=config.reporter_max_in_flight,
+            breaker_snapshots=self._get_breaker_snapshots,
+            sdk_instance_id=self._sdk_instance_id,
+            breaker_reporting_enabled=config.breaker_reporting_enabled,
         )
 
     @functools.cached_property
@@ -830,6 +833,7 @@ class Solwyn(_SolwynBase):
             estimated_media=estimated_media,
             agent_run_id=agent_run[0],
         )
+        self._reporter.observe_project_id(budget.project_id)
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
 
@@ -975,6 +979,7 @@ class Solwyn(_SolwynBase):
             timeout=_budget_timeout(deadline),
             agent_run_id=agent_run[0],
         )
+        self._reporter.observe_project_id(budget.project_id)
         # Refresh the CostPolicy signal from the server. Price hints are advisory
         # and slow-moving, so they PERSIST across hint-less responses — a budget
         # cache hit (price_hints None) leaves the last-known hints in place; we
@@ -1553,6 +1558,9 @@ class AsyncSolwyn(_SolwynBase):
             flush_interval=config.reporter_flush_interval,
             max_queue_size=config.reporter_max_queue_size,
             max_in_flight=config.reporter_max_in_flight,
+            breaker_snapshots=self._get_breaker_snapshots,
+            sdk_instance_id=self._sdk_instance_id,
+            breaker_reporting_enabled=config.breaker_reporting_enabled,
         )
 
     @functools.cached_property
@@ -1750,6 +1758,7 @@ class AsyncSolwyn(_SolwynBase):
             estimated_media=estimated_media,
             agent_run_id=agent_run[0],
         )
+        self._reporter.observe_project_id(budget.project_id)
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
 
@@ -1882,6 +1891,7 @@ class AsyncSolwyn(_SolwynBase):
             timeout=_budget_timeout(deadline),
             agent_run_id=agent_run[0],
         )
+        self._reporter.observe_project_id(budget.project_id)
         # Refresh the CostPolicy signal from the server. Hints PERSIST across
         # hint-less responses (cache hits) until the server sends new ones — see
         # the sync _intercepted_call for the rationale.

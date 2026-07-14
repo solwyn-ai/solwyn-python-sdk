@@ -1,8 +1,10 @@
-"""Local-only circuit breaker state machine.
+"""Process-local circuit breaker state machine with advisory cloud snapshots.
 
 Tracks provider health per SDK instance. State (CLOSED, OPEN, HALF_OPEN)
-is reported to the cloud API for dashboard visibility but never shared
-across instances.
+remains authoritative only in-process; the reporter reads frozen ``get_state()``
+snapshots on its periodic flush loop and sends the current state to the cloud API
+for dashboard visibility. Cloud snapshots never drive admission or cross-instance
+state sharing.
 
 Extracted from solwyn-core ``llm_client.py`` with Redis code removed --
 all state is process-local and all methods are synchronous.

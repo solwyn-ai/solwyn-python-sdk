@@ -37,7 +37,7 @@ from solwyn._types import (
     Modality,
     ProviderName,
 )
-from solwyn.circuit_breaker import CircuitBreaker
+from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
 from solwyn.config import SolwynConfig
 from solwyn.tokenizer import TokenizerManager
 
@@ -338,6 +338,17 @@ class _SolwynBase:
             if provider not in self._circuit_breakers:
                 self._circuit_breakers[provider] = self._new_circuit_breaker()
             return self._circuit_breakers[provider]
+
+    def _get_breaker_snapshots(self) -> list[tuple[ProviderName, CircuitBreakerState]]:
+        """Return one frozen current-state snapshot per distinct provider.
+
+        Copy the provider/breaker mapping under its lock, then release that lock
+        before each breaker acquires its own state lock. This keeps the two lock
+        domains independent while allowing providers to be added concurrently.
+        """
+        with self._breaker_lock:
+            breakers = list(self._circuit_breakers.items())
+        return [(ProviderName(provider), breaker.get_state()) for provider, breaker in breakers]
 
     def record_latency(self, provider: str, ms: float) -> None:
         """Record one observed SUCCESS latency (ms) for a provider (LatencyPolicy).

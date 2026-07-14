@@ -91,7 +91,12 @@ def _mock_speech_client(response: object) -> MagicMock:
 
 
 def _allow(reservation_id: str | None = "res_tts") -> SimpleNamespace:
-    return SimpleNamespace(allowed=True, reservation_id=reservation_id, price_hints=None)
+    return SimpleNamespace(
+        allowed=True,
+        reservation_id=reservation_id,
+        project_id=VALID_PROJECT_ID,
+        price_hints=None,
+    )
 
 
 def _deny() -> SimpleNamespace:

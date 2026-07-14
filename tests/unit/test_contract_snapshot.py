@@ -41,6 +41,7 @@ from pydantic import ValidationError
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
     SERVICE_TIER_MAX_LENGTH,
+    BreakerStateReport,
     BudgetCheckRequest,
     BudgetCheckResponse,
     BudgetConfirmRequest,
@@ -168,6 +169,17 @@ EXPECTED_MEDIA_USAGE_FIELDS = {
     "is_estimated",
 }
 
+# BreakerStateReport is a standalone API-first SDK snapshot. It is deliberately
+# separate from the existing event/check/confirm pending-set choreography.
+EXPECTED_BREAKER_STATE_REPORT_FIELDS = {
+    "provider",
+    "state",
+    "failure_count",
+    "success_count",
+    "reported_at",
+    "sdk_instance_id",
+}
+
 EXPECTED_METADATA_FIELDS = {
     "model",
     "provider",
@@ -224,6 +236,9 @@ class TestWireModelFieldSets:
     def test_media_usage_field_set(self) -> None:
         assert set(MediaUsage.model_fields) == EXPECTED_MEDIA_USAGE_FIELDS
 
+    def test_breaker_state_report_field_set(self) -> None:
+        assert set(BreakerStateReport.model_fields) == EXPECTED_BREAKER_STATE_REPORT_FIELDS
+
 
 def _confirm(**overrides: Any) -> BudgetConfirmRequest:
     base: dict[str, Any] = {
@@ -279,6 +294,25 @@ class TestWireModelDumpSnapshots:
             "modality": "text",
             "fallback_providers": ["anthropic"],
             "fallback_models": ["claude-x"],
+        }
+
+    def test_breaker_state_report_dump_keys(self) -> None:
+        report = BreakerStateReport(
+            provider="openai",
+            state="open",
+            failure_count=3,
+            success_count=0,
+            reported_at="2026-07-14T12:00:00Z",
+            sdk_instance_id="sdk-instance-1",
+        )
+
+        assert report.model_dump(mode="json") == {
+            "provider": "openai",
+            "state": "open",
+            "failure_count": 3,
+            "success_count": 0,
+            "reported_at": "2026-07-14T12:00:00Z",
+            "sdk_instance_id": "sdk-instance-1",
         }
 
     def test_budget_check_request_scoped_dump_carries_agent_run_id(self) -> None:
@@ -510,6 +544,31 @@ class TestWireModelFieldConstraints:
         # the served provider is REQUIRED on confirm so the Cloud API can
         # price against the provider that actually served the call.
         assert BudgetConfirmRequest.model_fields["provider"].is_required() is True
+
+    def test_breaker_state_report_constraints_match_cloud(self) -> None:
+        BreakerStateReport(
+            provider="openai",
+            state="closed",
+            failure_count=0,
+            success_count=1,
+            reported_at="2026-07-14T12:00:00Z",
+            sdk_instance_id="x" * 100,
+        )
+
+        invalid_payload = {
+            "provider": "openai",
+            "state": "degraded",
+            "failure_count": -1,
+            "success_count": 0,
+            "reported_at": "2026-07-14T12:00:00Z",
+            "sdk_instance_id": "x" * 101,
+            "message": "must never ride breaker telemetry",
+        }
+        with pytest.raises(ValidationError) as exc_info:
+            BreakerStateReport(**invalid_payload)
+
+        errors = {error["type"] for error in exc_info.value.errors()}
+        assert {"enum", "greater_than_equal", "string_too_long", "extra_forbidden"} <= errors
 
     def test_confirm_call_id_is_required(self) -> None:
         assert BudgetConfirmRequest.model_fields["call_id"].is_required() is True

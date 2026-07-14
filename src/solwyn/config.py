@@ -67,6 +67,7 @@ class SolwynConfig(BaseModel):
     reporter_flush_interval: float = 5.0
     reporter_max_queue_size: int = 10_000
     reporter_max_in_flight: int = 3
+    breaker_reporting_enabled: bool = True
 
     model_config = ConfigDict(extra="forbid")
 
@@ -87,6 +88,7 @@ class SolwynConfig(BaseModel):
             "reporter_flush_interval": "REPORTER_FLUSH_INTERVAL",
             "reporter_max_queue_size": "REPORTER_MAX_QUEUE_SIZE",
             "reporter_max_in_flight": "REPORTER_MAX_IN_FLIGHT",
+            "breaker_reporting_enabled": "BREAKER_REPORTING_ENABLED",
         }
 
         for field, env_suffix in field_env_map.items():
@@ -94,7 +96,7 @@ class SolwynConfig(BaseModel):
                 env_val = os.environ.get(f"{_ENV_PREFIX}{env_suffix}")
                 if env_val is not None:
                     # Coerce boolean-looking strings
-                    if field == "fail_open":
+                    if field in {"fail_open", "breaker_reporting_enabled"}:
                         values[field] = env_val.lower() in ("true", "1", "yes")
                     else:
                         values[field] = env_val
