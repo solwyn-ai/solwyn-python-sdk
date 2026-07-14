@@ -809,6 +809,32 @@ class TestRichTokenExtraction:
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
+    def test_global_default_solwyn_tags_never_reaches_primary_or_metadata(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(
+            client,
+            default_params={
+                "temperature": 0.2,
+                "solwyn_tags": {"source": "configured-default"},
+            },
+        )
+        reported_events: list = []
+        solwyn._reporter.report = lambda event: reported_events.append(event)
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()):
+            solwyn.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+
+        called = client.chat.completions.create.call_args.kwargs
+        assert called["temperature"] == 0.2
+        assert "solwyn_tags" not in called
+        assert reported_events[0].tags is None
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
     @pytest.mark.parametrize(
         "tags",
         [

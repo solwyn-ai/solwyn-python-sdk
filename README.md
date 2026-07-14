@@ -294,7 +294,7 @@ with solwyn.run("nightly-batch", tags={"team": "research", "env": "prod"}) as ru
     )
 ```
 
-Use the reserved `solwyn_tags=` keyword for a single-call override; it is removed before provider dispatch. Per-call keys shallow-merge over run tags. Tag mappings allow at most 10 string keys, keys must contain 1–64 characters, and string values may contain 0–256 characters. The SDK copies mappings at scope entry and call start, so later caller mutation cannot change attribution.
+Use the reserved `solwyn_tags=` keyword as a call argument, not in `default_params`; it is removed before provider dispatch. Per-call keys shallow-merge over run tags. Tag mappings allow at most 10 string keys, keys must contain 1–64 characters, and string values may contain 0–256 characters. The SDK copies mappings at scope entry and call start, so later caller mutation cannot change attribution.
 
 Works the same with `async with` and is safe across concurrent asyncio tasks — each task sees only its own active run. Calls made outside a `solwyn.run(...)` scope are still tracked; the API groups them into `_auto-{sdk_instance_id}-{YYYY-MM-DD}` using the event's UTC timestamp.
 

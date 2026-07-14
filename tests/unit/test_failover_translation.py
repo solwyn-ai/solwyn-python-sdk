@@ -194,7 +194,11 @@ class TestToolExchangeFailover:
                 (
                     anthropic,
                     "claude-3-5-sonnet",
-                    {"max_tokens": 256, "top_k": 40},
+                    {
+                        "max_tokens": 256,
+                        "top_k": 40,
+                        "solwyn_tags": {"source": "fallback-default"},
+                    },
                 )
             ],
         )
@@ -207,6 +211,7 @@ class TestToolExchangeFailover:
         kwargs = anthropic.messages.create.call_args.kwargs
         assert kwargs["max_tokens"] == 256
         assert kwargs["top_k"] == 40
+        assert "solwyn_tags" not in kwargs
 
         _close(solwyn)
 

@@ -393,8 +393,16 @@ def _build_hop_kwargs(
     function never logs, never stringifies content, and passes dicts straight
     through to ``_translation`` (a content-privileged module).
     """
-    merged_defaults = {**global_defaults, **rt.entry.default_params}
-    merged_kwargs: dict[str, object] = {**merged_defaults, **kwargs}
+    provider_global_defaults = {
+        key: value for key, value in global_defaults.items() if key != "solwyn_tags"
+    }
+    provider_entry_defaults = {
+        key: value for key, value in rt.entry.default_params.items() if key != "solwyn_tags"
+    }
+    provider_kwargs = {key: value for key, value in kwargs.items() if key != "solwyn_tags"}
+
+    merged_defaults = {**provider_global_defaults, **provider_entry_defaults}
+    merged_kwargs: dict[str, object] = {**merged_defaults, **provider_kwargs}
     if not is_provider_fallback:
         # PRIMARY hop is native passthrough; same-provider hop only swaps model.
         # Same-provider streaming (incl. model swap) keeps working unchanged.
@@ -441,9 +449,9 @@ def _build_hop_kwargs(
         # which key each side used. Do NOT rewrite the merged result again.
         target_name = rt.adapter.name
         normalized: dict[str, object] = {
-            **_with_legacy_max_tokens_key(target_name, global_defaults),
-            **_with_legacy_max_tokens_key(target_name, rt.entry.default_params),
-            **_with_legacy_max_tokens_key(target_name, kwargs),
+            **_with_legacy_max_tokens_key(target_name, provider_global_defaults),
+            **_with_legacy_max_tokens_key(target_name, provider_entry_defaults),
+            **_with_legacy_max_tokens_key(target_name, provider_kwargs),
         }
         passthrough = {
             key: value for key, value in normalized.items() if key not in _ENDPOINT_SCOPED_KEYS
@@ -451,7 +459,7 @@ def _build_hop_kwargs(
         passthrough.update(
             {
                 key: value
-                for key, value in rt.entry.default_params.items()
+                for key, value in provider_entry_defaults.items()
                 if key in _ENDPOINT_SCOPED_KEYS
             }
         )
@@ -466,8 +474,12 @@ def _build_hop_kwargs(
     # chain). Translation starts from SOURCE-dialect values only: the target
     # entry's default_params may contain target-native keys such as Anthropic
     # top_k.
-    source_defaults = _source_compatible_defaults(source_dialect, rt.entry.default_params)
-    source_kwargs: dict[str, object] = {**global_defaults, **source_defaults, **kwargs}
+    source_defaults = _source_compatible_defaults(source_dialect, provider_entry_defaults)
+    source_kwargs: dict[str, object] = {
+        **provider_global_defaults,
+        **source_defaults,
+        **provider_kwargs,
+    }
     canonical = _translation.to_canonical(source_dialect, source_kwargs)
 
     # CROSS-DIALECT STREAMING. A PLAIN-TEXT cross-dialect
@@ -481,7 +493,7 @@ def _build_hop_kwargs(
 
     call_kwargs = _translation.from_canonical(target_dialect, canonical, model=rt.entry.model)
     # Re-apply target entry defaults as fill-absent (e.g. Anthropic max_tokens).
-    return {**rt.entry.default_params, **call_kwargs}
+    return {**provider_entry_defaults, **call_kwargs}
 
 
 def _media_prepare(
