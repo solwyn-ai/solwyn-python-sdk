@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import VALID_API_KEY
 
+import solwyn as solwyn_pkg
 from solwyn._types import CallStatus
 from solwyn.client import Solwyn
 
@@ -178,9 +179,10 @@ class TestPossiblySucceededAbortFlag:
 
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            solwyn_pkg.run("timeout-job", tags={"team": "platform"}),
             pytest.raises(APITimeoutError),
         ):
-            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+            solwyn.chat.completions.create(**_PLAIN_REQUEST, solwyn_tags={"outcome": "timeout"})
 
         events = [c.args[0] for c in solwyn._reporter.report.call_args_list]
         errors = [e for e in events if e.status is CallStatus.ERROR]
@@ -189,6 +191,8 @@ class TestPossiblySucceededAbortFlag:
         assert errors[0].possibly_succeeded is True
         # …and still carries the per-call join key.
         assert errors[0].call_id
+        assert errors[0].tags == {"team": "platform", "outcome": "timeout"}
+        assert "solwyn_tags" not in openai.chat.completions.create.call_args.kwargs
 
         _close(solwyn)
 

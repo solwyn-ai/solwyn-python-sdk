@@ -1,9 +1,4 @@
-"""Tests that ``_build_metadata_event`` tags events with the active run.
-
-The contextvar set by ``solwyn.run("...")`` is read at event-build time —
-no parameter is threaded through the emit path. This file verifies that
-seam without exercising the full HTTP layer.
-"""
+"""Tests that event builders preserve captured run metadata."""
 
 from __future__ import annotations
 
@@ -16,6 +11,7 @@ from conftest import VALID_API_KEY
 import solwyn
 from solwyn._base import _SolwynBase
 from solwyn._registry import build_runtimes
+from solwyn._run import _capture_run_context
 from solwyn._types import CallStatus, MetadataEvent, ProviderEntry, ProviderName
 from solwyn.config import SolwynConfig
 
@@ -55,13 +51,15 @@ class TestEmitWithActiveRun:
         event = _build(base)
         assert event.agent_run_id is None
         assert event.agent_run_name is None
+        assert event.tags is None
 
     def test_inside_scope_fields_are_set(self) -> None:
         base = _make_base()
-        with solwyn.run("nightly-batch") as run_id:
+        with solwyn.run("nightly-batch", tags={"team": "research"}) as run_id:
             event = _build(base)
         assert event.agent_run_id == run_id
         assert event.agent_run_name == "nightly-batch"
+        assert event.tags == {"team": "research"}
 
     def test_after_scope_fields_revert_to_none(self) -> None:
         base = _make_base()
@@ -70,10 +68,11 @@ class TestEmitWithActiveRun:
         event = _build(base)
         assert event.agent_run_id is None
         assert event.agent_run_name is None
+        assert event.tags is None
 
     def test_error_event_also_tagged(self) -> None:
         base = _make_base()
-        with solwyn.run("nightly-batch") as run_id:
+        with solwyn.run("nightly-batch", tags={"team": "research"}) as run_id:
             event = base._build_error_event(
                 model="gpt-4o",
                 provider="openai",
@@ -83,6 +82,28 @@ class TestEmitWithActiveRun:
             )
         assert event.agent_run_id == run_id
         assert event.agent_run_name == "nightly-batch"
+        assert event.tags == {"team": "research"}
+
+    def test_explicit_snapshot_survives_scope_exit(self) -> None:
+        base = _make_base()
+        with solwyn.run("nightly-batch", tags={"team": "research"}) as run_id:
+            snapshot = _capture_run_context()
+
+        event = base._build_metadata_event(
+            model="gpt-4o",
+            provider="openai",
+            input_tokens=10,
+            output_tokens=5,
+            token_details=None,
+            latency_ms=12.3,
+            status=CallStatus.SUCCESS,
+            is_model_fallback=False,
+            call_id="call_run_snapshot",
+            agent_run=snapshot,
+        )
+        assert event.agent_run_id == run_id
+        assert event.agent_run_name == "nightly-batch"
+        assert event.tags == {"team": "research"}
 
     @pytest.mark.asyncio
     async def test_async_concurrent_tasks_tag_independently(self) -> None:

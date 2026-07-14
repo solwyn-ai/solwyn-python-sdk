@@ -58,7 +58,7 @@ from solwyn._proxies import (
 )
 from solwyn._registry import ProviderRuntime, build_runtimes
 from solwyn._routing import RoutingRequest, SelectionPolicy
-from solwyn._run import current_run
+from solwyn._run import _capture_run_context, _RunContextSnapshot
 from solwyn._token_details import TokenDetails
 from solwyn._types import CallStatus, FailoverReason, ProviderName
 from solwyn.budget import (
@@ -393,8 +393,16 @@ def _build_hop_kwargs(
     function never logs, never stringifies content, and passes dicts straight
     through to ``_translation`` (a content-privileged module).
     """
-    merged_defaults = {**global_defaults, **rt.entry.default_params}
-    merged_kwargs: dict[str, object] = {**merged_defaults, **kwargs}
+    provider_global_defaults = {
+        key: value for key, value in global_defaults.items() if key != "solwyn_tags"
+    }
+    provider_entry_defaults = {
+        key: value for key, value in rt.entry.default_params.items() if key != "solwyn_tags"
+    }
+    provider_kwargs = {key: value for key, value in kwargs.items() if key != "solwyn_tags"}
+
+    merged_defaults = {**provider_global_defaults, **provider_entry_defaults}
+    merged_kwargs: dict[str, object] = {**merged_defaults, **provider_kwargs}
     if not is_provider_fallback:
         # PRIMARY hop is native passthrough; same-provider hop only swaps model.
         # Same-provider streaming (incl. model swap) keeps working unchanged.
@@ -441,9 +449,9 @@ def _build_hop_kwargs(
         # which key each side used. Do NOT rewrite the merged result again.
         target_name = rt.adapter.name
         normalized: dict[str, object] = {
-            **_with_legacy_max_tokens_key(target_name, global_defaults),
-            **_with_legacy_max_tokens_key(target_name, rt.entry.default_params),
-            **_with_legacy_max_tokens_key(target_name, kwargs),
+            **_with_legacy_max_tokens_key(target_name, provider_global_defaults),
+            **_with_legacy_max_tokens_key(target_name, provider_entry_defaults),
+            **_with_legacy_max_tokens_key(target_name, provider_kwargs),
         }
         passthrough = {
             key: value for key, value in normalized.items() if key not in _ENDPOINT_SCOPED_KEYS
@@ -451,7 +459,7 @@ def _build_hop_kwargs(
         passthrough.update(
             {
                 key: value
-                for key, value in rt.entry.default_params.items()
+                for key, value in provider_entry_defaults.items()
                 if key in _ENDPOINT_SCOPED_KEYS
             }
         )
@@ -466,8 +474,12 @@ def _build_hop_kwargs(
     # chain). Translation starts from SOURCE-dialect values only: the target
     # entry's default_params may contain target-native keys such as Anthropic
     # top_k.
-    source_defaults = _source_compatible_defaults(source_dialect, rt.entry.default_params)
-    source_kwargs: dict[str, object] = {**global_defaults, **source_defaults, **kwargs}
+    source_defaults = _source_compatible_defaults(source_dialect, provider_entry_defaults)
+    source_kwargs: dict[str, object] = {
+        **provider_global_defaults,
+        **source_defaults,
+        **provider_kwargs,
+    }
     canonical = _translation.to_canonical(source_dialect, source_kwargs)
 
     # CROSS-DIALECT STREAMING. A PLAIN-TEXT cross-dialect
@@ -481,7 +493,7 @@ def _build_hop_kwargs(
 
     call_kwargs = _translation.from_canonical(target_dialect, canonical, model=rt.entry.model)
     # Re-apply target entry defaults as fill-absent (e.g. Anthropic max_tokens).
-    return {**rt.entry.default_params, **call_kwargs}
+    return {**provider_entry_defaults, **call_kwargs}
 
 
 def _media_prepare(
@@ -798,8 +810,8 @@ class Solwyn(_SolwynBase):
         (``measure_request``). An unobservable quantity stays None — never a
         zero-filled default — so a real $0 price is never settled.
         """
+        agent_run = _capture_run_context(kwargs.pop("solwyn_tags", None))
         requested_model = cast(str, kwargs["model"])
-        agent_run = current_run()
         call_id = str(uuid.uuid4())
         runtime = self._runtimes[0]
         provider = runtime.adapter.name
@@ -950,9 +962,9 @@ class Solwyn(_SolwynBase):
 
     def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Core interception logic: the classified candidate walk."""
+        agent_run = _capture_run_context(kwargs.pop("solwyn_tags", None))
         requested_model = cast(str, kwargs["model"])
         is_streaming = bool(kwargs.get("stream", False)) or _force_stream
-        agent_run = current_run()
         # One reconciliation join key per intercepted call: threaded into
         # every served-provider metadata event AND its confirm so the Cloud API
         # can join them (and dedup cache-hit / abandoned-stream spend).
@@ -1339,7 +1351,7 @@ class Solwyn(_SolwynBase):
         is_model_fallback: bool,
         primary_errored: bool,
         call_id: str,
-        agent_run: tuple[str | None, str | None],
+        agent_run: _RunContextSnapshot,
         estimated_input_tokens: int = 0,
     ) -> Any:
         """Wrap a streaming response, settling against the SERVED runtime.
@@ -1738,8 +1750,8 @@ class AsyncSolwyn(_SolwynBase):
         runtime alone. Billable quantity comes from the spec hooks (response
         usage first, request-derived fallback) and stays None when unobservable.
         """
+        agent_run = _capture_run_context(kwargs.pop("solwyn_tags", None))
         requested_model = cast(str, kwargs["model"])
-        agent_run = current_run()
         call_id = str(uuid.uuid4())
         runtime = self._runtimes[0]
         provider = runtime.adapter.name
@@ -1866,9 +1878,9 @@ class AsyncSolwyn(_SolwynBase):
 
     async def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Async core interception logic: the classified candidate walk."""
+        agent_run = _capture_run_context(kwargs.pop("solwyn_tags", None))
         requested_model = cast(str, kwargs["model"])
         is_streaming = bool(kwargs.get("stream", False)) or _force_stream
-        agent_run = current_run()
         # One reconciliation join key per intercepted call: see the sync
         # _intercepted_call for the join/dedup contract.
         call_id = str(uuid.uuid4())
@@ -2234,7 +2246,7 @@ class AsyncSolwyn(_SolwynBase):
         is_model_fallback: bool,
         primary_errored: bool,
         call_id: str,
-        agent_run: tuple[str | None, str | None],
+        agent_run: _RunContextSnapshot,
         estimated_input_tokens: int = 0,
     ) -> Any:
         """Wrap an async streaming response, settling against the SERVED runtime.

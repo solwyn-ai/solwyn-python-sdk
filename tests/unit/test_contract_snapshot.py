@@ -38,6 +38,7 @@ import pytest
 from conftest import VALID_API_KEY
 from pydantic import ValidationError
 
+from solwyn import _constants as wire_constants
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
     SERVICE_TIER_MAX_LENGTH,
@@ -205,6 +206,7 @@ EXPECTED_METADATA_FIELDS = {
     "call_id",
     "possibly_succeeded",
     "provider_region",
+    "tags",
 }
 
 
@@ -433,6 +435,11 @@ class TestWireModelDumpSnapshots:
         assert dumped["media_usage"]["image_count"] == 1
         assert dumped["media_usage"]["quality"] == "high"
 
+    def test_metadata_tags_omitted_when_none_present_when_set(self) -> None:
+        assert "tags" not in _metadata_event().model_dump(mode="json")
+        dumped = _metadata_event(tags={"team": "research"}).model_dump(mode="json")
+        assert dumped["tags"] == {"team": "research"}
+
     def test_token_details_default_dump_omits_is_estimated(self) -> None:
         # Provider-reported (non-estimated) counts: is_estimated stays OFF the
         # wire entirely — never "is_estimated": false — so every existing
@@ -593,6 +600,19 @@ class TestWireModelFieldConstraints:
 
     def test_metadata_call_id_is_required(self) -> None:
         assert MetadataEvent.model_fields["call_id"].is_required() is True
+
+    def test_metadata_tags_bounds_are_pinned(self) -> None:
+        assert wire_constants.TAGS_MAX_KEYS == 10
+        assert wire_constants.TAG_KEY_MAX_LENGTH == 64
+        assert wire_constants.TAG_VALUE_MAX_LENGTH == 256
+
+    def test_metadata_tags_schema_exposes_all_wire_bounds(self) -> None:
+        tags_schema = MetadataEvent.model_json_schema()["properties"]["tags"]["anyOf"][0]
+
+        assert tags_schema["type"] == "object"
+        assert tags_schema["maxProperties"] == 10
+        assert tags_schema["propertyNames"] == {"minLength": 1, "maxLength": 64}
+        assert tags_schema["additionalProperties"] == {"type": "string", "maxLength": 256}
 
     def test_metadata_without_call_id_raises_validation_error(self) -> None:
         with pytest.raises(ValidationError):

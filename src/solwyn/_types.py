@@ -17,6 +17,7 @@ from pydantic import (
     Field,
     SerializationInfo,
     SerializerFunctionWrapHandler,
+    StringConstraints,
     model_serializer,
     model_validator,
 )
@@ -29,6 +30,9 @@ from solwyn._constants import (
     MODEL_NAME_MAX_LENGTH,
     PROVIDER_REGION_MAX_LENGTH,
     SERVICE_TIER_MAX_LENGTH,
+    TAG_KEY_MAX_LENGTH,
+    TAG_VALUE_MAX_LENGTH,
+    TAGS_MAX_KEYS,
 )
 from solwyn._token_details import TokenDetails
 
@@ -117,6 +121,15 @@ ServiceTier = Literal["auto", "default", "flex", "scale", "priority", "standard"
 # selects the billing basis; core bills text tokens only until per-modality
 # cards land. Vendored lock-step with core shared/models.py's Modality.
 Modality = Literal["text", "image", "audio", "video", "embedding"]
+
+TagKey = Annotated[
+    str,
+    StringConstraints(min_length=1, max_length=TAG_KEY_MAX_LENGTH, strict=True),
+]
+TagValue = Annotated[
+    str,
+    StringConstraints(max_length=TAG_VALUE_MAX_LENGTH, strict=True),
+]
 
 
 # ── Config models ───────────────────────────────────────────────────────
@@ -234,8 +247,9 @@ class MediaUsage(BaseModel):
 class MetadataEvent(BaseModel):
     """Telemetry event sent from SDK to API after each LLM call.
 
-    Contains token/latency metadata only — never prompts, responses, or
-    SDK-computed costs.
+    Carries automatic token/latency metadata plus optional explicit
+    customer-supplied tags, which are outside the zero-content guarantee. It
+    never carries prompts, responses, or SDK-computed costs.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -337,6 +351,14 @@ class MetadataEvent(BaseModel):
             "for Bedrock, whose pricing is keyed per model AND region). None for "
             "providers without regional pricing — the None-skipping serializer "
             "keeps their wire bytes unchanged."
+        ),
+    )
+    tags: dict[TagKey, TagValue] | None = Field(
+        default=None,
+        max_length=TAGS_MAX_KEYS,
+        description=(
+            "Explicit customer-supplied metadata for grouping and export. "
+            "Never derived from prompts or responses."
         ),
     )
 

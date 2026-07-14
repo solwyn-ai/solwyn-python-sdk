@@ -787,18 +787,101 @@ class TestRichTokenExtraction:
             patch.object(
                 solwyn._budget, "check_budget", return_value=_allow_budget_result()
             ) as check,
-            solwyn_pkg.run("nightly-batch") as run_id,
+            solwyn_pkg.run("nightly-batch", tags={"team": "platform", "env": "prod"}) as run_id,
         ):
             solwyn.chat.completions.create(
                 model="gpt-4o",
                 messages=[{"role": "user", "content": "Hello"}],
+                solwyn_tags={"env": "stage", "job": "batch"},
             )
 
         assert len(reported_events) == 1
         assert check.call_args.kwargs["agent_run_id"] == run_id
         assert reported_events[0].agent_run_id == run_id
         assert reported_events[0].agent_run_name == "nightly-batch"
+        assert reported_events[0].tags == {
+            "team": "platform",
+            "env": "stage",
+            "job": "batch",
+        }
+        assert "solwyn_tags" not in client.chat.completions.create.call_args.kwargs
 
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_global_default_solwyn_tags_never_reaches_primary_or_metadata(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(
+            client,
+            default_params={
+                "temperature": 0.2,
+                "solwyn_tags": {"source": "configured-default"},
+            },
+        )
+        reported_events: list = []
+        solwyn._reporter.report = lambda event: reported_events.append(event)
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()):
+            solwyn.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+
+        called = client.chat.completions.create.call_args.kwargs
+        assert called["temperature"] == 0.2
+        assert "solwyn_tags" not in called
+        assert reported_events[0].tags is None
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    @pytest.mark.parametrize(
+        "tags",
+        [
+            {f"key-{i}": "value" for i in range(11)},
+            {"": "value"},
+            {"k" * 65: "value"},
+            {"key": "v" * 257},
+            {1: "value"},
+            {"key": 1},
+        ],
+    )
+    def test_invalid_per_call_tags_fail_before_budget_or_provider(self, tags: object) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client)
+
+        with (
+            patch.object(solwyn._budget, "check_budget") as check,
+            pytest.raises((TypeError, ValueError)),
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "Hello"}],
+                solwyn_tags=tags,
+            )
+
+        check.assert_not_called()
+        client.chat.completions.create.assert_not_called()
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_merged_tag_limit_fails_before_budget_or_provider(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client)
+
+        with (
+            patch.object(solwyn._budget, "check_budget") as check,
+            solwyn_pkg.run("too-many", tags={f"scope-{i}": "v" for i in range(6)}),
+            pytest.raises(ValueError, match="at most 10"),
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "Hello"}],
+                solwyn_tags={f"call-{i}": "v" for i in range(5)},
+            )
+
+        check.assert_not_called()
+        client.chat.completions.create.assert_not_called()
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
@@ -1010,21 +1093,32 @@ class TestSyncStreamingInterception:
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
+        scope_tags = {"team": "platform", "env": "prod"}
+        call_tags = {"env": "stage", "job": "stream"}
         with (
             patch.object(solwyn._budget._http, "post", return_value=mock_budget_response),
-            solwyn_pkg.run("nightly") as run_id,
+            solwyn_pkg.run("nightly", tags=scope_tags) as run_id,
         ):
             stream = solwyn.chat.completions.create(
                 model="gpt-4o",
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
+                solwyn_tags=call_tags,
             )
 
+        scope_tags["team"] = "mutated"
+        call_tags["job"] = "mutated"
         list(stream)
 
         assert len(reported_events) == 1
         assert reported_events[0].agent_run_id == run_id
         assert reported_events[0].agent_run_name == "nightly"
+        assert reported_events[0].tags == {
+            "team": "platform",
+            "env": "stage",
+            "job": "stream",
+        }
+        assert "solwyn_tags" not in client.chat.completions.create.call_args.kwargs
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
@@ -1358,19 +1452,30 @@ class TestAsyncStreamingInterception:
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
+        scope_tags = {"team": "platform", "env": "prod"}
+        call_tags = {"env": "stage", "job": "stream"}
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
-            async with solwyn_pkg.run("nightly") as run_id:
+            async with solwyn_pkg.run("nightly", tags=scope_tags) as run_id:
                 stream = await solwyn.chat.completions.create(
                     model="gpt-4o",
                     messages=[{"role": "user", "content": "Hello"}],
                     stream=True,
+                    solwyn_tags=call_tags,
                 )
 
+        scope_tags["team"] = "mutated"
+        call_tags["job"] = "mutated"
         _ = [chunk async for chunk in stream]
 
         assert len(reported_events) == 1
         assert reported_events[0].agent_run_id == run_id
         assert reported_events[0].agent_run_name == "nightly"
+        assert reported_events[0].tags == {
+            "team": "platform",
+            "env": "stage",
+            "job": "stream",
+        }
+        assert "solwyn_tags" not in client.chat.completions.create.call_args.kwargs
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

@@ -27,7 +27,7 @@ from solwyn._routing import (
     RoutingRequest,
     SelectionPolicy,
 )
-from solwyn._run import current_run
+from solwyn._run import _capture_run_context, _RunContextSnapshot
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
     CallStatus,
@@ -452,7 +452,7 @@ class _SolwynBase:
         service_tier: str | None = None,
         sdk_instance_id: str | None = None,
         timestamp: datetime | None = None,
-        agent_run: tuple[str | None, str | None] | None = None,
+        agent_run: _RunContextSnapshot | None = None,
         provider_region: str | None = None,
         modality: Modality = "text",
         media_usage: MediaUsage | None = None,
@@ -470,7 +470,9 @@ class _SolwynBase:
         """
         if not call_id:
             raise RuntimeError("call_id is required for metadata reconciliation")
-        agent_run_id, agent_run_name = current_run() if agent_run is None else agent_run
+        agent_run_id, agent_run_name, tags = (
+            _capture_run_context() if agent_run is None else agent_run
+        )
         return MetadataEvent(
             model=model,
             provider=ProviderName(provider),
@@ -496,6 +498,7 @@ class _SolwynBase:
             agent_run_name=agent_run_name,
             call_id=call_id,
             provider_region=provider_region,
+            tags=tags,
         )
 
     def _build_error_event(
@@ -512,7 +515,7 @@ class _SolwynBase:
         attempt_index: int = 0,
         call_id: str,
         possibly_succeeded: bool | None = None,
-        agent_run: tuple[str | None, str | None] | None = None,
+        agent_run: _RunContextSnapshot | None = None,
         provider_region: str | None = None,
     ) -> MetadataEvent:
         """Build an error-status MetadataEvent with zeroed token counts.
