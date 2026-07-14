@@ -86,7 +86,12 @@ def _make_solwyn(client, **overrides):
 
 def _allow_budget_result() -> SimpleNamespace:
     """Minimal budget-check result for tests that bypass HTTP."""
-    return SimpleNamespace(allowed=True, reservation_id=None, price_hints=None)
+    return SimpleNamespace(
+        allowed=True,
+        reservation_id=None,
+        project_id=VALID_PROJECT_ID,
+        price_hints=None,
+    )
 
 
 class _Status(Exception):
@@ -219,6 +224,12 @@ class TestBasicWrapping:
     def test_openai_call_goes_through(self) -> None:
         client, mock_response = _mock_openai_client()
         solwyn = _make_solwyn(client)
+
+        def create_after_project_learned(**_kwargs):
+            assert solwyn._reporter._breaker_project_id == VALID_PROJECT_ID
+            return mock_response
+
+        client.chat.completions.create.side_effect = create_after_project_learned
 
         # Mock budget to allow
         mock_budget_response = MagicMock()
@@ -1522,6 +1533,12 @@ class TestAsyncNonStreamingInterception:
         client.chat.completions.create = AsyncMockFn(return_value=mock_response)
 
         solwyn = _make_async_solwyn(client)
+
+        async def create_after_project_learned(**_kwargs):
+            assert solwyn._reporter._breaker_project_id == VALID_PROJECT_ID
+            return mock_response
+
+        client.chat.completions.create = AsyncMockFn(side_effect=create_after_project_learned)
         reported_events: list = []
         solwyn._reporter.report = lambda e: reported_events.append(e)
 

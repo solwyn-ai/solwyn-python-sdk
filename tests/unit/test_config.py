@@ -142,6 +142,32 @@ class TestEnvVarConstruction:
 
         solwyn.close()
 
+    @pytest.mark.parametrize(
+        ("env_val", "expected"),
+        [
+            ("true", True),
+            ("1", True),
+            ("yes", True),
+            ("false", False),
+            ("0", False),
+            ("no", False),
+        ],
+    )
+    def test_breaker_reporting_boolean_coercion(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env_val: str,
+        expected: bool,
+    ) -> None:
+        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.setenv("SOLWYN_BREAKER_REPORTING_ENABLED", env_val)
+
+        solwyn = _make_solwyn(_mock_openai_client())
+
+        assert solwyn._config.breaker_reporting_enabled is expected
+
+        solwyn.close()
+
 
 @pytest.mark.unit
 class TestConfigurationErrorFromBadCredentials:
@@ -309,6 +335,7 @@ class TestFailoverKnobDefaults:
         assert config.failover_idempotency == "safe"
         assert config.same_provider_retries == 0
         assert config.circuit_breaker_recovery_timeout_jitter == 0.2
+        assert config.breaker_reporting_enabled is True
         assert config.default_params == {}
 
     def test_failover_knobs_are_overridable(self) -> None:
@@ -318,11 +345,13 @@ class TestFailoverKnobDefaults:
             failover_total_timeout=12.5,
             failover_idempotency="always",
             same_provider_retries=2,
+            breaker_reporting_enabled=False,
             default_params={"temperature": 0.0},
         )
         assert config.failover_total_timeout == 12.5
         assert config.failover_idempotency == "always"
         assert config.same_provider_retries == 2
+        assert config.breaker_reporting_enabled is False
         assert config.default_params == {"temperature": 0.0}
 
     def test_negative_same_provider_retries_rejected(self) -> None:

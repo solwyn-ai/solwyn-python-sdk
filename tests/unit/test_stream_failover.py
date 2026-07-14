@@ -27,7 +27,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
 from solwyn._types import CallStatus, CircuitState
 from solwyn.client import (
@@ -158,7 +158,12 @@ def _google_client() -> MagicMock:
 
 
 def _allow_budget(reservation_id: str | None = None) -> SimpleNamespace:
-    return SimpleNamespace(allowed=True, reservation_id=reservation_id, price_hints=None)
+    return SimpleNamespace(
+        allowed=True,
+        reservation_id=reservation_id,
+        project_id=VALID_PROJECT_ID,
+        price_hints=None,
+    )
 
 
 def _make_solwyn(client: object, **overrides: object) -> Solwyn:

@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
 from solwyn.client import Solwyn
 from solwyn.exceptions import ProviderUnavailableError
@@ -84,7 +84,12 @@ def _anthropic_response() -> SimpleNamespace:
 
 
 def _allow_budget() -> SimpleNamespace:
-    return SimpleNamespace(allowed=True, reservation_id=None, price_hints=None)
+    return SimpleNamespace(
+        allowed=True,
+        reservation_id=None,
+        project_id=VALID_PROJECT_ID,
+        price_hints=None,
+    )
 
 
 def _make_solwyn(client: object, **overrides: object) -> Solwyn:

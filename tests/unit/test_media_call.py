@@ -71,7 +71,12 @@ def _route_to_images(surface, client, kwargs, *, timeout, max_retries):
 
 
 def _allow(reservation_id: str | None = "res_media") -> SimpleNamespace:
-    return SimpleNamespace(allowed=True, reservation_id=reservation_id, price_hints=None)
+    return SimpleNamespace(
+        allowed=True,
+        reservation_id=reservation_id,
+        project_id=VALID_PROJECT_ID,
+        price_hints=None,
+    )
 
 
 def _deny() -> SimpleNamespace:
@@ -109,6 +114,12 @@ class TestMediaCallSync:
     def test_success_confirms_and_reports_primary_only(self) -> None:
         client, resp = _sync_client()
         solwyn = _build_sync(client)
+
+        def create_after_project_learned(**_kwargs):
+            assert solwyn._reporter._breaker_project_id == VALID_PROJECT_ID
+            return resp
+
+        client.embeddings.create.side_effect = create_after_project_learned
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()) as check,
             patch.object(solwyn._budget, "confirm_cost") as confirm,
@@ -325,6 +336,12 @@ class TestMediaCallAsync:
     async def test_success_confirms_and_reports_primary_only(self) -> None:
         client, resp = _async_client()
         solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY)
+
+        async def create_after_project_learned(**_kwargs):
+            assert solwyn._reporter._breaker_project_id == VALID_PROJECT_ID
+            return resp
+
+        client.embeddings.create.side_effect = create_after_project_learned
         with (
             patch.object(
                 solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow())

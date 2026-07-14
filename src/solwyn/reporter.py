@@ -1,8 +1,8 @@
-"""Async metadata reporter.
+"""Async metadata and provider-health reporter.
 
 MetadataReporter (sync, background thread queue) and AsyncMetadataReporter
-(asyncio.create_task) batch and flush metadata events to the Solwyn cloud API.
-Neither blocks the LLM call path.
+(asyncio.create_task) batch and flush metadata events plus current circuit-breaker
+snapshots to the Solwyn cloud API. Neither blocks the LLM call path.
 
 Events contain cost/latency metadata only -- never prompts or responses.
 """
@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import contextlib
 import logging
 import re
 import threading
+from collections.abc import Callable
+from datetime import UTC, datetime
 
 import httpx
 
-from solwyn._types import BudgetConfirmRequest, MetadataEvent
+from solwyn._types import BreakerStateReport, BudgetConfirmRequest, MetadataEvent, ProviderName
+from solwyn.circuit_breaker import CircuitBreakerState
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +57,21 @@ class _ReporterBase:
         flush_interval: float = 5.0,
         max_queue_size: int = 10_000,
         max_in_flight: int = 3,
+        breaker_snapshots: Callable[[], list[tuple[ProviderName, CircuitBreakerState]]]
+        | None = None,
+        sdk_instance_id: str | None = None,
+        breaker_reporting_enabled: bool = True,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
         self.batch_size = batch_size
         self.flush_interval = flush_interval
         self.max_in_flight = max_in_flight
+        self._breaker_snapshots = breaker_snapshots
+        self._sdk_instance_id = sdk_instance_id
+        self._breaker_reporting_enabled = breaker_reporting_enabled
+        self._breaker_project_id: str | None = None
+        self._breaker_project_lock = threading.Lock()
 
         # Bounded deque: drops oldest events when full
         self._queue: collections.deque[MetadataEvent] = collections.deque(maxlen=max_queue_size)
@@ -69,6 +80,62 @@ class _ReporterBase:
         self._confirm_failure_threshold = 10
         self._consecutive_unparseable_responses = 0
         self._unparseable_response_threshold = 10
+
+    def observe_project_id(self, project_id: str | None) -> None:
+        """Remember the non-empty project resolved by a real/cached budget check."""
+        if not project_id:
+            return
+        with self._breaker_project_lock:
+            self._breaker_project_id = project_id
+
+    def _breaker_reporting_project_id(self) -> str | None:
+        """Return the learned project only when breaker reporting can run."""
+        if (
+            not self._breaker_reporting_enabled
+            or self._breaker_snapshots is None
+            or self._sdk_instance_id is None
+        ):
+            return None
+        with self._breaker_project_lock:
+            return self._breaker_project_id
+
+    def _build_breaker_reports(self) -> list[tuple[str, BreakerStateReport]]:
+        """Eagerly build one timestamped current-state report cycle."""
+        reports: list[tuple[str, BreakerStateReport]] = []
+        project_id = self._breaker_reporting_project_id()
+        if project_id is None or self._breaker_snapshots is None or self._sdk_instance_id is None:
+            return reports
+        try:
+            snapshots = self._breaker_snapshots()
+            reported_at = datetime.now(UTC)
+        except Exception as exc:
+            logger.warning(
+                "reporter.breaker_snapshot_failed: exc_type=%s",
+                type(exc).__name__,
+            )
+            return reports
+        for provider, snapshot in snapshots:
+            try:
+                reports.append(
+                    (
+                        project_id,
+                        BreakerStateReport(
+                            provider=provider,
+                            state=snapshot.state,
+                            failure_count=snapshot.failure_count,
+                            success_count=snapshot.success_count,
+                            reported_at=reported_at,
+                            sdk_instance_id=self._sdk_instance_id,
+                        ),
+                    ),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "reporter.breaker_snapshot_invalid: provider=%s exc_type=%s",
+                    provider.value,
+                    type(exc).__name__,
+                )
+        return reports
 
     def _enqueue(self, event: MetadataEvent) -> None:
         """Add an event to the queue.  Drop-oldest semantics on overflow."""
@@ -218,6 +285,10 @@ class MetadataReporter(_ReporterBase):
         flush_interval: float = 5.0,
         max_queue_size: int = 10_000,
         max_in_flight: int = 3,
+        breaker_snapshots: Callable[[], list[tuple[ProviderName, CircuitBreakerState]]]
+        | None = None,
+        sdk_instance_id: str | None = None,
+        breaker_reporting_enabled: bool = True,
     ) -> None:
         super().__init__(
             api_url,
@@ -226,10 +297,15 @@ class MetadataReporter(_ReporterBase):
             flush_interval=flush_interval,
             max_queue_size=max_queue_size,
             max_in_flight=max_in_flight,
+            breaker_snapshots=breaker_snapshots,
+            sdk_instance_id=sdk_instance_id,
+            breaker_reporting_enabled=breaker_reporting_enabled,
         )
         self._http = httpx.Client(timeout=10.0)
         self._shutdown = threading.Event()
         self._in_flight_lock = threading.Lock()
+        self._breaker_worker_lock = threading.Lock()
+        self._breaker_worker: threading.Thread | None = None
         # Separate queue for confirm_cost requests. Stream completion
         # fire-and-forgets onto this queue so the user's thread is not
         # blocked on an httpx.post to Solwyn.
@@ -252,10 +328,23 @@ class MetadataReporter(_ReporterBase):
 
     def close(self) -> None:
         """Flush remaining events and shut down the background thread."""
-        self._shutdown.set()
-        self._thread.join(timeout=10.0)
-        # Final flush of anything remaining
+        # Serialize shutdown with cadence-triggered breaker launches. If a
+        # breaker cycle is active now, it is adopted as the final cycle.
+        with self._breaker_worker_lock:
+            active_breaker_worker = self._breaker_worker
+            if active_breaker_worker is not None and not active_breaker_worker.is_alive():
+                active_breaker_worker = None
+            self._shutdown.set()
+
+        # The ingest loop never owns breaker I/O, so it can be joined without
+        # waiting for the per-provider breaker timeout chain.
+        self._thread.join()
         self._flush_remaining()
+
+        if active_breaker_worker is None:
+            active_breaker_worker = self._start_breaker_cycle(during_shutdown=True)
+        if active_breaker_worker is not None:
+            active_breaker_worker.join()
         self._http.close()
 
     def __enter__(self) -> MetadataReporter:
@@ -267,8 +356,10 @@ class MetadataReporter(_ReporterBase):
     def _flush_loop(self) -> None:
         """Background thread: periodically flush batches to the cloud."""
         while not self._shutdown.is_set():
-            self._shutdown.wait(timeout=self.flush_interval)
+            if self._shutdown.wait(timeout=self.flush_interval):
+                break
             self._flush_remaining()
+            self._start_breaker_cycle()
 
     def _flush_remaining(self) -> None:
         """Flush queued confirms, settlements, then metadata events in batches."""
@@ -283,6 +374,45 @@ class MetadataReporter(_ReporterBase):
             if not batch:
                 break
             self._send_batch(batch)
+
+    def _start_breaker_cycle(
+        self,
+        *,
+        during_shutdown: bool = False,
+    ) -> threading.Thread | None:
+        """Start one tracked breaker cycle, or coalesce into the active one."""
+        with self._breaker_worker_lock:
+            if self._shutdown.is_set() and not during_shutdown:
+                return None
+            worker = self._breaker_worker
+            if worker is not None and worker.is_alive():
+                return worker
+            worker = threading.Thread(
+                target=self._flush_breaker_reports,
+                daemon=True,
+                name="solwyn-breaker-reporter",
+            )
+            self._breaker_worker = worker
+            worker.start()
+            return worker
+
+    def _flush_breaker_reports(self) -> None:
+        """POST current breaker snapshots independently and drop every failure."""
+        for project_id, report in self._build_breaker_reports():
+            try:
+                response = self._http.post(
+                    f"{self.api_url}/api/v1/projects/{project_id}/providers/breaker-reports",
+                    json=report.model_dump(mode="json"),
+                    headers=self._auth_headers(),
+                    timeout=5.0,
+                )
+                response.raise_for_status()
+            except Exception as exc:
+                logger.warning(
+                    "reporter.breaker_send_failed: provider=%s exc_type=%s",
+                    report.provider.value,
+                    type(exc).__name__,
+                )
 
     def _send_confirm(self, confirm_request: BudgetConfirmRequest) -> None:
         """Send one confirm request and update confirm failure accounting."""
@@ -385,6 +515,10 @@ class AsyncMetadataReporter(_ReporterBase):
         flush_interval: float = 5.0,
         max_queue_size: int = 10_000,
         max_in_flight: int = 3,
+        breaker_snapshots: Callable[[], list[tuple[ProviderName, CircuitBreakerState]]]
+        | None = None,
+        sdk_instance_id: str | None = None,
+        breaker_reporting_enabled: bool = True,
     ) -> None:
         super().__init__(
             api_url,
@@ -393,10 +527,14 @@ class AsyncMetadataReporter(_ReporterBase):
             flush_interval=flush_interval,
             max_queue_size=max_queue_size,
             max_in_flight=max_in_flight,
+            breaker_snapshots=breaker_snapshots,
+            sdk_instance_id=sdk_instance_id,
+            breaker_reporting_enabled=breaker_reporting_enabled,
         )
         self._http = httpx.AsyncClient(timeout=10.0)
         self._shutdown_event: asyncio.Event | None = None
         self._flush_task: asyncio.Task[None] | None = None
+        self._breaker_task: asyncio.Task[None] | None = None
         self._confirm_queue: collections.deque[BudgetConfirmRequest] = collections.deque(
             maxlen=1000
         )
@@ -439,12 +577,19 @@ class AsyncMetadataReporter(_ReporterBase):
 
     async def close(self) -> None:
         """Flush remaining events and shut down."""
+        active_breaker_task = self._breaker_task
+        if active_breaker_task is not None and active_breaker_task.done():
+            active_breaker_task = None
         if self._shutdown_event is not None:
             self._shutdown_event.set()
         if self._flush_task is not None:
             await self._flush_task
-        # Final flush
         await self._flush_remaining()
+
+        if active_breaker_task is None:
+            active_breaker_task = self._start_breaker_cycle(during_shutdown=True)
+        if active_breaker_task is not None:
+            await active_breaker_task
         await self._http.aclose()
 
     async def __aenter__(self) -> AsyncMetadataReporter:
@@ -459,12 +604,16 @@ class AsyncMetadataReporter(_ReporterBase):
         if self._shutdown_event is None:
             raise RuntimeError("_flush_loop called before reporter was started")
         while not self._shutdown_event.is_set():
-            with contextlib.suppress(TimeoutError):
+            try:
                 await asyncio.wait_for(
                     self._shutdown_event.wait(),
                     timeout=self.flush_interval,
                 )
-            await self._flush_remaining()
+            except TimeoutError:
+                await self._flush_remaining()
+                self._start_breaker_cycle()
+            else:
+                break
 
     async def _flush_remaining(self) -> None:
         """Flush queued confirms, settlements, then metadata events in batches."""
@@ -478,6 +627,46 @@ class AsyncMetadataReporter(_ReporterBase):
             if not batch:
                 break
             await self._send_batch(batch)
+
+    def _start_breaker_cycle(
+        self,
+        *,
+        during_shutdown: bool = False,
+    ) -> asyncio.Task[None] | None:
+        """Start one tracked breaker task, or coalesce into the active task."""
+        if (
+            self._shutdown_event is not None
+            and self._shutdown_event.is_set()
+            and not during_shutdown
+        ):
+            return None
+        task = self._breaker_task
+        if task is not None and not task.done():
+            return task
+        task = asyncio.create_task(
+            self._flush_breaker_reports(),
+            name="solwyn-breaker-reporter",
+        )
+        self._breaker_task = task
+        return task
+
+    async def _flush_breaker_reports(self) -> None:
+        """POST current breaker snapshots independently and drop every failure."""
+        for project_id, report in self._build_breaker_reports():
+            try:
+                response = await self._http.post(
+                    f"{self.api_url}/api/v1/projects/{project_id}/providers/breaker-reports",
+                    json=report.model_dump(mode="json"),
+                    headers=self._auth_headers(),
+                    timeout=5.0,
+                )
+                response.raise_for_status()
+            except Exception as exc:
+                logger.warning(
+                    "reporter.breaker_send_failed: provider=%s exc_type=%s",
+                    report.provider.value,
+                    type(exc).__name__,
+                )
 
     async def _send_confirm(self, confirm_request: BudgetConfirmRequest) -> None:
         """Send one confirm request and update confirm failure accounting."""
