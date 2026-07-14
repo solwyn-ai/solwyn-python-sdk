@@ -277,7 +277,7 @@ for chunk in stream:
 
 ## Tagging Calls with Agent Runs
 
-Wrap a unit of work with `solwyn.run(name)` to attribute every LLM call inside it to a single agent run. The dashboard groups cost and latency by run, so you can see "this nightly batch cost $4.20."
+Wrap a unit of work with `solwyn.run(name, tags=...)` to attribute every LLM call inside it to a single agent run. The dashboard groups cost and latency by run, so you can see "this nightly batch cost $4.20." Tags are optional explicit customer metadata for grouping and export.
 
 ```python
 import solwyn
@@ -285,10 +285,16 @@ from openai import OpenAI
 
 client = solwyn.Solwyn(OpenAI(), api_key="sk_proj_...")
 
-with solwyn.run("nightly-batch") as run_id:
+with solwyn.run("nightly-batch", tags={"team": "research", "env": "prod"}) as run_id:
     client.chat.completions.create(model="gpt-4o", messages=[...])
-    client.chat.completions.create(model="gpt-4o", messages=[...])
+    client.chat.completions.create(
+        model="gpt-4o",
+        messages=[...],
+        solwyn_tags={"env": "staging", "job": "backfill"},
+    )
 ```
+
+Use the reserved `solwyn_tags=` keyword for a single-call override; it is removed before provider dispatch. Per-call keys shallow-merge over run tags. Tag mappings allow at most 10 string keys, keys must contain 1–64 characters, and string values may contain 0–256 characters. The SDK copies mappings at scope entry and call start, so later caller mutation cannot change attribution.
 
 Works the same with `async with` and is safe across concurrent asyncio tasks — each task sees only its own active run. Calls made outside a `solwyn.run(...)` scope are still tracked; the API groups them into `_auto-{sdk_instance_id}-{YYYY-MM-DD}` using the event's UTC timestamp.
 
@@ -402,12 +408,13 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `agent_run_id` | `str \| None` | Run id from the active `solwyn.run(...)` scope, if any. When omitted, the API creates `_auto-{sdk_instance_id}-{YYYY-MM-DD}` |
 | `agent_run_name` | `str \| None` | Run name passed to `solwyn.run(...)`, if any |
 | `provider_region` | `str \| None` | Cloud region of the serving endpoint (Bedrock — pricing is per model and region); omitted for other providers |
+| `tags` | `object \| None` | Optional explicit customer-supplied tags from `solwyn.run(..., tags=...)` and `solwyn_tags=`. Never inferred from prompts or responses; omitted when empty or unset |
 
-**The SDK never captures, logs, or transmits prompts or responses.** This is enforced by [structural tests](tests/unit/test_privacy_firewall.py) and the [privacy module](src/solwyn/_privacy.py).
+**The SDK never captures, logs, or transmits prompts or responses.** Explicit customer-supplied tags are outside this zero-content guarantee and are transmitted as provided. Prompt and response privacy is enforced by [structural tests](tests/unit/test_privacy_firewall.py) and the [privacy module](src/solwyn/_privacy.py).
 
 ## Release Compatibility
 
-Wire-contract changes are API-first: Solwyn Cloud must accept new fields and enum values before an SDK release ships them. As of the current release line the Cloud API accepts the full wire contract — the `modality` discriminator, the `media_usage` quantities (image counts, media durations, character counts, and resolution/quality selectors), the image and audio `token_details` buckets, the Bedrock and OpenAI-compatible `provider` values, `provider_region`, `service_tier` on budget confirms, `token_details.is_estimated`, 2048-char model identifiers, and per-event ingest dispositions. Optional fields are omitted entirely (never `null`) when unset, so payloads for providers that don't use them are byte-identical to earlier releases.
+Wire-contract changes are API-first: Solwyn Cloud must accept new fields and enum values before an SDK release ships them. As of the current release line the Cloud API accepts the full wire contract — the `modality` discriminator, the `media_usage` quantities (image counts, media durations, character counts, and resolution/quality selectors), the image and audio `token_details` buckets, the Bedrock and OpenAI-compatible `provider` values, `provider_region`, bounded `tags`, `service_tier` on budget confirms, `token_details.is_estimated`, 2048-char model identifiers, and per-event ingest dispositions. Optional fields are omitted entirely (never `null`) when unset, so payloads for providers that don't use them are byte-identical to earlier releases.
 
 ## Requirements
 

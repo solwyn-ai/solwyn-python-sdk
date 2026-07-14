@@ -1,13 +1,14 @@
 """Agent-run scope: ``with solwyn.run("name"):``.
 
-Binds an active ``(agent_run_id, agent_run_name)`` pair to a ``ContextVar``
-for the duration of a scope. Cost events emitted inside the scope are
-tagged with these values in the wire payload; events emitted outside are
-tagged with ``None`` and the API synthesizes a per-day fallback id.
+Binds an active run id/name plus optional explicit customer tags to a
+``ContextVar`` for the duration of a scope. Cost events emitted inside the
+scope carry a copied snapshot in the wire payload; events emitted outside are
+unscoped. Tags are never inferred from prompts or responses.
 
-The contextvar is the integration seam — no parameter is threaded through
-the LLM call path. ``contextvars`` propagation guarantees correct scoping
-across asyncio tasks. Threads and ``ThreadPoolExecutor`` workers do not
+The contextvar is the scope integration seam. Each intercepted call captures
+an immutable-by-convention snapshot and threads it through deferred reporting.
+``contextvars`` propagation guarantees correct scoping across asyncio tasks.
+Threads and ``ThreadPoolExecutor`` workers do not
 inherit the active run reliably; use ``run_in_executor(...)`` or
 ``contextvars.copy_context().run(...)`` when submitting threaded work.
 Do not open a run scope inside an async generator; async generator yields
@@ -23,7 +24,7 @@ import inspect
 import sys
 import unicodedata
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import Executor, Future
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from contextvars import ContextVar, Token, copy_context
@@ -31,15 +32,22 @@ from dataclasses import dataclass
 from types import FrameType, TracebackType
 from typing import ParamSpec, TypeVar
 
-from solwyn._constants import AGENT_RUN_NAME_MAX_LENGTH
+from solwyn._constants import (
+    AGENT_RUN_NAME_MAX_LENGTH,
+    TAG_KEY_MAX_LENGTH,
+    TAG_VALUE_MAX_LENGTH,
+    TAGS_MAX_KEYS,
+)
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
+_RunContextSnapshot = tuple[str | None, str | None, dict[str, str] | None]
 
-# Single contextvar holding either None or an immutable (id, name) tuple.
-# Storing both together makes the swap atomic — no async task can ever
-# observe an id without its matching name, even mid-transition.
-_active_run: ContextVar[tuple[str, str] | None] = ContextVar("solwyn_active_run", default=None)
+# Single contextvar holding either None or one run payload. Storing all values
+# together makes the swap atomic across async task transitions.
+_active_run: ContextVar[tuple[str, str, dict[str, str] | None] | None] = ContextVar(
+    "solwyn_active_run", default=None
+)
 
 _DISALLOWED_NAME_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
@@ -47,8 +55,8 @@ _DISALLOWED_NAME_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 @dataclass(frozen=True)
 class _RunFrame:
     scope_id: int
-    token: Token[tuple[str, str] | None]
-    prior_active: tuple[str, str] | None
+    token: Token[tuple[str, str, dict[str, str] | None] | None]
+    prior_active: tuple[str, str, dict[str, str] | None] | None
 
 
 _run_frames: ContextVar[tuple[_RunFrame, ...]] = ContextVar("solwyn_run_frames", default=())
@@ -72,7 +80,54 @@ def current_run() -> tuple[str | None, str | None]:
     active = _active_run.get()
     if active is None:
         return (None, None)
-    return active
+    return (active[0], active[1])
+
+
+def _copy_tags(
+    tags: object | None,
+    *,
+    parameter: str,
+) -> dict[str, str] | None:
+    """Validate and copy one explicit tag mapping without normalization."""
+    if tags is None:
+        return None
+    if not isinstance(tags, Mapping):
+        raise TypeError(f"{parameter} requires a mapping of string keys to string values")
+    if len(tags) > TAGS_MAX_KEYS:
+        raise ValueError(f"{parameter} allows at most {TAGS_MAX_KEYS} keys")
+
+    copied: dict[str, str] = {}
+    for key, value in tags.items():
+        if not isinstance(key, str):
+            raise TypeError(f"{parameter} keys must be strings")
+        if not key:
+            raise ValueError(f"{parameter} keys must be non-empty")
+        if len(key) > TAG_KEY_MAX_LENGTH:
+            raise ValueError(f"{parameter} key exceeds max length {TAG_KEY_MAX_LENGTH}")
+        if not isinstance(value, str):
+            raise TypeError(f"{parameter} values must be strings")
+        if len(value) > TAG_VALUE_MAX_LENGTH:
+            raise ValueError(f"{parameter} value exceeds max length {TAG_VALUE_MAX_LENGTH}")
+        copied[key] = value
+    return copied or None
+
+
+def _capture_run_context(
+    per_call_tags: object | None = None,
+) -> _RunContextSnapshot:
+    """Capture the active run plus a copied shallow merge of per-call tags."""
+    active = _active_run.get()
+    run_id: str | None = None
+    run_name: str | None = None
+    merged: dict[str, str] = {}
+    if active is not None:
+        run_id, run_name, scope_tags = active
+        if scope_tags is not None:
+            merged.update(scope_tags)
+    override = _copy_tags(per_call_tags, parameter="solwyn_tags")
+    if override is not None:
+        merged.update(override)
+    return (run_id, run_name, _copy_tags(merged, parameter="merged tags"))
 
 
 def _name_has_disallowed_char(name: str) -> bool:
@@ -100,7 +155,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
     The outer scope is restored automatically on exit via ``ContextVar.reset``.
     """
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str, tags: Mapping[str, str] | None = None) -> None:
         if not isinstance(name, str):
             raise TypeError(f"solwyn.run(name) requires str, got {type(name).__name__}")
         if not name.strip():
@@ -115,6 +170,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
                 f"solwyn.run(name) exceeds max length {AGENT_RUN_NAME_MAX_LENGTH} (got {len(name)})"
             )
         self._name = name
+        self._tags = _copy_tags(tags, parameter="solwyn.run(tags)")
         self._scope_id = id(self)
 
     def _enter(self) -> str:
@@ -125,7 +181,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
             )
         run_id = _new_run_id()
         prior_active = _active_run.get()
-        token = _active_run.set((run_id, self._name))
+        token = _active_run.set((run_id, self._name, self._tags))
         frames = _run_frames.get()
         _run_frames.set(
             (*frames, _RunFrame(scope_id=self._scope_id, token=token, prior_active=prior_active))
@@ -208,14 +264,14 @@ def run_in_executor(
     return executor.submit(run_with_context)
 
 
-def run(name: str) -> _RunScope:
+def run(name: str, tags: Mapping[str, str] | None = None) -> _RunScope:
     """Open an agent-run scope.
 
     Cost events emitted inside the scope are tagged with a fresh stable
-    ``agent_run_id`` and the provided ``name``. Use as a sync or async
-    context manager::
+    ``agent_run_id``, the provided ``name``, and a copied snapshot of optional
+    explicit customer ``tags``. Use as a sync or async context manager::
 
-        with solwyn.run("nightly-batch") as run_id:
+        with solwyn.run("nightly-batch", tags={"team": "research"}) as run_id:
             client.chat.completions.create(...)
 
         async with solwyn.run("ingest-job") as run_id:
@@ -234,4 +290,4 @@ def run(name: str) -> _RunScope:
     opened before ``yield`` would remain active in the consumer's ``async for``
     body, so the SDK raises at scope entry instead.
     """
-    return _RunScope(name)
+    return _RunScope(name, tags)

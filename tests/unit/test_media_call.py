@@ -125,10 +125,13 @@ class TestMediaCallSync:
             patch.object(solwyn._budget, "confirm_cost") as confirm,
             patch.object(solwyn._reporter, "report") as report,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
-            solwyn_pkg.run("sync-media") as run_id,
+            solwyn_pkg.run("sync-media", tags={"team": "platform"}) as run_id,
         ):
             result = solwyn._media_call(
-                _spec(), model="text-embedding-3-small", input="hello world"
+                _spec(),
+                model="text-embedding-3-small",
+                input="hello world",
+                solwyn_tags={"job": "embed"},
             )
 
         assert result is resp
@@ -157,6 +160,8 @@ class TestMediaCallSync:
         assert event.input_tokens == 42
         assert event.modality == "embedding"
         assert event.agent_run_id == run_id
+        assert event.tags == {"team": "platform", "job": "embed"}
+        assert "solwyn_tags" not in client.embeddings.create.call_args.kwargs
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
@@ -288,14 +293,21 @@ class TestMediaCallSync:
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_deny()),
             patch.object(solwyn._reporter, "report") as report,
+            solwyn_pkg.run("denied-media", tags={"team": "platform"}),
             pytest.raises(BudgetExceededError),
         ):
-            solwyn._media_call(_spec(), model="text-embedding-3-small", input="hi")
+            solwyn._media_call(
+                _spec(),
+                model="text-embedding-3-small",
+                input="hi",
+                solwyn_tags={"job": "embed"},
+            )
 
         client.embeddings.create.assert_not_called()
         denied = report.call_args.args[0]
         assert denied.status == CallStatus.BUDGET_DENIED
         assert denied.modality == "embedding"  # the denied event carries it too
+        assert denied.tags == {"team": "platform", "job": "embed"}
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
@@ -350,9 +362,12 @@ class TestMediaCallAsync:
             patch.object(solwyn._reporter, "report") as report,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
         ):
-            async with solwyn_pkg.run("async-media") as run_id:
+            async with solwyn_pkg.run("async-media", tags={"team": "platform"}) as run_id:
                 result = await solwyn._media_call(
-                    _spec(), model="text-embedding-3-small", input="hello"
+                    _spec(),
+                    model="text-embedding-3-small",
+                    input="hello",
+                    solwyn_tags={"job": "embed"},
                 )
 
         assert result is resp
@@ -368,6 +383,8 @@ class TestMediaCallAsync:
         assert event.is_model_fallback is False
         assert event.modality == "embedding"
         assert event.agent_run_id == run_id
+        assert event.tags == {"team": "platform", "job": "embed"}
+        assert "solwyn_tags" not in client.embeddings.create.call_args.kwargs
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

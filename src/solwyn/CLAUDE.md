@@ -11,7 +11,7 @@
 - `tokenizer.py` — tiktoken + heuristic fallback
 - `exceptions.py` — `SolwynError` base, `BudgetExceededError`, `ProviderUnavailableError`, `ConfigurationError`
 - `_privacy.py` — length-only prompt estimation. PRIVACY-CRITICAL: content-privileged allowlist with `providers/_translation/`
-- `_run.py` — `ContextVar`-backed agent-run scope; `run(name)` public entry point, `current_run()` read seam used by `_base.py`
+- `_run.py` — `ContextVar`-backed agent-run scope; `run(name, tags=...)` public entry point; `current_run()` preserves the public `(id, name)` tuple while a private copied snapshot carries bounded tags through deferred reporting
 - `_types.py` — Pydantic models for API request/response contracts
 - `_validation.py` — API key + project ID format validation
 - `providers/` — extraction adapters (OpenAI, OpenAI-compatible, Anthropic, Google, Bedrock); `_translation/` is content-privileged for request/response translation only

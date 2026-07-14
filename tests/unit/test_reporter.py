@@ -266,6 +266,23 @@ class TestMetadataReporter:
             payload = mock_post.call_args.kwargs["json"][0]
             assert "service_tier" not in payload
             assert "token_details" not in payload
+            assert "tags" not in payload
+            reporter._http.close()
+
+    def test_send_batch_includes_tags_when_present(self) -> None:
+        with patch("solwyn.reporter.MetadataReporter._flush_loop"):
+            reporter = MetadataReporter(
+                "https://api.test.solwyn.ai",
+                VALID_API_KEY,
+            )
+            reporter._shutdown.set()
+            reporter._thread.join(timeout=2.0)
+
+            with patch.object(reporter._http, "post") as mock_post:
+                reporter._send_batch([_make_event(tags={"team": "research"})])
+
+            payload = mock_post.call_args.kwargs["json"][0]
+            assert payload["tags"] == {"team": "research"}
             reporter._http.close()
 
     def test_send_batch_includes_service_tier_when_present(self) -> None:

@@ -58,7 +58,7 @@ from solwyn._proxies import (
 )
 from solwyn._registry import ProviderRuntime, build_runtimes
 from solwyn._routing import RoutingRequest, SelectionPolicy
-from solwyn._run import current_run
+from solwyn._run import _capture_run_context, _RunContextSnapshot
 from solwyn._token_details import TokenDetails
 from solwyn._types import CallStatus, FailoverReason, ProviderName
 from solwyn.budget import (
@@ -798,8 +798,8 @@ class Solwyn(_SolwynBase):
         (``measure_request``). An unobservable quantity stays None — never a
         zero-filled default — so a real $0 price is never settled.
         """
+        agent_run = _capture_run_context(kwargs.pop("solwyn_tags", None))
         requested_model = cast(str, kwargs["model"])
-        agent_run = current_run()
         call_id = str(uuid.uuid4())
         runtime = self._runtimes[0]
         provider = runtime.adapter.name
@@ -950,9 +950,9 @@ class Solwyn(_SolwynBase):
 
     def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Core interception logic: the classified candidate walk."""
+        agent_run = _capture_run_context(kwargs.pop("solwyn_tags", None))
         requested_model = cast(str, kwargs["model"])
         is_streaming = bool(kwargs.get("stream", False)) or _force_stream
-        agent_run = current_run()
         # One reconciliation join key per intercepted call: threaded into
         # every served-provider metadata event AND its confirm so the Cloud API
         # can join them (and dedup cache-hit / abandoned-stream spend).
@@ -1339,7 +1339,7 @@ class Solwyn(_SolwynBase):
         is_model_fallback: bool,
         primary_errored: bool,
         call_id: str,
-        agent_run: tuple[str | None, str | None],
+        agent_run: _RunContextSnapshot,
         estimated_input_tokens: int = 0,
     ) -> Any:
         """Wrap a streaming response, settling against the SERVED runtime.
@@ -1738,8 +1738,8 @@ class AsyncSolwyn(_SolwynBase):
         runtime alone. Billable quantity comes from the spec hooks (response
         usage first, request-derived fallback) and stays None when unobservable.
         """
+        agent_run = _capture_run_context(kwargs.pop("solwyn_tags", None))
         requested_model = cast(str, kwargs["model"])
-        agent_run = current_run()
         call_id = str(uuid.uuid4())
         runtime = self._runtimes[0]
         provider = runtime.adapter.name
@@ -1866,9 +1866,9 @@ class AsyncSolwyn(_SolwynBase):
 
     async def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Async core interception logic: the classified candidate walk."""
+        agent_run = _capture_run_context(kwargs.pop("solwyn_tags", None))
         requested_model = cast(str, kwargs["model"])
         is_streaming = bool(kwargs.get("stream", False)) or _force_stream
-        agent_run = current_run()
         # One reconciliation join key per intercepted call: see the sync
         # _intercepted_call for the join/dedup contract.
         call_id = str(uuid.uuid4())
@@ -2234,7 +2234,7 @@ class AsyncSolwyn(_SolwynBase):
         is_model_fallback: bool,
         primary_errored: bool,
         call_id: str,
-        agent_run: tuple[str | None, str | None],
+        agent_run: _RunContextSnapshot,
         estimated_input_tokens: int = 0,
     ) -> Any:
         """Wrap an async streaming response, settling against the SERVED runtime.

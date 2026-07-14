@@ -82,6 +82,78 @@ class TestRunContextManagerSync:
             assert current_run() == (outer_id, "outer")
         assert current_run() == (None, None)
 
+    def test_scope_tags_use_private_snapshot_without_changing_public_tuple(self) -> None:
+        with solwyn.run("tagged", tags={"team": "research"}) as run_id:
+            assert current_run() == (run_id, "tagged")
+            assert _run._capture_run_context() == (
+                run_id,
+                "tagged",
+                {"team": "research"},
+            )
+
+    def test_nested_scope_restores_outer_tags(self) -> None:
+        with solwyn.run("outer", tags={"scope": "outer"}) as outer_id:
+            with solwyn.run("inner", tags={"scope": "inner"}) as inner_id:
+                assert _run._capture_run_context() == (
+                    inner_id,
+                    "inner",
+                    {"scope": "inner"},
+                )
+            assert _run._capture_run_context() == (
+                outer_id,
+                "outer",
+                {"scope": "outer"},
+            )
+
+    def test_scope_copies_caller_mapping_and_private_snapshot(self) -> None:
+        tags = {"team": "research"}
+        scope = solwyn.run("copied", tags=tags)
+        tags["team"] = "mutated-before-entry"
+
+        with scope:
+            captured = _run._capture_run_context()
+            assert captured[2] == {"team": "research"}
+            assert captured[2] is not None
+            captured[2]["team"] = "mutated-snapshot"
+            assert _run._capture_run_context()[2] == {"team": "research"}
+
+    @pytest.mark.parametrize(
+        "tags",
+        [
+            {f"key-{index}": "value" for index in range(11)},
+            {"": "value"},
+            {"k" * 65: "value"},
+            {"key": "v" * 257},
+            {1: "value"},
+            {"key": 1},
+        ],
+    )
+    def test_invalid_scope_tags_fail_before_entry(self, tags: dict[object, object]) -> None:
+        with pytest.raises((TypeError, ValueError)):
+            solwyn.run("invalid", tags=tags)  # type: ignore[arg-type]
+
+    def test_private_snapshot_shallow_merges_per_call_tags(self) -> None:
+        with solwyn.run("merged", tags={"team": "platform", "env": "prod"}):
+            assert _run._capture_run_context({"env": "stage", "job": "batch"})[2] == {
+                "team": "platform",
+                "env": "stage",
+                "job": "batch",
+            }
+            assert _run._capture_run_context(None)[2] == {
+                "team": "platform",
+                "env": "prod",
+            }
+
+    def test_empty_merged_mapping_is_absent(self) -> None:
+        assert _run._capture_run_context({}) == (None, None, None)
+
+    def test_per_call_only_mapping_is_copied(self) -> None:
+        tags = {"job": "batch"}
+        captured = _run._capture_run_context(tags)
+        tags["job"] = "mutated"
+
+        assert captured == (None, None, {"job": "batch"})
+
     def test_exception_propagates_and_resets_state(self) -> None:
         with pytest.raises(RuntimeError, match="boom"), solwyn.run("foo"):
             raise RuntimeError("boom")
@@ -180,6 +252,19 @@ class TestRunContextManagerAsync:
         assert a_id != b_id
         assert all(seen == (a_id, "task-a") for seen in a_seen)
         assert all(seen == (b_id, "task-b") for seen in b_seen)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_tasks_have_independent_tags(self) -> None:
+        async def capture(label: str) -> tuple[str, dict[str, str] | None]:
+            async with solwyn.run(label, tags={"task": label}) as run_id:
+                await asyncio.sleep(0)
+                return run_id, _run._capture_run_context()[2]
+
+        first, second = await asyncio.gather(capture("first"), capture("second"))
+
+        assert first[0] != second[0]
+        assert first[1] == {"task": "first"}
+        assert second[1] == {"task": "second"}
 
 
 @pytest.mark.unit
