@@ -20,6 +20,7 @@ from typing import cast, get_args
 import httpx
 from pydantic import BaseModel, ConfigDict
 
+from solwyn._read_only_key import handle_read_only_key_error
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
     BudgetCheckRequest,
@@ -542,7 +543,8 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             # Log the exception TYPE only — symmetric with confirm_cost and
             # defense-in-depth: never interpolate the full exception (which could
             # carry response/body text) into the log.
-            logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
+            if not handle_read_only_key_error(exc):
+                logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
 
             prior_hard_deny = self._build_prior_hard_deny_unavailable_result(agent_run_id)
             if prior_hard_deny is not None:
@@ -598,6 +600,8 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             with self._state_lock:
                 self._consecutive_confirm_failures = 0
         except Exception as exc:
+            if handle_read_only_key_error(exc):
+                return
             with self._state_lock:
                 self._consecutive_confirm_failures += 1
                 count = self._consecutive_confirm_failures
@@ -706,7 +710,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             # Log the exception TYPE only — symmetric with confirm_cost and
             # defense-in-depth: never interpolate the full exception (which could
             # carry response/body text) into the log.
-            logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
+            if not handle_read_only_key_error(exc):
+                logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
 
             prior_hard_deny = self._build_prior_hard_deny_unavailable_result(agent_run_id)
             if prior_hard_deny is not None:
@@ -753,6 +758,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             resp.raise_for_status()
             self._consecutive_confirm_failures = 0
         except Exception as exc:
+            if handle_read_only_key_error(exc):
+                return
             self._consecutive_confirm_failures += 1
             count = self._consecutive_confirm_failures
             if count >= self._confirm_failure_threshold:

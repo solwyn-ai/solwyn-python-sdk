@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 
 import httpx
 
+from solwyn._read_only_key import handle_read_only_key_error
 from solwyn._types import BreakerStateReport, BudgetConfirmRequest, MetadataEvent, ProviderName
 from solwyn.circuit_breaker import CircuitBreakerState
 
@@ -426,6 +427,8 @@ class MetadataReporter(_ReporterBase):
             resp.raise_for_status()
             self._record_confirm_success()
         except Exception as exc:
+            if handle_read_only_key_error(exc):
+                return
             self._record_confirm_failure(exc)
 
     def _flush_settlements(self) -> None:
@@ -455,6 +458,8 @@ class MetadataReporter(_ReporterBase):
             resp.raise_for_status()
             self._log_ingest_rejections(resp, len(batch))
         except Exception as exc:
+            if handle_read_only_key_error(exc):
+                return
             # Log only the exception's class name (fix [D]) — the type-name-only
             # convention every other except-block follows. Safe here even though
             # the batch is content-free; keeps the privacy contract uniform.
@@ -680,6 +685,8 @@ class AsyncMetadataReporter(_ReporterBase):
             resp.raise_for_status()
             self._record_confirm_success()
         except Exception as exc:
+            if handle_read_only_key_error(exc):
+                return
             self._record_confirm_failure(exc)
 
     async def _flush_settlements(self) -> None:
@@ -709,6 +716,8 @@ class AsyncMetadataReporter(_ReporterBase):
             # httpx.Response.json() is sync on both clients — shared helper.
             self._log_ingest_rejections(resp, len(batch))
         except Exception as exc:
+            if handle_read_only_key_error(exc):
+                return
             # Log only the exception's class name (fix [D]) — the type-name-only
             # convention every other except-block follows. Safe here even though
             # the batch is content-free; keeps the privacy contract uniform.
