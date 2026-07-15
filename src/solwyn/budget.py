@@ -64,6 +64,7 @@ class BudgetCheckResult(BaseModel):
     # Server-provided RELATIVE price signal per provider for cost routing
     # (CostPolicy). The SDK never computes price. None on the cache path.
     price_hints: dict[str, float] | None = None
+    failover_tuning_allowed: bool | None = None
 
 
 class _BudgetEnforcerBase:
@@ -140,6 +141,7 @@ class _BudgetEnforcerBase:
             fallback_providers=[ProviderName(p) for p in (fallback_providers or [])],
             fallback_models=list(fallback_models or []),
             agent_run_id=agent_run_id,
+            failover_directive_version="1",
         )
 
     def _should_use_cache(self) -> bool:
@@ -263,6 +265,11 @@ class _BudgetEnforcerBase:
             if response.price_hints is not None
             else None
         )
+        failover_tuning_allowed = (
+            response.failover_directive.failover_tuning_allowed
+            if response.failover_directive is not None
+            else None
+        )
 
         if response.allowed:
             return BudgetCheckResult(
@@ -274,6 +281,7 @@ class _BudgetEnforcerBase:
                 budget_limit=response.budget_limit,
                 current_usage=response.current_usage,
                 price_hints=price_hints,
+                failover_tuning_allowed=failover_tuning_allowed,
             )
 
         # Denied by cloud
@@ -296,6 +304,7 @@ class _BudgetEnforcerBase:
                 budget_limit=response.budget_limit,
                 current_usage=response.current_usage,
                 price_hints=price_hints,
+                failover_tuning_allowed=failover_tuning_allowed,
             )
 
         # hard_deny
@@ -309,6 +318,7 @@ class _BudgetEnforcerBase:
             ),
             budget_limit=response.budget_limit,
             current_usage=response.current_usage,
+            failover_tuning_allowed=failover_tuning_allowed,
         )
 
     def _build_fail_open_result(self, estimated_input_tokens: int) -> BudgetCheckResult:

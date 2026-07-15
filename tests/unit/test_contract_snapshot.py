@@ -30,8 +30,8 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
-from types import SimpleNamespace
-from typing import Any
+from types import NoneType, SimpleNamespace
+from typing import Any, get_args
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -47,6 +47,7 @@ from solwyn._types import (
     BudgetCheckResponse,
     BudgetConfirmRequest,
     CallStatus,
+    FailoverDirective,
     MediaUsage,
     MetadataEvent,
     ProviderName,
@@ -70,11 +71,17 @@ EXPECTED_CHECK_FIELDS = {
     "fallback_providers",
     "fallback_models",
     "agent_run_id",
+    "failover_directive_version",
 }
 
-# The optional check field the None-skipping serializer drops when unset —
-# text/chat checks stay byte-identical to the pre-window-2 wire.
-_NONE_SKIPPED_CHECK_FIELDS = {"estimated_media", "agent_run_id"}
+# Optional check fields the None-skipping serializer drops when unset. Runtime
+# request construction intentionally sets the directive version; only direct or
+# otherwise unopted model construction omits it.
+_NONE_SKIPPED_CHECK_FIELDS = {
+    "estimated_media",
+    "agent_run_id",
+    "failover_directive_version",
+}
 
 EXPECTED_CHECK_RESPONSE_FIELDS = {
     "allowed",
@@ -86,6 +93,7 @@ EXPECTED_CHECK_RESPONSE_FIELDS = {
     "denied_by_period",
     "project_id",
     "price_hints",
+    "failover_directive",
 }
 
 EXPECTED_CONFIRM_FIELDS = {
@@ -223,6 +231,17 @@ class TestWireModelFieldSets:
     def test_budget_check_response_field_set(self) -> None:
         assert set(BudgetCheckResponse.model_fields) == EXPECTED_CHECK_RESPONSE_FIELDS
 
+    def test_every_nullable_budget_check_response_field_is_optional(self) -> None:
+        nullable_fields = {
+            name: field
+            for name, field in BudgetCheckResponse.model_fields.items()
+            if NoneType in get_args(field.annotation)
+        }
+
+        assert nullable_fields
+        assert all(field.default is None for field in nullable_fields.values())
+        assert all(not field.is_required() for field in nullable_fields.values())
+
     def test_budget_confirm_request_field_set(self) -> None:
         assert set(BudgetConfirmRequest.model_fields) == EXPECTED_CONFIRM_FIELDS
 
@@ -327,7 +346,10 @@ class TestWireModelDumpSnapshots:
 
         dumped = req.model_dump(mode="json")
 
-        assert set(dumped) == EXPECTED_CHECK_FIELDS - {"estimated_media"}
+        assert set(dumped) == EXPECTED_CHECK_FIELDS - {
+            "estimated_media",
+            "failover_directive_version",
+        }
         assert dumped["agent_run_id"] == "run_abc"
 
     def test_budget_check_request_agent_run_id_length_boundary(self) -> None:
@@ -358,7 +380,10 @@ class TestWireModelDumpSnapshots:
             estimated_media=MediaUsage(image_count=2, resolution="1024x1024", quality="low"),
         )
         dumped = req.model_dump(mode="json")
-        assert set(dumped) == EXPECTED_CHECK_FIELDS - {"agent_run_id"}
+        assert set(dumped) == EXPECTED_CHECK_FIELDS - {
+            "agent_run_id",
+            "failover_directive_version",
+        }
         assert dumped["estimated_media"]["image_count"] == 2
         assert dumped["modality"] == "image"
 
@@ -397,6 +422,16 @@ class TestWireModelDumpSnapshots:
             "openai": 1.0,
             "anthropic": 2.0,
         }
+
+    def test_failover_directive_v1_dump_and_rejects_other_versions(self) -> None:
+        directive = FailoverDirective(version="1", failover_tuning_allowed=False)
+
+        assert directive.model_dump(mode="json") == {
+            "version": "1",
+            "failover_tuning_allowed": False,
+        }
+        with pytest.raises(ValidationError):
+            FailoverDirective.model_validate({"version": "2", "failover_tuning_allowed": True})
 
     def test_budget_confirm_request_dump_keys(self) -> None:
         req = BudgetConfirmRequest(

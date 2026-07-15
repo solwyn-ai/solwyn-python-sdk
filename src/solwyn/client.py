@@ -204,6 +204,10 @@ class Deadline:
         """True once the chain deadline has elapsed."""
         return self.remaining() <= 0.0
 
+    def replace_total(self, total: float) -> None:
+        """Replace the total duration while preserving the original start."""
+        self._total = total
+
 
 class _MaterializedStream:
     """A first-chunk-materialized SYNC stream that owns the ORIGINAL generator.
@@ -845,6 +849,11 @@ class Solwyn(_SolwynBase):
             estimated_media=estimated_media,
             agent_run_id=agent_run[0],
         )
+        effective_total = self._apply_failover_tuning_directive(
+            getattr(budget, "failover_tuning_allowed", None)
+        )
+        if effective_total is not None:
+            deadline.replace_total(effective_total)
         self._reporter.observe_project_id(budget.project_id)
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
@@ -991,6 +1000,11 @@ class Solwyn(_SolwynBase):
             timeout=_budget_timeout(deadline),
             agent_run_id=agent_run[0],
         )
+        effective_total = self._apply_failover_tuning_directive(
+            getattr(budget, "failover_tuning_allowed", None)
+        )
+        if effective_total is not None:
+            deadline.replace_total(effective_total)
         self._reporter.observe_project_id(budget.project_id)
         # Refresh the CostPolicy signal from the server. Price hints are advisory
         # and slow-moving, so they PERSIST across hint-less responses — a budget
@@ -1770,6 +1784,11 @@ class AsyncSolwyn(_SolwynBase):
             estimated_media=estimated_media,
             agent_run_id=agent_run[0],
         )
+        effective_total = self._apply_failover_tuning_directive(
+            getattr(budget, "failover_tuning_allowed", None)
+        )
+        if effective_total is not None:
+            deadline.replace_total(effective_total)
         self._reporter.observe_project_id(budget.project_id)
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
@@ -1903,6 +1922,11 @@ class AsyncSolwyn(_SolwynBase):
             timeout=_budget_timeout(deadline),
             agent_run_id=agent_run[0],
         )
+        effective_total = self._apply_failover_tuning_directive(
+            getattr(budget, "failover_tuning_allowed", None)
+        )
+        if effective_total is not None:
+            deadline.replace_total(effective_total)
         self._reporter.observe_project_id(budget.project_id)
         # Refresh the CostPolicy signal from the server. Hints PERSIST across
         # hint-less responses (cache hits) until the server sends new ones — see

@@ -363,6 +363,15 @@ class MetadataEvent(BaseModel):
     )
 
 
+class FailoverDirective(BaseModel):
+    """Versioned server policy for SDK-managed provider failover."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal["1"]
+    failover_tuning_allowed: bool
+
+
 class BudgetCheckRequest(BaseModel):
     """Pre-flight budget check sent before an LLM call."""
 
@@ -376,10 +385,9 @@ class BudgetCheckRequest(BaseModel):
     ) -> dict[str, Any]:
         """Serialize checks without null-valued optional fields.
 
-        ``estimated_media`` and ``agent_run_id`` are optional fields; skipping
-        them when None keeps unscoped text/chat check wire bytes byte-identical
-        to the legacy wire. The always-present fields (modality and the
-        fallback-chain lists) never go None, so they always serialize.
+        Optional fields are skipped when None. Runtime request construction
+        always opts in to the v1 failover directive; direct model construction
+        may omit the version for compatibility tests and legacy callers.
         """
         data = handler(self)
         if not isinstance(data, dict):
@@ -425,6 +433,10 @@ class BudgetCheckRequest(BaseModel):
         max_length=AGENT_RUN_ID_MAX_LENGTH,
         description="Stable id for the active solwyn.run() scope, when present.",
     )
+    failover_directive_version: Literal["1"] | None = Field(
+        default=None,
+        description="Explicit opt-in to the version 1 server failover directive.",
+    )
 
     @model_validator(mode="after")
     def _check_chain_hint_alignment(self) -> BudgetCheckRequest:
@@ -448,7 +460,7 @@ class BudgetCheckResponse(BaseModel):
     budget_limit: float = Field(..., description="Total budget limit for current period in USD")
     current_usage: float = Field(..., description="Current spend in USD for this period")
     denied_by_period: str | None = Field(
-        ..., description="Which budget period triggered denial (e.g. 'daily')"
+        None, description="Which budget period triggered denial (e.g. 'daily')"
     )
     project_id: str = Field(..., description="Project identifier resolved from the API key")
     price_hints: dict[ProviderName, float] | None = Field(
@@ -457,6 +469,10 @@ class BudgetCheckResponse(BaseModel):
             "Server-provided RELATIVE price signal per provider for cost routing; "
             "SDK never computes price"
         ),
+    )
+    failover_directive: FailoverDirective | None = Field(
+        default=None,
+        description="Versioned server policy for SDK-managed failover.",
     )
 
 

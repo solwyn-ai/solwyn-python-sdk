@@ -82,6 +82,8 @@ class TestBudgetEnforcerBase:
         assert req.estimated_input_tokens == 500
         assert req.model == "gpt-4o"
         assert req.provider == "openai"
+        assert req.failover_directive_version == "1"
+        assert req.model_dump(mode="json")["failover_directive_version"] == "1"
 
     def test_build_check_request_carries_agent_run_id(self) -> None:
         base = _BudgetEnforcerBase(
@@ -143,6 +145,38 @@ class TestBudgetEnforcerBase:
         # Cache TTL is 0, so it should expire instantly
         assert base._should_use_cache() is False
 
+    @pytest.mark.parametrize(
+        ("payload", "expected_allowed"),
+        [
+            (ALLOW_BUDGET_RESPONSE, True),
+            (_ALERT_ONLY_DENY_RESPONSE, True),
+            (_DENY_RESPONSE, False),
+        ],
+    )
+    def test_cloud_result_branches_propagate_failover_tuning_allowed(
+        self,
+        payload: dict[str, object],
+        expected_allowed: bool,
+    ) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+        response = BudgetCheckResponse.model_validate(
+            {
+                **payload,
+                "failover_directive": {
+                    "version": "1",
+                    "failover_tuning_allowed": False,
+                },
+            }
+        )
+
+        result = base._build_result_from_response(response)
+
+        assert result.allowed is expected_allowed
+        assert result.failover_tuning_allowed is False
+
 
 # ---------------------------------------------------------------------------
 # Cloud allow
@@ -156,7 +190,13 @@ class TestCloudAllow:
     def test_returns_allowed(self) -> None:
         enforcer = _make_enforcer()
         mock_response = MagicMock()
-        mock_response.json.return_value = ALLOW_BUDGET_RESPONSE
+        mock_response.json.return_value = {
+            **ALLOW_BUDGET_RESPONSE,
+            "failover_directive": {
+                "version": "1",
+                "failover_tuning_allowed": True,
+            },
+        }
         mock_response.raise_for_status = MagicMock()
 
         with patch.object(enforcer._http, "post", return_value=mock_response):
@@ -168,6 +208,7 @@ class TestCloudAllow:
         assert result.remaining_budget == 80.0
         assert result.reservation_id == "res_123"
         assert result.warning is None
+        assert result.failover_tuning_allowed is True
 
     def test_shared_allow_fixture_propagates_non_none_price_hints(self) -> None:
         enforcer = _make_enforcer()
@@ -785,6 +826,7 @@ class TestBudgetCheckResult:
         assert result.reservation_id is None
         assert result.mode == BudgetMode.ALERT_ONLY
         assert result.warning is None
+        assert result.failover_tuning_allowed is None
 
     def test_all_fields(self) -> None:
         result = BudgetCheckResult(

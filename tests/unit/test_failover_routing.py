@@ -23,7 +23,8 @@ import pytest
 from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
 from solwyn._types import CircuitState
-from solwyn.client import AsyncSolwyn, Solwyn
+from solwyn.client import AsyncSolwyn, Deadline, Solwyn
+from solwyn.config import SolwynConfig
 from solwyn.exceptions import ProviderUnavailableError, UntranslatableRequestError
 
 
@@ -120,13 +121,14 @@ def _google_chunk() -> SimpleNamespace:
     )
 
 
-def _allow_budget() -> SimpleNamespace:
+def _allow_budget(*, failover_tuning_allowed: bool | None = None) -> SimpleNamespace:
     """Allow result with no reservation (skips confirm_cost)."""
     return SimpleNamespace(
         allowed=True,
         reservation_id=None,
         project_id=VALID_PROJECT_ID,
         price_hints=None,
+        failover_tuning_allowed=failover_tuning_allowed,
     )
 
 
@@ -150,6 +152,29 @@ _PLAIN_REQUEST = {
     "model": "gpt-4o",
     "messages": [{"role": "user", "content": "hi"}],
 }
+
+_FAILOVER_TUNING_FIELDS = (
+    "failover_total_timeout",
+    "failover_idempotency",
+    "same_provider_retries",
+    "circuit_breaker_recovery_timeout_jitter",
+    "circuit_breaker_failure_threshold",
+    "circuit_breaker_recovery_timeout",
+    "circuit_breaker_success_threshold",
+)
+_CUSTOM_FAILOVER_TUNING = {
+    "failover_total_timeout": 91.0,
+    "failover_idempotency": "never",
+    "same_provider_retries": 4,
+    "circuit_breaker_recovery_timeout_jitter": 0.05,
+    "circuit_breaker_failure_threshold": 8,
+    "circuit_breaker_recovery_timeout": 75,
+    "circuit_breaker_success_threshold": 6,
+}
+
+
+def _current_failover_tuning(solwyn: Solwyn | AsyncSolwyn) -> dict[str, object]:
+    return {name: getattr(solwyn._config, name) for name in _FAILOVER_TUNING_FIELDS}
 
 
 # ── cross-provider failover (the core case) ──────────────────────────────
@@ -604,6 +629,142 @@ class TestChainExhaustion:
 
         await solwyn._reporter._http.aclose()
         await solwyn._budget._http.aclose()
+
+
+# ── server failover-tuning directive ────────────────────────────────────
+
+
+@pytest.mark.unit
+class TestFailoverTuningDirective:
+    def test_false_then_true_suppresses_and_restores_sync_tuning_once(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create.return_value = _openai_response()
+        anthropic = _anthropic_client()
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            budget_check_cache_ttl=17,
+            **_CUSTOM_FAILOVER_TUNING,
+        )
+        runtime_order = [runtime.entry for runtime in solwyn._runtimes]
+        breaker_ids = {
+            provider: id(breaker) for provider, breaker in solwyn._circuit_breakers.items()
+        }
+        primary_breaker = solwyn._circuit_breakers["openai"]
+        caplog.set_level("WARNING", logger="solwyn._base")
+
+        with (
+            patch.object(
+                solwyn._budget,
+                "check_budget",
+                side_effect=[
+                    _allow_budget(failover_tuning_allowed=False),
+                    _allow_budget(failover_tuning_allowed=True),
+                    _allow_budget(failover_tuning_allowed=False),
+                ],
+            ),
+            patch.object(
+                primary_breaker,
+                "replace_tuning",
+                wraps=primary_breaker.replace_tuning,
+            ) as replace_tuning,
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+            defaults = {
+                name: SolwynConfig.model_fields[name].default for name in _FAILOVER_TUNING_FIELDS
+            }
+            assert _current_failover_tuning(solwyn) == defaults
+            assert openai.with_options.call_args.kwargs["timeout"] <= 30.0
+
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+            assert _current_failover_tuning(solwyn) == _CUSTOM_FAILOVER_TUNING
+
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+            assert replace_tuning.call_count == 3
+            solwyn._apply_failover_tuning_directive(False)
+            assert replace_tuning.call_count == 3
+
+        assert openai.chat.completions.create.call_count == 3
+        assert [runtime.entry for runtime in solwyn._runtimes] == runtime_order
+        assert {
+            provider: id(breaker) for provider, breaker in solwyn._circuit_breakers.items()
+        } == breaker_ids
+        assert solwyn._config.budget_check_cache_ttl == 17
+        suppression_logs = [
+            record
+            for record in caplog.records
+            if record.name == "solwyn._base" and "failover tuning" in record.getMessage().lower()
+        ]
+        assert len(suppression_logs) == 1
+        assert suppression_logs[0].getMessage() == (
+            "Custom failover tuning is unavailable for this plan; SDK defaults applied"
+        )
+
+        _close(solwyn)
+
+    @pytest.mark.asyncio
+    async def test_false_suppresses_tuning_but_async_provider_call_still_runs(self) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create = AsyncMock(return_value=_openai_response())
+        solwyn = AsyncSolwyn(
+            openai,
+            api_key=VALID_API_KEY,
+            model="gpt-4o",
+            **_CUSTOM_FAILOVER_TUNING,
+        )
+        runtime_order = [runtime.entry for runtime in solwyn._runtimes]
+        solwyn._reporter.report = MagicMock()
+
+        with patch.object(
+            solwyn._budget,
+            "check_budget",
+            new=AsyncMock(return_value=_allow_budget(failover_tuning_allowed=False)),
+        ):
+            await solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        defaults = {
+            name: SolwynConfig.model_fields[name].default for name in _FAILOVER_TUNING_FIELDS
+        }
+        assert _current_failover_tuning(solwyn) == defaults
+        assert [runtime.entry for runtime in solwyn._runtimes] == runtime_order
+        openai.chat.completions.create.assert_awaited_once()
+        assert openai.with_options.call_args.kwargs["timeout"] <= 30.0
+
+        await solwyn._reporter._http.aclose()
+        await solwyn._budget._http.aclose()
+
+    def test_missing_or_fail_open_directive_is_a_noop_and_call_proceeds(self) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create.return_value = _openai_response()
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            **_CUSTOM_FAILOVER_TUNING,
+        )
+
+        with patch.object(
+            solwyn._budget,
+            "check_budget",
+            return_value=_allow_budget(failover_tuning_allowed=None),
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        assert _current_failover_tuning(solwyn) == _CUSTOM_FAILOVER_TUNING
+        openai.chat.completions.create.assert_called_once()
+        _close(solwyn)
+
+    def test_deadline_can_replace_total_without_resetting_start(self) -> None:
+        deadline = Deadline(30.0)
+        original_start = deadline._start
+
+        deadline.replace_total(10.0)
+
+        assert deadline._start == original_start
+        assert 0.0 < deadline.remaining() <= 10.0
 
 
 # ── per-hop deadline bound ───────────────────────────────────────────────
