@@ -471,3 +471,60 @@ class TestRecoveryTimeoutJitter:
             # Just over the maximum possible window -> always eligible.
             cb.last_failure_time = time.monotonic() - 12.1
             assert cb.recovery_eligible is True
+
+
+@pytest.mark.unit
+class TestRetune:
+    def test_retune_preserves_open_state_and_counters_but_resamples_open_window(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cb = CircuitBreaker(
+            failure_threshold=1,
+            recovery_timeout=10,
+            success_threshold=2,
+            recovery_timeout_jitter=0.1,
+        )
+        cb.record_failure()
+        before = cb.get_state()
+        monkeypatch.setattr(cb, "_sample_recovery_window", lambda: 77.0)
+
+        cb.replace_tuning(
+            failure_threshold=5,
+            recovery_timeout=20,
+            success_threshold=4,
+            recovery_timeout_jitter=0.3,
+        )
+
+        after = cb.get_state()
+        assert after == before
+        assert cb.failure_threshold == 5
+        assert cb.recovery_timeout == 20
+        assert cb.success_threshold == 4
+        assert cb.recovery_timeout_jitter == 0.3
+        assert cb._effective_recovery_timeout == 77.0
+
+    def test_retune_preserves_half_open_probe_ownership_without_resampling(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cb = CircuitBreaker(failure_threshold=1, recovery_timeout=0)
+        cb.record_failure()
+        admission = cb.admit()
+        assert admission.owns_probe is True
+        original_window = cb._effective_recovery_timeout
+
+        monkeypatch.setattr(
+            cb,
+            "_sample_recovery_window",
+            lambda: pytest.fail("HALF_OPEN retune must not resample"),
+        )
+        cb.replace_tuning(
+            failure_threshold=5,
+            recovery_timeout=20,
+            success_threshold=4,
+            recovery_timeout_jitter=0.3,
+        )
+        assert cb.state == CircuitState.HALF_OPEN
+        assert cb._effective_recovery_timeout == original_window
+        assert cb.admit().allowed is False

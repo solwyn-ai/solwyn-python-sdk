@@ -91,7 +91,13 @@ class TestAsyncCloudAllow:
     async def test_returns_allowed(self) -> None:
         enforcer = _make_async_enforcer()
         mock_response = MagicMock()
-        mock_response.json.return_value = ALLOW_BUDGET_RESPONSE
+        mock_response.json.return_value = {
+            **ALLOW_BUDGET_RESPONSE,
+            "failover_directive": {
+                "version": "1",
+                "failover_tuning_allowed": False,
+            },
+        }
         mock_response.raise_for_status = MagicMock()
         enforcer._http.post = AsyncMock(return_value=mock_response)
         result = await enforcer.check_budget(
@@ -102,6 +108,7 @@ class TestAsyncCloudAllow:
         assert result.remaining_budget == 80.0
         assert result.reservation_id == "res_123"
         assert result.warning is None
+        assert result.failover_tuning_allowed is False
         await enforcer.close()
 
 

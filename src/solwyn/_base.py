@@ -53,6 +53,19 @@ logger = logging.getLogger(__name__)
 _LATENCY_WINDOW = 50
 _LATENCY_MIN_SAMPLES = 3
 
+# The complete and intentionally narrow set of customer-configurable failover
+# tuning governed by the server directive. Provider entries and routing policy
+# are deliberately outside this boundary.
+_FAILOVER_TUNING_FIELDS = (
+    "failover_total_timeout",
+    "failover_idempotency",
+    "same_provider_retries",
+    "circuit_breaker_recovery_timeout_jitter",
+    "circuit_breaker_failure_threshold",
+    "circuit_breaker_recovery_timeout",
+    "circuit_breaker_success_threshold",
+)
+
 # CostPolicy is inert until the server sends a relative price hint: with no hint
 # on any candidate it degrades to health-based ordering. Warn ONCE per process
 # when that fallback is in effect so the no-op is visible without logging on
@@ -289,6 +302,10 @@ class _SolwynBase:
     ) -> None:
         self._config = config
         self._runtimes = runtimes
+        self._requested_failover_tuning = {
+            name: getattr(config, name) for name in _FAILOVER_TUNING_FIELDS
+        }
+        self._failover_tuning_suppression_logged = False
         self._sdk_instance_id = str(uuid.uuid4())
         self._tokenizer = TokenizerManager()
         # Injectable routing policy: defaults to the health-only policy.
@@ -328,6 +345,61 @@ class _SolwynBase:
             success_threshold=self._config.circuit_breaker_success_threshold,
             recovery_timeout_jitter=self._config.circuit_breaker_recovery_timeout_jitter,
         )
+
+    def _apply_failover_tuning_directive(self, allowed: bool | None) -> float | None:
+        """Apply the server's tuning decision and return its effective deadline.
+
+        ``None`` is advisory-delivery failure or a legacy/missing directive and
+        is therefore a no-op. Config mutation and retuning every existing
+        breaker share the breaker-management lock with lazy breaker creation,
+        so existing and newly created breakers receive coherent tuning before
+        the current call continues into post-check routing.
+        """
+        if allowed is None:
+            return None
+
+        if allowed:
+            effective = dict(self._requested_failover_tuning)
+        else:
+            effective = {
+                name: SolwynConfig.model_fields[name].default for name in _FAILOVER_TUNING_FIELDS
+            }
+
+        should_log_suppression = False
+        with self._breaker_lock:
+            tuning_changed = any(
+                getattr(self._config, name) != effective[name] for name in _FAILOVER_TUNING_FIELDS
+            )
+            if tuning_changed:
+                for name, value in effective.items():
+                    setattr(self._config, name, value)
+                for breaker in self._circuit_breakers.values():
+                    breaker.replace_tuning(
+                        failure_threshold=self._config.circuit_breaker_failure_threshold,
+                        recovery_timeout=self._config.circuit_breaker_recovery_timeout,
+                        success_threshold=self._config.circuit_breaker_success_threshold,
+                        recovery_timeout_jitter=(
+                            self._config.circuit_breaker_recovery_timeout_jitter
+                        ),
+                    )
+
+            suppresses_requested_tuning = any(
+                effective[name] != self._requested_failover_tuning[name]
+                for name in _FAILOVER_TUNING_FIELDS
+            )
+            if (
+                not allowed
+                and suppresses_requested_tuning
+                and not self._failover_tuning_suppression_logged
+            ):
+                self._failover_tuning_suppression_logged = True
+                should_log_suppression = True
+
+        if should_log_suppression:
+            logger.warning(
+                "Custom failover tuning is unavailable for this plan; SDK defaults applied"
+            )
+        return float(effective["failover_total_timeout"])
 
     def _get_circuit_breaker(self, provider: str) -> CircuitBreaker:
         """Get the circuit breaker for a provider.

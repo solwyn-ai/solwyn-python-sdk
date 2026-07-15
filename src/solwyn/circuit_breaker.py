@@ -188,6 +188,28 @@ class CircuitBreaker:
                 self._half_open_probe_active = False
                 self._half_open_probe_token = None
 
+    def replace_tuning(
+        self,
+        *,
+        failure_threshold: int,
+        recovery_timeout: int,
+        success_threshold: int,
+        recovery_timeout_jitter: float,
+    ) -> None:
+        """Replace tuning without disturbing health or probe state.
+
+        An OPEN breaker receives a fresh effective recovery window using the
+        new timeout and jitter. CLOSED and HALF_OPEN breakers retain their
+        current window because it is relevant only to an active OPEN episode.
+        """
+        with self._lock:
+            self.failure_threshold = failure_threshold
+            self.recovery_timeout = recovery_timeout
+            self.success_threshold = success_threshold
+            self.recovery_timeout_jitter = recovery_timeout_jitter
+            if self.state == CircuitState.OPEN:
+                self._effective_recovery_timeout = self._sample_recovery_window()
+
     @property
     def recovery_eligible(self) -> bool:
         """Report whether an OPEN breaker is ready to probe — WITHOUT mutating.

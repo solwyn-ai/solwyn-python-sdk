@@ -70,12 +70,17 @@ def _route_to_images(surface, client, kwargs, *, timeout, max_retries):
     return client.images.generate, dict(kwargs)
 
 
-def _allow(reservation_id: str | None = "res_media") -> SimpleNamespace:
+def _allow(
+    reservation_id: str | None = "res_media",
+    *,
+    failover_tuning_allowed: bool | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         allowed=True,
         reservation_id=reservation_id,
         project_id=VALID_PROJECT_ID,
         price_hints=None,
+        failover_tuning_allowed=failover_tuning_allowed,
     )
 
 
@@ -111,6 +116,31 @@ def _build_sync(client: MagicMock, **overrides) -> Solwyn:
 
 @pytest.mark.unit
 class TestMediaCallSync:
+    def test_directive_refreshes_media_deadline_before_dispatch(self) -> None:
+        client, resp = _sync_client()
+        solwyn = _build_sync(client, failover_total_timeout=91.0)
+
+        with (
+            patch.object(
+                solwyn._budget,
+                "check_budget",
+                return_value=_allow(None, failover_tuning_allowed=False),
+            ),
+            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+        ):
+            result = solwyn._media_call(
+                _spec(),
+                model="text-embedding-3-small",
+                input="hello world",
+            )
+
+        assert result is resp
+        assert solwyn._config.failover_total_timeout == 30.0
+        assert 0.0 < client.with_options.call_args.kwargs["timeout"] <= 30.0
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
     def test_success_confirms_and_reports_primary_only(self) -> None:
         client, resp = _sync_client()
         solwyn = _build_sync(client)
@@ -344,6 +374,32 @@ def _async_client() -> tuple[MagicMock, SimpleNamespace]:
 
 @pytest.mark.unit
 class TestMediaCallAsync:
+    @pytest.mark.asyncio
+    async def test_directive_refreshes_media_deadline_before_dispatch(self) -> None:
+        client, resp = _async_client()
+        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, failover_total_timeout=91.0)
+
+        with (
+            patch.object(
+                solwyn._budget,
+                "check_budget",
+                new=AsyncMock(return_value=_allow(None, failover_tuning_allowed=False)),
+            ),
+            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+        ):
+            result = await solwyn._media_call(
+                _spec(),
+                model="text-embedding-3-small",
+                input="hello world",
+            )
+
+        assert result is resp
+        assert solwyn._config.failover_total_timeout == 30.0
+        assert 0.0 < client.with_options.call_args.kwargs["timeout"] <= 30.0
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
     @pytest.mark.asyncio
     async def test_success_confirms_and_reports_primary_only(self) -> None:
         client, resp = _async_client()
