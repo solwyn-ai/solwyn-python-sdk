@@ -33,6 +33,7 @@ from solwyn.exceptions import (
     ConfigurationError,
     ProviderUnavailableError,
     SolwynError,
+    UnsupportedSurfaceError,
     UntranslatableModelError,
     UntranslatableRequestError,
 )
@@ -48,6 +49,7 @@ __all__ = [
     "ConfigurationError",
     "UntranslatableRequestError",
     "UntranslatableModelError",
+    "UnsupportedSurfaceError",
     "ProviderEntry",
     "ProviderName",
     "FailoverReason",
