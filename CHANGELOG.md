@@ -7,6 +7,79 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-15
+
+Run-scoped budget enforcement, explicit customer tags, and server-governed
+failover tuning. Wire-contract changes are API-first: Solwyn Cloud accepts every
+field below before this SDK releases.
+
+### Added
+
+- **Run scopes enforce per-run caps.** Every pre-flight check made inside
+  `solwyn.run(...)` now carries the active `agent_run_id`, so Cloud can enforce a
+  cap scoped to a single run. Run-scoped checks bypass the SDK's global allow
+  cache — a cached allow for one run can never authorize another — and a run
+  denial (`denied_by_period == "agent_run"`) sticks to that run alone rather than
+  replacing global budget state, so one capped run cannot deny an unrelated one.
+  Cloud usage visibility stays asynchronous: with the defaults, the conservative
+  transition/leak upper bound after a cap is crossed is ~10 seconds (the 5-second
+  global allow-cache TTL plus the reporter's 5-second flush interval). (#29)
+- **Bounded customer tags.** `solwyn.run(name, tags={...})` and the reserved
+  per-call `solwyn_tags={...}` keyword carry explicit customer metadata for
+  grouping and export — never derived from prompts or responses. Per-call keys
+  shallow-merge over run tags. The merged mapping admits at most 10 keys, keys of
+  1–64 characters, and values of 0–256 characters; a mapping that exceeds any
+  bound is REJECTED, never silently truncated, so attribution is never quietly
+  wrong. `solwyn_tags=` is stripped before provider dispatch (pass it as a call
+  argument, not in `default_params`). Mappings are copied at scope entry and call
+  start, so later caller mutation cannot change attribution. (#31)
+- **Circuit breaker state reporting.** The reporter now piggybacks a
+  `BreakerStateReport` snapshot per provider — state, failure/success counts,
+  snapshot time, and the bounded `sdk_instance_id` — onto its existing flush
+  cycle, making SDK-local provider health visible server-side instead of trapped
+  in-process. Reporting is per-instance and self-limiting: it engages only once a
+  project id has been learned from a Cloud response, and a snapshot failure is
+  logged by exception type and skipped, never raised onto the call path. The
+  breaker remains authoritative and entirely process-local — only its state is
+  reported, and nothing Cloud returns steers it. Governed by the new
+  `breaker_reporting_enabled` config field (env var
+  `SOLWYN_BREAKER_REPORTING_ENABLED`), default enabled; set it false to opt out
+  of breaker snapshots entirely. (#30)
+- **Failover tuning entitlements.** Budget checks opt into a versioned
+  `FailoverDirective` (`version: "1"`), whose `failover_tuning_allowed` flag
+  governs exactly seven customer-configurable fields: `failover_total_timeout`,
+  `failover_idempotency`, `same_provider_retries`,
+  `circuit_breaker_recovery_timeout_jitter`,
+  `circuit_breaker_failure_threshold`, `circuit_breaker_recovery_timeout`, and
+  `circuit_breaker_success_threshold`. Enforcement is ADVISORY: when tuning is
+  not entitled, plan defaults are applied (retuning existing breakers in place)
+  without changing provider order and without failing calls; absent policy
+  delivery leaves behavior unchanged. Provider entries and routing policy are
+  deliberately outside the boundary. (#33)
+- **OpenAI prompt cache-write usage.** The OpenAI extractor now reads
+  `cache_write_tokens` off the prompt token details (Chat Completions) and input
+  token details (Responses API) — covering every OpenAI-compatible profile and
+  the stream accumulators — and reports it as `cache_creation_5m_tokens`.
+  OpenAI's cache writes are its provider-default/minimum 30-minute writes; they
+  ride the dataset's existing 5m cache-write bucket to preserve the wire
+  contract, rather than adding a per-TTL field. A response without the bucket
+  reports 0 exactly as before. (#28)
+- **Read-only project key diagnostics.** A Cloud 403 carrying the structured
+  `{"detail": {"code": "read_only_key"}}` contract is recognized and logged once
+  per process at ERROR level as an actionable configuration diagnostic, instead
+  of surfacing as a generic budget-check failure. The match is exact — only the
+  structured contract — and the response body is never exposed. (#32)
+
+### Changed
+
+- **`AGENT_RUN_ID_MAX_LENGTH` raised from 255 to 256.** The validation cap for
+  `agent_run_id` is now 256 characters. The bound only widens, so no previously
+  valid id becomes invalid; SDK-generated run ids are far shorter and unaffected.
+
+---
+
+## [0.2.0] - 2026-07-11
+
 Non-text modality support — SDK merge 1. Wire-contract changes are API-first:
 Solwyn Cloud accepts every field below before this SDK releases.
 

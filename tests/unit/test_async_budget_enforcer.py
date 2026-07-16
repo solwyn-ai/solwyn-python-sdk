@@ -406,6 +406,39 @@ class TestAsyncFailOpenSticky:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
+    async def test_prior_hard_deny_is_logged_when_cloud_unreachable(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        enforcer = _make_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        mock_response = MagicMock()
+        mock_response.json.return_value = _DENY_RESPONSE
+        mock_response.raise_for_status = MagicMock()
+        enforcer._http.post = AsyncMock(
+            side_effect=[mock_response, httpx.ConnectError("unreachable")]
+        )
+
+        with caplog.at_level("WARNING", logger="solwyn.budget"):
+            await enforcer.check_budget(
+                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            )
+            result = await enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            )
+
+        assert result.allowed is False
+        preserved = [
+            record
+            for record in caplog.records
+            if "preserving prior hard deny" in record.getMessage().lower()
+        ]
+        assert len(preserved) == 1
+        assert preserved[0].levelname == "WARNING"
+        # The logged message carries the same usage/limit figures as the field.
+        assert "$99.50/$100.00 used" in preserved[0].getMessage()
+        await enforcer.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
     async def test_cloud_hard_deny_overrides_local_alert_only_when_cloud_later_unreachable(
         self,
     ) -> None:

@@ -217,6 +217,14 @@ class _BudgetEnforcerBase:
                     self._run_hard_deny_responses.move_to_end(agent_run_id)
         if response is None:
             return None
+        # Surfaced on both the sync and async check_budget paths, which both
+        # return the preserved denial through this builder. The `warning` field
+        # below carries the same text for programmatic callers.
+        logger.warning(
+            "Cloud API unreachable; preserving prior hard deny: $%.2f/$%.2f used",
+            response.current_usage,
+            response.budget_limit,
+        )
         return BudgetCheckResult(
             allowed=False,
             remaining_budget=response.remaining_budget,
