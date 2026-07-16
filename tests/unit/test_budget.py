@@ -324,6 +324,38 @@ class TestFailOpen:
         assert "cloud api unreachable" in result.warning.lower()
         assert mock_post.call_count == 2
 
+    def test_prior_hard_deny_is_logged_when_cloud_unreachable(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        mock_response = MagicMock()
+        mock_response.json.return_value = _DENY_RESPONSE
+        mock_response.raise_for_status = MagicMock()
+
+        with (
+            patch.object(
+                enforcer._http,
+                "post",
+                side_effect=[mock_response, httpx.ConnectError("unreachable")],
+            ),
+            caplog.at_level("WARNING", logger="solwyn.budget"),
+        ):
+            enforcer.check_budget(estimated_input_tokens=50000, model="gpt-4o", provider="openai")
+            result = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            )
+
+        assert result.allowed is False
+        preserved = [
+            record
+            for record in caplog.records
+            if "preserving prior hard deny" in record.getMessage().lower()
+        ]
+        assert len(preserved) == 1
+        assert preserved[0].levelname == "WARNING"
+        # The logged message carries the same usage/limit figures as the field.
+        assert "$99.50/$100.00 used" in preserved[0].getMessage()
+
     def test_cloud_hard_deny_overrides_local_alert_only_when_cloud_later_unreachable(
         self,
     ) -> None:
