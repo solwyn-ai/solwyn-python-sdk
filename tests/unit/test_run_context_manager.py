@@ -16,6 +16,7 @@ import pytest
 
 import solwyn
 from solwyn import _run
+from solwyn._constants import AGENT_RUN_ID_MAX_LENGTH
 from solwyn._run import current_run
 
 
@@ -39,8 +40,8 @@ class TestRunIdGenerator:
         assert run_id[12] == "-"
 
     def test_id_fits_wire_max_length(self) -> None:
-        # Wire field cap is 255 chars; the id must comfortably fit.
-        assert len(_run._new_run_id()) <= 255
+        # The id must comfortably fit the wire field cap.
+        assert len(_run._new_run_id()) <= AGENT_RUN_ID_MAX_LENGTH
 
 
 @pytest.mark.unit
