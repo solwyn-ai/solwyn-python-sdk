@@ -7,7 +7,7 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-07-15
+## [0.3.0] - 2026-07-16
 
 Run-scoped budget enforcement, explicit customer tags, and server-governed
 failover tuning. Wire-contract changes are API-first: Solwyn Cloud accepts every
@@ -69,6 +69,18 @@ field below before this SDK releases.
   per process at ERROR level as an actionable configuration diagnostic, instead
   of surfacing as a generic budget-check failure. The match is exact — only the
   structured contract — and the response body is never exposed. (#32)
+- **Preserved hard denies are logged.** When a budget check cannot reach Cloud
+  while a prior authoritative hard deny is on record — the project-period deny,
+  or a run's sticky deny — the denial is preserved instead of failing open, and
+  the SDK now logs a WARNING on the `solwyn.budget` logger naming the usage and
+  limit (`Cloud API unreachable; preserving prior hard deny: $99.50/$100.00
+  used`). The warning is emitted on every affected call, not once per process,
+  so a sustained outage under a hard deny stays visible for its whole duration;
+  the `BudgetCheckResult.warning` field is unchanged. (#34)
+- **`UnsupportedSurfaceError` exported from the package root.** `from solwyn
+  import UnsupportedSurfaceError` now works and the class joins `__all__`,
+  alongside every other exception. The deep import from `solwyn.exceptions`
+  keeps working — the export is additive. (#34)
 
 ### Changed
 
