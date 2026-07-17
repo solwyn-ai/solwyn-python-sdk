@@ -87,9 +87,16 @@ class TestSyncHappyPath:
     ) -> None:
         # Long flush interval: nothing flushes until close() forces it — the
         # same live-ingest close contract test_metadata_ingest exercises for
-        # the bare reporter, now through the wrapper.
+        # the bare reporter, now through the wrapper. Both queues must be
+        # NON-EMPTY before close, or the drained-after assertions are vacuous:
+        # a consumed stream parks its settlement (confirm+event) in
+        # _settlement_queue; a non-streaming call queues a metadata event.
         client = make_wrapped_client(reporter_flush_interval=60.0)
+        stream = client.chat.completions.create(model="gpt-4o", messages=MESSAGES, stream=True)
+        for _chunk in stream:
+            pass
         client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+        assert len(client._reporter._settlement_queue) == 1
         assert len(client._reporter._queue) == 1
 
         client.close()

@@ -43,8 +43,17 @@ class TestAsyncHappyPath:
     async def test_close_flushes_pending_wire_traffic(
         self, make_async_wrapped_client, fake_provider: FakeProviderServer
     ) -> None:
+        # Mirror of the sync close-flush contract: park a real settlement (a
+        # fully consumed stream) AND a metadata event before close, so the
+        # drained-after assertions are not vacuously true.
         client = await make_async_wrapped_client(reporter_flush_interval=60.0)
+        stream = await client.chat.completions.create(
+            model="gpt-4o", messages=MESSAGES, stream=True
+        )
+        async for _chunk in stream:
+            pass
         await client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+        assert len(client._reporter._settlement_queue) == 1
         assert len(client._reporter._queue) == 1
 
         await client.close()
