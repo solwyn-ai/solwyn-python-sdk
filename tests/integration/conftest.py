@@ -312,8 +312,11 @@ class WireRecorder:
     - budget.confirm_cost      -> .confirms (kwargs dicts incl. token_details)
     - reporter.report          -> .events (MetadataEvent, queued for ingest)
     - reporter.report_settlement -> .settlements ((confirm_request, event));
-      this is the STREAMING settlement path — streamed calls never call
-      confirm_cost/report directly.
+      the STREAMING settlement path. A streamed call WITH a reservation
+      settles here (confirm+event as one unit) and never calls
+      confirm_cost/report directly — but a streaming ERROR, or a streamed
+      call with no reservation (e.g. unpriced model), still reports via
+      ``report`` (see client.py on_complete/on_error).
 
     Delegation is preserved, so everything still reaches the live API.
     """
