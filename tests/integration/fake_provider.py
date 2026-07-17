@@ -56,19 +56,23 @@ class _ServerState:
 class _Handler(BaseHTTPRequestHandler):
     state: _ServerState  # injected by FakeProviderServer via subclassing
 
-    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+    def log_message(self, format: str, *args: Any) -> None:
         """Silence per-request stderr noise."""
 
-    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
+    # do_POST is the BaseHTTPRequestHandler dispatch contract (name is fixed).
+    def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
         with self.state.lock:
             self.state.requests.append(RecordedRequest(path=self.path, body=body))
-            fail_status = self.state.fail_statuses.pop(0) if self.state.fail_statuses else None
 
         if not self.path.endswith("/chat/completions"):
             self._send_json(404, {"error": {"message": f"no route: {self.path}"}})
             return
+        # Queued failures apply only to the completions route — a request to an
+        # unrelated path must not silently consume a fail_next() entry.
+        with self.state.lock:
+            fail_status = self.state.fail_statuses.pop(0) if self.state.fail_statuses else None
         if fail_status is not None:
             self._send_json(
                 fail_status, {"error": {"message": "injected failure", "type": "fake_error"}}
@@ -206,10 +210,18 @@ class FakeProviderServer:
         return self
 
     def stop(self) -> None:
-        self._server.shutdown()
-        self._server.server_close()
+        """Stop the server. Safe to call twice, and before start().
+
+        ``shutdown()`` blocks on an event that only ``serve_forever()`` sets, so
+        calling it on a never-started server would hang forever — guard on the
+        thread. ``server_close()`` always runs so the port is released even when
+        start() was never reached (e.g. a fixture's defensive finally block).
+        """
         if self._thread is not None:
+            self._server.shutdown()
             self._thread.join(timeout=5)
+            self._thread = None
+        self._server.server_close()
 
     def __enter__(self) -> FakeProviderServer:
         return self.start()
