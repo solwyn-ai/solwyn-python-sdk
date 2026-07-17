@@ -8,7 +8,9 @@ tests/
     conftest.py           # Shared fixtures + constants (VALID_API_KEY, ALLOW_BUDGET_RESPONSE)
     test_providers/       # Provider adapter tests
   integration/            # Real HTTP against the Solwyn API
-    conftest.py           # Auto-bootstraps test user + project + API key
+    conftest.py           # Auto-bootstraps test user + project + API key; E2E wrapper harness
+    fake_provider.py      # Local fake OpenAI-compatible server (stdlib-only test infra)
+    test_e2e_*.py         # Real Solwyn(OpenAI(...)) wrappers over the live pipeline
 ```
 
 No `__init__.py` files anywhere. Import shared constants with `from conftest import ...` (absolute, not relative).
@@ -30,14 +32,26 @@ CI runs only `unit`. Integration is opt-in (PR label `run-integration` or `workf
 ## Running Integration Tests
 
 ```bash
-# In ../core:
-make db-setup && make dev-api
+# In ../core (smoke mode — Loops disabled so signup returns a token directly):
+make db-setup && make smoke-api-dev
 
 # In this repo:
 uv run pytest tests/ -m integration -v
 ```
 
 The integration conftest auto-creates a test user and project via the API. Set `SOLWYN_TEST_API_URL` (default `http://127.0.0.1:8080`), or `SOLWYN_TEST_API_KEY` + `SOLWYN_TEST_PROJECT_ID` to skip bootstrap.
+
+Bootstrap needs the API's dev signup fast path. `make dev-api` with a Loops key configured runs verify-first signup (OTP emailed, stored hashed) — the suite then skips with guidance rather than failing. Use `make smoke-api-dev`, or provide `SOLWYN_TEST_API_KEY` (happy-path tests only; the hard-deny fixture always bootstraps its own project).
+
+## E2E Wrapper Harness
+
+`test_e2e_*.py` are the only tests that run the full interception pipeline (`client.py`, `_proxies.py`, `stream.py`, `providers/`) over real HTTP on both sides: a real `openai` client (dev dep) pointed at `fake_provider.FakeProviderServer`, wrapped in a real `Solwyn`/`AsyncSolwyn` talking to the live API.
+
+- **Detection doubles as coverage**: an ephemeral-port server is detected as the `openai_compatible` catch-all; `start_on_conventional_port()` (1234/11434/8000) exercises the lmstudio/ollama/vllm port heuristic. Tests skip if all three ports are occupied by real services.
+- **`WireRecorder`** (conftest) records `confirm_cost` / `report` / `report_settlement` payloads while delegating to the real implementations — wire assertions with live delivery preserved. Streamed calls WITH a reservation settle via `report_settlement`; errors and reservation-less streams still go through `report`.
+- **Conventions**: wrapped clients are built with `budget_check_cache_ttl=0` (an allow-cache hit has no reservation_id → confirm silently skips) and happy paths use a model the API prices (`gpt-4o`; unpriced models are allowed without a reservation).
+- **Budget denial** is server-driven: `hard_denied_credentials` creates a `hard_deny` project ($0.05 limit) and burns it with one large confirm, so a wrapper check raises `BudgetExceededError` before any provider call.
+- **Failover-session seams**: `FakeProviderServer.fail_next(status, count=N)` queues error responses; run two servers as primary + fallback clients; streaming always ends with a usage-bearing final chunk.
 
 ## Conventions
 
