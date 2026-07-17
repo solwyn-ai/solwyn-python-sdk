@@ -36,6 +36,9 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.4",
     "mypy>=1.10",
+    # Integration harness only: constructs real wrapped clients against the
+    # fake provider server. Unit tests must keep mocking (never import openai).
+    "openai>=2.0",
 ]
 
 [project.urls]

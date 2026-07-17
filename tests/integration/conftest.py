@@ -44,50 +44,74 @@ def require_api(api_url: str) -> None:
         pytest.skip("Solwyn API not available")
 
 
-def _bootstrap_credentials(api_url: str) -> Credentials:
-    """Sign up a throwaway user, create a project, return credentials."""
-    session_id = uuid.uuid4().hex[:12]
+def _signup_token(http: httpx.Client, session_id: str) -> str:
+    """Sign up a throwaway user and return an access token.
+
+    Requires the API's dev signup fast path (Loops disabled — in ../core run
+    ``make smoke-api-dev``). A verify-first API (Loops enabled) returns a
+    pending-verification challenge whose OTP is emailed and stored hashed, so
+    bootstrap is impossible; skip with guidance instead of KeyError.
+    """
     email = f"sdk-test-{session_id}@example.com"
     password = f"TestPass!{session_id}"
+    r = http.post(
+        "/api/v1/auth/signup",
+        json={
+            "email": email,
+            "password": password,
+            # The Cloud API's signup requires a name field.
+            "display_name": f"SDK Test {session_id}",
+        },
+    )
+    if r.status_code == 409:
+        r = http.post("/api/v1/auth/login", json={"email": email, "password": password})
+    r.raise_for_status()
+    data = r.json()
+    if "access_token" not in data:
+        pytest.skip(
+            "Solwyn API requires email verification for signup; start it with "
+            "Loops disabled (in ../core: make smoke-api-dev) or set "
+            "SOLWYN_TEST_API_KEY"
+        )
+    return data["access_token"]
 
+
+def _create_project(
+    http: httpx.Client,
+    token: str,
+    *,
+    name: str,
+    budget_limit: float,
+    budget_mode: str,
+) -> str:
+    """Create a project via the API and return its auto-generated API key."""
+    r = http.post(
+        "/api/v1/projects",
+        json={
+            "name": name,
+            "budget_limit": budget_limit,
+            "budget_period": "monthly",
+            "budget_mode": budget_mode,
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    r.raise_for_status()
+    return r.json()["key"]
+
+
+def _bootstrap_credentials(api_url: str) -> Credentials:
+    """Sign up a throwaway user, create an alert-only project, return credentials."""
+    session_id = uuid.uuid4().hex[:12]
     with httpx.Client(base_url=api_url, timeout=10) as http:
-        # Sign up (fall back to login if user already exists)
-        r = http.post(
-            "/api/v1/auth/signup",
-            json={
-                "email": email,
-                "password": password,
-                # The Cloud API's verify-first signup requires a name field.
-                "display_name": f"SDK Test {session_id}",
-            },
+        token = _signup_token(http, session_id)
+        key = _create_project(
+            http,
+            token,
+            name=f"sdk-integ-{session_id}",
+            budget_limit=100.0,
+            budget_mode="alert_only",
         )
-        if r.status_code == 409:
-            r = http.post(
-                "/api/v1/auth/login",
-                json={"email": email, "password": password},
-            )
-        r.raise_for_status()
-        token = r.json()["access_token"]
-
-        # Create project (auto-generates first API key)
-        auth = {"Authorization": f"Bearer {token}"}
-        r = http.post(
-            "/api/v1/projects",
-            json={
-                "name": f"sdk-integ-{session_id}",
-                "budget_limit": 100.0,
-                "budget_period": "monthly",
-                "budget_mode": "alert_only",
-            },
-            headers=auth,
-        )
-        r.raise_for_status()
-        project = r.json()
-
-        return Credentials(
-            api_url=api_url,
-            api_key=project["key"],
-        )
+    return Credentials(api_url=api_url, api_key=key)
 
 
 @pytest.fixture(scope="session")
@@ -161,6 +185,65 @@ async def async_metadata_reporter(test_credentials: Credentials) -> AsyncMetadat
     await reporter.start()
     yield reporter
     await reporter.close()
+
+
+@pytest.fixture(scope="session")
+def hard_denied_credentials(api_url: str) -> Credentials:
+    """Credentials for a project driven OVER its hard_deny budget limit.
+
+    Bootstraps a dedicated project (hard_deny, $0.05 limit) and burns it with
+    one large confirmed spend (~$2.50 of gpt-4o tokens), then verifies with a
+    fresh enforcer (no allow-cache) that the API now denies. E2E tests use
+    these credentials to prove BudgetExceededError surfaces from the wrapper
+    WITHOUT the provider being called. Session-scoped: usage persists.
+
+    Always bootstraps its own project — SOLWYN_TEST_API_KEY cannot be used
+    (that project must stay usable for happy-path tests).
+    """
+    session_id = uuid.uuid4().hex[:12]
+    with httpx.Client(base_url=api_url, timeout=10) as http:
+        token = _signup_token(http, session_id)
+        key = _create_project(
+            http,
+            token,
+            name=f"sdk-deny-{session_id}",
+            budget_limit=0.05,
+            budget_mode="hard_deny",
+        )
+
+    burner = BudgetEnforcer(
+        api_url=api_url, api_key=key, budget_mode=BudgetMode.HARD_DENY, fail_open=False
+    )
+    try:
+        check = burner.check_budget(estimated_input_tokens=100, model="gpt-4o", provider="openai")
+        if check.reservation_id is None:
+            pytest.fail("hard-deny bootstrap: expected a reservation on a fresh project")
+        burner.confirm_cost(
+            reservation_id=check.reservation_id,
+            model="gpt-4o",
+            token_details=TokenDetails(input_tokens=200_000, output_tokens=200_000),
+            provider="openai",
+            call_id=f"harness-burn-{session_id}",
+        )
+    finally:
+        burner.close()
+
+    # Fresh enforcer: its allow-cache is empty, so this check hits the API.
+    verifier = BudgetEnforcer(
+        api_url=api_url, api_key=key, budget_mode=BudgetMode.HARD_DENY, fail_open=False
+    )
+    try:
+        denied = verifier.check_budget(
+            estimated_input_tokens=100, model="gpt-4o", provider="openai"
+        )
+    finally:
+        verifier.close()
+    if denied.allowed:
+        pytest.fail(
+            "hard-deny bootstrap: burn did not trip the budget "
+            f"(usage=${denied.current_usage:.2f}, limit=${denied.budget_limit:.2f})"
+        )
+    return Credentials(api_url=api_url, api_key=key)
 
 
 # Reusable token details for confirm calls
