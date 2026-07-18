@@ -7,6 +7,24 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
+### Changed
+
+- **The async reporter auto-starts its flush loop on first enqueue.** The sync
+  `MetadataReporter` is live from construction (its daemon flush thread starts in
+  `__init__`), but `AsyncMetadataReporter` previously flushed only after an
+  explicit `start()` / `async with AsyncSolwyn`. Constructed without `async
+  with`, it queued events AND budget-confirm settlements silently until
+  `close()` — and confirms are settlement data, so server-side spend tracking
+  drifted. `report()`, `report_confirm()`, and `report_settlement()` now start
+  the flush loop on the first enqueue when a running event loop is present;
+  called with no running loop, the event stays queued and a single warning per
+  reporter instance is logged (enqueue never raises — it is on the LLM call
+  path, so fail-loud was not an option there). `start()` is now idempotent (a
+  second call reuses the live flush task instead of orphaning it and resetting
+  the shutdown event), and `start()` after `close()` raises `RuntimeError` —
+  restarting a closed reporter is a programming error. Enqueue after `close()`
+  is silently dropped, matching the sync reporter.
+
 ## [0.3.0] - 2026-07-16
 
 Run-scoped budget enforcement, explicit customer tags, and server-governed
