@@ -7,12 +7,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
 from solwyn._read_only_key import _is_read_only_key_error
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
 from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer
+from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 
 
@@ -191,6 +192,74 @@ def test_sync_reporter_read_only_batches_are_terminal_and_log_once(
     assert "reporter.confirm_send_failed" not in caplog.text
     assert "Failed to send metadata batch" not in caplog.text
     reporter._http.close()
+
+
+@pytest.mark.unit
+def test_sync_breaker_reports_read_only_errors_log_configuration_once(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("solwyn._read_only_key._logged_read_only_key_error", False)
+    openai = CircuitBreaker()
+    anthropic = CircuitBreaker()
+    with patch("solwyn.reporter.MetadataReporter._flush_loop"):
+        reporter = MetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+            breaker_snapshots=lambda: [
+                (ProviderName.OPENAI, openai.get_state()),
+                (ProviderName.ANTHROPIC, anthropic.get_state()),
+            ],
+            sdk_instance_id="read-only-test",
+        )
+    reporter._thread.join(timeout=2)
+    reporter.observe_project_id(VALID_PROJECT_ID)
+
+    with (
+        patch.object(reporter._http, "post", return_value=_read_only_response()) as post,
+        caplog.at_level("WARNING"),
+    ):
+        reporter._flush_breaker_reports()
+        reporter._flush_breaker_reports()
+
+    # A read-only key can never post a breaker report: the first 403 ends the
+    # cycle (one POST per cycle, not one per provider) and later cycles stay
+    # silent after the single one-time diagnostic.
+    assert post.call_count == 2
+    assert caplog.text.count("solwyn.configuration_error.read_only_key") == 1
+    assert "reporter.breaker_send_failed" not in caplog.text
+    reporter._http.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_breaker_reports_read_only_errors_log_configuration_once(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("solwyn._read_only_key._logged_read_only_key_error", False)
+    openai = CircuitBreaker()
+    anthropic = CircuitBreaker()
+    reporter = AsyncMetadataReporter(
+        "https://api.test.solwyn.ai",
+        VALID_API_KEY,
+        breaker_snapshots=lambda: [
+            (ProviderName.OPENAI, openai.get_state()),
+            (ProviderName.ANTHROPIC, anthropic.get_state()),
+        ],
+        sdk_instance_id="read-only-test",
+    )
+    reporter.observe_project_id(VALID_PROJECT_ID)
+    reporter._http.post = AsyncMock(return_value=_read_only_response())
+
+    with caplog.at_level("WARNING"):
+        await reporter._flush_breaker_reports()
+        await reporter._flush_breaker_reports()
+
+    assert reporter._http.post.await_count == 2
+    assert caplog.text.count("solwyn.configuration_error.read_only_key") == 1
+    assert "reporter.breaker_send_failed" not in caplog.text
+    await reporter._http.aclose()
 
 
 @pytest.mark.unit
