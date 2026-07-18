@@ -6,7 +6,7 @@ import json
 
 import httpx
 import pytest
-from fake_provider import RESPONSE_CONTENT, FakeProviderServer
+from fake_provider import RESPONSE_CONTENT, FakeAnthropicServer, FakeProviderServer
 
 
 @pytest.mark.integration
@@ -123,3 +123,39 @@ class TestFakeProviderServer:
             ) as sr:
                 lines = [line for line in sr.iter_lines() if line.startswith("data: ")]
             assert lines[-1] == "data: [DONE]"
+
+
+@pytest.mark.integration
+class TestFakeAnthropicServer:
+    """The anthropic fake speaks enough Messages dialect for one translated hop."""
+
+    @pytest.mark.integration
+    def test_messages_endpoint_returns_anthropic_shape(self) -> None:
+        with FakeAnthropicServer(prompt_tokens=88, completion_tokens=44) as server:
+            r = httpx.post(
+                f"{server.base_url}/v1/messages",
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            assert r.status_code == 200
+            data = r.json()
+            assert data["type"] == "message"
+            assert data["role"] == "assistant"
+            assert data["content"] == [{"type": "text", "text": RESPONSE_CONTENT}]
+            assert data["stop_reason"] == "end_turn"
+            assert data["usage"] == {"input_tokens": 88, "output_tokens": 44}
+            assert server.requests[0].body["max_tokens"] == 64
+
+    @pytest.mark.integration
+    def test_fail_next_and_streaming_rejection(self) -> None:
+        with FakeAnthropicServer() as server:
+            server.fail_next(429, retry_after="0")
+            r = httpx.post(f"{server.base_url}/v1/messages", json={"model": "m"})
+            assert r.status_code == 429
+            assert r.headers["retry-after"] == "0"
+            # Streaming is out of scope for the cross-dialect fake: fail LOUD.
+            r2 = httpx.post(f"{server.base_url}/v1/messages", json={"model": "m", "stream": True})
+            assert r2.status_code == 501

@@ -60,35 +60,66 @@ class _ServerState:
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-class _Handler(BaseHTTPRequestHandler):
+class _BaseHandler(BaseHTTPRequestHandler):
+    """Shared plumbing for both dialect handlers: body recording, JSON replies,
+    and queued-failure injection. Dialect-specific routing/payload shaping
+    (``do_POST``, completion/usage shaping, streaming) lives on subclasses."""
+
     state: _ServerState  # injected by FakeProviderServer via subclassing
     protocol_version = "HTTP/1.1"  # chunked framing + keep-alive for SSE truncation detection
 
     def log_message(self, format: str, *args: Any) -> None:
         """Silence per-request stderr noise."""
 
-    # do_POST is the BaseHTTPRequestHandler dispatch contract (name is fixed).
-    def do_POST(self) -> None:
+    def _read_and_record(self) -> dict[str, Any]:
+        """Read + parse the request body, record it, and return the parsed body."""
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
         with self.state.lock:
             self.state.requests.append(RecordedRequest(path=self.path, body=body))
+        return body
+
+    def _maybe_send_queued_failure(self) -> bool:
+        """Pop and send the next queued failure, if any. Returns True if sent."""
+        with self.state.lock:
+            entry = self.state.fail_statuses.pop(0) if self.state.fail_statuses else None
+        if entry is None:
+            return False
+        status, retry_after = entry
+        headers = {"Retry-After": retry_after} if retry_after is not None else None
+        self._send_json(
+            status,
+            {"error": {"message": "injected failure", "type": "fake_error"}},
+            extra_headers=headers,
+        )
+        return True
+
+    def _send_json(
+        self, status: int, payload: dict[str, Any], *, extra_headers: dict[str, str] | None = None
+    ) -> None:
+        data = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class _Handler(_BaseHandler):
+    """OpenAI chat-completions dialect."""
+
+    # do_POST is the BaseHTTPRequestHandler dispatch contract (name is fixed).
+    def do_POST(self) -> None:
+        body = self._read_and_record()
 
         if not self.path.endswith("/chat/completions"):
             self._send_json(404, {"error": {"message": f"no route: {self.path}"}})
             return
         # Queued failures apply only to the completions route — a request to an
         # unrelated path must not silently consume a fail_next() entry.
-        with self.state.lock:
-            entry = self.state.fail_statuses.pop(0) if self.state.fail_statuses else None
-        if entry is not None:
-            status, retry_after = entry
-            headers = {"Retry-After": retry_after} if retry_after is not None else None
-            self._send_json(
-                status,
-                {"error": {"message": "injected failure", "type": "fake_error"}},
-                extra_headers=headers,
-            )
+        if self._maybe_send_queued_failure():
             return
         if body.get("stream"):
             self._send_stream(body)
@@ -120,18 +151,6 @@ class _Handler(BaseHTTPRequestHandler):
         if self.state.omit_usage:
             del payload["usage"]
         return payload
-
-    def _send_json(
-        self, status: int, payload: dict[str, Any], *, extra_headers: dict[str, str] | None = None
-    ) -> None:
-        data = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        for key, value in (extra_headers or {}).items():
-            self.send_header(key, value)
-        self.end_headers()
-        self.wfile.write(data)
 
     def _send_stream(self, body: dict[str, Any]) -> None:
         """SSE stream: two content chunks, a stop chunk, a usage-only final chunk.
@@ -198,6 +217,44 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"0\r\n\r\n")
 
 
+class _AnthropicHandler(_BaseHandler):
+    """Anthropic Messages dialect — JSON only, enough for ONE translated hop.
+
+    Streaming deliberately returns 501: the cross-dialect E2E scope is a single
+    non-streaming hop (building an SSE event-typed Messages stream would be a
+    second protocol emulator).
+    """
+
+    def do_POST(self) -> None:
+        body = self._read_and_record()
+        if not self.path.endswith("/v1/messages"):
+            self._send_json(404, {"error": {"type": "not_found_error", "message": self.path}})
+            return
+        if self._maybe_send_queued_failure():
+            return
+        if body.get("stream"):
+            self._send_json(
+                501, {"error": {"type": "api_error", "message": "fake server: no streaming"}}
+            )
+            return
+        self._send_json(
+            200,
+            {
+                "id": "msg_fake_0001",
+                "type": "message",
+                "role": "assistant",
+                "model": body.get("model", "fake-model"),
+                "content": [{"type": "text", "text": RESPONSE_CONTENT}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": self.state.prompt_tokens,
+                    "output_tokens": self.state.completion_tokens,
+                },
+            },
+        )
+
+
 class FakeProviderServer:
     """A fake OpenAI-compatible provider on 127.0.0.1.
 
@@ -206,9 +263,11 @@ class FakeProviderServer:
     as that named provider. Thread-per-request; state access is locked.
     """
 
+    handler_base: type[_BaseHandler] = _Handler
+
     def __init__(self, port: int = 0, *, prompt_tokens: int = 120, completion_tokens: int = 45):
         self._state = _ServerState(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
-        handler = type("_BoundHandler", (_Handler,), {"state": self._state})
+        handler = type("_BoundHandler", (self.handler_base,), {"state": self._state})
         self._server = ThreadingHTTPServer(("127.0.0.1", port), handler)
         self._server.daemon_threads = True
         self._thread: threading.Thread | None = None
@@ -288,6 +347,19 @@ class FakeProviderServer:
 
     def __exit__(self, *args: object) -> None:
         self.stop()
+
+
+class FakeAnthropicServer(FakeProviderServer):
+    """Anthropic-dialect sibling. base_url has NO /v1 (the SDK appends /v1/messages)."""
+
+    handler_base = _AnthropicHandler
+
+    def __init__(self, port: int = 0, *, prompt_tokens: int = 88, completion_tokens: int = 44):
+        super().__init__(port, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
 
 
 def start_on_conventional_port(**kwargs: Any) -> FakeProviderServer | None:

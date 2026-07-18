@@ -39,6 +39,9 @@ dev = [
     # Integration harness only: constructs real wrapped clients against the
     # fake provider server. Unit tests must keep mocking (never import openai).
     "openai>=2.0",
+    # Integration harness only: real cross-dialect fallback clients against
+    # the fake Anthropic-dialect server. Unit tests must keep mocking.
+    "anthropic>=0.50",
 ]
 
 [project.urls]

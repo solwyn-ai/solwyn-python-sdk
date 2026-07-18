@@ -16,7 +16,12 @@ from typing import Any
 
 import httpx
 import pytest
-from fake_provider import PORT_PROFILES, FakeProviderServer, start_on_conventional_port
+from fake_provider import (
+    PORT_PROFILES,
+    FakeAnthropicServer,
+    FakeProviderServer,
+    start_on_conventional_port,
+)
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetMode, MetadataEvent
@@ -282,10 +287,33 @@ def fake_provider() -> Iterator[FakeProviderServer]:
         yield server
 
 
+@pytest.fixture(scope="session")
+def fake_provider_fallback() -> Iterator[FakeProviderServer]:
+    """Second ephemeral-port OpenAI-dialect fake for failover targets.
+
+    DIFFERENT token counts than fake_provider (77/33 vs 120/45): usage
+    assertions prove which server actually served a failover hop.
+    """
+    with FakeProviderServer(prompt_tokens=77, completion_tokens=33) as server:
+        yield server
+
+
+@pytest.fixture(scope="session")
+def fake_provider_anthropic() -> Iterator[FakeAnthropicServer]:
+    """Anthropic-dialect fake for the cross-dialect failover hop (88/44 tokens)."""
+    with FakeAnthropicServer(prompt_tokens=88, completion_tokens=44) as server:
+        yield server
+
+
 @pytest.fixture(autouse=True)
 def _reset_fake_provider(request: pytest.FixtureRequest) -> None:
     """Clear recorded requests/failures on the session servers between tests."""
-    for name in ("fake_provider", "fake_provider_known_port"):
+    for name in (
+        "fake_provider",
+        "fake_provider_known_port",
+        "fake_provider_fallback",
+        "fake_provider_anthropic",
+    ):
         if name in request.fixturenames:
             request.getfixturevalue(name).reset()
 

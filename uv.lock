@@ -1260,6 +1260,7 @@ bedrock = [
     { name = "boto3" },
 ]
 dev = [
+    { name = "anthropic" },
     { name = "mypy" },
     { name = "openai" },
     { name = "pytest" },
@@ -1281,6 +1282,7 @@ together = [
 requires-dist = [
     { name = "anthropic", marker = "extra == 'all'", specifier = ">=0.50" },
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.50" },
+    { name = "anthropic", marker = "extra == 'dev'", specifier = ">=0.50" },
     { name = "boto3", marker = "extra == 'all'", specifier = ">=1.34" },
     { name = "boto3", marker = "extra == 'bedrock'", specifier = ">=1.34" },
     { name = "google-genai", marker = "extra == 'all'", specifier = ">=1.0" },
