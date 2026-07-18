@@ -460,7 +460,14 @@ class BudgetCheckResponse(BaseModel):
     budget_limit: float = Field(..., description="Total budget limit for current period in USD")
     current_usage: float = Field(..., description="Current spend in USD for this period")
     denied_by_period: str | None = Field(
-        None, description="Which budget period triggered denial (e.g. 'daily')"
+        None,
+        description=(
+            "Which budget period triggered denial (e.g. 'daily', 'agent_run'). "
+            "INTENTIONALLY defaulted, not required-nullable: the API serializes "
+            "directive-v1 responses (the SDK's only wire) with exclude_none, so "
+            "allow responses omit the key entirely. Deny-side drift is covered "
+            "live by tests/integration/test_live_contract.py."
+        ),
     )
     project_id: str = Field(..., description="Project identifier resolved from the API key")
     price_hints: dict[ProviderName, float] | None = Field(

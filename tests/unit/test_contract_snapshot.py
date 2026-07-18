@@ -242,6 +242,54 @@ class TestWireModelFieldSets:
         assert all(field.default is None for field in nullable_fields.values())
         assert all(not field.is_required() for field in nullable_fields.values())
 
+    def test_directive_v1_allow_response_parses_without_denied_by_period(self) -> None:
+        # The Cloud API serializes directive-v1 check responses — the only wire
+        # the SDK requests; _build_check_request always opts in — with
+        # exclude_none (core budgets router), so an ALLOW response carries NO
+        # denied_by_period / price_hints keys at all. denied_by_period is
+        # therefore INTENTIONALLY defaulted, not required-nullable: restoring
+        # Field(...) would reject every live allow response. Server-side drift
+        # for this field is covered live by
+        # tests/integration/test_live_contract.py.
+        payload = {
+            "allowed": True,
+            "remaining_budget": 99.99,
+            "reservation_id": "res_123",
+            "mode": "alert_only",
+            "budget_limit": 100.0,
+            "current_usage": 0.01,
+            "project_id": "proj_abc",
+            "failover_directive": {"version": "1", "failover_tuning_allowed": False},
+        }
+
+        parsed = BudgetCheckResponse.model_validate(payload)
+
+        assert parsed.denied_by_period is None
+        assert parsed.price_hints is None
+        assert parsed.failover_directive is not None
+        assert parsed.failover_directive.failover_tuning_allowed is False
+
+    def test_directive_v1_deny_response_parses_with_agent_run_period(self) -> None:
+        # "agent_run" is the wire literal run-scoped sticky denial keys on
+        # (budget.py _cache_response). This pins the SDK-side parse of the
+        # exact deny shape the server emits (exclude_none drops the
+        # reservation_id: deny responses reserve nothing).
+        payload = {
+            "allowed": False,
+            "remaining_budget": 0.0,
+            "mode": "hard_deny",
+            "budget_limit": 100.0,
+            "current_usage": 2.5,
+            "denied_by_period": "agent_run",
+            "project_id": "proj_abc",
+            "failover_directive": {"version": "1", "failover_tuning_allowed": True},
+        }
+
+        parsed = BudgetCheckResponse.model_validate(payload)
+
+        assert parsed.denied_by_period == "agent_run"
+        assert parsed.reservation_id is None
+
     def test_budget_confirm_request_field_set(self) -> None:
         assert set(BudgetConfirmRequest.model_fields) == EXPECTED_CONFIRM_FIELDS
 

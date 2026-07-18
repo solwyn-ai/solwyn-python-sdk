@@ -409,6 +409,10 @@ class MetadataReporter(_ReporterBase):
                 )
                 response.raise_for_status()
             except Exception as exc:
+                if handle_read_only_key_error(exc):
+                    # A read-only key denies every write: end the cycle instead
+                    # of posting the remaining doomed snapshots.
+                    return
                 logger.warning(
                     "reporter.breaker_send_failed: provider=%s exc_type=%s",
                     report.provider.value,
@@ -667,6 +671,10 @@ class AsyncMetadataReporter(_ReporterBase):
                 )
                 response.raise_for_status()
             except Exception as exc:
+                if handle_read_only_key_error(exc):
+                    # A read-only key denies every write: end the cycle instead
+                    # of posting the remaining doomed snapshots.
+                    return
                 logger.warning(
                     "reporter.breaker_send_failed: provider=%s exc_type=%s",
                     report.provider.value,
