@@ -9,7 +9,7 @@ tests/
     test_providers/       # Provider adapter tests
   integration/            # Real HTTP against the Solwyn API
     conftest.py           # Auto-bootstraps test user + project + API key; E2E wrapper harness
-    fake_provider.py      # Local fake OpenAI-compatible server (stdlib-only test infra)
+    fake_provider.py      # Local fake providers: OpenAI-compatible + anthropic-dialect servers (stdlib-only test infra)
     test_e2e_*.py         # Real Solwyn(OpenAI(...)) wrappers over the live pipeline
 ```
 
@@ -51,7 +51,9 @@ Bootstrap needs the API's dev signup fast path. `make dev-api` with a Loops key 
 - **`WireRecorder`** (conftest) records `confirm_cost` / `report` / `report_settlement` payloads while delegating to the real implementations — wire assertions with live delivery preserved. Streamed calls WITH a reservation settle via `report_settlement`; errors and reservation-less streams still go through `report`.
 - **Conventions**: wrapped clients are built with `budget_check_cache_ttl=0` (an allow-cache hit has no reservation_id → confirm silently skips) and happy paths use a model the API prices (`gpt-4o`; unpriced models are allowed without a reservation).
 - **Budget denial** is server-driven: `hard_denied_credentials` creates a `hard_deny` project ($0.05 limit) and burns it with one large confirm, so a wrapper check raises `BudgetExceededError` before any provider call.
-- **Failover-session seams**: `FakeProviderServer.fail_next(status, count=N)` queues error responses; run two servers as primary + fallback clients; streaming always ends with a usage-bearing final chunk.
+- **Failover-session seams**: `FakeProviderServer.fail_next(status, count=1, *, retry_after=None)` queues real error responses (optionally with a `Retry-After` header); `set_omit_usage()` strips usage from JSON and stream responses (the SDK must fall back to a length-based estimate with `is_estimated=True`); `drop_next_stream(after_chunks=N)` truncates the next stream without the HTTP/1.1 chunked terminator, so the client sees `httpx.RemoteProtocolError`, not clean EOF. All seams reset between tests via the autouse fixture.
+- **Fallback servers**: session fixtures `fake_provider` (120/45 tokens), `fake_provider_fallback` (77/33), and `fake_provider_anthropic` (88/44, anthropic dialect — serves `POST /v1/messages`, rejects `stream:true` with 501, `base_url` without `/v1`). Distinct token counts prove which server served a call; the 4-tuple fallback form `(client, model, params, "groq")` makes attribution distinguishable within the same dialect. Streaming ends with a usage-bearing final chunk unless `set_omit_usage()` is active.
+- **Entitlement ceiling**: signup-bootstrapped accounts are free tier, so the server's failover-tuning directive forces `same_provider_retries` (and other tuning fields) back to SDK defaults on every call — E2E tests can prove the suppression but NOT tuning-dependent behavior like Retry-After re-attempts (unit-only until the harness can provision a team/scale-tier account).
 
 ## Conventions
 
