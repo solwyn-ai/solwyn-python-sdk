@@ -187,7 +187,7 @@ async def async_metadata_reporter(test_credentials: Credentials) -> AsyncMetadat
         api_key=test_credentials.api_key,
         flush_interval=1.0,
     )
-    await reporter.start()
+    reporter.start()
     yield reporter
     await reporter.close()
 
