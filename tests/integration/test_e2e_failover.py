@@ -198,3 +198,56 @@ class TestSameDialectFailover:
         assert event.provider == ProviderName.GROQ
         assert event.is_provider_fallback is True
         assert recorder.confirms == []
+
+
+@pytest.mark.integration
+class TestCrossDialectFailover:
+    """openai-dialect primary -> REAL anthropic-dialect fallback, one translated hop."""
+
+    @pytest.mark.integration
+    def test_429_translates_hop_and_returns_source_dialect_shape(
+        self,
+        make_wrapped_client,
+        fake_provider: FakeProviderServer,
+        fake_provider_anthropic,
+    ) -> None:
+        anthropic = pytest.importorskip("anthropic")
+        inner_fallback = anthropic.Anthropic(
+            base_url=fake_provider_anthropic.base_url, api_key="sk-ant-fake-key"
+        )
+        client = make_wrapped_client(fallback=[(inner_fallback, "claude-sonnet-4-5")])
+        recorder = WireRecorder().attach(client)
+        fake_provider.fail_next(429)
+
+        # max_tokens is REQUIRED: the anthropic translation subset fails loud without it.
+        response = client.chat.completions.create(model="gpt-4o", messages=MESSAGES, max_tokens=64)
+
+        # Assert — caller receives the SOURCE-dialect (openai) response shape
+        assert response.choices[0].message.content == RESPONSE_CONTENT
+        assert response.choices[0].message.role == "assistant"
+        assert response.choices[0].finish_reason == "stop"  # end_turn -> stop
+
+        # Assert — the anthropic fake received ONE translated Messages request
+        assert fake_provider_anthropic.request_count == 1
+        wire = fake_provider_anthropic.requests[0]
+        assert wire.path.endswith("/v1/messages")
+        assert wire.body["model"] == "claude-sonnet-4-5"
+        assert wire.body["max_tokens"] == 64
+        assert wire.body["messages"][0]["role"] == "user"
+
+        # Assert — usage settled from the ANTHROPIC response (88/44), attributed to it
+        assert len(recorder.confirms) == 1
+        confirm = recorder.confirms[0]
+        assert confirm["provider"] == "anthropic"
+        assert confirm["model"] == "claude-sonnet-4-5"
+        assert confirm["token_details"].input_tokens == 88
+        assert confirm["token_details"].output_tokens == 44
+        assert confirm["token_details"].is_estimated is False
+
+        success = [e for e in recorder.events if e.status == CallStatus.SUCCESS]
+        assert len(success) == 1
+        assert success[0].provider == ProviderName.ANTHROPIC
+        assert success[0].is_provider_fallback is True
+        assert success[0].failover_reason == FailoverReason.PRIMARY_ERROR
+        assert success[0].requested_provider == ProviderName.OPENAI_COMPATIBLE
+        assert success[0].requested_model == "gpt-4o"
