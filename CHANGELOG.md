@@ -7,6 +7,51 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
+### Changed
+
+- **The async reporter auto-starts its flush loop on first enqueue.** The sync
+  `MetadataReporter` is live from construction (its daemon flush thread starts in
+  `__init__`), but `AsyncMetadataReporter` previously flushed only after an
+  explicit `start()` / `async with AsyncSolwyn`. Constructed without `async
+  with`, it queued events AND budget-confirm settlements silently until
+  `close()` — and confirms are settlement data, so server-side spend tracking
+  drifted. `report()`, `report_confirm()`, and `report_settlement()` now start
+  the flush loop on the first enqueue when a running event loop is present;
+  called with no running loop, the event stays queued and a single warning per
+  reporter instance is logged (enqueue never raises — it is on the LLM call
+  path, so fail-loud was not an option there). `start()` is now idempotent (a
+  second call reuses the live flush task instead of orphaning it and resetting
+  the shutdown event), and `start()` after `close()` raises `RuntimeError` —
+  restarting a closed reporter is a programming error. Enqueue after `close()`
+  is silently dropped, matching the sync reporter.
+### Fixed
+
+- **Breaker-report writes now recognize read-only keys.** The breaker-report
+  POST was the only Cloud write not routed through the one-time read-only-key
+  diagnostic (#32): with a key that can read budget checks but not write, each
+  5-second reporter cycle emitted a `reporter.breaker_send_failed` warning per
+  provider — the exact noise the diagnostic exists to collapse. A read-only 403
+  on the breaker path now logs `solwyn.configuration_error.read_only_key` once
+  per process and ends the cycle instead of posting the remaining doomed
+  snapshots; all other breaker-send failures still warn per provider.
+
+### Documentation
+
+- **`BudgetCheckResponse.denied_by_period` relaxation is intentional and now
+  documented + test-enforced.** The field moved from required-nullable to
+  defaulted in #33 without a stated rationale. Verified against the live API:
+  directive-v1 check responses (the only wire this SDK requests — every check
+  opts in via `failover_directive_version: "1"`) are serialized exclude-none,
+  so ALLOW responses omit the key entirely; restoring `Field(...)` would
+  reject every live allow response, and requiring it on deny would misread the
+  server's legitimate period-less deny edge case as a validation failure
+  (which fails open). The posture is pinned by unit tests
+  (`test_contract_snapshot.py`) and, because a defaulted field can no longer
+  fail loudly on server drift, the deny-side shapes the SDK keys on
+  (`denied_by_period`, including the run-scoped `"agent_run"` literal, and
+  `failover_directive.failover_tuning_allowed`) are now verified against the
+  live API by `tests/integration/test_live_contract.py`.
+
 ## [0.3.0] - 2026-07-16
 
 Run-scoped budget enforcement, explicit customer tags, and server-governed

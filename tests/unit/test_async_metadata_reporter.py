@@ -671,3 +671,219 @@ class TestAsyncReporterBatchFlush:
         assert "consecutive_failures=10" in caplog.text
         assert "HTTPStatusError" in caplog.text
         await reporter._http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Auto-start on first enqueue (sync/async parity)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAsyncReporterAutoStart:
+    """First enqueue auto-starts the flush loop; start() is idempotent."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_report_auto_starts_flush_task(self) -> None:
+        # A reporter constructed without ``async with`` must not queue events
+        # silently: the first report() inside a running loop starts the flush
+        # loop so the batch actually gets delivered.
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+            flush_interval=60.0,
+        )
+        assert reporter._flush_task is None
+
+        reporter.report(_make_event())
+
+        assert reporter._flush_task is not None
+        assert not reporter._flush_task.done()
+        assert reporter._shutdown_event is not None
+        assert len(reporter._queue) == 1
+
+        # Clean up
+        reporter._shutdown_event.set()
+        await reporter._flush_task
+        await reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_report_confirm_auto_starts_flush_task(self) -> None:
+        # Budget confirms are settlement data — they must not queue silently
+        # either, so report_confirm() auto-starts the flush loop as well.
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+            flush_interval=60.0,
+        )
+        assert reporter._flush_task is None
+
+        reporter.report_confirm(_make_confirm_request())
+
+        assert reporter._flush_task is not None
+        assert not reporter._flush_task.done()
+        assert len(reporter._confirm_queue) == 1
+
+        # Clean up
+        reporter._shutdown_event.set()
+        await reporter._flush_task
+        await reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_report_settlement_auto_starts_flush_task(self) -> None:
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+            flush_interval=60.0,
+        )
+        assert reporter._flush_task is None
+
+        reporter.report_settlement(_make_confirm_request(), _make_event())
+
+        assert reporter._flush_task is not None
+        assert not reporter._flush_task.done()
+        assert len(reporter._settlement_queue) == 1
+
+        # Clean up
+        reporter._shutdown_event.set()
+        await reporter._flush_task
+        await reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_start_is_idempotent_returns_same_task(self) -> None:
+        # A second start() must not orphan the live flush task or replace the
+        # shutdown event.
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+            flush_interval=60.0,
+        )
+        reporter.start()
+        first_task = reporter._flush_task
+        first_shutdown = reporter._shutdown_event
+
+        reporter.start()
+
+        assert reporter._flush_task is first_task
+        assert reporter._shutdown_event is first_shutdown
+
+        # Clean up
+        assert reporter._shutdown_event is not None
+        reporter._shutdown_event.set()
+        assert reporter._flush_task is not None
+        await reporter._flush_task
+        await reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_start_after_close_raises(self) -> None:
+        # Restarting a closed reporter is a programming error — fail loud
+        # (project rule: RuntimeError, never assert).
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+            flush_interval=60.0,
+        )
+        reporter.start()
+        with patch.object(reporter._http, "post", new_callable=AsyncMock):
+            await reporter.close()
+
+        with pytest.raises(RuntimeError):
+            reporter.start()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_enqueue_after_close_is_dropped(self) -> None:
+        # After close(), enqueues are silently dropped (matches the sync
+        # reporter): nothing queues, no new flush task, no exception.
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+            flush_interval=60.0,
+        )
+        reporter.start()
+        with patch.object(reporter._http, "post", new_callable=AsyncMock):
+            await reporter.close()
+        task_after_close = reporter._flush_task
+
+        reporter.report(_make_event())
+        reporter.report_confirm(_make_confirm_request())
+        reporter.report_settlement(_make_confirm_request(), _make_event())
+
+        assert len(reporter._queue) == 0
+        assert len(reporter._confirm_queue) == 0
+        assert len(reporter._settlement_queue) == 0
+        # No new flush task was spawned by the dropped enqueues.
+        assert reporter._flush_task is task_after_close
+
+    @pytest.mark.unit
+    def test_report_without_event_loop_queues_and_warns_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Plain sync context (no running loop): report() must not raise, the
+        # event stays queued, no flush task is created, and the "no event loop"
+        # warning fires exactly once per instance across repeated calls.
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+            flush_interval=60.0,
+        )
+
+        with caplog.at_level("WARNING"):
+            reporter.report(_make_event())
+            reporter.report(_make_event())
+
+        assert len(reporter._queue) == 2
+        assert reporter._flush_task is None
+        no_loop_warnings = [
+            record
+            for record in caplog.records
+            if "reporter.enqueue_without_event_loop" in record.getMessage()
+        ]
+        assert len(no_loop_warnings) == 1
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_close_flushes_auto_started_events(self) -> None:
+        # Events queued via auto-start (no explicit start()/async with) are
+        # delivered on close().
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+            batch_size=10,
+            flush_interval=60.0,
+        )
+
+        with patch.object(reporter, "_send_batch", new_callable=AsyncMock) as mock_send:
+            for _ in range(3):
+                reporter.report(_make_event())
+            assert reporter._flush_task is not None  # auto-started
+            await reporter.close()
+
+        mock_send.assert_called_once()
+        assert len(mock_send.call_args.args[0]) == 3
+        assert len(reporter._queue) == 0
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_with_and_report_compose_to_single_task(self) -> None:
+        # __aenter__ starts the flush task; a subsequent report() must reuse it
+        # (auto-start is idempotent), not spawn a second.
+        with patch.object(AsyncMetadataReporter, "_send_batch", new_callable=AsyncMock):
+            async with AsyncMetadataReporter(
+                "https://api.test.solwyn.ai",
+                VALID_API_KEY,
+                flush_interval=60.0,
+            ) as reporter:
+                task_after_enter = reporter._flush_task
+                assert task_after_enter is not None
+
+                reporter.report(_make_event())
+
+                assert reporter._flush_task is task_after_enter
+
+        assert reporter._shutdown_event is not None
+        assert reporter._shutdown_event.is_set()

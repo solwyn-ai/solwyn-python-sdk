@@ -42,7 +42,7 @@ _SolwynBase          # Shared sans-I/O logic (config, token estimation, metadata
 ## Key Conventions
 
 - Pydantic models use `extra="forbid"` — catches typos and contract drift
-- Response models (e.g. `BudgetCheckResponse`) use `Field(...)` for all fields the API returns — no silent defaults that mask contract changes
+- Response models (e.g. `BudgetCheckResponse`) use `Field(...)` for all fields the API returns — no silent defaults that mask contract changes. Documented exception: fields the API conditionally omits by design (`denied_by_period`, `price_hints`, `failover_directive` — directive-v1 responses serialize exclude-none) carry explicit `None` defaults; their server-side drift is caught by `tests/integration/test_live_contract.py`, not by required-field validation
 - Provider adapter registry lazy-loads concrete adapters on first call; ORDER IS LOAD-BEARING — OpenAI-compatible adapters (base_url/host detection) must precede the plain OpenAIAdapter, with the generic catch-all last among them
 - The `together` compatibility slot remains OpenAI dialect but uniquely admits native `together.Together` / `AsyncTogether` clients by module and class name; keep one slot rather than adding a separate native adapter
 - Provider `name` (attribution: budgets, metadata, breakers) is distinct from `dialect` (wire shape: dispatch, translation). Same-dialect failover is native passthrough; cross-dialect runs the translation subset

@@ -4,9 +4,10 @@
 
 ```
 tests/
-  unit/                   # All unit tests — mock all external deps
+  unit/                   # All unit tests — mock all external deps (one exception below)
     conftest.py           # Shared fixtures + constants (VALID_API_KEY, ALLOW_BUDGET_RESPONSE)
     test_providers/       # Provider adapter tests
+    test_real_sdk_*.py    # Real-SDK smoke tests (the sanctioned exception — see below)
   integration/            # Real HTTP against the Solwyn API
     conftest.py           # Auto-bootstraps test user + project + API key; E2E wrapper harness
     fake_provider.py      # Local fake providers: OpenAI-compatible + anthropic-dialect servers (stdlib-only test infra)
@@ -14,6 +15,18 @@ tests/
 ```
 
 No `__init__.py` files anywhere. Import shared constants with `from conftest import ...` (absolute, not relative).
+
+## Real-SDK Smoke Tests
+
+`tests/unit/test_real_sdk_*.py` are the ONE sanctioned exception to "unit tests
+mock everything": they construct GENUINE provider SDK objects (openai,
+anthropic, together, boto3 — test-only dev deps) to catch drift that synthetic
+stubs can't (renamed classes, changed base_url shapes, botocore internals).
+They stay hermetic — client construction and botocore `Stubber` only, never
+network. Each SDK is gated by `pytest.importorskip` (`ModuleNotFoundError` →
+clean skip, e.g. the wheel-only publish CI job), so the suite passes with no
+provider SDKs installed. `src/` still never imports a provider SDK; detection
+stays duck-typed. All OTHER unit tests must keep mocking.
 
 ## Markers
 
