@@ -13,10 +13,15 @@ vs. conventional port therefore exercises both detection paths with zero
 external dependencies.
 
 Extension seams for the failover session:
-- ``fail_next(status, count=N)`` queues N error responses before recovery.
+- ``fail_next(status, count=N, retry_after=...)`` queues N error responses
+  before recovery, optionally carrying a ``Retry-After`` header.
 - Instantiate TWO servers and wire them as primary + fallback clients.
-- Streaming responses always end with a usage-bearing final chunk; add
-  mid-stream abort support here if a test needs it.
+- ``set_omit_usage(True)`` strips ``usage`` from JSON completions and the
+  terminal usage chunk from SSE streams, for exercising the length-based
+  estimation fallback.
+- ``drop_next_stream(after_chunks=N)`` truncates the NEXT stream after N SSE
+  events, closing the connection without the chunked terminator — see
+  ``_send_stream`` for why this requires HTTP/1.1.
 """
 
 from __future__ import annotations
@@ -49,34 +54,72 @@ class _ServerState:
     prompt_tokens: int
     completion_tokens: int
     requests: list[RecordedRequest] = field(default_factory=list)
-    fail_statuses: list[int] = field(default_factory=list)
+    fail_statuses: list[tuple[int, str | None]] = field(default_factory=list)
+    omit_usage: bool = False
+    drop_stream_after: int | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-class _Handler(BaseHTTPRequestHandler):
+class _BaseHandler(BaseHTTPRequestHandler):
+    """Shared plumbing for both dialect handlers: body recording, JSON replies,
+    and queued-failure injection. Dialect-specific routing/payload shaping
+    (``do_POST``, completion/usage shaping, streaming) lives on subclasses."""
+
     state: _ServerState  # injected by FakeProviderServer via subclassing
+    protocol_version = "HTTP/1.1"  # chunked framing + keep-alive for SSE truncation detection
 
     def log_message(self, format: str, *args: Any) -> None:
         """Silence per-request stderr noise."""
 
-    # do_POST is the BaseHTTPRequestHandler dispatch contract (name is fixed).
-    def do_POST(self) -> None:
+    def _read_and_record(self) -> dict[str, Any]:
+        """Read + parse the request body, record it, and return the parsed body."""
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(length) or b"{}")
         with self.state.lock:
             self.state.requests.append(RecordedRequest(path=self.path, body=body))
+        return body
+
+    def _maybe_send_queued_failure(self) -> bool:
+        """Pop and send the next queued failure, if any. Returns True if sent."""
+        with self.state.lock:
+            entry = self.state.fail_statuses.pop(0) if self.state.fail_statuses else None
+        if entry is None:
+            return False
+        status, retry_after = entry
+        headers = {"Retry-After": retry_after} if retry_after is not None else None
+        self._send_json(
+            status,
+            {"error": {"message": "injected failure", "type": "fake_error"}},
+            extra_headers=headers,
+        )
+        return True
+
+    def _send_json(
+        self, status: int, payload: dict[str, Any], *, extra_headers: dict[str, str] | None = None
+    ) -> None:
+        data = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class _Handler(_BaseHandler):
+    """OpenAI chat-completions dialect."""
+
+    # do_POST is the BaseHTTPRequestHandler dispatch contract (name is fixed).
+    def do_POST(self) -> None:
+        body = self._read_and_record()
 
         if not self.path.endswith("/chat/completions"):
             self._send_json(404, {"error": {"message": f"no route: {self.path}"}})
             return
         # Queued failures apply only to the completions route — a request to an
         # unrelated path must not silently consume a fail_next() entry.
-        with self.state.lock:
-            fail_status = self.state.fail_statuses.pop(0) if self.state.fail_statuses else None
-        if fail_status is not None:
-            self._send_json(
-                fail_status, {"error": {"message": "injected failure", "type": "fake_error"}}
-            )
+        if self._maybe_send_queued_failure():
             return
         if body.get("stream"):
             self._send_stream(body)
@@ -91,7 +134,7 @@ class _Handler(BaseHTTPRequestHandler):
         }
 
     def _completion(self, body: dict[str, Any]) -> dict[str, Any]:
-        return {
+        payload = {
             "id": "chatcmpl-fake-0001",
             "object": "chat.completion",
             "created": 1700000000,
@@ -105,14 +148,9 @@ class _Handler(BaseHTTPRequestHandler):
             ],
             "usage": self._usage(),
         }
-
-    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
-        data = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        if self.state.omit_usage:
+            del payload["usage"]
+        return payload
 
     def _send_stream(self, body: dict[str, Any]) -> None:
         """SSE stream: two content chunks, a stop chunk, a usage-only final chunk.
@@ -121,11 +159,25 @@ class _Handler(BaseHTTPRequestHandler):
         ``stream_options.include_usage`` AND the always-on final-chunk usage many
         compat providers emit — so both the include_usage-injected (lmstudio)
         and never-inject (generic catch-all) adapter policies extract real usage
-        (tier 1), never the estimation fallback.
+        (tier 1), never the estimation fallback. ``set_omit_usage(True)`` drops
+        that final chunk entirely, forcing the length-based estimation fallback.
+
+        Framed as HTTP/1.1 chunked transfer encoding (rather than HTTP/1.0
+        close-terminated) so a ``drop_next_stream()`` truncation is DETECTABLE:
+        under HTTP/1.0 the connection close that ends a normal response and the
+        connection close that abandons a truncated one look identical to the
+        client, so a dropped stream would read as clean EOF. Chunked framing
+        gives the body an explicit ``0\\r\\n\\r\\n`` terminator — omitting it on a
+        drop makes the body demonstrably incomplete, and httpx's HTTP/1.1 layer
+        raises ``httpx.RemoteProtocolError`` instead of silently truncating.
         """
         model = body.get("model", "fake-model")
+        with self.state.lock:
+            drop_after = self.state.drop_stream_after
+            self.state.drop_stream_after = None  # one-shot
+            omit_usage = self.state.omit_usage
 
-        def chunk(delta: dict[str, Any], finish: str | None, usage: dict[str, int] | None):
+        def chunk(delta: dict[str, Any] | None, finish: str | None, usage: dict[str, int] | None):
             return {
                 "id": "chatcmpl-fake-0001",
                 "object": "chat.completion.chunk",
@@ -141,15 +193,66 @@ class _Handler(BaseHTTPRequestHandler):
             chunk({"role": "assistant", "content": "This is "}, None, None),
             chunk({"content": "a fake response."}, None, None),
             chunk({}, "stop", None),
-            chunk(None, None, self._usage()),
         ]
+        if not omit_usage:
+            events.append(chunk(None, None, self._usage()))
+
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
-        for event in events:
-            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
-        self.wfile.write(b"data: [DONE]\n\n")
+
+        def write_chunk(data: bytes) -> None:
+            self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
+
+        for sent, event in enumerate(events):
+            if drop_after is not None and sent >= drop_after:
+                # Close WITHOUT the chunked terminator: the client's HTTP layer
+                # sees an incomplete body and raises (RemoteProtocolError).
+                self.close_connection = True
+                return
+            write_chunk(f"data: {json.dumps(event)}\n\n".encode())
+        write_chunk(b"data: [DONE]\n\n")
+        self.wfile.write(b"0\r\n\r\n")
+
+
+class _AnthropicHandler(_BaseHandler):
+    """Anthropic Messages dialect — JSON only, enough for ONE translated hop.
+
+    Streaming deliberately returns 501: the cross-dialect E2E scope is a single
+    non-streaming hop (building an SSE event-typed Messages stream would be a
+    second protocol emulator).
+    """
+
+    def do_POST(self) -> None:
+        body = self._read_and_record()
+        if not self.path.endswith("/v1/messages"):
+            self._send_json(404, {"error": {"type": "not_found_error", "message": self.path}})
+            return
+        if self._maybe_send_queued_failure():
+            return
+        if body.get("stream"):
+            self._send_json(
+                501, {"error": {"type": "api_error", "message": "fake server: no streaming"}}
+            )
+            return
+        self._send_json(
+            200,
+            {
+                "id": "msg_fake_0001",
+                "type": "message",
+                "role": "assistant",
+                "model": body.get("model", "fake-model"),
+                "content": [{"type": "text", "text": RESPONSE_CONTENT}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": self.state.prompt_tokens,
+                    "output_tokens": self.state.completion_tokens,
+                },
+            },
+        )
 
 
 class FakeProviderServer:
@@ -160,9 +263,11 @@ class FakeProviderServer:
     as that named provider. Thread-per-request; state access is locked.
     """
 
+    handler_base: type[_BaseHandler] = _Handler
+
     def __init__(self, port: int = 0, *, prompt_tokens: int = 120, completion_tokens: int = 45):
         self._state = _ServerState(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
-        handler = type("_BoundHandler", (_Handler,), {"state": self._state})
+        handler = type("_BoundHandler", (self.handler_base,), {"state": self._state})
         self._server = ThreadingHTTPServer(("127.0.0.1", port), handler)
         self._server.daemon_threads = True
         self._thread: threading.Thread | None = None
@@ -193,16 +298,30 @@ class FakeProviderServer:
         with self._state.lock:
             return len(self._state.requests)
 
-    def fail_next(self, status: int, count: int = 1) -> None:
-        """Queue *count* error responses (failover-session extension seam)."""
+    def fail_next(self, status: int, count: int = 1, *, retry_after: str | None = None) -> None:
+        """Queue *count* error responses, optionally carrying a Retry-After header."""
         with self._state.lock:
-            self._state.fail_statuses.extend([status] * count)
+            self._state.fail_statuses.extend([(status, retry_after)] * count)
+
+    def set_omit_usage(self, omit: bool = True) -> None:
+        """While set, JSON completions have no ``usage`` key and SSE streams have
+        no terminal usage chunk — forces the length-based estimation fallback."""
+        with self._state.lock:
+            self._state.omit_usage = omit
+
+    def drop_next_stream(self, *, after_chunks: int) -> None:
+        """The NEXT streaming response sends *after_chunks* SSE events then
+        closes the connection without the chunked terminator. One-shot."""
+        with self._state.lock:
+            self._state.drop_stream_after = after_chunks
 
     def reset(self) -> None:
-        """Clear recorded requests and queued failures (between tests)."""
+        """Clear recorded requests, queued failures, omit flag, and pending drop."""
         with self._state.lock:
             self._state.requests.clear()
             self._state.fail_statuses.clear()
+            self._state.omit_usage = False
+            self._state.drop_stream_after = None
 
     def start(self) -> FakeProviderServer:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -228,6 +347,19 @@ class FakeProviderServer:
 
     def __exit__(self, *args: object) -> None:
         self.stop()
+
+
+class FakeAnthropicServer(FakeProviderServer):
+    """Anthropic-dialect sibling. base_url has NO /v1 (the SDK appends /v1/messages)."""
+
+    handler_base = _AnthropicHandler
+
+    def __init__(self, port: int = 0, *, prompt_tokens: int = 88, completion_tokens: int = 44):
+        super().__init__(port, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
 
 
 def start_on_conventional_port(**kwargs: Any) -> FakeProviderServer | None:

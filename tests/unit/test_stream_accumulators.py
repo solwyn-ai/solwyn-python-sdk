@@ -8,8 +8,10 @@ import pytest
 
 from solwyn._token_details import TokenDetails
 from solwyn.providers.anthropic import AnthropicAdapter, AnthropicStreamAccumulator
+from solwyn.providers.bedrock import BedrockAdapter, BedrockStreamAccumulator
 from solwyn.providers.google import GoogleAdapter, GoogleStreamAccumulator
 from solwyn.providers.openai import OpenAIAdapter, OpenAIStreamAccumulator
+from solwyn.providers.openai_compatible import CompatStreamAccumulator, build_compat_adapters
 
 # ---------------------------------------------------------------------------
 # OpenAI
@@ -512,3 +514,253 @@ class TestGooglePrepareStreaming:
         adapter = GoogleAdapter()
         acc = adapter.create_stream_accumulator()
         assert isinstance(acc, GoogleStreamAccumulator)
+
+
+# ---------------------------------------------------------------------------
+# Bedrock
+# ---------------------------------------------------------------------------
+
+
+def _bedrock_metadata(usage: dict, **extra) -> dict:
+    return {"metadata": {"usage": usage, **extra}}
+
+
+@pytest.mark.unit
+class TestBedrockStreamAccumulator:
+    """Bedrock ConverseStream: usage arrives only in the terminal metadata event."""
+
+    def test_extracts_usage_from_terminal_metadata_event(self) -> None:
+        acc = BedrockStreamAccumulator()
+        acc.observe({"messageStart": {"role": "assistant"}})
+        acc.observe({"contentBlockDelta": {"delta": {"text": "Hello"}, "contentBlockIndex": 0}})
+        acc.observe(
+            _bedrock_metadata(
+                {
+                    "inputTokens": 100,
+                    "outputTokens": 50,
+                    "totalTokens": 150,
+                    "cacheReadInputTokens": 20,
+                    "cacheWriteInputTokens": 30,
+                }
+            )
+        )
+        result = acc.finalize()
+        # AWS-documented normalization: input = base + cacheRead + cacheWrite
+        assert result.input_tokens == 100 + 20 + 30
+        assert result.output_tokens == 50
+        assert result.cached_input_tokens == 20
+        assert result.cache_creation_5m_tokens == 30  # no cacheDetails -> 5m bucket
+        assert result.cache_creation_1h_tokens == 0
+
+    def test_cache_details_splits_write_by_ttl(self) -> None:
+        acc = BedrockStreamAccumulator()
+        acc.observe(
+            _bedrock_metadata(
+                {
+                    "inputTokens": 100,
+                    "outputTokens": 50,
+                    "cacheWriteInputTokens": 30,
+                    "cacheDetails": [{"inputTokens": 12, "ttl": "1h"}],
+                }
+            )
+        )
+        result = acc.finalize()
+        assert result.cache_creation_1h_tokens == 12
+        assert result.cache_creation_5m_tokens == 30 - 12
+
+    def test_returns_zeros_on_empty_stream(self) -> None:
+        acc = BedrockStreamAccumulator()
+        assert acc.finalize() == TokenDetails()
+
+    def test_metadata_without_usage_warns_and_returns_zeros(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        acc = BedrockStreamAccumulator()
+        acc.observe({"contentBlockDelta": {"delta": {"text": "Hi"}, "contentBlockIndex": 0}})
+        result = acc.finalize()
+        assert result == TokenDetails()
+        assert "settled at zero tokens" in caplog.text
+
+    def test_non_mapping_chunks_are_ignored(self) -> None:
+        acc = BedrockStreamAccumulator()
+        acc.observe("not-a-dict")
+        acc.observe(None)
+        assert acc.finalize() == TokenDetails()
+
+    def test_service_tier_from_service_tier_type(self) -> None:
+        acc = BedrockStreamAccumulator()
+        acc.observe(
+            _bedrock_metadata({"inputTokens": 1, "outputTokens": 1}, serviceTier={"type": "flex"})
+        )
+        assert acc.get_service_tier() == "flex"
+
+    def test_service_tier_falls_back_to_performance_config_latency(self) -> None:
+        acc = BedrockStreamAccumulator()
+        acc.observe(
+            _bedrock_metadata(
+                {"inputTokens": 1, "outputTokens": 1},
+                performanceConfig={"latency": "optimized"},
+            )
+        )
+        assert acc.get_service_tier() == "optimized"
+
+
+@pytest.mark.unit
+class TestBedrockPrepareStreaming:
+    """ConverseStream always emits terminal metadata — no kwargs preparation."""
+
+    def test_returns_copy_unchanged(self) -> None:
+        adapter = BedrockAdapter()
+        kwargs = {"model": "us.anthropic.claude-sonnet-4-5", "messages": []}
+        result = adapter.prepare_streaming(kwargs)
+        assert result == kwargs
+        assert result is not kwargs
+
+    def test_creates_accumulator(self) -> None:
+        adapter = BedrockAdapter()
+        acc = adapter.create_stream_accumulator(estimated_input_tokens=99)
+        assert isinstance(acc, BedrockStreamAccumulator)
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible (CompatStreamAccumulator)
+# ---------------------------------------------------------------------------
+
+
+def _compat_adapter(name: str = "groq"):
+    """A FRESH adapter instance (never the registry singleton) so the
+    once-per-instance missing-usage warning latch starts clean per test."""
+    return next(a for a in build_compat_adapters() if a.name == name)
+
+
+def _compat_acc(estimated_input_tokens: int = 0, name: str = "groq") -> CompatStreamAccumulator:
+    return _compat_adapter(name).create_stream_accumulator(
+        estimated_input_tokens=estimated_input_tokens
+    )
+
+
+@pytest.mark.unit
+class TestCompatStreamAccumulator:
+    """Compat tiers: standard usage -> x_groq.usage -> explicit estimation."""
+
+    def test_tier1_last_nonzero_usage_wins(self) -> None:
+        acc = _compat_acc()
+        acc.observe(
+            SimpleNamespace(
+                usage=None, choices=[SimpleNamespace(delta=SimpleNamespace(content="Hi"))]
+            )
+        )
+        acc.observe(
+            SimpleNamespace(
+                usage=SimpleNamespace(prompt_tokens=120, completion_tokens=45), choices=[]
+            )
+        )
+        result = acc.finalize()
+        assert result.input_tokens == 120
+        assert result.output_tokens == 45
+        assert result.is_estimated is False
+
+    def test_tier1_zeroed_placeholder_usage_never_latches(self) -> None:
+        acc = _compat_acc()
+        acc.observe(
+            SimpleNamespace(
+                usage=SimpleNamespace(prompt_tokens=100, completion_tokens=40), choices=[]
+            )
+        )
+        # Trailing zero-placeholder block (some providers attach one per chunk)
+        acc.observe(
+            SimpleNamespace(usage=SimpleNamespace(prompt_tokens=0, completion_tokens=0), choices=[])
+        )
+        result = acc.finalize()
+        assert result.input_tokens == 100
+        assert result.output_tokens == 40
+
+    def test_tier2_x_groq_usage_dict_shape(self) -> None:
+        acc = _compat_acc()
+        acc.observe(
+            SimpleNamespace(
+                usage=None,
+                choices=[],
+                x_groq={"usage": {"prompt_tokens": 33, "completion_tokens": 11}},
+            )
+        )
+        result = acc.finalize()
+        assert result.input_tokens == 33
+        assert result.output_tokens == 11
+        assert result.is_estimated is False
+
+    def test_tier2_x_groq_usage_attr_shape(self) -> None:
+        acc = _compat_acc()
+        acc.observe(
+            SimpleNamespace(
+                usage=None,
+                choices=[],
+                x_groq=SimpleNamespace(
+                    usage=SimpleNamespace(prompt_tokens=21, completion_tokens=7)
+                ),
+            )
+        )
+        result = acc.finalize()
+        assert result.input_tokens == 21
+        assert result.output_tokens == 7
+
+    def test_tier1_beats_tier2_when_both_present(self) -> None:
+        acc = _compat_acc()
+        acc.observe(
+            SimpleNamespace(
+                usage=SimpleNamespace(prompt_tokens=50, completion_tokens=25),
+                choices=[],
+                x_groq={"usage": {"prompt_tokens": 1, "completion_tokens": 1}},
+            )
+        )
+        result = acc.finalize()
+        assert result.input_tokens == 50
+        assert result.output_tokens == 25
+
+    def test_tier3_estimates_and_marks_is_estimated(self, caplog: pytest.LogCaptureFixture) -> None:
+        acc = _compat_acc(estimated_input_tokens=42)
+        acc.observe(
+            SimpleNamespace(
+                usage=None,
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="Hello world"))],
+            )
+        )
+        result = acc.finalize()
+        assert result.is_estimated is True
+        assert result.input_tokens == 42  # pre-call estimate
+        assert result.output_tokens > 0  # from accumulated delta lengths — never zero
+        assert "no usage data" in caplog.text
+
+    def test_tier3_empty_stream_estimates_input_only(self) -> None:
+        acc = _compat_acc(estimated_input_tokens=42)
+        result = acc.finalize()
+        assert result.is_estimated is True
+        assert result.input_tokens == 42
+        assert result.output_tokens == 0
+
+    def test_garbage_usage_never_raises_and_degrades_to_estimation(self) -> None:
+        acc = _compat_acc(estimated_input_tokens=10)
+        acc.observe(SimpleNamespace(usage="garbage", choices=[]))  # must not raise
+        result = acc.finalize()
+        assert result.is_estimated is True
+        assert result.input_tokens == 10
+
+    def test_service_tier_extracted_from_chunk(self) -> None:
+        acc = _compat_acc()
+        acc.observe(
+            SimpleNamespace(
+                service_tier="flex",
+                usage=SimpleNamespace(prompt_tokens=5, completion_tokens=2),
+                choices=[],
+            )
+        )
+        assert acc.get_service_tier() == "flex"
+
+
+@pytest.mark.unit
+class TestCompatCreateAccumulator:
+    """The compat adapter wires itself + the input estimate into the accumulator."""
+
+    def test_creates_accumulator_with_estimate(self) -> None:
+        acc = _compat_adapter().create_stream_accumulator(estimated_input_tokens=7)
+        assert isinstance(acc, CompatStreamAccumulator)
