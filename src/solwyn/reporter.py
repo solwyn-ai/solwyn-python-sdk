@@ -544,6 +544,15 @@ class AsyncMetadataReporter(_ReporterBase):
         self._shutdown_event: asyncio.Event | None = None
         self._flush_task: asyncio.Task[None] | None = None
         self._breaker_task: asyncio.Task[None] | None = None
+        # Set by close(); once closed, enqueues are dropped and start() fails
+        # loud. Distinct from _shutdown_event, which only exists once a flush
+        # loop has run — a never-started reporter has no shutdown event but can
+        # still be closed.
+        self._closed = False
+        # Latches the one-per-instance "enqueued with no running loop" warning
+        # so a caller that never enters an event loop is warned once, not per
+        # event.
+        self._warned_no_loop = False
         self._confirm_queue: collections.deque[BudgetConfirmRequest] = collections.deque(
             maxlen=1000
         )
@@ -552,18 +561,64 @@ class AsyncMetadataReporter(_ReporterBase):
         )
 
     def start(self) -> None:
-        """Start the background flush loop.  Must be called within an event loop."""
+        """Start the background flush loop.  Must be called within an event loop.
+
+        Idempotent: if a flush task is already running, this is a no-op and the
+        existing ``_shutdown_event`` is left untouched (a second call must not
+        orphan the live task or reset its shutdown signal). Restarting a closed
+        reporter is a programming error and raises — the sync reporter is live
+        from construction, so a closed async reporter has no valid restart.
+        """
+        if self._closed:
+            raise RuntimeError("cannot start a closed AsyncMetadataReporter")
+        if self._flush_task is not None and not self._flush_task.done():
+            return
         self._shutdown_event = asyncio.Event()
         self._flush_task = asyncio.create_task(self._flush_loop())
 
+    def _ensure_started(self) -> None:
+        """Auto-start the flush loop on first enqueue, when a loop is running.
+
+        The sync reporter starts its flush thread in ``__init__``; the async
+        reporter cannot (there may be no event loop yet), so it starts lazily on
+        the first enqueue instead of only via ``start()`` / ``__aenter__``.
+        Without this, a reporter constructed outside ``async with`` queues
+        events AND budget-confirm settlements silently until ``close()``, so
+        server-side spend tracking drifts.
+
+        Never raises (called on the enqueue path): a closed reporter, an
+        already-running flush task, or the absence of a running loop each
+        short-circuit. With no running loop the event stays queued and a single
+        warning per reporter instance is logged.
+        """
+        if self._closed:
+            return
+        if self._flush_task is not None and not self._flush_task.done():
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            if not self._warned_no_loop:
+                self._warned_no_loop = True
+                logger.warning(
+                    "reporter.enqueue_without_event_loop: no running event loop; "
+                    "events stay queued until start() or close() runs inside a loop"
+                )
+            return
+        self.start()
+
     def report(self, event: MetadataEvent) -> None:
         """Enqueue a metadata event for async reporting.  Non-blocking."""
+        if self._closed:
+            return
+        self._ensure_started()
         self._enqueue(event)
 
     def report_confirm(self, request: BudgetConfirmRequest) -> None:
         """Fire-and-forget a confirm_cost request onto the async flush queue."""
-        if self._shutdown_event is not None and self._shutdown_event.is_set():
+        if self._closed:
             return
+        self._ensure_started()
         try:
             self._confirm_queue.append(request)
         except Exception as exc:
@@ -574,8 +629,9 @@ class AsyncMetadataReporter(_ReporterBase):
 
     def report_settlement(self, request: BudgetConfirmRequest, event: MetadataEvent) -> None:
         """Fire-and-forget a stream settlement as one ordered queue item."""
-        if self._shutdown_event is not None and self._shutdown_event.is_set():
+        if self._closed:
             return
+        self._ensure_started()
         try:
             self._settlement_queue.append((request, event))
         except Exception as exc:
@@ -586,6 +642,7 @@ class AsyncMetadataReporter(_ReporterBase):
 
     async def close(self) -> None:
         """Flush remaining events and shut down."""
+        self._closed = True
         active_breaker_task = self._breaker_task
         if active_breaker_task is not None and active_breaker_task.done():
             active_breaker_task = None

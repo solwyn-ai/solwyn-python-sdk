@@ -36,9 +36,15 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.4",
     "mypy>=1.10",
-    # Integration harness only: constructs real wrapped clients against the
-    # fake provider server. Unit tests must keep mocking (never import openai).
+    # Test-only provider SDKs. Two sanctioned uses: the integration harness
+    # constructs real wrapped clients against the fake provider server, and
+    # tests/unit/test_real_sdk_*.py validate duck-typed detection/extraction
+    # against genuine SDK objects (importorskip — each skips if absent).
+    # All other unit tests must keep mocking; src/ never imports these.
     "openai>=2.0",
+    "anthropic>=0.50",
+    "together>=2.0",
+    "boto3>=1.34",
 ]
 
 [project.urls]
