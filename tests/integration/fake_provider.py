@@ -13,10 +13,15 @@ vs. conventional port therefore exercises both detection paths with zero
 external dependencies.
 
 Extension seams for the failover session:
-- ``fail_next(status, count=N)`` queues N error responses before recovery.
+- ``fail_next(status, count=N, retry_after=...)`` queues N error responses
+  before recovery, optionally carrying a ``Retry-After`` header.
 - Instantiate TWO servers and wire them as primary + fallback clients.
-- Streaming responses always end with a usage-bearing final chunk; add
-  mid-stream abort support here if a test needs it.
+- ``set_omit_usage(True)`` strips ``usage`` from JSON completions and the
+  terminal usage chunk from SSE streams, for exercising the length-based
+  estimation fallback.
+- ``drop_next_stream(after_chunks=N)`` truncates the NEXT stream after N SSE
+  events, closing the connection without the chunked terminator — see
+  ``_send_stream`` for why this requires HTTP/1.1.
 """
 
 from __future__ import annotations
@@ -49,12 +54,15 @@ class _ServerState:
     prompt_tokens: int
     completion_tokens: int
     requests: list[RecordedRequest] = field(default_factory=list)
-    fail_statuses: list[int] = field(default_factory=list)
+    fail_statuses: list[tuple[int, str | None]] = field(default_factory=list)
+    omit_usage: bool = False
+    drop_stream_after: int | None = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class _Handler(BaseHTTPRequestHandler):
     state: _ServerState  # injected by FakeProviderServer via subclassing
+    protocol_version = "HTTP/1.1"  # chunked framing + keep-alive for SSE truncation detection
 
     def log_message(self, format: str, *args: Any) -> None:
         """Silence per-request stderr noise."""
@@ -72,10 +80,14 @@ class _Handler(BaseHTTPRequestHandler):
         # Queued failures apply only to the completions route — a request to an
         # unrelated path must not silently consume a fail_next() entry.
         with self.state.lock:
-            fail_status = self.state.fail_statuses.pop(0) if self.state.fail_statuses else None
-        if fail_status is not None:
+            entry = self.state.fail_statuses.pop(0) if self.state.fail_statuses else None
+        if entry is not None:
+            status, retry_after = entry
+            headers = {"Retry-After": retry_after} if retry_after is not None else None
             self._send_json(
-                fail_status, {"error": {"message": "injected failure", "type": "fake_error"}}
+                status,
+                {"error": {"message": "injected failure", "type": "fake_error"}},
+                extra_headers=headers,
             )
             return
         if body.get("stream"):
@@ -91,7 +103,7 @@ class _Handler(BaseHTTPRequestHandler):
         }
 
     def _completion(self, body: dict[str, Any]) -> dict[str, Any]:
-        return {
+        payload = {
             "id": "chatcmpl-fake-0001",
             "object": "chat.completion",
             "created": 1700000000,
@@ -105,12 +117,19 @@ class _Handler(BaseHTTPRequestHandler):
             ],
             "usage": self._usage(),
         }
+        if self.state.omit_usage:
+            del payload["usage"]
+        return payload
 
-    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+    def _send_json(
+        self, status: int, payload: dict[str, Any], *, extra_headers: dict[str, str] | None = None
+    ) -> None:
         data = json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        for key, value in (extra_headers or {}).items():
+            self.send_header(key, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -121,11 +140,25 @@ class _Handler(BaseHTTPRequestHandler):
         ``stream_options.include_usage`` AND the always-on final-chunk usage many
         compat providers emit — so both the include_usage-injected (lmstudio)
         and never-inject (generic catch-all) adapter policies extract real usage
-        (tier 1), never the estimation fallback.
+        (tier 1), never the estimation fallback. ``set_omit_usage(True)`` drops
+        that final chunk entirely, forcing the length-based estimation fallback.
+
+        Framed as HTTP/1.1 chunked transfer encoding (rather than HTTP/1.0
+        close-terminated) so a ``drop_next_stream()`` truncation is DETECTABLE:
+        under HTTP/1.0 the connection close that ends a normal response and the
+        connection close that abandons a truncated one look identical to the
+        client, so a dropped stream would read as clean EOF. Chunked framing
+        gives the body an explicit ``0\\r\\n\\r\\n`` terminator — omitting it on a
+        drop makes the body demonstrably incomplete, and httpx's HTTP/1.1 layer
+        raises ``httpx.RemoteProtocolError`` instead of silently truncating.
         """
         model = body.get("model", "fake-model")
+        with self.state.lock:
+            drop_after = self.state.drop_stream_after
+            self.state.drop_stream_after = None  # one-shot
+            omit_usage = self.state.omit_usage
 
-        def chunk(delta: dict[str, Any], finish: str | None, usage: dict[str, int] | None):
+        def chunk(delta: dict[str, Any] | None, finish: str | None, usage: dict[str, int] | None):
             return {
                 "id": "chatcmpl-fake-0001",
                 "object": "chat.completion.chunk",
@@ -141,15 +174,28 @@ class _Handler(BaseHTTPRequestHandler):
             chunk({"role": "assistant", "content": "This is "}, None, None),
             chunk({"content": "a fake response."}, None, None),
             chunk({}, "stop", None),
-            chunk(None, None, self._usage()),
         ]
+        if not omit_usage:
+            events.append(chunk(None, None, self._usage()))
+
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
-        for event in events:
-            self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
-        self.wfile.write(b"data: [DONE]\n\n")
+
+        def write_chunk(data: bytes) -> None:
+            self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
+
+        for sent, event in enumerate(events):
+            if drop_after is not None and sent >= drop_after:
+                # Close WITHOUT the chunked terminator: the client's HTTP layer
+                # sees an incomplete body and raises (RemoteProtocolError).
+                self.close_connection = True
+                return
+            write_chunk(f"data: {json.dumps(event)}\n\n".encode())
+        write_chunk(b"data: [DONE]\n\n")
+        self.wfile.write(b"0\r\n\r\n")
 
 
 class FakeProviderServer:
@@ -193,16 +239,30 @@ class FakeProviderServer:
         with self._state.lock:
             return len(self._state.requests)
 
-    def fail_next(self, status: int, count: int = 1) -> None:
-        """Queue *count* error responses (failover-session extension seam)."""
+    def fail_next(self, status: int, count: int = 1, *, retry_after: str | None = None) -> None:
+        """Queue *count* error responses, optionally carrying a Retry-After header."""
         with self._state.lock:
-            self._state.fail_statuses.extend([status] * count)
+            self._state.fail_statuses.extend([(status, retry_after)] * count)
+
+    def set_omit_usage(self, omit: bool = True) -> None:
+        """While set, JSON completions have no ``usage`` key and SSE streams have
+        no terminal usage chunk — forces the length-based estimation fallback."""
+        with self._state.lock:
+            self._state.omit_usage = omit
+
+    def drop_next_stream(self, *, after_chunks: int) -> None:
+        """The NEXT streaming response sends *after_chunks* SSE events then
+        closes the connection without the chunked terminator. One-shot."""
+        with self._state.lock:
+            self._state.drop_stream_after = after_chunks
 
     def reset(self) -> None:
-        """Clear recorded requests and queued failures (between tests)."""
+        """Clear recorded requests, queued failures, omit flag, and pending drop."""
         with self._state.lock:
             self._state.requests.clear()
             self._state.fail_statuses.clear()
+            self._state.omit_usage = False
+            self._state.drop_stream_after = None
 
     def start(self) -> FakeProviderServer:
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
