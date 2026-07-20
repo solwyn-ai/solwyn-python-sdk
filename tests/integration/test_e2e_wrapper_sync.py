@@ -6,6 +6,7 @@ First tests ever to run the full interception pipeline (check -> provider call
 
 from __future__ import annotations
 
+import openai
 import pytest
 from conftest import WireRecorder
 from fake_provider import RESPONSE_CONTENT, FakeProviderServer
@@ -38,23 +39,24 @@ class TestSyncHappyPath:
         assert fake_provider.request_count == 1
         assert fake_provider.requests[0].body["model"] == "gpt-4o"
 
-        # Assert — confirm carried the provider's exact usage (not an estimate)
-        assert len(recorder.confirms) == 1
-        confirm = recorder.confirms[0]
-        assert confirm["provider"] == "openai_compatible"
-        assert confirm["token_details"].input_tokens == fake_provider.prompt_tokens
-        assert confirm["token_details"].output_tokens == fake_provider.completion_tokens
-        assert confirm["token_details"].is_estimated is False
-        assert confirm["reservation_id"]
+        # Assert — the settlement carried the provider's exact usage (not an
+        # estimate): confirm + event ride report_settlement as one ordered unit.
+        assert len(recorder.settlements) == 1
+        confirm_request, event = recorder.settlements[0]
+        assert confirm_request.provider.value == "openai_compatible"
+        assert confirm_request.token_details.input_tokens == fake_provider.prompt_tokens
+        assert confirm_request.token_details.output_tokens == fake_provider.completion_tokens
+        assert confirm_request.token_details.is_estimated is False
+        assert confirm_request.reservation_id
 
-        # Assert — one success metadata event with matching wire token counts
-        assert len(recorder.events) == 1
-        event = recorder.events[0]
+        # Assert — the success metadata event travels WITH the confirm (no
+        # separate report() fired) and carries matching wire token counts
+        assert recorder.events == []
         assert event.status == CallStatus.SUCCESS
         assert event.provider == ProviderName.OPENAI_COMPATIBLE
         assert event.input_tokens == fake_provider.prompt_tokens
         assert event.output_tokens == fake_provider.completion_tokens
-        assert event.call_id == confirm["call_id"]
+        assert event.call_id == confirm_request.call_id
 
     @pytest.mark.integration
     def test_streaming_settles_exact_usage_on_completion(
@@ -71,15 +73,15 @@ class TestSyncHappyPath:
         )
 
         assert content == RESPONSE_CONTENT
-        # Streaming settles via report_settlement (confirm+event as one unit),
-        # never via the non-streaming confirm_cost/report path.
+        # Streaming settles via report_settlement (confirm+event as one unit) —
+        # the same single settlement path every reservation-backed success uses.
         assert len(recorder.settlements) == 1
         confirm_request, event = recorder.settlements[0]
         assert confirm_request.token_details.input_tokens == fake_provider.prompt_tokens
         assert confirm_request.token_details.output_tokens == fake_provider.completion_tokens
         assert confirm_request.token_details.is_estimated is False
         assert event.status == CallStatus.SUCCESS
-        assert recorder.confirms == []
+        assert recorder.events == []
 
     @pytest.mark.integration
     def test_close_flushes_pending_wire_traffic(
@@ -90,12 +92,16 @@ class TestSyncHappyPath:
         # the bare reporter, now through the wrapper. Both queues must be
         # NON-EMPTY before close, or the drained-after assertions are vacuous:
         # a consumed stream parks its settlement (confirm+event) in
-        # _settlement_queue; a non-streaming call queues a metadata event.
+        # _settlement_queue; a provider ERROR queues a plain metadata event on
+        # _queue via the report path (a reservation-backed SUCCESS now settles,
+        # so it would land in _settlement_queue, not _queue).
         client = make_wrapped_client(reporter_flush_interval=60.0)
         stream = client.chat.completions.create(model="gpt-4o", messages=MESSAGES, stream=True)
         for _chunk in stream:
             pass
-        client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+        fake_provider.fail_next(429)
+        with pytest.raises(openai.RateLimitError):
+            client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
         assert len(client._reporter._settlement_queue) == 1
         assert len(client._reporter._queue) == 1
 

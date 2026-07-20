@@ -31,8 +31,8 @@ class TestBudgetDenial:
 
         # The provider endpoint was never contacted.
         assert fake_provider.request_count == 0
-        # No spend was confirmed.
-        assert recorder.confirms == []
+        # No spend was settled.
+        assert recorder.settlements == []
         # The denial itself was reported for dashboard accuracy.
         assert len(recorder.events) == 1
         assert recorder.events[0].status == CallStatus.BUDGET_DENIED

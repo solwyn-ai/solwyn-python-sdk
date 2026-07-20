@@ -6,6 +6,7 @@ import pytest
 from conftest import SAMPLE_TOKEN_DETAILS
 
 from solwyn.budget import AsyncBudgetEnforcer
+from solwyn.reporter import AsyncMetadataReporter
 
 
 @pytest.mark.integration
@@ -34,7 +35,9 @@ class TestAsyncBudgetConfirm:
     @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_async_confirm_with_valid_reservation(
-        self, async_budget_enforcer: AsyncBudgetEnforcer
+        self,
+        async_budget_enforcer: AsyncBudgetEnforcer,
+        async_metadata_reporter: AsyncMetadataReporter,
     ) -> None:
         result = await async_budget_enforcer.check_budget(
             estimated_input_tokens=100,
@@ -43,25 +46,29 @@ class TestAsyncBudgetConfirm:
         )
         assert result.reservation_id is not None
 
-        # Should not raise
-        await async_budget_enforcer.confirm_cost(
+        # Build sans-I/O on the enforcer, settle via the reporter — should not raise.
+        confirm = async_budget_enforcer.build_confirm_request(
             reservation_id=result.reservation_id,
             model="gpt-4o",
             token_details=SAMPLE_TOKEN_DETAILS,
             provider="openai",
             call_id="call_async_integration_confirm_valid",
         )
+        await async_metadata_reporter._send_confirm(confirm)
 
     @pytest.mark.integration
     @pytest.mark.asyncio
     async def test_async_confirm_invalid_reservation_does_not_raise(
-        self, async_budget_enforcer: AsyncBudgetEnforcer
+        self,
+        async_budget_enforcer: AsyncBudgetEnforcer,
+        async_metadata_reporter: AsyncMetadataReporter,
     ) -> None:
-        """Async confirm_cost is best-effort — bad reservation logs, doesn't raise."""
-        await async_budget_enforcer.confirm_cost(
+        """Async settlement is best-effort — a bad reservation logs, doesn't raise."""
+        confirm = async_budget_enforcer.build_confirm_request(
             reservation_id="res_nonexistent_000",
             model="gpt-4o",
             token_details=SAMPLE_TOKEN_DETAILS,
             provider="openai",
             call_id="call_async_integration_confirm_invalid",
         )
+        await async_metadata_reporter._send_confirm(confirm)

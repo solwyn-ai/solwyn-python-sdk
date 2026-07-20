@@ -109,9 +109,7 @@ def _assert_settled_exactly_once(
     assert event.status is CallStatus.SUCCESS
     # The SUCCESS event travels WITH the confirm as one ordered settlement;
     # report() must not double-report it.
-    success_reports = [
-        c for c in report.call_args_list if c.args[0].status is CallStatus.SUCCESS
-    ]
+    success_reports = [c for c in report.call_args_list if c.args[0].status is CallStatus.SUCCESS]
     assert success_reports == []
     return event
 
@@ -163,9 +161,7 @@ class TestSyncNonStreamingSettlement:
         settle = MagicMock()
         report = MagicMock()
         with (
-            patch.object(
-                solwyn._budget, "check_budget", return_value=_allow_budget(None)
-            ),
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget(None)),
             patch.object(solwyn._reporter, "report_settlement", settle),
             patch.object(solwyn._reporter, "report", report),
         ):
@@ -190,9 +186,7 @@ class TestAsyncNonStreamingSettlement:
         settle = MagicMock()
         report = MagicMock()
         with (
-            patch.object(
-                solwyn._budget, "check_budget", AsyncMock(return_value=_allow_budget())
-            ),
+            patch.object(solwyn._budget, "check_budget", AsyncMock(return_value=_allow_budget())),
             patch.object(solwyn._reporter, "report_settlement", settle),
             patch.object(solwyn._reporter, "report", report),
         ):
@@ -270,9 +264,7 @@ class TestMediaSettlement:
                 solwyn._runtimes[0].adapter, "prepare_media_call", self._route_to_embeddings
             ),
         ):
-            result = solwyn._media_call(
-                self._spec(), model="text-embedding-3-small", input="hello"
-            )
+            result = solwyn._media_call(self._spec(), model="text-embedding-3-small", input="hello")
 
         assert result is resp
         confirm, event = settle.call_args.args
@@ -290,9 +282,7 @@ class TestMediaSettlement:
         settle = MagicMock()
         report = MagicMock()
         with (
-            patch.object(
-                solwyn._budget, "check_budget", AsyncMock(return_value=_allow_budget())
-            ),
+            patch.object(solwyn._budget, "check_budget", AsyncMock(return_value=_allow_budget())),
             patch.object(solwyn._reporter, "report_settlement", settle),
             patch.object(solwyn._reporter, "report", report),
             patch.object(

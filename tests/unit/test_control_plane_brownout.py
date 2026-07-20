@@ -134,9 +134,7 @@ class TestSyncBrownout:
                 f"pre-flight must be bounded by ~1s and confirm must not block"
             )
             # ...which opens the shared control-plane breaker...
-            assert (
-                solwyn._control_plane_breaker.get_state().state is CircuitState.OPEN
-            )
+            assert solwyn._control_plane_breaker.get_state().state is CircuitState.OPEN
             # ...so the next call applies the posture instantly.
             assert second_elapsed < SHORT_CIRCUIT_BOUND, (
                 f"second brownout call took {second_elapsed:.2f}s — the breaker "
@@ -155,9 +153,7 @@ class TestSyncBrownout:
             reporter_flush_interval=3600.0,
         )
         try:
-            with patch.object(
-                solwyn._budget, "check_budget", return_value=_allow_budget()
-            ):
+            with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
                 start = time.monotonic()
                 result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
                 elapsed = time.monotonic() - start
@@ -179,9 +175,7 @@ class TestSyncBrownout:
 @pytest.mark.unit
 class TestAsyncBrownout:
     @pytest.mark.asyncio
-    async def test_outage_discovered_once_then_short_circuits(
-        self, black_hole_url
-    ) -> None:
+    async def test_outage_discovered_once_then_short_circuits(self, black_hole_url) -> None:
         client, response = _openai_client(is_async=True)
         solwyn = AsyncSolwyn(
             client,
@@ -203,9 +197,7 @@ class TestAsyncBrownout:
             assert first is response
             assert second is response
             assert first_elapsed < FIRST_CALL_BOUND
-            assert (
-                solwyn._control_plane_breaker.get_state().state is CircuitState.OPEN
-            )
+            assert solwyn._control_plane_breaker.get_state().state is CircuitState.OPEN
             assert second_elapsed < SHORT_CIRCUIT_BOUND
         finally:
             await _teardown_async(solwyn)
