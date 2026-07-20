@@ -598,6 +598,13 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
 
             return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
+        finally:
+            # Cancellation (or any BaseException) bypasses the handler above; a
+            # consumed HALF_OPEN probe slot must be freed or every later
+            # recovery probe is refused. No-op once a success/failure verdict
+            # has already released the slot.
+            if breaker is not None:
+                breaker.release_probe(admission)
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -712,6 +719,13 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
 
             return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
+        finally:
+            # Cancellation (or any BaseException) bypasses the handler above; a
+            # consumed HALF_OPEN probe slot must be freed or every later
+            # recovery probe is refused. No-op once a success/failure verdict
+            # has already released the slot.
+            if breaker is not None:
+                breaker.release_probe(admission)
 
     async def close(self) -> None:
         """Close the underlying async HTTP client."""

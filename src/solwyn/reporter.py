@@ -456,6 +456,13 @@ class MetadataReporter(_ReporterBase):
             if breaker is not None:
                 breaker.record_failure()
             self._record_confirm_failure(exc)
+        finally:
+            # Cancellation (or any BaseException) bypasses the handler above; a
+            # consumed HALF_OPEN probe slot must be freed or every later
+            # recovery probe is refused. No-op once a success/failure verdict
+            # has already released the slot.
+            if breaker is not None:
+                breaker.release_probe(admission)
 
     def _flush_settlements(self) -> None:
         """Send reservation settlements in confirm-before-metadata order."""
@@ -791,6 +798,13 @@ class AsyncMetadataReporter(_ReporterBase):
             if breaker is not None:
                 breaker.record_failure()
             self._record_confirm_failure(exc)
+        finally:
+            # Cancellation (or any BaseException) bypasses the handler above; a
+            # consumed HALF_OPEN probe slot must be freed or every later
+            # recovery probe is refused. No-op once a success/failure verdict
+            # has already released the slot.
+            if breaker is not None:
+                breaker.release_probe(admission)
 
     async def _flush_settlements(self) -> None:
         """Send reservation settlements in confirm-before-metadata order."""

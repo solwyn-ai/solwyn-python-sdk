@@ -10,6 +10,7 @@ breaker; a read-only-key response means Solwyn RESPONDED, so it records success.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import patch
 
 import httpx
@@ -19,9 +20,9 @@ from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY
 import solwyn.circuit_breaker as circuit_breaker_mod
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, CircuitState, ProviderName
-from solwyn.budget import BudgetEnforcer
+from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer
 from solwyn.circuit_breaker import CircuitBreaker
-from solwyn.reporter import MetadataReporter
+from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 
 
 def _breaker(*, failure_threshold: int = 2, recovery_timeout: float = 30.0) -> CircuitBreaker:
@@ -50,6 +51,10 @@ class _CountingTransport:
         self.count += 1
         if self.mode == "connect":
             raise httpx.ConnectError("control plane unreachable")
+        if self.mode == "interrupt":
+            # A BaseException mid-probe (Ctrl-C is the sync analog of task
+            # cancellation): bypasses ``except Exception`` in the caller.
+            raise KeyboardInterrupt
         if self.mode == "read_only":
             return httpx.Response(
                 403,
@@ -267,4 +272,147 @@ class TestConfirmBreaker:
         for _ in range(3):
             reporter._send_confirm(_confirm())
         assert transport.count == 3
+        reporter._http.close()
+
+
+class _ParkingAsyncTransport:
+    """Async counting transport whose ``"hang"`` mode parks a request forever.
+
+    ``entered`` fires once the parked request is inside the transport — the
+    caller then owns the HALF_OPEN probe slot and is awaiting HTTP, the exact
+    window where ``asyncio.Task.cancel()`` bypasses ``except Exception``.
+    """
+
+    def __init__(self) -> None:
+        self.mode = "hang"
+        self.count = 0
+        self.entered = asyncio.Event()
+        self._never = asyncio.Event()
+
+    async def handler(self, request: httpx.Request) -> httpx.Response:
+        self.count += 1
+        if self.mode == "hang":
+            self.entered.set()
+            await self._never.wait()
+        return httpx.Response(200, json=ALLOW_BUDGET_RESPONSE)
+
+    def client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(self.handler), timeout=5.0)
+
+
+def _probing_breaker() -> CircuitBreaker:
+    """A control-plane breaker one ``admit()`` away from a HALF_OPEN probe."""
+    breaker = _breaker(failure_threshold=1, recovery_timeout=0.0)
+    breaker.record_failure()  # OPEN, and recovery-eligible immediately
+    return breaker
+
+
+async def _acheck(enforcer: AsyncBudgetEnforcer):
+    return await enforcer.check_budget(
+        estimated_input_tokens=10, model="gpt-5.5", provider="openai"
+    )
+
+
+@pytest.mark.unit
+class TestProbeCancellationRecovery:
+    """An aborted HALF_OPEN probe must free its slot, not strand recovery.
+
+    ``asyncio.CancelledError`` (and ``KeyboardInterrupt`` on the sync paths) is
+    a BaseException: it bypasses the ``except Exception`` verdict handlers, so
+    only the ``finally`` release keeps the shared breaker probeable. Without it
+    the slot stays occupied forever — HALF_OPEN has no timeout escape and every
+    later check/confirm is refused admission.
+    """
+
+    @pytest.mark.asyncio
+    async def test_async_check_cancellation_releases_probe(self) -> None:
+        breaker = _probing_breaker()
+        transport = _ParkingAsyncTransport()
+        enforcer = AsyncBudgetEnforcer(
+            "http://control-plane.test",
+            VALID_API_KEY,
+            fail_open=True,
+            control_plane_breaker=breaker,
+        )
+        await enforcer._http.aclose()
+        enforcer._http = transport.client()
+
+        probe = asyncio.create_task(_acheck(enforcer))
+        await transport.entered.wait()  # probe admitted, awaiting HTTP
+        assert breaker.get_state().state is CircuitState.HALF_OPEN
+
+        # Contention: while the probe is parked, a concurrent check is refused
+        # the slot — posture applies with no second HTTP attempt.
+        contender = await _acheck(enforcer)
+        assert contender.allowed is True  # fail-open posture
+        assert transport.count == 1
+
+        probe.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await probe
+
+        # The cancelled probe released its slot: the next check probes the
+        # network again and a successful probe closes the breaker.
+        transport.mode = "ok"
+        result = await _acheck(enforcer)
+        assert result.allowed is True
+        assert transport.count == 2
+        assert breaker.get_state().state is CircuitState.CLOSED
+        await enforcer.close()
+
+    @pytest.mark.asyncio
+    async def test_async_confirm_cancellation_releases_probe(self) -> None:
+        breaker = _probing_breaker()
+        transport = _ParkingAsyncTransport()
+        reporter = AsyncMetadataReporter(
+            "http://control-plane.test",
+            VALID_API_KEY,
+            control_plane_breaker=breaker,
+        )
+        await reporter._http.aclose()
+        reporter._http = transport.client()
+
+        probe = asyncio.create_task(reporter._send_confirm(_confirm()))
+        await transport.entered.wait()
+        assert breaker.get_state().state is CircuitState.HALF_OPEN
+        probe.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await probe
+
+        transport.mode = "ok"
+        await reporter._send_confirm(_confirm())
+        assert transport.count == 2
+        assert breaker.get_state().state is CircuitState.CLOSED
+        assert reporter._consecutive_confirm_failures == 0
+        await reporter._http.aclose()
+
+    def test_sync_check_interrupt_releases_probe(self) -> None:
+        breaker = _probing_breaker()
+        transport = _CountingTransport("interrupt")
+        enforcer = _make_enforcer(breaker, transport, fail_open=True)
+
+        with pytest.raises(KeyboardInterrupt):
+            _check(enforcer)
+        assert breaker.get_state().state is CircuitState.HALF_OPEN
+
+        transport.mode = "ok"
+        result = _check(enforcer)
+        assert result.allowed is True
+        assert transport.count == 2
+        assert breaker.get_state().state is CircuitState.CLOSED
+        enforcer.close()
+
+    def test_sync_confirm_interrupt_releases_probe(self) -> None:
+        breaker = _probing_breaker()
+        transport = _CountingTransport("interrupt")
+        reporter = _make_reporter(breaker, transport)
+
+        with pytest.raises(KeyboardInterrupt):
+            reporter._send_confirm(_confirm())
+        assert breaker.get_state().state is CircuitState.HALF_OPEN
+
+        transport.mode = "ok"
+        reporter._send_confirm(_confirm())
+        assert transport.count == 2
+        assert breaker.get_state().state is CircuitState.CLOSED
         reporter._http.close()
