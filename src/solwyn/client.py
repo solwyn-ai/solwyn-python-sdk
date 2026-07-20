@@ -931,15 +931,12 @@ class Solwyn(_SolwynBase):
             spec.measure_media(kwargs, response) if spec.measure_media is not None else None
         )
 
-        # 5. Confirm + report the served call (is_model_fallback=False, primary-only).
-        #    Confirm fires when EITHER basis is observable; skipped only when both
-        #    are None (never settle a real $0 price). When only media is observed,
-        #    a zeroed TokenDetails carries the confirm's required token field.
-        # Settle OFF the hot path: build the confirm sans-I/O and enqueue it
-        # with the metadata event as one ordered settlement (same path as chat
-        # + streaming). Confirm fires when EITHER basis is observable; skipped
-        # only when both are None. When only media is observed, a zeroed
-        # TokenDetails carries the confirm's required token field.
+        # 5. Settle OFF the hot path: build the confirm sans-I/O and enqueue it
+        #    with the metadata event as one ordered settlement (same path as
+        #    chat + streaming). Confirm fires when EITHER basis is observable;
+        #    skipped only when both are None (never settle a real $0 price).
+        #    When only media is observed, a zeroed TokenDetails carries the
+        #    confirm's required token field.
         service_tier = runtime.adapter.extract_service_tier(response)
         confirm = None
         if budget.reservation_id and (token_details is not None or media_usage is not None):

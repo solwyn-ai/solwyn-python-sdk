@@ -252,5 +252,5 @@ class TestCrossDialectFailover:
         assert success.provider == ProviderName.ANTHROPIC
         assert success.is_provider_fallback is True
         assert success.failover_reason == FailoverReason.PRIMARY_ERROR
-        assert success[0].requested_provider == ProviderName.OPENAI_COMPATIBLE
-        assert success[0].requested_model == "gpt-4o"
+        assert success.requested_provider == ProviderName.OPENAI_COMPATIBLE
+        assert success.requested_model == "gpt-4o"
