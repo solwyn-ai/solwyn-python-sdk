@@ -66,7 +66,7 @@ def _openai_response() -> SimpleNamespace:
     choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
     return SimpleNamespace(
         choices=[choice],
-        model="gpt-4o",
+        model="gpt-5.5",
         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
     )
 
@@ -78,7 +78,7 @@ def _anthropic_response() -> SimpleNamespace:
     return SimpleNamespace(
         content=[block],
         stop_reason="end_turn",
-        model="claude-3-5-sonnet",
+        model="claude-sonnet-5",
         usage=SimpleNamespace(input_tokens=10, output_tokens=5),
     )
 
@@ -109,7 +109,7 @@ def _close(solwyn: Solwyn) -> None:
 
 
 _PLAIN_REQUEST = {
-    "model": "gpt-4o",
+    "model": "gpt-5.5",
     "messages": [{"role": "user", "content": "hi"}],
 }
 
@@ -141,8 +141,8 @@ class TestSafeDefault:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with (
@@ -166,8 +166,8 @@ class TestSafeDefault:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with (
@@ -190,8 +190,8 @@ class TestSafeDefault:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
@@ -220,8 +220,8 @@ class TestAlwaysMode:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
             failover_idempotency="always",
         )
 
@@ -249,8 +249,8 @@ class TestAlwaysMode:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
             failover_idempotency="always",
         )
         events: list = []
@@ -282,8 +282,8 @@ class TestAlwaysMode:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list = []
         solwyn._reporter.report = lambda e: events.append(e)
@@ -313,8 +313,8 @@ class TestNeverMode:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
             failover_idempotency="never",
         )
 
@@ -339,7 +339,7 @@ class TestSameProviderOpenAITokenKeyRewrite:
 
         solwyn = _make_solwyn(
             client,
-            model="gpt-4o",
+            model="gpt-5.5",
             fallback=[(client, "o3-mini")],
             default_params={"max_tokens": 256},
             failover_idempotency="never",
@@ -365,8 +365,8 @@ class TestSameProviderOpenAITokenKeyRewrite:
 
         solwyn = _make_solwyn(
             client,
-            model="gpt-4o",
-            fallback=[(client, "gpt-4o-mini")],
+            model="gpt-5.5",
+            fallback=[(client, "gpt-5.4-mini")],
             failover_idempotency="never",
         )
 
@@ -375,7 +375,7 @@ class TestSameProviderOpenAITokenKeyRewrite:
 
         assert result is success
         assert client.chat.completions.create.call_count == 2
-        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-4o-mini"
+        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-5.4-mini"
 
         _close(solwyn)
 
@@ -395,8 +395,8 @@ class TestPerCallOverride:
         # Default policy is "safe"; the per-call flag escalates to ambiguous-OK.
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
@@ -428,7 +428,7 @@ class TestSameProviderDoubleCountGuard:
         client = _openai_client()
         client.chat.completions.create.side_effect = [_Status(429), _Status(429)]
 
-        solwyn = _make_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
+        solwyn = _make_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
         cb = solwyn._get_circuit_breaker("openai")
         assert cb.failure_threshold == 3  # default
 
@@ -452,7 +452,7 @@ class TestSameProviderDoubleCountGuard:
         client = _openai_client()
         client.chat.completions.create.side_effect = [_Status(429)] * 6
 
-        solwyn = _make_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
+        solwyn = _make_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
         cb = solwyn._get_circuit_breaker("openai")
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):

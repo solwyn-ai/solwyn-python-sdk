@@ -46,7 +46,7 @@ from solwyn.providers.bedrock import BedrockAdapter
 boto3 = pytest.importorskip("boto3")
 Stubber = pytest.importorskip("botocore.stub").Stubber
 
-BEDROCK_MODEL = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+BEDROCK_MODEL = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 
 def _bedrock_client(region: str = "us-east-1") -> Any:

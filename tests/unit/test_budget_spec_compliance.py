@@ -88,7 +88,7 @@ class TestDesignDocFailMatrix:
         # Act
         with patch.object(enforcer._http, "post", return_value=mock_resp):
             result = enforcer.check_budget(
-                estimated_input_tokens=100_000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=100_000, model="gpt-5.5", provider="openai"
             )
 
         # Assert
@@ -112,7 +112,7 @@ class TestDesignDocFailMatrix:
         # Act
         with patch.object(enforcer._http, "post", return_value=mock_resp):
             result = enforcer.check_budget(
-                estimated_input_tokens=100_000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=100_000, model="gpt-5.5", provider="openai"
             )
 
         # Assert
@@ -128,7 +128,7 @@ class TestDesignDocFailMatrix:
         # Act
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("offline")):
             result = enforcer.check_budget(
-                estimated_input_tokens=10, model="gpt-4o", provider="openai"
+                estimated_input_tokens=10, model="gpt-5.5", provider="openai"
             )
 
         # Assert
@@ -156,7 +156,7 @@ class TestDesignDocFailMatrix:
         )
         with patch.object(enforcer._http, "post", return_value=allow_resp):
             result = enforcer.check_budget(
-                estimated_input_tokens=100_000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=100_000, model="gpt-5.5", provider="openai"
             )
         assert result.allowed is True
 
@@ -164,7 +164,7 @@ class TestDesignDocFailMatrix:
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("offline")):
             # Should allow — local spend ($3 from Phase 1 via 100_000 tokens) + $3 < $500
             result = enforcer.check_budget(
-                estimated_input_tokens=100_000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=100_000, model="gpt-5.5", provider="openai"
             )
             assert result.allowed is True
             assert result.budget_limit == 500.0
@@ -184,7 +184,7 @@ class TestDesignDocFailMatrix:
             remaining=50.0,
         )
         with patch.object(enforcer._http, "post", return_value=allow_resp):
-            enforcer.check_budget(estimated_input_tokens=10_000, model="gpt-4o", provider="openai")
+            enforcer.check_budget(estimated_input_tokens=10_000, model="gpt-5.5", provider="openai")
 
         # Phase 2: Cloud goes offline. Spend locally up to the limit.
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("offline")):
@@ -194,7 +194,7 @@ class TestDesignDocFailMatrix:
 
             # ~$48.3 + $3.0 (100_000 tokens × $0.00003) = $51.3 > $50.0 -> deny
             result = enforcer.check_budget(
-                estimated_input_tokens=100_000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=100_000, model="gpt-5.5", provider="openai"
             )
             assert result.allowed is False
             assert "denies" in result.warning.lower()
@@ -212,7 +212,7 @@ class TestDesignDocFailMatrix:
         # Act — cloud immediately unreachable, no prior contact
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("offline")):
             result = enforcer.check_budget(
-                estimated_input_tokens=50_000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=50_000, model="gpt-5.5", provider="openai"
             )
 
         # Assert
@@ -248,7 +248,7 @@ class TestBudgetExceededErrorFields:
         # Act
         with patch.object(enforcer._http, "post", return_value=mock_resp):
             result = enforcer.check_budget(
-                estimated_input_tokens=100_000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=100_000, model="gpt-5.5", provider="openai"
             )
 
         # Assert — these are the fields that feed BudgetExceededError
@@ -270,7 +270,7 @@ class TestBudgetExceededErrorFields:
         # Act
         with patch.object(enforcer._http, "post", return_value=mock_resp):
             result = enforcer.check_budget(
-                estimated_input_tokens=500_000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500_000, model="gpt-5.5", provider="openai"
             )
 
         # Assert
@@ -300,7 +300,7 @@ class TestLastKnownBudgetLimit:
 
         # Act
         with patch.object(enforcer._http, "post", return_value=mock_resp):
-            enforcer.check_budget(estimated_input_tokens=50_000, model="gpt-4o", provider="openai")
+            enforcer.check_budget(estimated_input_tokens=50_000, model="gpt-5.5", provider="openai")
 
         # Assert
         assert enforcer._last_known_budget_limit == 750.0
@@ -315,7 +315,7 @@ class TestLastKnownBudgetLimit:
 
         # Act
         with patch.object(enforcer._http, "post", return_value=mock_resp):
-            enforcer.check_budget(estimated_input_tokens=50_000, model="gpt-4o", provider="openai")
+            enforcer.check_budget(estimated_input_tokens=50_000, model="gpt-5.5", provider="openai")
 
         # Assert
         assert enforcer._last_known_budget_limit == 200.0
@@ -328,7 +328,7 @@ class TestLastKnownBudgetLimit:
 
         # Act
         with patch.object(enforcer._http, "post", return_value=mock_resp):
-            enforcer.check_budget(estimated_input_tokens=50_000, model="gpt-4o", provider="openai")
+            enforcer.check_budget(estimated_input_tokens=50_000, model="gpt-5.5", provider="openai")
 
         # Assert — cache expired, but last-known limit persists
         assert enforcer._should_use_cache() is False

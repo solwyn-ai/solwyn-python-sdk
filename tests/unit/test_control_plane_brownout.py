@@ -55,7 +55,7 @@ def _openai_client(*, is_async: bool = False) -> tuple[MagicMock, SimpleNamespac
     choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
     response = SimpleNamespace(
         choices=[choice],
-        model="gpt-4o",
+        model="gpt-5.5",
         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
     )
     if is_async:
@@ -99,7 +99,7 @@ async def _teardown_async(solwyn: AsyncSolwyn) -> None:
 
 
 _PLAIN_REQUEST = {
-    "model": "gpt-4o",
+    "model": "gpt-5.5",
     "messages": [{"role": "user", "content": "hi"}],
 }
 
@@ -111,7 +111,7 @@ class TestSyncBrownout:
         solwyn = Solwyn(
             client,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
+            model="gpt-5.5",
             api_url=black_hole_url,
             control_plane_failure_threshold=1,
             reporter_flush_interval=3600.0,
@@ -148,7 +148,7 @@ class TestSyncBrownout:
         solwyn = Solwyn(
             client,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
+            model="gpt-5.5",
             api_url=black_hole_url,
             reporter_flush_interval=3600.0,
         )
@@ -180,7 +180,7 @@ class TestAsyncBrownout:
         solwyn = AsyncSolwyn(
             client,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
+            model="gpt-5.5",
             api_url=black_hole_url,
             control_plane_failure_threshold=1,
             reporter_flush_interval=3600.0,
@@ -208,7 +208,7 @@ class TestAsyncBrownout:
         solwyn = AsyncSolwyn(
             client,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
+            model="gpt-5.5",
             api_url=black_hole_url,
             reporter_flush_interval=3600.0,
         )

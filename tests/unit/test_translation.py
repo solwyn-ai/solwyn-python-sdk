@@ -36,7 +36,7 @@ SECRET = "SUPER_SECRET_PROMPT_a1b2c3"
 # --------------------------------------------------------------------------- #
 def openai_req(**over: object) -> dict[str, object]:
     base: dict[str, object] = {
-        "model": "gpt-4o",
+        "model": "gpt-5.5",
         "max_completion_tokens": 256,
         "messages": [{"role": "user", "content": "hello"}],
     }
@@ -46,7 +46,7 @@ def openai_req(**over: object) -> dict[str, object]:
 
 def anthropic_req(**over: object) -> dict[str, object]:
     base: dict[str, object] = {
-        "model": "claude-3-5-sonnet",
+        "model": "claude-sonnet-5",
         "max_tokens": 256,
         "messages": [{"role": "user", "content": "hello"}],
     }
@@ -56,7 +56,7 @@ def anthropic_req(**over: object) -> dict[str, object]:
 
 def google_req(**over: object) -> dict[str, object]:
     base: dict[str, object] = {
-        "model": "gemini-1.5-pro",
+        "model": "gemini-2.5-pro",
         "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
         "config": {"max_output_tokens": 256},
     }
@@ -103,7 +103,7 @@ class TestCanonicalModel:
 class TestFieldMapping:
     def test_openai_emits_max_completion_tokens_not_max_tokens(self) -> None:
         canonical = to_canonical("openai", openai_req(max_completion_tokens=128))
-        out = from_canonical("openai", canonical, model="gpt-4o")
+        out = from_canonical("openai", canonical, model="gpt-5.5")
         assert out["max_completion_tokens"] == 128
         assert "max_tokens" not in out
 
@@ -123,7 +123,7 @@ class TestFieldMapping:
             ),
         )
         assert canonical.system == "be terse"
-        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        out = from_canonical("anthropic", canonical, model="claude-sonnet-5")
         assert out["system"] == "be terse"
         assert out["max_tokens"] == 256
         # system must NOT remain as a message
@@ -131,18 +131,18 @@ class TestFieldMapping:
 
     def test_google_nests_under_config(self) -> None:
         canonical = to_canonical("openai", openai_req(stop=["X"]))
-        out = from_canonical("google", canonical, model="gemini-1.5-pro")
+        out = from_canonical("google", canonical, model="gemini-2.5-pro")
         assert out["config"]["max_output_tokens"] == 256
         assert out["config"]["stop_sequences"] == ["X"]
 
     def test_google_system_instruction(self) -> None:
         canonical = to_canonical("anthropic", anthropic_req(system="be terse"))
-        out = from_canonical("google", canonical, model="gemini-1.5-pro")
+        out = from_canonical("google", canonical, model="gemini-2.5-pro")
         assert out["config"]["system_instruction"] == "be terse"
 
     def test_temperature_in_range_passes(self) -> None:
         canonical = to_canonical("openai", openai_req(temperature=0.5))
-        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        out = from_canonical("anthropic", canonical, model="claude-sonnet-5")
         assert out["temperature"] == 0.5
 
     def test_temperature_above_one_raises(self) -> None:
@@ -153,7 +153,7 @@ class TestFieldMapping:
 
     def test_top_p_straight_passes(self) -> None:
         canonical = to_canonical("openai", openai_req(top_p=0.9))
-        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        out = from_canonical("anthropic", canonical, model="claude-sonnet-5")
         assert out["top_p"] == 0.9
 
     def test_stop_over_four_raises(self) -> None:
@@ -164,7 +164,7 @@ class TestFieldMapping:
     def test_stop_string_normalizes_to_list(self) -> None:
         canonical = to_canonical("openai", openai_req(stop="STOP"))
         assert canonical.stop == ["STOP"]
-        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        out = from_canonical("anthropic", canonical, model="claude-sonnet-5")
         assert out["stop_sequences"] == ["STOP"]
 
     def test_anthropic_consecutive_same_role_does_not_raise(self) -> None:
@@ -178,7 +178,7 @@ class TestFieldMapping:
                 ]
             ),
         )
-        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        out = from_canonical("anthropic", canonical, model="claude-sonnet-5")
         assert len(out["messages"]) == 2
 
 
@@ -205,7 +205,7 @@ class TestToolDeclarations:
                 tools=[{"type": "function", "function": TOOL}],
             ),
         )
-        out = from_canonical("openai", canonical, model="gpt-4o")
+        out = from_canonical("openai", canonical, model="gpt-5.5")
         assert out["tools"][0]["type"] == "function"
         assert out["tools"][0]["function"]["name"] == "get_weather"
         assert out["tools"][0]["function"]["parameters"] == TOOL["parameters"]
@@ -214,7 +214,7 @@ class TestToolDeclarations:
         canonical = to_canonical(
             "openai", openai_req(tools=[{"type": "function", "function": TOOL}])
         )
-        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        out = from_canonical("anthropic", canonical, model="claude-sonnet-5")
         decl = out["tools"][0]
         assert decl["name"] == "get_weather"
         assert decl["input_schema"] == TOOL["parameters"]
@@ -224,7 +224,7 @@ class TestToolDeclarations:
         canonical = to_canonical(
             "openai", openai_req(tools=[{"type": "function", "function": TOOL}])
         )
-        out = from_canonical("google", canonical, model="gemini-1.5-pro")
+        out = from_canonical("google", canonical, model="gemini-2.5-pro")
         decls = out["config"]["tools"][0]["function_declarations"]
         assert decls[0]["name"] == "get_weather"
         assert decls[0]["parameters_json_schema"] == TOOL["parameters"]
@@ -242,7 +242,7 @@ class TestToolDeclarations:
                 ]
             ),
         )
-        out = from_canonical("openai", canonical, model="gpt-4o")
+        out = from_canonical("openai", canonical, model="gpt-5.5")
         assert out["tools"][0]["function"]["name"] == "get_weather"
 
     def test_google_inbound_tool_decl(self) -> None:
@@ -265,7 +265,7 @@ class TestToolDeclarations:
                 }
             ),
         )
-        out = from_canonical("anthropic", canonical, model="claude-3-5-sonnet")
+        out = from_canonical("anthropic", canonical, model="claude-sonnet-5")
         assert out["tools"][0]["name"] == "get_weather"
 
 
@@ -287,7 +287,7 @@ class TestToolChoice:
                 tool_choice=native_choice,
             ),
         )
-        out = from_canonical("openai", canonical, model="gpt-4o")
+        out = from_canonical("openai", canonical, model="gpt-5.5")
         assert out["tool_choice"] == expected
 
     def test_openai_force_specific(self) -> None:
@@ -298,7 +298,7 @@ class TestToolChoice:
                 tool_choice={"type": "function", "function": {"name": "get_weather"}},
             ),
         )
-        out = from_canonical("openai", canonical, model="gpt-4o")
+        out = from_canonical("openai", canonical, model="gpt-5.5")
         assert out["tool_choice"] == {
             "type": "function",
             "function": {"name": "get_weather"},
@@ -443,7 +443,7 @@ class TestToolResultRoundTrip:
         canonical = to_canonical(
             "anthropic", anthropic_req(messages=_anthropic_resolved_tool_history())
         )
-        out = from_canonical("openai", canonical, model="gpt-4o")
+        out = from_canonical("openai", canonical, model="gpt-5.5")
         assistant = out["messages"][1]
         call = assistant["tool_calls"][0]
         assert call["type"] == "function"
@@ -462,7 +462,7 @@ class TestToolResultRoundTrip:
         canonical = to_canonical("openai", openai_req(messages=original))
         anthro = from_canonical("anthropic", canonical, model="m")
         canonical2 = to_canonical("anthropic", anthropic_req(messages=anthro["messages"]))
-        back = from_canonical("openai", canonical2, model="gpt-4o")
+        back = from_canonical("openai", canonical2, model="gpt-5.5")
         call = back["messages"][1]["tool_calls"][0]
         assert json.loads(call["function"]["arguments"]) == {"city": "paris"}
         assert back["messages"][2]["content"] == "sunny"
@@ -514,7 +514,7 @@ class TestToolResultRoundTrip:
             },
         ]
         canonical = to_canonical("google", google_req(contents=google_history))
-        out = from_canonical("openai", canonical, model="gpt-4o")
+        out = from_canonical("openai", canonical, model="gpt-5.5")
         call = out["messages"][1]["tool_calls"][0]
         assert call["function"]["name"] == "get_weather"
         assert json.loads(call["function"]["arguments"]) == {"city": "paris"}
@@ -967,7 +967,7 @@ class TestFailLoudly:
             to_canonical(
                 "openai",
                 {
-                    "model": "gpt-4o",
+                    "model": "gpt-5.5",
                     "max_completion_tokens": 10,
                     "input": [{"role": "user", "content": SECRET}],
                 },
@@ -989,18 +989,18 @@ class _Obj:
 
 def _anthropic_text_response() -> _Obj:
     block = _Obj(type="text", text="hello from claude")
-    return _Obj(content=[block], stop_reason="end_turn", model="claude-3-5-sonnet")
+    return _Obj(content=[block], stop_reason="end_turn", model="claude-sonnet-5")
 
 
 def _anthropic_tool_response() -> _Obj:
     block = _Obj(type="tool_use", id="toolu_9", name="get_weather", input={"city": "paris"})
-    return _Obj(content=[block], stop_reason="tool_use", model="claude-3-5-sonnet")
+    return _Obj(content=[block], stop_reason="tool_use", model="claude-sonnet-5")
 
 
 def _openai_text_response() -> _Obj:
     msg = _Obj(role="assistant", content="hello from gpt", tool_calls=None)
     choice = _Obj(index=0, message=msg, finish_reason="stop")
-    return _Obj(choices=[choice], model="gpt-4o")
+    return _Obj(choices=[choice], model="gpt-5.5")
 
 
 def _openai_tool_response() -> _Obj:
@@ -1011,7 +1011,7 @@ def _openai_tool_response() -> _Obj:
     )
     msg = _Obj(role="assistant", content=None, tool_calls=[call])
     choice = _Obj(index=0, message=msg, finish_reason="tool_calls")
-    return _Obj(choices=[choice], model="gpt-4o")
+    return _Obj(choices=[choice], model="gpt-5.5")
 
 
 @pytest.mark.unit
@@ -1072,7 +1072,7 @@ class TestNormalizeResponse:
         # ``response.text`` concatenates ALL text parts (google-genai semantics).
         block_a = _Obj(type="text", text="hello ")
         block_b = _Obj(type="text", text="world")
-        served = _Obj(content=[block_a, block_b], stop_reason="end_turn", model="claude-3-5-sonnet")
+        served = _Obj(content=[block_a, block_b], stop_reason="end_turn", model="claude-sonnet-5")
         resp = normalize_response(served="anthropic", requested="google", response=served)
         assert resp.text == "hello world"
 
@@ -1325,7 +1325,7 @@ class TestGoogleToolFinishReason:
         fc = _Obj(id="fc_1", name="get_weather", args={"city": "paris"})
         part = _Obj(text=None, function_call=fc)
         candidate = _Obj(content=_Obj(parts=[part], role="model"), finish_reason="STOP")
-        resp = _Obj(candidates=[candidate], model="gemini-1.5-pro")
+        resp = _Obj(candidates=[candidate], model="gemini-2.5-pro")
         # served google -> requested openai exposes the tool finish reason.
         out = normalize_response(served="google", requested="openai", response=resp)
         assert out.choices[0].finish_reason == "tool_calls"
@@ -1333,7 +1333,7 @@ class TestGoogleToolFinishReason:
     def test_google_plain_stop_stays_stop(self) -> None:
         part = _Obj(text="hi", function_call=None)
         candidate = _Obj(content=_Obj(parts=[part], role="model"), finish_reason="STOP")
-        resp = _Obj(candidates=[candidate], model="gemini-1.5-pro")
+        resp = _Obj(candidates=[candidate], model="gemini-2.5-pro")
         out = normalize_response(served="google", requested="openai", response=resp)
         assert out.choices[0].finish_reason == "stop"
 
@@ -1356,7 +1356,7 @@ class TestParallelToolCallsFalse:
         )
 
     def test_toward_openai_emits_false(self) -> None:
-        out = from_canonical("openai", self._canonical_no_parallel(), model="gpt-4o")
+        out = from_canonical("openai", self._canonical_no_parallel(), model="gpt-5.5")
         assert out["parallel_tool_calls"] is False
 
     def test_toward_anthropic_disables_parallel(self) -> None:
@@ -1381,7 +1381,7 @@ class TestGoogleToolResultContentRoundTrip:
         google = from_canonical("google", canonical, model="m")
         # round back through google -> canonical -> openai
         canonical2 = to_canonical("google", google_req(contents=google["contents"]))
-        back = from_canonical("openai", canonical2, model="gpt-4o")
+        back = from_canonical("openai", canonical2, model="gpt-5.5")
         assert back["messages"][2]["content"] == "sunny"
 
     def test_google_to_anthropic_content_survives(self) -> None:
@@ -1632,13 +1632,13 @@ def _anthropic_message_stop() -> SimpleNamespace:
 def _openai_text_chunk(text: str | None) -> SimpleNamespace:
     delta = SimpleNamespace(role=None, content=text)
     choice = SimpleNamespace(index=0, delta=delta, finish_reason=None)
-    return SimpleNamespace(choices=[choice], model="gpt-4o")
+    return SimpleNamespace(choices=[choice], model="gpt-5.5")
 
 
 def _openai_finish_chunk(finish_reason: str) -> SimpleNamespace:
     delta = SimpleNamespace(role=None, content=None)
     choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)
-    return SimpleNamespace(choices=[choice], model="gpt-4o")
+    return SimpleNamespace(choices=[choice], model="gpt-5.5")
 
 
 def _openai_tool_chunk() -> SimpleNamespace:
@@ -1650,7 +1650,7 @@ def _openai_tool_chunk() -> SimpleNamespace:
     )
     delta = SimpleNamespace(role=None, content=None, tool_calls=[tool_call])
     choice = SimpleNamespace(index=0, delta=delta, finish_reason=None)
-    return SimpleNamespace(choices=[choice], model="gpt-4o")
+    return SimpleNamespace(choices=[choice], model="gpt-5.5")
 
 
 def _google_text_chunk(*texts: str) -> SimpleNamespace:
@@ -1659,7 +1659,7 @@ def _google_text_chunk(*texts: str) -> SimpleNamespace:
         content=SimpleNamespace(parts=parts, role="model"),
         finish_reason=None,
     )
-    return SimpleNamespace(candidates=[candidate], model="gemini-1.5-pro")
+    return SimpleNamespace(candidates=[candidate], model="gemini-2.5-pro")
 
 
 def _google_finish_chunk(finish_reason: str) -> SimpleNamespace:
@@ -1667,7 +1667,7 @@ def _google_finish_chunk(finish_reason: str) -> SimpleNamespace:
         content=SimpleNamespace(parts=[], role="model"),
         finish_reason=finish_reason,
     )
-    return SimpleNamespace(candidates=[candidate], model="gemini-1.5-pro")
+    return SimpleNamespace(candidates=[candidate], model="gemini-2.5-pro")
 
 
 def _google_tool_chunk() -> SimpleNamespace:
@@ -1677,7 +1677,7 @@ def _google_tool_chunk() -> SimpleNamespace:
         content=SimpleNamespace(parts=[part], role="model"),
         finish_reason=None,
     )
-    return SimpleNamespace(candidates=[candidate], model="gemini-1.5-pro")
+    return SimpleNamespace(candidates=[candidate], model="gemini-2.5-pro")
 
 
 @pytest.mark.unit
@@ -1812,7 +1812,7 @@ class TestStreamChunkFailLoud:
             content=SimpleNamespace(parts=[part], role="model"),
             finish_reason=None,
         )
-        chunk = SimpleNamespace(candidates=[candidate], model="gemini-1.5-pro")
+        chunk = SimpleNamespace(candidates=[candidate], model="gemini-2.5-pro")
         with pytest.raises(UntranslatableRequestError) as ei:
             translate_stream_chunk(served="google", requested="openai", chunk=chunk)
         assert ei.value.feature == "cross_provider_multimodal_stream"
@@ -1833,7 +1833,7 @@ class TestStreamChunkFailLoud:
         # the SECRET must be absent from str/repr/args.
         bad_delta = SimpleNamespace(role=None, content=[f"leak::{SECRET}"], tool_calls=None)
         choice = SimpleNamespace(index=0, delta=bad_delta, finish_reason=None)
-        chunk = SimpleNamespace(choices=[choice], model="gpt-4o")
+        chunk = SimpleNamespace(choices=[choice], model="gpt-5.5")
 
         try:
             translate_stream_chunk(served="openai", requested="anthropic", chunk=chunk)
@@ -1960,13 +1960,13 @@ def _mixed_tool_result_text_request() -> CanonicalRequest:
 class TestMixedToolResultRender:
     def test_openai_mixed_tool_result_text_raises(self) -> None:
         with pytest.raises(UntranslatableRequestError) as ei:
-            from_canonical("openai", _mixed_tool_result_text_request(), model="gpt-4o")
+            from_canonical("openai", _mixed_tool_result_text_request(), model="gpt-5.5")
         assert ei.value.feature == "tool_result.mixed_content"
         assert ei.value.target == "openai"
 
     def test_google_mixed_tool_result_text_raises(self) -> None:
         with pytest.raises(UntranslatableRequestError) as ei:
-            from_canonical("google", _mixed_tool_result_text_request(), model="gemini-1.5-pro")
+            from_canonical("google", _mixed_tool_result_text_request(), model="gemini-2.5-pro")
         assert ei.value.feature == "tool_result.mixed_content"
         assert ei.value.target == "google"
 
@@ -2000,7 +2000,7 @@ def _assistant_text_plus_tool_use_request() -> CanonicalRequest:
 @pytest.mark.unit
 class TestAssistantTextPlusToolUseStillRenders:
     def test_openai_assistant_text_plus_tool_use(self) -> None:
-        out = from_canonical("openai", _assistant_text_plus_tool_use_request(), model="gpt-4o")
+        out = from_canonical("openai", _assistant_text_plus_tool_use_request(), model="gpt-5.5")
         assistant = out["messages"][0]
         assert assistant["role"] == "assistant"
         assert assistant["content"] == "let me check"
@@ -2014,7 +2014,7 @@ class TestAssistantTextPlusToolUseStillRenders:
 
     def test_google_assistant_text_plus_tool_use(self) -> None:
         out = from_canonical(
-            "google", _assistant_text_plus_tool_use_request(), model="gemini-1.5-pro"
+            "google", _assistant_text_plus_tool_use_request(), model="gemini-2.5-pro"
         )
         parts = out["contents"][0]["parts"]
         assert parts[0]["text"] == "let me check"

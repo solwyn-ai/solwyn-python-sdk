@@ -31,13 +31,13 @@ def test_build_runtimes_primary_only() -> None:
     primary = _mock_client("openai._client")
 
     # Act
-    runtimes = build_runtimes(primary, "gpt-4o", [])
+    runtimes = build_runtimes(primary, "gpt-5.5", [])
 
     # Assert
     assert len(runtimes) == 1
     assert isinstance(runtimes[0], ProviderRuntime)
     assert runtimes[0].entry.provider == ProviderName.OPENAI
-    assert runtimes[0].entry.model == "gpt-4o"
+    assert runtimes[0].entry.model == "gpt-5.5"
     assert runtimes[0].entry.default_params == {}
     assert runtimes[0].sdk_client is primary
     assert runtimes[0].adapter.name == "openai"
@@ -53,8 +53,8 @@ def test_build_runtimes_order_is_primary_then_fallbacks() -> None:
     # Act
     runtimes = build_runtimes(
         primary,
-        "gpt-4o",
-        [(fb_anthropic, "claude-3-5-sonnet"), (fb_google, "gemini-1.5-pro")],
+        "gpt-5.5",
+        [(fb_anthropic, "claude-sonnet-5"), (fb_google, "gemini-2.5-pro")],
     )
 
     # Assert — order preserved: [primary, *fallbacks]
@@ -64,9 +64,9 @@ def test_build_runtimes_order_is_primary_then_fallbacks() -> None:
         ProviderName.GOOGLE,
     ]
     assert [r.entry.model for r in runtimes] == [
-        "gpt-4o",
-        "claude-3-5-sonnet",
-        "gemini-1.5-pro",
+        "gpt-5.5",
+        "claude-sonnet-5",
+        "gemini-2.5-pro",
     ]
     assert runtimes[1].sdk_client is fb_anthropic
     assert runtimes[2].sdk_client is fb_google
@@ -79,7 +79,7 @@ def test_entry_provider_matches_detected_adapter() -> None:
     fb = _mock_client("google.genai")
 
     # Act
-    runtimes = build_runtimes(primary, "claude-3-5-sonnet", [(fb, "gemini-1.5-pro")])
+    runtimes = build_runtimes(primary, "claude-sonnet-5", [(fb, "gemini-2.5-pro")])
 
     # Assert — entry.provider is derived from adapter.name, not the caller
     for runtime in runtimes:
@@ -93,7 +93,7 @@ def test_two_tuple_fallback_spec_has_empty_default_params() -> None:
     fb = _mock_client("anthropic._client")
 
     # Act
-    runtimes = build_runtimes(primary, "gpt-4o", [(fb, "claude-3-5-sonnet")])
+    runtimes = build_runtimes(primary, "gpt-5.5", [(fb, "claude-sonnet-5")])
 
     # Assert
     assert runtimes[1].entry.default_params == {}
@@ -107,7 +107,7 @@ def test_three_tuple_fallback_spec_carries_default_params() -> None:
     params = {"max_tokens": 1024, "temperature": 0.2}
 
     # Act
-    runtimes = build_runtimes(primary, "gpt-4o", [(fb, "claude-3-5-sonnet", params)])
+    runtimes = build_runtimes(primary, "gpt-5.5", [(fb, "claude-sonnet-5", params)])
 
     # Assert
     assert runtimes[1].entry.default_params == params
@@ -142,14 +142,14 @@ def test_malformed_fallback_spec_raises_configuration_error(bad_spec: object) ->
 
     # Act / Assert
     with pytest.raises(ConfigurationError):
-        build_runtimes(primary, "gpt-4o", [bad_spec])
+        build_runtimes(primary, "gpt-5.5", [bad_spec])
 
 
 @pytest.mark.unit
 def test_runtime_is_frozen_dataclass() -> None:
     # Arrange
     primary = _mock_client("openai._client")
-    runtimes = build_runtimes(primary, "gpt-4o", [])
+    runtimes = build_runtimes(primary, "gpt-5.5", [])
 
     # Act / Assert — frozen dataclass rejects attribute assignment
     with pytest.raises(Exception):  # noqa: B017 — FrozenInstanceError subclass varies

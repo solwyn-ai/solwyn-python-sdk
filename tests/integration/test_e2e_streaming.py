@@ -30,7 +30,7 @@ class TestStreamErrorSettlement:
         recorder = WireRecorder().attach(client)
         fake_provider.drop_next_stream(after_chunks=1)
 
-        stream = client.chat.completions.create(model="gpt-4o", messages=MESSAGES, stream=True)
+        stream = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES, stream=True)
         with pytest.raises(httpx.RemoteProtocolError):
             for _chunk in stream:
                 pass
@@ -58,7 +58,7 @@ class TestUsageEstimation:
         recorder = WireRecorder().attach(client)
         fake_provider.set_omit_usage(True)
 
-        response = client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+        response = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
 
         assert response.choices[0].message.content == RESPONSE_CONTENT
         # Non-streaming success settles via report_settlement (confirm + event).
@@ -77,7 +77,7 @@ class TestUsageEstimation:
         recorder = WireRecorder().attach(client)
         fake_provider.set_omit_usage(True)
 
-        stream = client.chat.completions.create(model="gpt-4o", messages=MESSAGES, stream=True)
+        stream = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES, stream=True)
         content = "".join(
             chunk.choices[0].delta.content or ""
             for chunk in stream
@@ -106,7 +106,7 @@ class TestAsyncStreaming:
         recorder = WireRecorder().attach(client)
 
         stream = await client.chat.completions.create(
-            model="gpt-4o", messages=MESSAGES, stream=True
+            model="gpt-5.5", messages=MESSAGES, stream=True
         )
         content = ""
         async for chunk in stream:

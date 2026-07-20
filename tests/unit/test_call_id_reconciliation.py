@@ -38,7 +38,7 @@ def _openai_response() -> SimpleNamespace:
     choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
     return SimpleNamespace(
         choices=[choice],
-        model="gpt-4o",
+        model="gpt-5.5",
         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
     )
 
@@ -75,7 +75,7 @@ def _close(solwyn: Solwyn) -> None:
 
 
 _PLAIN_REQUEST = {
-    "model": "gpt-4o",
+    "model": "gpt-5.5",
     "messages": [{"role": "user", "content": "hi"}],
 }
 
@@ -87,7 +87,7 @@ class TestCallIdJoinKey:
     def test_success_event_and_confirm_share_call_id(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         settlements: list[tuple[object, object]] = []
 
@@ -117,7 +117,7 @@ class TestCallIdJoinKey:
     def test_call_id_unique_across_calls(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -143,7 +143,7 @@ class TestCacheHitReconciliation:
         # token_details, AND the served provider — the confirm-free path.
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         settle_spy = MagicMock()
         # reservation_id=None mimics a budget-cache hit.
@@ -184,7 +184,7 @@ class TestPossiblySucceededAbortFlag:
         original = APITimeoutError("read timed out")
         openai.chat.completions.create.side_effect = original
         # No fallback: safe default re-raises the ORIGINAL post-send-ambiguous exc.
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
@@ -208,7 +208,7 @@ class TestPossiblySucceededAbortFlag:
     def test_success_event_leaves_possibly_succeeded_none(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)

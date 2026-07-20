@@ -71,7 +71,7 @@ def _openai_text_response() -> SimpleNamespace:
     choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
     return SimpleNamespace(
         choices=[choice],
-        model="gpt-4o",
+        model="gpt-5.5",
         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
     )
 
@@ -81,7 +81,7 @@ def _anthropic_text_response(text: str = "ok from claude") -> SimpleNamespace:
     return SimpleNamespace(
         content=[block],
         stop_reason="end_turn",
-        model="claude-3-5-sonnet",
+        model="claude-sonnet-5",
         usage=SimpleNamespace(input_tokens=10, output_tokens=5),
     )
 
@@ -92,7 +92,7 @@ def _anthropic_length_response() -> SimpleNamespace:
     return SimpleNamespace(
         content=[block],
         stop_reason="max_tokens",
-        model="claude-3-5-sonnet",
+        model="claude-sonnet-5",
         usage=SimpleNamespace(input_tokens=10, output_tokens=5),
     )
 
@@ -104,7 +104,7 @@ def _anthropic_tool_response() -> SimpleNamespace:
     return SimpleNamespace(
         content=[block],
         stop_reason="tool_use",
-        model="claude-3-5-sonnet",
+        model="claude-sonnet-5",
         usage=SimpleNamespace(input_tokens=10, output_tokens=5),
     )
 
@@ -135,14 +135,14 @@ def _close(solwyn: Solwyn) -> None:
 
 
 _PLAIN_REQUEST = {
-    "model": "gpt-4o",
+    "model": "gpt-5.5",
     "messages": [{"role": "user", "content": "hi"}],
 }
 
 # A fully-resolved tool exchange in the OpenAI dialect: tool_call issued AND its
 # tool result returned (the stateless/resolvable case the subset supports).
 _TOOL_REQUEST = {
-    "model": "gpt-4o",
+    "model": "gpt-5.5",
     "messages": [
         {"role": "user", "content": "weather in paris?"},
         {
@@ -189,11 +189,11 @@ class TestToolExchangeFailover:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             fallback=[
                 (
                     anthropic,
-                    "claude-3-5-sonnet",
+                    "claude-sonnet-5",
                     {
                         "max_tokens": 256,
                         "top_k": 40,
@@ -223,8 +223,8 @@ class TestToolExchangeFailover:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
@@ -302,13 +302,13 @@ class TestUntranslatableAbortsChain:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         sentinel = "SUPER_SECRET_PROMPT_abort"
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": sentinel}],
             **extra_kwargs,
         }
@@ -349,12 +349,12 @@ class TestUntranslatableAbortsChain:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         dangling = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [
                 {"role": "user", "content": "weather?"},
                 {
@@ -392,12 +392,12 @@ class TestUntranslatableAbortsChain:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "search the web"}],
             "tools": [{"type": "web_search_preview"}],
         }
@@ -433,7 +433,7 @@ class TestEmptyModelAbortsCrossProviderHop:
         # Empty model on the cross-provider fallback entry.
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             fallback=[(anthropic, "", {"max_tokens": 256})],
         )
         anthropic_cb = solwyn._get_circuit_breaker("anthropic")
@@ -472,8 +472,8 @@ class TestResponseNormalization:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
@@ -496,8 +496,8 @@ class TestResponseNormalization:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
@@ -535,12 +535,12 @@ class TestCrossProviderStreamingFailsLoud:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -570,12 +570,12 @@ class TestCrossProviderStreamingFailsLoud:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "weather?"}],
             "stream": True,
             "tools": [
@@ -613,10 +613,10 @@ class TestCrossProviderStreamingFailsLoud:
 
         client.chat.completions.create.side_effect = [_Status(429), _stream()]
 
-        solwyn = _make_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
+        solwyn = _make_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -626,7 +626,7 @@ class TestCrossProviderStreamingFailsLoud:
 
         # The swap served (second call used the fallback model) and returned a
         # stream wrapper, not an UntranslatableRequestError.
-        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-4o-mini"
+        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-5.4-mini"
         assert result is not None
 
         _close(solwyn)
@@ -639,7 +639,7 @@ class TestZeroTranslationOnNativePath:
         native_resp = _openai_text_response()
         client.chat.completions.create.return_value = native_resp
 
-        solwyn = _make_solwyn(client, model="gpt-4o")
+        solwyn = _make_solwyn(client, model="gpt-5.5")
 
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
@@ -659,13 +659,13 @@ class TestZeroTranslationOnNativePath:
         _close(solwyn)
 
     def test_same_provider_model_swap_never_calls_to_canonical(self) -> None:
-        # Primary model 429s; the SAME client serves the gpt-4o-mini swap. A
+        # Primary model 429s; the SAME client serves the gpt-5.4-mini swap. A
         # same-provider hop only swaps the model string — no translation.
         client = _openai_client()
         success = _openai_text_response()
         client.chat.completions.create.side_effect = [_Status(429), success]
 
-        solwyn = _make_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
+        solwyn = _make_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
 
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
@@ -677,7 +677,7 @@ class TestZeroTranslationOnNativePath:
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         assert result is success
-        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-4o-mini"
+        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-5.4-mini"
         to_canon.assert_not_called()
         normalize.assert_not_called()
 

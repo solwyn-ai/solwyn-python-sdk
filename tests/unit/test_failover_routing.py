@@ -81,7 +81,7 @@ def _openai_response() -> SimpleNamespace:
     choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
     return SimpleNamespace(
         choices=[choice],
-        model="gpt-4o",
+        model="gpt-5.5",
         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
     )
 
@@ -95,14 +95,14 @@ def _anthropic_response() -> SimpleNamespace:
     return SimpleNamespace(
         content=[block],
         stop_reason="end_turn",
-        model="claude-3-5-sonnet",
+        model="claude-sonnet-5",
         usage=SimpleNamespace(input_tokens=10, output_tokens=5),
     )
 
 
 def _google_response() -> SimpleNamespace:
     return SimpleNamespace(
-        model="gemini-2.0-flash",
+        model="gemini-3.5-flash",
         usage_metadata=SimpleNamespace(
             prompt_token_count=10,
             candidates_token_count=5,
@@ -149,7 +149,7 @@ def _close(solwyn: Solwyn) -> None:
 
 
 _PLAIN_REQUEST = {
-    "model": "gpt-4o",
+    "model": "gpt-5.5",
     "messages": [{"role": "user", "content": "hi"}],
 }
 
@@ -191,8 +191,8 @@ class TestCrossProviderFailover:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
@@ -209,7 +209,7 @@ class TestCrossProviderFailover:
         # The Anthropic call received TRANSLATED, Anthropic-native kwargs.
         anthropic_kwargs = anthropic.messages.create.call_args.kwargs
         assert anthropic_kwargs["max_tokens"] == 256  # from entry default_params
-        assert anthropic_kwargs["model"] == "claude-3-5-sonnet"  # fallback entry model
+        assert anthropic_kwargs["model"] == "claude-sonnet-5"  # fallback entry model
         # Translation reshaped the OpenAI message into Anthropic block form.
         assert anthropic_kwargs["messages"] == [
             {"role": "user", "content": [{"type": "text", "text": "hi"}]}
@@ -227,8 +227,8 @@ class TestCrossProviderFailover:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
         anthropic_cb = solwyn._get_circuit_breaker("anthropic")
@@ -262,8 +262,8 @@ class TestCrossProviderFailover:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list = []
         solwyn._reporter.report = lambda e: events.append(e)
@@ -275,11 +275,11 @@ class TestCrossProviderFailover:
         assert len(success) == 1
         ev = success[0]
         assert ev.provider.value == "anthropic"  # served, not requested
-        assert ev.model == "claude-3-5-sonnet"
+        assert ev.model == "claude-sonnet-5"
         assert ev.is_provider_fallback is True
         assert ev.is_model_fallback is False
         assert ev.requested_provider.value == "openai"
-        assert ev.requested_model == "gpt-4o"
+        assert ev.requested_model == "gpt-5.5"
         # Primary was attempted-and-errored -> reactive failover -> PRIMARY_ERROR.
         assert ev.failover_reason is not None and ev.failover_reason.value == "primary_error"
         assert ev.attempt_index == 1
@@ -297,8 +297,8 @@ class TestCrossProviderFailover:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         # Primary breaker starts CLOSED, so the primary IS attempted in the walk.
         assert solwyn._get_circuit_breaker("openai").state == CircuitState.CLOSED
@@ -326,8 +326,8 @@ class TestCrossProviderFailover:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list = []
         solwyn._reporter.report = lambda e: events.append(e)
@@ -375,8 +375,8 @@ class TestCrossProviderFailover:
         solwyn = AsyncSolwyn(
             openai,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list = []
         solwyn._reporter.report = lambda e: events.append(e)
@@ -410,8 +410,8 @@ class TestCrossProviderFailover:
         solwyn = AsyncSolwyn(
             openai,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         solwyn._reporter.report = MagicMock()
         openai_cb = solwyn._get_circuit_breaker("openai")
@@ -429,7 +429,7 @@ class TestCrossProviderFailover:
         anthropic.messages.create.assert_awaited_once()
         anthropic_kwargs = anthropic.messages.create.call_args.kwargs
         assert anthropic_kwargs["max_tokens"] == 256
-        assert anthropic_kwargs["model"] == "claude-3-5-sonnet"
+        assert anthropic_kwargs["model"] == "claude-sonnet-5"
         # Breaker accounting mirrors the sync case.
         assert openai_cb.failure_count == 1
         assert anthropic_cb.failure_count == 0
@@ -444,12 +444,12 @@ class TestCrossProviderFailover:
 @pytest.mark.unit
 class TestSameProviderModelSwap:
     def test_model_swap_on_same_client(self) -> None:
-        # Primary model fails (429); the SAME client serves the gpt-4o-mini swap.
+        # Primary model fails (429); the SAME client serves the gpt-5.4-mini swap.
         client = _openai_client()
         success = _openai_response()
         client.chat.completions.create.side_effect = [_Status(429), success]
 
-        solwyn = _make_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
+        solwyn = _make_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
         events: list = []
         solwyn._reporter.report = lambda e: events.append(e)
 
@@ -458,7 +458,7 @@ class TestSameProviderModelSwap:
 
         assert result is success
         assert client.chat.completions.create.call_count == 2
-        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-4o-mini"
+        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-5.4-mini"
 
         success_events = [e for e in events if e.status.value == "success"]
         assert len(success_events) == 1
@@ -482,8 +482,8 @@ class TestFailFast:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
 
@@ -518,8 +518,8 @@ class TestFailFast:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
 
@@ -549,8 +549,8 @@ class TestChainExhaustion:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         # Open BOTH breakers, not recovery-eligible.
         for name in ("openai", "anthropic"):
@@ -583,8 +583,8 @@ class TestChainExhaustion:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with (
@@ -611,8 +611,8 @@ class TestChainExhaustion:
         solwyn = AsyncSolwyn(
             openai,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with (
@@ -645,8 +645,8 @@ class TestFailoverTuningDirective:
         anthropic = _anthropic_client()
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
             budget_check_cache_ttl=17,
             **_CUSTOM_FAILOVER_TUNING,
         )
@@ -713,7 +713,7 @@ class TestFailoverTuningDirective:
         solwyn = AsyncSolwyn(
             openai,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
+            model="gpt-5.5",
             **_CUSTOM_FAILOVER_TUNING,
         )
         runtime_order = [runtime.entry for runtime in solwyn._runtimes]
@@ -742,7 +742,7 @@ class TestFailoverTuningDirective:
         openai.chat.completions.create.return_value = _openai_response()
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             **_CUSTOM_FAILOVER_TUNING,
         )
 
@@ -776,7 +776,7 @@ class TestPerHopDeadline:
         client = _openai_client()
         client.chat.completions.create.return_value = _openai_response()
 
-        solwyn = _make_solwyn(client, model="gpt-4o")
+        solwyn = _make_solwyn(client, model="gpt-5.5")
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -792,12 +792,12 @@ class TestPerHopDeadline:
 
     def test_google_dispatch_sets_per_request_timeout_and_retry_bound(self) -> None:
         client = _google_client()
-        solwyn = _make_solwyn(client, model="gemini-2.0-flash")
+        solwyn = _make_solwyn(client, model="gemini-3.5-flash")
 
         solwyn._sync_dispatch(
             solwyn._runtimes[0],
             {
-                "model": "gemini-2.0-flash",
+                "model": "gemini-3.5-flash",
                 "contents": "hi",
                 "config": {
                     "temperature": 0.2,
@@ -830,13 +830,13 @@ class TestPerHopDeadline:
             return _google_response()
 
         client.models.generate_content = slow_generate_content
-        solwyn = _make_solwyn(client, model="gemini-2.0-flash")
+        solwyn = _make_solwyn(client, model="gemini-3.5-flash")
 
         started = time.perf_counter()
         with pytest.raises(_Status):
             solwyn._sync_dispatch(
                 solwyn._runtimes[0],
-                {"model": "gemini-2.0-flash", "contents": "hi"},
+                {"model": "gemini-3.5-flash", "contents": "hi"},
                 is_streaming=False,
                 timeout=0.001,
                 max_retries=0,
@@ -850,12 +850,12 @@ class TestPerHopDeadline:
     async def test_async_google_dispatch_sets_per_request_timeout_and_retry_bound(self) -> None:
         client = _google_client()
         client.models.generate_content = AsyncMock(return_value=_google_response())
-        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, model="gemini-2.0-flash")
+        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, model="gemini-3.5-flash")
 
         await solwyn._async_dispatch(
             solwyn._runtimes[0],
             {
-                "model": "gemini-2.0-flash",
+                "model": "gemini-3.5-flash",
                 "contents": "hi",
                 "config": {"http_options": {"timeout": 999_999}},
             },
@@ -885,13 +885,13 @@ class TestPerHopDeadline:
             return _google_response()
 
         client.models.generate_content = slow_generate_content
-        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, model="gemini-2.0-flash")
+        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, model="gemini-3.5-flash")
 
         started = time.perf_counter()
         with pytest.raises(_Status):
             await solwyn._async_dispatch(
                 solwyn._runtimes[0],
-                {"model": "gemini-2.0-flash", "contents": "hi"},
+                {"model": "gemini-3.5-flash", "contents": "hi"},
                 is_streaming=False,
                 timeout=0.001,
                 max_retries=0,
@@ -913,9 +913,9 @@ class TestPerHopDeadline:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             failover_total_timeout=30.0,
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
@@ -942,9 +942,9 @@ class TestPerHopDeadline:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             failover_total_timeout=0.0,
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with (
@@ -970,8 +970,8 @@ class TestPerHopDeadline:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         class _FakeDeadline:
@@ -1008,7 +1008,7 @@ class TestHalfOpenRecoveryThroughDispatch:
         client.chat.completions.create.return_value = _openai_response()
         solwyn = _make_solwyn(
             client,
-            model="gpt-4o",
+            model="gpt-5.5",
             circuit_breaker_failure_threshold=1,
             circuit_breaker_recovery_timeout=0,
             circuit_breaker_success_threshold=1,
@@ -1035,7 +1035,7 @@ class TestHalfOpenRecoveryThroughDispatch:
         solwyn = AsyncSolwyn(
             client,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
+            model="gpt-5.5",
             circuit_breaker_failure_threshold=1,
             circuit_breaker_recovery_timeout=0,
             circuit_breaker_success_threshold=1,
@@ -1075,7 +1075,7 @@ class TestProbeSlotReleaseOnNoHealthSignalExit:
         client.chat.completions.create.side_effect = _Status(400, "bad request")
         solwyn = _make_solwyn(
             client,
-            model="gpt-4o",
+            model="gpt-5.5",
             circuit_breaker_failure_threshold=1,
             circuit_breaker_recovery_timeout=0,
             circuit_breaker_success_threshold=1,
@@ -1107,8 +1107,8 @@ class TestProbeSlotReleaseOnNoHealthSignalExit:
         anthropic.messages.create.return_value = _anthropic_response()
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
             circuit_breaker_failure_threshold=1,
             circuit_breaker_recovery_timeout=0,
             circuit_breaker_success_threshold=1,
@@ -1142,7 +1142,7 @@ class TestProbeSlotReleaseOnNoHealthSignalExit:
         solwyn = AsyncSolwyn(
             client,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
+            model="gpt-5.5",
             circuit_breaker_failure_threshold=1,
             circuit_breaker_recovery_timeout=0,
             circuit_breaker_success_threshold=1,
@@ -1177,8 +1177,8 @@ class TestProbeSlotReleaseOnNoHealthSignalExit:
         solwyn = AsyncSolwyn(
             openai,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
             circuit_breaker_failure_threshold=1,
             circuit_breaker_recovery_timeout=0,
             circuit_breaker_success_threshold=1,
@@ -1213,7 +1213,7 @@ class TestProbeSlotReleaseOnNoHealthSignalExit:
 @pytest.mark.unit
 class TestCircuitBreakerLazyCreation:
     def test_get_circuit_breaker_lazy_create_is_atomic(self) -> None:
-        solwyn = _make_solwyn(_openai_client(), model="gpt-4o")
+        solwyn = _make_solwyn(_openai_client(), model="gpt-5.5")
         solwyn._circuit_breakers.clear()
         created: list[object] = []
         original_new_breaker = solwyn._new_circuit_breaker

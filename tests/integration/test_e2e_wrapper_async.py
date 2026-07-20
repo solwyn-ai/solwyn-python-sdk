@@ -23,7 +23,7 @@ class TestAsyncHappyPath:
         client = await make_async_wrapped_client()
         recorder = WireRecorder().attach(client)
 
-        response = await client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+        response = await client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
 
         assert response.choices[0].message.content == RESPONSE_CONTENT
         assert fake_provider.request_count == 1
@@ -52,13 +52,13 @@ class TestAsyncHappyPath:
         # SUCCESS now settles, so it would land in _settlement_queue, not _queue.
         client = await make_async_wrapped_client(reporter_flush_interval=60.0)
         stream = await client.chat.completions.create(
-            model="gpt-4o", messages=MESSAGES, stream=True
+            model="gpt-5.5", messages=MESSAGES, stream=True
         )
         async for _chunk in stream:
             pass
         fake_provider.fail_next(429)
         with pytest.raises(openai.RateLimitError):
-            await client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+            await client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
         assert len(client._reporter._settlement_queue) == 1
         assert len(client._reporter._queue) == 1
 

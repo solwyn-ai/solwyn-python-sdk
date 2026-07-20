@@ -143,12 +143,12 @@ class TestBedrockAdapterDetectModel:
     @pytest.mark.parametrize(
         "model",
         [
-            "anthropic.claude-3-5-sonnet-20241022-v2:0",
-            "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
             "eu.anthropic.claude-sonnet-4-20250514-v1:0",
             "apac.amazon.nova-pro-v1:0",
             "global.anthropic.claude-sonnet-4-5-20250929-v1:0",
-            "us-gov.anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
             "jp.anthropic.claude-sonnet-4-5-20250929-v1:0",
             "meta.llama3-1-70b-instruct-v1:0",
             "mistral.mistral-large-2402-v1:0",
@@ -159,10 +159,10 @@ class TestBedrockAdapterDetectModel:
             "deepseek.r1-v1:0",
             "openai.gpt-oss-120b-1:0",
             "arn:aws:bedrock:us-east-1:123456789012:inference-profile/"
-            "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
             "arn:aws:bedrock:eu-west-1:123456789012:application-inference-profile/abcdef",
             "arn:aws-us-gov:bedrock:us-gov-west-1:123456789012:inference-profile/"
-            "us-gov.anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "us-gov.anthropic.claude-sonnet-4-5-20250929-v1:0",
         ],
     )
     def test_detect_model_matches_bedrock_ids(self, model: str) -> None:
@@ -171,8 +171,8 @@ class TestBedrockAdapterDetectModel:
     @pytest.mark.parametrize(
         "model",
         [
-            "gpt-4o",
-            "claude-3-5-sonnet",  # direct-Anthropic id, not a Bedrock id
+            "gpt-5.5",
+            "claude-sonnet-5",  # direct-Anthropic id, not a Bedrock id
             "gemini-2.5-flash",
             "anthropic",  # vendor namespace alone, no model
             "us.unknownvendor.some-model-v1:0",

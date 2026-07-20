@@ -92,8 +92,8 @@ def test_default_policy_is_health_based_when_none_injected() -> None:
     # Arrange — no selection_policy injected
     solwyn = _make_solwyn(
         _openai_client(),
-        model="gpt-4o",
-        fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
     )
     try:
         # Assert — health policy is the default; configured order preserved
@@ -107,7 +107,7 @@ def test_default_policy_is_health_based_when_none_injected() -> None:
 def test_latency_policy_swap_changes_order_zero_dispatch_change() -> None:
     # Arrange — SAME provider chain for both clients; the ONLY difference is the
     # injected policy. Seed differing observed p50 so anthropic is the faster.
-    chain = dict(model="gpt-4o", fallback=[(_anthropic_client(), "claude-3-5-sonnet")])
+    chain = dict(model="gpt-5.5", fallback=[(_anthropic_client(), "claude-sonnet-5")])
 
     health = _make_solwyn(_openai_client(), **chain)
     latency = _make_solwyn(_openai_client(), selection_policy=LatencyPolicy(), **chain)
@@ -138,7 +138,7 @@ def test_latency_policy_swap_changes_order_zero_dispatch_change() -> None:
 @pytest.mark.unit
 def test_cost_policy_swap_changes_order_via_price_hints() -> None:
     # Arrange — same chain; CostPolicy injected on one. Anthropic is cheaper.
-    chain = dict(model="gpt-4o", fallback=[(_anthropic_client(), "claude-3-5-sonnet")])
+    chain = dict(model="gpt-5.5", fallback=[(_anthropic_client(), "claude-sonnet-5")])
 
     health = _make_solwyn(_openai_client(), **chain)
     cost = _make_solwyn(_openai_client(), selection_policy=CostPolicy(), **chain)
@@ -164,7 +164,7 @@ def test_cost_policy_swap_changes_order_via_price_hints() -> None:
 
 @pytest.mark.unit
 def test_observed_p50_none_below_min_samples() -> None:
-    solwyn = _make_solwyn(_openai_client(), model="gpt-4o")
+    solwyn = _make_solwyn(_openai_client(), model="gpt-5.5")
     try:
         # Arrange — fewer than _LATENCY_MIN_SAMPLES (3) samples
         solwyn.record_latency("openai", 100.0)
@@ -180,7 +180,7 @@ def test_observed_p50_none_below_min_samples() -> None:
 
 @pytest.mark.unit
 def test_observed_p50_returns_median_above_threshold() -> None:
-    solwyn = _make_solwyn(_openai_client(), model="gpt-4o")
+    solwyn = _make_solwyn(_openai_client(), model="gpt-5.5")
     try:
         # Arrange — odd count -> exact median is the middle value
         for ms in (10.0, 50.0, 30.0):
@@ -198,7 +198,7 @@ def test_observed_p50_returns_median_above_threshold() -> None:
 
 @pytest.mark.unit
 def test_record_latency_thread_safety_smoke() -> None:
-    solwyn = _make_solwyn(_openai_client(), model="gpt-4o")
+    solwyn = _make_solwyn(_openai_client(), model="gpt-5.5")
     try:
         # Arrange — many threads hammering record_latency concurrently
         n_threads = 8
@@ -238,8 +238,8 @@ def test_select_candidates_surfaces_observed_p50_onto_candidate() -> None:
 
     solwyn = _make_solwyn(
         _openai_client(),
-        model="gpt-4o",
-        fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
         selection_policy=_CapturePolicy(),
     )
     try:
@@ -261,8 +261,8 @@ def test_select_candidates_surfaces_observed_p50_onto_candidate() -> None:
 def test_select_candidates_reads_each_breaker_once_per_runtime() -> None:
     solwyn = _make_solwyn(
         _openai_client(),
-        model="gpt-4o",
-        fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
     )
     try:
         with patch.object(
@@ -306,8 +306,8 @@ def test_price_hints_flow_from_response_to_result() -> None:
 def test_price_hints_plumb_into_last_price_hints_and_candidate() -> None:
     solwyn = _make_solwyn(
         _openai_client(),
-        model="gpt-4o",
-        fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
         selection_policy=CostPolicy(),
     )
     try:
@@ -332,8 +332,8 @@ def test_cost_routing_does_no_price_arithmetic_only_server_hint() -> None:
     # the order, and no token count or rate is ever multiplied in.
     solwyn = _make_solwyn(
         _openai_client(),
-        model="gpt-4o",
-        fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
         selection_policy=CostPolicy(),
     )
     try:
@@ -371,8 +371,8 @@ def test_no_price_hints_leaves_cost_policy_on_health_order() -> None:
     # Arrange — CostPolicy injected but the server has provided NO hints yet.
     solwyn = _make_solwyn(
         _openai_client(),
-        model="gpt-4o",
-        fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
         selection_policy=CostPolicy(),
     )
     try:
@@ -410,8 +410,8 @@ def test_select_candidates_drops_foreign_runtime_from_misbehaving_policy() -> No
 
     solwyn = _make_solwyn(
         _openai_client(),
-        model="gpt-4o",
-        fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
         selection_policy=_ForeignAppendingPolicy(),
     )
     try:
@@ -447,8 +447,8 @@ def test_select_candidates_preserves_policy_order_for_valid_subset() -> None:
 
     solwyn = _make_solwyn(
         _openai_client(),
-        model="gpt-4o",
-        fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
         selection_policy=_ReverseWithForeignPolicy(),
     )
     try:
@@ -487,8 +487,8 @@ def test_cost_policy_warns_once_when_no_price_hints(
     # Arrange — CostPolicy selected but the server has provided NO hints.
     solwyn = _make_solwyn(
         _openai_client(),
-        model="gpt-4o",
-        fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
         selection_policy=CostPolicy(),
     )
     try:
@@ -514,8 +514,8 @@ def test_cost_policy_warning_suppressed_when_price_hints_present(
     # Arrange — CostPolicy WITH server hints: the policy is active, not inert.
     solwyn = _make_solwyn(
         _openai_client(),
-        model="gpt-4o",
-        fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
         selection_policy=CostPolicy(),
     )
     try:
@@ -538,7 +538,7 @@ def test_cost_policy_warning_not_emitted_for_other_policies(
 ) -> None:
     # Arrange — neither the default health policy nor LatencyPolicy is CostPolicy,
     # so the CostPolicy-inert warning must never fire, hints or not.
-    chain = dict(model="gpt-4o", fallback=[(_anthropic_client(), "claude-3-5-sonnet")])
+    chain = dict(model="gpt-5.5", fallback=[(_anthropic_client(), "claude-sonnet-5")])
     health = _make_solwyn(_openai_client(), **chain)
     latency = _make_solwyn(_openai_client(), selection_policy=LatencyPolicy(), **chain)
     try:
@@ -560,7 +560,7 @@ def test_cost_policy_warning_fires_once_across_multiple_clients(
 ) -> None:
     # Arrange — the guard is per-PROCESS, not per-client: two separate CostPolicy
     # clients each routing must still yield a single warning in total.
-    chain = dict(model="gpt-4o", fallback=[(_anthropic_client(), "claude-3-5-sonnet")])
+    chain = dict(model="gpt-5.5", fallback=[(_anthropic_client(), "claude-sonnet-5")])
     first = _make_solwyn(_openai_client(), selection_policy=CostPolicy(), **chain)
     second = _make_solwyn(_openai_client(), selection_policy=CostPolicy(), **chain)
     try:

@@ -18,7 +18,7 @@ VALID_PROJECT_ID = "proj_" + "a" * 24
 
 # A minimal one-link provider chain, enough to satisfy SolwynConfig's
 # required ``providers`` invariant in tests that don't care about routing.
-DEFAULT_PROVIDER_CHAIN = [ProviderEntry(provider=ProviderName.OPENAI, model="gpt-4o")]
+DEFAULT_PROVIDER_CHAIN = [ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")]
 
 
 def _accepted_response(body: dict[str, Any]) -> MagicMock:
@@ -80,7 +80,7 @@ def solwyn_config():
     """
     return SolwynConfig(
         api_key=VALID_API_KEY,
-        providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-4o")],
+        providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
     )
 
 

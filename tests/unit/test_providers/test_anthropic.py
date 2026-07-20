@@ -75,7 +75,7 @@ class TestAnthropicAdapterProtocol:
 @pytest.mark.unit
 class TestAnthropicAdapterDetect:
     def test_detect_model_claude_3(self) -> None:
-        assert AnthropicAdapter().detect_model("claude-3-5-sonnet") is True
+        assert AnthropicAdapter().detect_model("claude-sonnet-5") is True
 
     def test_detect_model_claude_opus(self) -> None:
         assert AnthropicAdapter().detect_model("claude-opus-4-6") is True
@@ -84,7 +84,7 @@ class TestAnthropicAdapterDetect:
         assert AnthropicAdapter().detect_model("claude-haiku-3-5") is True
 
     def test_detect_model_does_not_match_gpt(self) -> None:
-        assert AnthropicAdapter().detect_model("gpt-4o") is False
+        assert AnthropicAdapter().detect_model("gpt-5.5") is False
 
     def test_detect_model_does_not_match_gemini(self) -> None:
         assert AnthropicAdapter().detect_model("gemini-2.5-flash") is False

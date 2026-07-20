@@ -25,7 +25,7 @@ class TestBudgetConfirmRoundTrip:
         # Arrange — get a reservation
         result = budget_enforcer.check_budget(
             estimated_input_tokens=100,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
         )
         assert result.reservation_id is not None
@@ -34,7 +34,7 @@ class TestBudgetConfirmRoundTrip:
         # the reporter's confirm sender (best-effort, should not raise).
         confirm = budget_enforcer.build_confirm_request(
             reservation_id=result.reservation_id,
-            model="gpt-4o",
+            model="gpt-5.5",
             token_details=SAMPLE_TOKEN_DETAILS,
             provider="openai",
             call_id="call_integration_confirm_valid",
@@ -48,7 +48,7 @@ class TestBudgetConfirmRoundTrip:
         """Settlement is best-effort — a bad reservation_id logs, doesn't raise."""
         confirm = budget_enforcer.build_confirm_request(
             reservation_id="res_nonexistent_000",
-            model="gpt-4o",
+            model="gpt-5.5",
             token_details=SAMPLE_TOKEN_DETAILS,
             provider="openai",
             call_id="call_integration_confirm_invalid",

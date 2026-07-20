@@ -28,7 +28,7 @@ def test_reporter_report_confirm_concurrent_appends() -> None:
                 reporter.report_confirm(
                     BudgetConfirmRequest(
                         reservation_id=f"r{i}",
-                        model="gpt-4o",
+                        model="gpt-5.5",
                         provider="openai",
                         token_details=_DUMMY_DETAILS,
                         call_id=f"call-{threading.get_ident()}-{i}",

@@ -27,7 +27,7 @@ class TestBudgetDenial:
         recorder = WireRecorder().attach(client)
 
         with pytest.raises(BudgetExceededError) as exc_info:
-            client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+            client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
 
         # The provider endpoint was never contacted.
         assert fake_provider.request_count == 0

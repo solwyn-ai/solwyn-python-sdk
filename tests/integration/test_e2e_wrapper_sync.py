@@ -29,7 +29,7 @@ class TestSyncHappyPath:
         recorder = WireRecorder().attach(client)
 
         # Act
-        response = client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+        response = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
 
         # Assert — the caller sees the provider response untouched
         assert response.choices[0].message.content == RESPONSE_CONTENT
@@ -37,7 +37,7 @@ class TestSyncHappyPath:
 
         # Assert — the provider was called exactly once with the caller's model
         assert fake_provider.request_count == 1
-        assert fake_provider.requests[0].body["model"] == "gpt-4o"
+        assert fake_provider.requests[0].body["model"] == "gpt-5.5"
 
         # Assert — the settlement carried the provider's exact usage (not an
         # estimate): confirm + event ride report_settlement as one ordered unit.
@@ -65,7 +65,7 @@ class TestSyncHappyPath:
         client = make_wrapped_client()
         recorder = WireRecorder().attach(client)
 
-        stream = client.chat.completions.create(model="gpt-4o", messages=MESSAGES, stream=True)
+        stream = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES, stream=True)
         content = "".join(
             chunk.choices[0].delta.content or ""
             for chunk in stream
@@ -96,12 +96,12 @@ class TestSyncHappyPath:
         # _queue via the report path (a reservation-backed SUCCESS now settles,
         # so it would land in _settlement_queue, not _queue).
         client = make_wrapped_client(reporter_flush_interval=60.0)
-        stream = client.chat.completions.create(model="gpt-4o", messages=MESSAGES, stream=True)
+        stream = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES, stream=True)
         for _chunk in stream:
             pass
         fake_provider.fail_next(429)
         with pytest.raises(openai.RateLimitError):
-            client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+            client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
         assert len(client._reporter._settlement_queue) == 1
         assert len(client._reporter._queue) == 1
 

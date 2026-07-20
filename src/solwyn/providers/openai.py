@@ -120,7 +120,7 @@ def _extract_image_usage(response: Any) -> TokenDetails | None:
 
     Module-level so the images ``MediaSurfaceSpec`` (in ``_proxies``) can reuse
     it for native OpenAI and any compat endpoint that shares the shape. Token-
-    billed image models (gpt-image-1) report the Responses-style usage shape
+    billed image models (gpt-image-2) report the Responses-style usage shape
     with per-modality buckets (probe-verified 2026-07-10):
 
         usage.input_tokens / usage.output_tokens

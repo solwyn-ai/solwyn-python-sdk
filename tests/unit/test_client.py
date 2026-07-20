@@ -238,7 +238,7 @@ class TestBasicWrapping:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             result = solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -257,7 +257,7 @@ class TestBasicWrapping:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             result = solwyn.chat.completions.create(
-                model="claude-sonnet-4-5",
+                model="claude-sonnet-5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -299,7 +299,7 @@ class TestBudgetCheckBeforeCall:
             pytest.raises(BudgetExceededError),
         ):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -334,12 +334,12 @@ class TestBudgetCheckBeforeCall:
         ) as mock_post:
             with pytest.raises(BudgetExceededError):
                 solwyn.chat.completions.create(
-                    model="gpt-4o",
+                    model="gpt-5.5",
                     messages=[{"role": "user", "content": "Hello"}],
                 )
             with pytest.raises(BudgetExceededError):
                 solwyn.chat.completions.create(
-                    model="gpt-4o",
+                    model="gpt-5.5",
                     messages=[{"role": "user", "content": "Hello again"}],
                 )
 
@@ -373,7 +373,7 @@ class TestBudgetCheckBeforeCall:
             pytest.raises(BudgetExceededError),
         ):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -416,7 +416,7 @@ class TestBudgetCheckBeforeCall:
             pytest.raises(BudgetExceededError),
         ):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -458,7 +458,7 @@ class TestBudgetCheckBeforeCall:
             pytest.raises(BudgetExceededError) as exc_info,
         ):
             solwyn.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-3.5-flash",
                 contents="Hello",
             )
 
@@ -508,7 +508,7 @@ class TestCircuitBreakerFailover:
             pytest.raises(ProviderUnavailableError),
         ):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -528,11 +528,11 @@ class TestGetAttrPassThrough:
     def test_passthrough_to_underlying_client(self) -> None:
         client, _ = _mock_openai_client()
         client.models = MagicMock()
-        client.models.list.return_value = ["gpt-4o"]
+        client.models.list.return_value = ["gpt-5.5"]
 
         solwyn = _make_solwyn(client)
         result = solwyn.models.list()
-        assert result == ["gpt-4o"]
+        assert result == ["gpt-5.5"]
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
@@ -701,7 +701,7 @@ class TestRichTokenExtraction:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -740,7 +740,7 @@ class TestRichTokenExtraction:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             solwyn.chat.completions.create(
-                model="claude-sonnet-4-5",
+                model="claude-sonnet-5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -767,7 +767,7 @@ class TestRichTokenExtraction:
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -790,7 +790,7 @@ class TestRichTokenExtraction:
             solwyn_pkg.run("nightly-batch", tags={"team": "platform", "env": "prod"}) as run_id,
         ):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
                 solwyn_tags={"env": "stage", "job": "batch"},
             )
@@ -823,7 +823,7 @@ class TestRichTokenExtraction:
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -855,7 +855,7 @@ class TestRichTokenExtraction:
             pytest.raises((TypeError, ValueError)),
         ):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
                 solwyn_tags=tags,
             )
@@ -875,7 +875,7 @@ class TestRichTokenExtraction:
             pytest.raises(ValueError, match="at most 10"),
         ):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
                 solwyn_tags={f"call-{i}": "v" for i in range(5)},
             )
@@ -895,7 +895,7 @@ class TestRichTokenExtraction:
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()):
             solwyn.messages.create(
-                model="claude-sonnet-4-5",
+                model="claude-sonnet-5",
                 max_tokens=1024,
                 messages=[{"role": "user", "content": "Hello"}],
             )
@@ -924,7 +924,7 @@ class TestSyncErrorAgentRunTagging:
             pytest.raises(RuntimeError, match="primary failed"),
         ):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -938,14 +938,14 @@ class TestSyncErrorAgentRunTagging:
 
     def test_fallback_retry_error_events_tag_agent_run_id(self) -> None:
         # Same-provider model-swap fallback: the SAME client serves both hops.
-        # A 429-style error on the primary advances the chain to the gpt-4o-mini
+        # A 429-style error on the primary advances the chain to the gpt-5.4-mini
         # swap; the swap also 429s, so the chain exhausts and re-raises.
         client, _ = _mock_openai_client()
         client.chat.completions.create.side_effect = [
             _Status(429, "primary failed"),
             _Status(429, "fallback failed"),
         ]
-        solwyn = _make_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
+        solwyn = _make_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
 
         reported_events: list = []
         solwyn._reporter.report = lambda e: reported_events.append(e)
@@ -956,7 +956,7 @@ class TestSyncErrorAgentRunTagging:
             pytest.raises(_Status, match="fallback failed"),
         ):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -964,7 +964,7 @@ class TestSyncErrorAgentRunTagging:
         assert all(event.agent_run_id == run_id for event in reported_events)
         assert all(event.agent_run_name == "retry-doomed" for event in reported_events)
         # Second hop swapped the model on the same client.
-        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-4o-mini"
+        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-5.4-mini"
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
@@ -1007,7 +1007,7 @@ class TestSyncStreamingInterception:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             result = solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
             )
@@ -1045,7 +1045,7 @@ class TestSyncStreamingInterception:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             stream = solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
             )
@@ -1100,7 +1100,7 @@ class TestSyncStreamingInterception:
             solwyn_pkg.run("nightly", tags=scope_tags) as run_id,
         ):
             stream = solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
                 solwyn_tags=call_tags,
@@ -1149,7 +1149,7 @@ class TestSyncStreamingInterception:
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()):
             stream = solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
             )
@@ -1189,7 +1189,7 @@ class TestSyncStreamingInterception:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             stream = solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
             )
@@ -1218,7 +1218,7 @@ class TestSyncStreamingInterception:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             stream = solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
             )
@@ -1266,7 +1266,7 @@ class TestSyncStreamingInterception:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             stream = solwyn.models.generate_content_stream(
-                model="gemini-2.0-flash",
+                model="gemini-3.5-flash",
                 contents="Hello",
             )
             assert len(reported_events) == 0
@@ -1326,7 +1326,7 @@ class TestSyncStreamingInterception:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             stream = solwyn.messages.create(
-                model="claude-sonnet-4-5",
+                model="claude-sonnet-5",
                 max_tokens=1024,
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
@@ -1408,7 +1408,7 @@ class TestAsyncStreamingInterception:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             stream = await solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
             )
@@ -1457,7 +1457,7 @@ class TestAsyncStreamingInterception:
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             async with solwyn_pkg.run("nightly", tags=scope_tags) as run_id:
                 stream = await solwyn.chat.completions.create(
-                    model="gpt-4o",
+                    model="gpt-5.5",
                     messages=[{"role": "user", "content": "Hello"}],
                     stream=True,
                     solwyn_tags=call_tags,
@@ -1514,7 +1514,7 @@ class TestAsyncStreamingInterception:
             new=AsyncMockFn(return_value=_allow_budget_result()),
         ):
             stream = await solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
             )
@@ -1556,7 +1556,7 @@ class TestAsyncStreamingInterception:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             stream = await solwyn.models.generate_content_stream(
-                model="gemini-2.0-flash",
+                model="gemini-3.5-flash",
                 contents="Hello",
             )
             chunks = [c async for c in stream]
@@ -1605,7 +1605,7 @@ class TestAsyncStreamingInterception:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             stream = await solwyn.messages.create(
-                model="claude-sonnet-4-5",
+                model="claude-sonnet-5",
                 max_tokens=1024,
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
@@ -1655,7 +1655,7 @@ class TestAsyncNonStreamingInterception:
 
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             result = await solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -1701,7 +1701,7 @@ class TestAsyncNonStreamingInterception:
             async with solwyn_pkg.run("async-expensive-job") as run_id:
                 with pytest.raises(BudgetExceededError):
                     await solwyn.chat.completions.create(
-                        model="gpt-4o",
+                        model="gpt-5.5",
                         messages=[{"role": "user", "content": "Hello"}],
                     )
 
@@ -1745,12 +1745,12 @@ class TestAsyncNonStreamingInterception:
 
         with pytest.raises(BudgetExceededError):
             await solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
         with pytest.raises(BudgetExceededError):
             await solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello again"}],
             )
 
@@ -1778,7 +1778,7 @@ class TestAsyncNonStreamingInterception:
             new=AsyncMockFn(return_value=_allow_budget_result()),
         ):
             await solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -1804,7 +1804,7 @@ class TestAsyncNonStreamingInterception:
         ) as check:
             async with solwyn_pkg.run("async-nightly-batch") as run_id:
                 await solwyn.chat.completions.create(
-                    model="gpt-4o",
+                    model="gpt-5.5",
                     messages=[{"role": "user", "content": "Hello"}],
                 )
 
@@ -1834,7 +1834,7 @@ class TestAsyncNonStreamingInterception:
             async with solwyn_pkg.run("async-doomed") as run_id:
                 with pytest.raises(RuntimeError, match="primary failed"):
                     await solwyn.chat.completions.create(
-                        model="gpt-4o",
+                        model="gpt-5.5",
                         messages=[{"role": "user", "content": "Hello"}],
                     )
 
@@ -1858,7 +1858,7 @@ class TestAsyncNonStreamingInterception:
             ]
         )
 
-        solwyn = _make_async_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
+        solwyn = _make_async_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
         reported_events: list = []
         solwyn._reporter.report = lambda e: reported_events.append(e)
 
@@ -1870,14 +1870,14 @@ class TestAsyncNonStreamingInterception:
             async with solwyn_pkg.run("async-retry-doomed") as run_id:
                 with pytest.raises(_Status, match="fallback failed"):
                     await solwyn.chat.completions.create(
-                        model="gpt-4o",
+                        model="gpt-5.5",
                         messages=[{"role": "user", "content": "Hello"}],
                     )
 
         assert [event.status for event in reported_events] == ["error", "error"]
         assert all(event.agent_run_id == run_id for event in reported_events)
         assert all(event.agent_run_name == "async-retry-doomed" for event in reported_events)
-        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-4o-mini"
+        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-5.4-mini"
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

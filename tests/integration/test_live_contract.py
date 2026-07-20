@@ -27,14 +27,17 @@ from conftest import Credentials, _signup_token
 
 from solwyn._types import BudgetCheckRequest, BudgetCheckResponse, ProviderName
 
-RUN_CAP_USD = 0.02
+# Sized to gpt-5.5 prices ($5/M input, $30/M output): the first check's
+# estimate (1000 input tokens + projected output) stays under the cap, and the
+# burn below ($0.005 input + $0.06 output = $0.065) crosses it.
+RUN_CAP_USD = 0.05
 
 
 def _check_payload(agent_run_id: str | None = None) -> dict[str, object]:
     """The SDK's exact check wire bytes: directive v1 opt-in, None-skipping."""
     request = BudgetCheckRequest(
         estimated_input_tokens=1000,
-        model="gpt-4o",
+        model="gpt-5.5",
         provider=ProviderName.OPENAI,
         agent_run_id=agent_run_id,
         failover_directive_version="1",
@@ -166,13 +169,13 @@ class TestLiveDeniedByPeriodContract:
         reservation_id = first.get("reservation_id")
         assert isinstance(reservation_id, str), f"expected a reservation: {first}"
 
-        # Burn past the $0.02 run cap: $0.0025 input + $0.02 output = $0.0225.
+        # Burn past the $0.05 run cap: $0.005 input + $0.06 output = $0.065.
         with httpx.Client(base_url=run_capped_credentials.api_url, timeout=10) as http:
             r = http.post(
                 "/api/v1/budgets/confirm",
                 json={
                     "reservation_id": reservation_id,
-                    "model": "gpt-4o",
+                    "model": "gpt-5.5",
                     "provider": "openai",
                     "call_id": f"live-contract-burn-{run_id}",
                     "token_details": {"input_tokens": 1000, "output_tokens": 2000},

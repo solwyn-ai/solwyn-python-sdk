@@ -26,7 +26,7 @@ class TestCompatDetection:
         assert client._adapter.name == "openai_compatible"
 
         recorder = WireRecorder().attach(client)
-        client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+        client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
         # The live API accepted a settlement attributed to the catch-all name.
         assert recorder.settlements[0][0].provider.value == "openai_compatible"
 
@@ -39,7 +39,7 @@ class TestCompatDetection:
         assert client._adapter.name == expected
 
         recorder = WireRecorder().attach(client)
-        client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+        client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
         assert fake_provider_known_port.request_count == 1
         confirm_request, event = recorder.settlements[0]
         assert confirm_request.provider.value == expected

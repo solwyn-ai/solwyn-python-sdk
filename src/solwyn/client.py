@@ -13,7 +13,7 @@ Usage::
         api_key="sk_proj_...",
     )
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-5.5",
         messages=[{"role": "user", "content": "Hello"}],
     )
 """
@@ -543,7 +543,7 @@ class Solwyn(_SolwynBase):
             api_key="sk_proj_...",
         )
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.5",
             messages=[{"role": "user", "content": "Hello"}],
         )
         client.close()
@@ -1529,7 +1529,7 @@ class AsyncSolwyn(_SolwynBase):
             api_key="sk_proj_...",
         ) as client:
             response = await client.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
     """

@@ -84,7 +84,7 @@ class TokenDetails(BaseModel):
         description=(
             "Image tokens on the INPUT side, a SUBSET of input_tokens (image ⊂ "
             "input, mirroring reasoning ⊂ output). Documented, NOT enforced. "
-            "Token-billed image models (e.g. gpt-image-1) price these at their "
+            "Token-billed image models (e.g. gpt-image-2) price these at their "
             "own image-input rate; the server derives text input = input − image."
         ),
     )

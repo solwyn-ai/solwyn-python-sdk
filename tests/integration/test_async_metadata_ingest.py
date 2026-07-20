@@ -15,7 +15,7 @@ from solwyn.reporter import AsyncMetadataReporter
 def _make_event(seq: int = 0) -> MetadataEvent:
     """Create a minimal metadata event for testing."""
     return MetadataEvent(
-        model="gpt-4o",
+        model="gpt-5.5",
         provider=ProviderName.OPENAI,
         input_tokens=100 + seq,
         output_tokens=50 + seq,

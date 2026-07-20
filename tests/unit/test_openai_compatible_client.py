@@ -590,12 +590,12 @@ class TestCompatFailover:
         anthropic.messages.create.return_value = SimpleNamespace(
             content=[SimpleNamespace(type="text", text="from claude")],
             stop_reason="end_turn",
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-5",
             usage=SimpleNamespace(input_tokens=13, output_tokens=5),
         )
         solwyn = _make_solwyn(
             primary,
-            fallback=[(anthropic, "claude-sonnet-4-5", {"max_tokens": 128})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 128})],
         )
         _open_breaker(solwyn, "groq")
 
@@ -820,7 +820,7 @@ class TestCompatFailover:
         anthropic = make_mock_client(module="anthropic._client", name="Anthropic")
         solwyn = _make_solwyn(
             primary,
-            fallback=[(anthropic, "claude-sonnet-4-5", {"max_tokens": 128})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 128})],
         )
         _open_breaker(solwyn, "groq")
 

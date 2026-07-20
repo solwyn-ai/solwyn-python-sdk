@@ -17,7 +17,7 @@ class TestBudgetCheckAllowed:
     def test_check_budget_returns_allowed(self, budget_enforcer: BudgetEnforcer) -> None:
         result = budget_enforcer.check_budget(
             estimated_input_tokens=100,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
         )
         assert result.allowed is True
@@ -28,7 +28,7 @@ class TestBudgetCheckAllowed:
     def test_check_budget_returns_budget_metadata(self, budget_enforcer: BudgetEnforcer) -> None:
         result = budget_enforcer.check_budget(
             estimated_input_tokens=100,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
         )
         assert result.budget_limit > 0
@@ -50,7 +50,7 @@ class TestBudgetCheckFailOpen:
         try:
             result = enforcer.check_budget(
                 estimated_input_tokens=100,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
             )
             assert result.allowed is True

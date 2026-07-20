@@ -201,7 +201,7 @@ def hard_denied_credentials(api_url: str) -> Credentials:
     """Credentials for a project driven OVER its hard_deny budget limit.
 
     Bootstraps a dedicated project (hard_deny, $0.05 limit) and burns it with
-    one large confirmed spend (~$2.50 of gpt-4o tokens), then verifies with a
+    one large confirmed spend (~$2.50 of gpt-5.5 tokens), then verifies with a
     fresh enforcer (no allow-cache) that the API now denies. E2E tests use
     these credentials to prove BudgetExceededError surfaces from the wrapper
     WITHOUT the provider being called. Session-scoped: usage persists.
@@ -224,7 +224,7 @@ def hard_denied_credentials(api_url: str) -> Credentials:
         api_url=api_url, api_key=key, budget_mode=BudgetMode.HARD_DENY, fail_open=False
     )
     try:
-        check = burner.check_budget(estimated_input_tokens=100, model="gpt-4o", provider="openai")
+        check = burner.check_budget(estimated_input_tokens=100, model="gpt-5.5", provider="openai")
         if check.reservation_id is None:
             pytest.fail("hard-deny bootstrap: expected a reservation on a fresh project")
         # Settlement lives in the reporter now (no enforcer.confirm_cost): build
@@ -232,7 +232,7 @@ def hard_denied_credentials(api_url: str) -> Credentials:
         # throwaway reporter's _send_confirm so the burn lands before we verify.
         confirm = burner.build_confirm_request(
             reservation_id=check.reservation_id,
-            model="gpt-4o",
+            model="gpt-5.5",
             token_details=TokenDetails(input_tokens=200_000, output_tokens=200_000),
             provider="openai",
             call_id=f"harness-burn-{session_id}",
@@ -251,7 +251,7 @@ def hard_denied_credentials(api_url: str) -> Credentials:
     )
     try:
         denied = verifier.check_budget(
-            estimated_input_tokens=100, model="gpt-4o", provider="openai"
+            estimated_input_tokens=100, model="gpt-5.5", provider="openai"
         )
     finally:
         verifier.close()
@@ -279,7 +279,7 @@ SAMPLE_TOKEN_DETAILS = TokenDetails(input_tokens=100, output_tokens=50)
 # - budget_check_cache_ttl=0 on every wrapped client: the enforcer's allow-
 #   cache returns reservation_id=None on hits, which silently skips confirm
 #   for a second same-client call inside the 5s default TTL.
-# - Happy-path calls use a model the API prices (gpt-4o): unpriced models are
+# - Happy-path calls use a model the API prices (gpt-5.5): unpriced models are
 #   allowed WITHOUT a reservation, so confirm never fires.
 # - WireRecorder wraps private seams (client._budget / client._reporter) by
 #   design: it records the wire-bound payloads while REAL delivery to the live

@@ -37,7 +37,7 @@ def _openai_response() -> SimpleNamespace:
     choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
     return SimpleNamespace(
         choices=[choice],
-        model="gpt-4o",
+        model="gpt-5.5",
         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
     )
 
@@ -76,11 +76,11 @@ def _make_solwyn(client: object) -> Solwyn:
     # Patch the flush loop out (the thread exits immediately) WITHOUT setting
     # _shutdown — report_settlement drops items once shutdown is set.
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
-        return Solwyn(client, api_key=VALID_API_KEY, model="gpt-4o")
+        return Solwyn(client, api_key=VALID_API_KEY, model="gpt-5.5")
 
 
 def _make_async_solwyn(client: object) -> AsyncSolwyn:
-    return AsyncSolwyn(client, api_key=VALID_API_KEY, model="gpt-4o")
+    return AsyncSolwyn(client, api_key=VALID_API_KEY, model="gpt-5.5")
 
 
 def _close(solwyn: Solwyn) -> None:
@@ -90,7 +90,7 @@ def _close(solwyn: Solwyn) -> None:
 
 
 _PLAIN_REQUEST = {
-    "model": "gpt-4o",
+    "model": "gpt-5.5",
     "messages": [{"role": "user", "content": "hi"}],
 }
 

@@ -42,7 +42,7 @@ PNG_B64 = base64.b64encode(PNG_BYTES).decode("ascii")
 # --------------------------------------------------------------------------- #
 def bedrock_req(**over: object) -> dict[str, object]:
     base: dict[str, object] = {
-        "model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "model": "anthropic.claude-sonnet-4-5-20250929-v1:0",
         "messages": [{"role": "user", "content": [{"text": "hello"}]}],
         "inferenceConfig": {"maxTokens": 256},
     }
@@ -335,7 +335,7 @@ class TestCanonicalToBedrock:
         canonical = to_canonical(
             "anthropic",
             {
-                "model": "claude-3-5-sonnet",
+                "model": "claude-sonnet-5",
                 "max_tokens": 99,
                 "system": "be helpful",
                 "temperature": 0.3,
@@ -352,7 +352,7 @@ class TestCanonicalToBedrock:
         canonical = to_canonical(
             "openai",
             {
-                "model": "gpt-4o",
+                "model": "gpt-5.5",
                 "max_tokens": 10,
                 "stop": ["END"],
                 "messages": [{"role": "user", "content": "hi"}],
@@ -366,7 +366,7 @@ class TestCanonicalToBedrock:
         canonical = to_canonical(
             "openai",
             {
-                "model": "gpt-4o",
+                "model": "gpt-5.5",
                 "max_tokens": 10,
                 "messages": [{"role": "user", "content": "hi"}],
                 "tools": [
@@ -389,7 +389,7 @@ class TestCanonicalToBedrock:
         canonical = to_canonical(
             "openai",
             {
-                "model": "gpt-4o",
+                "model": "gpt-5.5",
                 "max_tokens": 10,
                 "messages": [{"role": "user", "content": "hi"}],
                 "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
@@ -405,7 +405,7 @@ class TestCanonicalToBedrock:
         canonical = to_canonical(
             "openai",
             {
-                "model": "gpt-4o",
+                "model": "gpt-5.5",
                 "max_tokens": 10,
                 "messages": [{"role": "user", "content": "hi"}],
                 "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
@@ -420,7 +420,7 @@ class TestCanonicalToBedrock:
         canonical = to_canonical(
             "anthropic",
             {
-                "model": "claude-3-5-sonnet",
+                "model": "claude-sonnet-5",
                 "max_tokens": 10,
                 "messages": [
                     {
@@ -449,7 +449,7 @@ class TestCanonicalToBedrock:
         canonical = to_canonical(
             "anthropic",
             {
-                "model": "claude-3-5-sonnet",
+                "model": "claude-sonnet-5",
                 "max_tokens": 10,
                 "messages": [
                     {
@@ -505,7 +505,7 @@ class TestCanonicalToBedrock:
         )
         canonical = to_canonical("bedrock", original)
         rendered = from_canonical(
-            "bedrock", canonical, model="anthropic.claude-3-5-sonnet-20241022-v2:0"
+            "bedrock", canonical, model="anthropic.claude-sonnet-4-5-20250929-v1:0"
         )
         assert rendered["messages"][1]["content"][0]["toolUse"]["toolUseId"] == "tu_1"  # type: ignore[index]
         assert rendered["messages"][2]["content"][0]["toolResult"]["toolUseId"] == "tu_1"  # type: ignore[index]
@@ -557,7 +557,7 @@ class TestBedrockResponseNormalization:
         served = SimpleNamespace(
             content=[SimpleNamespace(type="text", text="ok")],
             stop_reason="end_turn",
-            model="claude-3-5-sonnet",
+            model="claude-sonnet-5",
         )
         result = normalize_response(served="anthropic", requested="bedrock", response=served)
         assert result["output"]["message"]["content"][0]["text"] == "ok"  # type: ignore[index]

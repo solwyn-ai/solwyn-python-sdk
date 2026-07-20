@@ -35,7 +35,7 @@ client = Solwyn(
 )
 
 response = client.chat.completions.create(
-    model="gpt-4o",
+    model="gpt-5.5",
     messages=[{"role": "user", "content": "Hello!"}],
 )
 
@@ -47,7 +47,7 @@ Or use as a context manager:
 ```python
 with Solwyn(OpenAI(), api_key="sk_proj_...") as client:
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-5.5",
         messages=[{"role": "user", "content": "Hello!"}],
     )
 ```
@@ -61,7 +61,7 @@ from openai import OpenAI
 from solwyn import Solwyn
 
 client = Solwyn(OpenAI(), api_key="sk_proj_...")
-response = client.chat.completions.create(model="gpt-4o", messages=[...])
+response = client.chat.completions.create(model="gpt-5.5", messages=[...])
 ```
 
 ### Anthropic
@@ -81,7 +81,7 @@ from google import genai
 from solwyn import Solwyn
 
 client = Solwyn(genai.Client(api_key="..."), api_key="sk_proj_...")
-response = client.models.generate_content(model="gemini-2.0-flash", contents="Hello!")
+response = client.models.generate_content(model="gemini-3.5-flash", contents="Hello!")
 ```
 
 ### Amazon Bedrock
@@ -103,7 +103,7 @@ bedrock = boto3.client(
 
 client = Solwyn(bedrock, api_key="sk_proj_...")
 response = client.converse(
-    modelId="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+    modelId="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
     messages=[{"role": "user", "content": [{"text": "Hello!"}]}],
     inferenceConfig={"maxTokens": 1024},
 )
@@ -255,7 +255,7 @@ async with AsyncSolwyn(
     api_key="sk_proj_...",
 ) as client:
     response = await client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-5.5",
         messages=[{"role": "user", "content": "Hello!"}],
     )
 ```
@@ -266,7 +266,7 @@ Pass `stream=True` as you normally would. Solwyn wraps the stream transparently 
 
 ```python
 stream = client.chat.completions.create(
-    model="gpt-4o",
+    model="gpt-5.5",
     messages=[{"role": "user", "content": "Hello!"}],
     stream=True,
 )
@@ -286,9 +286,9 @@ from openai import OpenAI
 client = solwyn.Solwyn(OpenAI(), api_key="sk_proj_...")
 
 with solwyn.run("nightly-batch", tags={"team": "research", "env": "prod"}) as run_id:
-    client.chat.completions.create(model="gpt-4o", messages=[...])
+    client.chat.completions.create(model="gpt-5.5", messages=[...])
     client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-5.5",
         messages=[...],
         solwyn_tags={"env": "staging", "job": "backfill"},
     )
@@ -345,7 +345,7 @@ and delayed server visibility; it does not mean ingest is synchronous.
 from solwyn import BudgetExceededError
 
 try:
-    response = client.chat.completions.create(model="gpt-4o", messages=[...])
+    response = client.chat.completions.create(model="gpt-5.5", messages=[...])
 except BudgetExceededError as e:
     print(f"Budget limit: ${e.budget_limit}, usage: ${e.current_usage}")
 ```
@@ -393,7 +393,7 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `model` | `str` | Model name (e.g., `gpt-4o`) |
+| `model` | `str` | Model name (e.g., `gpt-5.5`) |
 | `provider` | `str` | Provider identifier (`openai`, `anthropic`, `google`, `bedrock`, `groq`, `openrouter`, …) |
 | `modality` | `str` | Call modality (`text`, `image`, `audio`, `video`, `embedding`); `text` for chat, `embedding` for embeddings calls |
 | `input_tokens` | `int` | Input token count |

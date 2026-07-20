@@ -180,7 +180,7 @@ class TestOpenAIPrepareStreaming:
 
     def test_injects_stream_options(self) -> None:
         adapter = OpenAIAdapter()
-        kwargs = {"model": "gpt-4o", "messages": [], "stream": True}
+        kwargs = {"model": "gpt-5.5", "messages": [], "stream": True}
         result = adapter.prepare_streaming(kwargs)
         assert result["stream_options"] == {"include_usage": True}
         # Original not mutated
@@ -188,7 +188,7 @@ class TestOpenAIPrepareStreaming:
 
     def test_preserves_existing_stream_options(self) -> None:
         adapter = OpenAIAdapter()
-        kwargs = {"model": "gpt-4o", "stream": True, "stream_options": {"include_usage": False}}
+        kwargs = {"model": "gpt-5.5", "stream": True, "stream_options": {"include_usage": False}}
         result = adapter.prepare_streaming(kwargs)
         # We override include_usage to True
         assert result["stream_options"]["include_usage"] is True
@@ -433,7 +433,7 @@ class TestAnthropicPrepareStreaming:
 
     def test_returns_copy_unchanged(self) -> None:
         adapter = AnthropicAdapter()
-        kwargs = {"model": "claude-sonnet-4-5", "messages": [], "stream": True}
+        kwargs = {"model": "claude-sonnet-5", "messages": [], "stream": True}
         result = adapter.prepare_streaming(kwargs)
         assert result == kwargs
         assert result is not kwargs  # Must be a copy
@@ -505,7 +505,7 @@ class TestGooglePrepareStreaming:
 
     def test_returns_copy_unchanged(self) -> None:
         adapter = GoogleAdapter()
-        kwargs = {"model": "gemini-pro", "contents": [], "stream": True}
+        kwargs = {"model": "gemini-2.5-pro", "contents": [], "stream": True}
         result = adapter.prepare_streaming(kwargs)
         assert result == kwargs
         assert result is not kwargs
@@ -611,7 +611,7 @@ class TestBedrockPrepareStreaming:
 
     def test_returns_copy_unchanged(self) -> None:
         adapter = BedrockAdapter()
-        kwargs = {"model": "us.anthropic.claude-sonnet-4-5", "messages": []}
+        kwargs = {"model": "us.anthropic.claude-sonnet-5", "messages": []}
         result = adapter.prepare_streaming(kwargs)
         assert result == kwargs
         assert result is not kwargs

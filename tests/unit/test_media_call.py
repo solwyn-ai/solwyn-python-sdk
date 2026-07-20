@@ -265,7 +265,7 @@ class TestMediaCallSync:
             patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_images),
         ):
-            solwyn._media_call(spec, model="gpt-image-1", prompt="a cat", n=2)
+            solwyn._media_call(spec, model="gpt-image-2", prompt="a cat", n=2)
 
         client.images.generate.assert_called_once()
         # estimated_media rides the CHECK (precise per-unit pre-flight).
@@ -461,7 +461,7 @@ class TestMediaCallAsync:
             patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_images),
         ):
-            await solwyn._media_call(spec, model="gpt-image-1", prompt="a cat", n=2)
+            await solwyn._media_call(spec, model="gpt-image-2", prompt="a cat", n=2)
 
         client.images.generate.assert_awaited_once()
         assert check.call_args.kwargs["estimated_media"].image_count == 2

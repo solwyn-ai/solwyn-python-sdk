@@ -20,17 +20,17 @@ def _make_base() -> _SolwynBase:
     client = MagicMock()
     client.__class__.__module__ = "openai._client"
     client.__class__.__name__ = "OpenAI"
-    runtimes = build_runtimes(client, "gpt-4o", [])
+    runtimes = build_runtimes(client, "gpt-5.5", [])
     config = SolwynConfig(
         api_key=VALID_API_KEY,
-        providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-4o")],
+        providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
     )
     return _SolwynBase(config, runtimes)
 
 
 def _build(base: _SolwynBase) -> MetadataEvent:
     return base._build_metadata_event(
-        model="gpt-4o",
+        model="gpt-5.5",
         provider="openai",
         input_tokens=10,
         output_tokens=5,
@@ -74,7 +74,7 @@ class TestEmitWithActiveRun:
         base = _make_base()
         with solwyn.run("nightly-batch", tags={"team": "research"}) as run_id:
             event = base._build_error_event(
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 latency_ms=12.3,
                 is_model_fallback=False,
@@ -90,7 +90,7 @@ class TestEmitWithActiveRun:
             snapshot = _capture_run_context()
 
         event = base._build_metadata_event(
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             input_tokens=10,
             output_tokens=5,

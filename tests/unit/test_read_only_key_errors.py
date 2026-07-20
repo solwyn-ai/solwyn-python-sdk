@@ -36,7 +36,7 @@ def _read_only_response() -> MagicMock:
 
 def _event() -> MetadataEvent:
     return MetadataEvent(
-        model="gpt-4o",
+        model="gpt-5.5",
         provider=ProviderName.OPENAI,
         input_tokens=10,
         output_tokens=5,
@@ -52,7 +52,7 @@ def _event() -> MetadataEvent:
 def _confirm() -> BudgetConfirmRequest:
     return BudgetConfirmRequest(
         reservation_id="res-read-only",
-        model="gpt-4o",
+        model="gpt-5.5",
         provider=ProviderName.OPENAI,
         call_id="call-read-only",
         token_details=TokenDetails(input_tokens=10, output_tokens=5),
@@ -98,12 +98,12 @@ def test_sync_budget_read_only_errors_log_configuration_once_and_fail_open(
     ):
         first = enforcer.check_budget(
             estimated_input_tokens=10,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
         )
         second = enforcer.check_budget(
             estimated_input_tokens=10,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
         )
 
@@ -135,7 +135,7 @@ async def test_async_budget_read_only_errors_log_configuration_once_and_fail_ope
     with caplog.at_level("WARNING"):
         result = await enforcer.check_budget(
             estimated_input_tokens=10,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
         )
 

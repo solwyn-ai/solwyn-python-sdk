@@ -18,7 +18,7 @@ from solwyn._types import MetadataEvent, ProviderName
 def _make_event(**overrides: object) -> MetadataEvent:
     """Create a MetadataEvent with sensible test defaults."""
     defaults: dict[str, object] = {
-        "model": "gpt-4o",
+        "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
         "input_tokens": 100,
         "output_tokens": 50,

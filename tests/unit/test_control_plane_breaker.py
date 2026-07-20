@@ -83,13 +83,13 @@ def _make_enforcer(
 
 
 def _check(enforcer: BudgetEnforcer):
-    return enforcer.check_budget(estimated_input_tokens=10, model="gpt-4o", provider="openai")
+    return enforcer.check_budget(estimated_input_tokens=10, model="gpt-5.5", provider="openai")
 
 
 def _confirm() -> BudgetConfirmRequest:
     return BudgetConfirmRequest(
         reservation_id="res-cp",
-        model="gpt-4o",
+        model="gpt-5.5",
         provider=ProviderName.OPENAI,
         call_id="call-cp",
         token_details=TokenDetails(input_tokens=10, output_tokens=5),

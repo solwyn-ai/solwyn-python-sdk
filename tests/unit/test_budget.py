@@ -76,10 +76,10 @@ class TestBudgetEnforcerBase:
             api_url="https://api.test.solwyn.ai",
             api_key=VALID_API_KEY,
         )
-        req = base._build_check_request(500, "gpt-4o", "openai")
+        req = base._build_check_request(500, "gpt-5.5", "openai")
         assert not hasattr(req, "project_id")
         assert req.estimated_input_tokens == 500
-        assert req.model == "gpt-4o"
+        assert req.model == "gpt-5.5"
         assert req.provider == "openai"
         assert req.failover_directive_version == "1"
         assert req.model_dump(mode="json")["failover_directive_version"] == "1"
@@ -92,7 +92,7 @@ class TestBudgetEnforcerBase:
 
         req = base._build_check_request(
             500,
-            "gpt-4o",
+            "gpt-5.5",
             "openai",
             agent_run_id="run_abc",
         )
@@ -200,7 +200,7 @@ class TestCloudAllow:
 
         with patch.object(enforcer._http, "post", return_value=mock_response):
             result = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert result.allowed is True
@@ -220,7 +220,7 @@ class TestCloudAllow:
 
         with patch.object(enforcer._http, "post", return_value=mock_response):
             result = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert result.price_hints == {"openai": 10.0, "anthropic": 2.0}
@@ -243,7 +243,7 @@ class TestCloudDenyHard:
 
         with patch.object(enforcer._http, "post", return_value=mock_response):
             result = enforcer.check_budget(
-                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
             )
 
         assert result.allowed is False
@@ -268,7 +268,7 @@ class TestCloudDenyAlertOnly:
 
         with patch.object(enforcer._http, "post", return_value=mock_response):
             result = enforcer.check_budget(
-                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
             )
 
         assert result.allowed is True
@@ -290,7 +290,7 @@ class TestFailOpen:
 
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
             result = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert result.allowed is True
@@ -309,10 +309,10 @@ class TestFailOpen:
             side_effect=[mock_response, httpx.ConnectError("unreachable")],
         ) as mock_post:
             denied = enforcer.check_budget(
-                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
             )
             result = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert denied.allowed is False
@@ -339,9 +339,9 @@ class TestFailOpen:
             ),
             caplog.at_level("WARNING", logger="solwyn.budget"),
         ):
-            enforcer.check_budget(estimated_input_tokens=50000, model="gpt-4o", provider="openai")
+            enforcer.check_budget(estimated_input_tokens=50000, model="gpt-5.5", provider="openai")
             result = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert result.allowed is False
@@ -369,10 +369,10 @@ class TestFailOpen:
             side_effect=[mock_response, httpx.ConnectError("unreachable")],
         ):
             denied = enforcer.check_budget(
-                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
             )
             result = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert denied.allowed is False
@@ -396,10 +396,10 @@ class TestFailOpen:
             side_effect=[mock_response, httpx.ConnectError("unreachable")],
         ):
             denied = enforcer.check_budget(
-                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
             )
             result = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert denied.allowed is True
@@ -429,13 +429,13 @@ class TestFailOpen:
             ],
         ):
             denied = enforcer.check_budget(
-                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
             )
             allowed = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
             outage = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert denied.allowed is False
@@ -456,10 +456,10 @@ class TestFailOpen:
             side_effect=[mock_response, httpx.ConnectError("unreachable")],
         ):
             denied = enforcer.check_budget(
-                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
             )
             result = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert denied.allowed is False
@@ -485,7 +485,7 @@ class TestLocalEnforcement:
 
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
             result = enforcer.check_budget(
-                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
             )
 
         assert result.allowed is False
@@ -510,12 +510,12 @@ class TestLocalEnforcement:
         }
         mock_response.raise_for_status = MagicMock()
         with patch.object(enforcer._http, "post", return_value=mock_response):
-            enforcer.check_budget(estimated_input_tokens=500, model="gpt-4o", provider="openai")
+            enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
 
         # Phase 2: Cloud goes offline
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
             result = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert result.allowed is True
@@ -540,7 +540,7 @@ class TestLocalEnforcement:
         }
         mock_response.raise_for_status = MagicMock()
         with patch.object(enforcer._http, "post", return_value=mock_response):
-            enforcer.check_budget(estimated_input_tokens=500, model="gpt-4o", provider="openai")
+            enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
 
         # Fill local budget past the $100 limit (directly via _track_local_cost)
         for _ in range(10):
@@ -549,7 +549,7 @@ class TestLocalEnforcement:
         # Phase 2: Cloud goes offline
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
             result = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert result.allowed is False
@@ -575,13 +575,13 @@ class TestCacheBehaviour:
         with patch.object(enforcer._http, "post", return_value=mock_response) as mock_post:
             # First call populates cache
             result1 = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
             assert result1.allowed is True
 
             # Second call should use cache
             result2 = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
             assert result2.allowed is True
 
@@ -595,8 +595,8 @@ class TestCacheBehaviour:
         mock_response.raise_for_status = MagicMock()
 
         with patch.object(enforcer._http, "post", return_value=mock_response) as mock_post:
-            enforcer.check_budget(estimated_input_tokens=500, model="gpt-4o", provider="openai")
-            enforcer.check_budget(estimated_input_tokens=500, model="gpt-4o", provider="openai")
+            enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
+            enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
 
             # Both calls should hit HTTP (deny is never cached)
             assert mock_post.call_count == 2
@@ -617,21 +617,21 @@ class TestScopedCacheAndStickyDenials:
             "post",
             side_effect=[global_allow, run_a_allow, run_b_allow],
         ) as mock_post:
-            enforcer.check_budget(estimated_input_tokens=500, model="gpt-4o", provider="openai")
+            enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
             enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_a",
             )
             enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_b",
             )
             unscoped = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert mock_post.call_count == 3
@@ -655,19 +655,19 @@ class TestScopedCacheAndStickyDenials:
         ):
             denied_a = enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_a",
             )
             outage_b = enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_b",
             )
             outage_a = enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_a",
             )
@@ -692,18 +692,18 @@ class TestScopedCacheAndStickyDenials:
         ):
             project_denied = enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
             )
             run_a_denied = enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_a",
             )
             outage_b = enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_b",
             )
@@ -730,31 +730,31 @@ class TestScopedCacheAndStickyDenials:
         ):
             enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_a",
             )
             enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_b",
             )
             enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_a",
             )
             outage_a = enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_a",
             )
             outage_b = enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_b",
             )
@@ -775,13 +775,13 @@ class TestScopedCacheAndStickyDenials:
         ):
             denied = enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_a",
             )
             outage_b = enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_b",
             )
@@ -803,19 +803,19 @@ class TestScopedCacheAndStickyDenials:
         ):
             hard_denied = enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_a",
             )
             alert_only = enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_a",
             )
             outage = enforcer.check_budget(
                 estimated_input_tokens=500,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider="openai",
                 agent_run_id="run_a",
             )

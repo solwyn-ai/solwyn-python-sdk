@@ -29,7 +29,7 @@ from solwyn.reporter import (
 def _make_event(**overrides) -> MetadataEvent:
     """Create a MetadataEvent with sensible test defaults."""
     defaults = {
-        "model": "gpt-4o",
+        "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
         "input_tokens": 100,
         "output_tokens": 50,
@@ -47,7 +47,7 @@ def _make_event(**overrides) -> MetadataEvent:
 def _make_confirm_request(**overrides) -> BudgetConfirmRequest:
     defaults = {
         "reservation_id": "res_123",
-        "model": "gpt-4o",
+        "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
         "call_id": "call_sync_confirm",
         "token_details": TokenDetails(input_tokens=10, output_tokens=5),
@@ -509,7 +509,7 @@ class TestIngestRejectionLogging:
             "rejected": [
                 _rejection(0, code="unknown_model", model="vendor-x-1"),
                 _rejection(2, code="unknown_model", model="vendor-x-1"),
-                _rejection(4, code="unknown_service_tier", model="gpt-4o"),
+                _rejection(4, code="unknown_service_tier", model="gpt-5.5"),
             ],
         }
 
@@ -528,7 +528,7 @@ class TestIngestRejectionLogging:
         assert len(rejection_logs) == 2
         assert any("code=unknown_model model=vendor-x-1 count=2" in line for line in rejection_logs)
         assert any(
-            "code=unknown_service_tier model=gpt-4o count=1" in line for line in rejection_logs
+            "code=unknown_service_tier model=gpt-5.5 count=1" in line for line in rejection_logs
         )
         reporter._http.close()
 

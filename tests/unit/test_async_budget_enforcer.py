@@ -77,7 +77,7 @@ class TestAsyncCloudAllow:
         mock_response.raise_for_status = MagicMock()
         enforcer._http.post = AsyncMock(return_value=mock_response)
         result = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert result.allowed is True
@@ -106,7 +106,7 @@ class TestAsyncCloudDenyHard:
         mock_response.raise_for_status = MagicMock()
         enforcer._http.post = AsyncMock(return_value=mock_response)
         result = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
 
         assert result.allowed is False
@@ -133,7 +133,7 @@ class TestAsyncCloudDenyAlertOnly:
         mock_response.raise_for_status = MagicMock()
         enforcer._http.post = AsyncMock(return_value=mock_response)
         result = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
 
         assert result.allowed is True
@@ -158,7 +158,7 @@ class TestAsyncFailOpen:
 
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
             result = await enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert result.allowed is True
@@ -184,21 +184,21 @@ class TestAsyncScopedCacheAndStickyDenials:
             ]
         )
 
-        await enforcer.check_budget(estimated_input_tokens=500, model="gpt-4o", provider="openai")
+        await enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
         await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
         await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_b",
         )
         unscoped = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert enforcer._http.post.call_count == 3
@@ -222,19 +222,19 @@ class TestAsyncScopedCacheAndStickyDenials:
 
         denied_a = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
         outage_b = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_b",
         )
         outage_a = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
@@ -259,18 +259,18 @@ class TestAsyncScopedCacheAndStickyDenials:
 
         project_denied = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
         )
         run_a_denied = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
         outage_b = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_b",
         )
@@ -297,19 +297,19 @@ class TestAsyncScopedCacheAndStickyDenials:
 
         hard_denied = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
         alert_only = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
         outage = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
@@ -333,13 +333,13 @@ class TestAsyncScopedCacheAndStickyDenials:
 
         denied = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
         outage_b = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_b",
         )
@@ -365,10 +365,10 @@ class TestAsyncFailOpenSticky:
         )
 
         denied = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
         result = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert denied.allowed is False
@@ -395,10 +395,10 @@ class TestAsyncFailOpenSticky:
 
         with caplog.at_level("WARNING", logger="solwyn.budget"):
             await enforcer.check_budget(
-                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
             )
             result = await enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert result.allowed is False
@@ -427,10 +427,10 @@ class TestAsyncFailOpenSticky:
         )
 
         denied = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
         result = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert denied.allowed is False
@@ -455,10 +455,10 @@ class TestAsyncFailOpenSticky:
         )
 
         denied = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
         result = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert denied.allowed is True
@@ -491,13 +491,13 @@ class TestAsyncFailOpenSticky:
         )
 
         denied = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
         allowed = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
         outage = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert denied.allowed is False
@@ -521,10 +521,10 @@ class TestAsyncFailOpenSticky:
         )
 
         denied = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
         result = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert denied.allowed is False

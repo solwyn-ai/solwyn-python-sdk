@@ -20,7 +20,7 @@ class TestAsyncBudgetCheck:
     ) -> None:
         result = await async_budget_enforcer.check_budget(
             estimated_input_tokens=100,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
         )
         assert result.allowed is True
@@ -41,7 +41,7 @@ class TestAsyncBudgetConfirm:
     ) -> None:
         result = await async_budget_enforcer.check_budget(
             estimated_input_tokens=100,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
         )
         assert result.reservation_id is not None
@@ -49,7 +49,7 @@ class TestAsyncBudgetConfirm:
         # Build sans-I/O on the enforcer, settle via the reporter — should not raise.
         confirm = async_budget_enforcer.build_confirm_request(
             reservation_id=result.reservation_id,
-            model="gpt-4o",
+            model="gpt-5.5",
             token_details=SAMPLE_TOKEN_DETAILS,
             provider="openai",
             call_id="call_async_integration_confirm_valid",
@@ -66,7 +66,7 @@ class TestAsyncBudgetConfirm:
         """Async settlement is best-effort — a bad reservation logs, doesn't raise."""
         confirm = async_budget_enforcer.build_confirm_request(
             reservation_id="res_nonexistent_000",
-            model="gpt-4o",
+            model="gpt-5.5",
             token_details=SAMPLE_TOKEN_DETAILS,
             provider="openai",
             call_id="call_async_integration_confirm_invalid",
