@@ -67,9 +67,10 @@ class CircuitBreaker:
     def __init__(
         self,
         failure_threshold: int = 3,
-        recovery_timeout: int = 60,
+        recovery_timeout: float = 60,
         success_threshold: int = 2,
         recovery_timeout_jitter: float = 0.0,
+        name: str = "provider",
     ) -> None:
         """Initialise circuit breaker.
 
@@ -82,11 +83,14 @@ class CircuitBreaker:
                 recovery window of ``recovery_timeout * (1 +
                 uniform(-jitter, +jitter))``. ``0.0`` (default) keeps the window
                 exactly ``recovery_timeout`` — deterministic.
+            name: Label distinguishing this breaker's health domain in logs
+                (e.g. ``"control-plane"`` vs a provider breaker).
         """
         self.failure_threshold = failure_threshold
         self.recovery_timeout = recovery_timeout
         self.success_threshold = success_threshold
         self.recovery_timeout_jitter = recovery_timeout_jitter
+        self.name = name
 
         # Authoritative in-process state
         self.state = CircuitState.CLOSED
@@ -270,7 +274,7 @@ class CircuitBreaker:
         self._half_open_probe_active = False
         self._half_open_probe_token = None
         self._effective_recovery_timeout = self._sample_recovery_window()
-        logger.warning("Circuit breaker opened due to failures")
+        logger.warning("Circuit breaker [%s] opened due to failures", self.name)
 
     def _transition_to_closed(self) -> None:
         """Transition to CLOSED state."""
@@ -281,7 +285,7 @@ class CircuitBreaker:
         # A fresh CLOSED episode starts with no probe in flight.
         self._half_open_probe_active = False
         self._half_open_probe_token = None
-        logger.info("Circuit breaker closed, provider recovered")
+        logger.info("Circuit breaker [%s] closed, recovered", self.name)
 
     def _transition_to_half_open(self) -> None:
         """Transition to HALF_OPEN state."""
@@ -289,4 +293,4 @@ class CircuitBreaker:
         self.last_state_change = time.monotonic()
         self.success_count = 0
         self.failure_count = 0
-        logger.info("Circuit breaker half-open, testing recovery")
+        logger.info("Circuit breaker [%s] half-open, testing recovery", self.name)

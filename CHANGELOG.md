@@ -9,6 +9,34 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **Non-streaming settlement moved off the caller's hot path.** Sync and async
+  chat completions and the whole media lifecycle (embeddings, images, audio,
+  video) previously settled a reservation with a BLOCKING `confirm_cost` POST on
+  the caller's thread AFTER the provider had already answered — the response was
+  withheld until Solwyn's `/budgets/confirm` round-trip returned. Settlement now
+  builds the confirm sans-I/O via `build_confirm_request` and enqueues it with
+  its metadata event as one ordered item through
+  `reporter.report_settlement(confirm, event)` — the exact path streaming
+  `on_complete` already used. The caller gets the provider response without
+  waiting on any Solwyn round-trip.
+- **`BudgetEnforcer.confirm_cost` / `AsyncBudgetEnforcer.confirm_cost` are
+  removed** (pre-launch, breaking). The reporter owns settlement delivery via
+  `_send_confirm`, and it already carries the consecutive-confirm-failure
+  ERROR-escalation convention (after 10 consecutive failures, logs at ERROR).
+- **A shared control-plane circuit breaker discovers a Solwyn outage once, not
+  once per call.** One `CircuitBreaker(name="control-plane")` per client guards
+  BOTH the `/budgets/check` POST (budget enforcer) and the `/budgets/confirm`
+  POST (reporter). A streak of consecutive failures against Solwyn's own API
+  opens the breaker so the next check/confirm short-circuits — applying the
+  configured posture (fail-open / local enforcement) or dropping the confirm
+  instantly — instead of paying the per-request timeout again. A read-only-key
+  response means Solwyn RESPONDED, so it records success; the control-plane
+  breaker is never a provider breaker (excluded from breaker reports).
+- **The budget pre-flight timeout dropped to 1.0s by default.** The
+  `/budgets/check` POST gates the caller's hot path, so its per-request timeout
+  is now a short `budget_check_timeout=1.0` (was 5s); the control-plane breaker
+  caps repeated discovery of an outage.
+
 - **The async reporter auto-starts its flush loop on first enqueue.** The sync
   `MetadataReporter` is live from construction (its daemon flush thread starts in
   `__init__`), but `AsyncMetadataReporter` previously flushed only after an
@@ -24,6 +52,19 @@ derived from git tags (hatch-vcs).
   the shutdown event), and `start()` after `close()` raises `RuntimeError` —
   restarting a closed reporter is a programming error. Enqueue after `close()`
   is silently dropped, matching the sync reporter.
+
+### Added
+
+- **New config knobs (with `SOLWYN_*` env vars):**
+  `budget_check_timeout` (`SOLWYN_BUDGET_CHECK_TIMEOUT`, default `1.0`),
+  `control_plane_failure_threshold`
+  (`SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD`, default `3`), and
+  `control_plane_recovery_timeout`
+  (`SOLWYN_CONTROL_PLANE_RECOVERY_TIMEOUT`, default `30.0`).
+- **`CircuitBreaker` gained a `name` label** (default `"provider"`) that
+  distinguishes health domains in the transition log lines
+  (e.g. `Circuit breaker [control-plane] opened due to failures`).
+
 ### Fixed
 
 - **Breaker-report writes now recognize read-only keys.** The breaker-report

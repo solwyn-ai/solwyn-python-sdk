@@ -62,6 +62,18 @@ class SolwynConfig(BaseModel):
     # Budget check cache
     budget_check_cache_ttl: int = 5
 
+    # Budget pre-flight: per-request timeout for the /budgets/check POST.
+    # Deliberately short — the check gates the caller's hot path; the breaker
+    # below caps repeated discovery of a control-plane outage.
+    budget_check_timeout: float = 1.0
+
+    # Control-plane breaker: after this many consecutive check/confirm
+    # failures against Solwyn's own API, skip the network call and apply the
+    # configured posture (fail_open / local enforcement) instantly for
+    # control_plane_recovery_timeout seconds.
+    control_plane_failure_threshold: int = 3
+    control_plane_recovery_timeout: float = 30.0
+
     # Reporter tuning
     reporter_batch_size: int = 50
     reporter_flush_interval: float = 5.0
@@ -84,6 +96,9 @@ class SolwynConfig(BaseModel):
             "circuit_breaker_recovery_timeout": "CIRCUIT_BREAKER_RECOVERY_TIMEOUT",
             "circuit_breaker_success_threshold": "CIRCUIT_BREAKER_SUCCESS_THRESHOLD",
             "budget_check_cache_ttl": "BUDGET_CHECK_CACHE_TTL",
+            "budget_check_timeout": "BUDGET_CHECK_TIMEOUT",
+            "control_plane_failure_threshold": "CONTROL_PLANE_FAILURE_THRESHOLD",
+            "control_plane_recovery_timeout": "CONTROL_PLANE_RECOVERY_TIMEOUT",
             "reporter_batch_size": "REPORTER_BATCH_SIZE",
             "reporter_flush_interval": "REPORTER_FLUSH_INTERVAL",
             "reporter_max_queue_size": "REPORTER_MAX_QUEUE_SIZE",

@@ -32,6 +32,7 @@ from solwyn._types import (
     ProviderName,
     ServiceTier,
 )
+from solwyn.circuit_breaker import CircuitBreaker
 
 # Fallback per-token cost when cloud API is unreachable.
 DEFAULT_COST_PER_TOKEN: float = 0.00003
@@ -81,12 +82,17 @@ class _BudgetEnforcerBase:
         budget_mode: BudgetMode = BudgetMode.ALERT_ONLY,
         fail_open: bool = True,
         cache_ttl: int = 5,
+        control_plane_breaker: CircuitBreaker | None = None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
         self.budget_mode = budget_mode
         self.fail_open = fail_open
         self.cache_ttl = cache_ttl
+        # Shared with the reporter: a streak of control-plane failures opens
+        # this breaker so the check skips the network call and applies the
+        # unreachable posture instantly (thread-safe; None = no breaker).
+        self._control_plane_breaker = control_plane_breaker
 
         # Protects all mutable instance state from concurrent access.
         # The async subclass inherits this lock via base-class methods but
@@ -237,6 +243,17 @@ class _BudgetEnforcerBase:
             budget_limit=response.budget_limit,
             current_usage=response.current_usage,
         )
+
+    def _build_unreachable_result(
+        self, estimated_input_tokens: int, agent_run_id: str | None
+    ) -> BudgetCheckResult:
+        """Posture when the control plane is unreachable (or breaker-open)."""
+        prior_hard_deny = self._build_prior_hard_deny_unavailable_result(agent_run_id)
+        if prior_hard_deny is not None:
+            return prior_hard_deny
+        if self.fail_open:
+            return self._build_fail_open_result(estimated_input_tokens)
+        return self._build_local_enforcement_result(estimated_input_tokens)
 
     def _track_local_cost(self, cost: float) -> None:
         """Track a cost in the local fallback dict."""
@@ -463,6 +480,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         budget_mode: BudgetMode = BudgetMode.ALERT_ONLY,
         fail_open: bool = True,
         cache_ttl: int = 5,
+        control_plane_breaker: CircuitBreaker | None = None,
     ) -> None:
         super().__init__(
             api_url=api_url,
@@ -470,10 +488,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             budget_mode=budget_mode,
             fail_open=fail_open,
             cache_ttl=cache_ttl,
+            control_plane_breaker=control_plane_breaker,
         )
         self._http = httpx.Client(timeout=5.0)
-        self._consecutive_confirm_failures = 0
-        self._confirm_failure_threshold = 10
 
     def check_budget(
         self,
@@ -526,6 +543,14 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                         current_usage=cached.current_usage,
                     )
 
+        breaker = self._control_plane_breaker
+        admission = breaker.admit() if breaker is not None else None
+        if admission is not None and not admission.allowed:
+            # Negative cache: a recent streak of control-plane failures means
+            # the posture applies instantly instead of paying the timeout.
+            logger.debug("budget.check_skipped_breaker_open")
+            return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
+
         request = self._build_check_request(
             estimated_input_tokens,
             model,
@@ -555,85 +580,24 @@ class BudgetEnforcer(_BudgetEnforcerBase):
 
             cloud_response = BudgetCheckResponse.model_validate(resp.json())
             self._cache_response(cloud_response, agent_run_id=agent_run_id)
+            if breaker is not None:
+                breaker.record_success()
             return self._build_result_from_response(cloud_response)
 
         except Exception as exc:
-            # Log the exception TYPE only — symmetric with confirm_cost and
-            # defense-in-depth: never interpolate the full exception (which could
-            # carry response/body text) into the log.
-            if not handle_read_only_key_error(exc):
+            # A read-only-key error means the control plane RESPONDED — record
+            # success. Anything else is an outage: record failure. Log the
+            # exception TYPE only (never interpolate a body that could carry
+            # response text).
+            if handle_read_only_key_error(exc):
+                if breaker is not None:
+                    breaker.record_success()
+            else:
+                if breaker is not None:
+                    breaker.record_failure()
                 logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
 
-            prior_hard_deny = self._build_prior_hard_deny_unavailable_result(agent_run_id)
-            if prior_hard_deny is not None:
-                return prior_hard_deny
-
-            if self.fail_open:
-                return self._build_fail_open_result(estimated_input_tokens)
-            else:
-                return self._build_local_enforcement_result(estimated_input_tokens)
-
-    def confirm_cost(
-        self,
-        reservation_id: str,
-        model: str,
-        token_details: TokenDetails,
-        *,
-        provider: str,
-        is_provider_fallback: bool = False,
-        call_id: str,
-        provider_region: str | None = None,
-        service_tier: str | None = None,
-        modality: Modality = "text",
-        media_usage: MediaUsage | None = None,
-    ) -> None:
-        """Confirm actual token usage for a budget reservation.
-
-        ``provider`` is the provider that actually served the call (required).
-        ``call_id`` is the required per-call reconciliation join key.
-
-        Best-effort: failures are logged but do not raise.
-        Tracks consecutive failures; after _confirm_failure_threshold consecutive
-        failures, logs at ERROR level so operators can see a persistent problem.
-        """
-        try:
-            request = self.build_confirm_request(
-                reservation_id,
-                model,
-                token_details,
-                provider=provider,
-                is_provider_fallback=is_provider_fallback,
-                call_id=call_id,
-                provider_region=provider_region,
-                service_tier=service_tier,
-                modality=modality,
-                media_usage=media_usage,
-            )
-            resp = self._http.post(
-                f"{self.api_url}/api/v1/budgets/confirm",
-                json=request.model_dump(mode="json"),
-                headers=self._auth_headers(),
-            )
-            resp.raise_for_status()
-            with self._state_lock:
-                self._consecutive_confirm_failures = 0
-        except Exception as exc:
-            if handle_read_only_key_error(exc):
-                return
-            with self._state_lock:
-                self._consecutive_confirm_failures += 1
-                count = self._consecutive_confirm_failures
-            if count >= self._confirm_failure_threshold:
-                logger.error(
-                    "budget.confirm_cost_persistent_failure: exc_type=%s consecutive_failures=%d",
-                    type(exc).__name__,
-                    count,
-                )
-            else:
-                logger.warning(
-                    "budget.confirm_cost_failed: exc_type=%s",
-                    type(exc).__name__,
-                )
+            return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -653,6 +617,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         budget_mode: BudgetMode = BudgetMode.ALERT_ONLY,
         fail_open: bool = True,
         cache_ttl: int = 5,
+        control_plane_breaker: CircuitBreaker | None = None,
     ) -> None:
         super().__init__(
             api_url=api_url,
@@ -660,10 +625,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             budget_mode=budget_mode,
             fail_open=fail_open,
             cache_ttl=cache_ttl,
+            control_plane_breaker=control_plane_breaker,
         )
         self._http = httpx.AsyncClient(timeout=5.0)
-        self._consecutive_confirm_failures = 0
-        self._confirm_failure_threshold = 10
 
     async def check_budget(
         self,
@@ -693,6 +657,14 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 current_usage=cached.current_usage,
             )
 
+        breaker = self._control_plane_breaker
+        admission = breaker.admit() if breaker is not None else None
+        if admission is not None and not admission.allowed:
+            # Negative cache: a recent streak of control-plane failures means
+            # the posture applies instantly instead of paying the timeout.
+            logger.debug("budget.check_skipped_breaker_open")
+            return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
+
         request = self._build_check_request(
             estimated_input_tokens,
             model,
@@ -722,75 +694,24 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
 
             cloud_response = BudgetCheckResponse.model_validate(resp.json())
             self._cache_response(cloud_response, agent_run_id=agent_run_id)
+            if breaker is not None:
+                breaker.record_success()
             return self._build_result_from_response(cloud_response)
 
         except Exception as exc:
-            # Log the exception TYPE only — symmetric with confirm_cost and
-            # defense-in-depth: never interpolate the full exception (which could
-            # carry response/body text) into the log.
-            if not handle_read_only_key_error(exc):
+            # A read-only-key error means the control plane RESPONDED — record
+            # success. Anything else is an outage: record failure. Log the
+            # exception TYPE only (never interpolate a body that could carry
+            # response text).
+            if handle_read_only_key_error(exc):
+                if breaker is not None:
+                    breaker.record_success()
+            else:
+                if breaker is not None:
+                    breaker.record_failure()
                 logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
 
-            prior_hard_deny = self._build_prior_hard_deny_unavailable_result(agent_run_id)
-            if prior_hard_deny is not None:
-                return prior_hard_deny
-
-            if self.fail_open:
-                return self._build_fail_open_result(estimated_input_tokens)
-            else:
-                return self._build_local_enforcement_result(estimated_input_tokens)
-
-    async def confirm_cost(
-        self,
-        reservation_id: str,
-        model: str,
-        token_details: TokenDetails,
-        *,
-        provider: str,
-        is_provider_fallback: bool = False,
-        call_id: str,
-        provider_region: str | None = None,
-        service_tier: str | None = None,
-        modality: Modality = "text",
-        media_usage: MediaUsage | None = None,
-    ) -> None:
-        """Async version of cost confirmation. See BudgetEnforcer.confirm_cost."""
-        try:
-            request = self.build_confirm_request(
-                reservation_id,
-                model,
-                token_details,
-                provider=provider,
-                is_provider_fallback=is_provider_fallback,
-                call_id=call_id,
-                provider_region=provider_region,
-                service_tier=service_tier,
-                modality=modality,
-                media_usage=media_usage,
-            )
-            resp = await self._http.post(
-                f"{self.api_url}/api/v1/budgets/confirm",
-                json=request.model_dump(mode="json"),
-                headers=self._auth_headers(),
-            )
-            resp.raise_for_status()
-            self._consecutive_confirm_failures = 0
-        except Exception as exc:
-            if handle_read_only_key_error(exc):
-                return
-            self._consecutive_confirm_failures += 1
-            count = self._consecutive_confirm_failures
-            if count >= self._confirm_failure_threshold:
-                logger.error(
-                    "budget.confirm_cost_persistent_failure: exc_type=%s consecutive_failures=%d",
-                    type(exc).__name__,
-                    count,
-                )
-            else:
-                logger.warning(
-                    "budget.confirm_cost_failed: exc_type=%s",
-                    type(exc).__name__,
-                )
+            return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
 
     async def close(self) -> None:
         """Close the underlying async HTTP client."""

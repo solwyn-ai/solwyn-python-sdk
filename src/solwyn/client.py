@@ -85,7 +85,6 @@ logger = logging.getLogger(__name__)
 # Floor for a per-hop dispatch timeout: even when the chain deadline is nearly
 # spent we give a hop at least this long rather than passing it ~0s.
 _MIN_HOP_TIMEOUT = 1.0
-_BUDGET_CHECK_TIMEOUT = 5.0
 _SOURCE_COMPATIBLE_DEFAULT_KEYS = {
     ProviderName.OPENAI.value: frozenset(
         {
@@ -169,9 +168,9 @@ def _source_compatible_defaults(dialect: str, params: dict[str, Any]) -> dict[st
     return {key: value for key, value in params.items() if key in allowed}
 
 
-def _budget_timeout(deadline: Deadline) -> float:
+def _budget_timeout(deadline: Deadline, check_timeout: float) -> float:
     """Timeout for the budget pre-flight, clamped by the chain deadline."""
-    return max(0.001, min(_BUDGET_CHECK_TIMEOUT, deadline.remaining()))
+    return max(0.001, min(check_timeout, deadline.remaining()))
 
 
 def _hop_timeout(deadline: Deadline, remaining_candidates: int) -> float:
@@ -611,6 +610,7 @@ class Solwyn(_SolwynBase):
             budget_mode=config.budget_mode,
             fail_open=config.fail_open,
             cache_ttl=config.budget_check_cache_ttl,
+            control_plane_breaker=self._control_plane_breaker,
         )
 
         # Metadata reporter
@@ -624,6 +624,7 @@ class Solwyn(_SolwynBase):
             breaker_snapshots=self._get_breaker_snapshots,
             sdk_instance_id=self._sdk_instance_id,
             breaker_reporting_enabled=config.breaker_reporting_enabled,
+            control_plane_breaker=self._control_plane_breaker,
         )
 
     @functools.cached_property
@@ -844,7 +845,7 @@ class Solwyn(_SolwynBase):
             estimated_input_tokens=est_in,
             model=requested_model,
             provider=provider,
-            timeout=_budget_timeout(deadline),
+            timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
             modality=spec.modality,
             estimated_media=estimated_media,
             agent_run_id=agent_run[0],
@@ -934,12 +935,18 @@ class Solwyn(_SolwynBase):
         #    Confirm fires when EITHER basis is observable; skipped only when both
         #    are None (never settle a real $0 price). When only media is observed,
         #    a zeroed TokenDetails carries the confirm's required token field.
+        # Settle OFF the hot path: build the confirm sans-I/O and enqueue it
+        # with the metadata event as one ordered settlement (same path as chat
+        # + streaming). Confirm fires when EITHER basis is observable; skipped
+        # only when both are None. When only media is observed, a zeroed
+        # TokenDetails carries the confirm's required token field.
         service_tier = runtime.adapter.extract_service_tier(response)
+        confirm = None
         if budget.reservation_id and (token_details is not None or media_usage is not None):
-            self._budget.confirm_cost(
-                budget.reservation_id,
-                requested_model,
-                token_details if token_details is not None else TokenDetails(),
+            confirm = self._budget.build_confirm_request(
+                reservation_id=budget.reservation_id,
+                model=requested_model,
+                token_details=token_details if token_details is not None else TokenDetails(),
                 provider=provider,
                 is_provider_fallback=False,
                 call_id=call_id,
@@ -948,25 +955,27 @@ class Solwyn(_SolwynBase):
                 modality=spec.modality,
                 media_usage=media_usage,
             )
-        self._reporter.report(
-            self._build_metadata_event(
-                model=requested_model,
-                provider=provider,
-                input_tokens=token_details.input_tokens if token_details is not None else 0,
-                output_tokens=token_details.output_tokens if token_details is not None else 0,
-                token_details=token_details,
-                latency_ms=latency_ms,
-                status=CallStatus.SUCCESS,
-                is_model_fallback=False,
-                attempt_index=0,
-                call_id=call_id,
-                service_tier=service_tier,
-                agent_run=agent_run,
-                provider_region=provider_region,
-                modality=spec.modality,
-                media_usage=media_usage,
-            )
+        event = self._build_metadata_event(
+            model=requested_model,
+            provider=provider,
+            input_tokens=token_details.input_tokens if token_details is not None else 0,
+            output_tokens=token_details.output_tokens if token_details is not None else 0,
+            token_details=token_details,
+            latency_ms=latency_ms,
+            status=CallStatus.SUCCESS,
+            is_model_fallback=False,
+            attempt_index=0,
+            call_id=call_id,
+            service_tier=service_tier,
+            agent_run=agent_run,
+            provider_region=provider_region,
+            modality=spec.modality,
+            media_usage=media_usage,
         )
+        if confirm is not None:
+            self._reporter.report_settlement(confirm, event)
+        else:
+            self._reporter.report(event)
         return response
 
     def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
@@ -997,7 +1006,7 @@ class Solwyn(_SolwynBase):
             provider=primary.adapter.name,
             fallback_providers=[r.entry.provider.value for r in self._runtimes[1:]],
             fallback_models=[r.entry.model for r in self._runtimes[1:]],
-            timeout=_budget_timeout(deadline),
+            timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
             agent_run_id=agent_run[0],
         )
         effective_total = self._apply_failover_tuning_directive(
@@ -1308,42 +1317,49 @@ class Solwyn(_SolwynBase):
                     requested=primary.adapter.dialect,
                     response=response,
                 )
+            # Settle OFF the hot path: build the confirm sans-I/O and enqueue
+            # it with the metadata event as one ordered settlement — the same
+            # path streaming on_complete uses. The caller gets the provider
+            # response without waiting on a Solwyn round-trip.
+            confirm = None
             if budget.reservation_id:
-                self._budget.confirm_cost(
-                    budget.reservation_id,
-                    served_model,
-                    token_details,
-                    provider=provider,
-                    is_provider_fallback=is_provider_fallback,
-                    call_id=call_id,
-                    provider_region=provider_region,
-                    service_tier=service_tier,
-                )
-            self._reporter.report(
-                self._build_metadata_event(
+                confirm = self._budget.build_confirm_request(
+                    reservation_id=budget.reservation_id,
                     model=served_model,
-                    provider=provider,
-                    input_tokens=token_details.input_tokens,
-                    output_tokens=token_details.output_tokens,
                     token_details=token_details,
-                    latency_ms=ctx.elapsed_ms(),
-                    status=CallStatus.SUCCESS,
-                    is_model_fallback=is_model_fallback,
+                    provider=provider,
                     is_provider_fallback=is_provider_fallback,
-                    requested_provider=primary.entry.provider if is_provider_fallback else None,
-                    requested_model=requested_model if is_provider_fallback else None,
-                    failover_reason=_success_failover_reason(
-                        is_provider_fallback=is_provider_fallback,
-                        is_model_fallback=is_model_fallback,
-                        primary_errored=primary_errored,
-                    ),
-                    attempt_index=chain_index,
                     call_id=call_id,
-                    service_tier=service_tier,
-                    agent_run=agent_run,
                     provider_region=provider_region,
+                    service_tier=service_tier,
                 )
+            event = self._build_metadata_event(
+                model=served_model,
+                provider=provider,
+                input_tokens=token_details.input_tokens,
+                output_tokens=token_details.output_tokens,
+                token_details=token_details,
+                latency_ms=ctx.elapsed_ms(),
+                status=CallStatus.SUCCESS,
+                is_model_fallback=is_model_fallback,
+                is_provider_fallback=is_provider_fallback,
+                requested_provider=primary.entry.provider if is_provider_fallback else None,
+                requested_model=requested_model if is_provider_fallback else None,
+                failover_reason=_success_failover_reason(
+                    is_provider_fallback=is_provider_fallback,
+                    is_model_fallback=is_model_fallback,
+                    primary_errored=primary_errored,
+                ),
+                attempt_index=chain_index,
+                call_id=call_id,
+                service_tier=service_tier,
+                agent_run=agent_run,
+                provider_region=provider_region,
             )
+            if confirm is not None:
+                self._reporter.report_settlement(confirm, event)
+            else:
+                self._reporter.report(event)
             return result
 
         if last_exc is not None:
@@ -1575,6 +1591,7 @@ class AsyncSolwyn(_SolwynBase):
             budget_mode=config.budget_mode,
             fail_open=config.fail_open,
             cache_ttl=config.budget_check_cache_ttl,
+            control_plane_breaker=self._control_plane_breaker,
         )
 
         self._reporter = AsyncMetadataReporter(
@@ -1587,6 +1604,7 @@ class AsyncSolwyn(_SolwynBase):
             breaker_snapshots=self._get_breaker_snapshots,
             sdk_instance_id=self._sdk_instance_id,
             breaker_reporting_enabled=config.breaker_reporting_enabled,
+            control_plane_breaker=self._control_plane_breaker,
         )
 
     @functools.cached_property
@@ -1779,7 +1797,7 @@ class AsyncSolwyn(_SolwynBase):
             estimated_input_tokens=est_in,
             model=requested_model,
             provider=provider,
-            timeout=_budget_timeout(deadline),
+            timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
             modality=spec.modality,
             estimated_media=estimated_media,
             agent_run_id=agent_run[0],
@@ -1858,14 +1876,17 @@ class AsyncSolwyn(_SolwynBase):
             spec.measure_media(kwargs, response) if spec.measure_media is not None else None
         )
 
-        # Confirm fires when EITHER basis is observable (both ride the confirm
-        # when both are); skipped only when both are None. See the sync mirror.
+        # Settle OFF the hot path: build the confirm sans-I/O and enqueue it
+        # with the metadata event as one ordered settlement (same path as chat
+        # + streaming). Confirm fires when EITHER basis is observable; skipped
+        # only when both are None. See the sync mirror.
         service_tier = runtime.adapter.extract_service_tier(response)
+        confirm = None
         if budget.reservation_id and (token_details is not None or media_usage is not None):
-            await self._budget.confirm_cost(
-                budget.reservation_id,
-                requested_model,
-                token_details if token_details is not None else TokenDetails(),
+            confirm = self._budget.build_confirm_request(
+                reservation_id=budget.reservation_id,
+                model=requested_model,
+                token_details=token_details if token_details is not None else TokenDetails(),
                 provider=provider,
                 is_provider_fallback=False,
                 call_id=call_id,
@@ -1874,25 +1895,27 @@ class AsyncSolwyn(_SolwynBase):
                 modality=spec.modality,
                 media_usage=media_usage,
             )
-        self._reporter.report(
-            self._build_metadata_event(
-                model=requested_model,
-                provider=provider,
-                input_tokens=token_details.input_tokens if token_details is not None else 0,
-                output_tokens=token_details.output_tokens if token_details is not None else 0,
-                token_details=token_details,
-                latency_ms=latency_ms,
-                status=CallStatus.SUCCESS,
-                is_model_fallback=False,
-                attempt_index=0,
-                call_id=call_id,
-                service_tier=service_tier,
-                agent_run=agent_run,
-                provider_region=provider_region,
-                modality=spec.modality,
-                media_usage=media_usage,
-            )
+        event = self._build_metadata_event(
+            model=requested_model,
+            provider=provider,
+            input_tokens=token_details.input_tokens if token_details is not None else 0,
+            output_tokens=token_details.output_tokens if token_details is not None else 0,
+            token_details=token_details,
+            latency_ms=latency_ms,
+            status=CallStatus.SUCCESS,
+            is_model_fallback=False,
+            attempt_index=0,
+            call_id=call_id,
+            service_tier=service_tier,
+            agent_run=agent_run,
+            provider_region=provider_region,
+            modality=spec.modality,
+            media_usage=media_usage,
         )
+        if confirm is not None:
+            self._reporter.report_settlement(confirm, event)
+        else:
+            self._reporter.report(event)
         return response
 
     async def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
@@ -1919,7 +1942,7 @@ class AsyncSolwyn(_SolwynBase):
             provider=primary.adapter.name,
             fallback_providers=[r.entry.provider.value for r in self._runtimes[1:]],
             fallback_models=[r.entry.model for r in self._runtimes[1:]],
-            timeout=_budget_timeout(deadline),
+            timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
             agent_run_id=agent_run[0],
         )
         effective_total = self._apply_failover_tuning_directive(
@@ -2213,42 +2236,49 @@ class AsyncSolwyn(_SolwynBase):
                     requested=primary.adapter.dialect,
                     response=response,
                 )
+            # Settle OFF the hot path: build the confirm sans-I/O and enqueue
+            # it with the metadata event as one ordered settlement — the same
+            # path streaming on_complete uses. The caller gets the provider
+            # response without waiting on a Solwyn round-trip.
+            confirm = None
             if budget.reservation_id:
-                await self._budget.confirm_cost(
-                    budget.reservation_id,
-                    served_model,
-                    token_details,
-                    provider=provider,
-                    is_provider_fallback=is_provider_fallback,
-                    call_id=call_id,
-                    provider_region=provider_region,
-                    service_tier=service_tier,
-                )
-            self._reporter.report(
-                self._build_metadata_event(
+                confirm = self._budget.build_confirm_request(
+                    reservation_id=budget.reservation_id,
                     model=served_model,
-                    provider=provider,
-                    input_tokens=token_details.input_tokens,
-                    output_tokens=token_details.output_tokens,
                     token_details=token_details,
-                    latency_ms=ctx.elapsed_ms(),
-                    status=CallStatus.SUCCESS,
-                    is_model_fallback=is_model_fallback,
+                    provider=provider,
                     is_provider_fallback=is_provider_fallback,
-                    requested_provider=primary.entry.provider if is_provider_fallback else None,
-                    requested_model=requested_model if is_provider_fallback else None,
-                    failover_reason=_success_failover_reason(
-                        is_provider_fallback=is_provider_fallback,
-                        is_model_fallback=is_model_fallback,
-                        primary_errored=primary_errored,
-                    ),
-                    attempt_index=chain_index,
                     call_id=call_id,
-                    service_tier=service_tier,
-                    agent_run=agent_run,
                     provider_region=provider_region,
+                    service_tier=service_tier,
                 )
+            event = self._build_metadata_event(
+                model=served_model,
+                provider=provider,
+                input_tokens=token_details.input_tokens,
+                output_tokens=token_details.output_tokens,
+                token_details=token_details,
+                latency_ms=ctx.elapsed_ms(),
+                status=CallStatus.SUCCESS,
+                is_model_fallback=is_model_fallback,
+                is_provider_fallback=is_provider_fallback,
+                requested_provider=primary.entry.provider if is_provider_fallback else None,
+                requested_model=requested_model if is_provider_fallback else None,
+                failover_reason=_success_failover_reason(
+                    is_provider_fallback=is_provider_fallback,
+                    is_model_fallback=is_model_fallback,
+                    primary_errored=primary_errored,
+                ),
+                attempt_index=chain_index,
+                call_id=call_id,
+                service_tier=service_tier,
+                agent_run=agent_run,
+                provider_region=provider_region,
             )
+            if confirm is not None:
+                self._reporter.report_settlement(confirm, event)
+            else:
+                self._reporter.report(event)
             return result
 
         if last_exc is not None:

@@ -4,9 +4,9 @@
 
 - `client.py` — `Solwyn` (sync) + `AsyncSolwyn` (async) wrappers
 - `_base.py` — shared sans-I/O logic (budget request construction, metadata formatting)
-- `budget.py` — `BudgetEnforcer` / `AsyncBudgetEnforcer` with cloud API check + local fallback
-- `circuit_breaker.py` — local-only circuit breaker state machine
-- `reporter.py` — `MetadataReporter` (thread queue) / `AsyncMetadataReporter` (create_task)
+- `budget.py` — `BudgetEnforcer` / `AsyncBudgetEnforcer` with cloud API check + local fallback. Settlement lives in the reporter, NOT here: `build_confirm_request` (sans-I/O) constructs the confirm; there is no `confirm_cost`. The `/budgets/check` POST rides the injected control-plane breaker
+- `circuit_breaker.py` — local-only circuit breaker state machine. `name` distinguishes health domains in logs (provider breakers vs the shared `"control-plane"` breaker)
+- `reporter.py` — `MetadataReporter` (thread queue) / `AsyncMetadataReporter` (create_task). Owns settlement delivery via `report_settlement` → `_send_confirm` (guarded by the shared control-plane breaker) and the consecutive-confirm-failure ERROR escalation
 - `config.py` — `SolwynConfig` with env var loading (`SOLWYN_*` prefix)
 - `tokenizer.py` — tiktoken + heuristic fallback
 - `exceptions.py` — `SolwynError` base, `BudgetExceededError`, `ProviderUnavailableError`, `ConfigurationError`
@@ -31,7 +31,7 @@
 - Per-provider dispatch quirks (stream kwarg vs dedicated method, Bedrock's `modelId` rename, Google's per-request HTTP bound) live on each adapter's `prepare_call`; `_sync_dispatch`/`_async_dispatch` are provider-agnostic. The Bedrock proxy renames boto3's `modelId` → internal `model` at interception; `BedrockAdapter.prepare_call` renames it back. The whole pipeline keys on `kwargs["model"]`
 - Bedrock streaming shape: `converse_stream` returns `{"stream": EventStream, ...}` — the SERVED adapter's `unwrap_stream_source` hands `_wrap_stream` the INNER event stream, and the PRIMARY adapter's `wrap_stream_result` reshapes the wrapper to the caller dialect (boto3 dict for Bedrock callers, the bare wrapper for everyone else); early abandonment settles via `result["stream"].close()` or the wrapper's context manager (exactly once, via the `_settled` guard)
 - Bedrock `invoke_model` fails loud (`ConfigurationError`) — usage is buried in a consume-once body with response content; silent pass-through would be a budget bypass
-- Stream `on_complete` fire-and-forgets reservation settlement via `reporter.report_settlement()` -- never blocks user thread
+- ALL reservation settlement — streaming `on_complete` AND non-streaming chat/media success — fire-and-forgets via `reporter.report_settlement(confirm, event)` (confirm built sans-I/O by `budget.build_confirm_request`, enqueued with its metadata event as one ordered item). Never blocks the user thread; there is no blocking `confirm_cost`
 
 ## Thread Safety
 

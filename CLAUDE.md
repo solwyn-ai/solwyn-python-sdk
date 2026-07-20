@@ -48,7 +48,8 @@ _SolwynBase          # Shared sans-I/O logic (config, token estimation, metadata
 - Provider `name` (attribution: budgets, metadata, breakers) is distinct from `dialect` (wire shape: dispatch, translation). Same-dialect failover is native passthrough; cross-dialect runs the translation subset
 - A compat provider that reports no usage gets a length-based estimate explicitly marked `token_details.is_estimated=True` — never silently zero
 - `check_budget(provider=...)` is required and keyword-only
-- Consecutive confirm_cost failures are tracked — after 10, logs at ERROR level
+- ALL settlement (streaming AND non-streaming, chat AND media) rides `reporter.report_settlement(confirm, event)` off the caller's thread — the enforcers have no `confirm_cost`. The reporter tracks consecutive confirm-send failures; after 10, logs at ERROR level
+- A shared control-plane `CircuitBreaker` (name `"control-plane"`, one per client) guards both the `/budgets/check` POST (enforcer) and the `/budgets/confirm` POST (reporter): a streak of failures against Solwyn's own API short-circuits the network call so the SDK discovers an outage once, not once per call. It is never a provider breaker (excluded from breaker reports). The budget pre-flight timeout defaults to `budget_check_timeout=1.0`
 
 ## Privacy
 

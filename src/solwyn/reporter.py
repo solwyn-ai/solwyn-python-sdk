@@ -21,7 +21,7 @@ import httpx
 
 from solwyn._read_only_key import handle_read_only_key_error
 from solwyn._types import BreakerStateReport, BudgetConfirmRequest, MetadataEvent, ProviderName
-from solwyn.circuit_breaker import CircuitBreakerState
+from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,7 @@ class _ReporterBase:
         | None = None,
         sdk_instance_id: str | None = None,
         breaker_reporting_enabled: bool = True,
+        control_plane_breaker: CircuitBreaker | None = None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
@@ -71,6 +72,11 @@ class _ReporterBase:
         self._breaker_snapshots = breaker_snapshots
         self._sdk_instance_id = sdk_instance_id
         self._breaker_reporting_enabled = breaker_reporting_enabled
+        # Shared with the budget enforcer's check path: a streak of confirm
+        # failures opens this breaker so a known-down confirm is dropped
+        # without paying the timeout. Never a provider — excluded from
+        # _build_breaker_reports (that is provider health only).
+        self._control_plane_breaker = control_plane_breaker
         self._breaker_project_id: str | None = None
         self._breaker_project_lock = threading.Lock()
 
@@ -290,6 +296,7 @@ class MetadataReporter(_ReporterBase):
         | None = None,
         sdk_instance_id: str | None = None,
         breaker_reporting_enabled: bool = True,
+        control_plane_breaker: CircuitBreaker | None = None,
     ) -> None:
         super().__init__(
             api_url,
@@ -301,6 +308,7 @@ class MetadataReporter(_ReporterBase):
             breaker_snapshots=breaker_snapshots,
             sdk_instance_id=sdk_instance_id,
             breaker_reporting_enabled=breaker_reporting_enabled,
+            control_plane_breaker=control_plane_breaker,
         )
         self._http = httpx.Client(timeout=10.0)
         self._shutdown = threading.Event()
@@ -421,6 +429,14 @@ class MetadataReporter(_ReporterBase):
 
     def _send_confirm(self, confirm_request: BudgetConfirmRequest) -> None:
         """Send one confirm request and update confirm failure accounting."""
+        breaker = self._control_plane_breaker
+        admission = breaker.admit() if breaker is not None else None
+        if admission is not None and not admission.allowed:
+            # Control plane known-down: drop this confirm (same data loss as a
+            # failed send today) without paying the timeout. Delivery hardening
+            # is PJ-3's scope. Does not touch the confirm-failure counter.
+            logger.debug("reporter.confirm_skipped_breaker_open")
+            return
         try:
             resp = self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",
@@ -429,10 +445,16 @@ class MetadataReporter(_ReporterBase):
                 timeout=5.0,
             )
             resp.raise_for_status()
+            if breaker is not None:
+                breaker.record_success()
             self._record_confirm_success()
         except Exception as exc:
             if handle_read_only_key_error(exc):
+                if breaker is not None:
+                    breaker.record_success()
                 return
+            if breaker is not None:
+                breaker.record_failure()
             self._record_confirm_failure(exc)
 
     def _flush_settlements(self) -> None:
@@ -528,6 +550,7 @@ class AsyncMetadataReporter(_ReporterBase):
         | None = None,
         sdk_instance_id: str | None = None,
         breaker_reporting_enabled: bool = True,
+        control_plane_breaker: CircuitBreaker | None = None,
     ) -> None:
         super().__init__(
             api_url,
@@ -539,6 +562,7 @@ class AsyncMetadataReporter(_ReporterBase):
             breaker_snapshots=breaker_snapshots,
             sdk_instance_id=sdk_instance_id,
             breaker_reporting_enabled=breaker_reporting_enabled,
+            control_plane_breaker=control_plane_breaker,
         )
         self._http = httpx.AsyncClient(timeout=10.0)
         self._shutdown_event: asyncio.Event | None = None
@@ -740,6 +764,14 @@ class AsyncMetadataReporter(_ReporterBase):
 
     async def _send_confirm(self, confirm_request: BudgetConfirmRequest) -> None:
         """Send one confirm request and update confirm failure accounting."""
+        breaker = self._control_plane_breaker
+        admission = breaker.admit() if breaker is not None else None
+        if admission is not None and not admission.allowed:
+            # Control plane known-down: drop this confirm (same data loss as a
+            # failed send today) without paying the timeout. Delivery hardening
+            # is PJ-3's scope. Does not touch the confirm-failure counter.
+            logger.debug("reporter.confirm_skipped_breaker_open")
+            return
         try:
             resp = await self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",
@@ -748,10 +780,16 @@ class AsyncMetadataReporter(_ReporterBase):
                 timeout=5.0,
             )
             resp.raise_for_status()
+            if breaker is not None:
+                breaker.record_success()
             self._record_confirm_success()
         except Exception as exc:
             if handle_read_only_key_error(exc):
+                if breaker is not None:
+                    breaker.record_success()
                 return
+            if breaker is not None:
+                breaker.record_failure()
             self._record_confirm_failure(exc)
 
     async def _flush_settlements(self) -> None:
