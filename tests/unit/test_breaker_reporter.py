@@ -50,7 +50,7 @@ def _error_response() -> MagicMock:
 
 def _event() -> MetadataEvent:
     return MetadataEvent(
-        model="gpt-4o",
+        model="gpt-5.5",
         provider=ProviderName.OPENAI,
         input_tokens=10,
         output_tokens=5,
@@ -66,7 +66,7 @@ def _event() -> MetadataEvent:
 def _confirm() -> BudgetConfirmRequest:
     return BudgetConfirmRequest(
         reservation_id="res-breaker-report",
-        model="gpt-4o",
+        model="gpt-5.5",
         provider=ProviderName.OPENAI,
         token_details=TokenDetails(input_tokens=10, output_tokens=5),
         call_id="call-breaker-report",
@@ -198,8 +198,8 @@ class TestSyncBreakerReporter:
             solwyn = Solwyn(
                 openai,
                 api_key=VALID_API_KEY,
-                model="gpt-4o",
-                fallback=[(anthropic, "claude-3-5-sonnet")],
+                model="gpt-5.5",
+                fallback=[(anthropic, "claude-sonnet-5")],
                 breaker_reporting_enabled=False,
             )
         solwyn._reporter._thread.join(timeout=2.0)

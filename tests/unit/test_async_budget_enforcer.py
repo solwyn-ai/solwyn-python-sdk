@@ -8,7 +8,6 @@ import httpx
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 
-from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetMode
 from solwyn.budget import AsyncBudgetEnforcer
 
@@ -39,29 +38,6 @@ def _response(payload: dict[str, object]) -> MagicMock:
     response.json.return_value = payload
     response.raise_for_status = MagicMock()
     return response
-
-
-def _error_response(status_code: int) -> MagicMock:
-    """A 4xx/5xx httpx.Response stand-in: raise_for_status raises HTTPStatusError.
-
-    raise_for_status is sync even on the async client, so it is a MagicMock.
-    """
-    resp = MagicMock(spec=httpx.Response)
-    resp.status_code = status_code
-    resp.raise_for_status = MagicMock(
-        side_effect=httpx.HTTPStatusError(
-            "error", request=MagicMock(spec=httpx.Request), response=resp
-        )
-    )
-    return resp
-
-
-def _ok_response() -> MagicMock:
-    """A 2xx httpx.Response stand-in: raise_for_status is a no-op."""
-    resp = MagicMock(spec=httpx.Response)
-    resp.status_code = 200
-    resp.raise_for_status = MagicMock()
-    return resp
 
 
 def _make_async_enforcer(**overrides) -> AsyncBudgetEnforcer:
@@ -101,7 +77,7 @@ class TestAsyncCloudAllow:
         mock_response.raise_for_status = MagicMock()
         enforcer._http.post = AsyncMock(return_value=mock_response)
         result = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert result.allowed is True
@@ -130,7 +106,7 @@ class TestAsyncCloudDenyHard:
         mock_response.raise_for_status = MagicMock()
         enforcer._http.post = AsyncMock(return_value=mock_response)
         result = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
 
         assert result.allowed is False
@@ -157,7 +133,7 @@ class TestAsyncCloudDenyAlertOnly:
         mock_response.raise_for_status = MagicMock()
         enforcer._http.post = AsyncMock(return_value=mock_response)
         result = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
 
         assert result.allowed is True
@@ -182,7 +158,7 @@ class TestAsyncFailOpen:
 
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
             result = await enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert result.allowed is True
@@ -208,21 +184,21 @@ class TestAsyncScopedCacheAndStickyDenials:
             ]
         )
 
-        await enforcer.check_budget(estimated_input_tokens=500, model="gpt-4o", provider="openai")
+        await enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
         await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
         await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_b",
         )
         unscoped = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert enforcer._http.post.call_count == 3
@@ -246,19 +222,19 @@ class TestAsyncScopedCacheAndStickyDenials:
 
         denied_a = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
         outage_b = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_b",
         )
         outage_a = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
@@ -283,18 +259,18 @@ class TestAsyncScopedCacheAndStickyDenials:
 
         project_denied = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
         )
         run_a_denied = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
         outage_b = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_b",
         )
@@ -321,19 +297,19 @@ class TestAsyncScopedCacheAndStickyDenials:
 
         hard_denied = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
         alert_only = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
         outage = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
@@ -357,13 +333,13 @@ class TestAsyncScopedCacheAndStickyDenials:
 
         denied = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_a",
         )
         outage_b = await enforcer.check_budget(
             estimated_input_tokens=500,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider="openai",
             agent_run_id="run_b",
         )
@@ -389,10 +365,10 @@ class TestAsyncFailOpenSticky:
         )
 
         denied = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
         result = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert denied.allowed is False
@@ -419,10 +395,10 @@ class TestAsyncFailOpenSticky:
 
         with caplog.at_level("WARNING", logger="solwyn.budget"):
             await enforcer.check_budget(
-                estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+                estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
             )
             result = await enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-4o", provider="openai"
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert result.allowed is False
@@ -451,10 +427,10 @@ class TestAsyncFailOpenSticky:
         )
 
         denied = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
         result = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert denied.allowed is False
@@ -479,10 +455,10 @@ class TestAsyncFailOpenSticky:
         )
 
         denied = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
         result = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert denied.allowed is True
@@ -515,13 +491,13 @@ class TestAsyncFailOpenSticky:
         )
 
         denied = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
         allowed = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
         outage = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert denied.allowed is False
@@ -545,10 +521,10 @@ class TestAsyncFailOpenSticky:
         )
 
         denied = await enforcer.check_budget(
-            estimated_input_tokens=50000, model="gpt-4o", provider="openai"
+            estimated_input_tokens=50000, model="gpt-5.5", provider="openai"
         )
         result = await enforcer.check_budget(
-            estimated_input_tokens=500, model="gpt-4o", provider="openai"
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
         )
 
         assert denied.allowed is False
@@ -565,106 +541,9 @@ class TestAsyncFailOpenSticky:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.unit
-class TestAsyncConfirmCost:
-    """confirm_cost() sends POST to cloud API (async)."""
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_sends_confirmation(self) -> None:
-        enforcer = _make_async_enforcer()
-        mock_response = MagicMock()
-        mock_response.raise_for_status = MagicMock()
-        token_details = TokenDetails(input_tokens=100, output_tokens=50)
-
-        enforcer._http.post = AsyncMock(return_value=mock_response)
-        await enforcer.confirm_cost(
-            "res_123",
-            "gpt-4o",
-            token_details,
-            provider="openai",
-            call_id="call_async_budget_confirm",
-        )
-
-        enforcer._http.post.assert_called_once()
-        call_args = enforcer._http.post.call_args
-        assert "budgets/confirm" in call_args[0][0]
-        await enforcer.close()
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_swallows_errors(self) -> None:
-        enforcer = _make_async_enforcer()
-        token_details = TokenDetails(input_tokens=100, output_tokens=50)
-
-        with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
-            # Should not raise
-            await enforcer.confirm_cost(
-                "res_123",
-                "gpt-4o",
-                token_details,
-                provider="openai",
-                call_id="call_async_budget_confirm",
-            )
-
-        await enforcer.close()
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_confirm_4xx_increments_failure_counter(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        # A server 422 must surface via raise_for_status and be counted as a
-        # failure, not silently treated as success.
-        enforcer = _make_async_enforcer()
-        token_details = TokenDetails(input_tokens=100, output_tokens=50)
-        enforcer._http.post = AsyncMock(return_value=_error_response(422))
-
-        with caplog.at_level("WARNING"):
-            await enforcer.confirm_cost(
-                "res_123",
-                "gpt-4o",
-                token_details,
-                provider="openai",
-                call_id="call_async_budget_confirm",
-            )
-
-        assert enforcer._consecutive_confirm_failures == 1
-        assert "budget.confirm_cost_failed" in caplog.text
-        # Privacy: only the exception class name is logged, never the body.
-        assert "HTTPStatusError" in caplog.text
-        assert "422 Unprocessable" not in caplog.text
-        await enforcer.close()
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_confirm_2xx_resets_failure_counter(self) -> None:
-        # A successful confirm clears any accumulated consecutive-failure count.
-        enforcer = _make_async_enforcer()
-        token_details = TokenDetails(input_tokens=100, output_tokens=50)
-
-        enforcer._http.post = AsyncMock(return_value=_error_response(422))
-        for _ in range(2):
-            await enforcer.confirm_cost(
-                "res_123",
-                "gpt-4o",
-                token_details,
-                provider="openai",
-                call_id="call_async_budget_confirm",
-            )
-        assert enforcer._consecutive_confirm_failures == 2
-
-        enforcer._http.post = AsyncMock(return_value=_ok_response())
-        await enforcer.confirm_cost(
-            "res_123",
-            "gpt-4o",
-            token_details,
-            provider="openai",
-            call_id="call_async_budget_confirm",
-        )
-        assert enforcer._consecutive_confirm_failures == 0
-
-        await enforcer.close()
+# Settlement moved off the enforcer: AsyncBudgetEnforcer.confirm_cost is removed
+# (settlement rides reporter.report_settlement / reporter._send_confirm). The
+# confirm POST + error accounting is covered by tests/unit/test_reporter.py.
 
 
 # ---------------------------------------------------------------------------

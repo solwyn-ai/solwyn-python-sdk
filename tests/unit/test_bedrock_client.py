@@ -25,7 +25,7 @@ from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import ConfigurationError
 
-BEDROCK_MODEL = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+BEDROCK_MODEL = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 
 def _converse_response(*, input_tokens: int = 12, output_tokens: int = 7) -> dict[str, Any]:
@@ -83,7 +83,7 @@ def _mock_anthropic_client() -> MagicMock:
     client.messages.create.return_value = SimpleNamespace(
         content=[SimpleNamespace(type="text", text="Hello")],
         stop_reason="end_turn",
-        model="claude-3-5-sonnet",
+        model="claude-sonnet-5",
         usage=SimpleNamespace(input_tokens=100, output_tokens=50, cache_read_input_tokens=0),
     )
     return client
@@ -155,6 +155,9 @@ class TestBedrockConverseInterception:
         solwyn = _make_solwyn(client)
         reported: list = []
         solwyn._reporter.report = lambda e: reported.append(e)
+        # Settlement rides report_settlement; forward its SUCCESS event into the
+        # same list so the metadata assertions observe it.
+        solwyn._reporter.report_settlement = lambda _c, e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = solwyn.converse(
@@ -184,8 +187,9 @@ class TestBedrockConverseInterception:
     def test_converse_confirm_carries_provider_region(self) -> None:
         client = _mock_bedrock_client(region="eu-west-1")
         solwyn = _make_solwyn(client)
+        settlements: list = []
         solwyn._reporter.report = lambda e: None
-        solwyn._budget.confirm_cost = MagicMock()
+        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             solwyn.converse(
@@ -193,8 +197,8 @@ class TestBedrockConverseInterception:
                 messages=[{"role": "user", "content": [{"text": "Hello"}]}],
             )
 
-        confirm_kwargs = solwyn._budget.confirm_cost.call_args.kwargs
-        assert confirm_kwargs["provider_region"] == "eu-west-1"
+        confirm, _event = settlements[0]
+        assert confirm.provider_region == "eu-west-1"
         solwyn.close()
 
     def test_converse_confirm_and_event_carry_same_service_tier(self) -> None:
@@ -206,9 +210,9 @@ class TestBedrockConverseInterception:
         response["serviceTier"] = {"type": "priority"}
         client.converse.return_value = response
         solwyn = _make_solwyn(client)
-        reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
-        solwyn._budget.confirm_cost = MagicMock()
+        settlements: list = []
+        solwyn._reporter.report = lambda e: None
+        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             solwyn.converse(
@@ -216,10 +220,11 @@ class TestBedrockConverseInterception:
                 messages=[{"role": "user", "content": [{"text": "Hello"}]}],
             )
 
-        confirm_kwargs = solwyn._budget.confirm_cost.call_args.kwargs
-        assert confirm_kwargs["service_tier"] == "priority"
-        assert len(reported) == 1
-        assert reported[0].service_tier == "priority"
+        # Confirm + metadata event settle together; both carry the same tier.
+        assert len(settlements) == 1
+        confirm, event = settlements[0]
+        assert confirm.service_tier == "priority"
+        assert event.service_tier == "priority"
         solwyn.close()
 
     def test_converse_requires_model_id(self) -> None:
@@ -410,9 +415,10 @@ class TestBedrockFailover:
         # not .status_code) must classify FAILOVER through the live dispatch.
         bedrock.converse.side_effect = _botocore_client_error("ThrottlingException", 429)
         anthropic = _mock_anthropic_client()
-        solwyn = _make_solwyn(bedrock, fallback=[(anthropic, "claude-3-5-sonnet")])
+        solwyn = _make_solwyn(bedrock, fallback=[(anthropic, "claude-sonnet-5")])
         reported: list = []
         solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._reporter.report_settlement = lambda _c, e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = solwyn.converse(
@@ -424,7 +430,7 @@ class TestBedrockFailover:
 
         # The served Anthropic hop got a TRANSLATED native request.
         anthropic_kwargs = anthropic.messages.create.call_args.kwargs
-        assert anthropic_kwargs["model"] == "claude-3-5-sonnet"
+        assert anthropic_kwargs["model"] == "claude-sonnet-5"
         assert anthropic_kwargs["max_tokens"] == 256
         assert anthropic_kwargs["temperature"] == 0.2
         assert anthropic_kwargs["system"] == "be brief"
@@ -450,10 +456,11 @@ class TestBedrockFailover:
         solwyn = _make_solwyn(openai, fallback=[(bedrock, BEDROCK_MODEL)])
         reported: list = []
         solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._reporter.report_settlement = lambda _c, e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 max_tokens=64,
                 messages=[{"role": "user", "content": "Hello"}],
             )
@@ -490,7 +497,7 @@ class TestBedrockFailover:
 
         with _mock_budget(solwyn):
             stream = solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 max_tokens=64,
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
@@ -538,7 +545,7 @@ class TestBedrockFailover:
                 ),
             ]
         )
-        solwyn = _make_solwyn(bedrock, fallback=[(anthropic, "claude-3-5-sonnet")])
+        solwyn = _make_solwyn(bedrock, fallback=[(anthropic, "claude-sonnet-5")])
         settlements: list = []
         solwyn._reporter.report = lambda e: None
         solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
@@ -574,7 +581,7 @@ class TestBedrockFailover:
         timeout_exc = _botocore_client_error("ModelTimeoutException", 408)
         bedrock.converse.side_effect = timeout_exc
         anthropic = _mock_anthropic_client()
-        solwyn = _make_solwyn(bedrock, fallback=[(anthropic, "claude-3-5-sonnet")])
+        solwyn = _make_solwyn(bedrock, fallback=[(anthropic, "claude-sonnet-5")])
         reported: list = []
         solwyn._reporter.report = lambda e: reported.append(e)
 
@@ -718,6 +725,7 @@ class TestAsyncBedrockConverse:
         solwyn = _make_async_solwyn(client)
         reported: list = []
         solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._reporter.report_settlement = lambda _c, e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = await solwyn.converse(

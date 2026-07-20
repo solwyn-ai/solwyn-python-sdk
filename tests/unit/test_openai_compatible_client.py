@@ -352,21 +352,20 @@ class TestEstimatedUsageFallback:
             prompt_tokens=None, content="z" * 80
         )
         solwyn = _make_solwyn(client)
-        with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget("res_1")),
-            patch.object(solwyn._budget, "confirm_cost") as confirm,
-        ):
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget("res_1")):
             solwyn.chat.completions.create(**_REQUEST)
 
-        event = _reported_events(solwyn)[0]
+        # A reservation was granted, so settlement rides report_settlement(confirm,
+        # event) — the SUCCESS event travels WITH the confirm.
+        solwyn._reporter.report_settlement.assert_called_once()
+        confirm, event = solwyn._reporter.report_settlement.call_args.args
         assert event.token_details.is_estimated is True
         # Input from the pre-call length estimate ("hello there" = 11 chars).
         assert event.input_tokens > 0
         assert event.output_tokens == 20  # 80 chars / 4.0
         # The budget confirm settles on the SAME flagged estimate.
-        confirmed_details = confirm.call_args.args[2]
-        assert confirmed_details.is_estimated is True
-        assert confirmed_details.output_tokens == 20
+        assert confirm.token_details.is_estimated is True
+        assert confirm.token_details.output_tokens == 20
 
     def test_streaming_missing_usage_reports_flagged_estimate(self) -> None:
         client = _compat_client("http://localhost:1234/v1")
@@ -591,12 +590,12 @@ class TestCompatFailover:
         anthropic.messages.create.return_value = SimpleNamespace(
             content=[SimpleNamespace(type="text", text="from claude")],
             stop_reason="end_turn",
-            model="claude-sonnet-4-5",
+            model="claude-sonnet-5",
             usage=SimpleNamespace(input_tokens=13, output_tokens=5),
         )
         solwyn = _make_solwyn(
             primary,
-            fallback=[(anthropic, "claude-sonnet-4-5", {"max_tokens": 128})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 128})],
         )
         _open_breaker(solwyn, "groq")
 
@@ -821,7 +820,7 @@ class TestCompatFailover:
         anthropic = make_mock_client(module="anthropic._client", name="Anthropic")
         solwyn = _make_solwyn(
             primary,
-            fallback=[(anthropic, "claude-sonnet-4-5", {"max_tokens": 128})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 128})],
         )
         _open_breaker(solwyn, "groq")
 

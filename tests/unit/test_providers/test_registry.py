@@ -84,7 +84,7 @@ class TestGetAdapterByName:
 @pytest.mark.unit
 class TestGetAdapterForModel:
     def test_gpt_prefix_returns_openai_adapter(self) -> None:
-        adapter = get_adapter_for_model("gpt-4o")
+        adapter = get_adapter_for_model("gpt-5.5")
         assert isinstance(adapter, OpenAIAdapter)
 
     def test_o3_prefix_returns_openai_adapter(self) -> None:
@@ -96,11 +96,11 @@ class TestGetAdapterForModel:
         assert isinstance(adapter, OpenAIAdapter)
 
     def test_claude_prefix_returns_anthropic_adapter(self) -> None:
-        adapter = get_adapter_for_model("claude-3-5-sonnet-20241022")
+        adapter = get_adapter_for_model("claude-sonnet-5")
         assert isinstance(adapter, AnthropicAdapter)
 
     def test_gemini_prefix_returns_google_adapter(self) -> None:
-        adapter = get_adapter_for_model("gemini-2.0-flash")
+        adapter = get_adapter_for_model("gemini-3.5-flash")
         assert isinstance(adapter, GoogleAdapter)
 
     def test_unknown_model_raises_value_error(self) -> None:
@@ -226,14 +226,14 @@ class TestAllAdaptersRegistered:
     def test_bedrock_model_id_routes_to_bedrock_adapter(self) -> None:
         from solwyn.providers import get_adapter_for_model
 
-        adapter = get_adapter_for_model("us.anthropic.claude-3-5-sonnet-20241022-v2:0")
+        adapter = get_adapter_for_model("us.anthropic.claude-sonnet-4-5-20250929-v1:0")
         assert adapter.name == "bedrock"
 
     def test_direct_anthropic_model_id_still_routes_to_anthropic(self) -> None:
         # The Bedrock patterns must never shadow the native adapters.
         from solwyn.providers import get_adapter_for_model
 
-        assert get_adapter_for_model("claude-3-5-sonnet").name == "anthropic"
+        assert get_adapter_for_model("claude-sonnet-5").name == "anthropic"
 
     def test_bedrock_runtime_client_routes_to_bedrock_adapter(self) -> None:
         from types import SimpleNamespace

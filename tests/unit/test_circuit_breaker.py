@@ -383,6 +383,23 @@ def test_circuit_breaker_state_is_pydantic_model() -> None:
 
 
 @pytest.mark.unit
+class TestBreakerName:
+    """The name label distinguishes health domains in transition logs."""
+
+    def test_default_name_is_provider(self) -> None:
+        assert CircuitBreaker().name == "provider"
+
+    def test_name_is_stored(self) -> None:
+        assert CircuitBreaker(name="control-plane").name == "control-plane"
+
+    def test_open_transition_logs_the_name(self, caplog: pytest.LogCaptureFixture) -> None:
+        cb = CircuitBreaker(failure_threshold=1, name="control-plane")
+        with caplog.at_level("WARNING", logger="solwyn.circuit_breaker"):
+            cb.record_failure()
+        assert "[control-plane]" in caplog.text
+
+
+@pytest.mark.unit
 def test_can_proceed_boolean_api_is_removed() -> None:
     """Admission must expose probe ownership instead of hiding it behind bool."""
     assert not hasattr(CircuitBreaker, "can_proceed")

@@ -127,7 +127,7 @@ class UntranslatableModelError(SolwynError):
     surface in the message.
 
     Attributes:
-        model: The model identifier that has no mapping (e.g. ``"gpt-4o"``).
+        model: The model identifier that has no mapping (e.g. ``"gpt-5.5"``).
         provider: The target provider the model was not configured for.
     """
 

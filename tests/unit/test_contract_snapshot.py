@@ -312,7 +312,7 @@ class TestWireModelFieldSets:
 def _confirm(**overrides: Any) -> BudgetConfirmRequest:
     base: dict[str, Any] = {
         "reservation_id": "res_123",
-        "model": "gpt-4o",
+        "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
         "token_details": TokenDetails(input_tokens=10, output_tokens=5),
         "call_id": "call-fixed",
@@ -323,7 +323,7 @@ def _confirm(**overrides: Any) -> BudgetConfirmRequest:
 
 def _metadata_event(**overrides: object) -> MetadataEvent:
     base: dict[str, object] = {
-        "model": "gpt-4o",
+        "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
         "input_tokens": 10,
         "output_tokens": 5,
@@ -345,7 +345,7 @@ class TestWireModelDumpSnapshots:
     def test_budget_check_request_dump_keys(self) -> None:
         req = BudgetCheckRequest(
             estimated_input_tokens=10,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider=ProviderName.OPENAI,
             fallback_providers=[ProviderName.ANTHROPIC],
             fallback_models=["claude-x"],
@@ -358,7 +358,7 @@ class TestWireModelDumpSnapshots:
         )
         assert req.model_dump(mode="json") == {
             "estimated_input_tokens": 10,
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "provider": "openai",
             "modality": "text",
             "fallback_providers": ["anthropic"],
@@ -387,7 +387,7 @@ class TestWireModelDumpSnapshots:
     def test_budget_check_request_scoped_dump_carries_agent_run_id(self) -> None:
         req = BudgetCheckRequest(
             estimated_input_tokens=10,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider=ProviderName.OPENAI,
             agent_run_id="run_abc",
         )
@@ -403,7 +403,7 @@ class TestWireModelDumpSnapshots:
     def test_budget_check_request_agent_run_id_length_boundary(self) -> None:
         accepted = BudgetCheckRequest(
             estimated_input_tokens=10,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider=ProviderName.OPENAI,
             agent_run_id="x" * 256,
         )
@@ -412,7 +412,7 @@ class TestWireModelDumpSnapshots:
         with pytest.raises(ValidationError):
             BudgetCheckRequest(
                 estimated_input_tokens=10,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider=ProviderName.OPENAI,
                 agent_run_id="x" * 257,
             )
@@ -422,7 +422,7 @@ class TestWireModelDumpSnapshots:
         # precise per-unit pre-flight cost.
         req = BudgetCheckRequest(
             estimated_input_tokens=0,
-            model="gpt-image-1",
+            model="gpt-image-2",
             provider=ProviderName.OPENAI,
             modality="image",
             estimated_media=MediaUsage(image_count=2, resolution="1024x1024", quality="low"),
@@ -484,7 +484,7 @@ class TestWireModelDumpSnapshots:
     def test_budget_confirm_request_dump_keys(self) -> None:
         req = BudgetConfirmRequest(
             reservation_id="res_123",
-            model="gpt-4o",
+            model="gpt-5.5",
             provider=ProviderName.OPENAI,
             token_details=TokenDetails(input_tokens=10, output_tokens=5),
             call_id="call-fixed",
@@ -668,7 +668,7 @@ class TestWireModelFieldConstraints:
         with pytest.raises(ValidationError):
             BudgetConfirmRequest(  # type: ignore[call-arg]
                 reservation_id="res_123",
-                model="gpt-4o",
+                model="gpt-5.5",
                 token_details=TokenDetails(input_tokens=10, output_tokens=5),
             )
 
@@ -676,7 +676,7 @@ class TestWireModelFieldConstraints:
         with pytest.raises(ValidationError):
             BudgetConfirmRequest(  # type: ignore[call-arg]
                 reservation_id="res_123",
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider=ProviderName.OPENAI,
                 token_details=TokenDetails(input_tokens=10, output_tokens=5),
             )
@@ -700,7 +700,7 @@ class TestWireModelFieldConstraints:
     def test_metadata_without_call_id_raises_validation_error(self) -> None:
         with pytest.raises(ValidationError):
             MetadataEvent(
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider=ProviderName.OPENAI,
                 input_tokens=10,
                 output_tokens=5,
@@ -742,7 +742,7 @@ class TestWireModelFieldConstraints:
         with pytest.raises(ValidationError):
             BudgetCheckRequest(
                 estimated_input_tokens=10,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider=ProviderName.OPENAI,
                 fallback_providers=[ProviderName.ANTHROPIC],
                 fallback_models=["x" * 2049],
@@ -792,7 +792,7 @@ def _openai_response() -> SimpleNamespace:
     choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
     return SimpleNamespace(
         choices=[choice],
-        model="gpt-4o",
+        model="gpt-5.5",
         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
     )
 
@@ -801,7 +801,7 @@ def _anthropic_response() -> SimpleNamespace:
     return SimpleNamespace(
         content=[SimpleNamespace(type="text", text="ok")],
         stop_reason="end_turn",
-        model="claude-3-5-sonnet",
+        model="claude-sonnet-5",
         usage=SimpleNamespace(input_tokens=11, output_tokens=7),
     )
 
@@ -850,6 +850,9 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
     solwyn._reporter._shutdown.set()
     solwyn._reporter._thread.join(timeout=2.0)
     solwyn._reporter.report = MagicMock()
+    # Non-streaming settlement now rides report_settlement(confirm, event); keep
+    # _reported_events observable by forwarding the settled event to report().
+    solwyn._reporter.report_settlement = lambda _req, event: solwyn._reporter.report(event)
     return solwyn
 
 
@@ -858,6 +861,7 @@ def _make_async_solwyn(client: object, **overrides: object) -> AsyncSolwyn:
     defaults.update(overrides)
     solwyn = AsyncSolwyn(client, **defaults)  # type: ignore[arg-type]
     solwyn._reporter.report = MagicMock()
+    solwyn._reporter.report_settlement = lambda _req, event: solwyn._reporter.report(event)
     return solwyn
 
 
@@ -882,7 +886,7 @@ def _reported_events(solwyn: Solwyn | AsyncSolwyn) -> list[MetadataEvent]:
     return [c.args[0] for c in solwyn._reporter.report.call_args_list]
 
 
-_PLAIN_REQUEST = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+_PLAIN_REQUEST = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
 _STREAM_REQUEST = {**_PLAIN_REQUEST, "stream": True}
 
 
@@ -903,10 +907,10 @@ class TestChainHintWiring:
         gemini = _openai_client()  # second OpenAI-shaped fallback (distinct model)
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             fallback=[
-                (anthropic, "claude-3-5-sonnet", {"max_tokens": 256}),
-                (gemini, "gpt-4o-mini"),
+                (anthropic, "claude-sonnet-5", {"max_tokens": 256}),
+                (gemini, "gpt-5.4-mini"),
             ],
         )
 
@@ -916,16 +920,16 @@ class TestChainHintWiring:
 
         check_spy.assert_called_once()
         kwargs = check_spy.call_args.kwargs
-        # Primary is provider=gpt-4o/openai; the hint excludes it and lists ONLY
+        # Primary is provider=gpt-5.5/openai; the hint excludes it and lists ONLY
         # runtimes[1:] in order, aligned element-for-element.
         assert kwargs["provider"] == "openai"
-        assert kwargs["model"] == "gpt-4o"
+        assert kwargs["model"] == "gpt-5.5"
         runtimes = solwyn._runtimes
         assert kwargs["fallback_providers"] == [r.entry.provider.value for r in runtimes[1:]]
         assert kwargs["fallback_models"] == [r.entry.model for r in runtimes[1:]]
         # Concretely: the two configured fallbacks, in order.
         assert kwargs["fallback_providers"] == ["anthropic", "openai"]
-        assert kwargs["fallback_models"] == ["claude-3-5-sonnet", "gpt-4o-mini"]
+        assert kwargs["fallback_models"] == ["claude-sonnet-5", "gpt-5.4-mini"]
         assert len(kwargs["fallback_providers"]) == len(kwargs["fallback_models"])
 
         _close(solwyn)
@@ -945,24 +949,28 @@ class TestCallIdConsistencyCrossProvider:
         anthropic.messages.create.return_value = _anthropic_response()
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
-        confirm_spy = MagicMock()
-        with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
-            patch.object(solwyn._budget, "confirm_cost", confirm_spy),
-        ):
+        settlements: list[tuple[Any, Any]] = []
+
+        def report_settlement(req: Any, event: Any) -> None:
+            settlements.append((req, event))
+            solwyn._reporter.report(event)
+
+        solwyn._reporter.report_settlement = report_settlement
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
         assert len(success) == 1
         assert success[0].is_provider_fallback is True
-        confirm_spy.assert_called_once()
+        assert len(settlements) == 1
+        confirm, _event = settlements[0]
         # Same join key on the served-provider success event AND its confirm.
-        assert confirm_spy.call_args.kwargs["call_id"] == success[0].call_id
-        assert confirm_spy.call_args.kwargs["provider"] == "anthropic"
+        assert confirm.call_id == success[0].call_id
+        assert confirm.provider == ProviderName.ANTHROPIC
 
         _close(solwyn)
 
@@ -976,31 +984,35 @@ class TestCallIdConsistencyCrossProvider:
         anthropic.messages.create = AsyncMock(return_value=_anthropic_response())
         solwyn = _make_async_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
-        confirm_spy = AsyncMock()
-        with (
-            patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
-            ),
-            patch.object(solwyn._budget, "confirm_cost", confirm_spy),
+        settlements: list[tuple[Any, Any]] = []
+
+        def report_settlement(req: Any, event: Any) -> None:
+            settlements.append((req, event))
+            solwyn._reporter.report(event)
+
+        solwyn._reporter.report_settlement = report_settlement
+        with patch.object(
+            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             await solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
         assert len(success) == 1
-        confirm_spy.assert_awaited_once()
-        assert confirm_spy.call_args.kwargs["call_id"] == success[0].call_id
-        assert confirm_spy.call_args.kwargs["provider"] == "anthropic"
+        assert len(settlements) == 1
+        confirm, _event = settlements[0]
+        assert confirm.call_id == success[0].call_id
+        assert confirm.provider == ProviderName.ANTHROPIC
 
         await _aclose(solwyn)
 
     def test_two_separate_calls_get_different_call_ids(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -1029,8 +1041,8 @@ class TestCallIdConsistencyCrossProvider:
         )
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         settlements: list[tuple[Any, Any]] = []
 
@@ -1068,20 +1080,20 @@ class TestNormalizeBeforeSettlement:
         anthropic.messages.create.return_value = _anthropic_response()
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
-        confirm_spy = MagicMock()
+        settle_spy = MagicMock()
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
-            patch.object(solwyn._budget, "confirm_cost", confirm_spy),
+            patch.object(solwyn._reporter, "report_settlement", settle_spy),
             patch("solwyn.client._translation.normalize_response", side_effect=RuntimeError),
             pytest.raises(RuntimeError),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-        confirm_spy.assert_not_called()
+        settle_spy.assert_not_called()
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
         assert success == []
 
@@ -1095,22 +1107,22 @@ class TestNormalizeBeforeSettlement:
         anthropic.messages.create = AsyncMock(return_value=_anthropic_response())
         solwyn = _make_async_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
-        confirm_spy = AsyncMock()
+        settle_spy = MagicMock()
         with (
             patch.object(
                 solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
             ),
-            patch.object(solwyn._budget, "confirm_cost", confirm_spy),
+            patch.object(solwyn._reporter, "report_settlement", settle_spy),
             patch("solwyn.client._translation.normalize_response", side_effect=RuntimeError),
             pytest.raises(RuntimeError),
         ):
             await solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-        confirm_spy.assert_not_awaited()
+        settle_spy.assert_not_called()
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
         assert success == []
 
@@ -1134,7 +1146,7 @@ class TestPossiblySucceededMatrix:
         openai = _openai_client()
         original = _Status(status_code, "upstream blew up")
         openai.chat.completions.create.side_effect = original
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
@@ -1159,8 +1171,8 @@ class TestPossiblySucceededMatrix:
         anthropic.messages.create.return_value = _anthropic_response()
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
@@ -1182,7 +1194,7 @@ class TestPossiblySucceededMatrix:
     def test_plain_success_leaves_possibly_succeeded_absent(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -1203,12 +1215,12 @@ class TestIsModelFallbackNarrowed:
     """is_model_fallback is same-provider model swap ONLY; never cross-provider."""
 
     def test_same_provider_model_swap_is_model_fallback_only(self) -> None:
-        # Primary gpt-4o 429s (FAILOVER); the SAME OpenAI client serves the
-        # gpt-4o-mini swap. The shared OpenAI breaker records one failure but
+        # Primary gpt-5.5 429s (FAILOVER); the SAME OpenAI client serves the
+        # gpt-5.4-mini swap. The shared OpenAI breaker records one failure but
         # stays closed, so the same-provider second candidate proceeds.
         openai = _openai_client()
         openai.chat.completions.create.side_effect = [_Status(429), _openai_response()]
-        solwyn = _make_solwyn(openai, model="gpt-4o", fallback=[(openai, "gpt-4o-mini")])
+        solwyn = _make_solwyn(openai, model="gpt-5.5", fallback=[(openai, "gpt-5.4-mini")])
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -1217,7 +1229,7 @@ class TestIsModelFallbackNarrowed:
         assert len(success) == 1
         assert success[0].is_model_fallback is True
         assert success[0].is_provider_fallback is False
-        assert success[0].model == "gpt-4o-mini"
+        assert success[0].model == "gpt-5.4-mini"
 
         _close(solwyn)
 
@@ -1227,8 +1239,8 @@ class TestIsModelFallbackNarrowed:
         anthropic.messages.create.return_value = _anthropic_response()
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         _force_primary_open(solwyn, "openai")
 
@@ -1245,7 +1257,7 @@ class TestIsModelFallbackNarrowed:
     def test_primary_success_both_flags_false(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -1281,7 +1293,7 @@ class TestFailoverErrorClassFirewall:
         sentinel = "SECRET_PROMPT_LEAK_a1b2c3"
         openai = _openai_client()
         openai.chat.completions.create.side_effect = _LeakyError(f"boom {sentinel} in body")
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
@@ -1307,7 +1319,7 @@ class TestFailoverErrorClassFirewall:
         openai.chat.completions.create = AsyncMock(
             side_effect=_LeakyError(f"boom {sentinel} in body")
         )
-        solwyn = _make_async_solwyn(openai, model="gpt-4o")
+        solwyn = _make_async_solwyn(openai, model="gpt-5.5")
 
         with (
             patch.object(

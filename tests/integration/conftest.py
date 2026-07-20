@@ -7,7 +7,6 @@ credentials are available (CI).
 
 from __future__ import annotations
 
-import inspect
 import os
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -202,7 +201,7 @@ def hard_denied_credentials(api_url: str) -> Credentials:
     """Credentials for a project driven OVER its hard_deny budget limit.
 
     Bootstraps a dedicated project (hard_deny, $0.05 limit) and burns it with
-    one large confirmed spend (~$2.50 of gpt-4o tokens), then verifies with a
+    one large confirmed spend (~$2.50 of gpt-5.5 tokens), then verifies with a
     fresh enforcer (no allow-cache) that the API now denies. E2E tests use
     these credentials to prove BudgetExceededError surfaces from the wrapper
     WITHOUT the provider being called. Session-scoped: usage persists.
@@ -225,16 +224,24 @@ def hard_denied_credentials(api_url: str) -> Credentials:
         api_url=api_url, api_key=key, budget_mode=BudgetMode.HARD_DENY, fail_open=False
     )
     try:
-        check = burner.check_budget(estimated_input_tokens=100, model="gpt-4o", provider="openai")
+        check = burner.check_budget(estimated_input_tokens=100, model="gpt-5.5", provider="openai")
         if check.reservation_id is None:
             pytest.fail("hard-deny bootstrap: expected a reservation on a fresh project")
-        burner.confirm_cost(
+        # Settlement lives in the reporter now (no enforcer.confirm_cost): build
+        # the confirm sans-I/O on the enforcer, then send it synchronously via a
+        # throwaway reporter's _send_confirm so the burn lands before we verify.
+        confirm = burner.build_confirm_request(
             reservation_id=check.reservation_id,
-            model="gpt-4o",
+            model="gpt-5.5",
             token_details=TokenDetails(input_tokens=200_000, output_tokens=200_000),
             provider="openai",
             call_id=f"harness-burn-{session_id}",
         )
+        burn_reporter = MetadataReporter(api_url=api_url, api_key=key)
+        try:
+            burn_reporter._send_confirm(confirm)
+        finally:
+            burn_reporter.close()
     finally:
         burner.close()
 
@@ -244,7 +251,7 @@ def hard_denied_credentials(api_url: str) -> Credentials:
     )
     try:
         denied = verifier.check_budget(
-            estimated_input_tokens=100, model="gpt-4o", provider="openai"
+            estimated_input_tokens=100, model="gpt-5.5", provider="openai"
         )
     finally:
         verifier.close()
@@ -272,7 +279,7 @@ SAMPLE_TOKEN_DETAILS = TokenDetails(input_tokens=100, output_tokens=50)
 # - budget_check_cache_ttl=0 on every wrapped client: the enforcer's allow-
 #   cache returns reservation_id=None on hits, which silently skips confirm
 #   for a second same-client call inside the 5s default TTL.
-# - Happy-path calls use a model the API prices (gpt-4o): unpriced models are
+# - Happy-path calls use a model the API prices (gpt-5.5): unpriced models are
 #   allowed WITHOUT a reservation, so confirm never fires.
 # - WireRecorder wraps private seams (client._budget / client._reporter) by
 #   design: it records the wire-bound payloads while REAL delivery to the live
@@ -336,59 +343,28 @@ def expected_compat_provider(server: FakeProviderServer) -> str:
 class WireRecorder:
     """Records wire-bound payloads while delegating to the real implementations.
 
-    Wraps three seams on a constructed wrapper client (sync or async):
-    - budget.confirm_cost      -> .confirms (kwargs dicts incl. token_details)
-    - reporter.report          -> .events (MetadataEvent, queued for ingest)
+    Wraps two reporter seams on a constructed wrapper client (sync or async):
     - reporter.report_settlement -> .settlements ((confirm_request, event));
-      the STREAMING settlement path. A streamed call WITH a reservation
-      settles here (confirm+event as one unit) and never calls
-      confirm_cost/report directly — but a streaming ERROR, or a streamed
-      call with no reservation (e.g. unpriced model), still reports via
-      ``report`` (see client.py on_complete/on_error).
+      the SINGLE settlement path for EVERY reservation-backed success —
+      non-streaming chat/media AND streaming (PJ-1: settlement rides the
+      reporter queue off the hot path; the enforcers have no confirm_cost).
+      The confirm and its metadata event travel as one ordered unit.
+    - reporter.report          -> .events (MetadataEvent, queued for ingest);
+      the NON-settlement reports: a budget denial, a reservation-less success
+      (e.g. an unpriced model), and every streaming/non-streaming ERROR (see
+      client.py on_complete/on_error).
 
     Delegation is preserved, so everything still reaches the live API.
     """
 
     def __init__(self) -> None:
-        self.confirms: list[dict[str, Any]] = []
         self.events: list[MetadataEvent] = []
         self.settlements: list[tuple[Any, MetadataEvent]] = []
 
     def attach(self, client: Any) -> WireRecorder:
-        budget = client._budget
         reporter = client._reporter
-        real_confirm = budget.confirm_cost
         real_report = reporter.report
         real_settlement = reporter.report_settlement
-
-        def record(reservation_id: str, model: str, token_details: Any, **kwargs: Any) -> None:
-            self.confirms.append(
-                {
-                    "reservation_id": reservation_id,
-                    "model": model,
-                    "token_details": token_details,
-                    **kwargs,
-                }
-            )
-
-        if inspect.iscoroutinefunction(real_confirm):
-
-            async def async_confirm(
-                reservation_id: str, model: str, token_details: Any, **kwargs: Any
-            ) -> None:
-                record(reservation_id, model, token_details, **kwargs)
-                await real_confirm(reservation_id, model, token_details, **kwargs)
-
-            budget.confirm_cost = async_confirm
-        else:
-
-            def sync_confirm(
-                reservation_id: str, model: str, token_details: Any, **kwargs: Any
-            ) -> None:
-                record(reservation_id, model, token_details, **kwargs)
-                real_confirm(reservation_id, model, token_details, **kwargs)
-
-            budget.confirm_cost = sync_confirm
 
         def recording_report(event: MetadataEvent) -> None:
             self.events.append(event)

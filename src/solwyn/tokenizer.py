@@ -30,11 +30,11 @@ class TokenizerManager:
     Usage::
 
         tm = TokenizerManager()
-        est = tm.estimate_tokens("Hello world", model="gpt-4o", provider="openai")
+        est = tm.estimate_tokens("Hello world", model="gpt-5.5", provider="openai")
 
         # With an Anthropic client for exact counting
         tm = TokenizerManager(anthropic_client=my_client)
-        exact = tm.count_tokens(messages, model="claude-sonnet-4-5", provider="anthropic")
+        exact = tm.count_tokens(messages, model="claude-sonnet-5", provider="anthropic")
     """
 
     def __init__(self, anthropic_client: Any | None = None) -> None:
@@ -61,7 +61,7 @@ class TokenizerManager:
 
         Args:
             text: The text to tokenize.
-            model: Model name (e.g. ``"gpt-4o"``, ``"claude-sonnet-4-5"``).
+            model: Model name (e.g. ``"gpt-5.5"``, ``"claude-sonnet-5"``).
             provider: Provider name (e.g. ``"openai"``, ``"anthropic"``,
                 ``"google"``).  Any other value falls back to ``len(text) // 4``.
 

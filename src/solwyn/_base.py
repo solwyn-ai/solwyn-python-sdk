@@ -337,6 +337,16 @@ class _SolwynBase:
             if provider not in self._circuit_breakers:
                 self._circuit_breakers[provider] = self._new_circuit_breaker()
 
+        # ONE control-plane breaker per client instance, shared by the budget
+        # enforcer (check) and the reporter (confirm): the SDK discovers a
+        # Solwyn outage once, not once per call. Never provider-reported.
+        self._control_plane_breaker = CircuitBreaker(
+            failure_threshold=config.control_plane_failure_threshold,
+            recovery_timeout=config.control_plane_recovery_timeout,
+            success_threshold=1,
+            name="control-plane",
+        )
+
     def _new_circuit_breaker(self) -> CircuitBreaker:
         """Create a circuit breaker from the configured tuning + jitter."""
         return CircuitBreaker(

@@ -26,9 +26,9 @@ class TestCompatDetection:
         assert client._adapter.name == "openai_compatible"
 
         recorder = WireRecorder().attach(client)
-        client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
-        # The live API accepted a confirm attributed to the catch-all name.
-        assert recorder.confirms[0]["provider"] == "openai_compatible"
+        client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
+        # The live API accepted a settlement attributed to the catch-all name.
+        assert recorder.settlements[0][0].provider.value == "openai_compatible"
 
     @pytest.mark.integration
     def test_conventional_port_detected_and_attributed(
@@ -39,7 +39,8 @@ class TestCompatDetection:
         assert client._adapter.name == expected
 
         recorder = WireRecorder().attach(client)
-        client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+        client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
         assert fake_provider_known_port.request_count == 1
-        assert recorder.confirms[0]["provider"] == expected
-        assert recorder.events[0].provider.value == expected
+        confirm_request, event = recorder.settlements[0]
+        assert confirm_request.provider.value == expected
+        assert event.provider.value == expected

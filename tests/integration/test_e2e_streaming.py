@@ -30,7 +30,7 @@ class TestStreamErrorSettlement:
         recorder = WireRecorder().attach(client)
         fake_provider.drop_next_stream(after_chunks=1)
 
-        stream = client.chat.completions.create(model="gpt-4o", messages=MESSAGES, stream=True)
+        stream = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES, stream=True)
         with pytest.raises(httpx.RemoteProtocolError):
             for _chunk in stream:
                 pass
@@ -39,7 +39,6 @@ class TestStreamErrorSettlement:
         error_events = [e for e in recorder.events if e.status == CallStatus.ERROR]
         assert len(error_events) == 1
         assert recorder.settlements == []
-        assert recorder.confirms == []
 
         # Exactly once: poking close() after the error must not settle again
         stream.close()
@@ -59,11 +58,13 @@ class TestUsageEstimation:
         recorder = WireRecorder().attach(client)
         fake_provider.set_omit_usage(True)
 
-        response = client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+        response = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
 
         assert response.choices[0].message.content == RESPONSE_CONTENT
-        assert len(recorder.confirms) == 1
-        details = recorder.confirms[0]["token_details"]
+        # Non-streaming success settles via report_settlement (confirm + event).
+        assert len(recorder.settlements) == 1
+        confirm_request, _event = recorder.settlements[0]
+        details = confirm_request.token_details
         assert details.is_estimated is True
         assert details.input_tokens > 0  # length-based, never zero
         assert details.output_tokens > 0
@@ -76,7 +77,7 @@ class TestUsageEstimation:
         recorder = WireRecorder().attach(client)
         fake_provider.set_omit_usage(True)
 
-        stream = client.chat.completions.create(model="gpt-4o", messages=MESSAGES, stream=True)
+        stream = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES, stream=True)
         content = "".join(
             chunk.choices[0].delta.content or ""
             for chunk in stream
@@ -105,7 +106,7 @@ class TestAsyncStreaming:
         recorder = WireRecorder().attach(client)
 
         stream = await client.chat.completions.create(
-            model="gpt-4o", messages=MESSAGES, stream=True
+            model="gpt-5.5", messages=MESSAGES, stream=True
         )
         content = ""
         async for chunk in stream:
@@ -119,7 +120,7 @@ class TestAsyncStreaming:
         assert confirm_request.token_details.output_tokens == fake_provider.completion_tokens
         assert confirm_request.token_details.is_estimated is False
         assert event.status == CallStatus.SUCCESS
-        assert recorder.confirms == []
+        assert recorder.events == []
 
         # Exactly once: closing an exhausted stream must not settle again
         await stream.close()

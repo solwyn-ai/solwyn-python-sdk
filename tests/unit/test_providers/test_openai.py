@@ -118,7 +118,7 @@ class TestOpenAIAdapterProtocol:
 @pytest.mark.unit
 class TestOpenAIAdapterDetect:
     def test_detect_model_gpt(self) -> None:
-        assert OpenAIAdapter().detect_model("gpt-4o") is True
+        assert OpenAIAdapter().detect_model("gpt-5.5") is True
 
     def test_detect_model_gpt_4(self) -> None:
         assert OpenAIAdapter().detect_model("gpt-4") is True
@@ -130,7 +130,7 @@ class TestOpenAIAdapterDetect:
         assert OpenAIAdapter().detect_model("o4-mini") is True
 
     def test_detect_model_does_not_match_claude(self) -> None:
-        assert OpenAIAdapter().detect_model("claude-3-5-sonnet") is False
+        assert OpenAIAdapter().detect_model("claude-sonnet-5") is False
 
     def test_detect_model_does_not_match_gemini(self) -> None:
         assert OpenAIAdapter().detect_model("gemini-2.5-flash") is False
@@ -440,21 +440,21 @@ class TestOpenAIAdapterDispatchSeams:
             return kwargs
 
         client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-        kwargs: dict[str, Any] = {"model": "gpt-4o"}
+        kwargs: dict[str, Any] = {"model": "gpt-5.5"}
 
         method, prepared = OpenAIAdapter().prepare_call(
             client, kwargs, is_streaming=False, timeout=30.0, max_retries=0
         )
 
         assert method is create
-        assert prepared == {"model": "gpt-4o"}
+        assert prepared == {"model": "gpt-5.5"}
         assert prepared is not kwargs  # never mutates / aliases the input
 
     def test_prepare_call_streaming_sets_stream_kwarg_without_mutation(self) -> None:
         client = SimpleNamespace(
             chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: kw))
         )
-        kwargs: dict[str, Any] = {"model": "gpt-4o"}
+        kwargs: dict[str, Any] = {"model": "gpt-5.5"}
 
         _, prepared = OpenAIAdapter().prepare_call(
             client, kwargs, is_streaming=True, timeout=30.0, max_retries=0
@@ -492,14 +492,14 @@ class TestOpenAIAdapterDispatchSeams:
             return kwargs
 
         client = SimpleNamespace(images=SimpleNamespace(generate=generate, edit=lambda **k: k))
-        kwargs: dict[str, Any] = {"model": "gpt-image-1", "prompt": "a cat", "n": 2}
+        kwargs: dict[str, Any] = {"model": "gpt-image-2", "prompt": "a cat", "n": 2}
 
         method, prepared = OpenAIAdapter().prepare_media_call(
             "images", client, kwargs, timeout=30.0, max_retries=0
         )
 
         assert method is generate
-        assert prepared == {"model": "gpt-image-1", "prompt": "a cat", "n": 2}
+        assert prepared == {"model": "gpt-image-2", "prompt": "a cat", "n": 2}
         assert prepared is not kwargs  # never mutates / aliases the input
 
     def test_prepare_media_call_images_edit_marker_selects_edit_and_is_stripped(self) -> None:
@@ -508,7 +508,7 @@ class TestOpenAIAdapterDispatchSeams:
             return kwargs
 
         client = SimpleNamespace(images=SimpleNamespace(generate=lambda **k: k, edit=edit))
-        kwargs: dict[str, Any] = {"model": "gpt-image-1", "prompt": "a cat", _IMAGE_OP_KEY: "edit"}
+        kwargs: dict[str, Any] = {"model": "gpt-image-2", "prompt": "a cat", _IMAGE_OP_KEY: "edit"}
 
         method, prepared = OpenAIAdapter().prepare_media_call(
             "images", client, kwargs, timeout=30.0, max_retries=0
@@ -516,7 +516,7 @@ class TestOpenAIAdapterDispatchSeams:
 
         assert method is edit
         assert _IMAGE_OP_KEY not in prepared  # marker stripped before the SDK call
-        assert prepared == {"model": "gpt-image-1", "prompt": "a cat"}
+        assert prepared == {"model": "gpt-image-2", "prompt": "a cat"}
 
     def test_prepare_media_call_audio_selects_transcriptions_create(self) -> None:
         # audio routes to client.audio.transcriptions.create by default (no op

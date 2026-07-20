@@ -18,7 +18,7 @@ from solwyn.reporter import AsyncMetadataReporter
 def _make_event(**overrides) -> MetadataEvent:
     """Create a MetadataEvent with sensible test defaults."""
     defaults = {
-        "model": "gpt-4o",
+        "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
         "input_tokens": 100,
         "output_tokens": 50,
@@ -36,7 +36,7 @@ def _make_event(**overrides) -> MetadataEvent:
 def _make_confirm_request(**overrides) -> BudgetConfirmRequest:
     defaults = {
         "reservation_id": "res_123",
-        "model": "gpt-4o",
+        "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
         "call_id": "call_async_confirm",
         "token_details": TokenDetails(input_tokens=10, output_tokens=5),
@@ -325,7 +325,7 @@ class TestAsyncReporterSendBatch:
             "rejected": [
                 {"index": 0, "code": "unknown_model", "model": "vendor-x-1", "message": "m"},
                 {"index": 1, "code": "unknown_model", "model": "vendor-x-1", "message": "m"},
-                {"index": 2, "code": "unknown_service_tier", "model": "gpt-4o", "message": "m2"},
+                {"index": 2, "code": "unknown_service_tier", "model": "gpt-5.5", "message": "m2"},
             ],
         }
 
@@ -348,7 +348,7 @@ class TestAsyncReporterSendBatch:
         assert len(rejection_logs) == 2
         assert any("code=unknown_model model=vendor-x-1 count=2" in line for line in rejection_logs)
         assert any(
-            "code=unknown_service_tier model=gpt-4o count=1" in line for line in rejection_logs
+            "code=unknown_service_tier model=gpt-5.5 count=1" in line for line in rejection_logs
         )
         await reporter._http.aclose()
 

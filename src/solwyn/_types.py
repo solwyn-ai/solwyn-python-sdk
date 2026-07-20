@@ -268,7 +268,7 @@ class MetadataEvent(BaseModel):
         return {key: value for key, value in serialized.items() if value is not None}
 
     model: str = Field(
-        ..., max_length=MODEL_NAME_MAX_LENGTH, description="LLM model name (e.g. gpt-4o)"
+        ..., max_length=MODEL_NAME_MAX_LENGTH, description="LLM model name (e.g. gpt-5.5)"
     )
     provider: ProviderName = Field(..., description="LLM provider")
     modality: Modality = Field(

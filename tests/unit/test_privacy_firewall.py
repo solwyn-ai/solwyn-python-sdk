@@ -533,7 +533,7 @@ def test_failover_solwyn_payloads_carry_no_content() -> None:
     anthropic.messages.create.return_value = SimpleNamespace(
         content=[SimpleNamespace(type="text", text=f"echo {SENTINEL}")],
         stop_reason="end_turn",
-        model="claude-3-5-sonnet",
+        model="claude-sonnet-5",
         usage=SimpleNamespace(input_tokens=11, output_tokens=7),
     )
 
@@ -541,11 +541,12 @@ def test_failover_solwyn_payloads_carry_no_content() -> None:
         solwyn = Solwyn(
             openai,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
-    # Quiesce the reporter's background thread so the flush is deterministic.
-    solwyn._reporter._shutdown.set()
+    # The background thread ran the no-op _flush_loop and exited; _shutdown stays
+    # UNSET so the non-streaming report_settlement can still enqueue the
+    # settlement (report_settlement drops items once shutdown is set).
     solwyn._reporter._thread.join(timeout=2.0)
 
     # Capture every json= body POSTed to config.api_url on BOTH clients.
@@ -560,7 +561,7 @@ def test_failover_solwyn_payloads_carry_no_content() -> None:
         openai_cb.record_failure()
 
     request = {
-        "model": "gpt-4o",
+        "model": "gpt-5.5",
         "messages": [
             {"role": "system", "content": f"system {SENTINEL}"},
             {"role": "user", "content": f"user prompt {SENTINEL}"},
@@ -646,8 +647,8 @@ def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
         solwyn = Solwyn(
             openai,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
     # The background thread ran the no-op _flush_loop and exited; _shutdown stays
     # UNSET so on_complete's report_settlement can still enqueue the settlement.
@@ -664,7 +665,7 @@ def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
         openai_cb.record_failure()
 
     request = {
-        "model": "gpt-4o",
+        "model": "gpt-5.5",
         "messages": [
             {"role": "system", "content": f"system {SENTINEL}"},
             {"role": "user", "content": f"user prompt {SENTINEL}"},

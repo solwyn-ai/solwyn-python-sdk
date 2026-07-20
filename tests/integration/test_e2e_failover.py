@@ -24,7 +24,7 @@ def fallback_spec(fake_provider_fallback: FakeProviderServer):
     """(client, model, default_params, provider) fallback tuple -> second fake."""
     openai = pytest.importorskip("openai")
     inner = openai.OpenAI(base_url=fake_provider_fallback.base_url, api_key="sk-fake-fallback-key")
-    return (inner, "gpt-4o-mini", {}, "groq")
+    return (inner, "gpt-5.4-mini", {}, "groq")
 
 
 @pytest.mark.integration
@@ -45,7 +45,7 @@ class TestSameDialectFailover:
         fake_provider.fail_next(429)  # no Retry-After header
 
         # Act
-        response = client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+        response = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
 
         # Assert — the caller sees the FALLBACK server's response
         assert response.choices[0].message.content == RESPONSE_CONTENT
@@ -54,30 +54,30 @@ class TestSameDialectFailover:
         # Assert — exactly one request per server; the fallback got ITS entry model
         assert fake_provider.request_count == 1  # also proves per-hop max_retries=0
         assert fake_provider_fallback.request_count == 1
-        assert fake_provider_fallback.requests[0].body["model"] == "gpt-4o-mini"
+        assert fake_provider_fallback.requests[0].body["model"] == "gpt-5.4-mini"
 
-        # Assert — confirm settles against the SERVING provider
-        assert len(recorder.confirms) == 1
-        confirm = recorder.confirms[0]
-        assert confirm["provider"] == "groq"
-        assert confirm["model"] == "gpt-4o-mini"
-        assert confirm["token_details"].input_tokens == 77
-        assert confirm["token_details"].output_tokens == 33
-        assert confirm["token_details"].is_estimated is False
+        # Assert — settlement fires against the SERVING provider (confirm +
+        # success event ride report_settlement as one unit)
+        assert len(recorder.settlements) == 1
+        confirm_request, success = recorder.settlements[0]
+        assert confirm_request.provider.value == "groq"
+        assert confirm_request.model == "gpt-5.4-mini"
+        assert confirm_request.token_details.input_tokens == 77
+        assert confirm_request.token_details.output_tokens == 33
+        assert confirm_request.token_details.is_estimated is False
 
-        # Assert — one ERROR event (primary 429) + one SUCCESS event (fallback)
+        # Assert — the primary's 429 ERROR event rode report() (.events); the
+        # fallback SUCCESS event travelled WITH the confirm on the settlement.
         error_events = [e for e in recorder.events if e.status == CallStatus.ERROR]
-        success_events = [e for e in recorder.events if e.status == CallStatus.SUCCESS]
         assert len(error_events) == 1
         assert error_events[0].provider == ProviderName.OPENAI_COMPATIBLE
-        assert len(success_events) == 1
-        success = success_events[0]
+        assert success.status == CallStatus.SUCCESS
         assert success.provider == ProviderName.GROQ
         assert success.is_provider_fallback is True
         assert success.failover_reason == FailoverReason.PRIMARY_ERROR
         assert success.attempt_index == 1
         assert success.requested_provider == ProviderName.OPENAI_COMPATIBLE
-        assert success.requested_model == "gpt-4o"
+        assert success.requested_model == "gpt-5.5"
         assert success.input_tokens == 77
 
     @pytest.mark.integration
@@ -94,12 +94,12 @@ class TestSameDialectFailover:
         recorder = WireRecorder().attach(client)
         fake_provider.fail_next(429, retry_after="0")
 
-        response = client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+        response = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
 
         assert response.usage.prompt_tokens == 77  # fallback served
         assert fake_provider.request_count == 1  # no same-provider re-attempt
         assert fake_provider_fallback.request_count == 1
-        assert recorder.confirms[0]["provider"] == "groq"
+        assert recorder.settlements[0][0].provider.value == "groq"
 
     @pytest.mark.integration
     def test_free_tier_directive_suppresses_same_provider_retries(
@@ -127,7 +127,7 @@ class TestSameDialectFailover:
         fake_provider.fail_next(429, retry_after="0")
 
         with caplog.at_level(logging.WARNING, logger="solwyn._base"):
-            response = client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+            response = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
 
         # The directive — not a broken retry path — is why the primary was not
         # re-attempted: both outcomes land on the fallback, so the suppression
@@ -136,10 +136,11 @@ class TestSameDialectFailover:
         assert response.usage.prompt_tokens == 77  # fallback served
         assert fake_provider.request_count == 1  # retry suppressed: one primary attempt
         assert fake_provider_fallback.request_count == 1
-        assert recorder.confirms[0]["provider"] == "groq"
-        success = [e for e in recorder.events if e.status == CallStatus.SUCCESS]
-        assert len(success) == 1
-        assert success[0].is_provider_fallback is True
+        assert len(recorder.settlements) == 1
+        confirm_request, success = recorder.settlements[0]
+        assert confirm_request.provider.value == "groq"
+        assert success.status == CallStatus.SUCCESS
+        assert success.is_provider_fallback is True
 
     @pytest.mark.integration
     def test_chain_exhaustion_reraises_last_provider_error(
@@ -156,11 +157,11 @@ class TestSameDialectFailover:
         fake_provider_fallback.fail_next(429)
 
         with pytest.raises(openai.RateLimitError):
-            client.chat.completions.create(model="gpt-4o", messages=MESSAGES)
+            client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
 
         assert fake_provider.request_count == 1
         assert fake_provider_fallback.request_count == 1
-        assert recorder.confirms == []
+        assert recorder.settlements == []  # chain exhausted: nothing settled
         error_events = [e for e in recorder.events if e.status == CallStatus.ERROR]
         assert len(error_events) == 2  # one per attempted hop
         assert {e.provider for e in error_events} == {
@@ -180,7 +181,7 @@ class TestSameDialectFailover:
         recorder = WireRecorder().attach(client)
         fake_provider.fail_next(429)
 
-        stream = client.chat.completions.create(model="gpt-4o", messages=MESSAGES, stream=True)
+        stream = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES, stream=True)
         content = "".join(
             chunk.choices[0].delta.content or ""
             for chunk in stream
@@ -197,7 +198,9 @@ class TestSameDialectFailover:
         assert event.status == CallStatus.SUCCESS
         assert event.provider == ProviderName.GROQ
         assert event.is_provider_fallback is True
-        assert recorder.confirms == []
+        # The primary's 429 ERROR still rode report() (.events); only the
+        # fallback SUCCESS settled — one settlement path for every success.
+        assert [e.status for e in recorder.events] == [CallStatus.ERROR]
 
 
 @pytest.mark.integration
@@ -215,12 +218,12 @@ class TestCrossDialectFailover:
         inner_fallback = anthropic.Anthropic(
             base_url=fake_provider_anthropic.base_url, api_key="sk-ant-fake-key"
         )
-        client = make_wrapped_client(fallback=[(inner_fallback, "claude-sonnet-4-5")])
+        client = make_wrapped_client(fallback=[(inner_fallback, "claude-sonnet-5")])
         recorder = WireRecorder().attach(client)
         fake_provider.fail_next(429)
 
         # max_tokens is REQUIRED: the anthropic translation subset fails loud without it.
-        response = client.chat.completions.create(model="gpt-4o", messages=MESSAGES, max_tokens=64)
+        response = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES, max_tokens=64)
 
         # Assert — caller receives the SOURCE-dialect (openai) response shape
         assert response.choices[0].message.content == RESPONSE_CONTENT
@@ -231,23 +234,23 @@ class TestCrossDialectFailover:
         assert fake_provider_anthropic.request_count == 1
         wire = fake_provider_anthropic.requests[0]
         assert wire.path.endswith("/v1/messages")
-        assert wire.body["model"] == "claude-sonnet-4-5"
+        assert wire.body["model"] == "claude-sonnet-5"
         assert wire.body["max_tokens"] == 64
         assert wire.body["messages"][0]["role"] == "user"
 
-        # Assert — usage settled from the ANTHROPIC response (88/44), attributed to it
-        assert len(recorder.confirms) == 1
-        confirm = recorder.confirms[0]
-        assert confirm["provider"] == "anthropic"
-        assert confirm["model"] == "claude-sonnet-4-5"
-        assert confirm["token_details"].input_tokens == 88
-        assert confirm["token_details"].output_tokens == 44
-        assert confirm["token_details"].is_estimated is False
+        # Assert — usage settled from the ANTHROPIC response (88/44), attributed
+        # to it: confirm + success event ride report_settlement as one unit
+        assert len(recorder.settlements) == 1
+        confirm_request, success = recorder.settlements[0]
+        assert confirm_request.provider.value == "anthropic"
+        assert confirm_request.model == "claude-sonnet-5"
+        assert confirm_request.token_details.input_tokens == 88
+        assert confirm_request.token_details.output_tokens == 44
+        assert confirm_request.token_details.is_estimated is False
 
-        success = [e for e in recorder.events if e.status == CallStatus.SUCCESS]
-        assert len(success) == 1
-        assert success[0].provider == ProviderName.ANTHROPIC
-        assert success[0].is_provider_fallback is True
-        assert success[0].failover_reason == FailoverReason.PRIMARY_ERROR
-        assert success[0].requested_provider == ProviderName.OPENAI_COMPATIBLE
-        assert success[0].requested_model == "gpt-4o"
+        assert success.status == CallStatus.SUCCESS
+        assert success.provider == ProviderName.ANTHROPIC
+        assert success.is_provider_fallback is True
+        assert success.failover_reason == FailoverReason.PRIMARY_ERROR
+        assert success.requested_provider == ProviderName.OPENAI_COMPATIBLE
+        assert success.requested_model == "gpt-5.5"

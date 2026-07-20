@@ -92,14 +92,14 @@ def test_build_confirm_request_returns_pydantic_model() -> None:
     )
     request = enforcer.build_confirm_request(
         reservation_id="r_test_123",
-        model="gpt-4o",
+        model="gpt-5.5",
         token_details=token_details,
         provider="openai",
         call_id="call_stream_confirm",
     )
     assert isinstance(request, BudgetConfirmRequest)
     assert request.reservation_id == "r_test_123"
-    assert request.model == "gpt-4o"
+    assert request.model == "gpt-5.5"
     assert request.provider == "openai"
     enforcer.close()
 
@@ -119,7 +119,7 @@ def test_build_confirm_request_narrows_service_tier_to_wire_literals() -> None:
     def _build(tier: str | None) -> BudgetConfirmRequest:
         return enforcer.build_confirm_request(
             reservation_id="r_test_123",
-            model="gpt-4o",
+            model="gpt-5.5",
             token_details=token_details,
             provider="openai",
             call_id="call_tier",

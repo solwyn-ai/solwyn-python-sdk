@@ -18,7 +18,7 @@ class TestFakeProviderServer:
         with FakeProviderServer(prompt_tokens=7, completion_tokens=3) as server:
             r = httpx.post(
                 f"{server.base_url}/chat/completions",
-                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+                json={"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]},
             )
             assert r.status_code == 200
             data = r.json()
@@ -29,7 +29,7 @@ class TestFakeProviderServer:
                 "total_tokens": 10,
             }
             assert server.request_count == 1
-            assert server.requests[0].body["model"] == "gpt-4o"
+            assert server.requests[0].body["model"] == "gpt-5.5"
 
     @pytest.mark.integration
     def test_sse_stream_ends_with_usage_chunk(self) -> None:
@@ -37,7 +37,7 @@ class TestFakeProviderServer:
             with httpx.stream(
                 "POST",
                 f"{server.base_url}/chat/completions",
-                json={"model": "gpt-4o", "messages": [], "stream": True},
+                json={"model": "gpt-5.5", "messages": [], "stream": True},
             ) as r:
                 assert r.headers["content-type"].startswith("text/event-stream")
                 lines = [
@@ -53,7 +53,7 @@ class TestFakeProviderServer:
     def test_fail_next_injects_error_then_recovers(self) -> None:
         with FakeProviderServer() as server:
             server.fail_next(500)
-            body = {"model": "gpt-4o", "messages": []}
+            body = {"model": "gpt-5.5", "messages": []}
             assert httpx.post(f"{server.base_url}/chat/completions", json=body).status_code == 500
             assert httpx.post(f"{server.base_url}/chat/completions", json=body).status_code == 200
 
@@ -135,7 +135,7 @@ class TestFakeAnthropicServer:
             r = httpx.post(
                 f"{server.base_url}/v1/messages",
                 json={
-                    "model": "claude-sonnet-4-5",
+                    "model": "claude-sonnet-5",
                     "max_tokens": 64,
                     "messages": [{"role": "user", "content": "hi"}],
                 },

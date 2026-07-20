@@ -148,24 +148,24 @@ class TestUntranslatableModelError:
     """Raised when a model id is not configured for the target provider (config, not content)."""
 
     def test_is_solwyn_error(self) -> None:
-        exc = UntranslatableModelError(model="gpt-4o", provider="anthropic")
+        exc = UntranslatableModelError(model="gpt-5.5", provider="anthropic")
         assert isinstance(exc, SolwynError)
         assert issubclass(UntranslatableModelError, SolwynError)
 
     def test_structural_fields_stored(self) -> None:
-        exc = UntranslatableModelError(model="gpt-4o", provider="anthropic")
-        assert exc.model == "gpt-4o"
+        exc = UntranslatableModelError(model="gpt-5.5", provider="anthropic")
+        assert exc.model == "gpt-5.5"
         assert exc.provider == "anthropic"
 
     def test_message_carries_model_and_provider(self) -> None:
-        exc = UntranslatableModelError(model="claude-3-5-sonnet", provider="openai")
+        exc = UntranslatableModelError(model="claude-sonnet-5", provider="openai")
         message = str(exc)
-        assert "claude-3-5-sonnet" in message
+        assert "claude-sonnet-5" in message
         assert "openai" in message
 
     def test_constructor_is_keyword_only(self) -> None:
         with pytest.raises(TypeError):
-            UntranslatableModelError("gpt-4o", "anthropic")  # type: ignore[misc]
+            UntranslatableModelError("gpt-5.5", "anthropic")  # type: ignore[misc]
 
 
 @pytest.mark.unit

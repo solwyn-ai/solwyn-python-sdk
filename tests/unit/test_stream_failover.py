@@ -221,7 +221,7 @@ def _google_lazy_async_stream_raising(exc: Exception) -> AsyncIterator[Any]:
 def _openai_text_chunk(text: str | None, finish: str | None = None) -> SimpleNamespace:
     delta = SimpleNamespace(role=None, content=text, tool_calls=None)
     choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish)
-    return SimpleNamespace(choices=[choice], model="gpt-4o", usage=None)
+    return SimpleNamespace(choices=[choice], model="gpt-5.5", usage=None)
 
 
 def _anthropic_text_chunk(text: str) -> SimpleNamespace:
@@ -285,12 +285,12 @@ class TestGoogleStreamingEstablishmentFailover:
 
         solwyn = _make_solwyn(
             google,
-            model="gemini-2.0-flash",
-            fallback=[(openai, "gpt-4o")],
+            model="gemini-3.5-flash",
+            fallback=[(openai, "gpt-5.5")],
         )
 
         request = {
-            "model": "gemini-2.0-flash",
+            "model": "gemini-3.5-flash",
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
             "config": {"max_output_tokens": 256},
         }
@@ -330,12 +330,12 @@ class TestCrossProviderStreamingIntoGoogle:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(google, "gemini-2.0-flash")],
+            model="gpt-5.5",
+            fallback=[(google, "gemini-3.5-flash")],
         )
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 256,
             "stream": True,
@@ -371,12 +371,12 @@ class TestCrossProviderStreamingIntoGoogle:
 
         solwyn = _make_async_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(google, "gemini-2.0-flash")],
+            model="gpt-5.5",
+            fallback=[(google, "gemini-3.5-flash")],
         )
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 256,
             "stream": True,
@@ -413,12 +413,12 @@ class TestGooglePrimaryStreamingFailoverIntoOpenAI:
 
         solwyn = _make_solwyn(
             google,
-            model="gemini-2.0-flash",
-            fallback=[(openai, "gpt-4o")],
+            model="gemini-3.5-flash",
+            fallback=[(openai, "gpt-5.5")],
         )
 
         request = {
-            "model": "gemini-2.0-flash",
+            "model": "gemini-3.5-flash",
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
             "config": {"max_output_tokens": 256},
         }
@@ -456,12 +456,12 @@ class TestGooglePrimaryStreamingFailoverIntoOpenAI:
 
         solwyn = _make_async_solwyn(
             google,
-            model="gemini-2.0-flash",
-            fallback=[(openai, "gpt-4o")],
+            model="gemini-3.5-flash",
+            fallback=[(openai, "gpt-5.5")],
         )
 
         request = {
-            "model": "gemini-2.0-flash",
+            "model": "gemini-3.5-flash",
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
             "config": {"max_output_tokens": 256},
         }
@@ -504,12 +504,12 @@ class TestCrossProviderTextStreamingNormalizes:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -536,12 +536,12 @@ class TestCrossProviderTextStreamingNormalizes:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "weather?"}],
             "stream": True,
             "tools": [
@@ -580,10 +580,10 @@ class TestSameDialectStreamingNoTranslation:
             iter([_openai_text_chunk("a"), _openai_text_chunk(None, finish="stop")]),
         ]
 
-        solwyn = _make_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
+        solwyn = _make_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -623,12 +623,12 @@ class TestMidStreamErrorNeverFailsOver:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -667,13 +667,13 @@ class TestMidStreamErrorNeverFailsOver:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -717,13 +717,13 @@ class TestMidStreamErrorNeverFailsOver:
 
         solwyn = _make_async_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -756,7 +756,7 @@ class TestMidStreamErrorNeverFailsOver:
 class TestEagerEstablishmentFailover:
     def test_openai_primary_eager_establishment_error_fails_over(self) -> None:
         # OpenAI dispatch raises eagerly at establishment (429) BEFORE any chunk.
-        # The candidate walk fails over to a same-provider gpt-4o-mini streaming
+        # The candidate walk fails over to a same-provider gpt-5.4-mini streaming
         # swap; the served stream is the fallback's (no chunk left the primary).
         client = _openai_client()
         client.chat.completions.create.side_effect = [
@@ -764,10 +764,10 @@ class TestEagerEstablishmentFailover:
             iter([_openai_text_chunk("served"), _openai_text_chunk(None, finish="stop")]),
         ]
 
-        solwyn = _make_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
+        solwyn = _make_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -778,7 +778,7 @@ class TestEagerEstablishmentFailover:
 
         # The fallback model served; the stream is its chunks.
         assert client.chat.completions.create.call_count == 2
-        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-4o-mini"
+        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-5.4-mini"
         texts = [
             c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content
         ]
@@ -796,13 +796,13 @@ class TestEagerEstablishmentFailover:
 
         solwyn = _make_solwyn(
             client,
-            model="claude-3-5-sonnet",
-            fallback=[(client, "claude-3-5-haiku", {"max_tokens": 256})],
+            model="claude-sonnet-5",
+            fallback=[(client, "claude-haiku-4-5", {"max_tokens": 256})],
             default_params={"max_tokens": 256},
         )
 
         request = {
-            "model": "claude-3-5-sonnet",
+            "model": "claude-sonnet-5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -812,7 +812,7 @@ class TestEagerEstablishmentFailover:
             chunks = list(stream)
 
         assert client.messages.create.call_count == 2
-        assert client.messages.create.call_args_list[1].kwargs["model"] == "claude-3-5-haiku"
+        assert client.messages.create.call_args_list[1].kwargs["model"] == "claude-haiku-4-5"
         # Same-dialect: raw Anthropic chunks pass straight through.
         assert chunks[0].delta.text == "ok"
         _close(solwyn)
@@ -827,10 +827,10 @@ class TestEagerEstablishmentFailover:
         )
         client.chat.completions.create = AsyncMock(side_effect=[_Status(429), served_stream])
 
-        solwyn = _make_async_solwyn(client, model="gpt-4o", fallback=[(client, "gpt-4o-mini")])
+        solwyn = _make_async_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -842,7 +842,7 @@ class TestEagerEstablishmentFailover:
             chunks = [c async for c in stream]
 
         assert client.chat.completions.create.await_count == 2
-        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-4o-mini"
+        assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-5.4-mini"
         texts = [
             c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content
         ]
@@ -875,12 +875,12 @@ class TestAsyncGoogleStreamingEstablishmentFailover:
 
         solwyn = _make_async_solwyn(
             google,
-            model="gemini-2.0-flash",
-            fallback=[(openai, "gpt-4o")],
+            model="gemini-3.5-flash",
+            fallback=[(openai, "gpt-5.5")],
         )
 
         request = {
-            "model": "gemini-2.0-flash",
+            "model": "gemini-3.5-flash",
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
             "config": {"max_output_tokens": 256},
         }
@@ -967,12 +967,12 @@ class TestMaterializedGoogleStreamForwardsClose:
         )
         google.models.generate_content_stream.return_value = original
 
-        solwyn = _make_solwyn(google, model="gemini-2.0-flash")
+        solwyn = _make_solwyn(google, model="gemini-3.5-flash")
         confirms: list[Any] = []
         solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
 
         request = {
-            "model": "gemini-2.0-flash",
+            "model": "gemini-3.5-flash",
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
             "config": {"max_output_tokens": 256},
         }
@@ -1003,22 +1003,18 @@ class TestMaterializedGoogleStreamForwardsClose:
         )
         google.models.generate_content_stream = AsyncMock(return_value=original)
 
-        solwyn = _make_async_solwyn(google, model="gemini-2.0-flash")
+        solwyn = _make_async_solwyn(google, model="gemini-3.5-flash")
         confirms: list[Any] = []
         solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
-        confirm_mock = AsyncMock()
 
         request = {
-            "model": "gemini-2.0-flash",
+            "model": "gemini-3.5-flash",
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
             "config": {"max_output_tokens": 256},
         }
 
-        with (
-            patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget("resv_g"))
-            ),
-            patch.object(solwyn._budget, "confirm_cost", new=confirm_mock),
+        with patch.object(
+            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget("resv_g"))
         ):
             stream = await solwyn.models.generate_content_stream(**request)
             async with stream:
@@ -1026,8 +1022,9 @@ class TestMaterializedGoogleStreamForwardsClose:
                     break  # abandon after the first chunk
 
         assert original.aclose_calls == 1
+        # Settlement rides report_settlement exactly once (the blocking
+        # confirm_cost path no longer exists).
         assert len(confirms) == 1
-        confirm_mock.assert_not_awaited()
         await _aclose(solwyn)
 
 
@@ -1062,7 +1059,7 @@ class TestNoDoubleEmitThreeChunks:
         c1 = _openai_text_chunk("b")
         c2 = SimpleNamespace(
             choices=[],
-            model="gpt-4o",
+            model="gpt-5.5",
             usage=SimpleNamespace(
                 prompt_tokens=11,
                 completion_tokens=7,
@@ -1073,7 +1070,7 @@ class TestNoDoubleEmitThreeChunks:
         client = _openai_client()
         client.chat.completions.create.return_value = iter([c0, c1, c2])
 
-        solwyn = _make_solwyn(client, model="gpt-4o")
+        solwyn = _make_solwyn(client, model="gpt-5.5")
 
         # Wrap the served runtime's accumulator so we can count observe() calls.
         rt = solwyn._runtimes[0]
@@ -1086,7 +1083,7 @@ class TestNoDoubleEmitThreeChunks:
             return acc
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -1130,14 +1127,14 @@ class TestCrossProviderStreamSettlement:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list[Any] = []
         solwyn._reporter.report = lambda e: events.append(e)
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -1184,14 +1181,14 @@ class TestCrossProviderStreamSettlement:
 
         solwyn = _make_async_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list[Any] = []
         solwyn._reporter.report = lambda e: events.append(e)
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -1237,12 +1234,12 @@ class TestStreamingIdempotencyMatrix:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -1267,12 +1264,12 @@ class TestStreamingIdempotencyMatrix:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -1301,13 +1298,13 @@ class TestStreamingIdempotencyMatrix:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
             failover_idempotency="always",
         )
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -1335,14 +1332,14 @@ class TestStreamingIdempotencyMatrix:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
             failover_idempotency="never",
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -1372,12 +1369,12 @@ class TestStreamingIdempotencyMatrix:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -1412,13 +1409,13 @@ class TestAbandonedStreamSettlement:
             [_openai_text_chunk("a"), _openai_text_chunk("b"), _openai_text_chunk("c")]
         )
 
-        solwyn = _make_solwyn(client, model="gpt-4o")
+        solwyn = _make_solwyn(client, model="gpt-5.5")
         # A reservation makes on_complete build + fire-and-forget a confirm.
         confirms: list[Any] = []
         solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -1448,12 +1445,12 @@ class TestAbandonedStreamSettlement:
             [_openai_text_chunk("a"), _openai_text_chunk("b")]
         )
 
-        solwyn = _make_solwyn(client, model="gpt-4o")
+        solwyn = _make_solwyn(client, model="gpt-5.5")
         confirms: list[Any] = []
         solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -1481,31 +1478,27 @@ class TestAbandonedStreamSettlement:
             )
         )
 
-        solwyn = _make_async_solwyn(client, model="gpt-4o")
+        solwyn = _make_async_solwyn(client, model="gpt-5.5")
         confirms: list[Any] = []
         solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
-        confirm_mock = AsyncMock()
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
 
-        with (
-            patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget("resv_3"))
-            ),
-            patch.object(solwyn._budget, "confirm_cost", new=confirm_mock),
+        with patch.object(
+            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget("resv_3"))
         ):
             stream = await solwyn.chat.completions.create(**request)
             async with stream:
                 async for _chunk in stream:
                     break  # abandon after the first chunk
 
-        # Settled exactly once.
+        # Settled exactly once via report_settlement (the blocking confirm_cost
+        # path no longer exists).
         assert len(confirms) == 1
-        confirm_mock.assert_not_awaited()
         await _aclose(solwyn)
 
 
@@ -1537,12 +1530,12 @@ class TestStreamingSuccessSingleBreakerCredit:
             [_openai_text_chunk("a"), _openai_text_chunk(None, finish="stop")]
         )
 
-        solwyn = _make_solwyn(client, model="gpt-4o", circuit_breaker_success_threshold=2)
+        solwyn = _make_solwyn(client, model="gpt-5.5", circuit_breaker_success_threshold=2)
         cb = solwyn._get_circuit_breaker("openai")
         _force_half_open(cb)
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -1568,7 +1561,7 @@ class TestStreamingSuccessSingleBreakerCredit:
 
         client.chat.completions.create.return_value = _exploding_stream()
 
-        solwyn = _make_solwyn(client, model="gpt-4o")
+        solwyn = _make_solwyn(client, model="gpt-5.5")
         cb = solwyn._get_circuit_breaker("openai")
         record_success = MagicMock(wraps=cb.record_success)
         record_failure = MagicMock(wraps=cb.record_failure)
@@ -1576,7 +1569,7 @@ class TestStreamingSuccessSingleBreakerCredit:
         cb.record_failure = record_failure  # type: ignore[method-assign]
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -1597,16 +1590,16 @@ class TestStreamingSuccessSingleBreakerCredit:
         # dispatch site (there is no on_complete on the non-streaming path).
         client = _openai_client()
         client.chat.completions.create.return_value = SimpleNamespace(
-            model="gpt-4o",
+            model="gpt-5.5",
             choices=[SimpleNamespace(message=SimpleNamespace(content="hi"), finish_reason="stop")],
             usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
         )
 
-        solwyn = _make_solwyn(client, model="gpt-4o", circuit_breaker_success_threshold=2)
+        solwyn = _make_solwyn(client, model="gpt-5.5", circuit_breaker_success_threshold=2)
         cb = solwyn._get_circuit_breaker("openai")
         _force_half_open(cb)
 
-        request = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+        request = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**request)
 
@@ -1625,12 +1618,12 @@ class TestStreamingSuccessSingleBreakerCredit:
             )
         )
 
-        solwyn = _make_async_solwyn(client, model="gpt-4o", circuit_breaker_success_threshold=2)
+        solwyn = _make_async_solwyn(client, model="gpt-5.5", circuit_breaker_success_threshold=2)
         cb = solwyn._get_circuit_breaker("openai")
         _force_half_open(cb)
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }
@@ -1657,7 +1650,7 @@ class TestStreamingSuccessSingleBreakerCredit:
 
         client.chat.completions.create = AsyncMock(return_value=_exploding_stream())
 
-        solwyn = _make_async_solwyn(client, model="gpt-4o")
+        solwyn = _make_async_solwyn(client, model="gpt-5.5")
         cb = solwyn._get_circuit_breaker("openai")
         record_success = MagicMock(wraps=cb.record_success)
         record_failure = MagicMock(wraps=cb.record_failure)
@@ -1665,7 +1658,7 @@ class TestStreamingSuccessSingleBreakerCredit:
         cb.record_failure = record_failure  # type: ignore[method-assign]
 
         request = {
-            "model": "gpt-4o",
+            "model": "gpt-5.5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }

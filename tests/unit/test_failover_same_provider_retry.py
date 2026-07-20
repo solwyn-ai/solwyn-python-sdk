@@ -81,7 +81,7 @@ def _openai_response() -> SimpleNamespace:
     choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
     return SimpleNamespace(
         choices=[choice],
-        model="gpt-4o",
+        model="gpt-5.5",
         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
     )
 
@@ -91,7 +91,7 @@ def _anthropic_response() -> SimpleNamespace:
     return SimpleNamespace(
         content=[block],
         stop_reason="end_turn",
-        model="claude-3-5-sonnet",
+        model="claude-sonnet-5",
         usage=SimpleNamespace(input_tokens=10, output_tokens=5),
     )
 
@@ -139,7 +139,7 @@ class _FixedDeadline:
 
 
 _PLAIN_REQUEST = {
-    "model": "gpt-4o",
+    "model": "gpt-5.5",
     "messages": [{"role": "user", "content": "hi"}],
 }
 
@@ -161,9 +161,9 @@ class TestSameProviderRetryOn429:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
 
@@ -192,9 +192,9 @@ class TestSameProviderRetryOn429:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
         anthropic_cb = solwyn._get_circuit_breaker("anthropic")
@@ -241,9 +241,9 @@ class TestSameProviderRetryOn429:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
 
@@ -272,8 +272,8 @@ class TestSameProviderRetryOn429:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
 
@@ -300,7 +300,7 @@ class TestSameProviderRetryOn429:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
             circuit_breaker_failure_threshold=1,
             circuit_breaker_recovery_timeout=0,
@@ -331,7 +331,7 @@ class TestSameProviderRetryOn429:
         success = _openai_response()
         openai.chat.completions.create.side_effect = [_Status429RetryAfter("0"), success]
 
-        solwyn = _make_solwyn(openai, model="gpt-4o", same_provider_retries=1)
+        solwyn = _make_solwyn(openai, model="gpt-5.5", same_provider_retries=1)
         events: list = []
         solwyn._reporter.report = lambda e: events.append(e)
 
@@ -360,9 +360,9 @@ class TestSameProviderRetryOn429:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list = []
         solwyn._reporter.report = lambda e: events.append(e)
@@ -393,7 +393,7 @@ class TestSameProviderRetryOn429:
             success,
         ]
 
-        solwyn = _make_solwyn(openai, model="gpt-4o", same_provider_retries=2)
+        solwyn = _make_solwyn(openai, model="gpt-5.5", same_provider_retries=2)
         openai_cb = solwyn._get_circuit_breaker("openai")
 
         with (
@@ -418,9 +418,9 @@ class TestSameProviderRetryOn429:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=2,
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
 
@@ -447,9 +447,9 @@ class TestSameProviderRetryOn429:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with (
@@ -472,7 +472,7 @@ class TestSameProviderRetryOn429:
         success = _openai_response()
         openai.chat.completions.create.side_effect = [_Status429RetryAfter("4"), success]
 
-        solwyn = _make_solwyn(openai, model="gpt-4o", same_provider_retries=1)
+        solwyn = _make_solwyn(openai, model="gpt-5.5", same_provider_retries=1)
 
         with (
             patch("solwyn.client.Deadline", _FixedDeadline),
@@ -498,9 +498,9 @@ class TestSameProviderRetryOn429:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
 
@@ -529,7 +529,7 @@ class TestSameProviderRetryOn429:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
             circuit_breaker_failure_threshold=1,
             circuit_breaker_recovery_timeout=0,
@@ -566,10 +566,10 @@ class TestSameProviderRetryOn429:
 
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
             failover_idempotency="never",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
         with (
@@ -596,7 +596,7 @@ class TestSameProviderRetryOn429:
             success,
         ]
 
-        solwyn = _make_solwyn(openai, model="gpt-4o", same_provider_retries=1)
+        solwyn = _make_solwyn(openai, model="gpt-5.5", same_provider_retries=1)
 
         with (
             patch("solwyn.client.time.sleep") as sleep,
@@ -625,9 +625,9 @@ class TestSameProviderRetryOn429:
 
         solwyn = _make_solwyn(
             client,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
-            fallback=[(client, "gpt-4o-mini")],
+            fallback=[(client, "gpt-5.4-mini")],
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
 
@@ -640,9 +640,9 @@ class TestSameProviderRetryOn429:
         assert result is success
         assert client.chat.completions.create.call_count == 3
         assert [c.kwargs["model"] for c in client.chat.completions.create.call_args_list] == [
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4o-mini",
+            "gpt-5.5",
+            "gpt-5.4-mini",
+            "gpt-5.4-mini",
         ]
         sleep.assert_called_once_with(0.0)
         assert openai_cb.failure_count == 0
@@ -667,9 +667,9 @@ class TestAsyncSameProviderRetryOn429:
         solwyn = AsyncSolwyn(
             openai,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         solwyn._reporter.report = MagicMock()
         openai_cb = solwyn._get_circuit_breaker("openai")
@@ -702,9 +702,9 @@ class TestAsyncSameProviderRetryOn429:
         solwyn = AsyncSolwyn(
             openai,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         solwyn._reporter.report = MagicMock()
         openai_cb = solwyn._get_circuit_breaker("openai")
@@ -757,9 +757,9 @@ class TestAsyncSameProviderRetryOn429:
         solwyn = AsyncSolwyn(
             openai,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         solwyn._reporter.report = MagicMock()
         openai_cb = solwyn._get_circuit_breaker("openai")
@@ -792,8 +792,8 @@ class TestAsyncSameProviderRetryOn429:
         solwyn = AsyncSolwyn(
             openai,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         solwyn._reporter.report = MagicMock()
         openai_cb = solwyn._get_circuit_breaker("openai")
@@ -825,7 +825,7 @@ class TestAsyncSameProviderRetryOn429:
         solwyn = AsyncSolwyn(
             openai,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
+            model="gpt-5.5",
             same_provider_retries=1,
             circuit_breaker_failure_threshold=1,
             circuit_breaker_recovery_timeout=0,
@@ -860,7 +860,9 @@ class TestAsyncSameProviderRetryOn429:
         success = _openai_response()
         openai.chat.completions.create = AsyncMock(side_effect=[_Status429RetryAfter("0"), success])
 
-        solwyn = AsyncSolwyn(openai, api_key=VALID_API_KEY, model="gpt-4o", same_provider_retries=1)
+        solwyn = AsyncSolwyn(
+            openai, api_key=VALID_API_KEY, model="gpt-5.5", same_provider_retries=1
+        )
         events: list = []
         solwyn._reporter.report = lambda e: events.append(e)
         openai_cb = solwyn._get_circuit_breaker("openai")

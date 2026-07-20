@@ -354,7 +354,7 @@ class TestDetectModel:
             get_adapter_for_model("llama-3-8b")
 
     def test_gpt_model_still_detects_openai(self) -> None:
-        adapter = get_adapter_for_model("gpt-4o")
+        adapter = get_adapter_for_model("gpt-5.5")
         assert adapter.name == "openai"
 
 

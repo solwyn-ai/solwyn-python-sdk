@@ -28,15 +28,15 @@ class TestProviderEntry:
     """ProviderEntry models a configured chain link — never carries creds."""
 
     def test_minimal_construction(self) -> None:
-        entry = ProviderEntry(provider=ProviderName.OPENAI, model="gpt-4o")
+        entry = ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")
 
         assert entry.provider is ProviderName.OPENAI
-        assert entry.model == "gpt-4o"
+        assert entry.model == "gpt-5.5"
         assert entry.default_params == {}
 
     def test_default_params_independent_per_instance(self) -> None:
         # default_factory must not share a single dict across instances.
-        a = ProviderEntry(provider=ProviderName.OPENAI, model="gpt-4o")
+        a = ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")
         b = ProviderEntry(provider=ProviderName.ANTHROPIC, model="claude-x")
 
         a.default_params["temperature"] = 0.1
@@ -48,7 +48,7 @@ class TestProviderEntry:
         with pytest.raises(ValidationError):
             ProviderEntry(
                 provider=ProviderName.OPENAI,
-                model="gpt-4o",
+                model="gpt-5.5",
                 api_key="sk-secret",  # type: ignore[call-arg]
             )
 
@@ -56,7 +56,7 @@ class TestProviderEntry:
         with pytest.raises(ValidationError):
             ProviderEntry(
                 provider=ProviderName.OPENAI,
-                model="gpt-4o",
+                model="gpt-5.5",
                 base_url="https://example.test",  # type: ignore[call-arg]
             )
 
@@ -80,7 +80,7 @@ class TestFailoverReason:
 
 def _metadata_event(**overrides: object) -> MetadataEvent:
     base: dict[str, object] = {
-        "model": "gpt-4o",
+        "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
         "input_tokens": 10,
         "output_tokens": 5,
@@ -126,7 +126,7 @@ class TestMetadataEventFailoverFields:
         ev = _metadata_event(
             is_provider_fallback=True,
             requested_provider=ProviderName.OPENAI,
-            requested_model="gpt-4o",
+            requested_model="gpt-5.5",
             failover_reason=FailoverReason.PRIMARY_ERROR,
             failover_error_class="APITimeoutError",
             attempt_index=1,
@@ -135,7 +135,7 @@ class TestMetadataEventFailoverFields:
 
         assert dumped["is_provider_fallback"] is True
         assert dumped["requested_provider"] == "openai"
-        assert dumped["requested_model"] == "gpt-4o"
+        assert dumped["requested_model"] == "gpt-5.5"
         assert dumped["failover_reason"] == "primary_error"
         assert dumped["failover_error_class"] == "APITimeoutError"
         assert dumped["attempt_index"] == 1
@@ -164,7 +164,7 @@ class TestMetadataEventReconciliationFields:
         # per-call id explicitly so metadata + confirm cannot silently diverge.
         with pytest.raises(ValidationError):
             MetadataEvent(
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider=ProviderName.OPENAI,
                 input_tokens=10,
                 output_tokens=5,
@@ -210,7 +210,7 @@ class TestBudgetCheckRequestChainHints:
     def test_defaults_empty(self) -> None:
         req = BudgetCheckRequest(
             estimated_input_tokens=10,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider=ProviderName.OPENAI,
         )
 
@@ -220,7 +220,7 @@ class TestBudgetCheckRequestChainHints:
     def test_aligned_hints_accepted(self) -> None:
         req = BudgetCheckRequest(
             estimated_input_tokens=10,
-            model="gpt-4o",
+            model="gpt-5.5",
             provider=ProviderName.OPENAI,
             fallback_providers=[ProviderName.ANTHROPIC],
             fallback_models=["claude-x"],
@@ -233,7 +233,7 @@ class TestBudgetCheckRequestChainHints:
         with pytest.raises(ValidationError):
             BudgetCheckRequest(
                 estimated_input_tokens=10,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider=ProviderName.OPENAI,
                 fallback_providers=[ProviderName.ANTHROPIC],
                 fallback_models=[],
@@ -243,7 +243,7 @@ class TestBudgetCheckRequestChainHints:
         with pytest.raises(ValidationError):
             BudgetCheckRequest(
                 estimated_input_tokens=10,
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider=ProviderName.OPENAI,
                 fallback_providers=[ProviderName.ANTHROPIC] * 9,
                 fallback_models=["claude-x"] * 9,
@@ -253,7 +253,7 @@ class TestBudgetCheckRequestChainHints:
 def _confirm_request(**overrides: object) -> BudgetConfirmRequest:
     base: dict[str, object] = {
         "reservation_id": "res_123",
-        "model": "gpt-4o",
+        "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
         "token_details": TokenDetails(input_tokens=10, output_tokens=5),
         "call_id": "call-test-123",
@@ -270,7 +270,7 @@ class TestBudgetConfirmRequestCallId:
         with pytest.raises(ValidationError):
             BudgetConfirmRequest(
                 reservation_id="res_123",
-                model="gpt-4o",
+                model="gpt-5.5",
                 provider=ProviderName.OPENAI,
                 token_details=TokenDetails(input_tokens=10, output_tokens=5),
             )

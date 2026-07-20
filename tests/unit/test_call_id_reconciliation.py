@@ -38,7 +38,7 @@ def _openai_response() -> SimpleNamespace:
     choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
     return SimpleNamespace(
         choices=[choice],
-        model="gpt-4o",
+        model="gpt-5.5",
         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
     )
 
@@ -63,6 +63,9 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
     solwyn._reporter._shutdown.set()
     solwyn._reporter._thread.join(timeout=2.0)
     solwyn._reporter.report = MagicMock()
+    # Non-streaming settlement now rides report_settlement(confirm, event); keep
+    # the SUCCESS event observable on report() by forwarding the settled event.
+    solwyn._reporter.report_settlement = lambda _req, event: solwyn._reporter.report(event)
     return solwyn
 
 
@@ -72,7 +75,7 @@ def _close(solwyn: Solwyn) -> None:
 
 
 _PLAIN_REQUEST = {
-    "model": "gpt-4o",
+    "model": "gpt-5.5",
     "messages": [{"role": "user", "content": "hi"}],
 }
 
@@ -84,13 +87,16 @@ class TestCallIdJoinKey:
     def test_success_event_and_confirm_share_call_id(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
-        confirm_spy = MagicMock()
-        with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
-            patch.object(solwyn._budget, "confirm_cost", confirm_spy),
-        ):
+        settlements: list[tuple[object, object]] = []
+
+        def report_settlement(req: object, event: object) -> None:
+            settlements.append((req, event))
+            solwyn._reporter.report(event)
+
+        solwyn._reporter.report_settlement = report_settlement
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # The success metadata event carries a call_id…
@@ -100,16 +106,18 @@ class TestCallIdJoinKey:
         event_call_id = success[0].call_id
         assert event_call_id
 
-        # …and the confirm was threaded the SAME call_id (the join key).
-        confirm_spy.assert_called_once()
-        assert confirm_spy.call_args.kwargs["call_id"] == event_call_id
+        # …and the confirm settled alongside it carries the SAME call_id (the
+        # join key).
+        assert len(settlements) == 1
+        confirm, _event = settlements[0]
+        assert confirm.call_id == event_call_id
 
         _close(solwyn)
 
     def test_call_id_unique_across_calls(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -135,20 +143,21 @@ class TestCacheHitReconciliation:
         # token_details, AND the served provider — the confirm-free path.
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
-        confirm_spy = MagicMock()
+        settle_spy = MagicMock()
         # reservation_id=None mimics a budget-cache hit.
         with (
             patch.object(
                 solwyn._budget, "check_budget", return_value=_allow_budget(reservation_id=None)
             ),
-            patch.object(solwyn._budget, "confirm_cost", confirm_spy),
+            patch.object(solwyn._reporter, "report_settlement", settle_spy),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-        # (a) confirm_cost is NOT called on a cache hit.
-        confirm_spy.assert_not_called()
+        # (a) settlement is NOT enqueued on a cache hit (no reservation to settle);
+        #     the SUCCESS event rides the plain report() path instead.
+        settle_spy.assert_not_called()
 
         # (b) the SUCCESS metadata event ALONE carries everything the Cloud API
         #     needs to reconcile: a non-None call_id, token_details, and the
@@ -175,7 +184,7 @@ class TestPossiblySucceededAbortFlag:
         original = APITimeoutError("read timed out")
         openai.chat.completions.create.side_effect = original
         # No fallback: safe default re-raises the ORIGINAL post-send-ambiguous exc.
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
@@ -199,7 +208,7 @@ class TestPossiblySucceededAbortFlag:
     def test_success_event_leaves_possibly_succeeded_none(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)

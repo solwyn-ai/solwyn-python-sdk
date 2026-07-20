@@ -98,13 +98,13 @@ class TestGoogleAdapterDetect:
         assert GoogleAdapter().detect_model("gemini-2.5-pro") is True
 
     def test_detect_model_gemini_flash_lite(self) -> None:
-        assert GoogleAdapter().detect_model("gemini-2.0-flash-lite") is True
+        assert GoogleAdapter().detect_model("gemini-3.1-flash-lite") is True
 
     def test_detect_model_does_not_match_gpt(self) -> None:
-        assert GoogleAdapter().detect_model("gpt-4o") is False
+        assert GoogleAdapter().detect_model("gpt-5.5") is False
 
     def test_detect_model_does_not_match_claude(self) -> None:
-        assert GoogleAdapter().detect_model("claude-3-5-sonnet") is False
+        assert GoogleAdapter().detect_model("claude-sonnet-5") is False
 
     def test_detect_client_google_genai_module(self) -> None:
         class FakeClient:
@@ -385,7 +385,7 @@ class TestGoogleAdapterDispatchSeams:
 
     def test_prepare_call_strips_stream_and_applies_http_bound(self) -> None:
         client = self._client()
-        kwargs: dict[str, Any] = {"model": "gemini-2.0-flash", "stream": True}
+        kwargs: dict[str, Any] = {"model": "gemini-3.5-flash", "stream": True}
         original = dict(kwargs)
 
         method, prepared = GoogleAdapter().prepare_call(
@@ -403,7 +403,7 @@ class TestGoogleAdapterDispatchSeams:
         client = self._client()
 
         method, _ = GoogleAdapter().prepare_call(
-            client, {"model": "gemini-2.0-flash"}, is_streaming=True, timeout=30.0, max_retries=0
+            client, {"model": "gemini-3.5-flash"}, is_streaming=True, timeout=30.0, max_retries=0
         )
 
         assert method is client.models.generate_content_stream
@@ -411,7 +411,7 @@ class TestGoogleAdapterDispatchSeams:
     def test_prepare_call_preserves_caller_config_keys(self) -> None:
         client = self._client()
         kwargs: dict[str, Any] = {
-            "model": "gemini-2.0-flash",
+            "model": "gemini-3.5-flash",
             "config": {"temperature": 0.2, "http_options": {"headers": {"x-a": "1"}}},
         }
 

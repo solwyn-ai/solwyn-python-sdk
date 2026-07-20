@@ -57,7 +57,7 @@ def _openai_response() -> SimpleNamespace:
     choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
     return SimpleNamespace(
         choices=[choice],
-        model="gpt-4o",
+        model="gpt-5.5",
         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
     )
 
@@ -67,7 +67,7 @@ def _anthropic_response() -> SimpleNamespace:
     return SimpleNamespace(
         content=[block],
         stop_reason="end_turn",
-        model="claude-3-5-sonnet",
+        model="claude-sonnet-5",
         usage=SimpleNamespace(input_tokens=10, output_tokens=5),
     )
 
@@ -75,14 +75,14 @@ def _anthropic_response() -> SimpleNamespace:
 def _openai_text_chunk(text: str | None, finish: str | None = None) -> SimpleNamespace:
     delta = SimpleNamespace(role=None, content=text, tool_calls=None)
     choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish)
-    return SimpleNamespace(choices=[choice], model="gpt-4o", usage=None)
+    return SimpleNamespace(choices=[choice], model="gpt-5.5", usage=None)
 
 
 def _openai_usage_chunk() -> SimpleNamespace:
     # Terminal usage-only chunk so the accumulator settles and on_complete fires.
     return SimpleNamespace(
         choices=[],
-        model="gpt-4o",
+        model="gpt-5.5",
         usage=SimpleNamespace(
             prompt_tokens=11,
             completion_tokens=7,
@@ -121,7 +121,7 @@ def _close(solwyn: Solwyn) -> None:
 
 
 _PLAIN_REQUEST = {
-    "model": "gpt-4o",
+    "model": "gpt-5.5",
     "messages": [{"role": "user", "content": "hi"}],
     # max_tokens so a cross-provider hop translates cleanly (Anthropic requires it).
     "max_tokens": 256,
@@ -146,8 +146,8 @@ class TestPriceHintLifetimeAcrossCacheHit:
         openai.chat.completions.create.return_value = _openai_response()
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+            model="gpt-5.5",
+            fallback=[(_anthropic_client(), "claude-sonnet-5")],
         )
         try:
             results = [
@@ -175,8 +175,8 @@ class TestPriceHintLifetimeAcrossCacheHit:
         solwyn = AsyncSolwyn(  # type: ignore[arg-type]
             openai,
             api_key=VALID_API_KEY,
-            model="gpt-4o",
-            fallback=[(_anthropic_client(), "claude-3-5-sonnet")],
+            model="gpt-5.5",
+            fallback=[(_anthropic_client(), "claude-sonnet-5")],
         )
         solwyn._reporter.report = MagicMock()
         try:
@@ -209,7 +209,7 @@ class TestPolicySwapThroughDispatch:
         return {
             "primary": openai,
             "fallback_client": anthropic,
-            "chain": dict(model="gpt-4o", fallback=[(anthropic, "claude-3-5-sonnet")]),
+            "chain": dict(model="gpt-5.5", fallback=[(anthropic, "claude-sonnet-5")]),
         }
 
     def _served_provider(self, c: dict[str, Any], **policy_kwargs: object) -> str:
@@ -264,7 +264,7 @@ class TestLatencyObservedThroughDispatch:
     def test_non_streaming_successes_transition_observed_p50(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
         try:
             # Below the min-sample threshold -> None.
             assert solwyn.observed_p50("openai") is None
@@ -287,7 +287,7 @@ class TestLatencyObservedThroughDispatch:
         openai.chat.completions.create.side_effect = lambda **_kw: iter(
             [_openai_text_chunk("hi", finish="stop"), _openai_usage_chunk()]
         )
-        solwyn = _make_solwyn(openai, model="gpt-4o")
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
         try:
             with patch.object(solwyn._budget, "check_budget", return_value=_budget_result()):
                 for _ in range(3):
@@ -314,8 +314,8 @@ class TestPriceHintPlumbingFromBudgetCheck:
         anthropic.messages.create.return_value = _anthropic_response()
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
-            fallback=[(anthropic, "claude-3-5-sonnet")],
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5")],
             selection_policy=CostPolicy(),
         )
         try:
@@ -346,7 +346,7 @@ class TestDeadlineBoundsThroughDispatch:
         openai.chat.completions.create.return_value = _openai_response()
         solwyn = _make_solwyn(
             openai,
-            model="gpt-4o",
+            model="gpt-5.5",
             failover_total_timeout=0.25,
         )
         try:

@@ -81,7 +81,7 @@ class TestBudgetExceededErrorFieldCorrectness:
             pytest.raises(BudgetExceededError) as exc_info,
         ):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
@@ -124,7 +124,7 @@ class TestBudgetExceededErrorFieldCorrectness:
             pytest.raises(BudgetExceededError) as exc_info,
         ):
             solwyn.chat.completions.create(
-                model="gpt-4o",
+                model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
