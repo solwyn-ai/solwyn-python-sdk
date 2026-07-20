@@ -185,9 +185,9 @@ def test_wrapped_converse_reports_normalized_usage_and_region() -> None:
     stubber.add_response("converse", _full_envelope(), params)
 
     solwyn = Solwyn(client, api_key=VALID_API_KEY)
-    reported: list = []
-    solwyn._reporter.report = lambda e: reported.append(e)
-    solwyn._budget.confirm_cost = MagicMock()
+    settlements: list = []
+    solwyn._reporter.report = lambda e: None
+    solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
     with _mock_budget(solwyn), stubber:
         result = solwyn.converse(modelId=BEDROCK_MODEL, messages=_messages())
@@ -198,9 +198,11 @@ def test_wrapped_converse_reports_normalized_usage_and_region() -> None:
     assert "usage" in result
     assert result["output"]["message"]["content"][0]["text"] == "ok"
 
+    # Confirm + metadata event settle together off the hot path.
+    assert len(settlements) == 1
+    confirm, event = settlements[0]
+
     # The reported metadata event carries normalized token details + region.
-    assert len(reported) == 1
-    event = reported[0]
     assert event.provider == "bedrock"
     assert event.model == BEDROCK_MODEL
     assert event.input_tokens == 100 + 30 + 20
@@ -211,13 +213,11 @@ def test_wrapped_converse_reports_normalized_usage_and_region() -> None:
     assert event.token_details.cache_creation_5m_tokens == 5
     assert event.token_details.cache_creation_1h_tokens == 15
 
-    # The confirm seam carries the SAME normalized details + region (token_details
-    # is the 3rd positional arg; provider_region/service_tier are keyword-only).
-    confirm_call = solwyn._budget.confirm_cost.call_args
-    assert confirm_call.kwargs["provider_region"] == "us-east-1"
-    assert confirm_call.kwargs["service_tier"] == "priority"
-    assert confirm_call.args[2].input_tokens == 100 + 30 + 20
-    assert confirm_call.args[2].cache_creation_1h_tokens == 15
+    # The confirm seam carries the SAME normalized details + region.
+    assert confirm.provider_region == "us-east-1"
+    assert confirm.service_tier == "priority"
+    assert confirm.token_details.input_tokens == 100 + 30 + 20
+    assert confirm.token_details.cache_creation_1h_tokens == 15
 
     solwyn.close()
 

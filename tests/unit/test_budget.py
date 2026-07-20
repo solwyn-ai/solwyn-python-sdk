@@ -9,7 +9,6 @@ import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 from pydantic import BaseModel
 
-from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetCheckResponse, BudgetMode
 from solwyn.budget import (
     BudgetCheckResult,
@@ -878,42 +877,9 @@ class TestBudgetCheckResult:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.unit
-class TestConfirmCost:
-    """confirm_cost() sends POST to cloud API."""
-
-    def test_sends_confirmation(self) -> None:
-        enforcer = _make_enforcer()
-        mock_response = MagicMock()
-        mock_response.raise_for_status = MagicMock()
-        token_details = TokenDetails(input_tokens=100, output_tokens=50)
-
-        with patch.object(enforcer._http, "post", return_value=mock_response) as mock_post:
-            enforcer.confirm_cost(
-                "res_123",
-                "gpt-4o",
-                token_details,
-                provider="openai",
-                call_id="call_budget_confirm",
-            )
-
-        mock_post.assert_called_once()
-        call_kwargs = mock_post.call_args
-        assert "budgets/confirm" in call_kwargs[0][0]
-
-    def test_swallows_errors(self) -> None:
-        enforcer = _make_enforcer()
-        token_details = TokenDetails(input_tokens=100, output_tokens=50)
-
-        with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
-            # Should not raise
-            enforcer.confirm_cost(
-                "res_123",
-                "gpt-4o",
-                token_details,
-                provider="openai",
-                call_id="call_budget_confirm",
-            )
+# Settlement moved off the enforcer: BudgetEnforcer.confirm_cost is removed
+# (settlement rides reporter.report_settlement / reporter._send_confirm). The
+# confirm POST + error accounting is covered by tests/unit/test_reporter.py.
 
 
 def test_budget_check_result_is_pydantic_model() -> None:

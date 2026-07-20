@@ -1006,7 +1006,6 @@ class TestMaterializedGoogleStreamForwardsClose:
         solwyn = _make_async_solwyn(google, model="gemini-2.0-flash")
         confirms: list[Any] = []
         solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
-        confirm_mock = AsyncMock()
 
         request = {
             "model": "gemini-2.0-flash",
@@ -1014,11 +1013,8 @@ class TestMaterializedGoogleStreamForwardsClose:
             "config": {"max_output_tokens": 256},
         }
 
-        with (
-            patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget("resv_g"))
-            ),
-            patch.object(solwyn._budget, "confirm_cost", new=confirm_mock),
+        with patch.object(
+            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget("resv_g"))
         ):
             stream = await solwyn.models.generate_content_stream(**request)
             async with stream:
@@ -1026,8 +1022,9 @@ class TestMaterializedGoogleStreamForwardsClose:
                     break  # abandon after the first chunk
 
         assert original.aclose_calls == 1
+        # Settlement rides report_settlement exactly once (the blocking
+        # confirm_cost path no longer exists).
         assert len(confirms) == 1
-        confirm_mock.assert_not_awaited()
         await _aclose(solwyn)
 
 
@@ -1484,7 +1481,6 @@ class TestAbandonedStreamSettlement:
         solwyn = _make_async_solwyn(client, model="gpt-4o")
         confirms: list[Any] = []
         solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
-        confirm_mock = AsyncMock()
 
         request = {
             "model": "gpt-4o",
@@ -1492,20 +1488,17 @@ class TestAbandonedStreamSettlement:
             "stream": True,
         }
 
-        with (
-            patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget("resv_3"))
-            ),
-            patch.object(solwyn._budget, "confirm_cost", new=confirm_mock),
+        with patch.object(
+            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget("resv_3"))
         ):
             stream = await solwyn.chat.completions.create(**request)
             async with stream:
                 async for _chunk in stream:
                     break  # abandon after the first chunk
 
-        # Settled exactly once.
+        # Settled exactly once via report_settlement (the blocking confirm_cost
+        # path no longer exists).
         assert len(confirms) == 1
-        confirm_mock.assert_not_awaited()
         await _aclose(solwyn)
 
 

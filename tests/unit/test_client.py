@@ -1646,18 +1646,14 @@ class TestAsyncNonStreamingInterception:
         client.chat.completions.create = AsyncMockFn(side_effect=create_after_project_learned)
         reported_events: list = []
         solwyn._reporter.report = lambda e: reported_events.append(e)
+        settlements: list = []
+        solwyn._reporter.report_settlement = lambda req, event: settlements.append((req, event))
 
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        mock_confirm_response = AsyncMockFn()
-        mock_confirm_response.raise_for_status = MagicMock()
-
-        with (
-            patch.object(solwyn._budget._http, "post", return_value=mock_budget_response),
-            patch.object(solwyn._budget, "confirm_cost", new_callable=AsyncMockFn) as mock_confirm,
-        ):
+        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
             result = await solwyn.chat.completions.create(
                 model="gpt-4o",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -1665,10 +1661,14 @@ class TestAsyncNonStreamingInterception:
 
         # Response passes through
         assert result is mock_response
-        # Non-streaming calls confirm_cost directly (not via reporter)
-        mock_confirm.assert_called_once()
-        # Metadata event reported
-        assert len(reported_events) == 1
+        # Non-streaming settlement rides reporter.report_settlement (confirm +
+        # event as ONE ordered item), never a blocking confirm_cost. The SUCCESS
+        # metadata event travels WITH the confirm, not via report().
+        assert len(settlements) == 1
+        confirm, event = settlements[0]
+        assert confirm.reservation_id == "res_123"
+        assert confirm.call_id == event.call_id
+        assert reported_events == []
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

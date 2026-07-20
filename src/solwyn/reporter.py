@@ -315,9 +315,9 @@ class MetadataReporter(_ReporterBase):
         self._in_flight_lock = threading.Lock()
         self._breaker_worker_lock = threading.Lock()
         self._breaker_worker: threading.Thread | None = None
-        # Separate queue for confirm_cost requests. Stream completion
-        # fire-and-forgets onto this queue so the user's thread is not
-        # blocked on an httpx.post to Solwyn.
+        # Separate queue for standalone confirm requests. Fire-and-forgets
+        # onto this queue so the user's thread is not blocked on an httpx.post
+        # to Solwyn.
         self._confirm_queue: collections.deque[BudgetConfirmRequest] = collections.deque(
             maxlen=1000
         )
@@ -499,7 +499,7 @@ class MetadataReporter(_ReporterBase):
                 self._in_flight -= 1
 
     def report_confirm(self, request: BudgetConfirmRequest) -> None:
-        """Fire-and-forget a confirm_cost request onto the flush queue.
+        """Fire-and-forget a confirm request onto the flush queue.
 
         Called from stream completion callbacks so the user's thread
         never blocks on Solwyn HTTP. The flush loop picks up confirm
@@ -639,7 +639,7 @@ class AsyncMetadataReporter(_ReporterBase):
         self._enqueue(event)
 
     def report_confirm(self, request: BudgetConfirmRequest) -> None:
-        """Fire-and-forget a confirm_cost request onto the async flush queue."""
+        """Fire-and-forget a confirm request onto the async flush queue."""
         if self._closed:
             return
         self._ensure_started()

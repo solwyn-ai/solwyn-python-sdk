@@ -155,6 +155,9 @@ class TestBedrockConverseInterception:
         solwyn = _make_solwyn(client)
         reported: list = []
         solwyn._reporter.report = lambda e: reported.append(e)
+        # Settlement rides report_settlement; forward its SUCCESS event into the
+        # same list so the metadata assertions observe it.
+        solwyn._reporter.report_settlement = lambda _c, e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = solwyn.converse(
@@ -184,8 +187,9 @@ class TestBedrockConverseInterception:
     def test_converse_confirm_carries_provider_region(self) -> None:
         client = _mock_bedrock_client(region="eu-west-1")
         solwyn = _make_solwyn(client)
+        settlements: list = []
         solwyn._reporter.report = lambda e: None
-        solwyn._budget.confirm_cost = MagicMock()
+        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             solwyn.converse(
@@ -193,8 +197,8 @@ class TestBedrockConverseInterception:
                 messages=[{"role": "user", "content": [{"text": "Hello"}]}],
             )
 
-        confirm_kwargs = solwyn._budget.confirm_cost.call_args.kwargs
-        assert confirm_kwargs["provider_region"] == "eu-west-1"
+        confirm, _event = settlements[0]
+        assert confirm.provider_region == "eu-west-1"
         solwyn.close()
 
     def test_converse_confirm_and_event_carry_same_service_tier(self) -> None:
@@ -206,9 +210,9 @@ class TestBedrockConverseInterception:
         response["serviceTier"] = {"type": "priority"}
         client.converse.return_value = response
         solwyn = _make_solwyn(client)
-        reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
-        solwyn._budget.confirm_cost = MagicMock()
+        settlements: list = []
+        solwyn._reporter.report = lambda e: None
+        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             solwyn.converse(
@@ -216,10 +220,11 @@ class TestBedrockConverseInterception:
                 messages=[{"role": "user", "content": [{"text": "Hello"}]}],
             )
 
-        confirm_kwargs = solwyn._budget.confirm_cost.call_args.kwargs
-        assert confirm_kwargs["service_tier"] == "priority"
-        assert len(reported) == 1
-        assert reported[0].service_tier == "priority"
+        # Confirm + metadata event settle together; both carry the same tier.
+        assert len(settlements) == 1
+        confirm, event = settlements[0]
+        assert confirm.service_tier == "priority"
+        assert event.service_tier == "priority"
         solwyn.close()
 
     def test_converse_requires_model_id(self) -> None:
@@ -413,6 +418,7 @@ class TestBedrockFailover:
         solwyn = _make_solwyn(bedrock, fallback=[(anthropic, "claude-3-5-sonnet")])
         reported: list = []
         solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._reporter.report_settlement = lambda _c, e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = solwyn.converse(
@@ -450,6 +456,7 @@ class TestBedrockFailover:
         solwyn = _make_solwyn(openai, fallback=[(bedrock, BEDROCK_MODEL)])
         reported: list = []
         solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._reporter.report_settlement = lambda _c, e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = solwyn.chat.completions.create(
@@ -718,6 +725,7 @@ class TestAsyncBedrockConverse:
         solwyn = _make_async_solwyn(client)
         reported: list = []
         solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._reporter.report_settlement = lambda _c, e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = await solwyn.converse(

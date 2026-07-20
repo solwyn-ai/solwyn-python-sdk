@@ -466,6 +466,22 @@ class TestMetadataReporter:
         assert "HTTPStatusError" in caplog.text
         reporter._http.close()
 
+    def test_flush_remaining_confirm_2xx_resets_failure_counter(self) -> None:
+        # A successful confirm POST clears the accumulated consecutive-failure
+        # count (settlement accounting that used to live on the enforcer).
+        reporter = _quiet_sync_reporter()
+        for _ in range(2):
+            reporter._confirm_queue.append(_make_confirm_request())
+        with patch.object(reporter._http, "post", return_value=_error_response(422)):
+            reporter._flush_remaining()
+        assert reporter._consecutive_confirm_failures == 2
+
+        reporter._confirm_queue.append(_make_confirm_request())
+        with patch.object(reporter._http, "post", return_value=MagicMock()):
+            reporter._flush_remaining()
+        assert reporter._consecutive_confirm_failures == 0
+        reporter._http.close()
+
 
 # ---------------------------------------------------------------------------
 # Per-event ingest rejection logging (v0.1.7)

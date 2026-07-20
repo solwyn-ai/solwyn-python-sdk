@@ -214,8 +214,7 @@ class TestAudioTranscriptionsProxy:
         solwyn = _build_sync(client)
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()) as check,
-            patch.object(solwyn._budget, "confirm_cost") as confirm,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
         ):
             result = solwyn.audio.transcriptions.create(
                 model="gpt-4o-transcribe", file=b"audio-bytes"
@@ -225,13 +224,13 @@ class TestAudioTranscriptionsProxy:
         client.audio.transcriptions.create.assert_called_once()
         # Budget checked on the audio modality.
         assert check.call_args.kwargs["modality"] == "audio"
-        # Confirm settles on the token basis with the audio subset.
-        confirm.assert_called_once()
-        assert confirm.call_args.args[2].audio_input_tokens == 30
-        assert confirm.call_args.kwargs["modality"] == "audio"
-        assert confirm.call_args.kwargs["media_usage"] is None
+        # Confirm + event settle together on the token basis with the audio subset.
+        settle.assert_called_once()
+        confirm, event = settle.call_args.args
+        assert confirm.token_details.audio_input_tokens == 30
+        assert confirm.modality == "audio"
+        assert confirm.media_usage is None
         # Metadata event carries the token basis + audio modality.
-        event = report.call_args.args[0]
         assert event.status == CallStatus.SUCCESS
         assert event.modality == "audio"
         assert event.input_tokens == 100
@@ -244,18 +243,17 @@ class TestAudioTranscriptionsProxy:
         solwyn = _build_sync(client)
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()),
-            patch.object(solwyn._budget, "confirm_cost") as confirm,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
         ):
             solwyn.audio.transcriptions.create(model="whisper-1", file=b"audio-bytes")
 
         # No token basis; confirm still fires on the MediaUsage duration basis
         # with a zeroed TokenDetails carrier (never a silent $0).
-        confirm.assert_called_once()
-        assert confirm.call_args.args[2] == TokenDetails()
-        assert confirm.call_args.kwargs["media_usage"].audio_seconds == 7.0
-        assert confirm.call_args.kwargs["modality"] == "audio"
-        event = report.call_args.args[0]
+        settle.assert_called_once()
+        confirm, event = settle.call_args.args
+        assert confirm.token_details == TokenDetails()
+        assert confirm.media_usage.audio_seconds == 7.0
+        assert confirm.modality == "audio"
         assert event.status == CallStatus.SUCCESS
         assert event.modality == "audio"
         assert event.token_details is None
@@ -272,13 +270,13 @@ class TestAudioTranscriptionsProxy:
         solwyn = _build_sync(client)
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()),
-            patch.object(solwyn._budget, "confirm_cost") as confirm,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._reporter, "report") as report,
             caplog.at_level(logging.WARNING, logger=_OPENAI_LOGGER),
         ):
             solwyn.audio.transcriptions.create(model="whisper-1", file=b"x", response_format="text")
 
-        confirm.assert_not_called()  # no observed basis -> never settle a real $0
+        settle.assert_not_called()  # no observed basis -> never settle a real $0
         event = report.call_args.args[0]
         assert event.status == CallStatus.SUCCESS
         assert event.modality == "audio"
@@ -369,15 +367,14 @@ class TestAsyncAudioTranscriptionsProxy:
         solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY)
         with (
             patch.object(solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow())),
-            patch.object(solwyn._budget, "confirm_cost", new=AsyncMock()) as confirm,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
         ):
             await solwyn.audio.transcriptions.create(model="gpt-4o-transcribe", file=b"audio")
 
         client.audio.transcriptions.create.assert_awaited_once()
-        confirm.assert_awaited_once()
-        assert confirm.call_args.args[2].audio_input_tokens == 30
-        event = report.call_args.args[0]
+        settle.assert_called_once()
+        confirm, event = settle.call_args.args
+        assert confirm.token_details.audio_input_tokens == 30
         assert event.modality == "audio"
         assert event.token_details.audio_input_tokens == 30
         await solwyn._budget._http.aclose()
@@ -389,14 +386,13 @@ class TestAsyncAudioTranscriptionsProxy:
         solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY)
         with (
             patch.object(solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow())),
-            patch.object(solwyn._budget, "confirm_cost", new=AsyncMock()) as confirm,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
         ):
             await solwyn.audio.transcriptions.create(model="whisper-1", file=b"audio")
 
-        confirm.assert_awaited_once()
-        assert confirm.call_args.kwargs["media_usage"].audio_seconds == 7.0
-        event = report.call_args.args[0]
+        settle.assert_called_once()
+        confirm, event = settle.call_args.args
+        assert confirm.media_usage.audio_seconds == 7.0
         assert event.modality == "audio"
         assert event.media_usage.audio_seconds == 7.0
         await solwyn._budget._http.aclose()

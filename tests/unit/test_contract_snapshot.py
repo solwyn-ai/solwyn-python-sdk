@@ -850,6 +850,9 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
     solwyn._reporter._shutdown.set()
     solwyn._reporter._thread.join(timeout=2.0)
     solwyn._reporter.report = MagicMock()
+    # Non-streaming settlement now rides report_settlement(confirm, event); keep
+    # _reported_events observable by forwarding the settled event to report().
+    solwyn._reporter.report_settlement = lambda _req, event: solwyn._reporter.report(event)
     return solwyn
 
 
@@ -858,6 +861,7 @@ def _make_async_solwyn(client: object, **overrides: object) -> AsyncSolwyn:
     defaults.update(overrides)
     solwyn = AsyncSolwyn(client, **defaults)  # type: ignore[arg-type]
     solwyn._reporter.report = MagicMock()
+    solwyn._reporter.report_settlement = lambda _req, event: solwyn._reporter.report(event)
     return solwyn
 
 
@@ -949,20 +953,24 @@ class TestCallIdConsistencyCrossProvider:
             fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
         )
 
-        confirm_spy = MagicMock()
-        with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
-            patch.object(solwyn._budget, "confirm_cost", confirm_spy),
-        ):
+        settlements: list[tuple[Any, Any]] = []
+
+        def report_settlement(req: Any, event: Any) -> None:
+            settlements.append((req, event))
+            solwyn._reporter.report(event)
+
+        solwyn._reporter.report_settlement = report_settlement
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
         assert len(success) == 1
         assert success[0].is_provider_fallback is True
-        confirm_spy.assert_called_once()
+        assert len(settlements) == 1
+        confirm, _event = settlements[0]
         # Same join key on the served-provider success event AND its confirm.
-        assert confirm_spy.call_args.kwargs["call_id"] == success[0].call_id
-        assert confirm_spy.call_args.kwargs["provider"] == "anthropic"
+        assert confirm.call_id == success[0].call_id
+        assert confirm.provider == ProviderName.ANTHROPIC
 
         _close(solwyn)
 
@@ -980,20 +988,24 @@ class TestCallIdConsistencyCrossProvider:
             fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
         )
 
-        confirm_spy = AsyncMock()
-        with (
-            patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
-            ),
-            patch.object(solwyn._budget, "confirm_cost", confirm_spy),
+        settlements: list[tuple[Any, Any]] = []
+
+        def report_settlement(req: Any, event: Any) -> None:
+            settlements.append((req, event))
+            solwyn._reporter.report(event)
+
+        solwyn._reporter.report_settlement = report_settlement
+        with patch.object(
+            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             await solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
         assert len(success) == 1
-        confirm_spy.assert_awaited_once()
-        assert confirm_spy.call_args.kwargs["call_id"] == success[0].call_id
-        assert confirm_spy.call_args.kwargs["provider"] == "anthropic"
+        assert len(settlements) == 1
+        confirm, _event = settlements[0]
+        assert confirm.call_id == success[0].call_id
+        assert confirm.provider == ProviderName.ANTHROPIC
 
         await _aclose(solwyn)
 
@@ -1072,16 +1084,16 @@ class TestNormalizeBeforeSettlement:
             fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
         )
 
-        confirm_spy = MagicMock()
+        settle_spy = MagicMock()
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
-            patch.object(solwyn._budget, "confirm_cost", confirm_spy),
+            patch.object(solwyn._reporter, "report_settlement", settle_spy),
             patch("solwyn.client._translation.normalize_response", side_effect=RuntimeError),
             pytest.raises(RuntimeError),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-        confirm_spy.assert_not_called()
+        settle_spy.assert_not_called()
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
         assert success == []
 
@@ -1099,18 +1111,18 @@ class TestNormalizeBeforeSettlement:
             fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
         )
 
-        confirm_spy = AsyncMock()
+        settle_spy = MagicMock()
         with (
             patch.object(
                 solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
             ),
-            patch.object(solwyn._budget, "confirm_cost", confirm_spy),
+            patch.object(solwyn._reporter, "report_settlement", settle_spy),
             patch("solwyn.client._translation.normalize_response", side_effect=RuntimeError),
             pytest.raises(RuntimeError),
         ):
             await solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-        confirm_spy.assert_not_awaited()
+        settle_spy.assert_not_called()
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
         assert success == []
 

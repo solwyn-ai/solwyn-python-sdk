@@ -544,8 +544,9 @@ def test_failover_solwyn_payloads_carry_no_content() -> None:
             model="gpt-4o",
             fallback=[(anthropic, "claude-3-5-sonnet", {"max_tokens": 256})],
         )
-    # Quiesce the reporter's background thread so the flush is deterministic.
-    solwyn._reporter._shutdown.set()
+    # The background thread ran the no-op _flush_loop and exited; _shutdown stays
+    # UNSET so the non-streaming report_settlement can still enqueue the
+    # settlement (report_settlement drops items once shutdown is set).
     solwyn._reporter._thread.join(timeout=2.0)
 
     # Capture every json= body POSTed to config.api_url on BOTH clients.

@@ -106,22 +106,15 @@ def test_sync_budget_read_only_errors_log_configuration_once_and_fail_open(
             model="gpt-4o",
             provider="openai",
         )
-        for call_id in ("confirm-one", "confirm-two"):
-            enforcer.confirm_cost(
-                "res-read-only",
-                "gpt-4o",
-                TokenDetails(input_tokens=10, output_tokens=5),
-                provider="openai",
-                call_id=call_id,
-            )
 
+    # A read-only key on the CHECK path fails open loudly ONCE (settlement's
+    # read-only handling now lives in the reporter — see the reporter tests
+    # below).
     assert first.allowed is True
     assert second.allowed is True
-    assert post.call_count == 4
-    assert enforcer._consecutive_confirm_failures == 0
+    assert post.call_count == 2
     assert caplog.text.count("solwyn.configuration_error.read_only_key") == 1
     assert "Cloud API budget check failed" not in caplog.text
-    assert "budget.confirm_cost_failed" not in caplog.text
     enforcer.close()
 
 
@@ -145,20 +138,12 @@ async def test_async_budget_read_only_errors_log_configuration_once_and_fail_ope
             model="gpt-4o",
             provider="openai",
         )
-        await enforcer.confirm_cost(
-            "res-read-only",
-            "gpt-4o",
-            TokenDetails(input_tokens=10, output_tokens=5),
-            provider="openai",
-            call_id="confirm-async",
-        )
 
+    # See the sync mirror: read-only settlement handling lives in the reporter.
     assert result.allowed is True
-    assert enforcer._http.post.await_count == 2
-    assert enforcer._consecutive_confirm_failures == 0
+    assert enforcer._http.post.await_count == 1
     assert caplog.text.count("solwyn.configuration_error.read_only_key") == 1
     assert "Cloud API budget check failed" not in caplog.text
-    assert "budget.confirm_cost_failed" not in caplog.text
     await enforcer.close()
 
 

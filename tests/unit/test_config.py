@@ -170,6 +170,56 @@ class TestEnvVarConstruction:
 
 
 @pytest.mark.unit
+class TestControlPlaneConfig:
+    """Budget-check timeout + control-plane breaker knobs: defaults and env."""
+
+    def test_control_plane_defaults(self) -> None:
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-4o")],
+        )
+        assert config.budget_check_timeout == 1.0
+        assert config.control_plane_failure_threshold == 3
+        assert config.control_plane_recovery_timeout == 30.0
+
+    def test_control_plane_knobs_are_overridable(self) -> None:
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-4o")],
+            budget_check_timeout=0.5,
+            control_plane_failure_threshold=1,
+            control_plane_recovery_timeout=10.0,
+        )
+        assert config.budget_check_timeout == 0.5
+        assert config.control_plane_failure_threshold == 1
+        assert config.control_plane_recovery_timeout == 10.0
+
+    def test_budget_check_timeout_loads_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.setenv("SOLWYN_BUDGET_CHECK_TIMEOUT", "2.5")
+
+        solwyn = _make_solwyn(_mock_openai_client())
+
+        assert solwyn._config.budget_check_timeout == 2.5
+
+        solwyn.close()
+
+    def test_control_plane_breaker_knobs_load_from_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.setenv("SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD", "7")
+        monkeypatch.setenv("SOLWYN_CONTROL_PLANE_RECOVERY_TIMEOUT", "45.0")
+
+        solwyn = _make_solwyn(_mock_openai_client())
+
+        assert solwyn._config.control_plane_failure_threshold == 7
+        assert solwyn._config.control_plane_recovery_timeout == 45.0
+
+        solwyn.close()
+
+
+@pytest.mark.unit
 class TestConfigurationErrorFromBadCredentials:
     """Malformed api_key raises ConfigurationError with correct attributes."""
 

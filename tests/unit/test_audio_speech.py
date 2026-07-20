@@ -131,8 +131,7 @@ class TestAudioSpeechProxy:
         solwyn = _build_sync(client)
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()) as check,
-            patch.object(solwyn._budget, "confirm_cost") as confirm,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
         ):
             result = solwyn.audio.speech.create(model="tts-1", voice="alloy", input="hello world")
 
@@ -143,14 +142,14 @@ class TestAudioSpeechProxy:
         # Budget checked on the audio modality with the EXACT pre-flight char count.
         assert check.call_args.kwargs["modality"] == "audio"
         assert check.call_args.kwargs["estimated_media"].input_characters == len("hello world")
-        # Confirm settles on the char basis with a zeroed TokenDetails carrier
-        # (TTS has no token basis; never a silent $0).
-        confirm.assert_called_once()
-        assert confirm.call_args.args[2] == TokenDetails()
-        assert confirm.call_args.kwargs["media_usage"].input_characters == len("hello world")
-        assert confirm.call_args.kwargs["modality"] == "audio"
+        # Confirm + event settle together on the char basis with a zeroed
+        # TokenDetails carrier (TTS has no token basis; never a silent $0).
+        settle.assert_called_once()
+        confirm, event = settle.call_args.args
+        assert confirm.token_details == TokenDetails()
+        assert confirm.media_usage.input_characters == len("hello world")
+        assert confirm.modality == "audio"
         # Metadata event carries the char basis + audio modality, no token basis.
-        event = report.call_args.args[0]
         assert event.status == CallStatus.SUCCESS
         assert event.modality == "audio"
         assert event.token_details is None
@@ -168,7 +167,7 @@ class TestAudioSpeechProxy:
         solwyn = _build_sync(client)
         with (
             patch.object(solwyn._budget, "check_budget") as check,
-            patch.object(solwyn._budget, "confirm_cost") as confirm,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._reporter, "report") as report,
             caplog.at_level(logging.WARNING, logger=_OPENAI_LOGGER),
         ):
@@ -179,7 +178,7 @@ class TestAudioSpeechProxy:
         assert second is client.audio.speech.create.return_value
         # Untracked: the lifecycle never runs.
         check.assert_not_called()
-        confirm.assert_not_called()
+        settle.assert_not_called()
         report.assert_not_called()
         assert client.audio.speech.create.call_count == 2
         # Raw kwargs only — no injected op marker on the carve-out path.
@@ -259,16 +258,15 @@ class TestAsyncAudioSpeechProxy:
         solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY)
         with (
             patch.object(solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow())),
-            patch.object(solwyn._budget, "confirm_cost", new=AsyncMock()) as confirm,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
         ):
             await solwyn.audio.speech.create(model="tts-1-hd", input="hello world", voice="nova")
 
         client.audio.speech.create.assert_awaited_once()
         assert _AUDIO_OP_KEY not in client.audio.speech.create.await_args.kwargs
-        confirm.assert_awaited_once()
-        assert confirm.call_args.kwargs["media_usage"].input_characters == len("hello world")
-        event = report.call_args.args[0]
+        settle.assert_called_once()
+        confirm, event = settle.call_args.args
+        assert confirm.media_usage.input_characters == len("hello world")
         assert event.modality == "audio"
         assert event.media_usage.input_characters == len("hello world")
         assert event.token_details is None

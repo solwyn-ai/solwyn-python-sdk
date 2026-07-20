@@ -152,8 +152,7 @@ class TestMediaCallSync:
         client.embeddings.create.side_effect = create_after_project_learned
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()) as check,
-            patch.object(solwyn._budget, "confirm_cost") as confirm,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
             solwyn_pkg.run("sync-media", tags={"team": "platform"}) as run_id,
         ):
@@ -175,15 +174,16 @@ class TestMediaCallSync:
         assert "fallback_providers" not in check.call_args.kwargs
         assert "fallback_models" not in check.call_args.kwargs
 
-        # Confirmed with the extractor's quantity, never a provider fallback;
-        # the confirm carries the surface modality so the API settles on it.
-        confirm.assert_called_once()
-        assert confirm.call_args.args[2].input_tokens == 42
-        assert confirm.call_args.kwargs["is_provider_fallback"] is False
-        assert confirm.call_args.kwargs["modality"] == "embedding"
+        # Settled off the hot path: confirm + event ride report_settlement as one
+        # ordered item. Confirmed with the extractor's quantity, never a provider
+        # fallback; the confirm carries the surface modality.
+        settle.assert_called_once()
+        confirm, event = settle.call_args.args
+        assert confirm.token_details.input_tokens == 42
+        assert confirm.is_provider_fallback is False
+        assert confirm.modality == "embedding"
 
         # Metadata: SUCCESS, foundation flags off, modality carried.
-        event = report.call_args.args[0]
         assert event.status == CallStatus.SUCCESS
         assert event.is_model_fallback is False
         assert event.is_provider_fallback is False
@@ -203,15 +203,15 @@ class TestMediaCallSync:
         spec = _spec(measure=lambda _kwargs: TokenDetails(input_tokens=7))
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()),
-            patch.object(solwyn._budget, "confirm_cost") as confirm,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
         ):
             solwyn._media_call(spec, model="text-embedding-3-small", input="hi")
 
         # Fell back to the request-derived measurer (extractor returned None).
-        assert confirm.call_args.args[2].input_tokens == 7
-        assert report.call_args.args[0].input_tokens == 7
+        confirm, event = settle.call_args.args
+        assert confirm.token_details.input_tokens == 7
+        assert event.input_tokens == 7
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
@@ -224,13 +224,15 @@ class TestMediaCallSync:
         spec = _spec(measure=lambda _kwargs: None)
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()),
-            patch.object(solwyn._budget, "confirm_cost") as confirm,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._reporter, "report") as report,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
         ):
             solwyn._media_call(spec, model="text-embedding-3-small", input="hi")
 
-        confirm.assert_not_called()  # no observed quantity -> never settle a real $0 price
+        # No observed quantity -> never settle a real $0 price; the SUCCESS event
+        # rides the plain report() path (no reservation to settle).
+        settle.assert_not_called()
         event = report.call_args.args[0]
         assert event.status == CallStatus.SUCCESS
         assert event.token_details is None
@@ -260,8 +262,7 @@ class TestMediaCallSync:
         )
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()) as check,
-            patch.object(solwyn._budget, "confirm_cost") as confirm,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_images),
         ):
             solwyn._media_call(spec, model="gpt-image-1", prompt="a cat", n=2)
@@ -271,12 +272,12 @@ class TestMediaCallSync:
         assert check.call_args.kwargs["estimated_media"].image_count == 2
         assert check.call_args.kwargs["modality"] == "image"
         # BOTH bases ride the confirm: token usage (image buckets) AND MediaUsage.
-        confirm.assert_called_once()
-        assert confirm.call_args.args[2].image_input_tokens == 194
-        assert confirm.call_args.kwargs["media_usage"].image_count == 2
-        assert confirm.call_args.kwargs["modality"] == "image"
+        settle.assert_called_once()
+        confirm, event = settle.call_args.args
+        assert confirm.token_details.image_input_tokens == 194
+        assert confirm.media_usage.image_count == 2
+        assert confirm.modality == "image"
         # And the metadata event carries both.
-        event = report.call_args.args[0]
         assert event.status == CallStatus.SUCCESS
         assert event.modality == "image"
         assert event.token_details.image_output_tokens == 1024
@@ -300,16 +301,15 @@ class TestMediaCallSync:
         )
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_allow()),
-            patch.object(solwyn._budget, "confirm_cost") as confirm,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_images),
         ):
             solwyn._media_call(spec, model="black-forest-labs/FLUX.1-schnell", prompt="a cat")
 
-        confirm.assert_called_once()
-        assert confirm.call_args.args[2] == TokenDetails()  # zeroed token carrier
-        assert confirm.call_args.kwargs["media_usage"].image_count == 1
-        event = report.call_args.args[0]
+        settle.assert_called_once()
+        confirm, event = settle.call_args.args
+        assert confirm.token_details == TokenDetails()  # zeroed token carrier
+        assert confirm.media_usage.image_count == 1
         assert event.token_details is None  # no token basis observed
         assert event.input_tokens == 0
         assert event.media_usage.image_count == 1
@@ -414,8 +414,7 @@ class TestMediaCallAsync:
             patch.object(
                 solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow())
             ) as check,
-            patch.object(solwyn._budget, "confirm_cost", new=AsyncMock()) as confirm,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
         ):
             async with solwyn_pkg.run("async-media", tags={"team": "platform"}) as run_id:
@@ -431,10 +430,10 @@ class TestMediaCallAsync:
         assert check.call_args.kwargs["provider"] == "openai"
         assert check.call_args.kwargs["modality"] == "embedding"
         assert check.call_args.kwargs["agent_run_id"] == run_id
-        confirm.assert_awaited_once()
-        assert confirm.call_args.args[2].input_tokens == 99
-        assert confirm.call_args.kwargs["modality"] == "embedding"
-        event = report.call_args.args[0]
+        settle.assert_called_once()
+        confirm, event = settle.call_args.args
+        assert confirm.token_details.input_tokens == 99
+        assert confirm.modality == "embedding"
         assert event.status == CallStatus.SUCCESS
         assert event.is_model_fallback is False
         assert event.modality == "embedding"
@@ -459,18 +458,17 @@ class TestMediaCallAsync:
             patch.object(
                 solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow())
             ) as check,
-            patch.object(solwyn._budget, "confirm_cost", new=AsyncMock()) as confirm,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_images),
         ):
             await solwyn._media_call(spec, model="gpt-image-1", prompt="a cat", n=2)
 
         client.images.generate.assert_awaited_once()
         assert check.call_args.kwargs["estimated_media"].image_count == 2
-        confirm.assert_awaited_once()
-        assert confirm.call_args.args[2].image_input_tokens == 194
-        assert confirm.call_args.kwargs["media_usage"].image_count == 2
-        event = report.call_args.args[0]
+        settle.assert_called_once()
+        confirm, event = settle.call_args.args
+        assert confirm.token_details.image_input_tokens == 194
+        assert confirm.media_usage.image_count == 2
         assert event.modality == "image"
         assert event.media_usage.image_count == 2
 
