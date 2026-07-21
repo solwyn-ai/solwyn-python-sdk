@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -22,6 +23,7 @@ from solwyn._types import (
 from solwyn.reporter import (
     AsyncMetadataReporter,
     MetadataReporter,
+    _PendingConfirm,
     _ReporterBase,
 )
 
@@ -87,9 +89,24 @@ def _quiet_sync_reporter(**kwargs) -> MetadataReporter:
             VALID_API_KEY,
             **kwargs,
         )
-    reporter._shutdown.set()
+    # The patched _flush_loop returns immediately, so the thread is already
+    # dead — do NOT set _shutdown: report()/report_confirm/report_settlement
+    # now correctly refuse (and count) post-shutdown enqueues, and these
+    # helpers exist precisely to keep enqueuing testable.
     reporter._thread.join(timeout=2.0)
     return reporter
+
+
+def _stop_flush_thread(reporter: MetadataReporter) -> None:
+    """Stop a live flush thread, then restore an UNSET shutdown event.
+
+    report()/report_confirm/report_settlement now refuse (and count)
+    post-shutdown enqueues, so tests that stop the thread purely to avoid
+    timing races must not leave the reporter looking closed.
+    """
+    reporter._shutdown.set()
+    reporter._thread.join(timeout=2.0)
+    reporter._shutdown = threading.Event()
 
 
 def _unstarted_sync_reporter(**kwargs) -> MetadataReporter:
@@ -161,11 +178,12 @@ class TestReporterBase:
             events.append(event)
             base._enqueue(event)
 
-        # Queue should contain only the 3 most recent
+        # Queue should contain only the 3 most recent (events wrapped in
+        # _PendingEvent for retry bookkeeping).
         assert len(base._queue) == 3
-        assert base._queue[0].input_tokens == 2
-        assert base._queue[1].input_tokens == 3
-        assert base._queue[2].input_tokens == 4
+        assert base._queue[0].event.input_tokens == 2
+        assert base._queue[1].event.input_tokens == 3
+        assert base._queue[2].event.input_tokens == 4
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +202,7 @@ class TestMetadataReporter:
                 VALID_API_KEY,
             )
             # Stop the background thread to avoid timing issues
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             event = _make_event()
             reporter.report(event)
@@ -199,8 +216,7 @@ class TestMetadataReporter:
                 VALID_API_KEY,
                 batch_size=3,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             # Enqueue 5 events
             for _ in range(5):
@@ -222,8 +238,7 @@ class TestMetadataReporter:
                 VALID_API_KEY,
                 batch_size=10,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             for _ in range(3):
                 reporter.report(_make_event())
@@ -246,8 +261,7 @@ class TestMetadataReporter:
                 VALID_API_KEY,
             ) as reporter,
         ):
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
             reporter.report(_make_event())
         # After context exit, reporter should be closed
 
@@ -257,8 +271,7 @@ class TestMetadataReporter:
                 "https://api.test.solwyn.ai",
                 VALID_API_KEY,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             with patch.object(reporter._http, "post") as mock_post:
                 reporter._send_batch([_make_event(service_tier=None)])
@@ -275,8 +288,7 @@ class TestMetadataReporter:
                 "https://api.test.solwyn.ai",
                 VALID_API_KEY,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             with patch.object(reporter._http, "post") as mock_post:
                 reporter._send_batch([_make_event(tags={"team": "research"})])
@@ -291,8 +303,7 @@ class TestMetadataReporter:
                 "https://api.test.solwyn.ai",
                 VALID_API_KEY,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             with patch.object(reporter._http, "post") as mock_post:
                 reporter._send_batch([_make_event(service_tier="priority")])
@@ -309,8 +320,7 @@ class TestMetadataReporter:
                 "https://api.test.solwyn.ai",
                 VALID_API_KEY,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             event = _make_event(
                 agent_run_id="run_test_abc",
@@ -332,8 +342,7 @@ class TestMetadataReporter:
                 "https://api.test.solwyn.ai",
                 VALID_API_KEY,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             with patch.object(reporter._http, "post") as mock_post:
                 reporter._send_batch([_make_event()])
@@ -374,7 +383,7 @@ class TestMetadataReporter:
         reporter = _quiet_sync_reporter()
         # Enqueue directly: report_confirm gates on the shutdown flag that
         # _quiet_sync_reporter sets to stop the background thread.
-        reporter._confirm_queue.append(_make_confirm_request())
+        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
 
         with (
             patch.object(reporter._http, "post", return_value=_error_response(422)),
@@ -395,7 +404,7 @@ class TestMetadataReporter:
         reporter.report(_make_event(call_id=call_id))
         # Enqueue directly: report_confirm gates on the shutdown flag that
         # _quiet_sync_reporter sets to stop the background thread.
-        reporter._confirm_queue.append(_make_confirm_request(call_id=call_id))
+        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request(call_id=call_id)))
 
         with patch.object(reporter._http, "post", return_value=MagicMock()) as mock_post:
             reporter._flush_remaining()
@@ -448,17 +457,22 @@ class TestMetadataReporter:
         reporter._http.close()
 
     def test_flush_remaining_confirm_persistent_failures_escalate_to_error(
-        self, caplog: pytest.LogCaptureFixture
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        reporter = _quiet_sync_reporter()
-        for _ in range(10):
-            reporter._confirm_queue.append(_make_confirm_request())
+        # A retrying head PARKS its queue (FIFO), so a persistent outage
+        # accrues one consecutive failure per flush cycle, not per queued item.
+        clock = {"t": 1000.0}
+        monkeypatch.setattr("solwyn.reporter._monotonic", lambda: clock["t"])
+        reporter = _quiet_sync_reporter(max_send_attempts=11)
+        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
 
         with (
             patch.object(reporter._http, "post", return_value=_error_response(503)),
             caplog.at_level("ERROR"),
         ):
-            reporter._flush_remaining()
+            for _ in range(10):
+                reporter._flush_remaining()
+                clock["t"] += 61.0  # past the backoff cap so the head is due
 
         assert reporter._consecutive_confirm_failures == 10
         assert "reporter.confirm_send_persistent_failure" in caplog.text
@@ -471,12 +485,12 @@ class TestMetadataReporter:
         # count (settlement accounting that used to live on the enforcer).
         reporter = _quiet_sync_reporter()
         for _ in range(2):
-            reporter._confirm_queue.append(_make_confirm_request())
+            reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
         with patch.object(reporter._http, "post", return_value=_error_response(422)):
             reporter._flush_remaining()
         assert reporter._consecutive_confirm_failures == 2
 
-        reporter._confirm_queue.append(_make_confirm_request())
+        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
         with patch.object(reporter._http, "post", return_value=MagicMock()):
             reporter._flush_remaining()
         assert reporter._consecutive_confirm_failures == 0
@@ -823,5 +837,5 @@ class TestAsyncMetadataReporter:
         reporter.report(_make_event(input_tokens=3))
 
         assert len(reporter._queue) == 2
-        assert reporter._queue[0].input_tokens == 2
-        assert reporter._queue[1].input_tokens == 3
+        assert reporter._queue[0].event.input_tokens == 2
+        assert reporter._queue[1].event.input_tokens == 3

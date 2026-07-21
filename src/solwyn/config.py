@@ -74,12 +74,25 @@ class SolwynConfig(BaseModel):
     control_plane_failure_threshold: int = 3
     control_plane_recovery_timeout: float = 30.0
 
-    # Reporter tuning
+    # Reporter tuning. A zero-capacity queue has no defined drop-oldest
+    # semantics (the reporter constructors reject it too) — at least one slot.
     reporter_batch_size: int = 50
     reporter_flush_interval: float = 5.0
-    reporter_max_queue_size: int = 10_000
+    reporter_max_queue_size: int = Field(default=10_000, ge=1)
     reporter_max_in_flight: int = 3
     breaker_reporting_enabled: bool = True
+
+    # Reporter at-least-once delivery: these bound the retry/backoff the reporter
+    # applies to confirms, settlements, and metadata batches so acknowledged
+    # provider spend is not silently lost on a transient control-plane blip, and
+    # cap the wall-clock the shutdown/exit flush chain may spend.
+    # Validated: a non-positive backoff base would put next_attempt_at in the
+    # past (hot retry loop burning the whole attempt budget in one flush
+    # cycle), and a negative deadline is already-expired (instant drops).
+    reporter_max_send_attempts: int = Field(default=5, ge=1)
+    reporter_retry_backoff_base: float = Field(default=1.0, gt=0)
+    reporter_retry_backoff_cap: float = Field(default=60.0, gt=0)
+    reporter_shutdown_deadline: float = Field(default=5.0, ge=0)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -104,6 +117,10 @@ class SolwynConfig(BaseModel):
             "reporter_max_queue_size": "REPORTER_MAX_QUEUE_SIZE",
             "reporter_max_in_flight": "REPORTER_MAX_IN_FLIGHT",
             "breaker_reporting_enabled": "BREAKER_REPORTING_ENABLED",
+            "reporter_max_send_attempts": "REPORTER_MAX_SEND_ATTEMPTS",
+            "reporter_retry_backoff_base": "REPORTER_RETRY_BACKOFF_BASE",
+            "reporter_retry_backoff_cap": "REPORTER_RETRY_BACKOFF_CAP",
+            "reporter_shutdown_deadline": "REPORTER_SHUTDOWN_DEADLINE",
         }
 
         for field, env_suffix in field_env_map.items():

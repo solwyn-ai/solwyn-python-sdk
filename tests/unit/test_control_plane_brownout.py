@@ -165,7 +165,8 @@ class TestSyncBrownout:
             )
             # The settlement (confirm + event, one ordered item) was queued.
             assert len(solwyn._reporter._settlement_queue) == 1
-            confirm, event = solwyn._reporter._settlement_queue[0]
+            settlement = solwyn._reporter._settlement_queue[0]
+            confirm, event = settlement.confirm.request, settlement.event
             assert confirm.reservation_id == "res_123"
             assert confirm.call_id == event.call_id
         finally:
@@ -223,7 +224,8 @@ class TestAsyncBrownout:
             assert result is response
             assert elapsed < CONFIRM_NEVER_GATES_BOUND
             assert len(solwyn._reporter._settlement_queue) == 1
-            confirm, event = solwyn._reporter._settlement_queue[0]
+            settlement = solwyn._reporter._settlement_queue[0]
+            confirm, event = settlement.confirm.request, settlement.event
             assert confirm.reservation_id == "res_123"
             assert confirm.call_id == event.call_id
         finally:

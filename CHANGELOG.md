@@ -51,10 +51,109 @@ derived from git tags (hatch-vcs).
   second call reuses the live flush task instead of orphaning it and resetting
   the shutdown event), and `start()` after `close()` raises `RuntimeError` —
   restarting a closed reporter is a programming error. Enqueue after `close()`
-  is silently dropped, matching the sync reporter.
+  is dropped and counted (`closed_enqueue`), matching the sync reporter.
+- **Spend telemetry is now delivered at least once.** Confirms, settlements, and
+  metadata batches used to be dropped on their first failed send. They are now
+  retried with bounded exponential backoff (`reporter_max_send_attempts`,
+  `reporter_retry_backoff_base`, `reporter_retry_backoff_cap`). A transient
+  failure — `httpx.TransportError` or HTTP 408/429/5xx — is retried; every other
+  status is terminal, so a poison item can never wedge the queue head. The
+  server dedups duplicate sends via an idempotency ledger, so the SDK retries
+  freely and never does client-side dedup.
+- **A breaker-open flush HOLDS settlements instead of dropping them.** When the
+  shared control-plane breaker refuses admission, the confirm is now kept for a
+  later cycle (it previously dropped the confirm at DEBUG, silently losing
+  acknowledged spend for the duration of a Solwyn outage). Breaker accounting is
+  unchanged: a refusal is not an attempt, so it touches neither the breaker nor
+  the consecutive-confirm-failure counter.
+- **A settlement's metadata event now survives its confirm.** When a settlement's
+  confirm is terminally rejected or exhausts its retries, the paired event is
+  still handed to the ingest queue — `cost_events` ingest is the durable spend
+  truth and must not be lost because the confirm failed. An overflow-evicted
+  settlement ships its event the same way; a settlement rejected after
+  `close()` counts BOTH halves (`settlement_confirm.closed_enqueue` and
+  `event.closed_enqueue`).
+- **Confirm and settlement queues drain strictly FIFO.** A head that fails
+  transiently is requeued and PARKS its queue for the cycle — later spend can
+  no longer be confirmed or ingested ahead of earlier acknowledged spend, and
+  an outage burns one retry attempt per cycle instead of one per queued item.
+- **Undeliverable spend is counted and loudly logged, never silently dropped.**
+  Queue overflow, retry exhaustion, terminal statuses, per-event rejections
+  inside a 202 ingest body, shutdown-deadline expiry, and enqueue-after-close
+  all increment a counter now readable via the new `dropped_counts` property. The first drop logs immediately; after that at
+  most one aggregated `reporter.spend_events_dropped` WARNING per 60s, so a
+  sustained outage reports loss without flooding logs.
+- **Queued spend survives interpreter exit.** A process that exits WITHOUT
+  calling `close()` previously discarded everything still queued. A single
+  `atexit` hook now flushes each live reporter (sync via `close()`, async over a
+  temporary sync client since no event loop exists at exit), and async reporters
+  additionally arm a GC-only `weakref.finalize` covering the constructed-queued-
+  then-garbage-collected case — GC-only (`atexit` disabled on the finalizer)
+  because weakref's own exit hook runs BEFORE the SDK's and would drain live
+  reporters without accounting; a genuine GC drain logs each loss
+  (`lifecycle.gc_flush_dropped`) since the collected reporter's
+  `dropped_counts` no longer exists. The exit drain is a true wall-clock bound:
+  it runs on a daemon worker joined at the deadline — closing a sync HTTP
+  client does not reliably interrupt a blocked read, so no close()-based abort
+  is trusted — with pop-and-claim ownership mirroring the reporter's close
+  seal: a timed-out join claims the worker's in-hand items and sweeps the
+  queues (counted `shutdown_deadline`), so a slow-drip response (invisible to
+  httpx's per-socket-op timeouts) cannot hold process exit and a worker
+  unblocking late never double-counts. Lossy dispositions publish atomically
+  with their ownership release (under the same lock), so the seal can never
+  land between the two and let the drain return with an item accounted
+  nowhere while process exit kills the worker. Exit delivery is
+  accountable per item: every popped
+  confirm and event reports a sent/failed/expired disposition and every failure
+  is counted. Exit confirms ride the control-plane breaker's admission — a
+  known-down control plane refuses them (counted `exit_breaker_open`) after at
+  most one recovery probe — while metadata ingest is never breaker-gated, so
+  settlement events and standalone events still get their deadline-bounded
+  ingest attempt on the way out.
+- **Reporters, budget enforcers, and circuit breakers are fork-safe.** Threads,
+  locks, and HTTP clients do not survive `fork()`, so a forked child inherited a
+  dead flush thread and never delivered its settlements. A single
+  `os.register_at_fork` hook (skipped on platforms without fork) now rebuilds
+  locks, swaps in fresh HTTP clients (abandoning — never closing — the parent's
+  sockets), and relaunches the sync flush thread on the child's next enqueue.
+  Breaker health state is deliberately inherited; queued items duplicated by
+  fork are deliberately kept, since the server dedups.
+- **`close()` is bounded by one shutdown deadline.** `close(timeout=...)` (sync
+  and async; default `reporter_shutdown_deadline`) now shares a single monotonic
+  deadline across the thread/task join, the final flush, and the breaker-report
+  cycle. Against a black-holed control plane, shutdown no longer pays a serial
+  per-request timeout chain across every queued item — work still queued when
+  the deadline is reached is counted `shutdown_deadline` and dropped. The
+  deadline is a true wall-clock bound: httpx timeouts cap individual socket
+  operations, not total response time, so the final flush runs off the closing
+  thread (sync: a daemon worker joined at the deadline; async: a task the
+  deadline cancels) and a slow-drip response cannot hold `close()` open. At the
+  deadline `close()` (sync AND async) seals delivery and takes final ownership
+  of ALL undelivered spend: items a stuck flush thread still holds mid-POST and
+  enqueues racing the final drain are counted before `close()` returns, never
+  requeued into a queue nothing drains. An async `close()` cancelled mid-flush
+  keeps the atexit hook and GC finalizer armed as the last delivery path — they
+  detach only once close actually completes — and a cancelled drain REQUEUES its
+  in-hand item under the ownership gate rather than writing it off: the rescue
+  paths can only retry what is in the queues, so a completing close's seal
+  counts the requeued item while a cancelled close leaves it deliverable. Even
+  a zero-deadline close awaits its cancelled drains' cleanup so every in-hand
+  item is back in its queue for the seal before rescue detaches.
 
 ### Added
 
+- **New reporter delivery knobs (with `SOLWYN_*` env vars):**
+  `reporter_max_send_attempts` (`SOLWYN_REPORTER_MAX_SEND_ATTEMPTS`, default
+  `5`), `reporter_retry_backoff_base` (`SOLWYN_REPORTER_RETRY_BACKOFF_BASE`,
+  default `1.0`), `reporter_retry_backoff_cap`
+  (`SOLWYN_REPORTER_RETRY_BACKOFF_CAP`, default `60.0`), and
+  `reporter_shutdown_deadline` (`SOLWYN_REPORTER_SHUTDOWN_DEADLINE`, default
+  `5.0`).
+- **`MetadataReporter.dropped_counts` / `AsyncMetadataReporter.dropped_counts`**
+  expose undeliverable spend as a `{"kind.reason": count}` mapping, with kinds
+  `confirm` / `settlement_confirm` / `event` and reasons `overflow`,
+  `retry_exhausted`, `terminal_status`, `ingest_rejected`, `shutdown_deadline`,
+  `exit_breaker_open`, and `closed_enqueue`.
 - **New config knobs (with `SOLWYN_*` env vars):**
   `budget_check_timeout` (`SOLWYN_BUDGET_CHECK_TIMEOUT`, default `1.0`),
   `control_plane_failure_threshold`

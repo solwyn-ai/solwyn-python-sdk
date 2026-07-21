@@ -19,6 +19,7 @@ import time
 
 from pydantic import BaseModel, ConfigDict
 
+from solwyn._lifecycle import register_fork_reset
 from solwyn._types import CircuitState
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,25 @@ class CircuitBreaker:
         self._half_open_probe_token: int | None = None
         self._next_probe_token = 0
         self._lock = threading.Lock()
+        register_fork_reset(self)
+
+    def _reset_after_fork_in_child(self) -> None:
+        """Repair a forked child's breaker: fresh lock, orphaned probe freed.
+
+        Health state (counts, state) carries over — the child inherits the
+        parent's provider-health view by design. Two things do NOT carry:
+
+        - the lock: inherited held (by a thread that does not exist in the
+          child) it would deadlock every admit/record call;
+        - an in-flight HALF_OPEN probe slot: it belongs to a PARENT thread, so
+          in the child no one can ever report its verdict or release it —
+          left set, ``admit()`` refuses forever and the breaker is wedged
+          permanently (P1 review finding: permanent fail-open for the child's
+          budget checks and permanent HELD for its confirms).
+        """
+        self._lock = threading.Lock()
+        self._half_open_probe_active = False
+        self._half_open_probe_token = None
 
     # ------------------------------------------------------------------
     # Public interface (synchronous)

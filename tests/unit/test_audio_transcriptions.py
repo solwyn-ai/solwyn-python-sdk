@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import VALID_API_KEY, VALID_PROJECT_ID
+from conftest import VALID_API_KEY, VALID_PROJECT_ID, foreground_records
 
 from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn._token_details import TokenDetails
@@ -135,7 +135,7 @@ class TestTranscriptionUsageExtraction:
         response = SimpleNamespace(usage=SimpleNamespace(type="mystery", widgets=3))
         with caplog.at_level(logging.WARNING, logger=_OPENAI_LOGGER):
             assert _transcription_usage_basis(response) == (None, None)
-        assert caplog.records == []
+        assert foreground_records(caplog) == []
 
     def test_zero_token_counts_yield_none(self) -> None:
         response = SimpleNamespace(
@@ -295,7 +295,7 @@ class TestAudioTranscriptionsProxy:
         solwyn = _build_sync(client)
         with caplog.at_level(logging.WARNING, logger="solwyn._base"):
             assert solwyn.audio.transcriptions.with_raw_response() == "raw"
-        assert caplog.records == []
+        assert foreground_records(caplog) == []
         _close_sync(solwyn)
 
     def test_budget_denied_short_circuits(self) -> None:
@@ -341,7 +341,7 @@ class TestAudioTranscriptionsProxy:
             _ = solwyn.audio
             _ = solwyn.audio.transcriptions
             _ = solwyn.audio.speech
-        assert caplog.records == []
+        assert foreground_records(caplog) == []
         _close_sync(solwyn)
 
 

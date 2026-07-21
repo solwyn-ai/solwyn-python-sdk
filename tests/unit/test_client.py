@@ -8,7 +8,12 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
+from conftest import (
+    ALLOW_BUDGET_RESPONSE,
+    VALID_API_KEY,
+    VALID_PROJECT_ID,
+    foreground_records,
+)
 
 import solwyn as solwyn_pkg
 from solwyn._base import _reset_unmetered_spend_warnings
@@ -620,7 +625,7 @@ class TestUnshippedSpendSurfacePosture:
             for surface in ("moderations", "files"):
                 assert getattr(solwyn, surface) is getattr(client, surface)
 
-        assert caplog.records == []
+        assert foreground_records(caplog) == []
         self._close(solwyn)
 
     def test_warning_message_carries_no_request_content(

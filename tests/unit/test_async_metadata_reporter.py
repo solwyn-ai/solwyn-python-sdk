@@ -649,14 +649,18 @@ class TestAsyncReporterBatchFlush:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_flush_remaining_confirm_persistent_failures_escalate_to_error(
-        self, caplog: pytest.LogCaptureFixture
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
+        # A retrying head PARKS its queue (FIFO), so a persistent outage
+        # accrues one consecutive failure per flush cycle, not per queued item.
+        clock = {"t": 1000.0}
+        monkeypatch.setattr("solwyn.reporter._monotonic", lambda: clock["t"])
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
             VALID_API_KEY,
+            max_send_attempts=11,
         )
-        for _ in range(10):
-            reporter.report_confirm(_make_confirm_request())
+        reporter.report_confirm(_make_confirm_request())
 
         with (
             patch.object(
@@ -664,7 +668,9 @@ class TestAsyncReporterBatchFlush:
             ),
             caplog.at_level("ERROR"),
         ):
-            await reporter._flush_remaining()
+            for _ in range(10):
+                await reporter._flush_remaining()
+                clock["t"] += 61.0  # past the backoff cap so the head is due
 
         assert reporter._consecutive_confirm_failures == 10
         assert "reporter.confirm_send_persistent_failure" in caplog.text
