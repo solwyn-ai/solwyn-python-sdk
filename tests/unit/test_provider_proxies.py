@@ -14,7 +14,12 @@ from unittest.mock import AsyncMock as AsyncMockFn
 from unittest.mock import MagicMock, patch
 
 import pytest
-from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
+from conftest import (
+    ALLOW_BUDGET_RESPONSE,
+    VALID_API_KEY,
+    VALID_PROJECT_ID,
+    foreground_records,
+)
 
 from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn.client import AsyncSolwyn, Solwyn
@@ -433,7 +438,7 @@ class TestGoogleModelsProxy:
                 config={"duration_seconds": 8},
             )
 
-        assert caplog.records == []
+        assert foreground_records(caplog) == []
         solwyn.close()
 
     def test_generate_videos_checks_budget_and_denies(self) -> None:
@@ -542,7 +547,7 @@ class TestGoogleModelsProxy:
         with caplog.at_level(logging.WARNING, logger="solwyn._base"), _mock_budget(solwyn):
             solwyn.models.embed_content(model="gemini-embedding-001", contents="hi")
 
-        assert caplog.records == []
+        assert foreground_records(caplog) == []
         solwyn.close()
 
     def test_generate_images_is_intercepted_and_reports_image_count(self) -> None:
@@ -626,7 +631,7 @@ class TestGoogleModelsProxy:
                 model="imagen-3.0-generate-002", prompt="a cat", config={"number_of_images": 1}
             )
 
-        assert caplog.records == []
+        assert foreground_records(caplog) == []
         solwyn.close()
 
     def test_generate_images_checks_budget_and_denies(self) -> None:
@@ -659,7 +664,7 @@ class TestGoogleModelsProxy:
         with caplog.at_level(logging.WARNING, logger="solwyn._base"):
             assert solwyn.models.list() == ["gemini-2.5-pro"]
 
-        assert caplog.records == []
+        assert foreground_records(caplog) == []
         solwyn.close()
 
     def test_openai_models_is_not_proxied(self) -> None:
@@ -982,7 +987,7 @@ class TestVideosProxy:
         with caplog.at_level(logging.WARNING, logger="solwyn._base"), _mock_budget(solwyn):
             solwyn.videos.create(model="sora-2", prompt="a cat", seconds="4")
 
-        assert caplog.records == []
+        assert foreground_records(caplog) == []
         solwyn.close()
 
     def test_videos_non_create_passes_through(self) -> None:

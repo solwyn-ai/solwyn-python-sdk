@@ -19,6 +19,7 @@ import time
 
 from pydantic import BaseModel, ConfigDict
 
+from solwyn._lifecycle import register_fork_reset
 from solwyn._types import CircuitState
 
 logger = logging.getLogger(__name__)
@@ -108,6 +109,17 @@ class CircuitBreaker:
         self._half_open_probe_active: bool = False
         self._half_open_probe_token: int | None = None
         self._next_probe_token = 0
+        self._lock = threading.Lock()
+        register_fork_reset(self)
+
+    def _reset_after_fork_in_child(self) -> None:
+        """Replace the lock in a forked child; health state is legitimately kept.
+
+        The ONLY allowed cross-fork mutation on the breaker: a lock inherited
+        held (by a thread that does not exist in the child) would deadlock every
+        admit/record call. Failure/success counts and state carry over — the
+        child inherits the parent's provider-health view by design.
+        """
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------

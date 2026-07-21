@@ -31,7 +31,11 @@ from typing import TypeVar
 
 import httpx
 
-from solwyn._lifecycle import register_async_reporter, register_sync_reporter
+from solwyn._lifecycle import (
+    register_async_reporter,
+    register_fork_reset,
+    register_sync_reporter,
+)
 from solwyn._read_only_key import handle_read_only_key_error
 from solwyn._types import BreakerStateReport, BudgetConfirmRequest, MetadataEvent, ProviderName
 from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
@@ -549,26 +553,83 @@ class MetadataReporter(_ReporterBase):
         self._shutdown = threading.Event()
         self._in_flight_lock = threading.Lock()
         self._breaker_worker_lock = threading.Lock()
+        self._thread_lock = threading.Lock()
+        # Set by the fork handler so the next enqueue relaunches the (fork-killed)
+        # flush thread. False otherwise, so a never-forked reporter never spawns
+        # an unexpected thread from report().
+        self._needs_thread_restart = False
         self._breaker_worker: threading.Thread | None = None
         # Separate queues for standalone confirms and settlements. Fire-and-
         # forgets onto these so the user's thread is not blocked on an
         # httpx.post to Solwyn. Bounds are enforced by _enqueue_bounded.
         self._confirm_queue: collections.deque[_PendingConfirm] = collections.deque()
         self._settlement_queue: collections.deque[_PendingSettlement] = collections.deque()
-        self._thread = threading.Thread(
-            target=self._flush_loop,
-            daemon=True,
-            name="solwyn-reporter",
-        )
-        self._thread.start()
+        self._thread = self._launch_thread()
         # Exit flush: if the process exits without close(), the atexit hook runs
         # close() so queued spend is still delivered. The live flush thread keeps
         # this reporter alive (its bound-method target), so no finalizer is
         # needed on the sync path — close() is the whole story.
         register_sync_reporter(self)
+        register_fork_reset(self)
+
+    def _launch_thread(self) -> threading.Thread:
+        """Create and start a fresh flush thread."""
+        thread = threading.Thread(
+            target=self._flush_loop,
+            daemon=True,
+            name="solwyn-reporter",
+        )
+        thread.start()
+        return thread
+
+    def _ensure_thread(self) -> None:
+        """Relaunch the flush thread if it is not running (e.g. after a fork).
+
+        The flush thread starts in ``__init__``; a forked child inherits a DEAD
+        thread. Restarting it lazily on the next enqueue — rather than inside the
+        ``os.register_at_fork`` handler, where starting a thread is fragile —
+        keeps delivery alive in the child. Guarded by ``_needs_thread_restart``
+        (set only by the fork handler) so a never-forked reporter never spawns an
+        unexpected thread; a no-op for a closed reporter.
+        """
+        if not self._needs_thread_restart or self._shutdown.is_set():
+            return
+        with self._thread_lock:
+            if not self._needs_thread_restart or self._shutdown.is_set():
+                return
+            self._needs_thread_restart = False
+            self._thread = self._launch_thread()
+
+    def _reset_after_fork_in_child(self) -> None:
+        """Repair a forked child: fresh locks + client; defer the thread relaunch.
+
+        Threads do not survive ``fork()``, so the inherited flush thread is dead
+        in the child. Starting a replacement INSIDE this fork handler is fragile
+        (the child is in a delicate post-fork state), so the thread is instead
+        relaunched lazily by ``_ensure_thread`` on the next enqueue. Locks
+        possibly held by a now-absent thread are replaced, and the inherited
+        client is abandoned (never closed — the parent owns those sockets).
+        Queued items duplicated into the child by fork are deliberately KEPT: the
+        server dedups. A closed reporter stays closed (fresh shutdown Event kept
+        set — see below).
+        """
+        self._breaker_project_lock = threading.Lock()
+        self._drop_lock = threading.Lock()
+        self._in_flight_lock = threading.Lock()
+        self._breaker_worker_lock = threading.Lock()
+        self._thread_lock = threading.Lock()
+        self._in_flight = 0
+        self._breaker_worker = None
+        self._http = httpx.Client(timeout=10.0)
+        if not self._shutdown.is_set():
+            # Replace the inherited Event and arm the lazy relaunch; a closed
+            # reporter keeps its set Event and never relaunches.
+            self._shutdown = threading.Event()
+            self._needs_thread_restart = True
 
     def report(self, event: MetadataEvent) -> None:
         """Enqueue a metadata event for async reporting.  Non-blocking."""
+        self._ensure_thread()
         self._enqueue(event)
 
     def close(self, timeout: float | None = None) -> None:
@@ -900,6 +961,7 @@ class MetadataReporter(_ReporterBase):
         if self._shutdown.is_set():
             self._count_drop("confirm", "closed_enqueue")
             return
+        self._ensure_thread()
         self._enqueue_bounded(
             self._confirm_queue, _PendingConfirm(request), _MAX_PENDING_CONTROL, "confirm"
         )
@@ -909,6 +971,7 @@ class MetadataReporter(_ReporterBase):
         if self._shutdown.is_set():
             self._count_drop("settlement_confirm", "closed_enqueue")
             return
+        self._ensure_thread()
         self._enqueue_bounded(
             self._settlement_queue,
             _PendingSettlement(_PendingConfirm(request), event),
@@ -981,6 +1044,24 @@ class AsyncMetadataReporter(_ReporterBase):
         # detaches it so nothing double-flushes.
         self._finalizer: weakref.finalize[..., AsyncMetadataReporter] | None = None
         register_async_reporter(self)
+        register_fork_reset(self)
+
+    def _reset_after_fork_in_child(self) -> None:
+        """Repair a forked child: fresh locks/client and cleared loop state.
+
+        The parent's event loop, flush task, and breaker task do not exist in the
+        child; clear them so ``_ensure_started`` relaunches the flush loop in the
+        child's own loop on the next enqueue. The inherited client is abandoned
+        (never closed — the parent owns those sockets). Queued items duplicated
+        into the child by fork are deliberately KEPT: the server dedups.
+        """
+        self._breaker_project_lock = threading.Lock()
+        self._drop_lock = threading.Lock()
+        self._in_flight = 0
+        self._flush_task = None
+        self._breaker_task = None
+        self._shutdown_event = None
+        self._http = httpx.AsyncClient(timeout=10.0)
 
     def start(self) -> None:
         """Start the background flush loop.  Must be called within an event loop.

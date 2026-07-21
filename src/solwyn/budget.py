@@ -20,6 +20,7 @@ from typing import cast, get_args
 import httpx
 from pydantic import BaseModel, ConfigDict
 
+from solwyn._lifecycle import register_fork_reset
 from solwyn._read_only_key import handle_read_only_key_error
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
@@ -115,6 +116,11 @@ class _BudgetEnforcerBase:
         # outage after a hard deny must not reopen spending.
         self._last_hard_deny_response: BudgetCheckResponse | None = None
         self._run_hard_deny_responses: OrderedDict[str, BudgetCheckResponse] = OrderedDict()
+
+    def _reset_after_fork_in_child(self) -> None:
+        """Replace the state lock in a forked child (concrete classes also swap
+        the inherited HTTP client — a shared socket across processes corrupts)."""
+        self._state_lock = threading.Lock()
 
     def _build_check_request(
         self,
@@ -491,6 +497,16 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             control_plane_breaker=control_plane_breaker,
         )
         self._http = httpx.Client(timeout=5.0)
+        register_fork_reset(self)
+
+    def _reset_after_fork_in_child(self) -> None:
+        """Fresh state lock AND a fresh sync client for the forked child.
+
+        The inherited ``httpx.Client`` is abandoned, never closed — the parent
+        still owns those sockets.
+        """
+        super()._reset_after_fork_in_child()
+        self._http = httpx.Client(timeout=5.0)
 
     def check_budget(
         self,
@@ -634,6 +650,16 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             cache_ttl=cache_ttl,
             control_plane_breaker=control_plane_breaker,
         )
+        self._http = httpx.AsyncClient(timeout=5.0)
+        register_fork_reset(self)
+
+    def _reset_after_fork_in_child(self) -> None:
+        """Fresh state lock AND a fresh async client for the forked child.
+
+        The inherited ``httpx.AsyncClient`` is abandoned, never closed — the
+        parent still owns those sockets, and the child's event loop is new.
+        """
+        super()._reset_after_fork_in_child()
         self._http = httpx.AsyncClient(timeout=5.0)
 
     async def check_budget(

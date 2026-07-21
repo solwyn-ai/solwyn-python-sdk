@@ -19,7 +19,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import VALID_API_KEY, VALID_PROJECT_ID
+from conftest import VALID_API_KEY, VALID_PROJECT_ID, foreground_records
 
 from solwyn import _base
 from solwyn._base import _reset_unmetered_spend_warnings
@@ -279,7 +279,7 @@ def test_sync_curated_silent_surfaces_pass_through_without_warning(
         assert solwyn.audio is not client.audio
         assert solwyn.videos is not client.videos
 
-    assert caplog.records == []
+    assert foreground_records(caplog) == []
     solwyn.close()
 
 
@@ -398,7 +398,7 @@ def test_missing_unmetered_surface_does_not_warn_or_consume_latch(
     with caplog.at_level(logging.WARNING, logger="solwyn._base"):
         with pytest.raises(AttributeError):
             _ = solwyn.rerank
-        assert caplog.records == []
+        assert foreground_records(caplog) == []
 
         resource = object()
         client.rerank = resource
@@ -447,7 +447,7 @@ def test_unrelated_surface_passes_through_silently(
     with caplog.at_level(logging.WARNING, logger="solwyn._base"):
         assert solwyn.moderations is resource
 
-    assert caplog.records == []
+    assert foreground_records(caplog) == []
     solwyn.close()
 
 

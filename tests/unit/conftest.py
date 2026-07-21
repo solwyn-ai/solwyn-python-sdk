@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -19,6 +20,24 @@ VALID_PROJECT_ID = "proj_" + "a" * 24
 # A minimal one-link provider chain, enough to satisfy SolwynConfig's
 # required ``providers`` invariant in tests that don't care about routing.
 DEFAULT_PROVIDER_CHAIN = [ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")]
+
+
+# Loggers written by the reporter's BACKGROUND delivery machinery (flush
+# threads, exit hooks). caplog installs its handler on the ROOT logger, so these
+# leak into any test's capture window — and since delivery is at-least-once, a
+# reporter left live by an earlier test retries against the unreachable test API
+# for several backoff cycles, emitting WARNINGs the whole time. Tests asserting
+# "the logger I named stayed silent" must not be tripped by that noise.
+_BACKGROUND_LOGGERS = ("solwyn.reporter", "solwyn._lifecycle")
+
+
+def foreground_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Captured records excluding the background delivery loggers.
+
+    Use instead of ``caplog.records`` when asserting that the logger named in
+    ``caplog.at_level(..., logger=...)`` emitted nothing.
+    """
+    return [r for r in caplog.records if not r.name.startswith(_BACKGROUND_LOGGERS)]
 
 
 def _accepted_response(body: dict[str, Any]) -> MagicMock:
