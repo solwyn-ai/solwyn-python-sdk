@@ -14,7 +14,12 @@ from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
 from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer
 from solwyn.circuit_breaker import CircuitBreaker
-from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
+from solwyn.reporter import (
+    AsyncMetadataReporter,
+    MetadataReporter,
+    _PendingConfirm,
+    _PendingEvent,
+)
 
 
 def _read_only_response() -> MagicMock:
@@ -160,8 +165,8 @@ def test_sync_reporter_read_only_batches_are_terminal_and_log_once(
             batch_size=1,
         )
     reporter._thread.join(timeout=2)
-    reporter._confirm_queue.append(_confirm())
-    reporter._queue.append(_event())
+    reporter._confirm_queue.append(_PendingConfirm(_confirm()))
+    reporter._queue.append(_PendingEvent(_event()))
 
     with (
         patch.object(reporter._http, "post", return_value=_read_only_response()) as post,
@@ -259,8 +264,8 @@ async def test_async_reporter_read_only_batches_are_terminal_and_log_once(
         VALID_API_KEY,
         batch_size=1,
     )
-    reporter._confirm_queue.append(_confirm())
-    reporter._queue.append(_event())
+    reporter._confirm_queue.append(_PendingConfirm(_confirm()))
+    reporter._queue.append(_PendingEvent(_event()))
     reporter._http.post = AsyncMock(return_value=_read_only_response())
 
     with caplog.at_level("WARNING"):

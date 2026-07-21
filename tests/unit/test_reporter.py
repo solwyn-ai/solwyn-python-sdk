@@ -22,6 +22,7 @@ from solwyn._types import (
 from solwyn.reporter import (
     AsyncMetadataReporter,
     MetadataReporter,
+    _PendingConfirm,
     _ReporterBase,
 )
 
@@ -161,11 +162,12 @@ class TestReporterBase:
             events.append(event)
             base._enqueue(event)
 
-        # Queue should contain only the 3 most recent
+        # Queue should contain only the 3 most recent (events wrapped in
+        # _PendingEvent for retry bookkeeping).
         assert len(base._queue) == 3
-        assert base._queue[0].input_tokens == 2
-        assert base._queue[1].input_tokens == 3
-        assert base._queue[2].input_tokens == 4
+        assert base._queue[0].event.input_tokens == 2
+        assert base._queue[1].event.input_tokens == 3
+        assert base._queue[2].event.input_tokens == 4
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +376,7 @@ class TestMetadataReporter:
         reporter = _quiet_sync_reporter()
         # Enqueue directly: report_confirm gates on the shutdown flag that
         # _quiet_sync_reporter sets to stop the background thread.
-        reporter._confirm_queue.append(_make_confirm_request())
+        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
 
         with (
             patch.object(reporter._http, "post", return_value=_error_response(422)),
@@ -395,7 +397,7 @@ class TestMetadataReporter:
         reporter.report(_make_event(call_id=call_id))
         # Enqueue directly: report_confirm gates on the shutdown flag that
         # _quiet_sync_reporter sets to stop the background thread.
-        reporter._confirm_queue.append(_make_confirm_request(call_id=call_id))
+        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request(call_id=call_id)))
 
         with patch.object(reporter._http, "post", return_value=MagicMock()) as mock_post:
             reporter._flush_remaining()
@@ -452,7 +454,7 @@ class TestMetadataReporter:
     ) -> None:
         reporter = _quiet_sync_reporter()
         for _ in range(10):
-            reporter._confirm_queue.append(_make_confirm_request())
+            reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
 
         with (
             patch.object(reporter._http, "post", return_value=_error_response(503)),
@@ -471,12 +473,12 @@ class TestMetadataReporter:
         # count (settlement accounting that used to live on the enforcer).
         reporter = _quiet_sync_reporter()
         for _ in range(2):
-            reporter._confirm_queue.append(_make_confirm_request())
+            reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
         with patch.object(reporter._http, "post", return_value=_error_response(422)):
             reporter._flush_remaining()
         assert reporter._consecutive_confirm_failures == 2
 
-        reporter._confirm_queue.append(_make_confirm_request())
+        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
         with patch.object(reporter._http, "post", return_value=MagicMock()):
             reporter._flush_remaining()
         assert reporter._consecutive_confirm_failures == 0
@@ -823,5 +825,5 @@ class TestAsyncMetadataReporter:
         reporter.report(_make_event(input_tokens=3))
 
         assert len(reporter._queue) == 2
-        assert reporter._queue[0].input_tokens == 2
-        assert reporter._queue[1].input_tokens == 3
+        assert reporter._queue[0].event.input_tokens == 2
+        assert reporter._queue[1].event.input_tokens == 3
