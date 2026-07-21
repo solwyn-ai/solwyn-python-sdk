@@ -81,6 +81,15 @@ class SolwynConfig(BaseModel):
     reporter_max_in_flight: int = 3
     breaker_reporting_enabled: bool = True
 
+    # Reporter at-least-once delivery: these bound the retry/backoff the reporter
+    # applies to confirms, settlements, and metadata batches so acknowledged
+    # provider spend is not silently lost on a transient control-plane blip, and
+    # cap the wall-clock the shutdown/exit flush chain may spend.
+    reporter_max_send_attempts: int = 5
+    reporter_retry_backoff_base: float = 1.0
+    reporter_retry_backoff_cap: float = 60.0
+    reporter_shutdown_deadline: float = 5.0
+
     model_config = ConfigDict(extra="forbid")
 
     @model_validator(mode="before")
@@ -104,6 +113,10 @@ class SolwynConfig(BaseModel):
             "reporter_max_queue_size": "REPORTER_MAX_QUEUE_SIZE",
             "reporter_max_in_flight": "REPORTER_MAX_IN_FLIGHT",
             "breaker_reporting_enabled": "BREAKER_REPORTING_ENABLED",
+            "reporter_max_send_attempts": "REPORTER_MAX_SEND_ATTEMPTS",
+            "reporter_retry_backoff_base": "REPORTER_RETRY_BACKOFF_BASE",
+            "reporter_retry_backoff_cap": "REPORTER_RETRY_BACKOFF_CAP",
+            "reporter_shutdown_deadline": "REPORTER_SHUTDOWN_DEADLINE",
         }
 
         for field, env_suffix in field_env_map.items():

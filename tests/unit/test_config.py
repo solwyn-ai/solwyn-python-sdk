@@ -220,6 +220,57 @@ class TestControlPlaneConfig:
 
 
 @pytest.mark.unit
+class TestReporterRetryConfig:
+    """Reporter at-least-once delivery knobs: retry/backoff/shutdown-deadline."""
+
+    def test_reporter_retry_knob_defaults(self) -> None:
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+        )
+        assert config.reporter_max_send_attempts == 5
+        assert config.reporter_retry_backoff_base == 1.0
+        assert config.reporter_retry_backoff_cap == 60.0
+        assert config.reporter_shutdown_deadline == 5.0
+
+    def test_reporter_retry_knobs_are_overridable(self) -> None:
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+            reporter_max_send_attempts=3,
+            reporter_retry_backoff_base=0.5,
+            reporter_retry_backoff_cap=10.0,
+            reporter_shutdown_deadline=2.5,
+        )
+        assert config.reporter_max_send_attempts == 3
+        assert config.reporter_retry_backoff_base == 0.5
+        assert config.reporter_retry_backoff_cap == 10.0
+        assert config.reporter_shutdown_deadline == 2.5
+
+    def test_reporter_retry_knobs_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.setenv("SOLWYN_REPORTER_MAX_SEND_ATTEMPTS", "3")
+        monkeypatch.setenv("SOLWYN_REPORTER_RETRY_BACKOFF_BASE", "0.5")
+        monkeypatch.setenv("SOLWYN_REPORTER_RETRY_BACKOFF_CAP", "10")
+        monkeypatch.setenv("SOLWYN_REPORTER_SHUTDOWN_DEADLINE", "2.5")
+
+        solwyn = _make_solwyn(_mock_openai_client())
+
+        # Config parsed the env vars...
+        assert solwyn._config.reporter_max_send_attempts == 3
+        assert solwyn._config.reporter_retry_backoff_base == 0.5
+        assert solwyn._config.reporter_retry_backoff_cap == 10.0
+        assert solwyn._config.reporter_shutdown_deadline == 2.5
+        # ...and the client threaded them into the reporter's public attrs.
+        assert solwyn._reporter.max_send_attempts == 3
+        assert solwyn._reporter.retry_backoff_base == 0.5
+        assert solwyn._reporter.retry_backoff_cap == 10.0
+        assert solwyn._reporter.shutdown_deadline == 2.5
+
+        solwyn.close()
+
+
+@pytest.mark.unit
 class TestConfigurationErrorFromBadCredentials:
     """Malformed api_key raises ConfigurationError with correct attributes."""
 

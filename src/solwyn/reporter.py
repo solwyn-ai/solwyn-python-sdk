@@ -63,12 +63,23 @@ class _ReporterBase:
         sdk_instance_id: str | None = None,
         breaker_reporting_enabled: bool = True,
         control_plane_breaker: CircuitBreaker | None = None,
+        max_send_attempts: int = 5,
+        retry_backoff_base: float = 1.0,
+        retry_backoff_cap: float = 60.0,
+        shutdown_deadline: float = 5.0,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
         self.batch_size = batch_size
         self.flush_interval = flush_interval
         self.max_in_flight = max_in_flight
+        # At-least-once delivery bounds (see SolwynConfig.reporter_*): retries
+        # per item before a counted drop, exponential backoff base/cap, and the
+        # single wall-clock budget the shutdown/exit flush chain may spend.
+        self.max_send_attempts = max_send_attempts
+        self.retry_backoff_base = retry_backoff_base
+        self.retry_backoff_cap = retry_backoff_cap
+        self.shutdown_deadline = shutdown_deadline
         self._breaker_snapshots = breaker_snapshots
         self._sdk_instance_id = sdk_instance_id
         self._breaker_reporting_enabled = breaker_reporting_enabled
@@ -297,6 +308,10 @@ class MetadataReporter(_ReporterBase):
         sdk_instance_id: str | None = None,
         breaker_reporting_enabled: bool = True,
         control_plane_breaker: CircuitBreaker | None = None,
+        max_send_attempts: int = 5,
+        retry_backoff_base: float = 1.0,
+        retry_backoff_cap: float = 60.0,
+        shutdown_deadline: float = 5.0,
     ) -> None:
         super().__init__(
             api_url,
@@ -309,6 +324,10 @@ class MetadataReporter(_ReporterBase):
             sdk_instance_id=sdk_instance_id,
             breaker_reporting_enabled=breaker_reporting_enabled,
             control_plane_breaker=control_plane_breaker,
+            max_send_attempts=max_send_attempts,
+            retry_backoff_base=retry_backoff_base,
+            retry_backoff_cap=retry_backoff_cap,
+            shutdown_deadline=shutdown_deadline,
         )
         self._http = httpx.Client(timeout=10.0)
         self._shutdown = threading.Event()
@@ -558,6 +577,10 @@ class AsyncMetadataReporter(_ReporterBase):
         sdk_instance_id: str | None = None,
         breaker_reporting_enabled: bool = True,
         control_plane_breaker: CircuitBreaker | None = None,
+        max_send_attempts: int = 5,
+        retry_backoff_base: float = 1.0,
+        retry_backoff_cap: float = 60.0,
+        shutdown_deadline: float = 5.0,
     ) -> None:
         super().__init__(
             api_url,
@@ -570,6 +593,10 @@ class AsyncMetadataReporter(_ReporterBase):
             sdk_instance_id=sdk_instance_id,
             breaker_reporting_enabled=breaker_reporting_enabled,
             control_plane_breaker=control_plane_breaker,
+            max_send_attempts=max_send_attempts,
+            retry_backoff_base=retry_backoff_base,
+            retry_backoff_cap=retry_backoff_cap,
+            shutdown_deadline=shutdown_deadline,
         )
         self._http = httpx.AsyncClient(timeout=10.0)
         self._shutdown_event: asyncio.Event | None = None

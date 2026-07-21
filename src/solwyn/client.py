@@ -625,6 +625,10 @@ class Solwyn(_SolwynBase):
             sdk_instance_id=self._sdk_instance_id,
             breaker_reporting_enabled=config.breaker_reporting_enabled,
             control_plane_breaker=self._control_plane_breaker,
+            max_send_attempts=config.reporter_max_send_attempts,
+            retry_backoff_base=config.reporter_retry_backoff_base,
+            retry_backoff_cap=config.reporter_retry_backoff_cap,
+            shutdown_deadline=config.reporter_shutdown_deadline,
         )
 
     @functools.cached_property
@@ -1602,6 +1606,10 @@ class AsyncSolwyn(_SolwynBase):
             sdk_instance_id=self._sdk_instance_id,
             breaker_reporting_enabled=config.breaker_reporting_enabled,
             control_plane_breaker=self._control_plane_breaker,
+            max_send_attempts=config.reporter_max_send_attempts,
+            retry_backoff_base=config.reporter_retry_backoff_base,
+            retry_backoff_cap=config.reporter_retry_backoff_cap,
+            shutdown_deadline=config.reporter_shutdown_deadline,
         )
 
     @functools.cached_property
