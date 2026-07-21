@@ -104,7 +104,9 @@ def _quiet(**kwargs) -> MetadataReporter:
     """A sync reporter with its background flush thread stopped."""
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         reporter = MetadataReporter(_URL, VALID_API_KEY, **kwargs)
-    reporter._shutdown.set()
+    # Patched _flush_loop -> thread already dead; leaving _shutdown UNSET keeps
+    # report()/report_confirm/report_settlement enqueuing testable (they now
+    # refuse and count post-shutdown enqueues).
     reporter._thread.join(timeout=2.0)
     return reporter
 

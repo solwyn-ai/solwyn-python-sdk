@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import UTC, datetime
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -23,6 +23,7 @@ from conftest import VALID_API_KEY
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
+from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.reporter import (
     AsyncMetadataReporter,
     MetadataReporter,
@@ -143,3 +144,99 @@ class TestAsyncShutdownDeadline:
         counts = reporter.dropped_counts
         assert counts.get("settlement_confirm.shutdown_deadline", 0) >= 1
         assert counts.get("event.shutdown_deadline", 0) >= 1
+
+
+@pytest.mark.unit
+def test_close_deadline_bounds_metadata_batch_send() -> None:
+    """P0 review pin: the ingest POST must be clamped into the shutdown window.
+
+    The mock HONORS the timeout kwarg (a mock that ignores it cannot tell a
+    bounded request from an unbounded one — the gap that hid this). Pre-fix,
+    _send_batch passed no timeout, so a black-holed control plane held close()
+    for the full 10s client default regardless of close(timeout=...).
+    """
+    reporter = _unstarted()
+    reporter.report(_make_event())
+
+    def _blackholed_post(url: str, **kwargs: object) -> None:
+        timeout = kwargs.get("timeout", 10.0)
+        time.sleep(min(float(timeout), 10.0))  # type: ignore[arg-type]
+        raise httpx.ConnectTimeout("simulated blackhole")
+
+    start = time.monotonic()
+    with patch.object(reporter._http, "post", side_effect=_blackholed_post):
+        reporter.close(timeout=1.0)
+    elapsed = time.monotonic() - start
+    assert elapsed < 3.0, f"close(timeout=1.0) took {elapsed:.1f}s — ingest POST unbounded"
+    reporter._http.close()
+
+
+@pytest.mark.unit
+async def test_async_close_deadline_bounds_metadata_batch_send() -> None:
+    """Async twin of the P0 ingest-deadline pin (timeout-honoring mock)."""
+    reporter = AsyncMetadataReporter("https://api.test.solwyn.ai", VALID_API_KEY)
+    reporter.start()
+    reporter.report(_make_event())
+
+    async def _blackholed_post(url: str, **kwargs: object) -> None:
+        timeout = kwargs.get("timeout", 10.0)
+        await asyncio.sleep(min(float(timeout), 10.0))  # type: ignore[arg-type]
+        raise httpx.ConnectTimeout("simulated blackhole")
+
+    start = time.monotonic()
+    with patch.object(reporter._http, "post", side_effect=_blackholed_post):
+        await reporter.close(timeout=1.0)
+    elapsed = time.monotonic() - start
+    assert elapsed < 3.0, f"close(timeout=1.0) took {elapsed:.1f}s — ingest POST unbounded"
+
+
+@pytest.mark.unit
+def test_settlement_drop_at_deadline_counts_event_loss() -> None:
+    """P2 review pin: a settlement dropped at the deadline loses its confirm
+    AND its event — dropped_counts must say so for both kinds."""
+    reporter = _unstarted()
+    reporter.report_settlement(_make_confirm_request(), _make_event())
+    reporter._flush_remaining(deadline=time.monotonic() - 1.0, final=True)
+    assert reporter.dropped_counts["settlement_confirm.shutdown_deadline"] == 1
+    assert reporter.dropped_counts["event.shutdown_deadline"] == 1
+    reporter._http.close()
+
+
+@pytest.mark.unit
+def test_exit_breaker_open_settlement_event_still_ships() -> None:
+    """P2 review pin: at final flush with the breaker OPEN the confirms are
+    undeliverable, but ingest is not breaker-gated — the settlement's event
+    must still get its deadline-bounded exit attempt."""
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=3600, name="control-plane")
+    breaker.record_failure()  # OPEN, not recovery-eligible
+    reporter = _unstarted(control_plane_breaker=breaker)
+    reporter.report_settlement(_make_confirm_request(), _make_event())
+
+    sent_urls: list[str] = []
+
+    def _ok_post(url: str, **kwargs: object) -> MagicMock:
+        sent_urls.append(url)
+        response = MagicMock(spec=httpx.Response)
+        response.json.return_value = {"ingested": 1, "rejected": []}
+        return response
+
+    with patch.object(reporter._http, "post", side_effect=_ok_post):
+        reporter._flush_remaining(deadline=time.monotonic() + 5.0, final=True)
+
+    assert reporter.dropped_counts.get("settlement_confirm.exit_breaker_open") == 1
+    assert any("metadata/ingest" in url for url in sent_urls), (
+        "settlement event must ride ingest even when confirms are breaker-held"
+    )
+    assert not any("budgets/confirm" in url for url in sent_urls)
+    reporter._http.close()
+
+
+@pytest.mark.unit
+def test_report_after_close_counts_closed_enqueue() -> None:
+    """P2 review pin: report() after close() must count, not silently retain."""
+    reporter = _unstarted()
+    reporter._shutdown.set()
+    reporter.report(_make_event())
+    assert reporter.dropped_counts["event.closed_enqueue"] == 1
+    assert len(reporter._queue) == 0
+    reporter._http.close()

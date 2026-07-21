@@ -85,10 +85,13 @@ class SolwynConfig(BaseModel):
     # applies to confirms, settlements, and metadata batches so acknowledged
     # provider spend is not silently lost on a transient control-plane blip, and
     # cap the wall-clock the shutdown/exit flush chain may spend.
-    reporter_max_send_attempts: int = 5
-    reporter_retry_backoff_base: float = 1.0
-    reporter_retry_backoff_cap: float = 60.0
-    reporter_shutdown_deadline: float = 5.0
+    # Validated: a non-positive backoff base would put next_attempt_at in the
+    # past (hot retry loop burning the whole attempt budget in one flush
+    # cycle), and a negative deadline is already-expired (instant drops).
+    reporter_max_send_attempts: int = Field(default=5, ge=1)
+    reporter_retry_backoff_base: float = Field(default=1.0, gt=0)
+    reporter_retry_backoff_cap: float = Field(default=60.0, gt=0)
+    reporter_shutdown_deadline: float = Field(default=5.0, ge=0)
 
     model_config = ConfigDict(extra="forbid")
 

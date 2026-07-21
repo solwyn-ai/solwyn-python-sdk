@@ -327,3 +327,87 @@ async def test_async_budget_enforcer_reset_swaps_lock_and_client() -> None:
     assert enforcer._http is not old_http
     await enforcer.close()
     await old_http.aclose()
+
+
+@pytest.mark.unit
+def test_circuit_breaker_reset_frees_orphaned_half_open_probe() -> None:
+    """P1 review pin: a HALF_OPEN probe in flight at fork time belongs to a
+    PARENT thread; inherited set, admit() refuses forever in the child (state
+    only advances via an admitted call) — permanently wedging the control-plane
+    breaker: fail-open budget checks and HELD confirms with no recovery."""
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=0.0, success_threshold=1)
+    breaker.record_failure()  # -> OPEN, immediately recovery-eligible
+    admission = breaker.admit()  # -> HALF_OPEN, consumes the single probe slot
+    assert admission.allowed and admission.owns_probe
+
+    breaker._reset_after_fork_in_child()
+
+    follow_up = breaker.admit()
+    assert follow_up.allowed, (
+        "child breaker must not stay wedged behind the parent's orphaned probe"
+    )
+
+
+_REGISTRY_LOCK_CHILD = """
+import os
+import sys
+import threading
+import time
+
+import solwyn._lifecycle as lifecycle
+from solwyn.circuit_breaker import CircuitBreaker
+
+CircuitBreaker(name="parent")  # installs the at_fork hooks
+
+held = threading.Event()
+
+def _hold_registry_lock() -> None:
+    with lifecycle._registry_lock:
+        held.set()
+        time.sleep(0.4)
+
+threading.Thread(target=_hold_registry_lock, daemon=True).start()
+held.wait(timeout=5.0)
+
+pid = os.fork()
+if pid == 0:
+    # Pre-fix: the child inherits _registry_lock held by a thread that does
+    # not exist here, and this construction deadlocks forever.
+    done = threading.Event()
+
+    def _construct() -> None:
+        CircuitBreaker(name="child")
+        done.set()
+
+    threading.Thread(target=_construct, daemon=True).start()
+    os._exit(0 if done.wait(timeout=3.0) else 7)
+else:
+    _, status = os.waitpid(pid, 0)
+    sys.exit(os.waitstatus_to_exitcode(status))
+"""
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
+def test_forked_child_survives_held_registry_lock() -> None:
+    """P1 review pin: _registry_lock is the one lock fork repair cannot repair
+    (it guards the repair registry itself). The at_fork acquire/release triple
+    holds it across the fork; pre-fix, a child forked while another thread
+    registers an SDK object deadlocks on its own next construction."""
+    for _ in range(10):
+        result = subprocess.run(
+            [sys.executable, "-c", _REGISTRY_LOCK_CHILD],
+            timeout=30,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return
+        if result.returncode == 7:
+            pytest.fail(
+                "forked child deadlocked constructing an SDK object "
+                "while _registry_lock was inherited held"
+            )
+        # Any other code: the macOS multi-threaded-fork SIGSEGV artifact —
+        # retry, mirroring test_forked_child_flush_thread_delivers.
+    pytest.skip("all fork attempts crashed pre-exec (platform artifact)")

@@ -73,6 +73,20 @@ def register_fork_reset(obj: _ForkResettable) -> None:
     global _fork_registered
     with _registry_lock:
         if not _fork_registered and hasattr(os, "register_at_fork"):
+            # _registry_lock is the ONE lock the fork-repair machinery cannot
+            # repair (it guards the repair registry itself). Hold it across the
+            # fork instead: the before-hook waits out any in-flight
+            # registration, and both sides release their copy — otherwise a
+            # child forked while another thread constructs an SDK object
+            # inherits the lock held forever and deadlocks on its own next
+            # construction (P1 review finding). Hooks registered here run
+            # before _run_fork_resets (after_in_child hooks run in
+            # registration order).
+            os.register_at_fork(
+                before=_registry_lock.acquire,
+                after_in_parent=_registry_lock.release,
+                after_in_child=_registry_lock.release,
+            )
             os.register_at_fork(after_in_child=_run_fork_resets)
             _fork_registered = True
     _FORK_RESETTABLE.add(obj)
@@ -256,6 +270,9 @@ def _drop_all(
             drop_counter("confirm", reason, n_confirm)
         if n_settlement:
             drop_counter("settlement_confirm", reason, n_settlement)
+            # Each settlement pair loses its metadata event too — count it or
+            # dropped_counts understates real event loss.
+            drop_counter("event", reason, n_settlement)
         if n_event:
             drop_counter("event", reason, n_event)
     confirm_q.clear()

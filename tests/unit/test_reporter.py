@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -88,9 +89,24 @@ def _quiet_sync_reporter(**kwargs) -> MetadataReporter:
             VALID_API_KEY,
             **kwargs,
         )
-    reporter._shutdown.set()
+    # The patched _flush_loop returns immediately, so the thread is already
+    # dead — do NOT set _shutdown: report()/report_confirm/report_settlement
+    # now correctly refuse (and count) post-shutdown enqueues, and these
+    # helpers exist precisely to keep enqueuing testable.
     reporter._thread.join(timeout=2.0)
     return reporter
+
+
+def _stop_flush_thread(reporter: MetadataReporter) -> None:
+    """Stop a live flush thread, then restore an UNSET shutdown event.
+
+    report()/report_confirm/report_settlement now refuse (and count)
+    post-shutdown enqueues, so tests that stop the thread purely to avoid
+    timing races must not leave the reporter looking closed.
+    """
+    reporter._shutdown.set()
+    reporter._thread.join(timeout=2.0)
+    reporter._shutdown = threading.Event()
 
 
 def _unstarted_sync_reporter(**kwargs) -> MetadataReporter:
@@ -186,8 +202,7 @@ class TestMetadataReporter:
                 VALID_API_KEY,
             )
             # Stop the background thread to avoid timing issues
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             event = _make_event()
             reporter.report(event)
@@ -201,8 +216,7 @@ class TestMetadataReporter:
                 VALID_API_KEY,
                 batch_size=3,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             # Enqueue 5 events
             for _ in range(5):
@@ -224,8 +238,7 @@ class TestMetadataReporter:
                 VALID_API_KEY,
                 batch_size=10,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             for _ in range(3):
                 reporter.report(_make_event())
@@ -248,8 +261,7 @@ class TestMetadataReporter:
                 VALID_API_KEY,
             ) as reporter,
         ):
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
             reporter.report(_make_event())
         # After context exit, reporter should be closed
 
@@ -259,8 +271,7 @@ class TestMetadataReporter:
                 "https://api.test.solwyn.ai",
                 VALID_API_KEY,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             with patch.object(reporter._http, "post") as mock_post:
                 reporter._send_batch([_make_event(service_tier=None)])
@@ -277,8 +288,7 @@ class TestMetadataReporter:
                 "https://api.test.solwyn.ai",
                 VALID_API_KEY,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             with patch.object(reporter._http, "post") as mock_post:
                 reporter._send_batch([_make_event(tags={"team": "research"})])
@@ -293,8 +303,7 @@ class TestMetadataReporter:
                 "https://api.test.solwyn.ai",
                 VALID_API_KEY,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             with patch.object(reporter._http, "post") as mock_post:
                 reporter._send_batch([_make_event(service_tier="priority")])
@@ -311,8 +320,7 @@ class TestMetadataReporter:
                 "https://api.test.solwyn.ai",
                 VALID_API_KEY,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             event = _make_event(
                 agent_run_id="run_test_abc",
@@ -334,8 +342,7 @@ class TestMetadataReporter:
                 "https://api.test.solwyn.ai",
                 VALID_API_KEY,
             )
-            reporter._shutdown.set()
-            reporter._thread.join(timeout=2.0)
+            _stop_flush_thread(reporter)
 
             with patch.object(reporter._http, "post") as mock_post:
                 reporter._send_batch([_make_event()])

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import contextlib
 import dataclasses
 import enum
 import logging
@@ -629,6 +628,12 @@ class MetadataReporter(_ReporterBase):
 
     def report(self, event: MetadataEvent) -> None:
         """Enqueue a metadata event for async reporting.  Non-blocking."""
+        if self._shutdown.is_set():
+            # Nothing will ever drain a post-close enqueue — count it like
+            # report_confirm/report_settlement do instead of retaining it
+            # silently (a late streaming on_complete can land here).
+            self._count_drop("event", "closed_enqueue")
+            return
         self._ensure_thread()
         self._enqueue(event)
 
@@ -676,7 +681,13 @@ class MetadataReporter(_ReporterBase):
         while not self._shutdown.is_set():
             if self._shutdown.wait(timeout=self.flush_interval):
                 break
-            self._flush_remaining()
+            try:
+                self._flush_remaining()
+            except Exception as exc:
+                # The flush loop must survive anything a drain raises (a
+                # transport edge, a concurrent-close artifact): a dead flush
+                # thread strands ALL queued spend until overflow, silently.
+                logger.warning("reporter.flush_cycle_failed: exc_type=%s", type(exc).__name__)
             self._start_breaker_cycle()
 
     def _flush_remaining(self, *, deadline: float | None = None, final: bool = False) -> None:
@@ -701,10 +712,17 @@ class MetadataReporter(_ReporterBase):
                 self._count_drop("confirm", "shutdown_deadline", n=len(self._confirm_queue))
                 self._confirm_queue.clear()
                 break
-            pending = self._confirm_queue[0]
+            try:
+                # Atomic pop, never peek-then-pop: once close()'s bounded join
+                # times out, close/atexit drains CONCURRENTLY with the flush
+                # thread — two drainers peeking one head would double-send it
+                # and IndexError on the second popleft.
+                pending = self._confirm_queue.popleft()
+            except IndexError:
+                break
             if not final and pending.next_attempt_at > _monotonic():
+                self._confirm_queue.appendleft(pending)
                 break  # head still backing off — nothing behind is due earlier
-            self._confirm_queue.popleft()
             outcome = self._send_confirm(pending.request, timeout=self._send_timeout(deadline))
             if outcome is _SendOutcome.SENT:
                 continue
@@ -734,15 +752,22 @@ class MetadataReporter(_ReporterBase):
         survivors: list[_PendingSettlement] = []
         while self._settlement_queue:
             if self._deadline_expired(deadline):
-                self._count_drop(
-                    "settlement_confirm", "shutdown_deadline", n=len(self._settlement_queue)
-                )
+                # Each dropped pair loses its confirm AND its event — count
+                # both kinds or dropped_counts understates real event loss.
+                n_pairs = len(self._settlement_queue)
+                self._count_drop("settlement_confirm", "shutdown_deadline", n=n_pairs)
+                self._count_drop("event", "shutdown_deadline", n=n_pairs)
                 self._settlement_queue.clear()
                 break
-            pending = self._settlement_queue[0]
-            if not final and pending.confirm.next_attempt_at > _monotonic():
+            try:
+                # Atomic pop — see _drain_confirms for the concurrent-drain
+                # rationale.
+                pending = self._settlement_queue.popleft()
+            except IndexError:
                 break
-            self._settlement_queue.popleft()
+            if not final and pending.confirm.next_attempt_at > _monotonic():
+                self._settlement_queue.appendleft(pending)
+                break
             outcome = self._send_confirm(
                 pending.confirm.request, timeout=self._send_timeout(deadline)
             )
@@ -751,12 +776,15 @@ class MetadataReporter(_ReporterBase):
                 continue
             if outcome is _SendOutcome.HELD:
                 if final:
-                    self._count_drop(
-                        "settlement_confirm",
-                        "exit_breaker_open",
-                        n=1 + len(self._settlement_queue),
-                    )
+                    # The confirms are undeliverable (control plane known-down),
+                    # but ingest is NOT breaker-gated: hand every event to the
+                    # event drain so the durable spend truth still gets its
+                    # deadline-bounded exit attempt.
+                    stranded = [pending, *self._settlement_queue]
                     self._settlement_queue.clear()
+                    self._count_drop("settlement_confirm", "exit_breaker_open", n=len(stranded))
+                    for orphan in stranded:
+                        self._move_event_to_queue(orphan.event)
                 else:
                     survivors.append(pending)
                 break
@@ -795,7 +823,7 @@ class MetadataReporter(_ReporterBase):
                 prefix.append(self._queue.popleft())
             if not prefix:
                 break
-            outcome = self._send_batch([p.event for p in prefix])
+            outcome = self._send_batch([p.event for p in prefix], deadline=deadline)
             if outcome is _SendOutcome.SENT:
                 continue
             if outcome is _SendOutcome.RETRY:
@@ -915,14 +943,21 @@ class MetadataReporter(_ReporterBase):
             if breaker is not None:
                 breaker.release_probe(admission)
 
-    def _send_batch(self, batch: list[MetadataEvent]) -> _SendOutcome:
+    def _send_batch(
+        self, batch: list[MetadataEvent], *, deadline: float | None = None
+    ) -> _SendOutcome:
         """Send a batch of events to the cloud API and return its outcome.
 
         Ingest is deliberately NOT control-plane-breaker-guarded: opening the
         enforcement breaker (which flips budget checks to their fail-open
         posture) on an ingest blip would be a worse failure mode than a delayed
         batch. Ingest self-paces via the retry backoff instead.
+
+        ``deadline`` clamps the request into the shutdown window; without it a
+        black-holed control plane made close() overrun its budget by the full
+        10s client timeout (P0 review finding).
         """
+        timeout = 10.0 if deadline is None else self._send_timeout(deadline)
         with self._in_flight_lock:
             self._in_flight += 1
         try:
@@ -931,6 +966,7 @@ class MetadataReporter(_ReporterBase):
                 f"{self.api_url}/api/v1/metadata/ingest",
                 json=payload,
                 headers=self._auth_headers(),
+                timeout=timeout,
             )
             resp.raise_for_status()
             self._log_ingest_rejections(resp, len(batch))
@@ -1180,8 +1216,18 @@ class AsyncMetadataReporter(_ReporterBase):
         if remaining <= 0:
             task.cancel()
             return
-        with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+        try:
             await asyncio.wait_for(task, timeout=remaining)
+        except TimeoutError:
+            pass  # wait_for already cancelled the stuck task
+        except asyncio.CancelledError:
+            # Two sources are conflated here: close() ITSELF being cancelled
+            # (must propagate — a cancelled close must not silently keep
+            # running) vs the awaited task having been cancelled elsewhere
+            # (safe to continue shutting down).
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
 
     async def __aenter__(self) -> AsyncMetadataReporter:
         self.start()
@@ -1201,7 +1247,14 @@ class AsyncMetadataReporter(_ReporterBase):
                     timeout=self.flush_interval,
                 )
             except TimeoutError:
-                await self._flush_remaining()
+                try:
+                    await self._flush_remaining()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # The flush task must survive anything a drain raises: a
+                    # dead flush task strands ALL queued spend until overflow.
+                    logger.warning("reporter.flush_cycle_failed: exc_type=%s", type(exc).__name__)
                 self._start_breaker_cycle()
             else:
                 break
@@ -1225,13 +1278,24 @@ class AsyncMetadataReporter(_ReporterBase):
                 self._count_drop("confirm", "shutdown_deadline", n=len(self._confirm_queue))
                 self._confirm_queue.clear()
                 break
-            pending = self._confirm_queue[0]
-            if not final and pending.next_attempt_at > _monotonic():
+            try:
+                # Atomic pop, never peek-then-pop: a cancelled close() and the
+                # cooperatively-scheduled flush task can interleave drains.
+                pending = self._confirm_queue.popleft()
+            except IndexError:
                 break
-            self._confirm_queue.popleft()
-            outcome = await self._send_confirm(
-                pending.request, timeout=self._send_timeout(deadline)
-            )
+            if not final and pending.next_attempt_at > _monotonic():
+                self._confirm_queue.appendleft(pending)
+                break
+            try:
+                outcome = await self._send_confirm(
+                    pending.request, timeout=self._send_timeout(deadline)
+                )
+            except asyncio.CancelledError:
+                # close() cancelled a stuck drain at the deadline — the in-hand
+                # item would otherwise vanish uncounted.
+                self._count_drop("confirm", "shutdown_deadline")
+                raise
             if outcome is _SendOutcome.SENT:
                 continue
             if outcome is _SendOutcome.HELD:
@@ -1262,29 +1326,45 @@ class AsyncMetadataReporter(_ReporterBase):
         survivors: list[_PendingSettlement] = []
         while self._settlement_queue:
             if self._deadline_expired(deadline):
-                self._count_drop(
-                    "settlement_confirm", "shutdown_deadline", n=len(self._settlement_queue)
-                )
+                # Each dropped pair loses its confirm AND its event — count
+                # both kinds or dropped_counts understates real event loss.
+                n_pairs = len(self._settlement_queue)
+                self._count_drop("settlement_confirm", "shutdown_deadline", n=n_pairs)
+                self._count_drop("event", "shutdown_deadline", n=n_pairs)
                 self._settlement_queue.clear()
                 break
-            pending = self._settlement_queue[0]
-            if not final and pending.confirm.next_attempt_at > _monotonic():
+            try:
+                # Atomic pop — see _drain_confirms for the interleaving
+                # rationale.
+                pending = self._settlement_queue.popleft()
+            except IndexError:
                 break
-            self._settlement_queue.popleft()
-            outcome = await self._send_confirm(
-                pending.confirm.request, timeout=self._send_timeout(deadline)
-            )
+            if not final and pending.confirm.next_attempt_at > _monotonic():
+                self._settlement_queue.appendleft(pending)
+                break
+            try:
+                outcome = await self._send_confirm(
+                    pending.confirm.request, timeout=self._send_timeout(deadline)
+                )
+            except asyncio.CancelledError:
+                # In-hand pair vanishes with the cancellation — count both.
+                self._count_drop("settlement_confirm", "shutdown_deadline")
+                self._count_drop("event", "shutdown_deadline")
+                raise
             if outcome is _SendOutcome.SENT:
                 self._move_event_to_queue(pending.event)
                 continue
             if outcome is _SendOutcome.HELD:
                 if final:
-                    self._count_drop(
-                        "settlement_confirm",
-                        "exit_breaker_open",
-                        n=1 + len(self._settlement_queue),
-                    )
+                    # The confirms are undeliverable (control plane known-down),
+                    # but ingest is NOT breaker-gated: hand every event to the
+                    # event drain so the durable spend truth still gets its
+                    # deadline-bounded exit attempt.
+                    stranded = [pending, *self._settlement_queue]
                     self._settlement_queue.clear()
+                    self._count_drop("settlement_confirm", "exit_breaker_open", n=len(stranded))
+                    for orphan in stranded:
+                        self._move_event_to_queue(orphan.event)
                 else:
                     survivors.append(pending)
                 break
@@ -1323,7 +1403,11 @@ class AsyncMetadataReporter(_ReporterBase):
                 prefix.append(self._queue.popleft())
             if not prefix:
                 break
-            outcome = await self._send_batch([p.event for p in prefix])
+            try:
+                outcome = await self._send_batch([p.event for p in prefix], deadline=deadline)
+            except asyncio.CancelledError:
+                self._count_drop("event", "shutdown_deadline", n=len(prefix))
+                raise
             if outcome is _SendOutcome.SENT:
                 continue
             if outcome is _SendOutcome.RETRY:
@@ -1436,14 +1520,21 @@ class AsyncMetadataReporter(_ReporterBase):
             if breaker is not None:
                 breaker.release_probe(admission)
 
-    async def _send_batch(self, batch: list[MetadataEvent]) -> _SendOutcome:
+    async def _send_batch(
+        self, batch: list[MetadataEvent], *, deadline: float | None = None
+    ) -> _SendOutcome:
         """Send a batch of events to the cloud API and return its outcome.
 
         Ingest is deliberately NOT control-plane-breaker-guarded: opening the
         enforcement breaker (which flips budget checks to their fail-open
         posture) on an ingest blip would be a worse failure mode than a delayed
         batch. Ingest self-paces via the retry backoff instead.
+
+        ``deadline`` clamps the request into the shutdown window; without it a
+        black-holed control plane made close() overrun its budget by the full
+        10s client timeout (P0 review finding).
         """
+        timeout = 10.0 if deadline is None else self._send_timeout(deadline)
         self._in_flight += 1
         try:
             payload = [e.model_dump(mode="json") for e in batch]
@@ -1451,6 +1542,7 @@ class AsyncMetadataReporter(_ReporterBase):
                 f"{self.api_url}/api/v1/metadata/ingest",
                 json=payload,
                 headers=self._auth_headers(),
+                timeout=timeout,
             )
             resp.raise_for_status()
             # httpx.Response.json() is sync on both clients — shared helper.

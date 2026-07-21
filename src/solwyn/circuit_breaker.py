@@ -113,14 +113,22 @@ class CircuitBreaker:
         register_fork_reset(self)
 
     def _reset_after_fork_in_child(self) -> None:
-        """Replace the lock in a forked child; health state is legitimately kept.
+        """Repair a forked child's breaker: fresh lock, orphaned probe freed.
 
-        The ONLY allowed cross-fork mutation on the breaker: a lock inherited
-        held (by a thread that does not exist in the child) would deadlock every
-        admit/record call. Failure/success counts and state carry over — the
-        child inherits the parent's provider-health view by design.
+        Health state (counts, state) carries over — the child inherits the
+        parent's provider-health view by design. Two things do NOT carry:
+
+        - the lock: inherited held (by a thread that does not exist in the
+          child) it would deadlock every admit/record call;
+        - an in-flight HALF_OPEN probe slot: it belongs to a PARENT thread, so
+          in the child no one can ever report its verdict or release it —
+          left set, ``admit()`` refuses forever and the breaker is wedged
+          permanently (P1 review finding: permanent fail-open for the child's
+          budget checks and permanent HELD for its confirms).
         """
         self._lock = threading.Lock()
+        self._half_open_probe_active = False
+        self._half_open_probe_token = None
 
     # ------------------------------------------------------------------
     # Public interface (synchronous)
