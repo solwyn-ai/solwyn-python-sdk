@@ -52,9 +52,66 @@ derived from git tags (hatch-vcs).
   the shutdown event), and `start()` after `close()` raises `RuntimeError` —
   restarting a closed reporter is a programming error. Enqueue after `close()`
   is silently dropped, matching the sync reporter.
+- **Spend telemetry is now delivered at least once.** Confirms, settlements, and
+  metadata batches used to be dropped on their first failed send. They are now
+  retried with bounded exponential backoff (`reporter_max_send_attempts`,
+  `reporter_retry_backoff_base`, `reporter_retry_backoff_cap`). A transient
+  failure — `httpx.TransportError` or HTTP 408/429/5xx — is retried; every other
+  status is terminal, so a poison item can never wedge the queue head. The
+  server dedups duplicate sends via an idempotency ledger, so the SDK retries
+  freely and never does client-side dedup.
+- **A breaker-open flush HOLDS settlements instead of dropping them.** When the
+  shared control-plane breaker refuses admission, the confirm is now kept for a
+  later cycle (it previously dropped the confirm at DEBUG, silently losing
+  acknowledged spend for the duration of a Solwyn outage). Breaker accounting is
+  unchanged: a refusal is not an attempt, so it touches neither the breaker nor
+  the consecutive-confirm-failure counter.
+- **A settlement's metadata event now survives its confirm.** When a settlement's
+  confirm is terminally rejected or exhausts its retries, the paired event is
+  still handed to the ingest queue — `cost_events` ingest is the durable spend
+  truth and must not be lost because the confirm failed.
+- **Undeliverable spend is counted and loudly logged, never silently dropped.**
+  Queue overflow, retry exhaustion, terminal statuses, shutdown-deadline
+  expiry, and enqueue-after-close all increment a counter now readable via the
+  new `dropped_counts` property. The first drop logs immediately; after that at
+  most one aggregated `reporter.spend_events_dropped` WARNING per 60s, so a
+  sustained outage reports loss without flooding logs.
+- **Queued spend survives interpreter exit.** A process that exits WITHOUT
+  calling `close()` previously discarded everything still queued. A single
+  `atexit` hook now flushes each live reporter (sync via `close()`, async over a
+  temporary sync client since no event loop exists at exit), and async reporters
+  additionally arm a `weakref.finalize` covering the constructed-queued-then-
+  garbage-collected case. A known-down control plane is skipped rather than
+  hammered on the way out, and that abandoned spend is counted.
+- **Reporters, budget enforcers, and circuit breakers are fork-safe.** Threads,
+  locks, and HTTP clients do not survive `fork()`, so a forked child inherited a
+  dead flush thread and never delivered its settlements. A single
+  `os.register_at_fork` hook (skipped on platforms without fork) now rebuilds
+  locks, swaps in fresh HTTP clients (abandoning — never closing — the parent's
+  sockets), and relaunches the sync flush thread on the child's next enqueue.
+  Breaker health state is deliberately inherited; queued items duplicated by
+  fork are deliberately kept, since the server dedups.
+- **`close()` is bounded by one shutdown deadline.** `close(timeout=...)` (sync
+  and async; default `reporter_shutdown_deadline`) now shares a single monotonic
+  deadline across the thread/task join, the final flush, and the breaker-report
+  cycle. Against a black-holed control plane, shutdown no longer pays a serial
+  per-request timeout chain across every queued item — work still queued when
+  the deadline is reached is counted `shutdown_deadline` and dropped.
 
 ### Added
 
+- **New reporter delivery knobs (with `SOLWYN_*` env vars):**
+  `reporter_max_send_attempts` (`SOLWYN_REPORTER_MAX_SEND_ATTEMPTS`, default
+  `5`), `reporter_retry_backoff_base` (`SOLWYN_REPORTER_RETRY_BACKOFF_BASE`,
+  default `1.0`), `reporter_retry_backoff_cap`
+  (`SOLWYN_REPORTER_RETRY_BACKOFF_CAP`, default `60.0`), and
+  `reporter_shutdown_deadline` (`SOLWYN_REPORTER_SHUTDOWN_DEADLINE`, default
+  `5.0`).
+- **`MetadataReporter.dropped_counts` / `AsyncMetadataReporter.dropped_counts`**
+  expose undeliverable spend as a `{"kind.reason": count}` mapping, with kinds
+  `confirm` / `settlement_confirm` / `event` and reasons `overflow`,
+  `retry_exhausted`, `terminal_status`, `shutdown_deadline`,
+  `exit_breaker_open`, and `closed_enqueue`.
 - **New config knobs (with `SOLWYN_*` env vars):**
   `budget_check_timeout` (`SOLWYN_BUDGET_CHECK_TIMEOUT`, default `1.0`),
   `control_plane_failure_threshold`
