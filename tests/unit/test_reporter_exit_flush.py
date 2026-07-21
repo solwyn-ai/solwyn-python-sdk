@@ -206,9 +206,10 @@ def _terminal_response(status_code: int) -> MagicMock:
     resp = MagicMock(spec=httpx.Response)
     resp.status_code = status_code
     resp.raise_for_status = MagicMock(
+        spec=httpx.Response.raise_for_status,
         side_effect=httpx.HTTPStatusError(
             "error", request=MagicMock(spec=httpx.Request), response=resp
-        )
+        ),
     )
     return resp
 

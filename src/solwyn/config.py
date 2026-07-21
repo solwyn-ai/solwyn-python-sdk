@@ -74,10 +74,11 @@ class SolwynConfig(BaseModel):
     control_plane_failure_threshold: int = 3
     control_plane_recovery_timeout: float = 30.0
 
-    # Reporter tuning
+    # Reporter tuning. A zero-capacity queue has no defined drop-oldest
+    # semantics (the reporter constructors reject it too) — at least one slot.
     reporter_batch_size: int = 50
     reporter_flush_interval: float = 5.0
-    reporter_max_queue_size: int = 10_000
+    reporter_max_queue_size: int = Field(default=10_000, ge=1)
     reporter_max_in_flight: int = 3
     breaker_reporting_enabled: bool = True
 

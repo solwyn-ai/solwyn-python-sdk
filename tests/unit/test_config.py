@@ -269,6 +269,16 @@ class TestReporterRetryConfig:
 
         solwyn.close()
 
+    def test_zero_queue_capacity_rejected(self) -> None:
+        """#13 review pin: a zero-capacity queue has no defined drop-oldest
+        semantics — the field requires at least one slot."""
+        with pytest.raises(ValidationError):
+            SolwynConfig(
+                api_key=VALID_API_KEY,
+                providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+                reporter_max_queue_size=0,
+            )
+
 
 @pytest.mark.unit
 class TestConfigurationErrorFromBadCredentials:

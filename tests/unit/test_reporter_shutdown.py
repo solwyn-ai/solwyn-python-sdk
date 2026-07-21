@@ -313,3 +313,137 @@ def test_enqueue_racing_close_is_refused_and_counted() -> None:
     assert len(reporter._confirm_queue) == 0
     assert reporter.dropped_counts.get("confirm.closed_enqueue") == 1
     reporter._http.close()
+
+
+@pytest.mark.unit
+def test_pop_in_hand_is_atomic_with_seal() -> None:
+    """#5 review pin: a drain's pop and its ownership claim are ONE step under
+    the ownership lock — the seal can never observe a popped item in neither
+    the queue nor _in_hand, and a sealed reporter refuses further pops."""
+    reporter = _unstarted()
+    reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
+    reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
+
+    # A drain claims the head: queue and _in_hand always account for both.
+    pending = reporter._pop_in_hand(reporter._confirm_queue, "confirm")
+    assert pending is not None
+    assert reporter._in_hand["confirm"] == 1
+
+    # The seal counts the in-hand item AND the still-queued one.
+    reporter._seal_delivery()
+    assert reporter.dropped_counts["confirm.shutdown_deadline"] == 2
+
+    # Sealed: pops are refused outright (the seal owns whatever re-appears).
+    reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
+    assert reporter._pop_in_hand(reporter._confirm_queue, "confirm") is None
+    assert reporter._pop_batch_in_hand(now=time.monotonic(), final=True) == []
+    reporter._http.close()
+
+
+@pytest.mark.unit
+def test_close_bounded_despite_slow_drip_send() -> None:
+    """#4 review pin: httpx timeouts bound socket operations, not total response
+    time — a slow-drip send must not hold close() past the wall-clock deadline.
+    The blocked post here ignores its timeout kwarg entirely, standing in for a
+    server that keeps making incremental progress."""
+    reporter = _unstarted()
+    reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
+    entered = threading.Event()
+    release = threading.Event()
+
+    def dripping_post(url: str, **_kw: object) -> httpx.Response:
+        entered.set()
+        release.wait(timeout=10.0)
+        raise httpx.ConnectError("released")
+
+    try:
+        with patch.object(reporter._http, "post", side_effect=dripping_post):
+            start = time.monotonic()
+            reporter.close(timeout=0.3)
+            elapsed = time.monotonic() - start
+
+        assert entered.is_set(), "the final flush never attempted the confirm"
+        assert elapsed < 2.0, f"close took {elapsed:.2f}s — a dripping send must not hold it"
+        # The in-hand confirm got its disposition before close returned.
+        assert reporter.dropped_counts.get("confirm.shutdown_deadline") == 1
+    finally:
+        release.set()
+        for worker in threading.enumerate():
+            if worker.name == "solwyn-final-flush":
+                worker.join(timeout=2.0)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_close_bounded_despite_slow_drip_send() -> None:
+    """Async twin of the slow-drip pin: the final flush rides its own task so
+    the deadline can cancel a send whose per-operation timeouts never fire."""
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
+    reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
+
+    async def dripping_post(url: str, **_kw: object) -> httpx.Response:
+        await asyncio.sleep(30.0)
+        raise httpx.ConnectError("unreachable")
+
+    with patch.object(reporter._http, "post", new=dripping_post):
+        start = time.monotonic()
+        await reporter.close(timeout=0.3)
+        elapsed = time.monotonic() - start
+
+    assert elapsed < 2.0, f"async close took {elapsed:.2f}s — a dripping send must not hold it"
+    assert reporter.dropped_counts.get("confirm.shutdown_deadline") == 1
+    assert reporter._close_completed is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_zero_deadline_close_counts_in_hand_before_returning() -> None:
+    """#7 review pin: a zero-deadline close cancels the flush task — but must
+    still AWAIT its cleanup so the in-hand item is counted (and the exit rescue
+    is detached only after every disposition is assigned)."""
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=0.05)
+    entered = asyncio.Event()
+    blocker = asyncio.Event()
+
+    async def blocked_post(url: str, **_kw: object) -> httpx.Response:
+        entered.set()
+        await blocker.wait()
+        raise httpx.ConnectError("released")
+
+    with patch.object(reporter._http, "post", new=blocked_post):
+        reporter.report_confirm(_make_confirm_request())
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+
+        await reporter.close(timeout=0.0)
+
+    # The cancelled drain's accounting ran BEFORE close returned.
+    assert reporter.dropped_counts.get("confirm.shutdown_deadline") == 1
+    assert reporter._close_completed is True
+    assert reporter._finalizer is None or not reporter._finalizer.alive
+
+
+@pytest.mark.unit
+def test_async_seal_counts_straggler_and_refuses_enqueue() -> None:
+    """#10 review pin: the async reporter shares the ownership gate — a
+    straggler appended after the final drain is claimed by the seal, and a
+    producer that lost the race with close() is refused-and-counted."""
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter._queue.append(_PendingEvent(_make_event()))
+
+    reporter._seal_delivery()
+    assert reporter.dropped_counts["event.shutdown_deadline"] == 1
+    assert len(reporter._queue) == 0
+
+    # A producer that passed the _closed check before the seal: refused, counted.
+    reporter.report(_make_event())
+    reporter.report_confirm(_make_confirm_request())
+    reporter.report_settlement(_make_confirm_request(), _make_event())
+    assert len(reporter._queue) == 0
+    assert len(reporter._confirm_queue) == 0
+    assert len(reporter._settlement_queue) == 0
+    assert reporter.dropped_counts["event.closed_enqueue"] == 2  # event + pair half
+    assert reporter.dropped_counts["confirm.closed_enqueue"] == 1
+    assert reporter.dropped_counts["settlement_confirm.closed_enqueue"] == 1
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+    reporter._close_completed = True  # queues empty; disarm the exit hook

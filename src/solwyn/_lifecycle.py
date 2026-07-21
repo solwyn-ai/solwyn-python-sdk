@@ -289,7 +289,7 @@ def _drain_queues_blocking(
                     _count(drop_counter, "settlement_confirm", outcome)
                 # Ingest is NOT breaker-gated: the event still gets its exit
                 # attempt even when its confirm was held or failed.
-                ev_outcome = _post_json(
+                ev_outcome, ev_response = _post_json_response(
                     client,
                     ingest_url,
                     [settlement.event.model_dump(mode="json")],
@@ -301,6 +301,14 @@ def _drain_queues_blocking(
                     break
                 if ev_outcome != "sent":
                     _count(drop_counter, "event", ev_outcome)
+                elif ev_response is not None:
+                    # A 202 can still reject the event terminally (#9 pin).
+                    _count(
+                        drop_counter,
+                        "event",
+                        "ingest_rejected",
+                        _ingest_rejected_count(ev_response, 1),
+                    )
             while event_q:
                 batch: list[_PendingEvent] = []
                 while event_q and len(batch) < _EXIT_BATCH_SIZE:
@@ -310,7 +318,7 @@ def _drain_queues_blocking(
                         break
                 if not batch:
                     break
-                outcome = _post_json(
+                outcome, response = _post_json_response(
                     client,
                     ingest_url,
                     [p.event.model_dump(mode="json") for p in batch],
@@ -322,6 +330,14 @@ def _drain_queues_blocking(
                     break
                 if outcome != "sent":
                     _count(drop_counter, "event", outcome, len(batch))
+                elif response is not None:
+                    # A 202 can still reject individual events terminally (#9).
+                    _count(
+                        drop_counter,
+                        "event",
+                        "ingest_rejected",
+                        _ingest_rejected_count(response, len(batch)),
+                    )
     except Exception as exc:
         logger.warning("lifecycle.exit_flush_failed: exc_type=%s", type(exc).__name__)
 
@@ -382,20 +398,50 @@ def _post_json(
     ``"terminal_status"``. A read-only-key rejection is a policy skip, not a
     loss. Never raises out of the exit hook.
     """
+    outcome, _ = _post_json_response(client, url, payload, headers, deadline)
+    return outcome
+
+
+def _post_json_response(
+    client: httpx.Client,
+    url: str,
+    payload: object,
+    headers: dict[str, str],
+    deadline: float,
+) -> tuple[str, httpx.Response | None]:
+    """``_post_json`` plus the 2xx response, for callers that parse the body."""
     remaining = deadline - _monotonic()
     if remaining <= 0:
-        return "expired"
+        return "expired", None
     try:
         response = client.post(url, json=payload, headers=headers, timeout=min(5.0, remaining))
         response.raise_for_status()
     except Exception as exc:
         if handle_read_only_key_error(exc):
-            return "sent"
+            return "sent", None
         # The server dedups a later duplicate, and an exit hook must never
         # raise. Log the type name only.
         logger.warning("lifecycle.exit_post_failed: exc_type=%s", type(exc).__name__)
-        return "retry_exhausted" if _is_retryable_exc(exc) else "terminal_status"
-    return "sent"
+        return "retry_exhausted" if _is_retryable_exc(exc) else "terminal_status", None
+    return "sent", response
+
+
+def _ingest_rejected_count(response: httpx.Response, batch_size: int) -> int:
+    """Best-effort count of per-event rejections in a 202 ingest body.
+
+    A 202 can still reject individual events (terminal — they reject
+    identically on every resubmission), and the whole-batch ``"sent"`` outcome
+    would silently understate that loss. Capped at ``batch_size`` so a
+    compromised/misrouted server cannot inflate drop counts. Fail-open: an
+    unparseable body counts nothing (the exit hook must never raise).
+    """
+    try:
+        rejected = response.json()["rejected"]
+        if not isinstance(rejected, list):
+            return 0
+        return min(len(rejected), batch_size)
+    except Exception:
+        return 0
 
 
 def _count(

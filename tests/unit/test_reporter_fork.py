@@ -133,8 +133,13 @@ else:
 
 # Forking a multi-threaded process can crash the child on macOS; retry those
 # attempts (they fail fast) so the pin measures OUR relaunch logic, not the
-# platform's fork reliability.
+# platform's fork reliability. On Linux — the platform CI actually gates on —
+# fork-in-threaded-process is the supported norm (it is multiprocessing's
+# default start method), so a signaled child there is OUR at-fork bug and must
+# FAIL, never retry into a skip: ten crashes turning the gate into a skip
+# would let an at-fork regression leave CI green (#6 review pin).
 _FORK_ATTEMPTS = 10
+_FORK_CRASH_IS_PLATFORM_ARTIFACT = sys.platform != "linux"
 
 
 @pytest.mark.unit
@@ -164,6 +169,11 @@ def test_forked_child_flush_thread_delivers() -> None:
             if "call_child" in confirm_ids:
                 break
             if "CHILD_SIGNALED=True" in result.stderr:
+                if not _FORK_CRASH_IS_PLATFORM_ARTIFACT:
+                    pytest.fail(
+                        "the forked child died on a signal on Linux — the at-fork "
+                        f"repair hooks must not crash the child: {result.stderr[-800:]}"
+                    )
                 # The forked child segfaulted before running any Python.
                 crashed_attempts += 1
                 continue
@@ -174,9 +184,11 @@ def test_forked_child_flush_thread_delivers() -> None:
                 f"{sorted(map(str, confirm_ids))}"
             )
         else:
+            # Only reachable off-Linux: every attempt crashed pre-exec.
             pytest.skip(
                 f"all {crashed_attempts}/{_FORK_ATTEMPTS} fork attempts crashed the "
-                "child (platform fork-in-threaded-process instability)"
+                f"child ({sys.platform} fork-in-threaded-process instability; "
+                "on Linux this is a hard failure)"
             )
 
         assert "call_child" in confirm_ids, (
@@ -394,7 +406,7 @@ def test_forked_child_survives_held_registry_lock() -> None:
     (it guards the repair registry itself). The at_fork acquire/release triple
     holds it across the fork; pre-fix, a child forked while another thread
     registers an SDK object deadlocks on its own next construction."""
-    for _ in range(10):
+    for _ in range(_FORK_ATTEMPTS):
         result = subprocess.run(
             [sys.executable, "-c", _REGISTRY_LOCK_CHILD],
             timeout=30,
@@ -408,6 +420,11 @@ def test_forked_child_survives_held_registry_lock() -> None:
                 "forked child deadlocked constructing an SDK object "
                 "while _registry_lock was inherited held"
             )
-        # Any other code: the macOS multi-threaded-fork SIGSEGV artifact —
+        if not _FORK_CRASH_IS_PLATFORM_ARTIFACT:
+            pytest.fail(
+                f"forked child crashed on Linux (returncode {result.returncode}) — "
+                f"the at-fork hooks must not crash the child: {result.stderr[-800:]}"
+            )
+        # Off-Linux: the macOS multi-threaded-fork SIGSEGV artifact —
         # retry, mirroring test_forked_child_flush_thread_delivers.
-    pytest.skip("all fork attempts crashed pre-exec (platform artifact)")
+    pytest.skip(f"all fork attempts crashed pre-exec ({sys.platform} platform artifact)")

@@ -78,9 +78,9 @@ derived from git tags (hatch-vcs).
   no longer be confirmed or ingested ahead of earlier acknowledged spend, and
   an outage burns one retry attempt per cycle instead of one per queued item.
 - **Undeliverable spend is counted and loudly logged, never silently dropped.**
-  Queue overflow, retry exhaustion, terminal statuses, shutdown-deadline
-  expiry, and enqueue-after-close all increment a counter now readable via the
-  new `dropped_counts` property. The first drop logs immediately; after that at
+  Queue overflow, retry exhaustion, terminal statuses, per-event rejections
+  inside a 202 ingest body, shutdown-deadline expiry, and enqueue-after-close
+  all increment a counter now readable via the new `dropped_counts` property. The first drop logs immediately; after that at
   most one aggregated `reporter.spend_events_dropped` WARNING per 60s, so a
   sustained outage reports loss without flooding logs.
 - **Queued spend survives interpreter exit.** A process that exits WITHOUT
@@ -108,13 +108,19 @@ derived from git tags (hatch-vcs).
   deadline across the thread/task join, the final flush, and the breaker-report
   cycle. Against a black-holed control plane, shutdown no longer pays a serial
   per-request timeout chain across every queued item — work still queued when
-  the deadline is reached is counted `shutdown_deadline` and dropped. At the
-  deadline the sync `close()` takes final ownership of ALL undelivered spend:
-  items a stuck flush thread still holds mid-POST and enqueues racing the final
-  drain are counted before `close()` returns, never requeued into a queue
-  nothing drains. An async `close()` cancelled mid-flush keeps the atexit hook
-  and GC finalizer armed as the last delivery path — they detach only once
-  close actually completes.
+  the deadline is reached is counted `shutdown_deadline` and dropped. The
+  deadline is a true wall-clock bound: httpx timeouts cap individual socket
+  operations, not total response time, so the final flush runs off the closing
+  thread (sync: a daemon worker joined at the deadline; async: a task the
+  deadline cancels) and a slow-drip response cannot hold `close()` open. At the
+  deadline `close()` (sync AND async) seals delivery and takes final ownership
+  of ALL undelivered spend: items a stuck flush thread still holds mid-POST and
+  enqueues racing the final drain are counted before `close()` returns, never
+  requeued into a queue nothing drains. An async `close()` cancelled mid-flush
+  keeps the atexit hook and GC finalizer armed as the last delivery path — they
+  detach only once close actually completes, and even a zero-deadline close
+  awaits its cancelled drains' cleanup so every in-hand item has a counted
+  disposition first.
 
 ### Added
 
@@ -128,7 +134,7 @@ derived from git tags (hatch-vcs).
 - **`MetadataReporter.dropped_counts` / `AsyncMetadataReporter.dropped_counts`**
   expose undeliverable spend as a `{"kind.reason": count}` mapping, with kinds
   `confirm` / `settlement_confirm` / `event` and reasons `overflow`,
-  `retry_exhausted`, `terminal_status`, `shutdown_deadline`,
+  `retry_exhausted`, `terminal_status`, `ingest_rejected`, `shutdown_deadline`,
   `exit_breaker_open`, and `closed_enqueue`.
 - **New config knobs (with `SOLWYN_*` env vars):**
   `budget_check_timeout` (`SOLWYN_BUDGET_CHECK_TIMEOUT`, default `1.0`),

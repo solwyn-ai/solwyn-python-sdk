@@ -22,6 +22,7 @@ from solwyn.reporter import (
     AsyncMetadataReporter,
     MetadataReporter,
     _PendingConfirm,
+    _PendingEvent,
     _PendingSettlement,
 )
 
@@ -62,18 +63,22 @@ def _error_response(status_code: int) -> MagicMock:
     resp = MagicMock(spec=httpx.Response)
     resp.status_code = status_code
     resp.raise_for_status = MagicMock(
+        spec=httpx.Response.raise_for_status,
         side_effect=httpx.HTTPStatusError(
             "error", request=MagicMock(spec=httpx.Request), response=resp
-        )
+        ),
     )
     return resp
 
 
-def _ok_response() -> MagicMock:
-    """A 2xx httpx.Response stand-in: raise_for_status is a no-op, clean body."""
+def _ok_response(rejected: list[dict[str, str]] | None = None) -> MagicMock:
+    """A 2xx httpx.Response stand-in: raise_for_status is a no-op, parseable body."""
     resp = MagicMock(spec=httpx.Response)
-    resp.raise_for_status = MagicMock()
-    resp.json = MagicMock(return_value={"ingested": 0, "rejected": []})
+    resp.raise_for_status = MagicMock(spec=httpx.Response.raise_for_status)
+    resp.json = MagicMock(
+        spec=httpx.Response.json,
+        return_value={"ingested": 0, "rejected": rejected or []},
+    )
     return resp
 
 
@@ -689,4 +694,72 @@ class TestAsyncReporterRetry:
         reporter.report_settlement(_make_confirm_request(), _make_event())
         assert reporter.dropped_counts["settlement_confirm.closed_enqueue"] == 1
         assert reporter.dropped_counts["event.closed_enqueue"] == 1
+        await reporter._http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Loss accounting and configuration bounds (review-round pins)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAccountingAndBounds:
+    def test_backoff_delay_overflow_safe(self) -> None:
+        """#12 review pin: ``2.0 ** 1024`` raises OverflowError, so a large but
+        VALID retry budget must not poison the queue head with an arithmetic
+        error before the cap can apply."""
+        reporter = _quiet(max_send_attempts=1_000_000, retry_backoff_cap=60.0)
+        try:
+            assert reporter._backoff_delay(1025) == 60.0
+            assert reporter._backoff_delay(1_000_000) == 60.0
+            finished, next_at = reporter._resolve_retryable(attempts=2000)
+            assert not finished
+            assert next_at > 0.0
+        finally:
+            reporter._http.close()
+
+    def test_zero_queue_capacity_rejected_at_construction(self) -> None:
+        """#13 review pin: capacity 0 has no defined drop-oldest semantics
+        (sync would evict every append, async retained one item) — reject it."""
+        with pytest.raises(ValueError, match="max_queue_size"):
+            MetadataReporter(_URL, VALID_API_KEY, max_queue_size=0)
+        with pytest.raises(ValueError, match="max_queue_size"):
+            AsyncMetadataReporter(_URL, VALID_API_KEY, max_queue_size=0)
+
+    def test_ingest_202_rejections_counted_as_drops(self, caplog: pytest.LogCaptureFixture) -> None:
+        """#9 review pin: a 202 that rejects individual events is terminal spend
+        loss — dropped_counts must say so, not just a WARNING line."""
+        reporter = _quiet()
+        rejected = [
+            {"code": "unpriced_model", "model": "mystery-9b", "message": "no pricing entry"},
+            {"code": "unpriced_model", "model": "mystery-9b", "message": "no pricing entry"},
+        ]
+        with (
+            patch.object(reporter._http, "post", return_value=_ok_response(rejected=rejected)),
+            caplog.at_level("WARNING"),
+        ):
+            for _ in range(3):
+                reporter.report(_make_event())
+            reporter._flush_remaining()
+
+        assert reporter.dropped_counts["event.ingest_rejected"] == 2
+        assert "reporter.ingest_events_rejected" in caplog.text
+        reporter._http.close()
+
+    @pytest.mark.asyncio
+    async def test_async_ingest_202_rejections_counted_as_drops(self) -> None:
+        """Async mirror of the 202 partial-rejection accounting pin."""
+        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
+        rejected = [
+            {"code": "unpriced_model", "model": "mystery-9b", "message": "no pricing entry"},
+        ]
+
+        async def post(url: str, **_kw: object) -> MagicMock:
+            return _ok_response(rejected=rejected)
+
+        reporter._queue.append(_PendingEvent(_make_event()))
+        with patch.object(reporter._http, "post", new=post):
+            await reporter._flush_remaining()
+
+        assert reporter.dropped_counts["event.ingest_rejected"] == 1
         await reporter._http.aclose()
