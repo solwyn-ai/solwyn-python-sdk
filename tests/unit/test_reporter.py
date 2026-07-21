@@ -457,17 +457,22 @@ class TestMetadataReporter:
         reporter._http.close()
 
     def test_flush_remaining_confirm_persistent_failures_escalate_to_error(
-        self, caplog: pytest.LogCaptureFixture
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        reporter = _quiet_sync_reporter()
-        for _ in range(10):
-            reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
+        # A retrying head PARKS its queue (FIFO), so a persistent outage
+        # accrues one consecutive failure per flush cycle, not per queued item.
+        clock = {"t": 1000.0}
+        monkeypatch.setattr("solwyn.reporter._monotonic", lambda: clock["t"])
+        reporter = _quiet_sync_reporter(max_send_attempts=11)
+        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
 
         with (
             patch.object(reporter._http, "post", return_value=_error_response(503)),
             caplog.at_level("ERROR"),
         ):
-            reporter._flush_remaining()
+            for _ in range(10):
+                reporter._flush_remaining()
+                clock["t"] += 61.0  # past the backoff cap so the head is due
 
         assert reporter._consecutive_confirm_failures == 10
         assert "reporter.confirm_send_persistent_failure" in caplog.text

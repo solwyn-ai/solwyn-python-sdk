@@ -2,19 +2,23 @@
 
 Scenario-1 pin: a sync reporter that queues a settlement and exits WITHOUT
 close() must flush it via the atexit hook. Plus in-process coverage of the async
-reporter's weakref finalizer, the breaker-open exit skip, and close() detaching
-the finalizer.
+reporter's weakref finalizer, breaker admission at exit (confirms held, events
+still shipped), per-item exit accounting, and close() detaching the finalizer
+only once it COMPLETES.
 """
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -22,7 +26,7 @@ from conftest import VALID_API_KEY
 
 from solwyn._lifecycle import blocking_exit_flush
 from solwyn._token_details import TokenDetails
-from solwyn._types import BudgetConfirmRequest, ProviderName
+from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
 from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.reporter import AsyncMetadataReporter
 
@@ -39,6 +43,23 @@ def _make_confirm_request(**overrides) -> BudgetConfirmRequest:
     }
     defaults.update(overrides)
     return BudgetConfirmRequest(**defaults)
+
+
+def _make_event(**overrides) -> MetadataEvent:
+    defaults = {
+        "model": "gpt-5.5",
+        "provider": ProviderName.OPENAI,
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "latency_ms": 1.0,
+        "status": "success",
+        "is_model_fallback": False,
+        "sdk_instance_id": "exit-instance",
+        "timestamp": datetime.now(UTC),
+        "call_id": "call_exit_event",
+    }
+    defaults.update(overrides)
+    return MetadataEvent(**defaults)
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +171,10 @@ class _RecordingResponse:
         return None
 
 
-def _make_recording_client(sink: list[str]) -> type:
+def _make_recording_client(sink: list[str], handler: Callable[[str], object] | None = None) -> type:
+    """A fake ``httpx.Client``: records POST urls; ``handler`` scripts outcomes
+    (return a response or raise) — default 200s everything."""
+
     class _Client:
         def __init__(self, *_a: object, **_k: object) -> None:
             pass
@@ -168,11 +192,35 @@ def _make_recording_client(sink: list[str]) -> type:
             json: object = None,
             headers: object = None,
             timeout: object = None,
-        ) -> _RecordingResponse:
+        ) -> object:
             sink.append(url)
+            if handler is not None:
+                return handler(url)
             return _RecordingResponse()
 
     return _Client
+
+
+def _terminal_response(status_code: int) -> MagicMock:
+    """A response stand-in whose raise_for_status raises HTTPStatusError."""
+    resp = MagicMock(spec=httpx.Response)
+    resp.status_code = status_code
+    resp.raise_for_status = MagicMock(
+        side_effect=httpx.HTTPStatusError(
+            "error", request=MagicMock(spec=httpx.Request), response=resp
+        )
+    )
+    return resp
+
+
+def _eligible_open_breaker() -> CircuitBreaker:
+    """An OPEN control-plane breaker whose recovery window has elapsed."""
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout=60.0, success_threshold=1, name="control-plane"
+    )
+    breaker.record_failure()  # OPEN
+    breaker.last_failure_time = time.monotonic() - 120.0  # window elapsed -> eligible
+    return breaker
 
 
 @pytest.mark.unit
@@ -230,9 +278,221 @@ async def test_close_detaches_finalizer() -> None:
     with patch.object(reporter._http, "post", new=_async_noop_post):
         await reporter.close()
 
-    # close() supersedes the safety net: the finalizer is detached.
+    # A COMPLETED close() supersedes the safety nets: the finalizer is
+    # detached and the atexit hook skips this reporter.
     assert not reporter._finalizer.alive
+    assert reporter._close_completed is True
 
 
 async def _async_noop_post(*_a: object, **_k: object) -> _RecordingResponse:
     return _RecordingResponse()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cancelled_close_keeps_exit_rescue_armed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1 review pin: a close() cancelled mid-flush must NOT disarm the atexit
+    hook or the GC finalizer — they are the last delivery path for whatever
+    the cancelled close left queued."""
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
+    reporter.start()
+    reporter.report_confirm(_make_confirm_request(call_id="in_hand"))
+    reporter.report_confirm(_make_confirm_request(call_id="queued_behind"))
+    started = asyncio.Event()
+
+    async def hung_post(url: str, **_kw: object) -> _RecordingResponse:
+        started.set()
+        await asyncio.sleep(3600)
+        return _RecordingResponse()
+
+    with patch.object(reporter._http, "post", new=hung_post):
+        close_task = asyncio.create_task(reporter.close(timeout=30.0))
+        await started.wait()
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+
+    # No new work — but shutdown did NOT complete, so both rescue paths stay
+    # armed and the queued remainder is retained (the in-hand confirm vanished
+    # with the cancellation and was counted).
+    assert reporter._closed is True
+    assert reporter._close_completed is False
+    assert reporter._finalizer is not None and reporter._finalizer.alive
+    assert len(reporter._confirm_queue) == 1
+    assert reporter.dropped_counts.get("confirm.shutdown_deadline") == 1
+
+    # The atexit-style blocking flush still delivers the remainder.
+    sink: list[str] = []
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
+    blocking_exit_flush(reporter)
+    assert any("budgets/confirm" in u for u in sink)
+    assert len(reporter._confirm_queue) == 0
+    reporter._finalizer.detach()
+    await reporter._http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Blocking exit drain: per-item accounting + breaker admission
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_exit_flush_breaker_open_still_ships_events(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """P1 review pin: a breaker-OPEN exit refuses the confirms, but metadata
+    ingest is NOT breaker-gated — settlement events and standalone events must
+    still get their deadline-bounded ingest attempt, never a breaker drop."""
+    sink: list[str] = []
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout=1e9, success_threshold=1, name="control-plane"
+    )
+    breaker.record_failure()  # OPEN, not recovery-eligible
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, control_plane_breaker=breaker)
+    reporter.report_confirm(_make_confirm_request())
+    reporter.report_settlement(_make_confirm_request(), _make_event(call_id="pair"))
+    reporter.report(_make_event(call_id="standalone"))
+
+    with caplog.at_level("ERROR"):
+        blocking_exit_flush(reporter)
+
+    assert not any("budgets/confirm" in u for u in sink)
+    assert len([u for u in sink if "metadata/ingest" in u]) == 2
+    counts = reporter.dropped_counts
+    assert counts.get("confirm.exit_breaker_open") == 1
+    assert counts.get("settlement_confirm.exit_breaker_open") == 1
+    assert not any(key.startswith("event.") for key in counts)
+    assert "lifecycle.exit_flush_skipped_breaker_open" in caplog.text
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+
+
+@pytest.mark.unit
+def test_exit_flush_counts_failed_posts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """P1 review pin: an exit POST that fails must count the popped item — it
+    can no longer hide behind the swallow-and-log path."""
+    sink: list[str] = []
+
+    def _down(_url: str) -> object:
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink, _down))
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter.report_confirm(_make_confirm_request())
+    reporter.report_settlement(_make_confirm_request(), _make_event())
+    reporter.report(_make_event())
+
+    blocking_exit_flush(reporter)
+
+    counts = reporter.dropped_counts
+    assert counts.get("confirm.retry_exhausted") == 1
+    assert counts.get("settlement_confirm.retry_exhausted") == 1
+    # The settlement's event AND the standalone batch both failed ingest.
+    assert counts.get("event.retry_exhausted") == 2
+    assert not reporter._confirm_queue
+    assert not reporter._settlement_queue
+    assert not reporter._queue
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+
+
+@pytest.mark.unit
+def test_exit_flush_counts_terminal_status_posts(monkeypatch: pytest.MonkeyPatch) -> None:
+    sink: list[str] = []
+    monkeypatch.setattr(
+        httpx, "Client", _make_recording_client(sink, lambda _url: _terminal_response(400))
+    )
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter.report_confirm(_make_confirm_request())
+    reporter.report(_make_event())
+
+    blocking_exit_flush(reporter)
+
+    counts = reporter.dropped_counts
+    assert counts.get("confirm.terminal_status") == 1
+    assert counts.get("event.terminal_status") == 1
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+
+
+@pytest.mark.unit
+def test_exit_flush_partial_deadline_counts_unsent_remainder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1 review pin: when the exit budget dies mid-drain, the popped-but-unsent
+    item goes back to its queue and the final sweep counts it — nothing
+    silently vanishes between popleft and POST."""
+    fake = {"t": 1000.0}
+    monkeypatch.setattr("solwyn._lifecycle._monotonic", lambda: fake["t"])
+    sink: list[str] = []
+
+    def _consume_budget(_url: str) -> _RecordingResponse:
+        fake["t"] += 10.0  # the first POST eats the whole exit budget
+        return _RecordingResponse()
+
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink, _consume_budget))
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, shutdown_deadline=5.0)
+    reporter.report_confirm(_make_confirm_request(call_id="sent"))
+    reporter.report_confirm(_make_confirm_request(call_id="expired"))
+
+    blocking_exit_flush(reporter)
+
+    assert len(sink) == 1
+    assert reporter.dropped_counts.get("confirm.shutdown_deadline") == 1
+    assert not reporter._confirm_queue
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+
+
+@pytest.mark.unit
+def test_exit_flush_open_breaker_gets_single_recovery_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2 review pin: a recovery-eligible OPEN breaker admits exactly ONE
+    HALF_OPEN probe at exit; a failed probe re-opens the breaker, so the rest
+    of the backlog is refused instead of hammering a down endpoint."""
+    sink: list[str] = []
+
+    def _down(url: str) -> object:
+        raise httpx.ConnectError("still down")
+
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink, _down))
+    breaker = _eligible_open_breaker()
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, control_plane_breaker=breaker)
+    for i in range(3):
+        reporter.report_confirm(_make_confirm_request(call_id=f"c{i}"))
+    reporter.report_settlement(_make_confirm_request(), _make_event())
+
+    blocking_exit_flush(reporter)
+
+    assert len([u for u in sink if "budgets/confirm" in u]) == 1  # the single probe
+    counts = reporter.dropped_counts
+    assert counts.get("confirm.retry_exhausted") == 1  # the failed probe itself
+    assert counts.get("confirm.exit_breaker_open") == 2  # the refused remainder
+    assert counts.get("settlement_confirm.exit_breaker_open") == 1
+    # The settlement's event still got its (failed, counted) ingest attempt.
+    assert any("metadata/ingest" in u for u in sink)
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+
+
+@pytest.mark.unit
+def test_exit_flush_recovered_breaker_drains_backlog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A recovery-eligible OPEN breaker whose probe SUCCEEDS closes and lets
+    the whole backlog drain at exit."""
+    sink: list[str] = []
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
+    breaker = _eligible_open_breaker()
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, control_plane_breaker=breaker)
+    for i in range(3):
+        reporter.report_confirm(_make_confirm_request(call_id=f"c{i}"))
+
+    blocking_exit_flush(reporter)
+
+    assert len([u for u in sink if "budgets/confirm" in u]) == 3
+    assert reporter.dropped_counts == {}
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()

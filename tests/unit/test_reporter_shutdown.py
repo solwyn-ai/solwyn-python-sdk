@@ -13,6 +13,7 @@ Every constant stays <= 1.5s so the suite stays fast.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
@@ -239,4 +240,76 @@ def test_report_after_close_counts_closed_enqueue() -> None:
     reporter.report(_make_event())
     assert reporter.dropped_counts["event.closed_enqueue"] == 1
     assert len(reporter._queue) == 0
+    reporter._http.close()
+
+
+# ---------------------------------------------------------------------------
+# Shutdown ownership: in-hand items and enqueue races (P1 review pins)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_timed_out_close_counts_in_hand_confirm_and_blocks_requeue() -> None:
+    """P1 review pin: when close()'s bounded join expires while the flush
+    thread holds a popped confirm mid-POST, close must count that in-hand item
+    before returning, and the worker's later transient outcome must neither
+    requeue it into the dead queue nor double count it."""
+    reporter = MetadataReporter(_URL, VALID_API_KEY, flush_interval=0.05)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_post(url: str, **_kw: object) -> httpx.Response:
+        entered.set()
+        release.wait(timeout=5.0)
+        raise httpx.ConnectError("transient")
+
+    try:
+        with patch.object(reporter._http, "post", side_effect=blocked_post):
+            reporter.report_confirm(_make_confirm_request())
+            assert entered.wait(2.0), "flush thread never picked up the confirm"
+
+            reporter.close(timeout=0.2)
+
+            # The in-hand confirm is counted BEFORE close returns.
+            assert reporter.dropped_counts.get("confirm.shutdown_deadline") == 1
+            assert len(reporter._confirm_queue) == 0
+
+            release.set()
+            reporter._thread.join(timeout=2.0)
+            assert not reporter._thread.is_alive()
+
+        # The worker's RETRY outcome after sealing: no requeue, no double count.
+        assert len(reporter._confirm_queue) == 0
+        assert reporter.dropped_counts.get("confirm.shutdown_deadline") == 1
+    finally:
+        release.set()
+
+
+@pytest.mark.unit
+def test_enqueue_racing_close_is_refused_and_counted() -> None:
+    """P1 review pin: an enqueue that passes the _shutdown check and then loses
+    the race with close()'s final drain must be refused (counted), never
+    appended into a queue nothing will ever drain."""
+    reporter = _unstarted()
+    producer_paused = threading.Event()
+    resume_producer = threading.Event()
+
+    def paused_ensure_thread() -> None:
+        producer_paused.set()
+        resume_producer.wait(timeout=5.0)
+
+    reporter._ensure_thread = paused_ensure_thread  # type: ignore[method-assign]
+    producer = threading.Thread(
+        target=lambda: reporter.report_confirm(_make_confirm_request()),
+        daemon=True,
+    )
+    producer.start()
+    assert producer_paused.wait(2.0)
+
+    reporter.close(timeout=0.5)  # completes fully and seals delivery
+    resume_producer.set()
+    producer.join(timeout=2.0)
+
+    assert len(reporter._confirm_queue) == 0
+    assert reporter.dropped_counts.get("confirm.closed_enqueue") == 1
     reporter._http.close()

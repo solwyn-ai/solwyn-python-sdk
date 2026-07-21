@@ -19,6 +19,7 @@ import asyncio
 import collections
 import dataclasses
 import enum
+import functools
 import logging
 import re
 import threading
@@ -31,6 +32,8 @@ from typing import TypeVar
 import httpx
 
 from solwyn._lifecycle import (
+    _drain_count,
+    _is_retryable_exc,
     register_async_reporter,
     register_fork_reset,
     register_sync_reporter,
@@ -71,21 +74,6 @@ def _escape_control(value: str) -> str:
     customer logs via echoed model names or rejection messages.
     """
     return _CONTROL_CHARS.sub(lambda m: repr(m.group())[1:-1], value)
-
-
-def _is_retryable_exc(exc: Exception) -> bool:
-    """Whether a send failure is transient and worth retrying.
-
-    Transport errors (connect/read/write/timeout) and the transient HTTP
-    statuses 408/429/5xx are retryable; every other HTTP status is a terminal
-    rejection (a poison item that would reject identically forever).
-    """
-    if isinstance(exc, httpx.TransportError):
-        return True
-    if isinstance(exc, httpx.HTTPStatusError):
-        code = exc.response.status_code
-        return code in (408, 429) or code >= 500
-    return False
 
 
 class _SendOutcome(enum.Enum):
@@ -260,20 +248,25 @@ class _ReporterBase:
         item: _T,
         maxlen: int,
         kind: str,
+        on_evict: Callable[[_T], None] | None = None,
     ) -> None:
         """Append with a drop-oldest bound that COUNTS the dropped item.
 
         The len-check + append is not atomic across threads; the bound is
         approximate by design — CPython deque ops are individually thread-safe,
         so a small transient overshoot is acceptable and never corrupts state.
+        ``on_evict`` sees the evicted item so a compound item can salvage or
+        account its other half (a settlement pair's metadata event).
         """
         if len(queue) >= maxlen:
             try:
-                queue.popleft()
+                evicted = queue.popleft()
             except IndexError:
                 pass
             else:
                 self._count_drop(kind, "overflow")
+                if on_evict is not None:
+                    on_evict(evicted)
         queue.append(item)
 
     def _move_event_to_queue(self, event: MetadataEvent) -> None:
@@ -327,13 +320,27 @@ class _ReporterBase:
     # ------------------------------------------------------------------
 
     def _count_drop(self, kind: str, reason: str, n: int = 1) -> None:
-        """Record ``n`` dropped spend items keyed ``"{kind}.{reason}"``."""
+        """Record ``n`` dropped spend items keyed ``"{kind}.{reason}"``.
+
+        Logging is driven from HERE (rate-limited by ``_maybe_log_drops``), not
+        only from flush cycles: the first drop ever must warn immediately, and
+        a post-close drop has no later flush cycle to surface it.
+        """
         if n <= 0:
             return
         with self._drop_lock:
             key = f"{kind}.{reason}"
             self._drop_counts[key] = self._drop_counts.get(key, 0) + n
             self._drops_since_last_log += n
+        self._maybe_log_drops()
+
+    def _count_settlement_drop(self, reason: str, n: int = 1) -> None:
+        """Count a lost settlement PAIR: its confirm AND its metadata event.
+
+        Counting only the confirm half understates real event loss.
+        """
+        self._count_drop("settlement_confirm", reason, n)
+        self._count_drop("event", reason, n)
 
     def _maybe_log_drops(self, *, force: bool = False) -> None:
         """Emit an aggregated drop WARNING, rate-limited to one per interval.
@@ -563,6 +570,14 @@ class MetadataReporter(_ReporterBase):
         # httpx.post to Solwyn. Bounds are enforced by _enqueue_bounded.
         self._confirm_queue: collections.deque[_PendingConfirm] = collections.deque()
         self._settlement_queue: collections.deque[_PendingSettlement] = collections.deque()
+        # Shutdown ownership. Every enqueue and every popped-but-unresolved
+        # ("in hand") drain item is tracked under this lock so a timed-out
+        # close() can take final ownership of ALL undelivered spend instead of
+        # letting a stuck flush thread requeue it (or a racing producer append
+        # it) into a queue nothing will ever drain — see _seal_delivery.
+        self._ownership_lock = threading.Lock()
+        self._in_hand: dict[str, int] = {}
+        self._delivery_closed = False
         self._thread = self._launch_thread()
         # Exit flush: if the process exits without close(), the atexit hook runs
         # close() so queued spend is still delivered. The live flush thread keeps
@@ -617,6 +632,10 @@ class MetadataReporter(_ReporterBase):
         self._in_flight_lock = threading.Lock()
         self._breaker_worker_lock = threading.Lock()
         self._thread_lock = threading.Lock()
+        self._ownership_lock = threading.Lock()
+        # In-hand items live on the parent's (now-absent) flush thread stack;
+        # the parent delivers them. The child's view starts clean.
+        self._in_hand = {}
         self._in_flight = 0
         self._breaker_worker = None
         self._http = httpx.Client(timeout=10.0)
@@ -635,7 +654,8 @@ class MetadataReporter(_ReporterBase):
             self._count_drop("event", "closed_enqueue")
             return
         self._ensure_thread()
-        self._enqueue(event)
+        if not self._enqueue_owned(self._queue, _PendingEvent(event), self.max_queue_size, "event"):
+            self._count_drop("event", "closed_enqueue")
 
     def close(self, timeout: float | None = None) -> None:
         """Flush remaining events and shut down within a single deadline.
@@ -661,6 +681,7 @@ class MetadataReporter(_ReporterBase):
         # duplicate send is server-deduped via the idempotency ledger.
         self._thread.join(timeout=max(0.0, deadline - _monotonic()))
         self._flush_remaining(deadline=deadline, final=True)
+        self._seal_delivery()
 
         if active_breaker_worker is None:
             active_breaker_worker = self._start_breaker_cycle(
@@ -704,13 +725,145 @@ class MetadataReporter(_ReporterBase):
         self._drain_event_batches(deadline=deadline, final=final)
         self._maybe_log_drops(force=final)
 
+    # ------------------------------------------------------------------
+    # Shutdown ownership: enqueue admission + in-hand drain items
+    # ------------------------------------------------------------------
+
+    def _enqueue_owned(
+        self,
+        queue: collections.deque[_T],
+        item: _T,
+        maxlen: int,
+        kind: str,
+        on_evict: Callable[[_T], None] | None = None,
+    ) -> bool:
+        """Append under the ownership lock; refuse once delivery has sealed.
+
+        Returns False when ``_seal_delivery`` already ran — the caller counts
+        the refusal. Without this gate an enqueue could pass the ``_shutdown``
+        check, lose the race with close()'s final drain, and append into a
+        queue nothing will ever drain. The drop-oldest bound is enforced
+        OUTSIDE the lock (the bound is approximate by design; deque ops are
+        individually thread-safe) so eviction accounting never logs while
+        holding the ownership lock.
+        """
+        with self._ownership_lock:
+            if self._delivery_closed:
+                return False
+            queue.append(item)
+        if len(queue) > maxlen:
+            try:
+                evicted = queue.popleft()
+            except IndexError:
+                pass
+            else:
+                self._count_drop(kind, "overflow")
+                if on_evict is not None:
+                    on_evict(evicted)
+        return True
+
+    def _take_in_hand(self, kind: str, n: int = 1) -> None:
+        """Mark ``n`` just-popped drain items as in hand (owned by this drain)."""
+        with self._ownership_lock:
+            self._in_hand[kind] = self._in_hand.get(kind, 0) + n
+
+    def _resolve_in_hand(
+        self,
+        kind: str,
+        n: int = 1,
+        requeue: Callable[[], None] | None = None,
+    ) -> tuple[int, bool]:
+        """Release ``n`` in-hand items with a terminal disposition.
+
+        Returns ``(owned, requeued)``. ``owned`` is how many of the items
+        close()'s seal has NOT already claimed-and-counted — the caller
+        counts any drop for ``owned`` items only, so a seal never double
+        counts. ``requeue`` runs under the ownership lock and only while
+        delivery is open; once sealed, requeueing would strand the items in a
+        queue with no owner, so the caller counts them instead.
+        """
+        with self._ownership_lock:
+            held = self._in_hand.get(kind, 0)
+            owned = min(held, n)
+            if owned:
+                self._in_hand[kind] = held - owned
+            if requeue is not None and not self._delivery_closed:
+                requeue()
+                return owned, True
+            return owned, False
+
+    def _park_confirm(self, pending: _PendingConfirm) -> None:
+        """Requeue a still-retryable confirm head — or count it once sealed."""
+        owned, requeued = self._resolve_in_hand(
+            "confirm", requeue=lambda: self._confirm_queue.appendleft(pending)
+        )
+        if not requeued and owned:
+            self._count_drop("confirm", "shutdown_deadline", n=owned)
+
+    def _park_settlement(self, pending: _PendingSettlement) -> None:
+        """Requeue a still-retryable settlement head — or count the pair."""
+        owned, requeued = self._resolve_in_hand(
+            "settlement", requeue=lambda: self._settlement_queue.appendleft(pending)
+        )
+        if not requeued and owned:
+            self._count_settlement_drop("shutdown_deadline", n=owned)
+
+    def _ship_settlement_event(self, event: MetadataEvent, owned: int = 1) -> None:
+        """Hand a resolved settlement's event to the event queue.
+
+        cost_events ingest is the durable spend truth, so the event must never
+        be lost because its confirm failed. Once delivery has sealed nothing
+        will drain the event queue — count the loss instead, unless close()'s
+        seal already claimed and counted the pair (``owned == 0``).
+        """
+        enqueued = self._enqueue_owned(
+            self._queue, _PendingEvent(event), self.max_queue_size, "event"
+        )
+        if not enqueued and owned:
+            self._count_drop("event", "shutdown_deadline", n=owned)
+
+    def _move_event_to_queue(self, event: MetadataEvent) -> None:
+        """Sync override: settlement events route through the ownership gate."""
+        self._ship_settlement_event(event)
+
+    def _seal_delivery(self) -> None:
+        """Take final ownership of every queued or in-hand item at close().
+
+        Runs after close()'s final flush. A join-timeout-stranded flush thread
+        may still hold popped items mid-POST (and would otherwise requeue them
+        into a dead queue), and a racing producer may have appended after the
+        final drain passed its queue. Atomically: seal delivery (enqueues and
+        requeues are refused from here on), claim whatever re-appeared in the
+        queues, and count the flush thread's in-hand items — their owner can
+        no longer deliver them within the deadline. A stuck send that later
+        succeeds leaves a conservative overcount for that one item; drops are
+        never UNDERstated.
+        """
+        with self._ownership_lock:
+            self._delivery_closed = True
+            in_hand = dict(self._in_hand)
+            self._in_hand.clear()
+            n_confirm = _drain_count(self._confirm_queue)
+            n_settlement = _drain_count(self._settlement_queue)
+            n_event = _drain_count(self._queue)
+        self._count_drop("confirm", "shutdown_deadline", n=n_confirm + in_hand.get("confirm", 0))
+        self._count_settlement_drop(
+            "shutdown_deadline", n=n_settlement + in_hand.get("settlement", 0)
+        )
+        self._count_drop("event", "shutdown_deadline", n=n_event + in_hand.get("event", 0))
+        self._maybe_log_drops(force=True)
+
+    # ------------------------------------------------------------------
+    # Drains
+    # ------------------------------------------------------------------
+
     def _drain_confirms(self, *, deadline: float | None = None, final: bool = False) -> None:
-        """Send due confirms in FIFO order; requeue survivors to the front."""
-        survivors: list[_PendingConfirm] = []
+        """Send due confirms in FIFO order; a retrying head parks the queue."""
         while self._confirm_queue:
             if self._deadline_expired(deadline):
-                self._count_drop("confirm", "shutdown_deadline", n=len(self._confirm_queue))
-                self._confirm_queue.clear()
+                self._count_drop(
+                    "confirm", "shutdown_deadline", n=_drain_count(self._confirm_queue)
+                )
                 break
             try:
                 # Atomic pop, never peek-then-pop: once close()'s bounded join
@@ -720,44 +873,45 @@ class MetadataReporter(_ReporterBase):
                 pending = self._confirm_queue.popleft()
             except IndexError:
                 break
+            self._take_in_hand("confirm")
             if not final and pending.next_attempt_at > _monotonic():
-                self._confirm_queue.appendleft(pending)
+                self._park_confirm(pending)
                 break  # head still backing off — nothing behind is due earlier
             outcome = self._send_confirm(pending.request, timeout=self._send_timeout(deadline))
             if outcome is _SendOutcome.SENT:
+                self._resolve_in_hand("confirm")
                 continue
             if outcome is _SendOutcome.HELD:
                 if final:
-                    self._count_drop("confirm", "exit_breaker_open", n=1 + len(self._confirm_queue))
-                    self._confirm_queue.clear()
+                    owned, _ = self._resolve_in_hand("confirm")
+                    self._count_drop(
+                        "confirm", "exit_breaker_open", n=owned + _drain_count(self._confirm_queue)
+                    )
                 else:
-                    survivors.append(pending)
+                    self._park_confirm(pending)
                 break
             if outcome is _SendOutcome.RETRY:
                 pending.attempts += 1
                 finished, next_at = self._resolve_retryable(attempts=pending.attempts)
                 if finished or final:
-                    self._count_drop("confirm", "retry_exhausted")
-                else:
-                    pending.next_attempt_at = next_at
-                    survivors.append(pending)
-                continue
-            self._count_drop("confirm", "terminal_status")
-        if survivors:
-            self._confirm_queue.extendleft(reversed(survivors))
+                    owned, _ = self._resolve_in_hand("confirm")
+                    self._count_drop("confirm", "retry_exhausted", n=owned)
+                    continue
+                pending.next_attempt_at = next_at
+                self._park_confirm(pending)
+                break  # FIFO: nothing behind a backing-off head may jump it
+            owned, _ = self._resolve_in_hand("confirm")
+            self._count_drop("confirm", "terminal_status", n=owned)
 
     def _drain_settlements(self, *, deadline: float | None = None, final: bool = False) -> None:
         """Resolve each settlement's confirm first, then hand its event to the
-        event queue (confirm-before-metadata order per item is load-bearing)."""
-        survivors: list[_PendingSettlement] = []
+        event queue (confirm-before-metadata order per item is load-bearing).
+        A retrying head parks the queue behind it (FIFO)."""
         while self._settlement_queue:
             if self._deadline_expired(deadline):
-                # Each dropped pair loses its confirm AND its event — count
-                # both kinds or dropped_counts understates real event loss.
-                n_pairs = len(self._settlement_queue)
-                self._count_drop("settlement_confirm", "shutdown_deadline", n=n_pairs)
-                self._count_drop("event", "shutdown_deadline", n=n_pairs)
-                self._settlement_queue.clear()
+                self._count_settlement_drop(
+                    "shutdown_deadline", n=_drain_count(self._settlement_queue)
+                )
                 break
             try:
                 # Atomic pop — see _drain_confirms for the concurrent-drain
@@ -765,14 +919,16 @@ class MetadataReporter(_ReporterBase):
                 pending = self._settlement_queue.popleft()
             except IndexError:
                 break
+            self._take_in_hand("settlement")
             if not final and pending.confirm.next_attempt_at > _monotonic():
-                self._settlement_queue.appendleft(pending)
+                self._park_settlement(pending)
                 break
             outcome = self._send_confirm(
                 pending.confirm.request, timeout=self._send_timeout(deadline)
             )
             if outcome is _SendOutcome.SENT:
-                self._move_event_to_queue(pending.event)
+                owned, _ = self._resolve_in_hand("settlement")
+                self._ship_settlement_event(pending.event, owned)
                 continue
             if outcome is _SendOutcome.HELD:
                 if final:
@@ -780,36 +936,43 @@ class MetadataReporter(_ReporterBase):
                     # but ingest is NOT breaker-gated: hand every event to the
                     # event drain so the durable spend truth still gets its
                     # deadline-bounded exit attempt.
-                    stranded = [pending, *self._settlement_queue]
-                    self._settlement_queue.clear()
-                    self._count_drop("settlement_confirm", "exit_breaker_open", n=len(stranded))
+                    owned, _ = self._resolve_in_hand("settlement")
+                    stranded: list[_PendingSettlement] = []
+                    while True:
+                        try:
+                            stranded.append(self._settlement_queue.popleft())
+                        except IndexError:
+                            break
+                    self._count_drop(
+                        "settlement_confirm", "exit_breaker_open", n=owned + len(stranded)
+                    )
+                    self._ship_settlement_event(pending.event, owned)
                     for orphan in stranded:
-                        self._move_event_to_queue(orphan.event)
+                        self._ship_settlement_event(orphan.event)
                 else:
-                    survivors.append(pending)
+                    self._park_settlement(pending)
                 break
             if outcome is _SendOutcome.RETRY:
                 pending.confirm.attempts += 1
                 finished, next_at = self._resolve_retryable(attempts=pending.confirm.attempts)
                 if finished or final:
-                    self._count_drop("settlement_confirm", "retry_exhausted")
-                    self._move_event_to_queue(pending.event)
-                else:
-                    pending.confirm.next_attempt_at = next_at
-                    survivors.append(pending)
-                continue
+                    owned, _ = self._resolve_in_hand("settlement")
+                    self._count_drop("settlement_confirm", "retry_exhausted", n=owned)
+                    self._ship_settlement_event(pending.event, owned)
+                    continue
+                pending.confirm.next_attempt_at = next_at
+                self._park_settlement(pending)
+                break
             # Terminal confirm: the event is still the durable spend truth.
-            self._count_drop("settlement_confirm", "terminal_status")
-            self._move_event_to_queue(pending.event)
-        if survivors:
-            self._settlement_queue.extendleft(reversed(survivors))
+            owned, _ = self._resolve_in_hand("settlement")
+            self._count_drop("settlement_confirm", "terminal_status", n=owned)
+            self._ship_settlement_event(pending.event, owned)
 
     def _drain_event_batches(self, *, deadline: float | None = None, final: bool = False) -> None:
         """Send due metadata events in batches; requeue a failed batch to front."""
         while self._queue:
             if self._deadline_expired(deadline):
-                self._count_drop("event", "shutdown_deadline", n=len(self._queue))
-                self._queue.clear()
+                self._count_drop("event", "shutdown_deadline", n=_drain_count(self._queue))
                 break
             with self._in_flight_lock:
                 if self._in_flight >= self.max_in_flight:
@@ -817,14 +980,22 @@ class MetadataReporter(_ReporterBase):
             now = _monotonic()
             prefix: list[_PendingEvent] = []
             while len(prefix) < self.batch_size and self._queue:
-                head = self._queue[0]
+                try:
+                    head = self._queue[0]
+                except IndexError:
+                    break
                 if not final and head.next_attempt_at > now:
                     break
-                prefix.append(self._queue.popleft())
+                try:
+                    prefix.append(self._queue.popleft())
+                except IndexError:
+                    break
             if not prefix:
                 break
+            self._take_in_hand("event", n=len(prefix))
             outcome = self._send_batch([p.event for p in prefix], deadline=deadline)
             if outcome is _SendOutcome.SENT:
+                self._resolve_in_hand("event", n=len(prefix))
                 continue
             if outcome is _SendOutcome.RETRY:
                 keep: list[_PendingEvent] = []
@@ -837,12 +1008,20 @@ class MetadataReporter(_ReporterBase):
                     else:
                         p.next_attempt_at = next_at
                         keep.append(p)
-                if dropped:
+                owned, requeued = self._resolve_in_hand(
+                    "event",
+                    n=len(prefix),
+                    requeue=functools.partial(self._queue.extendleft, tuple(reversed(keep))),
+                )
+                if requeued:
                     self._count_drop("event", "retry_exhausted", n=dropped)
-                if keep:
-                    self._queue.extendleft(reversed(keep))
+                else:
+                    # Sealed while in hand: whatever the seal did not claim is
+                    # abandoned here.
+                    self._count_drop("event", "shutdown_deadline", n=owned)
                 break
-            self._count_drop("event", "terminal_status", n=len(prefix))
+            owned, _ = self._resolve_in_hand("event", n=len(prefix))
+            self._count_drop("event", "terminal_status", n=owned)
 
     def _start_breaker_cycle(
         self,
@@ -998,22 +1177,29 @@ class MetadataReporter(_ReporterBase):
             self._count_drop("confirm", "closed_enqueue")
             return
         self._ensure_thread()
-        self._enqueue_bounded(
+        enqueued = self._enqueue_owned(
             self._confirm_queue, _PendingConfirm(request), _MAX_PENDING_CONTROL, "confirm"
         )
+        if not enqueued:
+            self._count_drop("confirm", "closed_enqueue")
 
     def report_settlement(self, request: BudgetConfirmRequest, event: MetadataEvent) -> None:
         """Fire-and-forget a stream settlement as one ordered queue item."""
         if self._shutdown.is_set():
-            self._count_drop("settlement_confirm", "closed_enqueue")
+            self._count_settlement_drop("closed_enqueue")
             return
         self._ensure_thread()
-        self._enqueue_bounded(
+        enqueued = self._enqueue_owned(
             self._settlement_queue,
             _PendingSettlement(_PendingConfirm(request), event),
             _MAX_PENDING_CONTROL,
             "settlement_confirm",
+            # An overflow-evicted pair drops only its confirm; the event is
+            # the durable spend truth and still rides the event queue.
+            on_evict=lambda evicted: self._ship_settlement_event(evicted.event),
         )
+        if not enqueued:
+            self._count_settlement_drop("closed_enqueue")
 
 
 class AsyncMetadataReporter(_ReporterBase):
@@ -1069,6 +1255,10 @@ class AsyncMetadataReporter(_ReporterBase):
         # loop has run — a never-started reporter has no shutdown event but can
         # still be closed.
         self._closed = False
+        # Set only when close() FINISHES its flush chain. _closed alone must
+        # not disarm the lifecycle rescue paths: a close() cancelled at its
+        # first await has flushed nothing, so the atexit hook keys on this.
+        self._close_completed = False
         # Latches the one-per-instance "enqueued with no running loop" warning
         # so a caller that never enters an event loop is warned once, not per
         # event.
@@ -1167,7 +1357,8 @@ class AsyncMetadataReporter(_ReporterBase):
     def report_settlement(self, request: BudgetConfirmRequest, event: MetadataEvent) -> None:
         """Fire-and-forget a stream settlement as one ordered queue item."""
         if self._closed:
-            self._count_drop("settlement_confirm", "closed_enqueue")
+            # The pair loses its confirm AND its event — count both halves.
+            self._count_settlement_drop("closed_enqueue")
             return
         self._ensure_started()
         self._enqueue_bounded(
@@ -1175,6 +1366,9 @@ class AsyncMetadataReporter(_ReporterBase):
             _PendingSettlement(_PendingConfirm(request), event),
             _MAX_PENDING_CONTROL,
             "settlement_confirm",
+            # An overflow-evicted pair drops only its confirm; the event is
+            # the durable spend truth and still rides the event queue.
+            on_evict=lambda evicted: self._move_event_to_queue(evicted.event),
         )
 
     async def close(self, timeout: float | None = None) -> None:
@@ -1182,12 +1376,14 @@ class AsyncMetadataReporter(_ReporterBase):
 
         See ``MetadataReporter.close`` — one monotonic ``deadline`` bounds the
         flush-task await, the final flush, and the breaker report cycle.
+
+        ``_closed`` (no new work) is set before the first await; the exit
+        rescue state (``_close_completed`` + the GC finalizer) is touched only
+        AFTER the flush chain finishes. A close() cancelled mid-await
+        propagates the cancellation but leaves both lifecycle rescue paths
+        armed for whatever spend is still queued.
         """
         self._closed = True
-        # A clean close supersedes the exit-flush safety net: drop the GC
-        # finalizer so it can never double-flush drained queues.
-        if self._finalizer is not None:
-            self._finalizer.detach()
         budget = self.shutdown_deadline if timeout is None else timeout
         deadline = _monotonic() + budget
         active_breaker_task = self._breaker_task
@@ -1204,6 +1400,12 @@ class AsyncMetadataReporter(_ReporterBase):
         if active_breaker_task is not None:
             await self._await_within(active_breaker_task, deadline)
         await self._http.aclose()
+        # A COMPLETED close supersedes the exit-flush safety nets: drop the GC
+        # finalizer so it can never double-flush drained queues, and tell the
+        # atexit hook this reporter needs no rescue.
+        self._close_completed = True
+        if self._finalizer is not None:
+            self._finalizer.detach()
 
     async def _await_within(self, task: asyncio.Task[None], deadline: float) -> None:
         """Await ``task`` but never past the shared shutdown deadline.
@@ -1271,12 +1473,12 @@ class AsyncMetadataReporter(_ReporterBase):
         self._maybe_log_drops(force=final)
 
     async def _drain_confirms(self, *, deadline: float | None = None, final: bool = False) -> None:
-        """Send due confirms in FIFO order; requeue survivors to the front."""
-        survivors: list[_PendingConfirm] = []
+        """Send due confirms in FIFO order; a retrying head parks the queue."""
         while self._confirm_queue:
             if self._deadline_expired(deadline):
-                self._count_drop("confirm", "shutdown_deadline", n=len(self._confirm_queue))
-                self._confirm_queue.clear()
+                self._count_drop(
+                    "confirm", "shutdown_deadline", n=_drain_count(self._confirm_queue)
+                )
                 break
             try:
                 # Atomic pop, never peek-then-pop: a cancelled close() and the
@@ -1300,38 +1502,34 @@ class AsyncMetadataReporter(_ReporterBase):
                 continue
             if outcome is _SendOutcome.HELD:
                 if final:
-                    self._count_drop("confirm", "exit_breaker_open", n=1 + len(self._confirm_queue))
-                    self._confirm_queue.clear()
+                    self._count_drop(
+                        "confirm", "exit_breaker_open", n=1 + _drain_count(self._confirm_queue)
+                    )
                 else:
-                    survivors.append(pending)
+                    self._confirm_queue.appendleft(pending)
                 break
             if outcome is _SendOutcome.RETRY:
                 pending.attempts += 1
                 finished, next_at = self._resolve_retryable(attempts=pending.attempts)
                 if finished or final:
                     self._count_drop("confirm", "retry_exhausted")
-                else:
-                    pending.next_attempt_at = next_at
-                    survivors.append(pending)
-                continue
+                    continue
+                pending.next_attempt_at = next_at
+                self._confirm_queue.appendleft(pending)
+                break  # FIFO: nothing behind a backing-off head may jump it
             self._count_drop("confirm", "terminal_status")
-        if survivors:
-            self._confirm_queue.extendleft(reversed(survivors))
 
     async def _drain_settlements(
         self, *, deadline: float | None = None, final: bool = False
     ) -> None:
         """Resolve each settlement's confirm first, then hand its event to the
-        event queue (confirm-before-metadata order per item is load-bearing)."""
-        survivors: list[_PendingSettlement] = []
+        event queue (confirm-before-metadata order per item is load-bearing).
+        A retrying head parks the queue behind it (FIFO)."""
         while self._settlement_queue:
             if self._deadline_expired(deadline):
-                # Each dropped pair loses its confirm AND its event — count
-                # both kinds or dropped_counts understates real event loss.
-                n_pairs = len(self._settlement_queue)
-                self._count_drop("settlement_confirm", "shutdown_deadline", n=n_pairs)
-                self._count_drop("event", "shutdown_deadline", n=n_pairs)
-                self._settlement_queue.clear()
+                self._count_settlement_drop(
+                    "shutdown_deadline", n=_drain_count(self._settlement_queue)
+                )
                 break
             try:
                 # Atomic pop — see _drain_confirms for the interleaving
@@ -1348,8 +1546,7 @@ class AsyncMetadataReporter(_ReporterBase):
                 )
             except asyncio.CancelledError:
                 # In-hand pair vanishes with the cancellation — count both.
-                self._count_drop("settlement_confirm", "shutdown_deadline")
-                self._count_drop("event", "shutdown_deadline")
+                self._count_settlement_drop("shutdown_deadline")
                 raise
             if outcome is _SendOutcome.SENT:
                 self._move_event_to_queue(pending.event)
@@ -1366,7 +1563,7 @@ class AsyncMetadataReporter(_ReporterBase):
                     for orphan in stranded:
                         self._move_event_to_queue(orphan.event)
                 else:
-                    survivors.append(pending)
+                    self._settlement_queue.appendleft(pending)
                 break
             if outcome is _SendOutcome.RETRY:
                 pending.confirm.attempts += 1
@@ -1374,14 +1571,12 @@ class AsyncMetadataReporter(_ReporterBase):
                 if finished or final:
                     self._count_drop("settlement_confirm", "retry_exhausted")
                     self._move_event_to_queue(pending.event)
-                else:
-                    pending.confirm.next_attempt_at = next_at
-                    survivors.append(pending)
-                continue
+                    continue
+                pending.confirm.next_attempt_at = next_at
+                self._settlement_queue.appendleft(pending)
+                break
             self._count_drop("settlement_confirm", "terminal_status")
             self._move_event_to_queue(pending.event)
-        if survivors:
-            self._settlement_queue.extendleft(reversed(survivors))
 
     async def _drain_event_batches(
         self, *, deadline: float | None = None, final: bool = False
@@ -1389,8 +1584,7 @@ class AsyncMetadataReporter(_ReporterBase):
         """Send due metadata events in batches; requeue a failed batch to front."""
         while self._queue:
             if self._deadline_expired(deadline):
-                self._count_drop("event", "shutdown_deadline", n=len(self._queue))
-                self._queue.clear()
+                self._count_drop("event", "shutdown_deadline", n=_drain_count(self._queue))
                 break
             if self._in_flight >= self.max_in_flight:
                 break

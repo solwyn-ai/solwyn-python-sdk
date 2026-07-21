@@ -327,24 +327,136 @@ class TestSyncReporterRetry:
             ]
 
         with caplog.at_level("WARNING"):
+            # The first drop EVER warns immediately from the drop path itself —
+            # no flush cycle needed (a post-close drop has no later cycle).
             reporter._count_drop("event", "terminal_status")
-            reporter._count_drop("event", "terminal_status")
-            reporter._maybe_log_drops()
             assert len(_drop_logs()) == 1
-            assert "new=2" in _drop_logs()[0]
+            assert "new=1" in _drop_logs()[0]
 
-            # Within the interval: another drop + flush logs nothing new.
+            # Within the interval: further drops log nothing new.
+            reporter._count_drop("event", "terminal_status")
             reporter._count_drop("confirm", "retry_exhausted")
             reporter._maybe_log_drops()
             assert len(_drop_logs()) == 1
 
             # After the interval: a second aggregate WARNING carrying totals.
             clock.advance(61.0)
-            reporter._maybe_log_drops()
+            reporter._count_drop("event", "terminal_status")
             logs = _drop_logs()
             assert len(logs) == 2
-            assert "new=1" in logs[1]
+            assert "new=3" in logs[1]
             assert "event.terminal_status" in logs[1]
+        reporter._http.close()
+
+    def test_post_close_drop_warns_without_a_flush_cycle(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # P2 review pin: a closed reporter has no later flush cycle — the
+        # closed_enqueue drop must surface its WARNING from the drop path.
+        reporter = _quiet()
+        reporter._shutdown.set()
+        with caplog.at_level("WARNING"):
+            reporter.report(_make_event())
+        assert "reporter.spend_events_dropped" in caplog.text
+        assert reporter.dropped_counts["event.closed_enqueue"] == 1
+        reporter._http.close()
+
+    def test_retrying_confirm_head_parks_queue_fifo(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # P2 review pin: a transient failure at the head must PARK the queue
+        # for the cycle — nothing behind a backing-off head may jump it.
+        clock = _FakeClock()
+        monkeypatch.setattr("solwyn.reporter._monotonic", clock)
+        reporter = _quiet(max_send_attempts=5, retry_backoff_base=1.0)
+        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request(call_id="a")))
+        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request(call_id="b")))
+        sent: list[str] = []
+        responses = [_error_response(503), _ok_response(), _ok_response()]
+
+        def post(url: str, **kw: object) -> MagicMock:
+            sent.append(kw["json"]["call_id"])  # type: ignore[index,call-overload]
+            return responses[len(sent) - 1]
+
+        with patch.object(reporter._http, "post", side_effect=post):
+            reporter._flush_remaining()
+            # Head a failed transiently: b must NOT have been attempted.
+            assert sent == ["a"]
+            assert [p.request.call_id for p in reporter._confirm_queue] == ["a", "b"]
+
+            clock.advance(1.5)
+            reporter._flush_remaining()
+
+        # FIFO preserved: a retried (and delivered) before b.
+        assert sent == ["a", "a", "b"]
+        assert len(reporter._confirm_queue) == 0
+        reporter._http.close()
+
+    def test_retrying_settlement_head_parks_queue_fifo(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # P2 review pin (A=503, B=200): B's confirm AND B's metadata ingest
+        # must not complete while A is backing off.
+        clock = _FakeClock()
+        monkeypatch.setattr("solwyn.reporter._monotonic", clock)
+        reporter = _quiet(max_send_attempts=5, retry_backoff_base=1.0)
+        reporter._settlement_queue.append(
+            _PendingSettlement(_PendingConfirm(_make_confirm_request(call_id="a")), _make_event())
+        )
+        reporter._settlement_queue.append(
+            _PendingSettlement(_PendingConfirm(_make_confirm_request(call_id="b")), _make_event())
+        )
+        urls: list[str] = []
+        first = {"pending": True}
+
+        def post(url: str, **_kw: object) -> MagicMock:
+            urls.append(url)
+            if "budgets/confirm" in url and first["pending"]:
+                first["pending"] = False
+                return _error_response(503)
+            return _ok_response()
+
+        with patch.object(reporter._http, "post", side_effect=post):
+            reporter._flush_remaining()
+            assert len([u for u in urls if "budgets/confirm" in u]) == 1
+            assert not any("metadata/ingest" in u for u in urls)
+            assert len(reporter._settlement_queue) == 2
+
+            clock.advance(1.5)
+            reporter._flush_remaining()
+
+        assert len([u for u in urls if "budgets/confirm" in u]) == 3
+        assert any("metadata/ingest" in u for u in urls)
+        assert len(reporter._settlement_queue) == 0
+        assert len(reporter._queue) == 0
+        reporter._http.close()
+
+    def test_settlement_overflow_ships_event_and_counts_confirm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # P2 review pin: an overflow-evicted settlement loses only its confirm
+        # (counted); its event is the durable spend truth and moves to the
+        # event queue instead of silently vanishing.
+        monkeypatch.setattr("solwyn.reporter._MAX_PENDING_CONTROL", 1)
+        reporter = _unstarted()
+        reporter.report_settlement(_make_confirm_request(call_id="old"), _make_event(call_id="old"))
+        reporter.report_settlement(_make_confirm_request(call_id="new"), _make_event(call_id="new"))
+
+        assert reporter.dropped_counts["settlement_confirm.overflow"] == 1
+        assert len(reporter._settlement_queue) == 1
+        assert reporter._settlement_queue[0].confirm.request.call_id == "new"
+        assert [p.event.call_id for p in reporter._queue] == ["old"]
+        assert "event.overflow" not in reporter.dropped_counts
+        # Items are deliberately left queued — keep the atexit hook off them.
+        reporter._shutdown.set()
+        reporter._http.close()
+
+    def test_settlement_closed_enqueue_counts_both_halves(self) -> None:
+        # P2 review pin: a post-close settlement loses its confirm AND its
+        # event — dropped_counts must say so for both kinds.
+        reporter = _unstarted()
+        reporter._shutdown.set()
+        reporter.report_settlement(_make_confirm_request(), _make_event())
+        assert reporter.dropped_counts["settlement_confirm.closed_enqueue"] == 1
+        assert reporter.dropped_counts["event.closed_enqueue"] == 1
         reporter._http.close()
 
 
@@ -467,4 +579,114 @@ class TestAsyncReporterRetry:
         assert any("budgets/confirm" in u for u in urls)
         assert any("metadata/ingest" in u for u in urls)
         assert len(reporter._settlement_queue) == 0
+        await reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_retrying_confirm_head_parks_queue_fifo(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Async mirror of the FIFO-parking pin.
+        clock = _FakeClock()
+        monkeypatch.setattr("solwyn.reporter._monotonic", clock)
+        reporter = AsyncMetadataReporter(
+            _URL, VALID_API_KEY, max_send_attempts=5, retry_backoff_base=1.0
+        )
+        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request(call_id="a")))
+        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request(call_id="b")))
+        sent: list[str] = []
+        responses = [_error_response(503), _ok_response(), _ok_response()]
+
+        async def post(url: str, **kw: object) -> MagicMock:
+            sent.append(kw["json"]["call_id"])  # type: ignore[index,call-overload]
+            return responses[len(sent) - 1]
+
+        with patch.object(reporter._http, "post", new=post):
+            await reporter._flush_remaining()
+            assert sent == ["a"]
+            assert [p.request.call_id for p in reporter._confirm_queue] == ["a", "b"]
+
+            clock.advance(1.5)
+            await reporter._flush_remaining()
+
+        assert sent == ["a", "a", "b"]
+        assert len(reporter._confirm_queue) == 0
+        await reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_retrying_settlement_head_parks_queue_fifo(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Async mirror of the settlement FIFO-parking pin (A=503, B=200).
+        clock = _FakeClock()
+        monkeypatch.setattr("solwyn.reporter._monotonic", clock)
+        reporter = AsyncMetadataReporter(
+            _URL, VALID_API_KEY, max_send_attempts=5, retry_backoff_base=1.0
+        )
+        reporter._settlement_queue.append(
+            _PendingSettlement(_PendingConfirm(_make_confirm_request(call_id="a")), _make_event())
+        )
+        reporter._settlement_queue.append(
+            _PendingSettlement(_PendingConfirm(_make_confirm_request(call_id="b")), _make_event())
+        )
+        urls: list[str] = []
+        first = {"pending": True}
+
+        async def post(url: str, **_kw: object) -> MagicMock:
+            urls.append(url)
+            if "budgets/confirm" in url and first["pending"]:
+                first["pending"] = False
+                return _error_response(503)
+            return _ok_response()
+
+        with patch.object(reporter._http, "post", new=post):
+            await reporter._flush_remaining()
+            assert len([u for u in urls if "budgets/confirm" in u]) == 1
+            assert not any("metadata/ingest" in u for u in urls)
+            assert len(reporter._settlement_queue) == 2
+
+            clock.advance(1.5)
+            await reporter._flush_remaining()
+
+        assert len([u for u in urls if "budgets/confirm" in u]) == 3
+        assert any("metadata/ingest" in u for u in urls)
+        assert len(reporter._settlement_queue) == 0
+        assert len(reporter._queue) == 0
+        await reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_settlement_overflow_ships_event_and_counts_confirm(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Async mirror of the settlement-overflow pin.
+        monkeypatch.setattr("solwyn.reporter._MAX_PENDING_CONTROL", 1)
+        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
+        reporter.report_settlement(_make_confirm_request(call_id="old"), _make_event(call_id="old"))
+        reporter.report_settlement(_make_confirm_request(call_id="new"), _make_event(call_id="new"))
+
+        assert reporter.dropped_counts["settlement_confirm.overflow"] == 1
+        assert len(reporter._settlement_queue) == 1
+        assert reporter._settlement_queue[0].confirm.request.call_id == "new"
+        assert [p.event.call_id for p in reporter._queue] == ["old"]
+        assert "event.overflow" not in reporter.dropped_counts
+
+        # Wind down without network: stop the auto-started flush task and
+        # disarm the exit paths (items are deliberately left queued).
+        reporter._closed = True
+        reporter._close_completed = True
+        if reporter._shutdown_event is not None:
+            reporter._shutdown_event.set()
+        if reporter._flush_task is not None:
+            await reporter._flush_task
+        if reporter._finalizer is not None:
+            reporter._finalizer.detach()
+        await reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_settlement_closed_enqueue_counts_both_halves(self) -> None:
+        # Async mirror of the closed-enqueue pair-accounting pin.
+        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+        reporter._closed = True
+        reporter.report_settlement(_make_confirm_request(), _make_event())
+        assert reporter.dropped_counts["settlement_confirm.closed_enqueue"] == 1
+        assert reporter.dropped_counts["event.closed_enqueue"] == 1
         await reporter._http.aclose()

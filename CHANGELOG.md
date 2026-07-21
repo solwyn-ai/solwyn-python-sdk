@@ -51,7 +51,7 @@ derived from git tags (hatch-vcs).
   second call reuses the live flush task instead of orphaning it and resetting
   the shutdown event), and `start()` after `close()` raises `RuntimeError` —
   restarting a closed reporter is a programming error. Enqueue after `close()`
-  is silently dropped, matching the sync reporter.
+  is dropped and counted (`closed_enqueue`), matching the sync reporter.
 - **Spend telemetry is now delivered at least once.** Confirms, settlements, and
   metadata batches used to be dropped on their first failed send. They are now
   retried with bounded exponential backoff (`reporter_max_send_attempts`,
@@ -69,7 +69,14 @@ derived from git tags (hatch-vcs).
 - **A settlement's metadata event now survives its confirm.** When a settlement's
   confirm is terminally rejected or exhausts its retries, the paired event is
   still handed to the ingest queue — `cost_events` ingest is the durable spend
-  truth and must not be lost because the confirm failed.
+  truth and must not be lost because the confirm failed. An overflow-evicted
+  settlement ships its event the same way; a settlement rejected after
+  `close()` counts BOTH halves (`settlement_confirm.closed_enqueue` and
+  `event.closed_enqueue`).
+- **Confirm and settlement queues drain strictly FIFO.** A head that fails
+  transiently is requeued and PARKS its queue for the cycle — later spend can
+  no longer be confirmed or ingested ahead of earlier acknowledged spend, and
+  an outage burns one retry attempt per cycle instead of one per queued item.
 - **Undeliverable spend is counted and loudly logged, never silently dropped.**
   Queue overflow, retry exhaustion, terminal statuses, shutdown-deadline
   expiry, and enqueue-after-close all increment a counter now readable via the
@@ -81,8 +88,13 @@ derived from git tags (hatch-vcs).
   `atexit` hook now flushes each live reporter (sync via `close()`, async over a
   temporary sync client since no event loop exists at exit), and async reporters
   additionally arm a `weakref.finalize` covering the constructed-queued-then-
-  garbage-collected case. A known-down control plane is skipped rather than
-  hammered on the way out, and that abandoned spend is counted.
+  garbage-collected case. Exit delivery is accountable per item: every popped
+  confirm and event reports a sent/failed/expired disposition and every failure
+  is counted. Exit confirms ride the control-plane breaker's admission — a
+  known-down control plane refuses them (counted `exit_breaker_open`) after at
+  most one recovery probe — while metadata ingest is never breaker-gated, so
+  settlement events and standalone events still get their deadline-bounded
+  ingest attempt on the way out.
 - **Reporters, budget enforcers, and circuit breakers are fork-safe.** Threads,
   locks, and HTTP clients do not survive `fork()`, so a forked child inherited a
   dead flush thread and never delivered its settlements. A single
@@ -96,7 +108,13 @@ derived from git tags (hatch-vcs).
   deadline across the thread/task join, the final flush, and the breaker-report
   cycle. Against a black-holed control plane, shutdown no longer pays a serial
   per-request timeout chain across every queued item — work still queued when
-  the deadline is reached is counted `shutdown_deadline` and dropped.
+  the deadline is reached is counted `shutdown_deadline` and dropped. At the
+  deadline the sync `close()` takes final ownership of ALL undelivered spend:
+  items a stuck flush thread still holds mid-POST and enqueues racing the final
+  drain are counted before `close()` returns, never requeued into a queue
+  nothing drains. An async `close()` cancelled mid-flush keeps the atexit hook
+  and GC finalizer armed as the last delivery path — they detach only once
+  close actually completes.
 
 ### Added
 
