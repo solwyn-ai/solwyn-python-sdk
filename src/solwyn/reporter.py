@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextlib
 import dataclasses
 import enum
 import logging
@@ -563,8 +564,17 @@ class MetadataReporter(_ReporterBase):
         """Enqueue a metadata event for async reporting.  Non-blocking."""
         self._enqueue(event)
 
-    def close(self) -> None:
-        """Flush remaining events and shut down the background thread."""
+    def close(self, timeout: float | None = None) -> None:
+        """Flush remaining events and shut down within a single deadline.
+
+        ``timeout`` (default ``self.shutdown_deadline``) bounds the WHOLE
+        shutdown chain — thread join, final flush, and breaker report cycle all
+        share one monotonic ``deadline``. Work still queued when it is reached is
+        counted ``shutdown_deadline`` and dropped rather than paying a serial
+        per-request timeout chain against a black-holed control plane.
+        """
+        budget = self.shutdown_deadline if timeout is None else timeout
+        deadline = _monotonic() + budget
         # Serialize shutdown with cadence-triggered breaker launches. If a
         # breaker cycle is active now, it is adopted as the final cycle.
         with self._breaker_worker_lock:
@@ -573,15 +583,18 @@ class MetadataReporter(_ReporterBase):
                 active_breaker_worker = None
             self._shutdown.set()
 
-        # The ingest loop never owns breaker I/O, so it can be joined without
-        # waiting for the per-provider breaker timeout chain.
-        self._thread.join()
-        self._flush_remaining()
+        # Join the ingest loop within the remaining budget. If the join times
+        # out, the final flush below STILL runs: deque ops are thread-safe and a
+        # duplicate send is server-deduped via the idempotency ledger.
+        self._thread.join(timeout=max(0.0, deadline - _monotonic()))
+        self._flush_remaining(deadline=deadline, final=True)
 
         if active_breaker_worker is None:
-            active_breaker_worker = self._start_breaker_cycle(during_shutdown=True)
+            active_breaker_worker = self._start_breaker_cycle(
+                during_shutdown=True, deadline=deadline
+            )
         if active_breaker_worker is not None:
-            active_breaker_worker.join()
+            active_breaker_worker.join(timeout=max(0.0, deadline - _monotonic()))
         self._http.close()
 
     def __enter__(self) -> MetadataReporter:
@@ -739,6 +752,7 @@ class MetadataReporter(_ReporterBase):
         self,
         *,
         during_shutdown: bool = False,
+        deadline: float | None = None,
     ) -> threading.Thread | None:
         """Start one tracked breaker cycle, or coalesce into the active one."""
         with self._breaker_worker_lock:
@@ -749,6 +763,7 @@ class MetadataReporter(_ReporterBase):
                 return worker
             worker = threading.Thread(
                 target=self._flush_breaker_reports,
+                kwargs={"deadline": deadline},
                 daemon=True,
                 name="solwyn-breaker-reporter",
             )
@@ -756,15 +771,22 @@ class MetadataReporter(_ReporterBase):
             worker.start()
             return worker
 
-    def _flush_breaker_reports(self) -> None:
-        """POST current breaker snapshots independently and drop every failure."""
+    def _flush_breaker_reports(self, deadline: float | None = None) -> None:
+        """POST current breaker snapshots independently and drop every failure.
+
+        Bounded by the shared shutdown ``deadline`` when set: remaining providers
+        are skipped once it is reached. Breaker snapshots are advisory — dropping
+        them is fine and is NOT counted as a spend drop.
+        """
         for project_id, report in self._build_breaker_reports():
+            if self._deadline_expired(deadline):
+                return
             try:
                 response = self._http.post(
                     f"{self.api_url}/api/v1/projects/{project_id}/providers/breaker-reports",
                     json=report.model_dump(mode="json"),
                     headers=self._auth_headers(),
-                    timeout=5.0,
+                    timeout=self._send_timeout(deadline),
                 )
                 response.raise_for_status()
             except Exception as exc:
@@ -1026,23 +1048,43 @@ class AsyncMetadataReporter(_ReporterBase):
             "settlement_confirm",
         )
 
-    async def close(self) -> None:
-        """Flush remaining events and shut down."""
+    async def close(self, timeout: float | None = None) -> None:
+        """Flush remaining events and shut down within a single deadline.
+
+        See ``MetadataReporter.close`` — one monotonic ``deadline`` bounds the
+        flush-task await, the final flush, and the breaker report cycle.
+        """
         self._closed = True
+        budget = self.shutdown_deadline if timeout is None else timeout
+        deadline = _monotonic() + budget
         active_breaker_task = self._breaker_task
         if active_breaker_task is not None and active_breaker_task.done():
             active_breaker_task = None
         if self._shutdown_event is not None:
             self._shutdown_event.set()
         if self._flush_task is not None:
-            await self._flush_task
-        await self._flush_remaining()
+            await self._await_within(self._flush_task, deadline)
+        await self._flush_remaining(deadline=deadline, final=True)
 
         if active_breaker_task is None:
-            active_breaker_task = self._start_breaker_cycle(during_shutdown=True)
+            active_breaker_task = self._start_breaker_cycle(during_shutdown=True, deadline=deadline)
         if active_breaker_task is not None:
-            await active_breaker_task
+            await self._await_within(active_breaker_task, deadline)
         await self._http.aclose()
+
+    async def _await_within(self, task: asyncio.Task[None], deadline: float) -> None:
+        """Await ``task`` but never past the shared shutdown deadline.
+
+        On timeout the task is cancelled — during close we would rather abandon a
+        stuck flush/breaker task than exceed the deadline; a duplicate send is
+        server-deduped.
+        """
+        remaining = deadline - _monotonic()
+        if remaining <= 0:
+            task.cancel()
+            return
+        with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=remaining)
 
     async def __aenter__(self) -> AsyncMetadataReporter:
         self.start()
@@ -1209,6 +1251,7 @@ class AsyncMetadataReporter(_ReporterBase):
         self,
         *,
         during_shutdown: bool = False,
+        deadline: float | None = None,
     ) -> asyncio.Task[None] | None:
         """Start one tracked breaker task, or coalesce into the active task."""
         if (
@@ -1221,21 +1264,27 @@ class AsyncMetadataReporter(_ReporterBase):
         if task is not None and not task.done():
             return task
         task = asyncio.create_task(
-            self._flush_breaker_reports(),
+            self._flush_breaker_reports(deadline=deadline),
             name="solwyn-breaker-reporter",
         )
         self._breaker_task = task
         return task
 
-    async def _flush_breaker_reports(self) -> None:
-        """POST current breaker snapshots independently and drop every failure."""
+    async def _flush_breaker_reports(self, deadline: float | None = None) -> None:
+        """POST current breaker snapshots independently and drop every failure.
+
+        Bounded by the shared shutdown ``deadline`` when set (advisory snapshots
+        are dropped, not counted as spend).
+        """
         for project_id, report in self._build_breaker_reports():
+            if self._deadline_expired(deadline):
+                return
             try:
                 response = await self._http.post(
                     f"{self.api_url}/api/v1/projects/{project_id}/providers/breaker-reports",
                     json=report.model_dump(mode="json"),
                     headers=self._auth_headers(),
-                    timeout=5.0,
+                    timeout=self._send_timeout(deadline),
                 )
                 response.raise_for_status()
             except Exception as exc:
