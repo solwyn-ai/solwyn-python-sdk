@@ -447,3 +447,34 @@ def test_async_seal_counts_straggler_and_refuses_enqueue() -> None:
     if reporter._finalizer is not None:
         reporter._finalizer.detach()
     reporter._close_completed = True  # queues empty; disarm the exit hook
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_cancelled_drain_after_seal_counts_in_hand() -> None:
+    """Re-review #4 pin, seal branch: a cancelled drain requeues its in-hand
+    item for the lifecycle rescue — but never into a SEALED queue (nothing will
+    ever drain it again). A seal-refused requeue is counted instead."""
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
+    reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
+    entered = asyncio.Event()
+
+    async def hung_post(url: str, **_kw: object) -> httpx.Response:
+        entered.set()
+        await asyncio.sleep(3600)
+        raise httpx.ConnectError("unreachable")
+
+    with patch.object(reporter._http, "post", new=hung_post):
+        drain = asyncio.create_task(reporter._drain_confirms(final=True))
+        await asyncio.wait_for(entered.wait(), timeout=2.0)
+        reporter._seal_delivery()
+        drain.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await drain
+
+    assert reporter.dropped_counts.get("confirm.shutdown_deadline") == 1
+    assert not reporter._confirm_queue
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+    reporter._close_completed = True  # queues empty; disarm the exit hook
+    await reporter._http.aclose()

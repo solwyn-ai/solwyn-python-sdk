@@ -342,6 +342,23 @@ class _ReporterBase:
         self._count_drop("event", "shutdown_deadline", n=n_event + in_hand.get("event", 0))
         self._maybe_log_drops(force=True)
 
+    def _requeue_cancelled(self, queue: collections.deque[_T], items: list[_T]) -> bool:
+        """Return a cancelled drain's in-hand items to the head of their queue.
+
+        A cancelled close() leaves the lifecycle rescue paths armed, and rescue
+        can only retry what is IN the queues — counting a still-deliverable
+        in-hand item as dropped would write off spend the exit hook could ship.
+        A close() that COMPLETES instead seals right after the cancelled drain
+        settles, so the requeued item still gets its counted disposition.
+        Returns False once delivery has sealed (nothing will ever drain the
+        queue again); the caller counts the drop.
+        """
+        with self._ownership_lock:
+            if self._delivery_closed:
+                return False
+            queue.extendleft(reversed(items))
+            return True
+
     def _drain_batch(self) -> list[MetadataEvent]:
         """Drain up to batch_size events from the front of the queue."""
         batch: list[MetadataEvent] = []
@@ -1458,8 +1475,9 @@ class AsyncMetadataReporter(_ReporterBase):
         # The final flush rides its own task so the shared deadline can CANCEL
         # a slow-drip send: httpx timeouts bound individual socket operations,
         # not total response time, so an inline await could outlive the
-        # deadline indefinitely (#4 review pin). A cancelled drain counts its
-        # in-hand item before re-raising.
+        # deadline indefinitely (#4 review pin). A cancelled drain requeues its
+        # in-hand item before re-raising — the seal below counts it, or a
+        # cancelled close leaves it queued for the lifecycle rescue.
         await self._await_within(
             asyncio.ensure_future(self._flush_remaining(deadline=deadline, final=True)), deadline
         )
@@ -1491,9 +1509,9 @@ class AsyncMetadataReporter(_ReporterBase):
         remaining = deadline - _monotonic()
         if remaining <= 0:
             # Deadline already spent: cancel, then STILL await the task so its
-            # cleanup — the drains' CancelledError accounting — assigns every
-            # in-hand item a disposition before close() proceeds to detach the
-            # exit rescue (#7 review pin). wait_for below gives the timeout
+            # cleanup — the drains' CancelledError requeue — returns every
+            # in-hand item to its queue before close() proceeds to seal and
+            # detach the exit rescue (#7 review pin). wait_for below gives the timeout
             # path the same guarantee (it awaits the cancelled task before
             # raising), so only this fast path needed it.
             task.cancel()
@@ -1580,9 +1598,13 @@ class AsyncMetadataReporter(_ReporterBase):
                     pending.request, timeout=self._send_timeout(deadline)
                 )
             except asyncio.CancelledError:
-                # close() cancelled a stuck drain at the deadline — the in-hand
-                # item would otherwise vanish uncounted.
-                self._count_drop("confirm", "shutdown_deadline")
+                # A cancelled drain's in-hand item is still deliverable: a
+                # cancelled close() leaves rescue armed, and rescue only sees
+                # the QUEUES — so requeue for it (#4 re-review pin). A
+                # completing close seals next and counts the requeued item;
+                # only a seal-refused requeue is counted here.
+                if not self._requeue_cancelled(self._confirm_queue, [pending]):
+                    self._count_drop("confirm", "shutdown_deadline")
                 raise
             if outcome is _SendOutcome.SENT:
                 continue
@@ -1631,8 +1653,10 @@ class AsyncMetadataReporter(_ReporterBase):
                     pending.confirm.request, timeout=self._send_timeout(deadline)
                 )
             except asyncio.CancelledError:
-                # In-hand pair vanishes with the cancellation — count both.
-                self._count_settlement_drop("shutdown_deadline")
+                # Same rescue-requeue as _drain_confirms; a seal-refused pair
+                # loses its confirm AND its event — count both.
+                if not self._requeue_cancelled(self._settlement_queue, [pending]):
+                    self._count_settlement_drop("shutdown_deadline")
                 raise
             if outcome is _SendOutcome.SENT:
                 self._move_event_to_queue(pending.event)
@@ -1686,7 +1710,9 @@ class AsyncMetadataReporter(_ReporterBase):
             try:
                 outcome = await self._send_batch([p.event for p in prefix], deadline=deadline)
             except asyncio.CancelledError:
-                self._count_drop("event", "shutdown_deadline", n=len(prefix))
+                # Same rescue-requeue as _drain_confirms, for the whole batch.
+                if not self._requeue_cancelled(self._queue, prefix):
+                    self._count_drop("event", "shutdown_deadline", n=len(prefix))
                 raise
             if outcome is _SendOutcome.SENT:
                 continue

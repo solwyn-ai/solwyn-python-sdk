@@ -87,8 +87,20 @@ derived from git tags (hatch-vcs).
   calling `close()` previously discarded everything still queued. A single
   `atexit` hook now flushes each live reporter (sync via `close()`, async over a
   temporary sync client since no event loop exists at exit), and async reporters
-  additionally arm a `weakref.finalize` covering the constructed-queued-then-
-  garbage-collected case. Exit delivery is accountable per item: every popped
+  additionally arm a GC-only `weakref.finalize` covering the constructed-queued-
+  then-garbage-collected case — GC-only (`atexit` disabled on the finalizer)
+  because weakref's own exit hook runs BEFORE the SDK's and would drain live
+  reporters without accounting; a genuine GC drain logs each loss
+  (`lifecycle.gc_flush_dropped`) since the collected reporter's
+  `dropped_counts` no longer exists. The exit drain is a true wall-clock bound:
+  it runs on a daemon worker joined at the deadline — closing a sync HTTP
+  client does not reliably interrupt a blocked read, so no close()-based abort
+  is trusted — with pop-and-claim ownership mirroring the reporter's close
+  seal: a timed-out join claims the worker's in-hand items and sweeps the
+  queues (counted `shutdown_deadline`), so a slow-drip response (invisible to
+  httpx's per-socket-op timeouts) cannot hold process exit and a worker
+  unblocking late never double-counts. Exit delivery is
+  accountable per item: every popped
   confirm and event reports a sent/failed/expired disposition and every failure
   is counted. Exit confirms ride the control-plane breaker's admission — a
   known-down control plane refuses them (counted `exit_breaker_open`) after at
@@ -118,9 +130,12 @@ derived from git tags (hatch-vcs).
   enqueues racing the final drain are counted before `close()` returns, never
   requeued into a queue nothing drains. An async `close()` cancelled mid-flush
   keeps the atexit hook and GC finalizer armed as the last delivery path — they
-  detach only once close actually completes, and even a zero-deadline close
-  awaits its cancelled drains' cleanup so every in-hand item has a counted
-  disposition first.
+  detach only once close actually completes — and a cancelled drain REQUEUES its
+  in-hand item under the ownership gate rather than writing it off: the rescue
+  paths can only retry what is in the queues, so a completing close's seal
+  counts the requeued item while a cancelled close leaves it deliverable. Even
+  a zero-deadline close awaits its cancelled drains' cleanup so every in-hand
+  item is back in its queue for the seal before rescue detaches.
 
 ### Added
 

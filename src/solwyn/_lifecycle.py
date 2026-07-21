@@ -157,19 +157,27 @@ def register_sync_reporter(reporter: MetadataReporter) -> None:
 
 
 def register_async_reporter(reporter: AsyncMetadataReporter) -> None:
-    """Track an async reporter for exit flush AND arm a GC finalizer.
+    """Track an async reporter for exit flush AND arm a GC-only finalizer.
 
     The finalizer covers the reporter-GC'd-before-exit case (constructed, events
     queued, never started — so no flush task holds it alive). It captures the
     QUEUES + config (never ``reporter``, which would defeat the weak reference),
-    so a collected reporter still drains over a temporary sync client. A running
-    reporter cannot be GC'd (its flush task holds a strong ref), so only the exit
-    hook flushes it. A COMPLETED ``close()`` detaches the finalizer; a cancelled
-    close leaves it armed as the last-chance delivery path.
+    so a collected reporter still drains over a temporary sync client, with its
+    losses accounted the only way left — loudly, via ``_gc_drop_counter``. A
+    running reporter cannot be GC'd (its flush task holds a strong ref). A
+    COMPLETED ``close()`` detaches the finalizer; a cancelled close leaves it
+    armed as the last-chance delivery path.
+
+    ``atexit`` is disabled on the finalizer: weakref's own exit hook is
+    atexit-registered when the process's FIRST finalizer is created — here,
+    AFTER ``_exit_flush_all`` — so LIFO ordering would run it first at exit and
+    drain still-LIVE reporters with logger-only accounting while their
+    ``dropped_counts`` is fully observable. ``_exit_flush_all`` is the sole
+    exit owner for live reporters; the finalizer covers genuine pre-exit GC.
     """
     _ensure_atexit_registered()
     _LIVE_ASYNC_REPORTERS.add(reporter)
-    reporter._finalizer = weakref.finalize(
+    finalizer = weakref.finalize(
         reporter,
         _drain_queues_blocking,
         reporter._confirm_queue,
@@ -179,8 +187,21 @@ def register_async_reporter(reporter: AsyncMetadataReporter) -> None:
         reporter.api_key,
         reporter._control_plane_breaker,
         reporter.shutdown_deadline,
-        None,  # drop_counter: a GC'd reporter's dropped_counts is unobservable
+        _gc_drop_counter,
     )
+    # Documented writable property; typeshed models finalize with __slots__
+    # only, so mypy rejects the assignment it cannot see.
+    finalizer.atexit = False  # type: ignore[misc]
+    reporter._finalizer = finalizer
+
+
+def _gc_drop_counter(kind: str, reason: str, n: int = 1) -> None:
+    """Drop accounting for the GC-finalizer drain.
+
+    A collected reporter's ``dropped_counts`` no longer exists, so a loss on
+    this path is reported the only way left: a WARNING per counted drop.
+    """
+    logger.warning("lifecycle.gc_flush_dropped: kind=%s reason=%s n=%d", kind, reason, n)
 
 
 def blocking_exit_flush(base: AsyncMetadataReporter) -> None:
@@ -202,6 +223,85 @@ def blocking_exit_flush(base: AsyncMetadataReporter) -> None:
     )
 
 
+class _ExitOwnership:
+    """Pop-and-claim ownership shared by the exit-drain worker and its joiner.
+
+    Mirrors the reporter's ``_seal_delivery`` machinery for the blocking exit
+    drain: the worker registers every popped item in-hand ATOMICALLY with the
+    pop, so the deadline seal can never observe an item in neither a queue nor
+    a hand. After the seal, ``resolve`` returns owned=0 and ``requeue`` is
+    refused — the seal already counted those items ``shutdown_deadline`` — so
+    a worker unblocking late no-ops instead of double-counting. A settlement
+    pair is held as its two halves (``settlement_confirm`` +
+    ``settlement_event``) because each half reaches its disposition
+    separately. A send stuck at the seal that later succeeds leaves a
+    conservative overcount for that one item; drops are never UNDERstated.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counts: dict[str, int] = {}
+        self._sealed = False
+
+    def pop_in_hand(self, queue: collections.deque[_T], *kinds: str) -> _T | None:
+        """Pop the head and register it under each ``kinds`` atomically."""
+        with self._lock:
+            if self._sealed:
+                return None
+            try:
+                item = queue.popleft()
+            except IndexError:
+                return None
+            for kind in kinds:
+                self._counts[kind] = self._counts.get(kind, 0) + 1
+            return item
+
+    def pop_batch_in_hand(self, queue: collections.deque[_T], kind: str, limit: int) -> list[_T]:
+        """Batched ``pop_in_hand`` for the event queue."""
+        with self._lock:
+            if self._sealed:
+                return []
+            batch: list[_T] = []
+            while len(batch) < limit:
+                try:
+                    batch.append(queue.popleft())
+                except IndexError:
+                    break
+            if batch:
+                self._counts[kind] = self._counts.get(kind, 0) + len(batch)
+            return batch
+
+    def resolve(self, kind: str, n: int = 1) -> int:
+        """Release up to ``n`` in-hand items; returns how many the caller
+        still owns (0 after the seal claimed them — those must not be
+        counted again)."""
+        with self._lock:
+            held = self._counts.get(kind, 0)
+            owned = min(n, held)
+            self._counts[kind] = held - owned
+            return owned
+
+    def requeue(self, queue: collections.deque[_T], items: list[_T], kinds: dict[str, int]) -> bool:
+        """Return still-owned items to the queue head (deadline-expired
+        outcome) so the final sweep counts them; refused once sealed (the
+        seal already counted them)."""
+        with self._lock:
+            if self._sealed:
+                return False
+            for kind, n in kinds.items():
+                self._counts[kind] = max(0, self._counts.get(kind, 0) - n)
+            queue.extendleft(reversed(items))
+            return True
+
+    def seal(self) -> dict[str, int]:
+        """Claim every in-hand item; further pops/resolves/requeues refuse."""
+        with self._lock:
+            self._sealed = True
+            counts = {kind: n for kind, n in self._counts.items() if n}
+            self._counts.clear()
+            return counts
+
+
 def _drain_queues_blocking(
     confirm_q: collections.deque[_PendingConfirm],
     settlement_q: collections.deque[_PendingSettlement],
@@ -210,9 +310,18 @@ def _drain_queues_blocking(
     api_key: str,
     breaker: CircuitBreaker | None,
     budget: float,
-    drop_counter: Callable[[str, str, int], None] | None,
+    drop_counter: Callable[[str, str, int], None],
 ) -> None:
     """Best-effort, single-attempt, deadline-bounded exit flush of the queues.
+
+    The deadline is a true wall-clock bound: the drain runs on a daemon worker
+    JOINED at the deadline. httpx timeouts cap socket operations, not total
+    response time, and closing a sync client does not reliably interrupt a
+    blocked read — so no close()-based abort is trusted; the join is the
+    bound. ``_ExitOwnership`` keeps the timeout honest: every pop registers
+    the item in-hand atomically, a timed-out join SEALS delivery (counting
+    in-hand items ``shutdown_deadline`` and sweeping the queues), and a worker
+    unblocking after the seal resolves to owned=0 instead of double-counting.
 
     Every item popped here stays accountable until it has a disposition: each
     POST reports sent / failed / deadline-expired, failures are counted by
@@ -235,13 +344,15 @@ def _drain_queues_blocking(
     base_url = api_url.rstrip("/")
     confirm_url = f"{base_url}/api/v1/budgets/confirm"
     ingest_url = f"{base_url}/api/v1/metadata/ingest"
-    held_drops = 0
-    try:
-        with httpx.Client(timeout=5.0) as client:
-            while confirm_q:
-                try:
-                    pending = confirm_q.popleft()
-                except IndexError:
+    own = _ExitOwnership()
+    client = httpx.Client(timeout=5.0)
+
+    def _run() -> None:
+        held_drops = 0
+        try:
+            while True:
+                pending = own.pop_in_hand(confirm_q, "confirm")
+                if pending is None:
                     break
                 outcome = _post_confirm_blocking(
                     client,
@@ -252,23 +363,23 @@ def _drain_queues_blocking(
                     deadline,
                 )
                 if outcome == "expired":
-                    # Keep the in-hand item accountable: the final sweep
-                    # below counts it with the rest.
-                    confirm_q.appendleft(pending)
+                    # Keep the in-hand item accountable: requeued for the
+                    # final sweep (or already claimed by the seal).
+                    own.requeue(confirm_q, [pending], {"confirm": 1})
                     break
+                owned = own.resolve("confirm")
                 if outcome == "held":
-                    # Control plane known-down: the whole confirm backlog is
-                    # undeliverable — count it, then still drain events.
-                    n = 1 + _drain_count(confirm_q)
-                    _count(drop_counter, "confirm", "exit_breaker_open", n)
-                    held_drops += n
-                    break
+                    # Control plane known-down: each queued confirm is
+                    # refused per item (admit() short-circuits, no HTTP) so
+                    # every pop stays ownership-tracked.
+                    _count(drop_counter, "confirm", "exit_breaker_open", owned)
+                    held_drops += owned
+                    continue
                 if outcome != "sent":
-                    _count(drop_counter, "confirm", outcome)
-            while settlement_q:
-                try:
-                    settlement = settlement_q.popleft()
-                except IndexError:
+                    _count(drop_counter, "confirm", outcome, owned)
+            while True:
+                settlement = own.pop_in_hand(settlement_q, "settlement_confirm", "settlement_event")
+                if settlement is None:
                     break
                 # Confirm-before-metadata order per item is load-bearing.
                 outcome = _post_confirm_blocking(
@@ -280,13 +391,18 @@ def _drain_queues_blocking(
                     deadline,
                 )
                 if outcome == "expired":
-                    settlement_q.appendleft(settlement)
+                    own.requeue(
+                        settlement_q,
+                        [settlement],
+                        {"settlement_confirm": 1, "settlement_event": 1},
+                    )
                     break
+                owned = own.resolve("settlement_confirm")
                 if outcome == "held":
-                    _count(drop_counter, "settlement_confirm", "exit_breaker_open")
-                    held_drops += 1
+                    _count(drop_counter, "settlement_confirm", "exit_breaker_open", owned)
+                    held_drops += owned
                 elif outcome != "sent":
-                    _count(drop_counter, "settlement_confirm", outcome)
+                    _count(drop_counter, "settlement_confirm", outcome, owned)
                 # Ingest is NOT breaker-gated: the event still gets its exit
                 # attempt even when its confirm was held or failed.
                 ev_outcome, ev_response = _post_json_response(
@@ -296,26 +412,22 @@ def _drain_queues_blocking(
                     headers,
                     deadline,
                 )
+                owned_ev = own.resolve("settlement_event")
                 if ev_outcome == "expired":
-                    _count(drop_counter, "event", "shutdown_deadline")
+                    _count(drop_counter, "event", "shutdown_deadline", owned_ev)
                     break
                 if ev_outcome != "sent":
-                    _count(drop_counter, "event", ev_outcome)
+                    _count(drop_counter, "event", ev_outcome, owned_ev)
                 elif ev_response is not None:
                     # A 202 can still reject the event terminally (#9 pin).
                     _count(
                         drop_counter,
                         "event",
                         "ingest_rejected",
-                        _ingest_rejected_count(ev_response, 1),
+                        min(_ingest_rejected_count(ev_response, 1), owned_ev),
                     )
-            while event_q:
-                batch: list[_PendingEvent] = []
-                while event_q and len(batch) < _EXIT_BATCH_SIZE:
-                    try:
-                        batch.append(event_q.popleft())
-                    except IndexError:
-                        break
+            while True:
+                batch = own.pop_batch_in_hand(event_q, "event", _EXIT_BATCH_SIZE)
                 if not batch:
                     break
                 outcome, response = _post_json_response(
@@ -326,25 +438,53 @@ def _drain_queues_blocking(
                     deadline,
                 )
                 if outcome == "expired":
-                    event_q.extendleft(reversed(batch))
+                    own.requeue(event_q, batch, {"event": len(batch)})
                     break
+                owned = own.resolve("event", len(batch))
                 if outcome != "sent":
-                    _count(drop_counter, "event", outcome, len(batch))
+                    _count(drop_counter, "event", outcome, owned)
                 elif response is not None:
                     # A 202 can still reject individual events terminally (#9).
                     _count(
                         drop_counter,
                         "event",
                         "ingest_rejected",
-                        _ingest_rejected_count(response, len(batch)),
+                        min(_ingest_rejected_count(response, len(batch)), owned),
                     )
-    except Exception as exc:
-        logger.warning("lifecycle.exit_flush_failed: exc_type=%s", type(exc).__name__)
+        except Exception as exc:
+            logger.warning("lifecycle.exit_flush_failed: exc_type=%s", type(exc).__name__)
+        if held_drops:
+            logger.error("lifecycle.exit_flush_skipped_breaker_open: dropped=%d", held_drops)
 
-    if held_drops:
-        logger.error("lifecycle.exit_flush_skipped_breaker_open: dropped=%d", held_drops)
+    # The join below is the wall-clock bound (#2 re-review pin). At
+    # interpreter shutdown new threads can be refused; the inline fallback
+    # keeps the per-request deadline clamps as the only bound there.
+    try:
+        worker = threading.Thread(target=_run, daemon=True, name="solwyn-exit-flush")
+        worker.start()
+    except RuntimeError:
+        _run()
+    else:
+        worker.join(timeout=max(0.0, deadline - _monotonic()))
+    # Seal: claim a stuck worker's in-hand items, then sweep the queues.
+    in_hand = own.seal()
+    _count(drop_counter, "confirm", "shutdown_deadline", in_hand.get("confirm", 0))
+    _count(
+        drop_counter,
+        "settlement_confirm",
+        "shutdown_deadline",
+        in_hand.get("settlement_confirm", 0),
+    )
+    _count(
+        drop_counter,
+        "event",
+        "shutdown_deadline",
+        in_hand.get("settlement_event", 0) + in_hand.get("event", 0),
+    )
     # Whatever the deadline left behind is abandoned — count it.
     _drop_all(confirm_q, settlement_q, event_q, drop_counter, "shutdown_deadline")
+    # Best-effort transport teardown for a still-stuck worker (NOT the bound).
+    client.close()
 
 
 def _post_confirm_blocking(
@@ -419,6 +559,12 @@ def _post_json_response(
     except Exception as exc:
         if handle_read_only_key_error(exc):
             return "sent", None
+        if _monotonic() >= deadline:
+            # Deadline passed mid-request (e.g. the joiner's best-effort
+            # client teardown surfaced here). The loss reason is the deadline,
+            # not the transport artifact: "expired" makes the caller requeue
+            # so the final sweep counts it shutdown_deadline.
+            return "expired", None
         # The server dedups a later duplicate, and an exit hook must never
         # raise. Log the type name only.
         logger.warning("lifecycle.exit_post_failed: exc_type=%s", type(exc).__name__)
@@ -445,13 +591,13 @@ def _ingest_rejected_count(response: httpx.Response, batch_size: int) -> int:
 
 
 def _count(
-    drop_counter: Callable[[str, str, int], None] | None,
+    drop_counter: Callable[[str, str, int], None],
     kind: str,
     reason: str,
     n: int = 1,
 ) -> None:
-    """Invoke the drop counter when present (a GC'd reporter has none)."""
-    if drop_counter is not None and n > 0:
+    """Invoke the drop counter (a GC'd reporter gets ``_gc_drop_counter``)."""
+    if n > 0:
         drop_counter(kind, reason, n)
 
 
@@ -459,7 +605,7 @@ def _drop_all(
     confirm_q: collections.deque[_PendingConfirm],
     settlement_q: collections.deque[_PendingSettlement],
     event_q: collections.deque[_PendingEvent],
-    drop_counter: Callable[[str, str, int], None] | None,
+    drop_counter: Callable[[str, str, int], None],
     reason: str,
 ) -> None:
     """Clear every queue, counting the loss by kind.

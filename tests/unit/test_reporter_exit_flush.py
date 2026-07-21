@@ -198,6 +198,10 @@ def _make_recording_client(sink: list[str], handler: Callable[[str], object] | N
                 return handler(url)
             return _RecordingResponse()
 
+        def close(self) -> None:
+            # The exit drain's deadline watchdog holds client.close.
+            return None
+
     return _Client
 
 
@@ -240,6 +244,44 @@ def test_async_finalizer_flushes_queued_confirm_on_gc(monkeypatch: pytest.Monkey
     assert any("budgets/confirm" in u for u in sink), (
         f"GC finalizer did not flush the queued confirm; got {sink}"
     )
+
+
+@pytest.mark.unit
+def test_finalizer_is_gc_only_never_exit() -> None:
+    """Re-review #1 pin: weakref's own atexit hook is registered AFTER
+    _exit_flush_all (first-finalizer creation) and so runs FIRST at exit —
+    it would drain still-LIVE reporters with logger-only accounting while
+    their dropped_counts is fully observable. The finalizer must be GC-only;
+    _exit_flush_all is the sole live-reporter exit owner."""
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    assert reporter._finalizer is not None
+    assert reporter._finalizer.atexit is False
+    reporter._finalizer.detach()
+    reporter._close_completed = True  # nothing queued; disarm the exit hook
+
+
+@pytest.mark.unit
+def test_gc_finalizer_losses_are_logged(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Re-review #1 pin: a genuine pre-exit GC drain has no dropped_counts left
+    to increment — a failed delivery must still be accounted, loudly, in the
+    logs instead of vanishing."""
+    sink: list[str] = []
+
+    def _down(_url: str) -> object:
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink, _down))
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter.report_confirm(_make_confirm_request())
+
+    with caplog.at_level("WARNING", logger="solwyn._lifecycle"):
+        del reporter
+        gc.collect()
+
+    assert "lifecycle.gc_flush_dropped" in caplog.text
+    assert "kind=confirm" in caplog.text
 
 
 @pytest.mark.unit
@@ -316,19 +358,21 @@ async def test_cancelled_close_keeps_exit_rescue_armed(
             await close_task
 
     # No new work — but shutdown did NOT complete, so both rescue paths stay
-    # armed and the queued remainder is retained (the in-hand confirm vanished
-    # with the cancellation and was counted).
+    # armed and BOTH confirms are retained: the cancelled drain REQUEUES its
+    # in-hand item (re-review #4 pin — rescue can only retry what is in the
+    # queues) instead of writing off deliverable spend as dropped.
     assert reporter._closed is True
     assert reporter._close_completed is False
     assert reporter._finalizer is not None and reporter._finalizer.alive
-    assert len(reporter._confirm_queue) == 1
-    assert reporter.dropped_counts.get("confirm.shutdown_deadline") == 1
+    assert len(reporter._confirm_queue) == 2
+    assert reporter._confirm_queue[0].request.call_id == "in_hand"  # FIFO kept
+    assert "confirm.shutdown_deadline" not in reporter.dropped_counts
 
-    # The atexit-style blocking flush still delivers the remainder.
+    # The atexit-style blocking flush still delivers the WHOLE backlog.
     sink: list[str] = []
     monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
     blocking_exit_flush(reporter)
-    assert any("budgets/confirm" in u for u in sink)
+    assert len([u for u in sink if "budgets/confirm" in u]) == 2
     assert len(reporter._confirm_queue) == 0
     reporter._finalizer.detach()
     await reporter._http.aclose()
@@ -420,6 +464,36 @@ def test_exit_flush_counts_terminal_status_posts(monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.unit
+def test_exit_flush_counts_202_rejections(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-review coverage gap: the EXIT drain parses 202 bodies too — a
+    per-event rejection inside an accepted batch is a counted terminal loss on
+    both the settlement-event and standalone-batch ingest paths."""
+    sink: list[str] = []
+
+    class _PartialRejectResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"ingested": 0, "rejected": [{"index": 0, "reason": "invalid"}]}
+
+    monkeypatch.setattr(
+        httpx, "Client", _make_recording_client(sink, lambda _url: _PartialRejectResponse())
+    )
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter.report_settlement(_make_confirm_request(), _make_event(call_id="pair"))
+    reporter.report(_make_event(call_id="standalone"))
+
+    blocking_exit_flush(reporter)
+
+    # One rejection per ingest POST: the settlement's event and the batch.
+    assert reporter.dropped_counts.get("event.ingest_rejected") == 2
+    assert not reporter.dropped_counts.get("settlement_confirm.terminal_status")
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+
+
+@pytest.mark.unit
 def test_exit_flush_partial_deadline_counts_unsent_remainder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -497,3 +571,78 @@ def test_exit_flush_recovered_breaker_drains_backlog(monkeypatch: pytest.MonkeyP
     assert reporter.dropped_counts == {}
     if reporter._finalizer is not None:
         reporter._finalizer.detach()
+
+
+class _SlowDripServer:
+    """A REAL localhost server that answers a POST with an endless drip.
+
+    Sends valid response headers with a huge Content-Length, then one body
+    byte every 0.1s — under httpx's per-socket-op read timeout, so the read
+    never times out and only an external wall-clock bound can end the drain.
+    """
+
+    def __init__(self) -> None:
+        stop = self._stop = threading.Event()
+
+        class _Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
+                try:
+                    length = int(self.headers.get("Content-Length", 0))
+                    self.rfile.read(length)
+                    self.send_response(202)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", "1000000")
+                    self.end_headers()
+                    while not stop.is_set():
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        time.sleep(0.1)
+                except OSError:
+                    pass  # client torn down mid-drip
+
+            def log_message(self, *_args: object) -> None:
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._server.daemon_threads = True
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._server.shutdown()
+        self._server.server_close()
+
+
+@pytest.mark.unit
+def test_exit_flush_bounded_despite_slow_drip_post() -> None:
+    """Re-review #2 pin, REAL httpx client against a REAL slow-drip server:
+    httpx timeouts bound socket operations, not total response time, and
+    closing a sync client does not reliably interrupt a blocked read — so the
+    deadline must come from joining the drain worker, with the in-hand item
+    claimed by the seal."""
+    server = _SlowDripServer()
+    try:
+        reporter = AsyncMetadataReporter(
+            f"http://127.0.0.1:{server.port}", VALID_API_KEY, shutdown_deadline=0.3
+        )
+        reporter.report(_make_event())
+
+        start = time.monotonic()
+        blocking_exit_flush(reporter)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 0.55, f"exit drain outlived its deadline: {elapsed:.3f}s"
+        assert reporter.dropped_counts.get("event.shutdown_deadline") == 1
+        assert not reporter._queue
+        if reporter._finalizer is not None:
+            reporter._finalizer.detach()
+    finally:
+        server.close()
+        # Tear down cleanly: the drip's end errors the worker's read promptly.
+        for worker in threading.enumerate():
+            if worker.name == "solwyn-exit-flush":
+                worker.join(timeout=2.0)
