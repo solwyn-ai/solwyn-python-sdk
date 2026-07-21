@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict
 
+from solwyn._lifecycle import register_fork_reset
 from solwyn._routing import (
     CostPolicy,
     HealthBasedPolicy,
@@ -346,6 +347,22 @@ class _SolwynBase:
             success_threshold=1,
             name="control-plane",
         )
+
+        # Fork repair: a user thread can hold _breaker_lock (lazy provider-
+        # breaker creation) or _signal_lock (latency window append) at fork
+        # time; the child would inherit them held by a thread it doesn't have.
+        register_fork_reset(self)
+
+    def _reset_after_fork_in_child(self) -> None:
+        """Replace this client's locks in a forked child.
+
+        Only the locks: latency windows, price hints, breakers, and the
+        control-plane breaker are plain state the child legitimately inherits
+        (the breakers repair their own internal locks via their own
+        registration).
+        """
+        self._signal_lock = threading.Lock()
+        self._breaker_lock = threading.Lock()
 
     def _new_circuit_breaker(self) -> CircuitBreaker:
         """Create a circuit breaker from the configured tuning + jitter."""

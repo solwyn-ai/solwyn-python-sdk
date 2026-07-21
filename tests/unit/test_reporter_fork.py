@@ -18,10 +18,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, make_mock_client
 
 from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer
 from solwyn.circuit_breaker import CircuitBreaker
+from solwyn.client import Solwyn
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 
 _URL = "https://api.test.solwyn.ai"
@@ -273,6 +274,30 @@ async def test_async_reporter_reset_clears_loop_state_and_swaps_client() -> None
 
     await reporter._http.aclose()
     await old_http.aclose()
+
+
+@pytest.mark.unit
+def test_solwyn_base_reset_replaces_client_locks() -> None:
+    # _SolwynBase's two locks guard pure in-process state, but a user thread can
+    # hold _breaker_lock on the lazy provider-breaker creation path; inheriting it
+    # held would deadlock the child's next breaker lookup.
+    with patch("solwyn.reporter.MetadataReporter._flush_loop"):
+        solwyn = Solwyn(make_mock_client(), api_key=VALID_API_KEY, model="gpt-5.5")
+    solwyn._reporter._shutdown.set()
+    solwyn._reporter._thread.join(timeout=2.0)
+
+    old_signal_lock = solwyn._signal_lock
+    old_breaker_lock = solwyn._breaker_lock
+    breakers_before = dict(solwyn._circuit_breakers)
+
+    solwyn._reset_after_fork_in_child()
+
+    assert solwyn._signal_lock is not old_signal_lock
+    assert solwyn._breaker_lock is not old_breaker_lock
+    # Breaker objects (and their health) are legitimately inherited.
+    assert solwyn._circuit_breakers == breakers_before
+
+    solwyn.close()
 
 
 @pytest.mark.unit
