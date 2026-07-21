@@ -24,12 +24,14 @@ import logging
 import re
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TypeVar
 
 import httpx
 
+from solwyn._lifecycle import register_async_reporter, register_sync_reporter
 from solwyn._read_only_key import handle_read_only_key_error
 from solwyn._types import BreakerStateReport, BudgetConfirmRequest, MetadataEvent, ProviderName
 from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
@@ -559,6 +561,11 @@ class MetadataReporter(_ReporterBase):
             name="solwyn-reporter",
         )
         self._thread.start()
+        # Exit flush: if the process exits without close(), the atexit hook runs
+        # close() so queued spend is still delivered. The live flush thread keeps
+        # this reporter alive (its bound-method target), so no finalizer is
+        # needed on the sync path — close() is the whole story.
+        register_sync_reporter(self)
 
     def report(self, event: MetadataEvent) -> None:
         """Enqueue a metadata event for async reporting.  Non-blocking."""
@@ -969,6 +976,11 @@ class AsyncMetadataReporter(_ReporterBase):
         self._warned_no_loop = False
         self._confirm_queue: collections.deque[_PendingConfirm] = collections.deque()
         self._settlement_queue: collections.deque[_PendingSettlement] = collections.deque()
+        # Set by register_async_reporter: a GC finalizer covering the case where
+        # this reporter is dropped before its flush loop ever ran. close()
+        # detaches it so nothing double-flushes.
+        self._finalizer: weakref.finalize[..., AsyncMetadataReporter] | None = None
+        register_async_reporter(self)
 
     def start(self) -> None:
         """Start the background flush loop.  Must be called within an event loop.
@@ -1055,6 +1067,10 @@ class AsyncMetadataReporter(_ReporterBase):
         flush-task await, the final flush, and the breaker report cycle.
         """
         self._closed = True
+        # A clean close supersedes the exit-flush safety net: drop the GC
+        # finalizer so it can never double-flush drained queues.
+        if self._finalizer is not None:
+            self._finalizer.detach()
         budget = self.shutdown_deadline if timeout is None else timeout
         deadline = _monotonic() + budget
         active_breaker_task = self._breaker_task
