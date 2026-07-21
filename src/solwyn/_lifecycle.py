@@ -229,7 +229,10 @@ class _ExitOwnership:
     Mirrors the reporter's ``_seal_delivery`` machinery for the blocking exit
     drain: the worker registers every popped item in-hand ATOMICALLY with the
     pop, so the deadline seal can never observe an item in neither a queue nor
-    a hand. After the seal, ``resolve`` returns owned=0 and ``requeue`` is
+    a hand — and a drop disposition is PUBLISHED under the same lock
+    (``resolve_counted``), so the seal can never land in a release→publish gap
+    and return while an item is accounted nowhere. After the seal,
+    ``resolve``/``resolve_counted`` return owned=0 and ``requeue`` is
     refused — the seal already counted those items ``shutdown_deadline`` — so
     a worker unblocking late no-ops instead of double-counting. A settlement
     pair is held as its two halves (``settlement_confirm`` +
@@ -272,13 +275,49 @@ class _ExitOwnership:
             return batch
 
     def resolve(self, kind: str, n: int = 1) -> int:
-        """Release up to ``n`` in-hand items; returns how many the caller
-        still owns (0 after the seal claimed them — those must not be
-        counted again)."""
+        """Release up to ``n`` in-hand items WITHOUT a drop publication.
+
+        For SENT dispositions only — a lossy disposition must ride
+        ``resolve_counted`` so its publication is atomic with the release.
+        Returns how many the caller still owned (0 after the seal claimed
+        them)."""
         with self._lock:
             held = self._counts.get(kind, 0)
             owned = min(n, held)
             self._counts[kind] = held - owned
+            return owned
+
+    def resolve_counted(
+        self,
+        kind: str,
+        drop_counter: Callable[[str, str, int], None],
+        publish_kind: str,
+        reason: str,
+        n: int = 1,
+        cap: int | None = None,
+    ) -> int:
+        """Atomically release up to ``n`` in-hand items AND publish their drop.
+
+        The publication runs while the ownership lock is held: if the seal
+        could land between the release and the ``drop_counter`` call, the
+        drain would return with the item accounted NOWHERE — and at
+        interpreter exit the daemon worker may never run again to record it
+        (P1 re-review pin). Either this call publishes the disposition (and a
+        later seal finds nothing in hand), or the seal already claimed the
+        items as ``shutdown_deadline`` (owned=0, nothing published here).
+        ``cap`` bounds the published count below ``owned`` (per-event 202
+        rejections inside an otherwise-sent batch). Only the in-process drop
+        counter runs under the lock — a guarded dict increment plus a
+        rate-limited log line, never network I/O — so the seal's wait on it
+        is bounded. Returns owned.
+        """
+        with self._lock:
+            held = self._counts.get(kind, 0)
+            owned = min(n, held)
+            self._counts[kind] = held - owned
+            publish_n = owned if cap is None else min(owned, cap)
+            if publish_n > 0:
+                drop_counter(publish_kind, reason, publish_n)
             return owned
 
     def requeue(self, queue: collections.deque[_T], items: list[_T], kinds: dict[str, int]) -> bool:
@@ -319,9 +358,11 @@ def _drain_queues_blocking(
     response time, and closing a sync client does not reliably interrupt a
     blocked read — so no close()-based abort is trusted; the join is the
     bound. ``_ExitOwnership`` keeps the timeout honest: every pop registers
-    the item in-hand atomically, a timed-out join SEALS delivery (counting
-    in-hand items ``shutdown_deadline`` and sweeping the queues), and a worker
-    unblocking after the seal resolves to owned=0 instead of double-counting.
+    the item in-hand atomically, every lossy disposition publishes atomically
+    with its ownership release (``resolve_counted``), a timed-out join SEALS
+    delivery (counting in-hand items ``shutdown_deadline`` and sweeping the
+    queues), and a worker unblocking after the seal resolves to owned=0
+    instead of double-counting.
 
     Every item popped here stays accountable until it has a disposition: each
     POST reports sent / failed / deadline-expired, failures are counted by
@@ -367,16 +408,18 @@ def _drain_queues_blocking(
                     # final sweep (or already claimed by the seal).
                     own.requeue(confirm_q, [pending], {"confirm": 1})
                     break
-                owned = own.resolve("confirm")
                 if outcome == "held":
                     # Control plane known-down: each queued confirm is
                     # refused per item (admit() short-circuits, no HTTP) so
                     # every pop stays ownership-tracked.
-                    _count(drop_counter, "confirm", "exit_breaker_open", owned)
-                    held_drops += owned
+                    held_drops += own.resolve_counted(
+                        "confirm", drop_counter, "confirm", "exit_breaker_open"
+                    )
                     continue
                 if outcome != "sent":
-                    _count(drop_counter, "confirm", outcome, owned)
+                    own.resolve_counted("confirm", drop_counter, "confirm", outcome)
+                else:
+                    own.resolve("confirm")
             while True:
                 settlement = own.pop_in_hand(settlement_q, "settlement_confirm", "settlement_event")
                 if settlement is None:
@@ -397,12 +440,19 @@ def _drain_queues_blocking(
                         {"settlement_confirm": 1, "settlement_event": 1},
                     )
                     break
-                owned = own.resolve("settlement_confirm")
                 if outcome == "held":
-                    _count(drop_counter, "settlement_confirm", "exit_breaker_open", owned)
-                    held_drops += owned
+                    held_drops += own.resolve_counted(
+                        "settlement_confirm",
+                        drop_counter,
+                        "settlement_confirm",
+                        "exit_breaker_open",
+                    )
                 elif outcome != "sent":
-                    _count(drop_counter, "settlement_confirm", outcome, owned)
+                    own.resolve_counted(
+                        "settlement_confirm", drop_counter, "settlement_confirm", outcome
+                    )
+                else:
+                    own.resolve("settlement_confirm")
                 # Ingest is NOT breaker-gated: the event still gets its exit
                 # attempt even when its confirm was held or failed.
                 ev_outcome, ev_response = _post_json_response(
@@ -412,20 +462,24 @@ def _drain_queues_blocking(
                     headers,
                     deadline,
                 )
-                owned_ev = own.resolve("settlement_event")
                 if ev_outcome == "expired":
-                    _count(drop_counter, "event", "shutdown_deadline", owned_ev)
+                    own.resolve_counted(
+                        "settlement_event", drop_counter, "event", "shutdown_deadline"
+                    )
                     break
                 if ev_outcome != "sent":
-                    _count(drop_counter, "event", ev_outcome, owned_ev)
+                    own.resolve_counted("settlement_event", drop_counter, "event", ev_outcome)
                 elif ev_response is not None:
                     # A 202 can still reject the event terminally (#9 pin).
-                    _count(
+                    own.resolve_counted(
+                        "settlement_event",
                         drop_counter,
                         "event",
                         "ingest_rejected",
-                        min(_ingest_rejected_count(ev_response, 1), owned_ev),
+                        cap=_ingest_rejected_count(ev_response, 1),
                     )
+                else:
+                    own.resolve("settlement_event")
             while True:
                 batch = own.pop_batch_in_hand(event_q, "event", _EXIT_BATCH_SIZE)
                 if not batch:
@@ -440,17 +494,20 @@ def _drain_queues_blocking(
                 if outcome == "expired":
                     own.requeue(event_q, batch, {"event": len(batch)})
                     break
-                owned = own.resolve("event", len(batch))
                 if outcome != "sent":
-                    _count(drop_counter, "event", outcome, owned)
+                    own.resolve_counted("event", drop_counter, "event", outcome, n=len(batch))
                 elif response is not None:
                     # A 202 can still reject individual events terminally (#9).
-                    _count(
+                    own.resolve_counted(
+                        "event",
                         drop_counter,
                         "event",
                         "ingest_rejected",
-                        min(_ingest_rejected_count(response, len(batch)), owned),
+                        n=len(batch),
+                        cap=_ingest_rejected_count(response, len(batch)),
                     )
+                else:
+                    own.resolve("event", len(batch))
         except Exception as exc:
             logger.warning("lifecycle.exit_flush_failed: exc_type=%s", type(exc).__name__)
         if held_drops:

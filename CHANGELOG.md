@@ -99,7 +99,10 @@ derived from git tags (hatch-vcs).
   seal: a timed-out join claims the worker's in-hand items and sweeps the
   queues (counted `shutdown_deadline`), so a slow-drip response (invisible to
   httpx's per-socket-op timeouts) cannot hold process exit and a worker
-  unblocking late never double-counts. Exit delivery is
+  unblocking late never double-counts. Lossy dispositions publish atomically
+  with their ownership release (under the same lock), so the seal can never
+  land between the two and let the drain return with an item accounted
+  nowhere while process exit kills the worker. Exit delivery is
   accountable per item: every popped
   confirm and event reports a sent/failed/expired disposition and every failure
   is counted. Exit confirms ride the control-plane breaker's admission — a

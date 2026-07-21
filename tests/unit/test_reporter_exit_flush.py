@@ -24,7 +24,7 @@ import httpx
 import pytest
 from conftest import VALID_API_KEY
 
-from solwyn._lifecycle import blocking_exit_flush
+from solwyn._lifecycle import _drain_queues_blocking, blocking_exit_flush
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
 from solwyn.circuit_breaker import CircuitBreaker
@@ -571,6 +571,58 @@ def test_exit_flush_recovered_breaker_drains_backlog(monkeypatch: pytest.MonkeyP
     assert reporter.dropped_counts == {}
     if reporter._finalizer is not None:
         reporter._finalizer.detach()
+
+
+@pytest.mark.unit
+def test_exit_drain_publishes_disposition_before_returning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-review P1 pin: releasing ownership and publishing the drop must be
+    ATOMIC under the ownership lock. If the seal can land in the gap between
+    them, the drain returns with the item accounted NOWHERE — and at
+    interpreter exit the daemon worker may never run again to record it. A
+    gated counter holds the worker's publication open across the join
+    deadline; the drain must wait for it, never return empty-handed."""
+    sink: list[str] = []
+    monkeypatch.setattr(
+        httpx, "Client", _make_recording_client(sink, lambda _url: _terminal_response(400))
+    )
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter.report(_make_event())
+
+    gate = threading.Event()
+    published: list[tuple[str, str, int]] = []
+
+    def gated_counter(kind: str, reason: str, n: int = 1) -> None:
+        if reason != "shutdown_deadline":
+            gate.wait(timeout=5.0)  # hold the publication open past the join deadline
+        published.append((kind, reason, n))
+
+    releaser = threading.Timer(0.6, gate.set)
+    releaser.daemon = True
+    releaser.start()
+    try:
+        _drain_queues_blocking(
+            reporter._confirm_queue,
+            reporter._settlement_queue,
+            reporter._queue,
+            reporter.api_url,
+            reporter.api_key,
+            reporter._control_plane_breaker,
+            0.15,  # join deadline expires while the publication is gated
+            gated_counter,
+        )
+    finally:
+        releaser.cancel()
+        gate.set()
+
+    assert published == [("event", "terminal_status", 1)], (
+        f"drain returned before the disposition was published: {published}"
+    )
+    assert not reporter._queue
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+    reporter._close_completed = True  # queues empty; disarm the exit hook
 
 
 class _SlowDripServer:
