@@ -620,6 +620,12 @@ class _BudgetEnforcerBase:
                 "renew" if renewal else "grant",
                 type(exc).__name__,
             )
+            if renewal:
+                # The lease stays valid until its own deadline — but the
+                # in-flight flag must clear, under a backoff, or the run never
+                # renews again AND every later admission would retry at once.
+                with self._state_lock:
+                    self._lease.renewal_failed(agent_run_id, time.monotonic())
             return "unreachable"
 
         now = time.monotonic()

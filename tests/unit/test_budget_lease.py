@@ -10,6 +10,7 @@ what actually reached the wire.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 
@@ -19,6 +20,7 @@ import respx
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 from httpx import Response
 
+from solwyn import _lifecycle
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetMode
 from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer
@@ -439,6 +441,264 @@ class TestLeaseOutage:
         state = enforcer._lease.state_for(RUN)
         assert state is not None
         assert state.share_remaining_tokens == 50_000 - 600
+        enforcer._http.close()
+
+
+# ---------------------------------------------------------------------------
+# Renewals (always off the caller's thread)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestLeaseRenewal:
+    """Renew ahead of need; a renewal never sits on a customer call."""
+
+    def test_depletion_renews_once_and_admissions_keep_flowing(self) -> None:
+        enforcer = _make_enforcer()
+        with respx.mock:
+            grant = respx.post(GRANT_URL).mock(
+                return_value=Response(200, json=_grant_payload(granted_tokens=2_400))
+            )
+            renew = respx.post(RENEW_URL).mock(
+                return_value=Response(200, json=_grant_payload(generation=2, granted_tokens=2_400))
+            )
+            check = respx.post(CHECK_URL).mock(
+                return_value=Response(200, json=ALLOW_BUDGET_RESPONSE)
+            )
+
+            # 600 per call against a 2_400 grant: the 3rd call is 75% depleted.
+            for index in range(3):
+                assert _check(enforcer, f"call_{index}").lease_id == "lease_1"
+            assert _wait_for(lambda: renew.call_count == 1)
+            # The renewal restored the grant, so the 4th call still admits.
+            assert _check(enforcer, "call_3").lease_id == "lease_1"
+
+        assert grant.call_count == 1
+        assert renew.call_count == 1
+        assert check.call_count == 0
+        import json as _json
+
+        payload = _json.loads(renew.calls[0].request.read())
+        assert payload["lease_id"] == "lease_1"
+        assert payload["holder_id"] == "sdk_instance_1"
+        assert payload["generation"] == 1
+        state = enforcer._lease.state_for(RUN)
+        assert state is not None
+        assert state.generation == 2
+        enforcer._http.close()
+
+    def test_a_slow_renewal_never_delays_admission(self) -> None:
+        enforcer = _make_enforcer()
+        release = threading.Event()
+        in_flight = threading.Event()
+
+        def _slow_renewal(request: httpx.Request) -> Response:
+            in_flight.set()
+            release.wait(timeout=5.0)
+            return Response(200, json=_grant_payload(generation=2))
+
+        with respx.mock:
+            respx.post(GRANT_URL).mock(
+                return_value=Response(200, json=_grant_payload(granted_tokens=6_000))
+            )
+            renew = respx.post(RENEW_URL).mock(side_effect=_slow_renewal)
+            respx.post(CHECK_URL).mock(return_value=Response(200, json=ALLOW_BUDGET_RESPONSE))
+
+            # 600 per call against 6_000: the 8th call crosses 75% depletion.
+            for index in range(8):
+                _check(enforcer, f"warm_{index}")
+            assert in_flight.wait(timeout=3.0)
+
+            # The renewal is parked mid-flight; admissions must not wait on it.
+            started = time.monotonic()
+            for index in range(2):
+                assert _check(enforcer, f"fast_{index}").lease_id == "lease_1"
+            elapsed = time.monotonic() - started
+            release.set()
+            assert _wait_for(lambda: renew.call_count == 1)
+
+        assert elapsed < 0.5
+        # ...and no second renewal was stacked while the first was in flight.
+        assert renew.call_count == 1
+        enforcer._http.close()
+
+    @pytest.mark.parametrize("status", [404, 409])
+    def test_a_lost_lease_is_dropped_and_regranted(self, status: int) -> None:
+        enforcer = _make_enforcer()
+        with respx.mock:
+            grant = respx.post(GRANT_URL).mock(
+                return_value=Response(200, json=_grant_payload(granted_tokens=2_400))
+            )
+            renew = respx.post(RENEW_URL).mock(return_value=Response(status, json={}))
+            check = respx.post(CHECK_URL).mock(
+                return_value=Response(200, json=ALLOW_BUDGET_RESPONSE)
+            )
+
+            for index in range(3):
+                _check(enforcer, f"call_{index}")
+            assert _wait_for(lambda: renew.call_count == 1)
+            assert _wait_for(lambda: enforcer._lease.lease_id_for(RUN) is None)
+
+            # The next call has no lease at all: it re-grants rather than
+            # drawing on authority the server no longer recognizes.
+            assert _check(enforcer, "call_after").lease_id == "lease_1"
+
+        assert grant.call_count == 2
+        assert check.call_count == 0
+        enforcer._http.close()
+
+    def test_a_failed_renewal_backs_off_instead_of_retrying_per_call(self) -> None:
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(
+                return_value=Response(200, json=_grant_payload(granted_tokens=2_400))
+            )
+            renew = respx.post(RENEW_URL).mock(side_effect=httpx.ConnectError("down"))
+            respx.post(CHECK_URL).mock(return_value=Response(200, json=ALLOW_BUDGET_RESPONSE))
+
+            for index in range(3):
+                _check(enforcer, f"call_{index}")
+            assert _wait_for(lambda: renew.call_count == 1)
+            # Every later admission is still >=75% depleted; the backoff must
+            # stop them turning into a renewal per call.
+            for index in range(3, 6):
+                _check(enforcer, f"call_{index}")
+
+        assert renew.call_count == 1
+        state = enforcer._lease.state_for(RUN)
+        assert state is not None
+        assert state.lease_id == "lease_1"
+        assert state.consecutive_failures == 1
+        assert state.next_attempt_at > 0.0
+        enforcer._http.close()
+
+    def test_a_denied_renewal_becomes_sticky(self) -> None:
+        enforcer = _make_enforcer(budget_mode=BudgetMode.HARD_DENY)
+        with respx.mock:
+            respx.post(GRANT_URL).mock(
+                return_value=Response(200, json=_grant_payload(granted_tokens=2_400))
+            )
+            renew = respx.post(RENEW_URL).mock(return_value=Response(200, json=_deny_payload()))
+            check = respx.post(CHECK_URL).mock(
+                side_effect=httpx.ConnectError("control plane unreachable")
+            )
+
+            for index in range(3):
+                _check(enforcer, f"call_{index}")
+            assert _wait_for(lambda: renew.call_count == 1)
+            assert _wait_for(lambda: RUN in enforcer._run_hard_deny_responses)
+
+            after = _check(enforcer, "call_after")
+
+        assert after.allowed is False
+        assert after.warning is not None
+        assert "preserving prior hard deny" in after.warning.lower()
+        assert check.call_count == 1
+        enforcer._http.close()
+
+    async def test_async_renewal_runs_as_a_task(self) -> None:
+        enforcer = _make_async_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(
+                return_value=Response(200, json=_grant_payload(granted_tokens=2_400))
+            )
+            renew = respx.post(RENEW_URL).mock(
+                return_value=Response(200, json=_grant_payload(generation=2, granted_tokens=2_400))
+            )
+            check = respx.post(CHECK_URL).mock(
+                return_value=Response(200, json=ALLOW_BUDGET_RESPONSE)
+            )
+
+            for index in range(3):
+                await _acheck(enforcer, f"call_{index}")
+            # The task is scheduled, not awaited: let the loop run it.
+            for _ in range(50):
+                if renew.call_count == 1:
+                    break
+                await asyncio.sleep(0.005)
+
+        assert renew.call_count == 1
+        assert check.call_count == 0
+        state = enforcer._lease.state_for(RUN)
+        assert state is not None
+        assert state.generation == 2
+        await enforcer._http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Surrender
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestLeaseSurrender:
+    """close() hands the float back instead of letting it expire."""
+
+    def test_close_surrenders_every_held_lease(self) -> None:
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(return_value=Response(200, json={}))
+
+            _check(enforcer, "call_1")
+            enforcer.close()
+
+            assert surrender.call_count == 1
+            import json as _json
+
+            payload = _json.loads(surrender.calls[0].request.read())
+            assert payload["lease_id"] == "lease_1"
+            assert payload["holder_id"] == "sdk_instance_1"
+            assert payload["generation"] == 1
+            # Surrendered leases are forgotten, so the exit hook cannot send a
+            # second release for the same lease.
+            assert enforcer._lease.active_run_ids() == []
+
+    def test_close_without_a_lease_sends_nothing(self) -> None:
+        enforcer = _make_enforcer()
+        with respx.mock:
+            surrender = respx.post(SURRENDER_URL).mock(return_value=Response(200, json={}))
+            enforcer.close()
+            assert surrender.call_count == 0
+
+    def test_a_failed_surrender_never_raises_out_of_close(self) -> None:
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            respx.post(SURRENDER_URL).mock(side_effect=httpx.ConnectError("down"))
+
+            _check(enforcer, "call_1")
+            enforcer.close()
+
+    async def test_async_close_surrenders_every_held_lease(self) -> None:
+        enforcer = _make_async_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(return_value=Response(200, json={}))
+
+            await _acheck(enforcer, "call_1")
+            await enforcer.close()
+
+            assert surrender.call_count == 1
+
+    def test_exit_hook_surrenders_a_lease_the_process_still_holds(self) -> None:
+        enforcer = _make_enforcer(holder_id="exit_holder")
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(return_value=Response(200, json={}))
+
+            _check(enforcer, "call_1")
+            _lifecycle._exit_surrender_all()
+
+            import json as _json
+
+            # The hook drains every live holder in the process, so assert on
+            # THIS enforcer's release rather than the global call count.
+            payloads = [_json.loads(call.request.read()) for call in surrender.calls]
+            assert {"lease_id": "lease_1", "holder_id": "exit_holder"} in [
+                {"lease_id": p["lease_id"], "holder_id": p["holder_id"]} for p in payloads
+            ]
+            assert enforcer._lease.active_run_ids() == []
         enforcer._http.close()
 
 
