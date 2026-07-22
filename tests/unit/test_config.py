@@ -220,6 +220,74 @@ class TestControlPlaneConfig:
 
 
 @pytest.mark.unit
+class TestLeaseConfig:
+    """Budget-lease knobs: kill switch + default output bound."""
+
+    def test_lease_defaults(self) -> None:
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+        )
+        assert config.lease_enabled is True
+        assert config.lease_output_bound_default == 4096
+
+    def test_lease_knobs_are_overridable(self) -> None:
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+            lease_enabled=False,
+            lease_output_bound_default=1024,
+        )
+        assert config.lease_enabled is False
+        assert config.lease_output_bound_default == 1024
+
+    def test_lease_output_bound_must_be_positive(self) -> None:
+        with pytest.raises(ValidationError):
+            SolwynConfig(
+                api_key=VALID_API_KEY,
+                providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+                lease_output_bound_default=0,
+            )
+
+    @pytest.mark.parametrize(
+        ("env_val", "expected"),
+        [
+            ("true", True),
+            ("1", True),
+            ("yes", True),
+            ("false", False),
+            ("0", False),
+            ("no", False),
+        ],
+    )
+    def test_lease_enabled_boolean_coercion(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env_val: str,
+        expected: bool,
+    ) -> None:
+        """SOLWYN_LEASE_ENABLED coerces string values to booleans like fail_open."""
+        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.setenv("SOLWYN_LEASE_ENABLED", env_val)
+
+        solwyn = _make_solwyn(_mock_openai_client())
+
+        assert solwyn._config.lease_enabled is expected
+
+        solwyn.close()
+
+    def test_lease_output_bound_loads_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.setenv("SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT", "8192")
+
+        solwyn = _make_solwyn(_mock_openai_client())
+
+        assert solwyn._config.lease_output_bound_default == 8192
+
+        solwyn.close()
+
+
+@pytest.mark.unit
 class TestReporterRetryConfig:
     """Reporter at-least-once delivery knobs: retry/backoff/shutdown-deadline."""
 

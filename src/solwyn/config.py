@@ -67,6 +67,14 @@ class SolwynConfig(BaseModel):
     # below caps repeated discovery of a control-plane outage.
     budget_check_timeout: float = 1.0
 
+    # Budget leases (PJ-2): run-scoped, token-billed calls draw down a
+    # server-granted token lease in memory instead of paying a blocking
+    # /budgets/check per call. Kill switch — False routes every call back to
+    # the per-call check path. lease_output_bound_default bounds a call's
+    # reservation when it carries no max_tokens-family cap.
+    lease_enabled: bool = True
+    lease_output_bound_default: int = Field(default=4096, gt=0)
+
     # Control-plane breaker: after this many consecutive check/confirm
     # failures against Solwyn's own API, skip the network call and apply the
     # configured posture (fail_open / local enforcement) instantly for
@@ -110,6 +118,8 @@ class SolwynConfig(BaseModel):
             "circuit_breaker_success_threshold": "CIRCUIT_BREAKER_SUCCESS_THRESHOLD",
             "budget_check_cache_ttl": "BUDGET_CHECK_CACHE_TTL",
             "budget_check_timeout": "BUDGET_CHECK_TIMEOUT",
+            "lease_enabled": "LEASE_ENABLED",
+            "lease_output_bound_default": "LEASE_OUTPUT_BOUND_DEFAULT",
             "control_plane_failure_threshold": "CONTROL_PLANE_FAILURE_THRESHOLD",
             "control_plane_recovery_timeout": "CONTROL_PLANE_RECOVERY_TIMEOUT",
             "reporter_batch_size": "REPORTER_BATCH_SIZE",
@@ -128,7 +138,7 @@ class SolwynConfig(BaseModel):
                 env_val = os.environ.get(f"{_ENV_PREFIX}{env_suffix}")
                 if env_val is not None:
                     # Coerce boolean-looking strings
-                    if field in {"fail_open", "breaker_reporting_enabled"}:
+                    if field in {"fail_open", "breaker_reporting_enabled", "lease_enabled"}:
                         values[field] = env_val.lower() in ("true", "1", "yes")
                     else:
                         values[field] = env_val
