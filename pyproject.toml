@@ -94,3 +94,8 @@ strict = true
 [[tool.mypy.overrides]]
 module = "tiktoken"
 ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "respx>=0.21",
+]
