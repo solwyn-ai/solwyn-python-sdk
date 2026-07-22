@@ -448,26 +448,6 @@ class TestLeasePartitioning:
         )
 
     @pytest.mark.integration
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "OPEN PJ-2 FINDING (S4/S5 report, contract mismatch #3) — SDK SIDE, and "
-            "NOT the core leak that core 8bbeb805 fixed (that one took $15.00 out of "
-            "this $10.00 cap; the same drive now takes $10.20). What is left is the "
-            "in-flight renewal window: LeaseLedger.apply_grant_response RESETS "
-            "granted_remaining_tokens to the new grant, but a renewal is dispatched "
-            "off the hot path (DoD 2) and admissions keep drawing while it flies. "
-            "Those draws are settled AND re-granted. Measured: grants 333333 -> 83333 "
-            "-> 3333 against a 333333-token pool, 34 calls admitted, 340000 tokens "
-            "drawn, project usage $10.20 on a $10.00 hard cap. The overshoot is one "
-            "call's reserve per renewal here, and scales with renewal latency x call "
-            "rate. Likely repair is SDK-side (net the post-dispatch drawdown out of "
-            "the applied grant, which the ledger already tracks as "
-            "spent_tokens_since_report); the server cannot see those calls when it "
-            "sizes the successor. Delete this xfail (do NOT add slack to the "
-            "assertion) when the ledger nets the in-flight window."
-        ),
-    )
     def test_lifetime_drawdown_stays_within_the_granted_bound(
         self, api_url: str, make_lease_enforcer: EnforcerFactory
     ) -> None:
