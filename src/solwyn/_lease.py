@@ -24,7 +24,14 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Literal
 
-from solwyn._types import BudgetMode, LeaseGrantResponse, Modality
+from solwyn._types import (
+    BudgetMode,
+    LeaseGrantResponse,
+    LeaseRenewRequest,
+    LeaseSurrenderRequest,
+    Modality,
+    ProviderName,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +285,11 @@ class LeaseLedger:
         if state is not None and state.has_lease and not state.covers(model, fallback_models):
             return LeaseAdmission(LeaseDecision.LEGACY_CHECK, reason="model_outside_declared_set")
 
+        if state is not None:
+            # Abandoned reservations are swept on the admission path — the SDK
+            # runs no timer thread.
+            self._sweep_state(state, now)
+
         reserve = max(0, estimated_input_tokens) + self._output_bound(output_bound)
 
         if state is None or not state.has_lease:
@@ -504,6 +516,7 @@ class LeaseLedger:
         state.run_ineligible = False
         state.ineligible_retry_at = 0.0
         self._store_snapshot(state, response)
+        self._settle_pending_report(state)
 
         if state.final_grant:
             logger.warning(
@@ -548,6 +561,57 @@ class LeaseLedger:
         self._states.clear()
         self._call_index.clear()
 
+    # ── reservation lifecycle ────────────────────────────────────────────
+
+    def true_up(self, call_id: str, actual_tokens: int) -> None:
+        """Settle a reservation against the call's ACTUAL token usage.
+
+        Overshoot is applied in full and may drive the remainder negative:
+        the next admission then sees an exhausted lease and follows the
+        normal path (renew, or the outage ladder).
+        """
+        state, reservation = self._take_reservation(call_id)
+        if state is None or reservation is None:
+            return
+        if reservation.lease_id != state.lease_id:
+            # The lease that funded this call is gone; its counters are dead.
+            return
+        actual = max(0, actual_tokens)
+        delta = actual - reservation.tokens
+        if reservation.pool == _POOL_GRANTED:
+            state.granted_remaining_tokens -= delta
+        else:
+            state.share_remaining_tokens -= delta
+        state.spent_tokens_since_report += actual
+
+    def release(self, call_id: str) -> None:
+        """Give a reservation back untouched (error paths — no spend happened)."""
+        state, reservation = self._take_reservation(call_id)
+        if state is None or reservation is None:
+            return
+        if reservation.lease_id != state.lease_id:
+            return
+        if reservation.pool == _POOL_GRANTED:
+            state.granted_remaining_tokens += reservation.tokens
+        else:
+            state.share_remaining_tokens += reservation.tokens
+
+    def sweep(self, now: float) -> int:
+        """Release reservations older than 900s; returns how many were swept."""
+        return sum(self._sweep_state(state, now) for state in list(self._states.values()))
+
+    def _sweep_state(self, state: LeaseState, now: float) -> int:
+        stale = [
+            call_id
+            for call_id, reservation in state.reservations.items()
+            if now - reservation.created_at >= RESERVATION_MAX_AGE_S
+        ]
+        for call_id in stale:
+            self.release(call_id)
+        if stale:
+            logger.warning("lease.reservations_swept: count=%d", len(stale))
+        return len(stale)
+
     # ── renewal bookkeeping ──────────────────────────────────────────────
 
     def renewal_due(self, state: LeaseState, now: float) -> bool:
@@ -567,6 +631,72 @@ class LeaseLedger:
         depleted = state.granted_tokens - state.granted_remaining_tokens
         return depleted * RENEWAL_DEPLETION_DEN >= state.granted_tokens * RENEWAL_DEPLETION_NUM
 
+    def build_renewal_request(
+        self,
+        run_id: str,
+        *,
+        model: str | None = None,
+        provider: ProviderName | None = None,
+        fallback_providers: Sequence[ProviderName] = (),
+        fallback_models: Sequence[str] = (),
+    ) -> LeaseRenewRequest | None:
+        """Payload for ``POST /budgets/lease/renew``; None when there is no lease.
+
+        The reported tallies are held pending — they clear only when the
+        renewal response is applied, so a lost response never loses spend.
+        """
+        state = self._states.get(run_id)
+        if state is None or state.lease_id is None:
+            return None
+        state.pending_report = _PendingReport(
+            spent_tokens=state.spent_tokens_since_report,
+            uncounted_calls=state.uncounted_calls,
+            uncounted_tokens=state.uncounted_tokens,
+        )
+        return LeaseRenewRequest(
+            lease_id=state.lease_id,
+            holder_id=self.holder_id,
+            generation=state.generation,
+            spent_tokens=state.spent_tokens_since_report,
+            reserved_tokens=state.reserved_tokens,
+            uncounted_calls=state.uncounted_calls,
+            uncounted_tokens=state.uncounted_tokens,
+            model=model,
+            provider=provider,
+            fallback_providers=list(fallback_providers),
+            fallback_models=list(fallback_models),
+        )
+
+    def build_surrender_request(self, run_id: str) -> LeaseSurrenderRequest | None:
+        """Payload for ``POST /budgets/lease/surrender``; None without a lease."""
+        state = self._states.get(run_id)
+        if state is None or state.lease_id is None:
+            return None
+        return LeaseSurrenderRequest(
+            lease_id=state.lease_id,
+            holder_id=self.holder_id,
+            generation=state.generation,
+            spent_tokens=state.spent_tokens_since_report,
+        )
+
+    def renewal_sent(self, run_id: str) -> None:
+        """Mark a renewal in flight (suppresses further renewal-due signals)."""
+        state = self._states.get(run_id)
+        if state is not None:
+            state.renewal_in_flight = True
+
+    def renewal_failed(self, run_id: str, now: float) -> None:
+        """Record a failed renewal: exponential backoff, base 1s, cap 30s, full jitter."""
+        state = self._states.get(run_id)
+        if state is None:
+            return
+        state.renewal_in_flight = False
+        state.pending_report = None
+        state.consecutive_failures += 1
+        state.next_attempt_at = now + self._rng.uniform(
+            0.0, backoff_ceiling(state.consecutive_failures)
+        )
+
     # ── internals ────────────────────────────────────────────────────────
 
     def _output_bound(self, output_bound: int | None) -> int:
@@ -581,6 +711,15 @@ class LeaseLedger:
             lease_id=state.lease_id, tokens=tokens, created_at=now, pool=pool
         )
         self._call_index[call_id] = state.run_id
+
+    def _take_reservation(self, call_id: str) -> tuple[LeaseState | None, _Reservation | None]:
+        run_id = self._call_index.pop(call_id, None)
+        if run_id is None:
+            return None, None
+        state = self._states.get(run_id)
+        if state is None:
+            return None, None
+        return state, state.reservations.pop(call_id, None)
 
     def _drop_lease(self, state: LeaseState) -> None:
         """Clear lease authority, keeping what is still owed to the server.
@@ -607,3 +746,22 @@ class LeaseLedger:
             current_usage=response.current_usage,
             remaining_budget=response.remaining_budget,
         )
+
+    def _settle_pending_report(self, state: LeaseState) -> None:
+        """An acknowledged renewal clears exactly what it reported, no more."""
+        pending = state.pending_report
+        if pending is None:
+            return
+        state.spent_tokens_since_report = max(
+            0, state.spent_tokens_since_report - pending.spent_tokens
+        )
+        state.uncounted_calls = max(0, state.uncounted_calls - pending.uncounted_calls)
+        state.uncounted_tokens = max(0, state.uncounted_tokens - pending.uncounted_tokens)
+        state.pending_report = None
+
+
+def backoff_ceiling(consecutive_failures: int) -> float:
+    """Full-jitter ceiling for the Nth consecutive renewal failure (1-based)."""
+    if consecutive_failures <= 0:
+        return 0.0
+    return min(BACKOFF_CAP_S, BACKOFF_BASE_S * 2.0 ** (consecutive_failures - 1))

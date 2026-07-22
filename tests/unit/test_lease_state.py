@@ -10,18 +10,23 @@ sync enforcer does.
 from __future__ import annotations
 
 import random
+import threading
 from typing import Any
 
 import pytest
 
 from solwyn._lease import (
+    BACKOFF_BASE_S,
+    BACKOFF_CAP_S,
     INELIGIBLE_RETRY_AFTER_S,
     REFRESH_JITTER_MAX,
     REFRESH_JITTER_MIN,
+    RESERVATION_MAX_AGE_S,
     GrantOutcome,
     LeaseAdmission,
     LeaseDecision,
     LeaseLedger,
+    backoff_ceiling,
 )
 from solwyn._types import BudgetMode, LeaseGrantResponse
 
@@ -484,3 +489,403 @@ class TestOutageLadderExpiredLease:
         assert state.granted_remaining_tokens == 100_000
         assert state.share_remaining_tokens == 500_000
         assert state.reservations == {}
+
+
+@pytest.mark.unit
+class TestReservationLifecycle:
+    """True-up, release, sweep — reservation in, actual out."""
+
+    def test_true_up_settles_the_reservation_against_actual_usage(self) -> None:
+        # Arrange — reserve 1_500, spend 400.
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+
+        # Act
+        ledger.true_up("a", 400)
+
+        # Assert — the unspent 1_100 comes back and the spend is reportable.
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.granted_remaining_tokens == 100_000 - 400
+        assert state.spent_tokens_since_report == 400
+        assert state.reservations == {}
+
+    def test_overshoot_drives_the_remainder_negative(self) -> None:
+        # DoD 8 / spec §2: an uncapped call's overshoot is applied in FULL.
+        ledger = _granted_ledger(granted_tokens=2_000)
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+
+        ledger.true_up("a", 9_000)
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.granted_remaining_tokens == 2_000 - 9_000
+        assert state.spent_tokens_since_report == 9_000
+
+    def test_next_admission_after_overshoot_follows_the_normal_path(self) -> None:
+        ledger = _granted_ledger(granted_tokens=2_000)
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+        ledger.true_up("a", 9_000)
+
+        plane_up = _admit(ledger, call_id="b", breaker_open=False)
+        plane_down = _admit(ledger, call_id="c", breaker_open=True)
+
+        assert plane_up.decision is LeaseDecision.LEGACY_CHECK
+        assert plane_down.decision is LeaseDecision.ADMIT_OUTAGE_METERED
+
+    def test_release_returns_the_reservation_untouched(self) -> None:
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+
+        ledger.release("a")
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.granted_remaining_tokens == 100_000
+        assert state.spent_tokens_since_report == 0
+
+    def test_true_up_and_release_of_an_unknown_call_are_no_ops(self) -> None:
+        ledger = _granted_ledger()
+
+        ledger.true_up("never-admitted", 100)
+        ledger.release("never-admitted")
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.granted_remaining_tokens == 100_000
+
+    def test_true_up_after_the_funding_lease_is_gone_touches_nothing(self) -> None:
+        # Arrange — the lease that funded the call is dropped (404/expiry) and
+        # a fresh one installed; the stale true-up must not hit new counters.
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+        ledger.drop(RUN)
+        ledger.apply_grant_response(
+            RUN,
+            _response(lease_id="lse_new", generation=1, granted_tokens=50_000),
+            now=1_010.0,
+            declared_models=["gpt-5.5"],
+        )
+
+        # Act
+        ledger.true_up("a", 9_000)
+
+        # Assert
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.granted_remaining_tokens == 50_000
+        assert state.spent_tokens_since_report == 0
+
+    def test_outage_share_reservation_trues_up_against_the_share(self) -> None:
+        ledger = _granted_ledger(granted_tokens=0)
+        _admit(
+            ledger,
+            call_id="a",
+            estimated_input_tokens=1_000,
+            output_bound=500,
+            breaker_open=True,
+        )
+
+        ledger.true_up("a", 900)
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.share_remaining_tokens == 500_000 - 900
+        assert state.granted_remaining_tokens == 0
+
+    def test_abandoned_reservations_are_swept_after_900s(self) -> None:
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="abandoned", estimated_input_tokens=1_000, output_bound=500)
+
+        swept = ledger.sweep(now=1_001.0 + RESERVATION_MAX_AGE_S)
+
+        assert swept == 1
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.granted_remaining_tokens == 100_000
+        assert state.reservations == {}
+
+    def test_admission_sweeps_the_runs_abandoned_reservations(self) -> None:
+        # The sweep rides admission — no timer thread exists in the SDK. The
+        # lease outlives the sweep window here so the reservation, not the
+        # lease, is what expires.
+        ledger = _granted_ledger(lease_length_s=10_000.0)
+        _admit(ledger, call_id="abandoned", estimated_input_tokens=1_000, output_bound=500)
+
+        fresh = _admit(
+            ledger,
+            call_id="fresh",
+            estimated_input_tokens=1_000,
+            output_bound=500,
+            now=1_001.0 + RESERVATION_MAX_AGE_S,
+        )
+
+        assert fresh.decision is LeaseDecision.ADMIT_LOCAL
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert "abandoned" not in state.reservations
+        assert state.granted_remaining_tokens == 100_000 - 1_500
+
+    def test_fresh_reservations_are_not_swept(self) -> None:
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+
+        swept = ledger.sweep(now=1_001.0 + RESERVATION_MAX_AGE_S - 1.0)
+
+        assert swept == 0
+
+
+@pytest.mark.unit
+class TestRenewalBookkeeping:
+    """Renew-ahead thresholds, backoff, and the report payloads."""
+
+    def test_renewal_is_not_due_below_75_percent_depletion(self) -> None:
+        ledger = _granted_ledger(granted_tokens=10_000)
+
+        # 7_400 of 10_000 == 74%.
+        admission = _admit(ledger, estimated_input_tokens=7_000, output_bound=400)
+
+        assert admission.decision is LeaseDecision.ADMIT_LOCAL
+        assert admission.renewal_due is False
+
+    def test_renewal_is_due_at_75_percent_depletion(self) -> None:
+        ledger = _granted_ledger(granted_tokens=10_000)
+
+        admission = _admit(ledger, estimated_input_tokens=7_100, output_bound=400)
+
+        assert admission.renewal_due is True
+
+    def test_renewal_is_due_once_the_refresh_deadline_passes(self) -> None:
+        ledger = _granted_ledger()  # jitter ratio 1.0 → refresh at 1_000 + 17.25
+
+        assert _admit(ledger, call_id="a", now=1_017.0).renewal_due is False
+        assert _admit(ledger, call_id="b", now=1_018.0).renewal_due is True
+
+    def test_renewal_is_suppressed_while_one_is_in_flight(self) -> None:
+        ledger = _granted_ledger()
+        ledger.renewal_sent(RUN)
+
+        assert _admit(ledger, now=1_100.0).renewal_due is False
+
+    def test_renewal_is_suppressed_until_the_backoff_elapses(self) -> None:
+        ledger = _granted_ledger()
+        ledger.renewal_sent(RUN)
+        ledger.renewal_failed(RUN, now=1_020.0)  # ceiling 1s, _FixedRandom → 1.0s
+
+        assert _admit(ledger, call_id="a", now=1_020.5).renewal_due is False
+        assert _admit(ledger, call_id="b", now=1_021.0).renewal_due is True
+
+    def test_backoff_schedule_is_exponential_with_a_30s_cap(self) -> None:
+        # _FixedRandom(1.0) returns the top of the full-jitter window, so the
+        # schedule the ceiling implies is directly observable.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+
+        observed = []
+        for attempt in range(7):
+            ledger.renewal_failed(RUN, now=float(attempt))
+            observed.append(round(state.next_attempt_at - attempt, 3))
+
+        assert observed == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0]
+        assert backoff_ceiling(1) == BACKOFF_BASE_S
+        assert backoff_ceiling(99) == BACKOFF_CAP_S
+
+    def test_a_successful_grant_clears_the_backoff_and_in_flight_flag(self) -> None:
+        ledger = _granted_ledger()
+        ledger.renewal_sent(RUN)
+        ledger.renewal_failed(RUN, now=1_000.0)
+
+        ledger.apply_grant_response(RUN, _response(generation=2), now=1_030.0)
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.consecutive_failures == 0
+        assert state.next_attempt_at == 0.0
+        assert state.renewal_in_flight is False
+
+    def test_final_grant_stops_asking_for_renewals(self) -> None:
+        ledger = _granted_ledger(final_grant=True)
+
+        assert _admit(ledger, now=1_100.0).renewal_due is False
+
+    def test_renewal_request_reports_spend_reservations_and_tallies(self) -> None:
+        # Arrange — one settled call, one still in flight, one uncounted call
+        # from an earlier lease death.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        state.uncounted_calls = 3
+        state.uncounted_tokens = 900
+        _admit(ledger, call_id="settled", estimated_input_tokens=1_000, output_bound=500)
+        ledger.true_up("settled", 800)
+        _admit(ledger, call_id="in-flight", estimated_input_tokens=1_000, output_bound=500)
+
+        # Act
+        request = ledger.build_renewal_request(RUN)
+
+        # Assert
+        assert request is not None
+        assert request.lease_id == "lse_abc"
+        assert request.holder_id == HOLDER
+        assert request.generation == 1
+        assert request.spent_tokens == 800
+        assert request.reserved_tokens == 1_500
+        assert request.uncounted_calls == 3
+        assert request.uncounted_tokens == 900
+
+    def test_renewal_request_can_redeclare_the_model_set(self) -> None:
+        ledger = _granted_ledger()
+
+        request = ledger.build_renewal_request(RUN, model="gpt-5.5-mini")
+
+        assert request is not None
+        assert request.model == "gpt-5.5-mini"
+
+    def test_renewal_request_is_none_without_a_lease(self) -> None:
+        ledger = _ledger()
+
+        assert ledger.build_renewal_request(RUN) is None
+
+    def test_tallies_clear_only_when_the_report_is_acknowledged(self) -> None:
+        # Arrange — report 800 spent, then spend 200 more before the response
+        # lands. Only the acknowledged 800 may clear.
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+        ledger.true_up("a", 800)
+        state = ledger.state_for(RUN)
+        assert state is not None
+        state.uncounted_calls = 2
+        state.uncounted_tokens = 500
+
+        request = ledger.build_renewal_request(RUN)
+        assert request is not None
+        _admit(ledger, call_id="b", estimated_input_tokens=1_000, output_bound=500)
+        ledger.true_up("b", 200)
+
+        # Act
+        ledger.apply_grant_response(RUN, _response(generation=2), now=1_020.0)
+
+        # Assert
+        assert state.spent_tokens_since_report == 200
+        assert state.uncounted_calls == 0
+        assert state.uncounted_tokens == 0
+
+    def test_a_failed_renewal_keeps_the_tallies_owed(self) -> None:
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        state.uncounted_calls = 2
+        state.uncounted_tokens = 500
+        ledger.build_renewal_request(RUN)
+
+        ledger.renewal_failed(RUN, now=1_010.0)
+
+        assert state.uncounted_calls == 2
+        assert state.uncounted_tokens == 500
+
+    def test_surrender_request_carries_the_final_true_up(self) -> None:
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+        ledger.true_up("a", 700)
+
+        request = ledger.build_surrender_request(RUN)
+
+        assert request is not None
+        assert request.lease_id == "lse_abc"
+        assert request.holder_id == HOLDER
+        assert request.generation == 1
+        assert request.spent_tokens == 700
+
+    def test_surrender_request_is_none_without_a_lease(self) -> None:
+        assert _ledger().build_surrender_request(RUN) is None
+
+
+@pytest.mark.unit
+class TestLeaseStateLifecycle:
+    """Drop, discard, fork reset."""
+
+    def test_drop_forgets_the_lease_but_keeps_what_is_owed(self) -> None:
+        # 404 lease_not_found / 409 generation conflict: re-grant next
+        # admission, but the uncounted tally is still owed to the server.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        state.uncounted_calls = 4
+        state.uncounted_tokens = 1_000
+
+        ledger.drop(RUN)
+
+        assert ledger.lease_id_for(RUN) is None
+        assert _admit(ledger).decision is LeaseDecision.NEED_GRANT
+        assert state.uncounted_calls == 4
+        assert state.uncounted_tokens == 1_000
+
+    def test_discard_forgets_the_run_entirely(self) -> None:
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="a")
+
+        ledger.discard(RUN)
+
+        assert ledger.state_for(RUN) is None
+        assert ledger.active_run_ids() == []
+        # A late true-up for the discarded run is a no-op, not a KeyError.
+        ledger.true_up("a", 100)
+
+    def test_fork_reset_drops_all_lease_state(self) -> None:
+        # A forked child must re-grant: the parent's lease is bound to the
+        # parent's holder identity and its float is the parent's.
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="a")
+
+        ledger.on_fork_reset()
+
+        assert ledger.state_for(RUN) is None
+        assert ledger.active_run_ids() == []
+        assert _admit(ledger).decision is LeaseDecision.NEED_GRANT
+
+
+@pytest.mark.unit
+class TestConcurrentBurst:
+    """DoD 8: concurrent admissions can never jointly overrun the remainder."""
+
+    def test_concurrent_burst_cannot_overrun(self) -> None:
+        # Arrange — 15_000 granted, 1_500 per call: at most 10 may pass, no
+        # matter how many threads race. The test holds the enforcer-style
+        # lock exactly where BudgetEnforcer holds its _state_lock.
+        ledger = _granted_ledger(granted_tokens=15_000)
+        lock = threading.Lock()
+        start = threading.Barrier(40)
+        admissions: list[LeaseAdmission] = []
+        results_lock = threading.Lock()
+
+        def worker(index: int) -> None:
+            start.wait(timeout=5.0)
+            with lock:
+                admission = ledger.admit(
+                    run_id=RUN,
+                    call_id=f"call-{index}",
+                    estimated_input_tokens=1_000,
+                    model="gpt-5.5",
+                    output_bound=500,
+                    now=1_001.0,
+                    breaker_open=False,
+                )
+            with results_lock:
+                admissions.append(admission)
+
+        # Act
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(40)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.0)
+
+        # Assert
+        admitted = [a for a in admissions if a.decision is LeaseDecision.ADMIT_LOCAL]
+        assert len(admissions) == 40
+        assert len(admitted) == 15_000 // 1_500
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.granted_remaining_tokens == 0
+        assert sum(r.tokens for r in state.reservations.values()) == 15_000
