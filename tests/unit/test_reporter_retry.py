@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, call_uuid
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
@@ -40,7 +40,7 @@ def _make_event(**overrides) -> MetadataEvent:
         "is_model_fallback": False,
         "sdk_instance_id": "test-instance-001",
         "timestamp": datetime.now(UTC),
-        "call_id": "call_retry_event",
+        "call_id": call_uuid("call_retry_event"),
     }
     defaults.update(overrides)
     return MetadataEvent(**defaults)
@@ -51,7 +51,7 @@ def _make_confirm_request(**overrides) -> BudgetConfirmRequest:
         "reservation_id": "res_123",
         "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
-        "call_id": "call_retry_confirm",
+        "call_id": call_uuid("call_retry_confirm"),
         "token_details": TokenDetails(input_tokens=10, output_tokens=5),
     }
     defaults.update(overrides)
@@ -192,8 +192,8 @@ class TestSyncReporterRetry:
         reporter = _quiet()
         reporter._settlement_queue.append(
             _PendingSettlement(
-                _PendingConfirm(_make_confirm_request(call_id="c1")),
-                _make_event(call_id="c1"),
+                _PendingConfirm(_make_confirm_request(call_id=call_uuid("c1"))),
+                _make_event(call_id=call_uuid("c1")),
             )
         )
         urls: list[str] = []
@@ -372,8 +372,12 @@ class TestSyncReporterRetry:
         clock = _FakeClock()
         monkeypatch.setattr("solwyn.reporter._monotonic", clock)
         reporter = _quiet(max_send_attempts=5, retry_backoff_base=1.0)
-        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request(call_id="a")))
-        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request(call_id="b")))
+        reporter._confirm_queue.append(
+            _PendingConfirm(_make_confirm_request(call_id=call_uuid("a")))
+        )
+        reporter._confirm_queue.append(
+            _PendingConfirm(_make_confirm_request(call_id=call_uuid("b")))
+        )
         sent: list[str] = []
         responses = [_error_response(503), _ok_response(), _ok_response()]
 
@@ -384,14 +388,17 @@ class TestSyncReporterRetry:
         with patch.object(reporter._http, "post", side_effect=post):
             reporter._flush_remaining()
             # Head a failed transiently: b must NOT have been attempted.
-            assert sent == ["a"]
-            assert [p.request.call_id for p in reporter._confirm_queue] == ["a", "b"]
+            assert sent == [call_uuid("a")]
+            assert [p.request.call_id for p in reporter._confirm_queue] == [
+                call_uuid("a"),
+                call_uuid("b"),
+            ]
 
             clock.advance(1.5)
             reporter._flush_remaining()
 
         # FIFO preserved: a retried (and delivered) before b.
-        assert sent == ["a", "a", "b"]
+        assert sent == [call_uuid("a"), call_uuid("a"), call_uuid("b")]
         assert len(reporter._confirm_queue) == 0
         reporter._http.close()
 
@@ -404,10 +411,14 @@ class TestSyncReporterRetry:
         monkeypatch.setattr("solwyn.reporter._monotonic", clock)
         reporter = _quiet(max_send_attempts=5, retry_backoff_base=1.0)
         reporter._settlement_queue.append(
-            _PendingSettlement(_PendingConfirm(_make_confirm_request(call_id="a")), _make_event())
+            _PendingSettlement(
+                _PendingConfirm(_make_confirm_request(call_id=call_uuid("a"))), _make_event()
+            )
         )
         reporter._settlement_queue.append(
-            _PendingSettlement(_PendingConfirm(_make_confirm_request(call_id="b")), _make_event())
+            _PendingSettlement(
+                _PendingConfirm(_make_confirm_request(call_id=call_uuid("b"))), _make_event()
+            )
         )
         urls: list[str] = []
         first = {"pending": True}
@@ -442,13 +453,17 @@ class TestSyncReporterRetry:
         # event queue instead of silently vanishing.
         monkeypatch.setattr("solwyn.reporter._MAX_PENDING_CONTROL", 1)
         reporter = _unstarted()
-        reporter.report_settlement(_make_confirm_request(call_id="old"), _make_event(call_id="old"))
-        reporter.report_settlement(_make_confirm_request(call_id="new"), _make_event(call_id="new"))
+        reporter.report_settlement(
+            _make_confirm_request(call_id=call_uuid("old")), _make_event(call_id=call_uuid("old"))
+        )
+        reporter.report_settlement(
+            _make_confirm_request(call_id=call_uuid("new")), _make_event(call_id=call_uuid("new"))
+        )
 
         assert reporter.dropped_counts["settlement_confirm.overflow"] == 1
         assert len(reporter._settlement_queue) == 1
-        assert reporter._settlement_queue[0].confirm.request.call_id == "new"
-        assert [p.event.call_id for p in reporter._queue] == ["old"]
+        assert reporter._settlement_queue[0].confirm.request.call_id == call_uuid("new")
+        assert [p.event.call_id for p in reporter._queue] == [call_uuid("old")]
         assert "event.overflow" not in reporter.dropped_counts
         # Items are deliberately left queued — keep the atexit hook off them.
         reporter._shutdown.set()
@@ -537,8 +552,8 @@ class TestAsyncReporterRetry:
         reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
         reporter._settlement_queue.append(
             _PendingSettlement(
-                _PendingConfirm(_make_confirm_request(call_id="c1")),
-                _make_event(call_id="c1"),
+                _PendingConfirm(_make_confirm_request(call_id=call_uuid("c1"))),
+                _make_event(call_id=call_uuid("c1")),
             )
         )
         urls: list[str] = []
@@ -596,8 +611,12 @@ class TestAsyncReporterRetry:
         reporter = AsyncMetadataReporter(
             _URL, VALID_API_KEY, max_send_attempts=5, retry_backoff_base=1.0
         )
-        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request(call_id="a")))
-        reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request(call_id="b")))
+        reporter._confirm_queue.append(
+            _PendingConfirm(_make_confirm_request(call_id=call_uuid("a")))
+        )
+        reporter._confirm_queue.append(
+            _PendingConfirm(_make_confirm_request(call_id=call_uuid("b")))
+        )
         sent: list[str] = []
         responses = [_error_response(503), _ok_response(), _ok_response()]
 
@@ -607,13 +626,16 @@ class TestAsyncReporterRetry:
 
         with patch.object(reporter._http, "post", new=post):
             await reporter._flush_remaining()
-            assert sent == ["a"]
-            assert [p.request.call_id for p in reporter._confirm_queue] == ["a", "b"]
+            assert sent == [call_uuid("a")]
+            assert [p.request.call_id for p in reporter._confirm_queue] == [
+                call_uuid("a"),
+                call_uuid("b"),
+            ]
 
             clock.advance(1.5)
             await reporter._flush_remaining()
 
-        assert sent == ["a", "a", "b"]
+        assert sent == [call_uuid("a"), call_uuid("a"), call_uuid("b")]
         assert len(reporter._confirm_queue) == 0
         await reporter._http.aclose()
 
@@ -628,10 +650,14 @@ class TestAsyncReporterRetry:
             _URL, VALID_API_KEY, max_send_attempts=5, retry_backoff_base=1.0
         )
         reporter._settlement_queue.append(
-            _PendingSettlement(_PendingConfirm(_make_confirm_request(call_id="a")), _make_event())
+            _PendingSettlement(
+                _PendingConfirm(_make_confirm_request(call_id=call_uuid("a"))), _make_event()
+            )
         )
         reporter._settlement_queue.append(
-            _PendingSettlement(_PendingConfirm(_make_confirm_request(call_id="b")), _make_event())
+            _PendingSettlement(
+                _PendingConfirm(_make_confirm_request(call_id=call_uuid("b"))), _make_event()
+            )
         )
         urls: list[str] = []
         first = {"pending": True}
@@ -665,13 +691,17 @@ class TestAsyncReporterRetry:
         # Async mirror of the settlement-overflow pin.
         monkeypatch.setattr("solwyn.reporter._MAX_PENDING_CONTROL", 1)
         reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
-        reporter.report_settlement(_make_confirm_request(call_id="old"), _make_event(call_id="old"))
-        reporter.report_settlement(_make_confirm_request(call_id="new"), _make_event(call_id="new"))
+        reporter.report_settlement(
+            _make_confirm_request(call_id=call_uuid("old")), _make_event(call_id=call_uuid("old"))
+        )
+        reporter.report_settlement(
+            _make_confirm_request(call_id=call_uuid("new")), _make_event(call_id=call_uuid("new"))
+        )
 
         assert reporter.dropped_counts["settlement_confirm.overflow"] == 1
         assert len(reporter._settlement_queue) == 1
-        assert reporter._settlement_queue[0].confirm.request.call_id == "new"
-        assert [p.event.call_id for p in reporter._queue] == ["old"]
+        assert reporter._settlement_queue[0].confirm.request.call_id == call_uuid("new")
+        assert [p.event.call_id for p in reporter._queue] == [call_uuid("old")]
         assert "event.overflow" not in reporter.dropped_counts
 
         # Wind down without network: stop the auto-started flush task and

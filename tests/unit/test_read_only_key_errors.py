@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, VALID_PROJECT_ID
+from conftest import VALID_API_KEY, VALID_PROJECT_ID, call_uuid
 
 from solwyn._read_only_key import _is_read_only_key_error
 from solwyn._token_details import TokenDetails
@@ -50,7 +50,7 @@ def _event() -> MetadataEvent:
         is_model_fallback=False,
         sdk_instance_id="read-only-test",
         timestamp=datetime.now(UTC),
-        call_id="call-read-only",
+        call_id=call_uuid("call-read-only"),
     )
 
 
@@ -59,7 +59,7 @@ def _confirm() -> BudgetConfirmRequest:
         reservation_id="res-read-only",
         model="gpt-5.5",
         provider=ProviderName.OPENAI,
-        call_id="call-read-only",
+        call_id=call_uuid("call-read-only"),
         token_details=TokenDetails(input_tokens=10, output_tokens=5),
     )
 

@@ -27,6 +27,8 @@ from pydantic import (
 from solwyn._constants import (
     AGENT_RUN_ID_MAX_LENGTH,
     AGENT_RUN_NAME_MAX_LENGTH,
+    CALL_ID_MAX_LENGTH,
+    CALL_ID_PATTERN,
     HOLDER_ID_MAX_LENGTH,
     LEASE_ID_MAX_LENGTH,
     MODEL_NAME_MAX_LENGTH,
@@ -799,7 +801,14 @@ class BudgetConfirmRequest(BaseModel):
     )
     call_id: str = Field(
         ...,
-        description=("uuid per intercepted call; dedups confirm vs metadata reconciliation"),
+        max_length=CALL_ID_MAX_LENGTH,
+        pattern=CALL_ID_PATTERN,
+        description=(
+            "uuid per intercepted call; dedups confirm vs metadata reconciliation. "
+            "Canonical lowercase UUID, matching the API's own pin — a confirm is "
+            "the settlement of real spend, so an id the server would 422 must fail "
+            "here, at the seam that built it."
+        ),
     )
     token_details: TokenDetails = Field(
         ..., description="Actual token breakdown from the provider adapter"

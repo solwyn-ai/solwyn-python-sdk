@@ -9,6 +9,14 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **`BudgetConfirmRequest.call_id` now pins the canonical UUID text form** the
+  API has required since its idempotency ledger landed (`^[0-9a-f]{8}-...$`,
+  max 36 chars). The SDK has only ever emitted `str(uuid.uuid4())` here, so no
+  emitted confirm changes; what changes is that a drifted id fails at the seam
+  that built it instead of arriving as a 422 that loses the settlement it was
+  carrying. `call_id` is durable spend identity — the API's cost-event ledger
+  dedups on it.
+
 - **Non-streaming settlement moved off the caller's hot path.** Sync and async
   chat completions and the whole media lifecycle (embeddings, images, audio,
   video) previously settled a reservation with a BLOCKING `confirm_cost` POST on

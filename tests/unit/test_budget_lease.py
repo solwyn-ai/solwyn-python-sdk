@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 import respx
-from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
+from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID, call_uuid
 from httpx import Response
 
 import solwyn as solwyn_pkg
@@ -198,7 +198,7 @@ class TestLeaseAdmission:
                 return_value=Response(200, json=ALLOW_BUDGET_RESPONSE)
             )
 
-            result = _check(enforcer, "call_1")
+            result = _check(enforcer, call_uuid("call_1"))
 
         assert grant.call_count == 1
         assert check.call_count == 0
@@ -259,7 +259,7 @@ class TestLeaseAdmission:
                 return_value=Response(200, json=ALLOW_BUDGET_RESPONSE)
             )
 
-            result = _check(enforcer, "call_1")
+            result = _check(enforcer, call_uuid("call_1"))
 
         assert grant.call_count == 0
         assert check.call_count == 1
@@ -460,7 +460,7 @@ class TestLeaseOutage:
         with respx.mock:
             respx.post(GRANT_URL).mock(side_effect=httpx.ConnectError("down"))
 
-            result = _check(enforcer, "call_1")
+            result = _check(enforcer, call_uuid("call_1"))
 
         assert result.allowed is True
         assert result.warning is not None
@@ -476,7 +476,7 @@ class TestLeaseOutage:
         with respx.mock:
             respx.post(GRANT_URL).mock(side_effect=httpx.ConnectError("down"))
 
-            result = _check(enforcer, "call_1")
+            result = _check(enforcer, call_uuid("call_1"))
 
         assert result.allowed is False
         state = enforcer._lease.state_for(RUN)
@@ -910,7 +910,7 @@ class TestLeaseSettlement:
         enforcer = _make_enforcer()
         with respx.mock:
             respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
-            result = _check(enforcer, "call_1")
+            result = _check(enforcer, call_uuid("call_1"))
 
         state = enforcer._lease.state_for(RUN)
         assert state is not None
@@ -920,7 +920,7 @@ class TestLeaseSettlement:
             model="gpt-5.5",
             token_details=TokenDetails(input_tokens=120, output_tokens=80),
             provider="openai",
-            call_id="call_1",
+            call_id=call_uuid("call_1"),
             lease_id=result.lease_id,
         )
 
@@ -953,7 +953,7 @@ class TestLeaseSettlement:
             model="gpt-5.5",
             token_details=TokenDetails(input_tokens=1, output_tokens=1),
             provider="openai",
-            call_id="call_x",
+            call_id=call_uuid("call_x"),
         )
         assert confirm.reservation_id == "res_123"
         assert confirm.lease_id is None

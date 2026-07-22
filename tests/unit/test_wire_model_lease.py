@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from conftest import call_uuid
 from pydantic import ValidationError
 
 from solwyn._token_details import TokenDetails
@@ -365,7 +366,7 @@ def _confirm(**overrides: Any) -> BudgetConfirmRequest:
         "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
         "token_details": TokenDetails(input_tokens=10, output_tokens=5),
-        "call_id": "call-fixed",
+        "call_id": call_uuid("call-fixed"),
     }
     base.update(overrides)
     return BudgetConfirmRequest(**base)

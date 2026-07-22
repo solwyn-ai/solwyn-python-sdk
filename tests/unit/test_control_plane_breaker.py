@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY
+from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, call_uuid
 
 import solwyn.circuit_breaker as circuit_breaker_mod
 from solwyn._token_details import TokenDetails
@@ -96,7 +96,7 @@ def _confirm() -> BudgetConfirmRequest:
         reservation_id="res-cp",
         model="gpt-5.5",
         provider=ProviderName.OPENAI,
-        call_id="call-cp",
+        call_id=call_uuid("call-cp"),
         token_details=TokenDetails(input_tokens=10, output_tokens=5),
     )
 
