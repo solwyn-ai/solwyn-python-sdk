@@ -28,6 +28,7 @@ from solwyn._constants import (
     AGENT_RUN_ID_MAX_LENGTH,
     AGENT_RUN_NAME_MAX_LENGTH,
     HOLDER_ID_MAX_LENGTH,
+    LEASE_ID_MAX_LENGTH,
     MODEL_NAME_MAX_LENGTH,
     PROVIDER_REGION_MAX_LENGTH,
     SERVICE_TIER_MAX_LENGTH,
@@ -529,6 +530,7 @@ class LeaseGrantRequest(BaseModel):
     )
     fallback_models: list[Annotated[str, Field(max_length=MODEL_NAME_MAX_LENGTH)]] = Field(
         default_factory=list,
+        max_length=8,
         description="Failover models aligned element-for-element with fallback_providers",
     )
     fail_open: bool = Field(
@@ -576,7 +578,7 @@ class LeaseRenewRequest(BaseModel):
         serialized = cast(dict[str, Any], data)
         return {key: value for key, value in serialized.items() if value is not None}
 
-    lease_id: str = Field(..., description="Lease being renewed")
+    lease_id: str = Field(..., max_length=LEASE_ID_MAX_LENGTH, description="Lease being renewed")
     holder_id: str = Field(
         ..., max_length=HOLDER_ID_MAX_LENGTH, description="SDK instance id — the lease holder"
     )
@@ -610,6 +612,7 @@ class LeaseRenewRequest(BaseModel):
     )
     fallback_models: list[Annotated[str, Field(max_length=MODEL_NAME_MAX_LENGTH)]] = Field(
         default_factory=list,
+        max_length=8,
         description="Failover models aligned element-for-element with fallback_providers",
     )
 
@@ -639,7 +642,9 @@ class LeaseSurrenderRequest(BaseModel):
         serialized = cast(dict[str, Any], data)
         return {key: value for key, value in serialized.items() if value is not None}
 
-    lease_id: str = Field(..., description="Lease being surrendered")
+    lease_id: str = Field(
+        ..., max_length=LEASE_ID_MAX_LENGTH, description="Lease being surrendered"
+    )
     holder_id: str = Field(
         ..., max_length=HOLDER_ID_MAX_LENGTH, description="SDK instance id — the lease holder"
     )

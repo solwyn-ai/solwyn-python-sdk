@@ -48,6 +48,9 @@ from solwyn._types import (
     BudgetConfirmRequest,
     CallStatus,
     FailoverDirective,
+    LeaseGrantRequest,
+    LeaseRenewRequest,
+    LeaseSurrenderRequest,
     MediaUsage,
     MetadataEvent,
     ProviderName,
@@ -750,6 +753,24 @@ class TestWireModelFieldConstraints:
                 fallback_providers=[ProviderName.ANTHROPIC],
                 fallback_models=["x" * 2049],
             )
+
+    def test_lease_request_fallback_chain_max_items_pinned(self) -> None:
+        # Core's lease schemas cap the declared chain at 8. Without the SDK
+        # mirror a 9-model chain validates here and 422s server-side, so the
+        # bound is pinned on BOTH lease requests that carry a chain.
+        for schema in (
+            LeaseGrantRequest.model_json_schema(),
+            LeaseRenewRequest.model_json_schema(),
+        ):
+            assert schema["properties"]["fallback_models"]["maxItems"] == 8
+
+    def test_lease_id_max_length_pinned(self) -> None:
+        # The lease id echoed back to the API is bounded lock-step with core.
+        assert wire_constants.LEASE_ID_MAX_LENGTH == 64
+        for model in (LeaseRenewRequest, LeaseSurrenderRequest):
+            field = model.model_fields["lease_id"]
+            max_lengths = [m.max_length for m in field.metadata if hasattr(m, "max_length")]
+            assert 64 in max_lengths
 
     def test_metadata_provider_region_omitted_when_none_present_when_set(self) -> None:
         # provider_region rides the None-skipping serializer: absent for the

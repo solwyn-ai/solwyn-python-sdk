@@ -124,6 +124,30 @@ class TestLeaseGrantRequest:
                 provider=ProviderName.OPENAI,
             )
 
+    def test_rejects_a_fallback_chain_over_eight_models(self) -> None:
+        # Contract parity with core (and with BudgetCheckRequest): a 9-model
+        # chain must fail HERE, not with a 422 after the round-trip.
+        with pytest.raises(ValidationError):
+            LeaseGrantRequest(
+                agent_run_id="run_1",
+                holder_id="sdk-instance-1",
+                model="gpt-5.5",
+                provider=ProviderName.OPENAI,
+                fallback_providers=[ProviderName.ANTHROPIC] * 9,
+                fallback_models=[f"claude-{index}" for index in range(9)],
+            )
+
+    def test_accepts_a_full_eight_model_fallback_chain(self) -> None:
+        request = LeaseGrantRequest(
+            agent_run_id="run_1",
+            holder_id="sdk-instance-1",
+            model="gpt-5.5",
+            provider=ProviderName.OPENAI,
+            fallback_providers=[ProviderName.ANTHROPIC] * 8,
+            fallback_models=[f"claude-{index}" for index in range(8)],
+        )
+        assert len(request.fallback_models) == 8
+
     def test_rejects_misaligned_fallback_chain(self) -> None:
         # The chain is aligned element-for-element, same as BudgetCheckRequest.
         with pytest.raises(ValidationError):
@@ -188,6 +212,24 @@ class TestLeaseRenewRequest:
         assert request.uncounted_calls == 0
         assert request.uncounted_tokens == 0
 
+    def test_rejects_a_fallback_chain_over_eight_models(self) -> None:
+        with pytest.raises(ValidationError):
+            LeaseRenewRequest(
+                lease_id="lse_abc",
+                holder_id="sdk-instance-1",
+                generation=1,
+                fallback_providers=[ProviderName.ANTHROPIC] * 9,
+                fallback_models=[f"claude-{index}" for index in range(9)],
+            )
+
+    def test_rejects_lease_id_over_64_chars(self) -> None:
+        with pytest.raises(ValidationError):
+            LeaseRenewRequest(
+                lease_id="x" * 65,
+                holder_id="sdk-instance-1",
+                generation=1,
+            )
+
     def test_rejects_negative_counters(self) -> None:
         with pytest.raises(ValidationError):
             LeaseRenewRequest(
@@ -215,6 +257,14 @@ class TestLeaseSurrenderRequest:
             "generation": 4,
             "spent_tokens": 77,
         }
+
+    def test_rejects_lease_id_over_64_chars(self) -> None:
+        with pytest.raises(ValidationError):
+            LeaseSurrenderRequest(
+                lease_id="x" * 65,
+                holder_id="sdk-instance-1",
+                generation=4,
+            )
 
     def test_rejects_extra_fields(self) -> None:
         with pytest.raises(ValidationError):

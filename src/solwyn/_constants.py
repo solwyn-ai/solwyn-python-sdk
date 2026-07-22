@@ -12,6 +12,9 @@ MODEL_NAME_MAX_LENGTH = 2048
 PROVIDER_REGION_MAX_LENGTH = 32
 # Lease holder identity on the wire is the SDK instance id (a uuid4, 36 chars).
 HOLDER_ID_MAX_LENGTH = 64
+# Server-issued lease id, echoed back on every renew/surrender. Bounded
+# lock-step with core's lease schemas.
+LEASE_ID_MAX_LENGTH = 64
 TAGS_MAX_KEYS = 10
 TAG_KEY_MAX_LENGTH = 64
 TAG_VALUE_MAX_LENGTH = 256
