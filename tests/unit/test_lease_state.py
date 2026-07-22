@@ -334,3 +334,153 @@ class TestLiveLeaseAdmission:
         assert second.decision is LeaseDecision.ADMIT_LOCAL
         # 3_000 - 1_500 - 1_500 = 0 left: the third does not fit.
         assert third.decision is LeaseDecision.LEGACY_CHECK
+
+
+@pytest.mark.unit
+class TestOutageLadderLiveLease:
+    """Step 5 past exhaustion: plane up → legacy, plane down → share, then mode."""
+
+    def test_exhausted_with_plane_up_falls_to_the_legacy_check(self) -> None:
+        # Arrange — an empty wallet is not a denial: the server stays
+        # authoritative while it is reachable.
+        ledger = _granted_ledger(granted_tokens=1_000)
+
+        admission = _admit(ledger, estimated_input_tokens=5_000, breaker_open=False)
+
+        assert admission.decision is LeaseDecision.LEGACY_CHECK
+        assert admission.reason == "granted_exhausted_plane_up"
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.share_remaining_tokens == 500_000  # share untouched
+
+    def test_exhausted_and_unreachable_draws_down_the_headroom_share(self) -> None:
+        ledger = _granted_ledger(granted_tokens=1_000)
+
+        admission = _admit(
+            ledger, estimated_input_tokens=5_000, output_bound=1_000, breaker_open=True
+        )
+
+        assert admission.decision is LeaseDecision.ADMIT_OUTAGE_METERED
+        assert admission.reserved_tokens == 6_000
+        assert admission.warning is not None
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.share_remaining_tokens == 494_000
+        assert state.granted_remaining_tokens == 1_000  # granted never over-drawn
+
+    def test_share_exhausted_with_hard_deny_stops_the_call(self) -> None:
+        # Arrange — the customer's own cap, conservatively enforced offline.
+        ledger = _granted_ledger(
+            granted_tokens=0,
+            headroom_share_tokens=100,
+            posture={"mode": "hard_deny", "on_unreachable": "fail_open"},
+        )
+
+        admission = _admit(ledger, estimated_input_tokens=5_000, breaker_open=True)
+
+        assert admission.decision is LeaseDecision.DENY
+        assert admission.mode is BudgetMode.HARD_DENY
+        assert admission.reason == "lease_share_exhausted"
+        assert admission.warning is not None
+
+    def test_share_exhausted_with_alert_only_continues_with_a_warning(self) -> None:
+        ledger = _granted_ledger(
+            granted_tokens=0,
+            headroom_share_tokens=100,
+            posture={"mode": "alert_only", "on_unreachable": "fail_open"},
+        )
+
+        admission = _admit(ledger, estimated_input_tokens=5_000, breaker_open=True)
+
+        assert admission.decision is LeaseDecision.ADMIT_OUTAGE_METERED
+        assert admission.mode is BudgetMode.ALERT_ONLY
+        assert admission.warning is not None
+
+
+@pytest.mark.unit
+class TestOutageLadderExpiredLease:
+    """Step 6: expiry ends granted authority — it is never a deny by itself."""
+
+    def test_expired_with_plane_up_drops_the_lease_and_needs_a_grant(self) -> None:
+        ledger = _granted_ledger()
+
+        admission = _admit(ledger, now=1_200.0, breaker_open=False)
+
+        assert admission.decision is LeaseDecision.NEED_GRANT
+        assert ledger.lease_id_for(RUN) is None
+
+    def test_expired_and_unreachable_fail_open_admits_uncounted_and_tallies(self) -> None:
+        ledger = _granted_ledger()
+
+        first = _admit(
+            ledger, call_id="a", estimated_input_tokens=1_000, now=1_200.0, breaker_open=True
+        )
+        second = _admit(
+            ledger, call_id="b", estimated_input_tokens=2_000, now=1_201.0, breaker_open=True
+        )
+
+        assert first.decision is LeaseDecision.ADMIT_UNCOUNTED
+        assert first.warning is not None
+        assert second.decision is LeaseDecision.ADMIT_UNCOUNTED
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.uncounted_calls == 2
+        # est + the 4096 default output bound, both calls.
+        assert state.uncounted_tokens == (1_000 + 4_096) + (2_000 + 4_096)
+
+    def test_expired_and_unreachable_local_enforce_meters_against_last_share(self) -> None:
+        ledger = _granted_ledger(
+            headroom_share_tokens=10_000,
+            posture={"mode": "hard_deny", "on_unreachable": "local_enforce"},
+        )
+
+        admission = _admit(
+            ledger,
+            estimated_input_tokens=1_000,
+            output_bound=1_000,
+            now=1_200.0,
+            breaker_open=True,
+        )
+
+        assert admission.decision is LeaseDecision.ADMIT_OUTAGE_METERED
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.share_remaining_tokens == 8_000
+        # The granted counter is dead past expiry — never drawn down again.
+        assert state.granted_remaining_tokens == 100_000
+
+    def test_expired_local_enforce_bound_exceeded_applies_the_customers_mode(self) -> None:
+        denying = _granted_ledger(
+            headroom_share_tokens=10,
+            posture={"mode": "hard_deny", "on_unreachable": "local_enforce"},
+        )
+        warning = _granted_ledger(
+            headroom_share_tokens=10,
+            posture={"mode": "alert_only", "on_unreachable": "local_enforce"},
+        )
+
+        denied = _admit(denying, estimated_input_tokens=5_000, now=1_200.0, breaker_open=True)
+        allowed = _admit(warning, estimated_input_tokens=5_000, now=1_200.0, breaker_open=True)
+
+        assert denied.decision is LeaseDecision.DENY
+        assert denied.mode is BudgetMode.HARD_DENY
+        assert allowed.decision is LeaseDecision.ADMIT_OUTAGE_METERED
+        assert allowed.warning is not None
+
+    def test_expired_is_not_exhausted(self) -> None:
+        # DoD 8: past the deadline with a fat remainder, admissions must not
+        # touch the granted or share counters — the server reclaimed that
+        # float, so spending it would spend the same authority twice (R2-3).
+        ledger = _granted_ledger()
+
+        for index in range(5):
+            admission = _admit(
+                ledger, call_id=f"call-{index}", now=1_200.0 + index, breaker_open=True
+            )
+            assert admission.decision is LeaseDecision.ADMIT_UNCOUNTED
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.granted_remaining_tokens == 100_000
+        assert state.share_remaining_tokens == 500_000
+        assert state.reservations == {}

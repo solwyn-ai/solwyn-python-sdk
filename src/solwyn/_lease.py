@@ -329,8 +329,8 @@ class LeaseLedger:
                 reason="share_drawdown",
             )
 
-        # True exhaustion inside a live authority window: the customer's own
-        # mode decides. This is their cap, conservatively enforced offline.
+        # True exhaustion inside a LIVE authority window escalates to the
+        # customer's configured mode: their cap, conservatively enforced.
         if state.posture_mode is BudgetMode.HARD_DENY:
             return LeaseAdmission(
                 LeaseDecision.DENY,
@@ -386,8 +386,8 @@ class LeaseLedger:
                 reason="expired_fail_open",
             )
 
-        # local_enforce: meter against the freshest known bound (the last
-        # share remainder) — a local bound, not granted authority.
+        # local_enforce: meter against the freshest known BOUND (the last
+        # share remainder) — a local bound, never granted authority.
         if state.share_remaining_tokens >= reserve:
             state.share_remaining_tokens -= reserve
             self._reserve(state, call_id, reserve, now, _POOL_SHARE)
@@ -409,8 +409,7 @@ class LeaseLedger:
                 mode=state.posture_mode,
                 warning=(
                     "Budget lease expired, Solwyn unreachable and the last "
-                    "known headroom share is exhausted; hard_deny mode denies "
-                    "the call"
+                    "known headroom share is exhausted; hard_deny mode denies the call"
                 ),
                 reason="local_enforce_bound_exceeded",
             )
