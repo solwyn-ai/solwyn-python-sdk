@@ -935,7 +935,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         true it up) and ``estimated_output_bound`` is the call's own
         ``max_tokens``-family cap. Everything else — non-run traffic, media,
         an ineligible run, the kill switch — falls through to the per-call
-        path below, unchanged.
+        path below, unchanged. A caller that omits ``call_id`` still admits,
+        under a synthetic key: its reservation simply cannot be trued up or
+        released and comes back on the 900s abandoned-reservation sweep.
 
         Behaviour matrix:
         - Cloud reachable + allowed: return allowed=True
