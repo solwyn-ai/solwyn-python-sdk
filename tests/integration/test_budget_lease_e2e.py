@@ -355,9 +355,12 @@ class TestLeasePartitioning:
         is the server's PARTITION: at every instant, the token authority the two
         holders jointly hold is at most what one holder alone was granted.
 
-        (Total lease-funded tokens over the life of the run is deliberately NOT
-        the assertion — see the xfail below: settled-within-claim spend never
-        reaches the counters, so lifetime drawdown is unbounded today.)
+        Lifetime drawdown is a DIFFERENT invariant and belongs to the test
+        below, which now holds live: a run cannot outdraw the pool it was sized
+        from. Getting there took a fix on each side — core converting settled
+        float into counted spend, and the ledger netting the drawdown a
+        renewal's sizing never saw — and the strict xfail that carried this
+        test's assertion through both is what forced them.
         """
         credentials = provision_project(
             api_url, name="sdk-lease-pair", budget_limit=10.0, budget_mode="hard_deny"
@@ -419,6 +422,10 @@ class TestLeasePartitioning:
         joint_peak = 0
 
         def sample_joint_authority() -> None:
+            # Sampling races the drivers, and it races them in the SAFE
+            # direction: a sample landing between one holder's grant and the
+            # other's sees LESS joint authority, never more. So the race can
+            # only make this test miss a violation, never invent one.
             nonlocal joint_peak
             while not stop_sampling.is_set():
                 held = 0
