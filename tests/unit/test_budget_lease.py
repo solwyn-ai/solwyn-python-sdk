@@ -1254,6 +1254,171 @@ class TestLeaseForkReset:
             assert enforcer._lease.state_for(RUN) is None
         enforcer._http.close()
 
+    def test_fork_reset_takes_a_fresh_holder_identity(self) -> None:
+        # The client's _sdk_instance_id survives a fork unchanged, so the
+        # enforcer must mint its own holder id in the child: core releases a
+        # same-(project, run, holder) active lease as stale when a grant lands,
+        # so a child re-granting under the PARENT's id would kill the parent's
+        # live lease — and the parent's next regrant would kill the child's.
+        enforcer = _make_enforcer()
+        parent_holder = enforcer._lease.holder_id
+
+        enforcer._reset_after_fork_in_child()
+
+        assert enforcer._lease.holder_id != parent_holder
+        assert enforcer._lease.holder_id
+        enforcer._http.close()
+
+    async def test_async_fork_reset_takes_a_fresh_holder_identity(self) -> None:
+        enforcer = _make_async_enforcer()
+        parent_holder = enforcer._lease.holder_id
+
+        enforcer._reset_after_fork_in_child()
+
+        assert enforcer._lease.holder_id != parent_holder
+        await enforcer._http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Uncounted-mode telemetry (§8: warn on episode entry, then at most 1/30s)
+# ---------------------------------------------------------------------------
+
+
+def _uncounted_records(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Just the uncounted-mode telemetry lines (the grant failures also warn)."""
+    return [r.getMessage() for r in caplog.records if "lease.uncounted" in r.getMessage()]
+
+
+@pytest.mark.unit
+class TestUncountedTelemetry:
+    """Fail-open uncounted mode is loud on entry, then rate-limited (never silent)."""
+
+    def test_entry_to_an_uncounted_episode_warns_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+        with respx.mock:
+            respx.post(GRANT_URL).mock(side_effect=httpx.ConnectError("down"))
+
+            with caplog.at_level("WARNING", logger="solwyn.budget"):
+                result = _check(enforcer, call_uuid("call_1"))
+
+        assert result.allowed is True
+        messages = _uncounted_records(caplog)
+        assert len(messages) == 1, f"entry to uncounted mode must warn exactly once: {messages}"
+        assert "lease.uncounted_entry" in messages[0]
+        enforcer._http.close()
+
+    def test_a_second_uncounted_call_inside_the_window_stays_quiet(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+        with respx.mock:
+            respx.post(GRANT_URL).mock(side_effect=httpx.ConnectError("down"))
+
+            with caplog.at_level("WARNING", logger="solwyn.budget"):
+                first = _check(enforcer, call_uuid("call_1"))
+                second = _check(enforcer, call_uuid("call_2"))
+
+        assert first.allowed is True and second.allowed is True
+        messages = _uncounted_records(caplog)
+        assert len(messages) == 1, f"the 30s rate limit must suppress the second: {messages}"
+        # Both calls are still tallied — only the LOG is rate-limited.
+        state = enforcer._lease.state_for(RUN)
+        assert state is not None
+        assert state.uncounted_calls == 2
+        enforcer._http.close()
+
+    def test_a_new_episode_warns_on_entry_again(self, caplog: pytest.LogCaptureFixture) -> None:
+        # An installed grant ENDS the episode; the next lease death is a new
+        # one, and must be as loud as the first.
+        enforcer = _make_enforcer(fail_open=True)
+        with respx.mock:
+            respx.post(GRANT_URL).mock(
+                side_effect=[
+                    httpx.ConnectError("down"),
+                    Response(200, json=_grant_payload()),
+                    httpx.ConnectError("down"),
+                ]
+            )
+
+            with caplog.at_level("WARNING", logger="solwyn.budget"):
+                _check(enforcer, call_uuid("call_1"))
+                covered = _check(enforcer, call_uuid("call_2"))
+                # The lease dies (404 drop / expiry) while the plane is down.
+                enforcer._lease.drop(RUN)
+                _check(enforcer, call_uuid("call_3"))
+
+        assert covered.lease_id is not None
+        messages = _uncounted_records(caplog)
+        assert len(messages) == 2, f"a fresh episode must warn on entry: {messages}"
+        assert all("lease.uncounted_entry" in message for message in messages)
+        enforcer._http.close()
+
+    def test_the_rate_limited_line_names_the_still_uncounted_state(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Past the window the episode warns again, as a CONTINUING line: an
+        # hour-long outage stays visible without one line per call.
+        clock = _FakeClock()
+        enforcer = _make_enforcer(fail_open=True)
+        with respx.mock, patch("solwyn.budget.time", clock):
+            respx.post(GRANT_URL).mock(side_effect=httpx.ConnectError("down"))
+
+            with caplog.at_level("WARNING", logger="solwyn.budget"):
+                _check(enforcer, call_uuid("call_1"))
+                clock.advance(31.0)
+                _check(enforcer, call_uuid("call_2"))
+
+        messages = _uncounted_records(caplog)
+        assert len(messages) == 2, f"past 30s the episode warns again: {messages}"
+        assert "lease.uncounted_entry" in messages[0]
+        assert "lease.uncounted_continuing" in messages[1]
+        enforcer._http.close()
+
+    def test_the_expiry_ladders_uncounted_admission_warns_too(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The other entry point: a lease that ran past its deadline while the
+        # plane is believed down (§4 step 6), not a cold start.
+        breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=600, name="control-plane")
+        enforcer = _make_enforcer(fail_open=True, control_plane_breaker=breaker)
+        clock = _FakeClock()
+        with respx.mock, patch("solwyn.budget.time", clock):
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+
+            covered = _check(enforcer, call_uuid("call_1"))
+            breaker.record_failure()  # the plane is now believed unreachable
+            clock.advance(601.0)  # ... and the lease outlived its deadline
+
+            with caplog.at_level("WARNING", logger="solwyn.budget"):
+                expired = _check(enforcer, call_uuid("call_2"))
+
+        assert covered.lease_id is not None
+        assert expired.allowed is True
+        assert expired.lease_id is None, "an uncounted admission settles against nothing"
+        messages = _uncounted_records(caplog)
+        assert len(messages) == 1, f"expiry into fail-open must warn on entry: {messages}"
+        assert "lease.uncounted_entry" in messages[0]
+        assert "expired_fail_open" in messages[0]
+        enforcer._http.close()
+
+    async def test_the_async_twin_warns_on_entry_and_rate_limits(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        enforcer = _make_async_enforcer(fail_open=True)
+        with respx.mock:
+            respx.post(GRANT_URL).mock(side_effect=httpx.ConnectError("down"))
+
+            with caplog.at_level("WARNING", logger="solwyn.budget"):
+                await _acheck(enforcer, call_uuid("call_1"))
+                await _acheck(enforcer, call_uuid("call_2"))
+
+        messages = _uncounted_records(caplog)
+        assert len(messages) == 1, f"the async path shares the one discipline: {messages}"
+        assert "lease.uncounted_entry" in messages[0]
+        await enforcer._http.aclose()
+
 
 # ---------------------------------------------------------------------------
 # Thread-safety scaffolding used by the renewal tests

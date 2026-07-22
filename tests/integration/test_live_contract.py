@@ -384,6 +384,36 @@ class TestLiveLeaseGrantContract:
         _surrender(lease_contract_project, payload["lease_id"], holder, payload["generation"])
 
     @pytest.mark.integration
+    def test_grant_on_a_hard_deny_project_echoes_hard_deny_posture(self, api_url: str) -> None:
+        """posture.mode is the customer's cap verdict, and it must not drift.
+
+        The §4 ladder keys share-exhaustion entirely off ``posture.mode``:
+        silent drift to ``alert_only`` would keep spending a hard_deny
+        customer's money during exactly the outage their cap exists for. Every
+        other live grant pin runs alert_only — this is the negative space, on
+        an UNDER-cap hard_deny project (so the grant carries a real lease block
+        rather than the deny shape pinned below).
+        """
+        credentials = provision_project(
+            api_url, name="sdk-lease-posture-deny", budget_limit=100.0, budget_mode="hard_deny"
+        )
+        holder = _holder_id()
+        payload = _grant(credentials, _run_id(), holder)
+
+        assert payload["eligible"] is True
+        assert payload["allowed"] is True, "an under-cap hard_deny project still gets a lease"
+        assert payload["posture"]["mode"] == "hard_deny", (
+            f"the grant must echo the project's hard_deny posture: {payload}"
+        )
+        assert payload["mode"] == "hard_deny"
+
+        parsed = LeaseGrantResponse.model_validate(payload)
+        assert parsed.posture is not None
+        assert parsed.posture.mode is BudgetMode.HARD_DENY
+
+        _surrender(credentials, payload["lease_id"], holder, payload["generation"])
+
+    @pytest.mark.integration
     def test_ineligible_grant_omits_the_lease_block(
         self, lease_contract_project: ProjectCredentials
     ) -> None:

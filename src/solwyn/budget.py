@@ -75,6 +75,15 @@ _GrantVerdict = Literal["applied", "legacy", "denied", "unreachable"]
 # unbounded stream of run UUIDs in a long-lived SDK process.
 _MAX_STICKY_RUN_DENIALS = 128
 
+# Uncounted-mode telemetry (§8): loud on ENTRY to a fail-open uncounted
+# episode, then at most one line per this interval while it persists. An
+# hour-long outage must stay visible without one warning per call.
+_UNCOUNTED_WARN_INTERVAL_S = 30.0
+
+# Same footgun as the sticky-deny map: a long-lived process must not retain an
+# episode clock per run id forever. Evicting one only costs an extra ENTRY line.
+_MAX_UNCOUNTED_EPISODES = 128
+
 # The contractual confirm tier values (derived from the ServiceTier literal,
 # never hand-copied). Adapters echo arbitrary bounded strings; only these may
 # ride the value-strict confirm wire.
@@ -170,14 +179,30 @@ class _BudgetEnforcerBase:
         # one would block a customer call — the losers take the legacy path.
         self._lease_grants_in_flight: set[str] = set()
 
+        # Uncounted-mode telemetry (§8). run_id -> monotonic time this run's
+        # CURRENT lease-death episode last warned. An absent run is not in an
+        # episode, so its next uncounted admission is an ENTRY; installing a
+        # grant ends the episode. The ledger cannot own this — it is sans-I/O
+        # and must never log.
+        self._uncounted_episodes: OrderedDict[str, float] = OrderedDict()
+
     def _reset_after_fork_in_child(self) -> None:
         """Replace the state lock in a forked child (concrete classes also swap
         the inherited HTTP client — a shared socket across processes corrupts)."""
         self._state_lock = threading.Lock()
-        # A child inherits no lease authority: the parent's grants are bound to
-        # the parent's holder id, and its in-flight renewal flags are lies here.
+        # A child inherits no lease authority: the parent's leases live in the
+        # parent's process, and its in-flight renewal flags are lies here. The
+        # child must also become a DIFFERENT holder — the client's
+        # ``_sdk_instance_id`` survives a fork unchanged, and the server
+        # releases a same-(project, run, holder) active lease as stale when a
+        # grant lands. A child re-granting under the parent's id would kill the
+        # parent's live lease, the parent's regrant would kill the child's, and
+        # a forked same-run workload would churn one blocking grant per refresh
+        # interval each. A fresh id makes the child a legitimate second holder.
+        self._lease.holder_id = str(uuid.uuid4())
         self._lease.on_fork_reset()
         self._lease_grants_in_flight = set()
+        self._uncounted_episodes = OrderedDict()
 
     def _build_check_request(
         self,
@@ -587,12 +612,17 @@ class _BudgetEnforcerBase:
     ) -> GrantOutcome:
         """Install a grant/renew response under the ledger's serialization."""
         with self._state_lock:
-            return self._lease.apply_grant_response(
+            outcome = self._lease.apply_grant_response(
                 agent_run_id,
                 response,
                 now=time.monotonic(),
                 declared_models=declared_models,
             )
+            if outcome is GrantOutcome.APPLIED:
+                # Live authority again: the uncounted episode is over, so the
+                # next lease death warns on entry as loudly as this one did.
+                self._uncounted_episodes.pop(agent_run_id, None)
+            return outcome
 
     def _classify_lease_failure(
         self, exc: Exception, agent_run_id: str, *, renewal: bool
@@ -695,6 +725,39 @@ class _BudgetEnforcerBase:
         """Tally a fail-open admission made with no lease state at all."""
         with self._state_lock:
             self._lease.record_uncounted(agent_run_id, tokens)
+
+    def _note_uncounted_admission(self, agent_run_id: str, *, reason: str) -> None:
+        """Emit the §8 uncounted-mode telemetry for one fail-open admission.
+
+        Uncounted means no counter anywhere covers the call until the run's
+        next successful renewal reports the tally — the customer must be able
+        to see that from their logs, so this is loud on ENTRY to the episode
+        (lease death or absence) and rate-limited to 1/30s while it persists.
+        The episode ends when a grant installs (``_apply_lease_response``).
+        """
+        now = time.monotonic()
+        with self._state_lock:
+            last_warned = self._uncounted_episodes.get(agent_run_id)
+            if last_warned is not None and now - last_warned < _UNCOUNTED_WARN_INTERVAL_S:
+                return
+            entry = last_warned is None
+            self._uncounted_episodes[agent_run_id] = now
+            self._uncounted_episodes.move_to_end(agent_run_id)
+            while len(self._uncounted_episodes) > _MAX_UNCOUNTED_EPISODES:
+                self._uncounted_episodes.popitem(last=False)
+
+        if entry:
+            logger.warning(
+                "lease.uncounted_entry: Solwyn is unreachable and this run holds no live "
+                "lease; calls proceed UNCOUNTED under fail_open and are tallied for the "
+                "next successful renewal to report (reason=%s)",
+                reason,
+            )
+        else:
+            logger.warning(
+                "lease.uncounted_continuing: still admitting UNCOUNTED under fail_open (reason=%s)",
+                reason,
+            )
 
     def release_reservation(self, call_id: str) -> None:
         """Hand a lease reservation back when the call will never settle.
@@ -1106,6 +1169,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                             estimated_input_tokens, estimated_output_bound
                         ),
                     )
+                    self._note_uncounted_admission(agent_run_id, reason="no_lease_unreachable")
                 return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
             if verdict != "applied":
                 return None
@@ -1134,6 +1198,10 @@ class BudgetEnforcer(_BudgetEnforcerBase):
 
         if admission.decision is LeaseDecision.LEGACY_CHECK:
             return None
+        if admission.decision is LeaseDecision.ADMIT_UNCOUNTED:
+            self._note_uncounted_admission(
+                agent_run_id, reason=admission.reason or "expired_fail_open"
+            )
         return self._result_from_admission(agent_run_id, admission)
 
     def _grant_lease(
@@ -1525,6 +1593,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                             estimated_input_tokens, estimated_output_bound
                         ),
                     )
+                    self._note_uncounted_admission(agent_run_id, reason="no_lease_unreachable")
                 return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
             if verdict != "applied":
                 return None
@@ -1552,6 +1621,10 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
 
         if admission.decision is LeaseDecision.LEGACY_CHECK:
             return None
+        if admission.decision is LeaseDecision.ADMIT_UNCOUNTED:
+            self._note_uncounted_admission(
+                agent_run_id, reason=admission.reason or "expired_fail_open"
+            )
         return self._result_from_admission(agent_run_id, admission)
 
     async def _grant_lease(
