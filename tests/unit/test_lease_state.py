@@ -846,6 +846,58 @@ class TestLeaseStateLifecycle:
 
 
 @pytest.mark.unit
+class TestDisplaySnapshot:
+    """The enforcer builds its results from the server's numbers, never its own."""
+
+    def test_snapshot_is_stored_from_a_grant(self) -> None:
+        ledger = _granted_ledger()
+
+        snapshot = ledger.snapshot_for(RUN)
+
+        assert snapshot is not None
+        assert snapshot.project_id == "proj_1"
+        assert snapshot.mode is BudgetMode.ALERT_ONLY
+        assert snapshot.budget_limit == 100.0
+        assert snapshot.current_usage == 10.0
+        assert snapshot.remaining_budget == 90.0
+
+    def test_snapshot_survives_a_deny_and_an_ineligible_verdict(self) -> None:
+        # Both carry the display snapshot; the enforcer needs those numbers
+        # for the BudgetExceededError / warning it raises.
+        denied = _ledger()
+        denied.apply_grant_response(
+            RUN,
+            _response(
+                allowed=False,
+                denied_by_period="daily",
+                current_usage=99.0,
+                remaining_budget=1.0,
+                lease_id=None,
+                generation=None,
+                granted_tokens=None,
+                refresh_interval_s=None,
+                lease_length_s=None,
+                headroom_share_tokens=None,
+                posture=None,
+                final_grant=None,
+            ),
+            now=1_000.0,
+        )
+        ineligible = _ledger()
+        ineligible.apply_grant_response(
+            RUN, _response(eligible=False, ineligible_reason="zero_rate_model"), now=1_000.0
+        )
+
+        deny_snapshot = denied.snapshot_for(RUN)
+        ineligible_snapshot = ineligible.snapshot_for(RUN)
+
+        assert deny_snapshot is not None
+        assert deny_snapshot.current_usage == 99.0
+        assert ineligible_snapshot is not None
+        assert ineligible_snapshot.budget_limit == 100.0
+
+
+@pytest.mark.unit
 class TestConcurrentBurst:
     """DoD 8: concurrent admissions can never jointly overrun the remainder."""
 

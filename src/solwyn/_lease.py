@@ -462,6 +462,7 @@ class LeaseLedger:
 
         if not response.eligible:
             self._drop_lease(state)
+            self._store_snapshot(state, response)
             state.run_ineligible = True
             state.ineligible_retry_at = math.inf
             logger.info(
@@ -528,8 +529,13 @@ class LeaseLedger:
     def mark_ineligible(self, run_id: str, *, now: float, retry_after: float | None = None) -> None:
         """Route a run to the legacy path; ``retry_after`` None means forever.
 
-        A Solwyn-side refusal (503 lease_unavailable, holder cap) must never
-        block a call — the legacy per-call path has its own fail-open.
+        A Solwyn-side refusal must never block a call — the legacy per-call
+        path has its own fail-open. Use this for a refusal of a GRANT: a 409
+        ``lease_holder_cap_exceeded`` (permanent for this run) or a 503
+        ``lease_unavailable`` (with ``retry_after=INELIGIBLE_RETRY_AFTER_S``).
+        It DROPS any installed lease, so a 503 answering a RENEWAL must NOT
+        come here — that lease stays valid until its deadline and the failure
+        belongs in ``renewal_failed`` (backoff); the ladder governs afterwards.
         """
         state = self._states.get(run_id)
         if state is None:
