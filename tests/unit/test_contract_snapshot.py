@@ -98,6 +98,7 @@ EXPECTED_CHECK_RESPONSE_FIELDS = {
 
 EXPECTED_CONFIRM_FIELDS = {
     "reservation_id",
+    "lease_id",
     "model",
     "provider",
     "modality",
@@ -112,7 +113,9 @@ EXPECTED_CONFIRM_FIELDS = {
 # The optional confirm fields the None-skipping serializer drops when unset —
 # bearer-key providers' confirm wire bytes stay byte-identical to pre-Bedrock;
 # media_usage (window 2) is dropped on every chat/token confirm the same way.
-_NONE_SKIPPED_CONFIRM_FIELDS = {"provider_region", "service_tier", "media_usage"}
+# lease_id is dropped on every reservation-settled confirm (the settlement key
+# is exactly-one-of, enforced by a model validator).
+_NONE_SKIPPED_CONFIRM_FIELDS = {"provider_region", "service_tier", "media_usage", "lease_id"}
 
 # Provider identifiers ARE wire values (events/confirms/checks carry them).
 # Adding one is an API-first deploy: the Cloud API must accept it BEFORE any
