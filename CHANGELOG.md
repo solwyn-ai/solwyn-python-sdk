@@ -9,6 +9,30 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **`check_budget` gained `call_id` and `estimated_output_bound`** (both
+  keyword-only, both optional). `call_id` keys the in-process lease
+  reservation the call draws down so settlement can true it up against actual
+  usage — the same id the confirm and the metadata event already join on, now
+  threaded one step earlier. `estimated_output_bound` is the call's own
+  `max_tokens`-family cap, which sizes the output half of that reservation; a
+  call that declares no cap reserves `lease_output_bound_default` instead. A
+  caller that supplies neither still admits — the enforcer mints a `call_id`
+  and falls back to the default bound — so the signature is additive for
+  anyone driving the enforcer directly.
+- **`build_confirm_request` is now fully keyword-only and its settlement key
+  is exclusive.** `reservation_id` moved from a required positional to an
+  optional keyword and gained a sibling, `lease_id`: a confirm settles EITHER
+  a per-call reservation or a lease, never both, matching the API's new
+  exactly-one-of validator. Building a lease-keyed confirm also trues the
+  call's local reservation up from its bound to actual token usage, so the
+  in-memory remainder and the server's float move on the same event. Lease
+  authority wins if a caller somehow passes both keys — the authority the call
+  actually drew down is the one that must be settled.
+- **`BudgetCheckResult` gained `lease_id`**, set when the call was admitted on
+  lease authority instead of a per-call reservation. Callers thread whichever
+  of `reservation_id` / `lease_id` is populated straight into
+  `build_confirm_request`; exactly one of them is ever non-`None`.
+
 - **`call_id` now pins the canonical UUID text form** on both wires that carry
   it — `BudgetConfirmRequest.call_id` and `MetadataEvent.call_id` — matching
   what the API has required since its idempotency ledger landed
@@ -153,6 +177,72 @@ derived from git tags (hatch-vcs).
 
 ### Added
 
+- **Run-scoped token leases replace the per-call `/budgets/check` on the hot
+  path.** A call carrying an `agent_run_id` used to pay a blocking budget
+  round-trip to Solwyn before every provider request. The enforcer now takes
+  ONE server-granted lease per run (`POST /api/v1/budgets/lease`), draws it
+  down in memory, renews it ahead of need off the caller's thread
+  (`/budgets/lease/renew`), and hands it back when the run is done
+  (`/budgets/lease/surrender`) — the DHCP shape, with the same reason for
+  being: authority is delegated for a bounded window so the client can keep
+  serving without asking permission per call. The lease is denominated in
+  TOKENS, never dollars; the server folds price into `granted_tokens` and the
+  SDK still never computes cost. Admission is a sans-I/O state machine
+  (`_lease.py`) shared by the sync and async enforcers: each call atomically
+  reserves `estimated_input + output_bound` out of the granted remainder under
+  one lock, and settlement trues that reservation up to actual usage
+  (overshoot may drive the remainder negative — the next renewal nets it out).
+  A reservation stranded by an error path that never settles is swept at 900s.
+  Renewals are ALWAYS asynchronous — a thread for the sync enforcer, a task
+  for the async one — and are driven by admission (≥75% depleted, or the
+  refresh deadline passed) rather than by a timer, so an idle run costs
+  nothing: breaker-guarded, jittered, one in flight at a time, with 1s→30s
+  full-jitter backoff. Every grant carries a `generation`, and a response
+  applies only if its generation exceeds the local one, so a slow renewal
+  landing out of order can never rewind the ledger. A grant that arrives
+  `final_grant=True` logs a wind-down warning; a deny verdict at grant or
+  renewal feeds the existing sticky-deny machinery unchanged.
+- **The lease admission ladder never lets a Solwyn outage block a customer
+  call.** Every deny the lease path can produce traces to a customer-chosen
+  verdict, never to unreachability. With the granted remainder exhausted and
+  the control plane believed UP, the call falls back to today's per-call
+  check — an empty wallet is not a refusal, and the server stays
+  authoritative. With the plane unreachable, the call draws instead on
+  `headroom_share_tokens`, the run's apportioned slice of real remaining
+  headroom: admitted with a warning, still metered. Only when that share is
+  genuinely exhausted does the CUSTOMER's own mode decide — `hard_deny`
+  denies, `alert_only` admits and warns. Past the lease deadline with the
+  plane still down, the grant's `posture.on_unreachable` (the client's own
+  configured `fail_open`, echoed back by the server so the grant is one
+  self-describing artifact) picks the floor: `fail_open` admits UNCOUNTED,
+  warning once on entry to the episode and then at most 1/30s, tallying every
+  such call for the next successful renewal to report; `local_enforce` meters
+  against the freshest known share remainder and denies at the customer's mode
+  when it is spent. Structured refusals are absorbed rather than propagated: a
+  `409 lease_holder_cap_exceeded` marks the run lease-ineligible (legacy path),
+  `404 lease_not_found` / `409 lease_generation_conflict` drop the local lease
+  so the next admission asks for a fresh grant, and `503 lease_unavailable`
+  parks lease attempts for 30s while the legacy path — which has its own
+  fail-open — carries the traffic. Non-run calls, non-text modalities, calls
+  carrying `estimated_media`, and calls whose model or fallback chain is
+  outside the lease's declared set take the legacy per-call path automatically.
+- **A held lease is handed back at close AND at interpreter exit.** The
+  enforcer's `close()` surrenders every live lease best-effort on a short
+  timeout, and the shipped `atexit` machinery does the same for a process that
+  exits without closing — DHCPRELEASE, not merely a flush: surrendering lets
+  the server re-lend the float immediately instead of waiting out the lease
+  deadline. Exit surrenders ride the control-plane breaker's admission exactly
+  like exit confirms (a known-down plane refuses them instantly) and run on a
+  daemon worker joined at a wall-clock deadline, so an unreachable Solwyn can
+  never hold up process exit. Unlike queued spend, nothing here is worth
+  waiting for — an unsurrendered lease expires on the server anyway.
+- **New lease knobs (with `SOLWYN_*` env vars):** `lease_enabled`
+  (`SOLWYN_LEASE_ENABLED`, default `True`) is the kill switch — `False` routes
+  every call back to the per-call check path, with no lease state built at all;
+  `lease_output_bound_default` (`SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT`, default
+  `4096`) bounds the output half of a reservation for a call that declares no
+  `max_tokens`-family cap, and defaults to the ledger's own constant so the two
+  can never drift.
 - **New reporter delivery knobs (with `SOLWYN_*` env vars):**
   `reporter_max_send_attempts` (`SOLWYN_REPORTER_MAX_SEND_ATTEMPTS`, default
   `5`), `reporter_retry_backoff_base` (`SOLWYN_REPORTER_RETRY_BACKOFF_BASE`,
