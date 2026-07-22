@@ -696,7 +696,17 @@ class LeaseGrantResponse(BaseModel):
             "Deny-only; omitted on allow responses."
         ),
     )
-    lease_id: str | None = Field(default=None, description="Granted lease id")
+    lease_id: str | None = Field(
+        default=None,
+        max_length=LEASE_ID_MAX_LENGTH,
+        description=(
+            "Granted lease id. Bounded lock-step with the renew/surrender "
+            "REQUEST bound: a drifted id must fail HERE, where the enforcer "
+            "treats a malformed grant as ineligible and drops to the per-call "
+            "path, not later when the renewal/surrender request is built on a "
+            "customer call."
+        ),
+    )
     generation: int | None = Field(
         default=None, description="Grant generation — starts at 1, +1 per renewal (fencing)"
     )

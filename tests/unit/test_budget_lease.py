@@ -11,6 +11,7 @@ what actually reached the wire.
 from __future__ import annotations
 
 import asyncio
+import random
 import threading
 import time
 from types import SimpleNamespace
@@ -25,6 +26,7 @@ from httpx import Response
 import solwyn as solwyn_pkg
 from solwyn import _lifecycle
 from solwyn._base import MediaSurfaceSpec
+from solwyn._lease import INELIGIBLE_RETRY_AFTER_S
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetMode
 from solwyn.budget import AsyncBudgetEnforcer, BudgetCheckResult, BudgetEnforcer
@@ -135,6 +137,38 @@ async def _acheck(enforcer: AsyncBudgetEnforcer, call_id: str, **overrides: obje
     }
     kwargs.update(overrides)
     return await enforcer.check_budget(**kwargs)  # type: ignore[arg-type]
+
+
+class _MaxJitter(random.Random):
+    """An RNG whose ``uniform`` always returns the ceiling.
+
+    The ledger samples full-jitter backoffs from ``uniform(0, ceiling)``; a
+    near-zero sample would let the very next admission retry a renewal the
+    test expects to be suppressed. Pinning the ceiling makes the backoff
+    assertions deterministic (the ledger takes an ``rng`` seam for exactly
+    this reason — the enforcer just does not plumb it through).
+    """
+
+    def uniform(self, a: float, b: float) -> float:
+        return b
+
+
+class _FakeClock:
+    """A controllable stand-in for the ``time`` module inside ``budget.py``.
+
+    ``budget.py`` reads ``time.monotonic()`` at call time, so swapping the
+    module reference drives every deadline the enforcer computes (retry
+    floors, cache expiry) without touching the real clock.
+    """
+
+    def __init__(self) -> None:
+        self._now = time.monotonic()
+
+    def monotonic(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
 
 
 def _wait_for(predicate, timeout: float = 3.0) -> bool:
@@ -344,7 +378,8 @@ class TestLeaseRefusals:
 
     def test_lease_unavailable_retries_the_grant_only_after_the_floor(self) -> None:
         enforcer = _make_enforcer()
-        with respx.mock:
+        clock = _FakeClock()
+        with respx.mock, patch("solwyn.budget.time", clock):
             grant = respx.post(GRANT_URL).mock(
                 return_value=Response(503, json={"detail": {"code": "lease_unavailable"}})
             )
@@ -354,9 +389,37 @@ class TestLeaseRefusals:
 
             for index in range(3):
                 _check(enforcer, f"call_{index}")
+            suppressed = grant.call_count
 
-        assert grant.call_count == 1
+            # Past the retry floor the run is eligible to ask again — the 503
+            # parks the grant for 30s, it does not disable the run for good.
+            clock.advance(INELIGIBLE_RETRY_AFTER_S + 1.0)
+            _check(enforcer, "call_after_floor")
+
+        assert suppressed == 1
+        assert grant.call_count == 2
+        assert check.call_count == 4
+        enforcer._http.close()
+
+    def test_a_drifted_lease_id_degrades_to_the_legacy_path(self) -> None:
+        # A server lease id longer than the wire bound must be caught where
+        # every other malformed grant body is — at install, degrading to the
+        # per-call path — and must NEVER raise out of check_budget().
+        enforcer = _make_enforcer()
+        with respx.mock:
+            grant = respx.post(GRANT_URL).mock(
+                return_value=Response(200, json=_grant_payload(lease_id="x" * 65))
+            )
+            check = respx.post(CHECK_URL).mock(
+                return_value=Response(200, json=ALLOW_BUDGET_RESPONSE)
+            )
+
+            results = [_check(enforcer, f"call_{index}") for index in range(3)]
+
+        assert all(result.allowed and result.lease_id is None for result in results)
+        assert grant.call_count == 1  # then the 30s ineligible window holds
         assert check.call_count == 3
+        assert enforcer._lease.lease_id_for(RUN) is None
         enforcer._http.close()
 
     def test_grant_deny_is_authoritative_and_becomes_sticky(self) -> None:
@@ -476,6 +539,11 @@ class TestLeaseRenewal:
             for index in range(3):
                 assert _check(enforcer, f"call_{index}").lease_id == "lease_1"
             assert _wait_for(lambda: renew.call_count == 1)
+            state = enforcer._lease.state_for(RUN)
+            assert state is not None
+            # The worker applies OFF this thread — wait for the install before
+            # asserting on it (the admission below needs no such wait).
+            assert _wait_for(lambda: state.generation == 2)
             # The renewal restored the grant, so the 4th call still admits.
             assert _check(enforcer, "call_3").lease_id == "lease_1"
 
@@ -488,8 +556,6 @@ class TestLeaseRenewal:
         assert payload["lease_id"] == "lease_1"
         assert payload["holder_id"] == "sdk_instance_1"
         assert payload["generation"] == 1
-        state = enforcer._lease.state_for(RUN)
-        assert state is not None
         assert state.generation == 2
         enforcer._http.close()
 
@@ -555,6 +621,7 @@ class TestLeaseRenewal:
 
     def test_a_failed_renewal_backs_off_instead_of_retrying_per_call(self) -> None:
         enforcer = _make_enforcer()
+        enforcer._lease._rng = _MaxJitter()
         with respx.mock:
             respx.post(GRANT_URL).mock(
                 return_value=Response(200, json=_grant_payload(granted_tokens=2_400))
@@ -565,14 +632,17 @@ class TestLeaseRenewal:
             for index in range(3):
                 _check(enforcer, f"call_{index}")
             assert _wait_for(lambda: renew.call_count == 1)
+            state = enforcer._lease.state_for(RUN)
+            assert state is not None
+            # The worker records its verdict off this thread; wait for it, or
+            # the "no second renewal" assertion below proves nothing.
+            assert _wait_for(lambda: state.consecutive_failures == 1)
             # Every later admission is still >=75% depleted; the backoff must
             # stop them turning into a renewal per call.
             for index in range(3, 6):
                 _check(enforcer, f"call_{index}")
 
         assert renew.call_count == 1
-        state = enforcer._lease.state_for(RUN)
-        assert state is not None
         assert state.lease_id == "lease_1"
         assert state.consecutive_failures == 1
         assert state.next_attempt_at > 0.0
@@ -600,6 +670,64 @@ class TestLeaseRenewal:
         assert after.warning is not None
         assert "preserving prior hard deny" in after.warning.lower()
         assert check.call_count == 1
+        enforcer._http.close()
+
+    def test_a_stale_generation_renewal_arms_the_backoff_and_keeps_the_lease(self) -> None:
+        # The frozen ledger returns STALE *before* clearing renewal_in_flight,
+        # so the enforcer must clear it under a backoff — otherwise the run
+        # never renews again and silently coasts to expiry.
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(
+                return_value=Response(200, json=_grant_payload(granted_tokens=2_400))
+            )
+            # The renewal re-delivers the CURRENT generation (1), which cannot
+            # install over itself.
+            renew = respx.post(RENEW_URL).mock(
+                return_value=Response(200, json=_grant_payload(generation=1))
+            )
+            respx.post(CHECK_URL).mock(return_value=Response(200, json=ALLOW_BUDGET_RESPONSE))
+
+            for index in range(3):
+                _check(enforcer, f"call_{index}")
+            assert _wait_for(lambda: renew.call_count == 1)
+            state = enforcer._lease.state_for(RUN)
+            assert state is not None
+            assert _wait_for(lambda: state.consecutive_failures == 1)
+            assert state.renewal_in_flight is False
+
+        assert state.lease_id == "lease_1"
+        assert state.generation == 1
+        assert state.granted_tokens == 2_400  # nothing was re-installed
+        assert state.consecutive_failures == 1
+        assert state.next_attempt_at > 0.0
+        assert renew.call_count == 1
+        enforcer._http.close()
+
+    def test_a_renewal_worker_that_cannot_start_never_wedges_the_lease(self) -> None:
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(
+                return_value=Response(200, json=_grant_payload(granted_tokens=2_400))
+            )
+            renew = respx.post(RENEW_URL).mock(return_value=Response(200, json=_grant_payload()))
+            respx.post(CHECK_URL).mock(return_value=Response(200, json=ALLOW_BUDGET_RESPONSE))
+
+            for index in range(2):
+                _check(enforcer, f"warm_{index}")
+            with patch.object(
+                threading.Thread, "start", side_effect=RuntimeError("can't start new thread")
+            ):
+                # Thread exhaustion must not raise into the customer's call...
+                assert _check(enforcer, "call_2").allowed is True
+
+        state = enforcer._lease.state_for(RUN)
+        assert state is not None
+        assert renew.call_count == 0
+        # ...and must not leave the lease believing a renewal is in flight.
+        assert state.renewal_in_flight is False
+        assert state.consecutive_failures == 1
+        assert state.next_attempt_at > 0.0
         enforcer._http.close()
 
     async def test_async_renewal_runs_as_a_task(self) -> None:
@@ -686,6 +814,67 @@ class TestLeaseSurrender:
             await enforcer.close()
 
             assert surrender.call_count == 1
+
+    def test_close_bounds_all_renewal_joins_by_one_shared_deadline(self) -> None:
+        # Three runs with parked renewals must cost ONE deadline at close, not
+        # one per run (parity with the async close's single asyncio.wait).
+        enforcer = _make_enforcer()
+        release = threading.Event()
+        in_flight = threading.Semaphore(0)
+
+        def _parked_renewal(request: httpx.Request) -> Response:
+            in_flight.release()
+            release.wait(timeout=10.0)
+            return Response(200, json=_grant_payload(generation=2))
+
+        try:
+            with respx.mock:
+                respx.post(GRANT_URL).mock(
+                    return_value=Response(200, json=_grant_payload(granted_tokens=2_400))
+                )
+                respx.post(RENEW_URL).mock(side_effect=_parked_renewal)
+                respx.post(SURRENDER_URL).mock(return_value=Response(200, json={}))
+                respx.post(CHECK_URL).mock(return_value=Response(200, json=ALLOW_BUDGET_RESPONSE))
+
+                for run in ("run_a", "run_b", "run_c"):
+                    for index in range(3):
+                        _check(enforcer, f"{run}_{index}", agent_run_id=run)
+                for _ in range(3):
+                    assert in_flight.acquire(timeout=3.0)
+
+                started = time.monotonic()
+                enforcer.close()
+                elapsed = time.monotonic() - started
+        finally:
+            release.set()
+
+        assert elapsed < 2.0  # one 1s deadline, not three
+
+    def test_exit_surrender_is_bounded_by_wall_clock_not_socket_timeouts(self) -> None:
+        # A trickling server must not hold interpreter exit past the budget:
+        # the drain runs on a daemon worker JOINED at the deadline, the same
+        # bound the reporter's exit flush uses.
+        enforcer = _make_enforcer(holder_id="slow_holder")
+        release = threading.Event()
+
+        def _trickle(request: httpx.Request) -> Response:
+            release.wait(timeout=10.0)
+            return Response(200, json={})
+
+        try:
+            with respx.mock:
+                respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+                respx.post(SURRENDER_URL).mock(side_effect=_trickle)
+
+                _check(enforcer, "call_1")
+                started = time.monotonic()
+                _lifecycle._exit_surrender_all()
+                elapsed = time.monotonic() - started
+        finally:
+            release.set()
+
+        assert elapsed < _lifecycle._EXIT_SURRENDER_BUDGET_S + 1.5
+        enforcer._http.close()
 
     def test_exit_hook_surrenders_a_lease_the_process_still_holds(self) -> None:
         enforcer = _make_enforcer(holder_id="exit_holder")

@@ -336,6 +336,14 @@ class TestLeaseGrantResponse:
             with pytest.raises(ValidationError):
                 LeaseGrantResponse.model_validate(payload)
 
+    def test_rejects_lease_id_over_64_chars(self) -> None:
+        # The RESPONSE bound mirrors the renew/surrender REQUEST bound: a
+        # drifted server lease id must be rejected HERE, where the enforcer
+        # already degrades to the legacy path, instead of detonating later
+        # when the renewal or surrender request is built on a customer call.
+        with pytest.raises(ValidationError):
+            LeaseGrantResponse.model_validate(dict(_FULL_RESPONSE, lease_id="x" * 65))
+
     def test_rejects_extra_fields(self) -> None:
         with pytest.raises(ValidationError):
             LeaseGrantResponse.model_validate(dict(_FULL_RESPONSE, surprise=1))

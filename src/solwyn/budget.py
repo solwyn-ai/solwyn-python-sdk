@@ -1223,7 +1223,17 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         with self._state_lock:
             self._renewal_threads = {t for t in self._renewal_threads if t.is_alive()}
             self._renewal_threads.add(thread)
-        thread.start()
+        try:
+            thread.start()
+        except Exception as exc:
+            # Thread exhaustion (or an interpreter shutting down) must not
+            # leave the lease believing a renewal is in flight: that flag is
+            # what suppresses the next attempt, so without this the run coasts
+            # to expiry without ever renewing again.
+            logger.warning("lease.renew_dispatch_failed: %s", type(exc).__name__)
+            with self._state_lock:
+                self._renewal_threads.discard(thread)
+                self._lease.renewal_failed(agent_run_id, time.monotonic())
 
     def _renew_lease(
         self,
@@ -1298,10 +1308,12 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         """Surrender held leases, then close the underlying HTTP client."""
         with self._state_lock:
             threads = list(self._renewal_threads)
+        # ONE shared deadline across every join (parity with the async close's
+        # single asyncio.wait): letting in-flight renewals land keeps the
+        # server's view fresh, but N leased runs must not cost N timeouts.
+        drain_deadline = time.monotonic() + _SURRENDER_TIMEOUT_S
         for thread in threads:
-            # Bounded: a renewal in flight when the transport closes would only
-            # log a failure, but letting it land keeps the server's view fresh.
-            thread.join(timeout=_SURRENDER_TIMEOUT_S)
+            thread.join(timeout=max(0.0, drain_deadline - time.monotonic()))
         self._surrender_leases()
         self._http.close()
 

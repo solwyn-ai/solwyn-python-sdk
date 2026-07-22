@@ -217,40 +217,65 @@ def _exit_surrender_all() -> None:
     Runs AFTER the reporter flush — settled spend is the durable truth and owns
     the shutdown deadline; this is the DHCPRELEASE-style courtesy that lets the
     server re-lend the float immediately instead of waiting out the lease. It
-    is breaker-admission gated exactly like exit confirms and bounded by its
-    own small deadline, so a down control plane costs the exiting process one
-    refused admission, not a hang. Both enforcer flavours are drained over a
-    temporary SYNC client: no event loop exists at interpreter exit.
+    is breaker-admission gated exactly like exit confirms. Both enforcer
+    flavours are drained over a temporary SYNC client: no event loop exists at
+    interpreter exit.
+
+    The budget is a TRUE WALL-CLOCK bound, the same way the reporter's exit
+    flush gets one: the releases run on a daemon worker JOINED at the deadline.
+    httpx timeouts cap socket operations, not total response time, so a
+    trickling server would otherwise hold exit well past the budget — and
+    unlike spend, nothing here is worth waiting for (an unsurrendered lease is
+    simply reclaimed at its deadline). Nothing needs counting when the join
+    times out: the payloads were already drained out of the ledger, and the
+    server reclaims what it never heard about.
     """
     holders = list(_LIVE_LEASE_HOLDERS)
     if not holders:
         return
     deadline = _monotonic() + _EXIT_SURRENDER_BUDGET_S
-    client: httpx.Client | None = None
+
+    def _run() -> None:
+        client: httpx.Client | None = None
+        try:
+            for holder in holders:
+                try:
+                    payloads = holder.lease_surrender_payloads()
+                except Exception as exc:
+                    logger.warning(
+                        "lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__
+                    )
+                    continue
+                for request in payloads:
+                    if _monotonic() >= deadline:
+                        logger.debug("lifecycle.exit_surrender_expired")
+                        return
+                    if client is None:
+                        client = httpx.Client(timeout=5.0)
+                    _post_confirm_blocking(
+                        client,
+                        f"{holder.api_url}/api/v1/budgets/lease/surrender",
+                        request.model_dump(mode="json"),
+                        holder._auth_headers(),
+                        holder._control_plane_breaker,
+                        deadline,
+                    )
+        except Exception as exc:  # the exit hook must never raise
+            logger.warning("lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__)
+        finally:
+            if client is not None:
+                # Best-effort transport teardown (NOT the bound — the join is).
+                client.close()
+
+    # At interpreter shutdown new threads can be refused; the inline fallback
+    # keeps the per-request deadline clamps as the only bound there.
     try:
-        for holder in holders:
-            try:
-                payloads = holder.lease_surrender_payloads()
-            except Exception as exc:
-                logger.warning("lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__)
-                continue
-            for request in payloads:
-                if _monotonic() >= deadline:
-                    logger.debug("lifecycle.exit_surrender_expired")
-                    return
-                if client is None:
-                    client = httpx.Client(timeout=5.0)
-                _post_confirm_blocking(
-                    client,
-                    f"{holder.api_url}/api/v1/budgets/lease/surrender",
-                    request.model_dump(mode="json"),
-                    holder._auth_headers(),
-                    holder._control_plane_breaker,
-                    deadline,
-                )
-    finally:
-        if client is not None:
-            client.close()
+        worker = threading.Thread(target=_run, daemon=True, name="solwyn-exit-surrender")
+        worker.start()
+    except RuntimeError:
+        _run()
+    else:
+        worker.join(timeout=max(0.0, deadline - _monotonic()))
 
 
 def _gc_drop_counter(kind: str, reason: str, n: int = 1) -> None:
