@@ -302,6 +302,10 @@ class TestGrantApplication:
         admission = _admit(ledger)
 
         assert admission.decision is LeaseDecision.LEGACY_CHECK
+        # ...and it must NOT read as fully depleted: a zero grant is depleted
+        # by definition, so a ratio test would ask for a renewal on every
+        # single call — the opposite of bounded round-trips.
+        assert admission.renewal_due is False
 
 
 @pytest.mark.unit
@@ -325,6 +329,19 @@ class TestLiveLeaseAdmission:
         ledger.apply_grant_response(RUN, _response(), now=1_000.0, declared_models=["gpt-5.5"])
 
         admission = _admit(ledger, estimated_input_tokens=1_000)
+
+        assert admission.reserved_tokens == 3_048
+
+    @pytest.mark.parametrize("bound", [0, -1])
+    def test_a_non_positive_output_bound_falls_back_to_the_default(self, bound: int) -> None:
+        # A caller cap of 0/negative is nonsense, and honoring it would reserve
+        # the input estimate alone — an unbounded response could then overrun
+        # the remainder with nothing standing behind it. Deliberate: fall back
+        # to the configured bound rather than trust an absurd cap.
+        ledger = _ledger(output_bound_default=2_048)
+        ledger.apply_grant_response(RUN, _response(), now=1_000.0, declared_models=["gpt-5.5"])
+
+        admission = _admit(ledger, estimated_input_tokens=1_000, output_bound=bound)
 
         assert admission.reserved_tokens == 3_048
 
@@ -426,7 +443,12 @@ class TestOutageLadderExpiredLease:
 
         assert first.decision is LeaseDecision.ADMIT_UNCOUNTED
         assert first.warning is not None
+        # An uncounted call settles against NOTHING: its spend is owed through
+        # the uncounted tally, so tagging a confirm with the dead lease would
+        # double-count it server-side.
+        assert first.lease_id is None
         assert second.decision is LeaseDecision.ADMIT_UNCOUNTED
+        assert second.lease_id is None
         state = ledger.state_for(RUN)
         assert state is not None
         assert state.uncounted_calls == 2
@@ -626,6 +648,38 @@ class TestReservationLifecycle:
         assert "abandoned" not in state.reservations
         assert state.granted_remaining_tokens == 100_000 - 1_500
 
+    def test_a_repeated_call_id_releases_the_orphaned_reservation(self) -> None:
+        # Nothing on today's call path re-admits the same call_id, but a silent
+        # orphan would strand tokens until the 900s sweep.
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="dup", estimated_input_tokens=1_000, output_bound=500)
+
+        _admit(ledger, call_id="dup", estimated_input_tokens=1_000, output_bound=500)
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert len(state.reservations) == 1
+        assert state.granted_remaining_tokens == 100_000 - 1_500
+
+    def test_superseded_reservations_do_not_inflate_the_demand_hint(self) -> None:
+        # A reservation funded by a dropped lease no-ops at true-up; it must
+        # not be reported to the server as live demand either.
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="old", estimated_input_tokens=1_000, output_bound=500)
+        ledger.drop(RUN)
+        ledger.apply_grant_response(
+            RUN,
+            _response(lease_id="lse_new", generation=1),
+            now=1_010.0,
+            declared_models=["gpt-5.5"],
+        )
+        _admit(ledger, call_id="new", estimated_input_tokens=1_000, output_bound=500, now=1_011.0)
+
+        request = ledger.build_renewal_request(RUN)
+
+        assert request is not None
+        assert request.reserved_tokens == 1_500
+
     def test_fresh_reservations_are_not_swept(self) -> None:
         ledger = _granted_ledger()
         _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
@@ -715,8 +769,8 @@ class TestRenewalBookkeeping:
         ledger = _granted_ledger()
         state = ledger.state_for(RUN)
         assert state is not None
-        state.uncounted_calls = 3
-        state.uncounted_tokens = 900
+        for _ in range(3):
+            ledger.record_uncounted(RUN, 300)
         _admit(ledger, call_id="settled", estimated_input_tokens=1_000, output_bound=500)
         ledger.true_up("settled", 800)
         _admit(ledger, call_id="in-flight", estimated_input_tokens=1_000, output_bound=500)
@@ -755,8 +809,8 @@ class TestRenewalBookkeeping:
         ledger.true_up("a", 800)
         state = ledger.state_for(RUN)
         assert state is not None
-        state.uncounted_calls = 2
-        state.uncounted_tokens = 500
+        for _ in range(2):
+            ledger.record_uncounted(RUN, 250)
 
         request = ledger.build_renewal_request(RUN)
         assert request is not None
@@ -775,8 +829,8 @@ class TestRenewalBookkeeping:
         ledger = _granted_ledger()
         state = ledger.state_for(RUN)
         assert state is not None
-        state.uncounted_calls = 2
-        state.uncounted_tokens = 500
+        for _ in range(2):
+            ledger.record_uncounted(RUN, 250)
         ledger.build_renewal_request(RUN)
 
         ledger.renewal_failed(RUN, now=1_010.0)
@@ -811,8 +865,8 @@ class TestLeaseStateLifecycle:
         ledger = _granted_ledger()
         state = ledger.state_for(RUN)
         assert state is not None
-        state.uncounted_calls = 4
-        state.uncounted_tokens = 1_000
+        for _ in range(4):
+            ledger.record_uncounted(RUN, 250)
 
         ledger.drop(RUN)
 
@@ -843,6 +897,95 @@ class TestLeaseStateLifecycle:
         assert ledger.state_for(RUN) is None
         assert ledger.active_run_ids() == []
         assert _admit(ledger).decision is LeaseDecision.NEED_GRANT
+
+
+@pytest.mark.unit
+class TestUncountedTally:
+    """Cold start with the plane down still owes the server a tally."""
+
+    def test_record_uncounted_creates_state_for_an_unknown_run(self) -> None:
+        # Plan step 4: a cold-start grant attempt against an unreachable plane
+        # under fail_open admits UNCOUNTED — there is no lease to tally against.
+        ledger = _ledger()
+
+        ledger.record_uncounted(RUN, 5_096)
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.uncounted_calls == 1
+        assert state.uncounted_tokens == 5_096
+        assert state.has_lease is False
+
+    def test_cold_start_tallies_ride_the_first_renewal_of_a_later_lease(self) -> None:
+        # Arrange — two uncounted cold-start calls, then the plane comes back
+        # and grants a lease.
+        ledger = _ledger()
+        ledger.record_uncounted(RUN, 5_096)
+        ledger.record_uncounted(RUN, 2_000)
+        ledger.apply_grant_response(RUN, _response(), now=1_000.0, declared_models=["gpt-5.5"])
+
+        # Act
+        request = ledger.build_renewal_request(RUN)
+
+        # Assert — the debt survived the grant and is reported.
+        assert request is not None
+        assert request.uncounted_calls == 2
+        assert request.uncounted_tokens == 7_096
+
+    def test_record_uncounted_ignores_a_negative_token_count(self) -> None:
+        ledger = _ledger()
+
+        ledger.record_uncounted(RUN, -100)
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.uncounted_calls == 1
+        assert state.uncounted_tokens == 0
+
+
+@pytest.mark.unit
+class TestDeclaredModelSet:
+    """The declared set belongs to ONE lease — a new lease never inherits it."""
+
+    def test_a_new_lease_replaces_the_previous_declared_set(self) -> None:
+        # Arrange — lease L1 declared model A; it is dropped (404/expiry) and
+        # lease L2 is granted declaring only model B. The server folded L2's
+        # worst-case rate over {B} alone, so A must not ride L2.
+        ledger = _ledger()
+        ledger.apply_grant_response(RUN, _response(), now=1_000.0, declared_models=["model-a"])
+        ledger.drop(RUN)
+        ledger.apply_grant_response(
+            RUN,
+            _response(lease_id="lse_2", generation=1),
+            now=1_010.0,
+            declared_models=["model-b"],
+        )
+
+        # Act
+        stale = _admit(ledger, model="model-a", now=1_011.0)
+        fresh = _admit(ledger, call_id="b", model="model-b", now=1_011.0)
+
+        # Assert
+        assert stale.decision is LeaseDecision.LEGACY_CHECK
+        assert stale.reason == "model_outside_declared_set"
+        assert fresh.decision is LeaseDecision.ADMIT_LOCAL
+
+    def test_a_renewal_of_the_same_lease_unions_the_declared_set(self) -> None:
+        # The server UNIONS a re-declaration into the lease's declared set, so
+        # the holder must too — and a renewal that re-declares nothing keeps it.
+        ledger = _ledger()
+        ledger.apply_grant_response(RUN, _response(), now=1_000.0, declared_models=["model-a"])
+
+        ledger.apply_grant_response(
+            RUN, _response(generation=2), now=1_010.0, declared_models=["model-b"]
+        )
+        ledger.apply_grant_response(RUN, _response(generation=3), now=1_020.0)
+
+        assert _admit(ledger, model="model-a", now=1_021.0).decision is LeaseDecision.ADMIT_LOCAL
+        assert (
+            _admit(ledger, call_id="b", model="model-b", now=1_021.0).decision
+            is LeaseDecision.ADMIT_LOCAL
+        )
 
 
 @pytest.mark.unit

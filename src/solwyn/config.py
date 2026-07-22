@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from solwyn._lease import DEFAULT_OUTPUT_BOUND
 from solwyn._types import BudgetMode, ProviderEntry
 from solwyn._validation import validate_project_key_format
 from solwyn.exceptions import ConfigurationError
@@ -71,9 +72,10 @@ class SolwynConfig(BaseModel):
     # server-granted token lease in memory instead of paying a blocking
     # /budgets/check per call. Kill switch — False routes every call back to
     # the per-call check path. lease_output_bound_default bounds a call's
-    # reservation when it carries no max_tokens-family cap.
+    # reservation when it carries no max_tokens-family cap; it defaults to the
+    # ledger's own constant so the two can never drift.
     lease_enabled: bool = True
-    lease_output_bound_default: int = Field(default=4096, gt=0)
+    lease_output_bound_default: int = Field(default=DEFAULT_OUTPUT_BOUND, gt=0)
 
     # Control-plane breaker: after this many consecutive check/confirm
     # failures against Solwyn's own API, skip the network call and apply the

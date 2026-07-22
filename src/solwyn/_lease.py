@@ -58,10 +58,14 @@ REFRESH_JITTER_MAX = 1.15
 BACKOFF_BASE_S = 1.0
 BACKOFF_CAP_S = 30.0
 
-_POOL_GRANTED = "granted"
-_POOL_SHARE = "share"
-
 OnUnreachable = Literal["fail_open", "local_enforce"]
+
+
+class _Pool(StrEnum):
+    """Which counter a reservation drew from — never a bare string."""
+
+    GRANTED = "granted"
+    SHARE = "share"
 
 
 class LeaseDecision(StrEnum):
@@ -142,7 +146,7 @@ class _Reservation:
     lease_id: str
     tokens: int
     created_at: float
-    pool: str
+    pool: _Pool
 
 
 @dataclass(slots=True)
@@ -191,8 +195,16 @@ class LeaseState:
 
     @property
     def reserved_tokens(self) -> int:
-        """Currently in-flight reservation total (renewal demand hint)."""
-        return sum(reservation.tokens for reservation in self.reservations.values())
+        """In-flight reservations funded by the CURRENT lease (demand hint).
+
+        A superseded lease's leftovers no-op at true-up; counting them would
+        inflate the demand the server sizes the next grant from.
+        """
+        return sum(
+            reservation.tokens
+            for reservation in self.reservations.values()
+            if reservation.lease_id == self.lease_id
+        )
 
     def covers(self, model: str, fallback_models: Sequence[str]) -> bool:
         """True when every model the call may reach is in the declared set."""
@@ -310,7 +322,7 @@ class LeaseLedger:
         """Step 5: the grant is unexpired — granted remainder, then share."""
         if state.granted_remaining_tokens >= reserve:
             state.granted_remaining_tokens -= reserve
-            self._reserve(state, call_id, reserve, now, _POOL_GRANTED)
+            self._reserve(state, call_id, reserve, now, _Pool.GRANTED)
             return LeaseAdmission(
                 LeaseDecision.ADMIT_LOCAL,
                 lease_id=state.lease_id,
@@ -329,7 +341,7 @@ class LeaseLedger:
 
         if state.share_remaining_tokens >= reserve:
             state.share_remaining_tokens -= reserve
-            self._reserve(state, call_id, reserve, now, _POOL_SHARE)
+            self._reserve(state, call_id, reserve, now, _Pool.SHARE)
             return LeaseAdmission(
                 LeaseDecision.ADMIT_OUTAGE_METERED,
                 lease_id=state.lease_id,
@@ -354,7 +366,7 @@ class LeaseLedger:
                 reason="lease_share_exhausted",
             )
         state.share_remaining_tokens -= reserve
-        self._reserve(state, call_id, reserve, now, _POOL_SHARE)
+        self._reserve(state, call_id, reserve, now, _Pool.SHARE)
         return LeaseAdmission(
             LeaseDecision.ADMIT_OUTAGE_METERED,
             lease_id=state.lease_id,
@@ -390,7 +402,11 @@ class LeaseLedger:
             state.uncounted_tokens += reserve
             return LeaseAdmission(
                 LeaseDecision.ADMIT_UNCOUNTED,
-                lease_id=state.lease_id,
+                # DELIBERATELY no lease_id: nothing settles this call. Its
+                # spend is owed through the uncounted tally on the next
+                # renewal, and a confirm tagged with the reclaimed lease would
+                # be counted twice (settlement excess AND the tally).
+                lease_id=None,
                 warning=(
                     "Budget lease expired and Solwyn unreachable; proceeding "
                     "UNCOUNTED in fail-open mode"
@@ -402,7 +418,7 @@ class LeaseLedger:
         # share remainder) — a local bound, never granted authority.
         if state.share_remaining_tokens >= reserve:
             state.share_remaining_tokens -= reserve
-            self._reserve(state, call_id, reserve, now, _POOL_SHARE)
+            self._reserve(state, call_id, reserve, now, _Pool.SHARE)
             return LeaseAdmission(
                 LeaseDecision.ADMIT_OUTAGE_METERED,
                 lease_id=state.lease_id,
@@ -426,7 +442,7 @@ class LeaseLedger:
                 reason="local_enforce_bound_exceeded",
             )
         state.share_remaining_tokens -= reserve
-        self._reserve(state, call_id, reserve, now, _POOL_SHARE)
+        self._reserve(state, call_id, reserve, now, _Pool.SHARE)
         return LeaseAdmission(
             LeaseDecision.ADMIT_OUTAGE_METERED,
             lease_id=state.lease_id,
@@ -498,6 +514,12 @@ class LeaseLedger:
             logger.debug("lease.stale_generation_ignored")
             return GrantOutcome.STALE
 
+        # The declared set belongs to ONE lease: the server folded that
+        # lease's worst-case rate over exactly these models. A different
+        # lease_id (fresh grant, or a regrant after a drop) REPLACES the set —
+        # inheriting a dead lease's models would admit calls the new grant
+        # never priced. Only a renewal of the same lease unions.
+        is_same_lease = state.lease_id == response.lease_id
         state.lease_id = response.lease_id
         state.generation = generation
         state.granted_tokens = max(0, response.granted_tokens)
@@ -510,7 +532,10 @@ class LeaseLedger:
         state.posture_mode = response.posture.mode
         state.on_unreachable = response.posture.on_unreachable
         state.final_grant = bool(response.final_grant)
-        state.declared_models.update(declared_models)
+        if is_same_lease:
+            state.declared_models.update(declared_models)
+        else:
+            state.declared_models = set(declared_models)
         state.renewal_in_flight = False
         state.consecutive_failures = 0
         state.next_attempt_at = 0.0
@@ -544,6 +569,22 @@ class LeaseLedger:
         self._drop_lease(state)
         state.run_ineligible = True
         state.ineligible_retry_at = math.inf if retry_after is None else now + retry_after
+
+    def record_uncounted(self, run_id: str, tokens: int) -> None:
+        """Tally one call that no counter covered (admission step 4, cold start).
+
+        The expiry ladder tallies its own uncounted admissions; this is the
+        enforcer's entry point for the case with no lease at all — a cold-start
+        grant attempt that found the plane down under fail_open. The tally
+        survives ``drop``/expiry, so it rides the first successful renewal of
+        whatever lease the run gets next.
+        """
+        state = self._states.get(run_id)
+        if state is None:
+            state = LeaseState(run_id=run_id)
+            self._states[run_id] = state
+        state.uncounted_calls += 1
+        state.uncounted_tokens += max(0, tokens)
 
     def drop(self, run_id: str) -> None:
         """Forget the run's lease (404 lease_not_found / 409 generation conflict).
@@ -584,7 +625,7 @@ class LeaseLedger:
             return
         actual = max(0, actual_tokens)
         delta = actual - reservation.tokens
-        if reservation.pool == _POOL_GRANTED:
+        if reservation.pool is _Pool.GRANTED:
             state.granted_remaining_tokens -= delta
         else:
             state.share_remaining_tokens -= delta
@@ -597,7 +638,7 @@ class LeaseLedger:
             return
         if reservation.lease_id != state.lease_id:
             return
-        if reservation.pool == _POOL_GRANTED:
+        if reservation.pool is _Pool.GRANTED:
             state.granted_remaining_tokens += reservation.tokens
         else:
             state.share_remaining_tokens += reservation.tokens
@@ -634,6 +675,12 @@ class LeaseLedger:
             return False
         if now >= state.refresh_deadline:
             return True
+        if state.granted_tokens <= 0:
+            # A zero-token grant (alert_only past cap) is depleted by
+            # definition: a ratio test would ask for a renewal on every single
+            # call, stacking a round-trip on top of the legacy check that
+            # branch already pays. Only the refresh deadline may renew it.
+            return False
         depleted = state.granted_tokens - state.granted_remaining_tokens
         return depleted * RENEWAL_DEPLETION_DEN >= state.granted_tokens * RENEWAL_DEPLETION_NUM
 
@@ -706,13 +753,28 @@ class LeaseLedger:
     # ── internals ────────────────────────────────────────────────────────
 
     def _output_bound(self, output_bound: int | None) -> int:
+        """Resolve the call's output bound.
+
+        None (no max_tokens-family cap on the call) uses the configured
+        default. A caller-supplied 0 or negative cap is honored as the
+        default too, deliberately: trusting it would reserve the input
+        estimate alone, leaving an unbounded response able to overrun the
+        remainder with nothing standing behind it.
+        """
         if output_bound is None or output_bound <= 0:
             return self.output_bound_default
         return output_bound
 
-    def _reserve(self, state: LeaseState, call_id: str, tokens: int, now: float, pool: str) -> None:
+    def _reserve(
+        self, state: LeaseState, call_id: str, tokens: int, now: float, pool: _Pool
+    ) -> None:
         if state.lease_id is None:
             raise RuntimeError("cannot reserve against a run with no lease")
+        if call_id in state.reservations:
+            # No call path re-admits one call_id today; if one ever does, the
+            # first drawdown must come back now rather than at the 900s sweep.
+            logger.warning("lease.duplicate_reservation_released")
+            self.release(call_id)
         state.reservations[call_id] = _Reservation(
             lease_id=state.lease_id, tokens=tokens, created_at=now, pool=pool
         )

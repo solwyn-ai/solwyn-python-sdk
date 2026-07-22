@@ -9,6 +9,7 @@ import pytest
 from conftest import VALID_API_KEY
 from pydantic import ValidationError
 
+from solwyn._lease import DEFAULT_OUTPUT_BOUND
 from solwyn._types import BudgetMode, ProviderEntry, ProviderName
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.config import SolwynConfig
@@ -230,6 +231,13 @@ class TestLeaseConfig:
         )
         assert config.lease_enabled is True
         assert config.lease_output_bound_default == 4096
+
+    def test_output_bound_default_cannot_drift_from_the_ledger_constant(self) -> None:
+        # The ledger resolves an absent call cap against its own constant; the
+        # config field must be the same number, declared once.
+        assert SolwynConfig.model_fields["lease_output_bound_default"].default == (
+            DEFAULT_OUTPUT_BOUND
+        )
 
     def test_lease_knobs_are_overridable(self) -> None:
         config = SolwynConfig(
