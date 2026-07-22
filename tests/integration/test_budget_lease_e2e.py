@@ -451,18 +451,21 @@ class TestLeasePartitioning:
     @pytest.mark.xfail(
         strict=True,
         reason=(
-            "OPEN PJ-2 FINDING (S4/S5 report, contract mismatch #1): a lease-tagged "
-            "confirm whose spend lands INSIDE the claim never reaches the enforcement "
-            "counters, and the renewal recycles the same claim "
-            "(new_outstanding = max(rem_g, claim_g+1)) instead of converting the "
-            "settled part into counted spend. A run therefore keeps drawing fresh "
-            "grants past a hard cap with the control plane fully reachable — measured "
-            "live at $15.00 of settled spend on a $10.00 hard_deny project, with the "
-            "project's reported usage pinned at $9.99999 throughout. The only repair "
-            "is the 300s reconcile pass, and only once the calls' metadata events are "
-            "durable in cost_events (the reconcile floor is durable spend + lease "
-            "outstanding). Delete this xfail (do NOT loosen the assertion) when core's "
-            "renewal algebra counts settled float."
+            "OPEN PJ-2 FINDING (S4/S5 report, contract mismatch #3) — SDK SIDE, and "
+            "NOT the core leak that core 8bbeb805 fixed (that one took $15.00 out of "
+            "this $10.00 cap; the same drive now takes $10.20). What is left is the "
+            "in-flight renewal window: LeaseLedger.apply_grant_response RESETS "
+            "granted_remaining_tokens to the new grant, but a renewal is dispatched "
+            "off the hot path (DoD 2) and admissions keep drawing while it flies. "
+            "Those draws are settled AND re-granted. Measured: grants 333333 -> 83333 "
+            "-> 3333 against a 333333-token pool, 34 calls admitted, 340000 tokens "
+            "drawn, project usage $10.20 on a $10.00 hard cap. The overshoot is one "
+            "call's reserve per renewal here, and scales with renewal latency x call "
+            "rate. Likely repair is SDK-side (net the post-dispatch drawdown out of "
+            "the applied grant, which the ledger already tracks as "
+            "spent_tokens_since_report); the server cannot see those calls when it "
+            "sizes the successor. Delete this xfail (do NOT add slack to the "
+            "assertion) when the ledger nets the in-flight window."
         ),
     )
     def test_lifetime_drawdown_stays_within_the_granted_bound(
@@ -472,8 +475,22 @@ class TestLeasePartitioning:
 
         Every admitted call is settled with a lease-tagged confirm carrying
         exactly the tokens it reserved — the production settlement path. The
-        tokens a run can draw over its whole life must therefore stay inside the
-        authority the server sized from the project's headroom.
+        tokens a run can draw over its whole LIFE (not just per window) must
+        therefore stay inside the authority the server sized from the project's
+        headroom, however many renewals it takes.
+
+        This is the regression pin for the settled-float leak (core 8bbeb805):
+        before that fix, settled-within-claim spend never became counted spend
+        and the renewal recycled the same claim forever, so this same drive took
+        $15.00 out of a $10.00 hard_deny cap with the control plane fully up.
+
+        Why the calls are ALL OUTPUT: the pool is denominated in tokens at the
+        declared set's WORST-CASE rate. A cheaper mix (some input tokens) buys
+        legitimately more tokens than that bound, so the token comparison below
+        would be wrong for a reason that has nothing to do with the invariant.
+        Spending only output tokens makes the actual rate the worst-case rate,
+        which is what lets this test state the bound in tokens — the SDK never
+        computes a price.
         """
         credentials = provision_project(
             api_url, name="sdk-lease-drawdown", budget_limit=10.0, budget_mode="hard_deny"
@@ -487,27 +504,28 @@ class TestLeasePartitioning:
             credentials, budget_mode=BudgetMode.HARD_DENY, fail_open=False
         )
         run_id = _run_id()
-        input_tokens, output_bound = 2_000, 8_000
+        output_bound = 10_000
+        attempts = 60
         drawn = 0
-        for _ in range(60):
+        admitted_calls = 0
+        for _ in range(attempts):
             call_id = str(uuid.uuid4())
             result = _admit(
                 enforcer,
                 run_id,
-                estimated_input_tokens=input_tokens,
+                estimated_input_tokens=0,
                 estimated_output_bound=output_bound,
                 call_id=call_id,
             )
             if not (result.allowed and result.lease_id is not None):
                 continue
-            drawn += input_tokens + output_bound
+            drawn += output_bound
+            admitted_calls += 1
             _send_confirm(
                 credentials,
                 enforcer.build_confirm_request(
                     model=MODEL,
-                    token_details=TokenDetails(
-                        input_tokens=input_tokens, output_tokens=output_bound
-                    ),
+                    token_details=TokenDetails(input_tokens=0, output_tokens=output_bound),
                     provider="openai",
                     call_id=call_id,
                     lease_id=result.lease_id,
@@ -515,9 +533,18 @@ class TestLeasePartitioning:
             )
 
         assert drawn > 0
+        assert admitted_calls < attempts, (
+            "the run never ran out of lease authority — a pool that funds every "
+            "attempt cannot show that the drawdown is bounded at all"
+        )
         assert drawn <= solo_bound, (
             f"the run drew {drawn} lease-funded tokens against a pool sized at {solo_bound}"
         )
+        # The cap held server-side too: the counter now carries the settled
+        # spend (that is the fix), so this is a real statement rather than a
+        # float placeholder sitting where the spend should be.
+        status = budget_status(credentials)
+        assert status["current_usage"] <= status["budget_limit"]
 
 
 @pytest.mark.integration
