@@ -528,8 +528,13 @@ class TestLeaseRenewal:
             grant = respx.post(GRANT_URL).mock(
                 return_value=Response(200, json=_grant_payload(granted_tokens=2_400))
             )
+            # Sized above the original: nothing settles in this harness, so
+            # all three calls are still in flight when the renewal lands and
+            # their bounds are carried onto the replacement grant. A 2_400
+            # renewal would arrive 1_800 committed — 75% depleted on arrival,
+            # and honestly due for another renewal on the spot.
             renew = respx.post(RENEW_URL).mock(
-                return_value=Response(200, json=_grant_payload(generation=2, granted_tokens=2_400))
+                return_value=Response(200, json=_grant_payload(generation=2, granted_tokens=9_600))
             )
             check = respx.post(CHECK_URL).mock(
                 return_value=Response(200, json=ALLOW_BUDGET_RESPONSE)

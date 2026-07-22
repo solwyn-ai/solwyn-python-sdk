@@ -520,17 +520,21 @@ class LeaseLedger:
         # inheriting a dead lease's models would admit calls the new grant
         # never priced. Only a renewal of the same lease unions.
         is_same_lease = state.lease_id == response.lease_id
-        post_snapshot_spend = self._post_snapshot_spend(state) if is_same_lease else 0
+        # Both terms are read BEFORE the new lease is installed, and both are
+        # confined to a renewal of the SAME lease: across a lease boundary
+        # neither is conserved, because true-up no-ops once the funding lease
+        # is gone (charging them would leave nothing standing behind them).
+        carried = self._carried_drawdown(state) if is_same_lease else 0
         state.lease_id = response.lease_id
         state.generation = generation
         state.granted_tokens = max(0, response.granted_tokens)
         # The new grant is authority NET of what its sizing could not see: a
         # renewal flies off the hot path, admissions keep drawing meanwhile,
-        # and spend settled after the report snapshot is already counted by
-        # the server. Installing the grant verbatim would settle AND re-grant
-        # those tokens — an overshoot scaling with renewal latency x call rate.
+        # and the server sized this response from the report snapshot alone.
+        # Installing it verbatim would re-grant tokens already committed —
+        # an overshoot scaling with renewal latency x call rate.
         # May go negative; the ladder handles that exactly as an overshoot.
-        state.granted_remaining_tokens = state.granted_tokens - post_snapshot_spend
+        state.granted_remaining_tokens = state.granted_tokens - carried
         state.share_remaining_tokens = max(0, response.headroom_share_tokens)
         state.refresh_deadline = now + response.refresh_interval_s * self._rng.uniform(
             REFRESH_JITTER_MIN, REFRESH_JITTER_MAX
@@ -822,20 +826,31 @@ class LeaseLedger:
             remaining_budget=response.remaining_budget,
         )
 
-    def _post_snapshot_spend(self, state: LeaseState) -> int:
-        """Settled drawdown accrued AFTER the outstanding report's snapshot.
+    def _carried_drawdown(self, state: LeaseState) -> int:
+        """Drawdown a replacement grant must arrive net of, in two terms.
 
-        ``build_renewal_request`` pins the reported figure in
-        ``pending_report``; ``spent_tokens_since_report`` keeps accumulating
-        every later true-up. The difference is exactly the spend the server
-        sized this response without — the netting term. Zero when no report is
-        outstanding (a fresh grant, or a renewal whose failure cleared it):
-        there is no snapshot, so nothing was missed.
+        SETTLED: ``build_renewal_request`` pins the reported figure in
+        ``pending_report`` while ``spent_tokens_since_report`` keeps
+        accumulating every later true-up; the difference is exactly the spend
+        the server sized this response without. Zero when no report is
+        outstanding (a fresh grant, or a renewal whose failure cleared it) —
+        no snapshot, nothing missed.
+
+        RESERVED: in-flight calls hold bounds drawn from the grant being
+        retired, and the server folds them nowhere (``reserved_tokens`` on the
+        renewal is a demand hint, never subtracted from the sizing). Carrying
+        them keeps the ledger conserved across the swap: a crossing call that
+        settles unwinds its bound through true-up's delta and leaves the grant
+        net of its ACTUAL, and one that releases gives the bound back whole.
+
+        The two never overlap — settling pops the reservation, so a call is in
+        exactly one term.
         """
         pending = state.pending_report
-        if pending is None:
-            return 0
-        return max(0, state.spent_tokens_since_report - pending.spent_tokens)
+        settled = (
+            0 if pending is None else max(0, state.spent_tokens_since_report - pending.spent_tokens)
+        )
+        return settled + state.reserved_tokens
 
     def _settle_pending_report(self, state: LeaseState) -> None:
         """An acknowledged renewal clears exactly what it reported, no more."""

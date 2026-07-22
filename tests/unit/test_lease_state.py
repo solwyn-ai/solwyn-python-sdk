@@ -910,9 +910,11 @@ class TestRenewalNetting:
         assert admission.decision is LeaseDecision.LEGACY_CHECK
         assert admission.reason == "granted_exhausted_plane_up"
 
-    def test_a_reservation_in_flight_across_a_renewal_is_not_carried_over(self) -> None:
+    def test_a_reservation_in_flight_across_a_renewal_is_carried_onto_the_new_grant(self) -> None:
         # Arrange — one call reserved before the snapshot and still unsettled
-        # when the response lands.
+        # when the response lands. Its bound was drawn from the RETIRED grant
+        # and the server folded it into NEITHER channel (`reserved_tokens` is
+        # a demand hint it never subtracts), so it must ride across too.
         ledger = _granted_ledger()
         state = ledger.state_for(RUN)
         assert state is not None
@@ -924,15 +926,70 @@ class TestRenewalNetting:
             RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
         )
 
-        # Assert — nothing SETTLED in the window, so nothing is netted...
-        assert state.granted_remaining_tokens == 50_000
-        # ...and the crossing reservation settles as a DELTA: its 1_500 bound
-        # was drawn from the retired grant, so only (actual - reserved) lands
-        # on the new one. This pins the seam as it stands; carrying the bound
-        # across would be a SECOND netting term (see the S6 report finding).
+        # Assert — nothing settled in the window, but 1_500 is still committed.
+        assert state.granted_remaining_tokens == 48_500
+
+    def test_a_crossing_reservation_that_settles_leaves_the_grant_net_of_its_actual(self) -> None:
+        # Arrange — 4_000 settled in-window AND one call still in flight, so
+        # both netting terms are live at once.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        ledger.build_renewal_request(RUN)
+        _admit(ledger, call_id="settled", estimated_input_tokens=3_000, output_bound=1_000)
+        ledger.true_up("settled", 4_000)
+        _admit(ledger, call_id="crossing", estimated_input_tokens=1_000, output_bound=500)
+        ledger.apply_grant_response(
+            RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
+        )
+        assert state.granted_remaining_tokens == 44_500  # 50_000 - 4_000 - 1_500
+
+        # Act — the crossing call settles under its bound.
         ledger.true_up("crossing", 1_200)
-        assert state.granted_remaining_tokens == 50_300
-        assert state.spent_tokens_since_report == 1_200
+
+        # Assert — true-up's delta (-300) unwinds the carried bound exactly,
+        # leaving the grant net of the settled window and the call's ACTUAL.
+        assert state.granted_remaining_tokens == 44_800  # 50_000 - 4_000 - 1_200
+
+    def test_a_crossing_reservation_that_is_released_gives_the_whole_bound_back(self) -> None:
+        # Arrange — same shape, but the crossing call dies on an error path.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        ledger.build_renewal_request(RUN)
+        _admit(ledger, call_id="settled", estimated_input_tokens=3_000, output_bound=1_000)
+        ledger.true_up("settled", 4_000)
+        _admit(ledger, call_id="crossing", estimated_input_tokens=1_000, output_bound=500)
+        ledger.apply_grant_response(
+            RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
+        )
+
+        # Act
+        ledger.release("crossing")
+
+        # Assert — no spend happened, so the carried bound is fully returned.
+        assert state.granted_remaining_tokens == 46_000  # 50_000 - 4_000
+
+    def test_a_call_reserved_before_the_snapshot_and_settled_after_it_nets_once(self) -> None:
+        # Arrange — the double-count candidate: the call is reported as a
+        # reservation AND settles before the response lands.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        _admit(ledger, call_id="x", estimated_input_tokens=1_000, output_bound=500)
+        request = ledger.build_renewal_request(RUN)
+        assert request is not None
+        assert request.reserved_tokens == 1_500
+        ledger.true_up("x", 1_200)
+
+        # Act
+        ledger.apply_grant_response(
+            RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
+        )
+
+        # Assert — settling popped the reservation, so it lands in the SETTLED
+        # term alone: 1_200 off, not 1_200 + 1_500.
+        assert state.granted_remaining_tokens == 48_800
 
     def test_netting_applies_once_per_renewal_cycle(self) -> None:
         # Arrange / Act — two back-to-back cycles, each with in-window spend.
@@ -988,6 +1045,7 @@ class TestRenewalNetting:
         ledger.build_renewal_request(RUN)
         _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
         ledger.true_up("a", 4_000)
+        _admit(ledger, call_id="crossing", estimated_input_tokens=1_000, output_bound=500)
 
         # Act
         ledger.apply_grant_response(
@@ -997,8 +1055,13 @@ class TestRenewalNetting:
             declared_models=["gpt-5.5"],
         )
 
-        # Assert
+        # Assert — NEITHER term crosses a lease boundary. Both are only
+        # conserved by true-up's delta, which no-ops once the funding lease is
+        # gone, so netting them here would charge the new grant with nothing
+        # standing behind it.
         assert ledger.lease_id_for(RUN) == "lse_new"
+        assert state.granted_remaining_tokens == 50_000
+        ledger.true_up("crossing", 1_200)
         assert state.granted_remaining_tokens == 50_000
 
     def test_a_regrant_after_a_drop_replaces_the_remainder_wholesale(self) -> None:
