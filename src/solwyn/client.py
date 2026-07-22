@@ -173,6 +173,34 @@ def _budget_timeout(deadline: Deadline, check_timeout: float) -> float:
     return max(0.001, min(check_timeout, deadline.remaining()))
 
 
+# The caller-supplied output caps, in the order the dialects name them. Read
+# for the LEASE reservation bound only — never content, just an int.
+_OUTPUT_CAP_KEYS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
+
+
+def _estimated_output_bound(kwargs: dict[str, object]) -> int | None:
+    """The call's own output cap, or None when it set no bound.
+
+    A bounded call reserves exactly what it can spend; an unbounded one falls
+    back to the configured ``lease_output_bound_default`` inside the ledger.
+    """
+    for key in _OUTPUT_CAP_KEYS:
+        value = kwargs.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
+
+def _settlement_keys(budget: Any) -> tuple[str | None, str | None]:
+    """The (reservation_id, lease_id) pair a settled call confirms against.
+
+    Exactly one is ever set: a lease-funded admission carries no reservation.
+    ``lease_id`` is read defensively — pre-lease budget doubles in tests (and
+    any caller-supplied result object) may not carry the field.
+    """
+    return getattr(budget, "reservation_id", None), getattr(budget, "lease_id", None)
+
+
 def _hop_timeout(deadline: Deadline, remaining_candidates: int) -> float:
     """Timeout for one provider hop, never exceeding the remaining deadline."""
     remaining = deadline.remaining()
@@ -611,6 +639,10 @@ class Solwyn(_SolwynBase):
             fail_open=config.fail_open,
             cache_ttl=config.budget_check_cache_ttl,
             control_plane_breaker=self._control_plane_breaker,
+            # PJ-2: the SDK instance id IS the lease holder identity.
+            holder_id=self._sdk_instance_id,
+            lease_enabled=config.lease_enabled,
+            lease_output_bound_default=config.lease_output_bound_default,
         )
 
         # Metadata reporter
@@ -853,6 +885,7 @@ class Solwyn(_SolwynBase):
             modality=spec.modality,
             estimated_media=estimated_media,
             agent_run_id=agent_run[0],
+            call_id=call_id,
         )
         effective_total = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
@@ -908,6 +941,9 @@ class Solwyn(_SolwynBase):
                 max_retries=0,
             )
         except Exception as exc:
+            # Nothing will settle this call: hand any lease reservation back
+            # rather than stranding it until the 900s sweep.
+            self._budget.release_reservation(call_id)
             self._reporter.report(
                 self._build_error_event(
                     model=requested_model,
@@ -943,9 +979,11 @@ class Solwyn(_SolwynBase):
         #    confirm's required token field.
         service_tier = runtime.adapter.extract_service_tier(response)
         confirm = None
-        if budget.reservation_id and (token_details is not None or media_usage is not None):
+        reservation_id, lease_id = _settlement_keys(budget)
+        if (reservation_id or lease_id) and (token_details is not None or media_usage is not None):
             confirm = self._budget.build_confirm_request(
-                reservation_id=budget.reservation_id,
+                reservation_id=reservation_id,
+                lease_id=lease_id,
                 model=requested_model,
                 token_details=token_details if token_details is not None else TokenDetails(),
                 provider=provider,
@@ -1009,6 +1047,8 @@ class Solwyn(_SolwynBase):
             fallback_models=[r.entry.model for r in self._runtimes[1:]],
             timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
             agent_run_id=agent_run[0],
+            call_id=call_id,
+            estimated_output_bound=_estimated_output_bound(kwargs),
         )
         effective_total = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
@@ -1080,8 +1120,10 @@ class Solwyn(_SolwynBase):
         if not allow_cross_provider:
             candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
         if not candidates:
+            self._budget.release_reservation(call_id)
             raise ProviderUnavailableError("all providers unavailable", attempted=[])
         if deadline.remaining() <= 0.0:
+            self._budget.release_reservation(call_id)
             raise ProviderUnavailableError(
                 "failover deadline expired",
                 attempted=[r.adapter.name for r in candidates],
@@ -1140,6 +1182,7 @@ class Solwyn(_SolwynBase):
                     )
             except Exception:
                 cb.release_probe(admission)
+                self._budget.release_reservation(call_id)
                 raise
 
             # Same-provider retry budget for THIS chain entry (config seam,
@@ -1244,8 +1287,13 @@ class Solwyn(_SolwynBase):
                         )
                     )
                     if disp is Disposition.FAIL_FAST:
+                        self._budget.release_reservation(call_id)
                         raise  # 4xx/404/refusal — do NOT advance the chain
                     if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
+                        # The call MAY have landed, but no confirm will ever
+                        # settle it here: the server reconciles the possibly-
+                        # succeeded attempt from the error event.
+                        self._budget.release_reservation(call_id)
                         raise  # re-raise ORIGINAL exception (drop-in contract)
                     last_exc = exc
                     advanced = True
@@ -1323,9 +1371,11 @@ class Solwyn(_SolwynBase):
             # path streaming on_complete uses. The caller gets the provider
             # response without waiting on a Solwyn round-trip.
             confirm = None
-            if budget.reservation_id:
+            reservation_id, lease_id = _settlement_keys(budget)
+            if reservation_id or lease_id:
                 confirm = self._budget.build_confirm_request(
-                    reservation_id=budget.reservation_id,
+                    reservation_id=reservation_id,
+                    lease_id=lease_id,
                     model=served_model,
                     token_details=token_details,
                     provider=provider,
@@ -1363,6 +1413,9 @@ class Solwyn(_SolwynBase):
                 self._reporter.report(event)
             return result
 
+        # Every candidate failed (or none was attempted): no settlement will
+        # follow, so the lease reservation goes back now.
+        self._budget.release_reservation(call_id)
         if last_exc is not None:
             raise last_exc
         raise ProviderUnavailableError(
@@ -1414,9 +1467,11 @@ class Solwyn(_SolwynBase):
             # the same tier or the enforcement counter and durable cost diverge.
             service_tier = accumulator.get_service_tier()
             confirm = None
-            if budget.reservation_id:
+            reservation_id, lease_id = _settlement_keys(budget)
+            if reservation_id or lease_id:
                 confirm = self._budget.build_confirm_request(
-                    reservation_id=budget.reservation_id,
+                    reservation_id=reservation_id,
+                    lease_id=lease_id,
                     model=served_model,
                     token_details=token_details,
                     provider=provider,
@@ -1455,6 +1510,10 @@ class Solwyn(_SolwynBase):
 
         def on_error(_exc: Exception) -> None:
             self._get_circuit_breaker(provider).record_failure()
+            # A stream that dies mid-flight never reaches on_complete, so its
+            # lease reservation is handed back here (the _settled guard makes
+            # on_complete / on_error mutually exclusive).
+            self._budget.release_reservation(call_id)
             self._reporter.report(
                 self._build_error_event(
                     model=served_model,
@@ -1593,6 +1652,10 @@ class AsyncSolwyn(_SolwynBase):
             fail_open=config.fail_open,
             cache_ttl=config.budget_check_cache_ttl,
             control_plane_breaker=self._control_plane_breaker,
+            # PJ-2: the SDK instance id IS the lease holder identity.
+            holder_id=self._sdk_instance_id,
+            lease_enabled=config.lease_enabled,
+            lease_output_bound_default=config.lease_output_bound_default,
         )
 
         self._reporter = AsyncMetadataReporter(
@@ -1806,6 +1869,7 @@ class AsyncSolwyn(_SolwynBase):
             modality=spec.modality,
             estimated_media=estimated_media,
             agent_run_id=agent_run[0],
+            call_id=call_id,
         )
         effective_total = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
@@ -1859,6 +1923,9 @@ class AsyncSolwyn(_SolwynBase):
                 max_retries=0,
             )
         except Exception as exc:
+            # Nothing will settle this call: hand any lease reservation back
+            # rather than stranding it until the 900s sweep.
+            self._budget.release_reservation(call_id)
             self._reporter.report(
                 self._build_error_event(
                     model=requested_model,
@@ -1887,9 +1954,11 @@ class AsyncSolwyn(_SolwynBase):
         # only when both are None. See the sync mirror.
         service_tier = runtime.adapter.extract_service_tier(response)
         confirm = None
-        if budget.reservation_id and (token_details is not None or media_usage is not None):
+        reservation_id, lease_id = _settlement_keys(budget)
+        if (reservation_id or lease_id) and (token_details is not None or media_usage is not None):
             confirm = self._budget.build_confirm_request(
-                reservation_id=budget.reservation_id,
+                reservation_id=reservation_id,
+                lease_id=lease_id,
                 model=requested_model,
                 token_details=token_details if token_details is not None else TokenDetails(),
                 provider=provider,
@@ -1949,6 +2018,8 @@ class AsyncSolwyn(_SolwynBase):
             fallback_models=[r.entry.model for r in self._runtimes[1:]],
             timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
             agent_run_id=agent_run[0],
+            call_id=call_id,
+            estimated_output_bound=_estimated_output_bound(kwargs),
         )
         effective_total = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
@@ -2013,8 +2084,10 @@ class AsyncSolwyn(_SolwynBase):
         if not allow_cross_provider:
             candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
         if not candidates:
+            self._budget.release_reservation(call_id)
             raise ProviderUnavailableError("all providers unavailable", attempted=[])
         if deadline.remaining() <= 0.0:
+            self._budget.release_reservation(call_id)
             raise ProviderUnavailableError(
                 "failover deadline expired",
                 attempted=[r.adapter.name for r in candidates],
@@ -2072,6 +2145,7 @@ class AsyncSolwyn(_SolwynBase):
                     )
             except Exception:
                 cb.release_probe(admission)
+                self._budget.release_reservation(call_id)
                 raise
 
             # Same-provider retry budget for THIS chain entry (mirrors the sync
@@ -2170,8 +2244,10 @@ class AsyncSolwyn(_SolwynBase):
                         )
                     )
                     if disp is Disposition.FAIL_FAST:
+                        self._budget.release_reservation(call_id)
                         raise
                     if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
+                        self._budget.release_reservation(call_id)
                         raise
                     last_exc = exc
                     advanced = True
@@ -2246,9 +2322,11 @@ class AsyncSolwyn(_SolwynBase):
             # path streaming on_complete uses. The caller gets the provider
             # response without waiting on a Solwyn round-trip.
             confirm = None
-            if budget.reservation_id:
+            reservation_id, lease_id = _settlement_keys(budget)
+            if reservation_id or lease_id:
                 confirm = self._budget.build_confirm_request(
-                    reservation_id=budget.reservation_id,
+                    reservation_id=reservation_id,
+                    lease_id=lease_id,
                     model=served_model,
                     token_details=token_details,
                     provider=provider,
@@ -2286,6 +2364,9 @@ class AsyncSolwyn(_SolwynBase):
                 self._reporter.report(event)
             return result
 
+        # Every candidate failed (or none was attempted): no settlement will
+        # follow, so the lease reservation goes back now.
+        self._budget.release_reservation(call_id)
         if last_exc is not None:
             raise last_exc
         raise ProviderUnavailableError(
@@ -2335,9 +2416,11 @@ class AsyncSolwyn(_SolwynBase):
             # (see the sync on_complete).
             service_tier = accumulator.get_service_tier()
             confirm = None
-            if budget.reservation_id:
+            reservation_id, lease_id = _settlement_keys(budget)
+            if reservation_id or lease_id:
                 confirm = self._budget.build_confirm_request(
-                    reservation_id=budget.reservation_id,
+                    reservation_id=reservation_id,
+                    lease_id=lease_id,
                     model=served_model,
                     token_details=token_details,
                     provider=provider,
@@ -2376,6 +2459,10 @@ class AsyncSolwyn(_SolwynBase):
 
         async def on_error(_exc: Exception) -> None:
             self._get_circuit_breaker(provider).record_failure()
+            # A stream that dies mid-flight never reaches on_complete, so its
+            # lease reservation is handed back here (the _settled guard makes
+            # on_complete / on_error mutually exclusive).
+            self._budget.release_reservation(call_id)
             self._reporter.report(
                 self._build_error_event(
                     model=served_model,

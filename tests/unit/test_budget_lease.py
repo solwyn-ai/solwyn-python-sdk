@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -20,11 +22,15 @@ import respx
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 from httpx import Response
 
+import solwyn as solwyn_pkg
 from solwyn import _lifecycle
+from solwyn._base import MediaSurfaceSpec
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetMode
-from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer
+from solwyn.budget import AsyncBudgetEnforcer, BudgetCheckResult, BudgetEnforcer
 from solwyn.circuit_breaker import CircuitBreaker
+from solwyn.client import Solwyn
+from solwyn.exceptions import ProviderUnavailableError
 
 API_URL = "https://api.test.solwyn.ai"
 CHECK_URL = f"{API_URL}/api/v1/budgets/check"
@@ -764,6 +770,219 @@ class TestLeaseSettlement:
         assert confirm.lease_id is None
         assert "lease_id" not in confirm.model_dump(mode="json")
         enforcer._http.close()
+
+
+# ---------------------------------------------------------------------------
+# Client plumbing
+# ---------------------------------------------------------------------------
+
+
+def _openai_client() -> tuple[MagicMock, object]:
+    client = MagicMock()
+    client.__class__.__module__ = "openai._client"
+    client.__class__.__name__ = "OpenAI"
+    client.with_options.return_value = client
+    response = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=100, completion_tokens=50))
+    client.chat.completions.create.return_value = response
+    return client, response
+
+
+def _build_solwyn(client: MagicMock, **overrides: object) -> Solwyn:
+    with patch("solwyn.reporter.MetadataReporter._flush_loop"):
+        solwyn = Solwyn(client, api_key=VALID_API_KEY, **overrides)  # type: ignore[arg-type]
+    solwyn._reporter._shutdown.set()
+    solwyn._reporter._thread.join(timeout=2.0)
+    return solwyn
+
+
+def _lease_result() -> BudgetCheckResult:
+    return BudgetCheckResult(
+        allowed=True,
+        remaining_budget=80.0,
+        project_id=VALID_PROJECT_ID,
+        reservation_id=None,
+        lease_id="lease_1",
+        budget_limit=100.0,
+        current_usage=20.0,
+    )
+
+
+@pytest.mark.unit
+class TestClientLeasePlumbing:
+    """The call's own bound, join key, and settlement key reach the enforcer."""
+
+    def test_the_client_binds_the_ledger_to_its_instance_id_and_config(self) -> None:
+        client, _ = _openai_client()
+        solwyn = _build_solwyn(client, lease_output_bound_default=777)
+
+        assert solwyn._budget._lease.holder_id == solwyn._sdk_instance_id
+        assert solwyn._budget._lease.enabled is True
+        assert solwyn._budget._lease.output_bound_default == 777
+
+        disabled = _build_solwyn(client, lease_enabled=False)
+        assert disabled._budget._lease.enabled is False
+
+        for wrapper in (solwyn, disabled):
+            wrapper._reporter._http.close()
+            wrapper._budget._http.close()
+
+    @pytest.mark.parametrize("cap_field", ["max_tokens", "max_completion_tokens"])
+    def test_the_calls_output_cap_becomes_the_lease_bound(self, cap_field: str) -> None:
+        client, _ = _openai_client()
+        solwyn = _build_solwyn(client)
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
+            patch.object(solwyn._reporter, "report_settlement"),
+            solwyn_pkg.run("bounded-job"),
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                **{cap_field: 256},
+            )
+
+        assert check.call_args.kwargs["estimated_output_bound"] == 256
+        assert check.call_args.kwargs["call_id"]
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_an_uncapped_call_sends_no_bound(self) -> None:
+        client, _ = _openai_client()
+        solwyn = _build_solwyn(client)
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
+            patch.object(solwyn._reporter, "report_settlement"),
+            solwyn_pkg.run("uncapped-job"),
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5", messages=[{"role": "user", "content": "Hello"}]
+            )
+
+        assert check.call_args.kwargs["estimated_output_bound"] is None
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_a_lease_funded_success_settles_on_the_lease(self) -> None:
+        client, _ = _openai_client()
+        solwyn = _build_solwyn(client)
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
+            patch.object(solwyn._reporter, "report_settlement") as settle,
+            solwyn_pkg.run("leased-job"),
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5", messages=[{"role": "user", "content": "Hello"}]
+            )
+
+        settle.assert_called_once()
+        confirm = settle.call_args[0][0]
+        assert confirm.lease_id == "lease_1"
+        assert confirm.reservation_id is None
+        assert confirm.call_id == check.call_args.kwargs["call_id"]
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_a_failed_call_hands_the_reservation_back(self) -> None:
+        client, _ = _openai_client()
+        client.chat.completions.create.side_effect = RuntimeError("fail fast")
+        solwyn = _build_solwyn(client)
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
+            patch.object(solwyn._budget, "release_reservation") as release,
+            patch.object(solwyn._reporter, "report"),
+            solwyn_pkg.run("doomed-job"),
+            pytest.raises(RuntimeError),
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5", messages=[{"role": "user", "content": "Hello"}]
+            )
+
+        release.assert_called_once_with(check.call_args.kwargs["call_id"])
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_no_provider_can_serve_hands_the_reservation_back(self) -> None:
+        client, _ = _openai_client()
+        solwyn = _build_solwyn(client)
+        # Every candidate is filtered out: the walk raises before any dispatch.
+        solwyn._get_circuit_breaker("openai").record_failure()
+        solwyn._get_circuit_breaker("openai").record_failure()
+        solwyn._get_circuit_breaker("openai").record_failure()
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
+            patch.object(solwyn._budget, "release_reservation") as release,
+            patch.object(solwyn._reporter, "report"),
+            solwyn_pkg.run("unavailable-job"),
+            pytest.raises(ProviderUnavailableError),
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5", messages=[{"role": "user", "content": "Hello"}]
+            )
+
+        release.assert_called_once_with(check.call_args.kwargs["call_id"])
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_media_calls_carry_the_join_key(self) -> None:
+        client, _ = _openai_client()
+        client.embeddings.create.return_value = SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=42)
+        )
+        solwyn = _build_solwyn(client)
+        spec = MediaSurfaceSpec(
+            surface="embeddings",
+            modality="embedding",
+            extract_usage=lambda response: TokenDetails(input_tokens=response.usage.prompt_tokens),
+            measure_request=lambda _kwargs: None,
+        )
+
+        def _route(surface, sdk_client, kwargs, *, timeout, max_retries):
+            return sdk_client.embeddings.create, dict(kwargs)
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
+            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route),
+            solwyn_pkg.run("media-job"),
+        ):
+            solwyn._media_call(spec, model="text-embedding-3-small", input="hello")
+
+        assert check.call_args.kwargs["call_id"]
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_a_failed_media_call_hands_the_reservation_back(self) -> None:
+        client, _ = _openai_client()
+        client.embeddings.create.side_effect = RuntimeError("boom")
+        solwyn = _build_solwyn(client)
+        spec = MediaSurfaceSpec(
+            surface="embeddings",
+            modality="embedding",
+            extract_usage=lambda _response: None,
+            measure_request=lambda _kwargs: None,
+        )
+
+        def _route(surface, sdk_client, kwargs, *, timeout, max_retries):
+            return sdk_client.embeddings.create, dict(kwargs)
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
+            patch.object(solwyn._budget, "release_reservation") as release,
+            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route),
+            solwyn_pkg.run("media-doomed"),
+            pytest.raises(RuntimeError),
+        ):
+            solwyn._media_call(spec, model="text-embedding-3-small", input="hello")
+
+        release.assert_called_once_with(check.call_args.kwargs["call_id"])
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
 
 
 # ---------------------------------------------------------------------------
