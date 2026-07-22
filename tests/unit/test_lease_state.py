@@ -856,6 +856,199 @@ class TestRenewalBookkeeping:
 
 
 @pytest.mark.unit
+class TestRenewalNetting:
+    """A renewal grant must arrive net of the spend its sizing could not see.
+
+    ``build_renewal_request`` snapshots the report and the renewal flies off
+    the hot path; admissions keep drawing on the current grant meanwhile. A
+    call SETTLED inside that window is counted by the server (its confirm
+    settles against the lease's claim) but was invisible to the sizing that
+    produced the response — so installing the grant verbatim would settle AND
+    re-grant those tokens, overshooting the cap by renewal latency x call rate.
+    """
+
+    def test_spend_settled_after_the_snapshot_is_netted_out_of_the_new_grant(self) -> None:
+        # Arrange — 800 reported, then 5_000 settled while the renewal flies.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        _admit(ledger, call_id="reported", estimated_input_tokens=1_000, output_bound=500)
+        ledger.true_up("reported", 800)
+        request = ledger.build_renewal_request(RUN)
+        assert request is not None
+        assert request.spent_tokens == 800
+        _admit(ledger, call_id="in-window", estimated_input_tokens=4_000, output_bound=2_000)
+        ledger.true_up("in-window", 5_000)
+
+        # Act
+        outcome = ledger.apply_grant_response(
+            RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
+        )
+
+        # Assert — the grant is authority for 50_000, but 5_000 of it is
+        # already spent by the time it lands.
+        assert outcome is GrantOutcome.APPLIED
+        assert state.granted_tokens == 50_000
+        assert state.granted_remaining_tokens == 45_000
+
+    def test_a_post_snapshot_drawdown_beyond_the_new_grant_goes_negative(self) -> None:
+        # Arrange — a late renewal answers small while 10_000 burned through.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        ledger.build_renewal_request(RUN)
+        _admit(ledger, call_id="burn", estimated_input_tokens=9_000, output_bound=1_000)
+        ledger.true_up("burn", 10_000)
+
+        # Act
+        ledger.apply_grant_response(RUN, _response(generation=2, granted_tokens=3_000), now=1_020.0)
+
+        # Assert — overshoot rides through as a negative remainder (S1
+        # semantics) and the next call is NOT admitted on lease authority.
+        assert state.granted_remaining_tokens == -7_000
+        admission = _admit(ledger, call_id="next", now=1_021.0)
+        assert admission.decision is LeaseDecision.LEGACY_CHECK
+        assert admission.reason == "granted_exhausted_plane_up"
+
+    def test_a_reservation_in_flight_across_a_renewal_is_not_carried_over(self) -> None:
+        # Arrange — one call reserved before the snapshot and still unsettled
+        # when the response lands.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        _admit(ledger, call_id="crossing", estimated_input_tokens=1_000, output_bound=500)
+        ledger.build_renewal_request(RUN)
+
+        # Act
+        ledger.apply_grant_response(
+            RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
+        )
+
+        # Assert — nothing SETTLED in the window, so nothing is netted...
+        assert state.granted_remaining_tokens == 50_000
+        # ...and the crossing reservation settles as a DELTA: its 1_500 bound
+        # was drawn from the retired grant, so only (actual - reserved) lands
+        # on the new one. This pins the seam as it stands; carrying the bound
+        # across would be a SECOND netting term (see the S6 report finding).
+        ledger.true_up("crossing", 1_200)
+        assert state.granted_remaining_tokens == 50_300
+        assert state.spent_tokens_since_report == 1_200
+
+    def test_netting_applies_once_per_renewal_cycle(self) -> None:
+        # Arrange / Act — two back-to-back cycles, each with in-window spend.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+
+        ledger.build_renewal_request(RUN)
+        _admit(ledger, call_id="c1", estimated_input_tokens=1_000, output_bound=500)
+        ledger.true_up("c1", 2_000)
+        ledger.apply_grant_response(
+            RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
+        )
+
+        # Assert — cycle 1 nets its own 2_000...
+        assert state.granted_remaining_tokens == 48_000
+
+        ledger.build_renewal_request(RUN)
+        _admit(ledger, call_id="c2", estimated_input_tokens=1_000, output_bound=500, now=1_021.0)
+        ledger.true_up("c2", 3_000)
+        ledger.apply_grant_response(
+            RUN, _response(generation=3, granted_tokens=50_000), now=1_030.0
+        )
+
+        # ...and cycle 2 nets only ITS 3_000: the cycle-1 residual was
+        # re-baselined into the second report, never netted twice.
+        assert state.granted_remaining_tokens == 47_000
+
+    def test_a_grant_with_no_report_in_flight_is_not_netted(self) -> None:
+        # Arrange — spend, but no renewal snapshot was ever taken (the
+        # NEED_GRANT path: a blocking grant with no overlapping admissions).
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+        ledger.true_up("a", 4_000)
+
+        # Act
+        ledger.apply_grant_response(
+            RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
+        )
+
+        # Assert — no snapshot, nothing invisible to the server, no netting.
+        assert state.granted_remaining_tokens == 50_000
+
+    def test_a_response_carrying_a_new_lease_id_is_not_netted(self) -> None:
+        # Arrange — a renewal answered with a DIFFERENT lease: the post-
+        # snapshot spend was drawn on the retired lease's counters, and the
+        # new lease replaces state wholesale.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        ledger.build_renewal_request(RUN)
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+        ledger.true_up("a", 4_000)
+
+        # Act
+        ledger.apply_grant_response(
+            RUN,
+            _response(lease_id="lse_new", generation=2, granted_tokens=50_000),
+            now=1_020.0,
+            declared_models=["gpt-5.5"],
+        )
+
+        # Assert
+        assert ledger.lease_id_for(RUN) == "lse_new"
+        assert state.granted_remaining_tokens == 50_000
+
+    def test_a_regrant_after_a_drop_replaces_the_remainder_wholesale(self) -> None:
+        # Arrange — 404 lease_not_found between the snapshot and the regrant.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        ledger.build_renewal_request(RUN)
+        _admit(ledger, call_id="orphan", estimated_input_tokens=1_000, output_bound=500)
+        ledger.true_up("orphan", 4_000)
+        ledger.drop(RUN)
+
+        # Act
+        ledger.apply_grant_response(
+            RUN,
+            _response(lease_id="lse_regrant", generation=1, granted_tokens=50_000),
+            now=1_030.0,
+            declared_models=["gpt-5.5"],
+        )
+
+        # Assert — post-drop spend belongs to no lease; the regrant is whole,
+        # and the spend is still owed through the report channel.
+        assert state.granted_remaining_tokens == 50_000
+        assert state.spent_tokens_since_report == 4_000
+
+    def test_a_stale_response_nets_nothing(self) -> None:
+        # Arrange — a newer generation already landed; the late response for
+        # the outstanding report must not touch the installed remainder.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        ledger.build_renewal_request(RUN)
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+        ledger.true_up("a", 4_000)
+        ledger.apply_grant_response(
+            RUN, _response(generation=5, granted_tokens=50_000), now=1_020.0
+        )
+        installed = state.granted_remaining_tokens
+
+        # Act
+        outcome = ledger.apply_grant_response(
+            RUN, _response(generation=2, granted_tokens=90_000), now=1_021.0
+        )
+
+        # Assert
+        assert outcome is GrantOutcome.STALE
+        assert state.granted_remaining_tokens == installed
+
+
+@pytest.mark.unit
 class TestLeaseStateLifecycle:
     """Drop, discard, fork reset."""
 
