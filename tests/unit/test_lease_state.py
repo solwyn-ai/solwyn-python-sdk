@@ -929,6 +929,87 @@ class TestRenewalNetting:
         # Assert — nothing settled in the window, but 1_500 is still committed.
         assert state.granted_remaining_tokens == 48_500
 
+    def test_a_share_pool_reservation_in_flight_does_not_net_the_new_grant(self) -> None:
+        # Arrange — an empty grant with the plane believed down: the call is
+        # metered against the headroom share, so its bound never touched the
+        # granted pool at all.
+        ledger = _granted_ledger(granted_tokens=0)
+        state = ledger.state_for(RUN)
+        assert state is not None
+        admission = _admit(
+            ledger,
+            call_id="share-crossing",
+            estimated_input_tokens=1_000,
+            output_bound=500,
+            breaker_open=True,
+        )
+        assert admission.decision is LeaseDecision.ADMIT_OUTAGE_METERED
+        ledger.build_renewal_request(RUN)
+
+        # Act
+        ledger.apply_grant_response(
+            RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
+        )
+
+        # Assert — only GRANTED-pool bounds may be carried. Charging this one
+        # to the grant would be a charge the grant can never get back: the
+        # unwind is pool-dispatched and lands on the share counter.
+        assert state.granted_remaining_tokens == 50_000
+        ledger.true_up("share-crossing", 1_200)
+        assert state.granted_remaining_tokens == 50_000
+        # The share side is untouched BY THE NETTING; that it takes the delta
+        # against a counter the apply already reset is the pre-existing
+        # over-credit (review M2), tracked separately and not this fix's.
+        assert state.share_remaining_tokens == 500_300
+
+    def test_a_share_pool_reservation_released_after_a_renewal_leaves_the_grant_whole(self) -> None:
+        # Arrange — same outage admission, but the call dies on an error path.
+        ledger = _granted_ledger(granted_tokens=0)
+        state = ledger.state_for(RUN)
+        assert state is not None
+        _admit(
+            ledger,
+            call_id="share-crossing",
+            estimated_input_tokens=1_000,
+            output_bound=500,
+            breaker_open=True,
+        )
+        ledger.build_renewal_request(RUN)
+        ledger.apply_grant_response(
+            RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
+        )
+
+        # Act
+        ledger.release("share-crossing")
+
+        # Assert — the refund goes to the share pool, so the grant must never
+        # have been charged in the first place.
+        assert state.granted_remaining_tokens == 50_000
+        assert state.share_remaining_tokens == 501_500  # review M2, as above
+
+    def test_a_grant_that_lands_heavily_pre_committed_is_renewal_due_at_once(self) -> None:
+        # Arrange — 4_000 settled in-window against a 5_000 renewal, so the
+        # replacement grant arrives 80% depleted.
+        ledger = _granted_ledger()
+        state = ledger.state_for(RUN)
+        assert state is not None
+        ledger.build_renewal_request(RUN)
+        _admit(ledger, call_id="burn", estimated_input_tokens=3_000, output_bound=1_000)
+        ledger.true_up("burn", 4_000)
+        ledger.apply_grant_response(RUN, _response(generation=2, granted_tokens=5_000), now=1_020.0)
+        assert state.granted_remaining_tokens == 1_000
+
+        # Act — well inside the refresh deadline, so this is the DEPLETION
+        # path talking, not the timer.
+        admission = _admit(
+            ledger, call_id="next", estimated_input_tokens=100, output_bound=100, now=1_021.0
+        )
+
+        # Assert — a grant that lands mostly spoken for asks for the next one
+        # immediately. Intended: the carried drawdown is real depletion.
+        assert admission.decision is LeaseDecision.ADMIT_LOCAL
+        assert admission.renewal_due is True
+
     def test_a_crossing_reservation_that_settles_leaves_the_grant_net_of_its_actual(self) -> None:
         # Arrange — 4_000 settled in-window AND one call still in flight, so
         # both netting terms are live at once.

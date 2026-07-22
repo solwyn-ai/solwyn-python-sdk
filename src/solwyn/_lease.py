@@ -843,14 +843,26 @@ class LeaseLedger:
         settles unwinds its bound through true-up's delta and leaves the grant
         net of its ACTUAL, and one that releases gives the bound back whole.
 
-        The two never overlap — settling pops the reservation, so a call is in
-        exactly one term.
+        Only GRANTED-pool bounds qualify, because that unwind is
+        pool-dispatched: an outage-metered call's delta and refund land on the
+        share counter, so charging its bound to the grant would be a charge
+        the grant can never get back. The wire demand hint deliberately keeps
+        counting both pools — it describes in-flight demand, not this pool's
+        commitments — so this is a separate sum, not that property.
+
+        The two terms never overlap — settling pops the reservation, so a call
+        is in exactly one of them.
         """
         pending = state.pending_report
         settled = (
             0 if pending is None else max(0, state.spent_tokens_since_report - pending.spent_tokens)
         )
-        return settled + state.reserved_tokens
+        reserved_from_grant = sum(
+            reservation.tokens
+            for reservation in state.reservations.values()
+            if reservation.lease_id == state.lease_id and reservation.pool is _Pool.GRANTED
+        )
+        return settled + reserved_from_grant
 
     def _settle_pending_report(self, state: LeaseState) -> None:
         """An acknowledged renewal clears exactly what it reported, no more."""
