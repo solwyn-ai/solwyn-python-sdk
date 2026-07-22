@@ -9,13 +9,16 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
-- **`BudgetConfirmRequest.call_id` now pins the canonical UUID text form** the
-  API has required since its idempotency ledger landed (`^[0-9a-f]{8}-...$`,
-  max 36 chars). The SDK has only ever emitted `str(uuid.uuid4())` here, so no
-  emitted confirm changes; what changes is that a drifted id fails at the seam
-  that built it instead of arriving as a 422 that loses the settlement it was
-  carrying. `call_id` is durable spend identity — the API's cost-event ledger
-  dedups on it.
+- **`call_id` now pins the canonical UUID text form** on both wires that carry
+  it — `BudgetConfirmRequest.call_id` and `MetadataEvent.call_id` — matching
+  what the API has required since its idempotency ledger landed
+  (`^[0-9a-f]{8}-...$`, max 36 chars). The SDK has only ever emitted
+  `str(uuid.uuid4())` here and no caller supplies one, so nothing the SDK sends
+  changes; what changes is that a drifted id fails at the seam that built it
+  instead of arriving as a 422 that loses the settlement it was carrying.
+  `call_id` is durable spend identity — the API's cost-event ledger dedups on
+  it — and it is the join key between an event and its confirm, so both halves
+  answer to one shape.
 
 - **Non-streaming settlement moved off the caller's hot path.** Sync and async
   chat completions and the whole media lifecycle (embeddings, images, audio,

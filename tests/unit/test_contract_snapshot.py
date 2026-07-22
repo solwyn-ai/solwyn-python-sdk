@@ -716,6 +716,26 @@ class TestWireModelFieldConstraints:
     def test_metadata_call_id_is_required(self) -> None:
         assert MetadataEvent.model_fields["call_id"].is_required() is True
 
+    def test_metadata_call_id_must_be_a_canonical_uuid(self) -> None:
+        # The OTHER half of the same identity contract: the metadata event and
+        # its confirm carry the SAME call_id (the reconciliation join key), and
+        # the API pins the canonical UUID form on both. A shape only one side
+        # accepts would let an event through that its confirm could never join.
+        canonical = "3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b"
+        assert _metadata_event(call_id=canonical).call_id == canonical
+
+        for rejected in (
+            "",
+            "call-test-123",
+            canonical.upper(),
+            f"{{{canonical}}}",
+            f"urn:uuid:{canonical}",
+            f" {canonical}",
+            "x" * 36,
+        ):
+            with pytest.raises(ValidationError):
+                _metadata_event(call_id=rejected)
+
     def test_metadata_tags_bounds_are_pinned(self) -> None:
         assert wire_constants.TAGS_MAX_KEYS == 10
         assert wire_constants.TAG_KEY_MAX_LENGTH == 64

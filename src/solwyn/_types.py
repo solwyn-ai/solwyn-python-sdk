@@ -313,9 +313,13 @@ class MetadataEvent(BaseModel):
     attempt_index: int = Field(default=0, ge=0, description="0=primary, 1=first fallback")
     call_id: str = Field(
         ...,
+        max_length=CALL_ID_MAX_LENGTH,
+        pattern=CALL_ID_PATTERN,
         description=(
             "uuid per intercepted call; join key for cache-hit spend reconciliation. "
-            "Always present on the wire — it is NOT content."
+            "Always present on the wire — it is NOT content. Canonical lowercase "
+            "UUID, matching the API's own pin: this id and its confirm's are the "
+            "SAME id, so both halves of the join key answer to one shape."
         ),
     )
     possibly_succeeded: bool | None = Field(
