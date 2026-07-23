@@ -16,7 +16,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -215,6 +215,200 @@ def _with_legacy_max_tokens_key(provider: str, kwargs: dict[str, object]) -> dic
     value = rewritten.pop("max_completion_tokens")
     rewritten["max_tokens"] = value
     return rewritten
+
+
+_OUTPUT_CAP_KEYS = frozenset(
+    {
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "config",
+        "inferenceConfig",
+    }
+)
+_OUTPUT_CAP_KEYS_BY_DIALECT = {
+    ProviderName.OPENAI.value: frozenset({"max_tokens", "max_completion_tokens"}),
+    ProviderName.ANTHROPIC.value: frozenset({"max_tokens"}),
+    ProviderName.GOOGLE.value: frozenset({"config", "max_output_tokens"}),
+    ProviderName.BEDROCK.value: frozenset({"inferenceConfig"}),
+}
+
+
+def _positive_output_cap(value: object) -> int | None:
+    """Return a usable token cap without coercing caller-owned objects."""
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def _nested_output_cap(value: object, key: str) -> int | None:
+    """Read one cap from a dict or SDK config object without copying config.
+
+    Google config objects may also carry a system instruction, and Bedrock
+    request dictionaries carry messages beside ``inferenceConfig``. Reading
+    only the named scalar keeps lease sizing outside content-privileged code.
+    """
+    nested = value.get(key) if isinstance(value, dict) else getattr(value, key, None)
+    return _positive_output_cap(nested)
+
+
+def _dialect_output_cap(dialect: str, kwargs: dict[str, object]) -> int | None:
+    """Return the effective native cap in one dialect-shaped kwargs mapping."""
+    if dialect == ProviderName.GOOGLE.value:
+        nested = _nested_output_cap(kwargs.get("config"), "max_output_tokens")
+        return nested or _positive_output_cap(kwargs.get("max_output_tokens"))
+    if dialect == ProviderName.BEDROCK.value:
+        return _nested_output_cap(kwargs.get("inferenceConfig"), "maxTokens")
+    if dialect == ProviderName.OPENAI.value:
+        return _positive_output_cap(kwargs.get("max_completion_tokens")) or _positive_output_cap(
+            kwargs.get("max_tokens")
+        )
+    if dialect == ProviderName.ANTHROPIC.value:
+        return _positive_output_cap(kwargs.get("max_tokens"))
+    return None
+
+
+def _output_cap_params(params: dict[str, Any]) -> dict[str, object]:
+    """Copy only structural cap fields, never request content."""
+    return {key: value for key, value in params.items() if key in _OUTPUT_CAP_KEYS}
+
+
+def _source_output_cap_defaults(
+    dialect: str,
+    params: dict[str, object],
+) -> dict[str, object]:
+    """Keep only entry-default cap fields legal in the source dialect."""
+    allowed = _OUTPUT_CAP_KEYS_BY_DIALECT.get(dialect, frozenset())
+    return {key: value for key, value in params.items() if key in allowed}
+
+
+def _normalized_openai_output_cap_layer(
+    provider: str,
+    model: str,
+    params: dict[str, object],
+) -> dict[str, object]:
+    """Normalize cap aliases in one precedence layer to its OpenAI target key."""
+    requires_modern_key = provider in (
+        ProviderName.OPENAI.value,
+        ProviderName.AZURE_OPENAI.value,
+    ) and _openai_uses_max_completion_tokens(model)
+    if requires_modern_key:
+        return _with_openai_completion_token_key(provider, model, params)
+    if "max_completion_tokens" not in params:
+        return params
+    normalized = dict(params)
+    value = normalized.pop("max_completion_tokens")
+    normalized["max_tokens"] = value
+    return normalized
+
+
+def _effective_output_bound(
+    *,
+    primary: ProviderRuntime,
+    runtimes: list[ProviderRuntime],
+    global_defaults: dict[str, Any],
+    kwargs: dict[str, object],
+    default_bound: int,
+) -> int:
+    """Largest output reservation any configured provider hop can spend.
+
+    Mirrors dispatch cap precedence without translating or copying request
+    content: call kwargs beat entry defaults, which beat global defaults;
+    same-dialect compatibility hops normalize completion-token keys per source
+    layer; cross-dialect hops retain the source dialect's cap. Every actually
+    unbounded hop contributes the configured conservative fallback.
+    """
+    provider_global_defaults = _output_cap_params(global_defaults)
+    provider_kwargs = _output_cap_params(kwargs)
+    bounds: list[int] = []
+
+    for runtime in runtimes:
+        provider_entry_defaults = _output_cap_params(runtime.entry.default_params)
+        is_primary = runtime is primary
+        is_provider_fallback = runtime.entry.provider != primary.entry.provider
+        target_model = cast(str, kwargs["model"]) if is_primary else runtime.entry.model
+
+        if not is_provider_fallback:
+            if runtime.adapter.dialect == ProviderName.OPENAI.value:
+                native = {
+                    **_normalized_openai_output_cap_layer(
+                        runtime.adapter.name,
+                        target_model,
+                        provider_global_defaults,
+                    ),
+                    **_normalized_openai_output_cap_layer(
+                        runtime.adapter.name,
+                        target_model,
+                        provider_entry_defaults,
+                    ),
+                    **_normalized_openai_output_cap_layer(
+                        runtime.adapter.name,
+                        target_model,
+                        provider_kwargs,
+                    ),
+                }
+            else:
+                native = {
+                    **provider_global_defaults,
+                    **provider_entry_defaults,
+                    **provider_kwargs,
+                }
+            cap = _dialect_output_cap(runtime.adapter.dialect, native)
+        elif primary.adapter.dialect == runtime.adapter.dialect:
+            target_name = runtime.adapter.name
+            native = {
+                **_normalized_openai_output_cap_layer(
+                    target_name,
+                    runtime.entry.model,
+                    provider_global_defaults,
+                ),
+                **_normalized_openai_output_cap_layer(
+                    target_name,
+                    runtime.entry.model,
+                    provider_entry_defaults,
+                ),
+                **_normalized_openai_output_cap_layer(
+                    target_name,
+                    runtime.entry.model,
+                    provider_kwargs,
+                ),
+            }
+            cap = _dialect_output_cap(runtime.adapter.dialect, native)
+        else:
+            source_defaults = _source_output_cap_defaults(
+                primary.adapter.dialect,
+                provider_entry_defaults,
+            )
+            if primary.adapter.dialect == ProviderName.OPENAI.value:
+                source_model = cast(str, kwargs["model"])
+                source_native = {
+                    **_normalized_openai_output_cap_layer(
+                        primary.adapter.name,
+                        source_model,
+                        provider_global_defaults,
+                    ),
+                    **_normalized_openai_output_cap_layer(
+                        primary.adapter.name,
+                        source_model,
+                        source_defaults,
+                    ),
+                    **_normalized_openai_output_cap_layer(
+                        primary.adapter.name,
+                        source_model,
+                        provider_kwargs,
+                    ),
+                }
+            else:
+                source_native = {
+                    **provider_global_defaults,
+                    **source_defaults,
+                    **provider_kwargs,
+                }
+            cap = _dialect_output_cap(primary.adapter.dialect, source_native)
+
+        bounds.append(cap if cap is not None else default_bound)
+
+    return max(bounds, default=default_bound)
 
 
 @dataclass(frozen=True)

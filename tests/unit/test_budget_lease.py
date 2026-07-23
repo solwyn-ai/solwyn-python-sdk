@@ -14,24 +14,28 @@ import asyncio
 import random
 import threading
 import time
+import uuid
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 import respx
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID, call_uuid
 from httpx import Response
+from pydantic import ValidationError
 
 import solwyn as solwyn_pkg
+import solwyn.budget as budget_module
 from solwyn import _lifecycle
-from solwyn._base import MediaSurfaceSpec
+from solwyn._base import MediaSurfaceSpec, _effective_output_bound
 from solwyn._lease import INELIGIBLE_RETRY_AFTER_S
+from solwyn._registry import ProviderRuntime
 from solwyn._token_details import TokenDetails
-from solwyn._types import BudgetMode
+from solwyn._types import BudgetMode, LeaseGrantResponse, ProviderEntry, ProviderName
 from solwyn.budget import AsyncBudgetEnforcer, BudgetCheckResult, BudgetEnforcer
 from solwyn.circuit_breaker import CircuitBreaker
-from solwyn.client import Solwyn
+from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import ProviderUnavailableError
 
 API_URL = "https://api.test.solwyn.ai"
@@ -113,26 +117,47 @@ def _make_async_enforcer(**overrides: object) -> AsyncBudgetEnforcer:
     return AsyncBudgetEnforcer(**defaults)  # type: ignore[arg-type]
 
 
-def _check(enforcer: BudgetEnforcer, call_id: str, **overrides: object):
+def _wire_call_id(label_or_id: str) -> str:
+    """Keep canonical ids; derive stable UUIDs from readable test labels."""
+    try:
+        parsed = uuid.UUID(label_or_id)
+    except ValueError:
+        return call_uuid(label_or_id)
+    return label_or_id if str(parsed) == label_or_id else call_uuid(label_or_id)
+
+
+def _check(
+    enforcer: BudgetEnforcer,
+    call_id: str,
+    *,
+    raw_call_id: bool = False,
+    **overrides: object,
+):
     kwargs: dict[str, object] = {
         "estimated_input_tokens": 100,
         "model": "gpt-5.5",
         "provider": "openai",
         "agent_run_id": RUN,
-        "call_id": call_id,
+        "call_id": call_id if raw_call_id else _wire_call_id(call_id),
         "estimated_output_bound": 500,
     }
     kwargs.update(overrides)
     return enforcer.check_budget(**kwargs)  # type: ignore[arg-type]
 
 
-async def _acheck(enforcer: AsyncBudgetEnforcer, call_id: str, **overrides: object):
+async def _acheck(
+    enforcer: AsyncBudgetEnforcer,
+    call_id: str,
+    *,
+    raw_call_id: bool = False,
+    **overrides: object,
+):
     kwargs: dict[str, object] = {
         "estimated_input_tokens": 100,
         "model": "gpt-5.5",
         "provider": "openai",
         "agent_run_id": RUN,
-        "call_id": call_id,
+        "call_id": call_id if raw_call_id else _wire_call_id(call_id),
         "estimated_output_bound": 500,
     }
     kwargs.update(overrides)
@@ -512,6 +537,112 @@ class TestLeaseOutage:
         assert state.share_remaining_tokens == 50_000 - 600
         enforcer._http.close()
 
+    def test_half_open_follower_cannot_bypass_exhausted_hard_deny_share(self) -> None:
+        breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=0, name="control-plane")
+        enforcer = _make_enforcer(control_plane_breaker=breaker, fail_open=True)
+        with respx.mock:
+            respx.post(GRANT_URL).mock(
+                return_value=Response(
+                    200,
+                    json=_grant_payload(
+                        granted_tokens=600,
+                        headroom_share_tokens=0,
+                        posture={"mode": "hard_deny", "on_unreachable": "fail_open"},
+                    ),
+                )
+            )
+            check = respx.post(CHECK_URL).mock(side_effect=httpx.ConnectError("down"))
+
+            first = _check(enforcer, call_uuid("half-open-first"))
+            breaker.record_failure()
+            probe = breaker.admit()
+            assert probe.allowed and probe.owns_probe
+
+            follower = _check(enforcer, call_uuid("half-open-follower"))
+
+        assert first.lease_id == "lease_1"
+        assert follower.allowed is False
+        assert follower.warning is not None
+        assert "hard_deny" in follower.warning
+        assert check.call_count == 0
+        breaker.release_probe(probe)
+        enforcer._http.close()
+
+    async def test_async_half_open_follower_cannot_bypass_exhausted_share(self) -> None:
+        breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=0, name="control-plane")
+        enforcer = _make_async_enforcer(control_plane_breaker=breaker, fail_open=True)
+        with respx.mock:
+            respx.post(GRANT_URL).mock(
+                return_value=Response(
+                    200,
+                    json=_grant_payload(
+                        granted_tokens=600,
+                        headroom_share_tokens=0,
+                        posture={"mode": "hard_deny", "on_unreachable": "fail_open"},
+                    ),
+                )
+            )
+            check = respx.post(CHECK_URL).mock(side_effect=httpx.ConnectError("down"))
+
+            first = await _acheck(enforcer, call_uuid("async-half-open-first"))
+            breaker.record_failure()
+            probe = breaker.admit()
+            assert probe.allowed and probe.owns_probe
+
+            follower = await _acheck(enforcer, call_uuid("async-half-open-follower"))
+
+        assert first.lease_id == "lease_1"
+        assert follower.allowed is False
+        assert check.call_count == 0
+        breaker.release_probe(probe)
+        await enforcer._http.aclose()
+
+    def test_half_open_cold_start_follower_is_tallied_as_uncounted(self) -> None:
+        breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=0, name="control-plane")
+        enforcer = _make_enforcer(control_plane_breaker=breaker, fail_open=True)
+        breaker.record_failure()
+        probe = breaker.admit()
+        assert probe.allowed and probe.owns_probe
+        with enforcer._state_lock:
+            enforcer._lease_grants_in_flight.add(RUN)
+
+        try:
+            result = _check(enforcer, call_uuid("half-open-cold-follower"))
+
+            assert result.allowed is True
+            state = enforcer._lease.state_for(RUN)
+            assert state is not None
+            assert state.uncounted_calls == 1
+            assert state.uncounted_tokens == 600
+        finally:
+            with enforcer._state_lock:
+                enforcer._lease_grants_in_flight.discard(RUN)
+            breaker.release_probe(probe)
+            enforcer._http.close()
+
+    async def test_async_half_open_cold_start_follower_is_tallied_as_uncounted(self) -> None:
+        breaker = CircuitBreaker(failure_threshold=1, recovery_timeout=0, name="control-plane")
+        enforcer = _make_async_enforcer(control_plane_breaker=breaker, fail_open=True)
+        breaker.record_failure()
+        probe = breaker.admit()
+        assert probe.allowed and probe.owns_probe
+        with enforcer._state_lock:
+            enforcer._lease_grants_in_flight.add(RUN)
+
+        try:
+            result = await _acheck(enforcer, call_uuid("async-half-open-cold-follower"))
+
+            assert result.allowed is True
+            state = enforcer._lease.state_for(RUN)
+            assert state is not None
+            assert state.uncounted_calls == 1
+            assert state.uncounted_tokens == 600
+        finally:
+            with enforcer._state_lock:
+                enforcer._lease_grants_in_flight.discard(RUN)
+            breaker.release_probe(probe)
+            await enforcer._http.aclose()
+
 
 # ---------------------------------------------------------------------------
 # Renewals (always off the caller's thread)
@@ -521,6 +652,132 @@ class TestLeaseOutage:
 @pytest.mark.unit
 class TestLeaseRenewal:
     """Renew ahead of need; a renewal never sits on a customer call."""
+
+    def test_two_due_signals_claim_only_one_renewal(self) -> None:
+        enforcer = _make_enforcer()
+        release = threading.Event()
+        entered = threading.Semaphore(0)
+
+        def _parked_renewal(request: httpx.Request) -> Response:
+            entered.release()
+            release.wait(timeout=5.0)
+            return Response(200, json=_grant_payload(generation=2))
+
+        try:
+            with respx.mock:
+                respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+                renew = respx.post(RENEW_URL).mock(side_effect=_parked_renewal)
+                _check(enforcer, call_uuid("atomic-renew-grant"))
+
+                enforcer._start_renewal(
+                    RUN,
+                    model="gpt-5.5",
+                    provider="openai",
+                    fallback_providers=[],
+                    fallback_models=[],
+                )
+                enforcer._start_renewal(
+                    RUN,
+                    model="gpt-5.5",
+                    provider="openai",
+                    fallback_providers=[],
+                    fallback_models=[],
+                )
+                assert entered.acquire(timeout=3.0)
+                with enforcer._state_lock:
+                    assert len(enforcer._renewal_threads) == 1
+        finally:
+            release.set()
+            _wait_for(lambda: renew.call_count == 1)
+            enforcer._http.close()
+
+    def test_sync_renewal_workers_are_globally_bounded(self) -> None:
+        enforcer = _make_enforcer()
+        release = threading.Event()
+        entered = threading.Semaphore(0)
+        run_count = 7
+
+        def _parked_renewal(request: httpx.Request) -> Response:
+            entered.release()
+            release.wait(timeout=5.0)
+            return Response(200, json=_grant_payload(generation=2))
+
+        try:
+            with respx.mock:
+                renew = respx.post(RENEW_URL).mock(side_effect=_parked_renewal)
+                for index in range(run_count):
+                    run_id = f"bounded-sync-{index}"
+                    with enforcer._state_lock:
+                        enforcer._lease.apply_grant_response(
+                            run_id,
+                            LeaseGrantResponse.model_validate(
+                                _grant_payload(lease_id=f"lease-sync-{index}")
+                            ),
+                            now=time.monotonic(),
+                            declared_models=["gpt-5.5"],
+                        )
+                    enforcer._start_renewal(
+                        run_id,
+                        model="gpt-5.5",
+                        provider="openai",
+                        fallback_providers=[],
+                        fallback_models=[],
+                    )
+
+                for _ in range(budget_module._MAX_RENEWAL_WORKERS):
+                    assert entered.acquire(timeout=3.0)
+                assert not entered.acquire(timeout=0.05)
+                with enforcer._state_lock:
+                    assert len(enforcer._renewal_threads) <= budget_module._MAX_RENEWAL_WORKERS
+        finally:
+            release.set()
+            _wait_for(lambda: renew.call_count == budget_module._MAX_RENEWAL_WORKERS)
+            enforcer._http.close()
+
+    async def test_async_renewal_tasks_are_globally_bounded(self) -> None:
+        enforcer = _make_async_enforcer()
+        release = asyncio.Event()
+        entered = asyncio.Semaphore(0)
+        run_count = 7
+
+        async def _parked_post(*args: object, **kwargs: object) -> Response:
+            entered.release()
+            await release.wait()
+            return Response(
+                200,
+                json=_grant_payload(generation=2),
+                request=httpx.Request("POST", RENEW_URL),
+            )
+
+        with patch.object(enforcer._http, "post", autospec=True, side_effect=_parked_post):
+            for index in range(run_count):
+                run_id = f"bounded-async-{index}"
+                with enforcer._state_lock:
+                    enforcer._lease.apply_grant_response(
+                        run_id,
+                        LeaseGrantResponse.model_validate(
+                            _grant_payload(lease_id=f"lease-async-{index}")
+                        ),
+                        now=time.monotonic(),
+                        declared_models=["gpt-5.5"],
+                    )
+                enforcer._start_renewal(
+                    run_id,
+                    model="gpt-5.5",
+                    provider="openai",
+                    fallback_providers=[],
+                    fallback_models=[],
+                )
+
+            for _ in range(budget_module._MAX_RENEWAL_WORKERS):
+                await asyncio.wait_for(entered.acquire(), timeout=3.0)
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(entered.acquire(), timeout=0.05)
+            assert len(enforcer._renewal_tasks) <= budget_module._MAX_RENEWAL_WORKERS
+            release.set()
+            await asyncio.gather(*list(enforcer._renewal_tasks))
+
+        await enforcer._http.aclose()
 
     def test_depletion_renews_once_and_admissions_keep_flowing(self) -> None:
         enforcer = _make_enforcer()
@@ -622,6 +879,56 @@ class TestLeaseRenewal:
 
         assert grant.call_count == 2
         assert check.call_count == 0
+        enforcer._http.close()
+
+    def test_a_late_404_cannot_drop_a_replacement_lease(self) -> None:
+        enforcer = _make_enforcer()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _late_not_found(request: httpx.Request) -> Response:
+            entered.set()
+            release.wait(timeout=5.0)
+            return Response(404, json={})
+
+        try:
+            with respx.mock:
+                respx.post(GRANT_URL).mock(
+                    return_value=Response(200, json=_grant_payload(granted_tokens=2_400))
+                )
+                renew = respx.post(RENEW_URL).mock(side_effect=_late_not_found)
+
+                for index in range(3):
+                    _check(enforcer, call_uuid(f"late-404-{index}"))
+                assert entered.wait(timeout=3.0)
+
+                with enforcer._state_lock:
+                    enforcer._lease.drop(RUN)
+                    enforcer._lease.apply_grant_response(
+                        RUN,
+                        LeaseGrantResponse.model_validate(
+                            _grant_payload(
+                                lease_id="lease_replacement",
+                                generation=1,
+                                granted_tokens=77_000,
+                            )
+                        ),
+                        now=time.monotonic(),
+                        declared_models=["gpt-5.5"],
+                    )
+                release.set()
+                assert _wait_for(lambda: renew.call_count == 1)
+                assert _wait_for(
+                    lambda: not any(thread.is_alive() for thread in enforcer._renewal_threads)
+                )
+        finally:
+            release.set()
+
+        state = enforcer._lease.state_for(RUN)
+        assert state is not None
+        assert state.lease_id == "lease_replacement"
+        assert state.generation == 1
+        assert state.granted_remaining_tokens == 77_000
         enforcer._http.close()
 
     def test_a_failed_renewal_backs_off_instead_of_retrying_per_call(self) -> None:
@@ -773,6 +1080,341 @@ class TestLeaseRenewal:
 class TestLeaseSurrender:
     """close() hands the float back instead of letting it expire."""
 
+    def test_late_renewal_surrenders_spend_settled_after_its_snapshot(self) -> None:
+        enforcer = _make_enforcer()
+        with enforcer._state_lock:
+            enforcer._lease.apply_grant_response(
+                RUN,
+                LeaseGrantResponse.model_validate(_grant_payload()),
+                now=time.monotonic(),
+                declared_models=["gpt-5.5"],
+            )
+            before_snapshot = enforcer._lease.admit(
+                run_id=RUN,
+                call_id="before-snapshot",
+                estimated_input_tokens=100,
+                output_bound=500,
+                model="gpt-5.5",
+                now=time.monotonic(),
+                breaker_open=False,
+            )
+            enforcer._lease.true_up(
+                "before-snapshot",
+                400,
+                claim_token=before_snapshot.claim_token,
+            )
+
+        work = enforcer._claim_renewal_work(
+            RUN,
+            model="gpt-5.5",
+            provider="openai",
+            fallback_providers=[],
+            fallback_models=[],
+        )
+        assert work is not None
+        request, close_epoch = work
+        assert request.spent_tokens == 400
+
+        with enforcer._state_lock:
+            after_snapshot = enforcer._lease.admit(
+                run_id=RUN,
+                call_id="after-snapshot",
+                estimated_input_tokens=100,
+                output_bound=500,
+                model="gpt-5.5",
+                now=time.monotonic(),
+                breaker_open=False,
+            )
+            enforcer._lease.true_up(
+                "after-snapshot",
+                250,
+                claim_token=after_snapshot.claim_token,
+            )
+
+        old_generation = enforcer._begin_close()
+        late = enforcer._finish_renewal(
+            RUN,
+            request,
+            LeaseGrantResponse.model_validate(_grant_payload(generation=2)),
+            ["gpt-5.5"],
+            close_epoch=close_epoch,
+        )
+
+        assert old_generation is not None
+        assert len(old_generation) == 1
+        assert old_generation[0].generation == 1
+        assert old_generation[0].spent_tokens == 650
+        assert enforcer.lease_surrender_payloads() == []
+        assert late is not None
+        assert late.generation == 2
+        assert late.spent_tokens == 250
+        enforcer._http.close()
+
+    def test_initial_grant_returning_after_close_is_surrendered_not_installed(self) -> None:
+        enforcer = _make_enforcer()
+        entered = threading.Event()
+        release = threading.Event()
+        result: list[BudgetCheckResult] = []
+
+        def _late_grant(request: httpx.Request) -> Response:
+            entered.set()
+            release.wait(timeout=5.0)
+            return Response(200, json=_grant_payload())
+
+        def _run_check() -> None:
+            result.append(_check(enforcer, call_uuid("late-initial-grant")))
+
+        with respx.mock, patch("solwyn.budget._SURRENDER_TIMEOUT_S", 0.1):
+            grant = respx.post(GRANT_URL).mock(side_effect=_late_grant)
+            respx.post(CHECK_URL).mock(return_value=Response(200, json=ALLOW_BUDGET_RESPONSE))
+            surrender = respx.post(SURRENDER_URL).mock(return_value=Response(200, json={}))
+
+            worker = threading.Thread(target=_run_check)
+            worker.start()
+            assert entered.wait(timeout=3.0)
+            enforcer.close()
+            release.set()
+            worker.join(timeout=3.0)
+
+            assert not worker.is_alive()
+            assert grant.call_count == 1
+            assert result and result[0].allowed is True
+            assert enforcer._lease.state_for(RUN) is None
+            assert _wait_for(lambda: surrender.call_count == 1)
+
+            import json as _json
+
+            payload = _json.loads(surrender.calls[0].request.read())
+            assert payload["lease_id"] == "lease_1"
+            assert payload["generation"] == 1
+            assert payload["spent_tokens"] == 0
+
+    def test_grant_installed_before_close_falls_back_without_reentry_crash(self) -> None:
+        enforcer = _make_enforcer()
+        installed = threading.Event()
+        release = threading.Event()
+        results: list[BudgetCheckResult] = []
+        errors: list[BaseException] = []
+        install_grant = enforcer._install_grant
+
+        def _park_after_install(*args: object, **kwargs: object) -> object:
+            outcome = install_grant(*args, **kwargs)  # type: ignore[arg-type]
+            installed.set()
+            release.wait(timeout=5.0)
+            return outcome
+
+        def _run_check() -> None:
+            try:
+                results.append(_check(enforcer, call_uuid("grant-close-reentry")))
+            except BaseException as exc:
+                errors.append(exc)
+
+        with (
+            respx.mock,
+            patch.object(enforcer, "_install_grant", side_effect=_park_after_install),
+            patch("solwyn.budget._SURRENDER_TIMEOUT_S", 0.1),
+        ):
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            respx.post(SURRENDER_URL).mock(return_value=Response(200, json={}))
+            worker = threading.Thread(target=_run_check)
+            worker.start()
+            assert installed.wait(timeout=3.0)
+
+            enforcer.close()
+            release.set()
+            worker.join(timeout=3.0)
+
+        assert not worker.is_alive()
+        assert errors == []
+        assert results and results[0].allowed is True
+        assert enforcer._lease.state_for(RUN) is None
+
+    async def test_async_initial_grant_returning_after_close_is_surrendered(self) -> None:
+        enforcer = _make_async_enforcer()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def _post(url: str, **kwargs: object) -> Response:
+            if url.endswith("/api/v1/budgets/lease"):
+                entered.set()
+                await release.wait()
+                return Response(
+                    200,
+                    json=_grant_payload(),
+                    request=httpx.Request("POST", url),
+                )
+            return Response(
+                200,
+                json=ALLOW_BUDGET_RESPONSE,
+                request=httpx.Request("POST", url),
+            )
+
+        with (
+            respx.mock,
+            patch.object(enforcer._http, "post", side_effect=_post),
+            patch("solwyn.budget._SURRENDER_TIMEOUT_S", 0.1),
+        ):
+            surrender = respx.post(SURRENDER_URL).mock(return_value=Response(200, json={}))
+            check_task = asyncio.create_task(
+                _acheck(enforcer, call_uuid("async-late-initial-grant"))
+            )
+            await asyncio.wait_for(entered.wait(), timeout=3.0)
+            await enforcer.close()
+            release.set()
+            result = await asyncio.wait_for(check_task, timeout=3.0)
+
+            assert result.allowed is True
+            assert enforcer._lease.state_for(RUN) is None
+            assert surrender.call_count == 1
+
+            import json as _json
+
+            payload = _json.loads(surrender.calls[0].request.read())
+            assert payload["lease_id"] == "lease_1"
+            assert payload["generation"] == 1
+            assert payload["spent_tokens"] == 0
+
+    def test_late_renewal_after_close_is_surrendered_not_reinstalled(self) -> None:
+        enforcer = _make_enforcer()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _late_renewal(request: httpx.Request) -> Response:
+            entered.set()
+            release.wait(timeout=5.0)
+            return Response(200, json=_grant_payload(generation=2, granted_tokens=88_000))
+
+        with respx.mock, patch("solwyn.budget._SURRENDER_TIMEOUT_S", 0.05):
+            respx.post(GRANT_URL).mock(
+                return_value=Response(200, json=_grant_payload(granted_tokens=2_400))
+            )
+            renew = respx.post(RENEW_URL).mock(side_effect=_late_renewal)
+            surrender = respx.post(SURRENDER_URL).mock(return_value=Response(200, json={}))
+
+            for index in range(3):
+                _check(enforcer, call_uuid(f"late-close-{index}"))
+            assert entered.wait(timeout=3.0)
+
+            enforcer.close()
+            assert enforcer._lease.state_for(RUN) is None
+
+            release.set()
+            assert _wait_for(lambda: renew.call_count == 1)
+            assert _wait_for(lambda: surrender.call_count >= 2)
+
+            import json as _json
+
+            payloads = [_json.loads(call.request.read()) for call in surrender.calls]
+            assert any(payload["generation"] == 2 for payload in payloads)
+            assert enforcer._lease.state_for(RUN) is None
+
+    async def test_async_cancelled_renewal_cannot_reinstall_after_close(self) -> None:
+        enforcer = _make_async_enforcer()
+        entered = asyncio.Event()
+
+        async def _respond_after_cancellation(*args: object, **kwargs: object) -> Response:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Model a transport that already received the successor and
+                # returns it despite the caller cancelling its wait.
+                return Response(
+                    200,
+                    json=_grant_payload(generation=2, granted_tokens=88_000),
+                    request=httpx.Request("POST", RENEW_URL),
+                )
+            raise RuntimeError("unreachable")
+
+        with (
+            respx.mock,
+            patch.object(
+                enforcer._http,
+                "post",
+                autospec=True,
+                side_effect=_respond_after_cancellation,
+            ),
+            patch("solwyn.budget._SURRENDER_TIMEOUT_S", 0.1),
+        ):
+            surrender = respx.post(SURRENDER_URL).mock(return_value=Response(200, json={}))
+            with enforcer._state_lock:
+                enforcer._lease.apply_grant_response(
+                    RUN,
+                    LeaseGrantResponse.model_validate(_grant_payload()),
+                    now=time.monotonic(),
+                    declared_models=["gpt-5.5"],
+                )
+            enforcer._start_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            await asyncio.wait_for(entered.wait(), timeout=3.0)
+
+            await enforcer.close()
+
+            import json as _json
+
+            payloads = [_json.loads(call.request.read()) for call in surrender.calls]
+            assert any(payload["generation"] == 2 for payload in payloads)
+            assert enforcer._lease.state_for(RUN) is None
+
+    async def test_async_close_waits_for_a_renewal_response_before_cancelling(self) -> None:
+        enforcer = _make_async_enforcer()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        cancelled = False
+
+        async def _renew_before_deadline(*args: object, **kwargs: object) -> Response:
+            nonlocal cancelled
+            entered.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            return Response(
+                200,
+                json=_grant_payload(generation=2, granted_tokens=88_000),
+                request=httpx.Request("POST", RENEW_URL),
+            )
+
+        with (
+            respx.mock,
+            patch.object(enforcer._http, "post", side_effect=_renew_before_deadline),
+            patch("solwyn.budget._SURRENDER_TIMEOUT_S", 0.5),
+        ):
+            surrender = respx.post(SURRENDER_URL).mock(return_value=Response(200, json={}))
+            with enforcer._state_lock:
+                enforcer._lease.apply_grant_response(
+                    RUN,
+                    LeaseGrantResponse.model_validate(_grant_payload()),
+                    now=time.monotonic(),
+                    declared_models=["gpt-5.5"],
+                )
+            enforcer._start_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            await asyncio.wait_for(entered.wait(), timeout=3.0)
+
+            close_task = asyncio.create_task(enforcer.close())
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.wait_for(close_task, timeout=3.0)
+
+            import json as _json
+
+            payloads = [_json.loads(call.request.read()) for call in surrender.calls]
+            assert cancelled is False
+            assert any(payload["generation"] == 2 for payload in payloads)
+            assert enforcer._lease.state_for(RUN) is None
+
     def test_close_surrenders_every_held_lease(self) -> None:
         enforcer = _make_enforcer()
         with respx.mock:
@@ -799,6 +1441,50 @@ class TestLeaseSurrender:
             surrender = respx.post(SURRENDER_URL).mock(return_value=Response(200, json={}))
             enforcer.close()
             assert surrender.call_count == 0
+
+    def test_close_evicts_inactive_and_uncounted_run_state(self) -> None:
+        enforcer = _make_enforcer()
+        with enforcer._state_lock:
+            enforcer._lease.record_uncounted("inactive-run", 600)
+            enforcer._lease.mark_ineligible(
+                "ineligible-run", now=time.monotonic(), retry_after=None
+            )
+
+        enforcer.close()
+
+        assert enforcer._lease.state_for("inactive-run") is None
+        assert enforcer._lease.state_for("ineligible-run") is None
+
+    def test_close_bounds_surrender_fanout_by_one_wall_clock_deadline(self) -> None:
+        enforcer = _make_enforcer()
+        release = threading.Event()
+
+        def _slow_surrender(request: httpx.Request) -> Response:
+            release.wait(timeout=0.2)
+            return Response(200, json={})
+
+        try:
+            with respx.mock, patch("solwyn.budget._SURRENDER_TIMEOUT_S", 0.05):
+                surrender = respx.post(SURRENDER_URL).mock(side_effect=_slow_surrender)
+                with enforcer._state_lock:
+                    for index in range(3):
+                        enforcer._lease.apply_grant_response(
+                            f"surrender-run-{index}",
+                            LeaseGrantResponse.model_validate(
+                                _grant_payload(lease_id=f"surrender-lease-{index}")
+                            ),
+                            now=time.monotonic(),
+                            declared_models=["gpt-5.5"],
+                        )
+
+                started = time.monotonic()
+                enforcer.close()
+                elapsed = time.monotonic() - started
+        finally:
+            release.set()
+
+        assert elapsed < 0.15
+        assert surrender.call_count <= 1
 
     def test_a_failed_surrender_never_raises_out_of_close(self) -> None:
         enforcer = _make_enforcer()
@@ -911,6 +1597,119 @@ class TestLeaseSurrender:
 class TestLeaseSettlement:
     """Reservations are trued up on settlement and released on error paths."""
 
+    def test_descriptive_call_id_is_ignored_when_no_run_can_use_a_lease(self) -> None:
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(CHECK_URL).mock(return_value=Response(200, json=ALLOW_BUDGET_RESPONSE))
+
+            result = _check(
+                enforcer,
+                "legacy-direct-caller",
+                raw_call_id=True,
+                agent_run_id=None,
+            )
+
+        assert result.allowed is True
+        enforcer._http.close()
+
+    def test_descriptive_call_id_is_ignored_when_leases_are_disabled(self) -> None:
+        enforcer = _make_enforcer(lease_enabled=False)
+        with respx.mock:
+            respx.post(CHECK_URL).mock(return_value=Response(200, json=ALLOW_BUDGET_RESPONSE))
+
+            result = _check(enforcer, "legacy-disabled", raw_call_id=True)
+
+        assert result.allowed is True
+        enforcer._http.close()
+
+    async def test_async_descriptive_call_id_is_ignored_for_media_calls(self) -> None:
+        enforcer = _make_async_enforcer()
+        with respx.mock:
+            respx.post(CHECK_URL).mock(return_value=Response(200, json=ALLOW_BUDGET_RESPONSE))
+
+            result = await _acheck(
+                enforcer,
+                "legacy-media",
+                raw_call_id=True,
+                modality="embedding",
+            )
+
+        assert result.allowed is True
+        await enforcer._http.aclose()
+
+    def test_invalid_check_call_id_is_rejected_before_lease_drawdown(self) -> None:
+        enforcer = _make_enforcer()
+        with enforcer._state_lock:
+            enforcer._lease.apply_grant_response(
+                RUN,
+                LeaseGrantResponse.model_validate(_grant_payload()),
+                now=time.monotonic(),
+                declared_models=["gpt-5.5"],
+            )
+        state = enforcer._lease.state_for(RUN)
+        assert state is not None
+
+        with pytest.raises(ValidationError):
+            _check(enforcer, "not-a-canonical-uuid", raw_call_id=True)
+
+        assert state.granted_remaining_tokens == 100_000
+        assert state.reservations == {}
+        enforcer._http.close()
+
+    async def test_async_invalid_call_id_is_rejected_before_drawdown(self) -> None:
+        enforcer = _make_async_enforcer()
+        with enforcer._state_lock:
+            enforcer._lease.apply_grant_response(
+                RUN,
+                LeaseGrantResponse.model_validate(_grant_payload()),
+                now=time.monotonic(),
+                declared_models=["gpt-5.5"],
+            )
+        state = enforcer._lease.state_for(RUN)
+        assert state is not None
+
+        with pytest.raises(ValidationError):
+            await _acheck(enforcer, "not-a-canonical-uuid", raw_call_id=True)
+
+        assert state.granted_remaining_tokens == 100_000
+        assert state.reservations == {}
+        await enforcer._http.aclose()
+
+    def test_invalid_confirm_is_validated_before_true_up(self) -> None:
+        enforcer = _make_enforcer()
+        with enforcer._state_lock:
+            enforcer._lease.apply_grant_response(
+                RUN,
+                LeaseGrantResponse.model_validate(_grant_payload()),
+                now=time.monotonic(),
+                declared_models=["gpt-5.5"],
+            )
+            enforcer._lease.admit(
+                run_id=RUN,
+                call_id="not-a-canonical-uuid",
+                estimated_input_tokens=100,
+                output_bound=500,
+                model="gpt-5.5",
+                now=time.monotonic(),
+                breaker_open=False,
+            )
+        state = enforcer._lease.state_for(RUN)
+        assert state is not None
+        before = state.granted_remaining_tokens
+
+        with pytest.raises(ValidationError):
+            enforcer.build_confirm_request(
+                model="gpt-5.5",
+                token_details=TokenDetails(input_tokens=100, output_tokens=50),
+                provider="openai",
+                call_id="not-a-canonical-uuid",
+                lease_id="lease_1",
+            )
+
+        assert state.granted_remaining_tokens == before
+        assert "not-a-canonical-uuid" in state.reservations
+        enforcer._http.close()
+
     def test_confirm_carries_the_lease_id_and_trues_up_the_reservation(self) -> None:
         enforcer = _make_enforcer()
         with respx.mock:
@@ -927,6 +1726,7 @@ class TestLeaseSettlement:
             provider="openai",
             call_id=call_uuid("call_1"),
             lease_id=result.lease_id,
+            lease_claim_token=result.lease_claim_token,
         )
 
         assert confirm.lease_id == "lease_1"
@@ -937,13 +1737,30 @@ class TestLeaseSettlement:
         assert state.spent_tokens_since_report == 200
         enforcer._http.close()
 
+    def test_lease_confirm_requires_the_exact_local_claim_capability(self) -> None:
+        enforcer = _make_enforcer()
+
+        with pytest.raises(RuntimeError, match="lease_claim_token"):
+            enforcer.build_confirm_request(
+                model="gpt-5.5",
+                token_details=TokenDetails(input_tokens=1, output_tokens=1),
+                provider="openai",
+                call_id=call_uuid("missing-lease-claim"),
+                lease_id="lease_1",
+            )
+
+        enforcer._http.close()
+
     def test_release_returns_an_abandoned_reservation(self) -> None:
         enforcer = _make_enforcer()
         with respx.mock:
             respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
-            _check(enforcer, "call_1")
+            result = _check(enforcer, "call_1")
 
-        enforcer.release_reservation("call_1")
+        enforcer.release_reservation(
+            call_uuid("call_1"),
+            lease_claim_token=result.lease_claim_token,
+        )
 
         state = enforcer._lease.state_for(RUN)
         assert state is not None
@@ -971,17 +1788,39 @@ class TestLeaseSettlement:
 # ---------------------------------------------------------------------------
 
 
-def _openai_client() -> tuple[MagicMock, object]:
-    client = MagicMock()
-    client.__class__.__module__ = "openai._client"
-    client.__class__.__name__ = "OpenAI"
-    client.with_options.return_value = client
+def _create_completion(**kwargs: object) -> object:
+    raise NotImplementedError
+
+
+def _create_embedding(**kwargs: object) -> object:
+    raise NotImplementedError
+
+
+class _OpenAIClient:
+    """Small SDK-shaped shell with specs at the actual call boundaries."""
+
+    __module__ = "openai._client"
+
+    def __init__(self, response: object) -> None:
+        self.chat = SimpleNamespace(
+            completions=SimpleNamespace(
+                create=MagicMock(spec=_create_completion, return_value=response)
+            )
+        )
+        self.embeddings = SimpleNamespace(create=MagicMock(spec=_create_embedding))
+        self.with_options = MagicMock(spec=self._with_options, return_value=self)
+
+    def _with_options(self, **kwargs: object) -> _OpenAIClient:
+        return self
+
+
+def _openai_client() -> tuple[_OpenAIClient, object]:
     response = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=100, completion_tokens=50))
-    client.chat.completions.create.return_value = response
+    client = _OpenAIClient(response)
     return client, response
 
 
-def _build_solwyn(client: MagicMock, **overrides: object) -> Solwyn:
+def _build_solwyn(client: object, **overrides: object) -> Solwyn:
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, api_key=VALID_API_KEY, **overrides)  # type: ignore[arg-type]
     solwyn._reporter._shutdown.set()
@@ -996,6 +1835,7 @@ def _lease_result() -> BudgetCheckResult:
         project_id=VALID_PROJECT_ID,
         reservation_id=None,
         lease_id="lease_1",
+        lease_claim_token=123,
         budget_limit=100.0,
         current_usage=20.0,
     )
@@ -1041,9 +1881,104 @@ class TestClientLeasePlumbing:
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
-    def test_an_uncapped_call_sends_no_bound(self) -> None:
+    @pytest.mark.parametrize(
+        ("model", "expected_key"),
+        [
+            ("gpt-5.5", "max_completion_tokens"),
+            ("gpt-4o", "max_tokens"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("global_defaults", "call_cap"),
+        [
+            ({"max_completion_tokens": 4_096}, {"max_tokens": 256}),
+            ({"max_tokens": 4_096}, {"max_completion_tokens": 256}),
+        ],
+    )
+    def test_call_cap_alias_beats_global_alias_for_bound_and_dispatch(
+        self,
+        model: str,
+        expected_key: str,
+        global_defaults: dict[str, int],
+        call_cap: dict[str, int],
+    ) -> None:
         client, _ = _openai_client()
-        solwyn = _build_solwyn(client)
+        solwyn = _build_solwyn(client, default_params=global_defaults)
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
+            patch.object(solwyn._reporter, "report_settlement"),
+            solwyn_pkg.run("alias-precedence"),
+        ):
+            solwyn.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": "Hello"}],
+                **call_cap,
+            )
+
+        assert check.call_args.kwargs["estimated_output_bound"] == 256
+        dispatched = client.chat.completions.create.call_args.kwargs
+        assert dispatched[expected_key] == 256
+        assert ({"max_tokens", "max_completion_tokens"} - {expected_key}).isdisjoint(dispatched)
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    @pytest.mark.parametrize(
+        ("model", "expected_key"),
+        [
+            ("gpt-5.5", "max_completion_tokens"),
+            ("gpt-4o", "max_tokens"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        ("global_defaults", "call_cap"),
+        [
+            ({"max_completion_tokens": 4_096}, {"max_tokens": 256}),
+            ({"max_tokens": 4_096}, {"max_completion_tokens": 256}),
+        ],
+    )
+    async def test_async_call_cap_alias_beats_global_alias_for_bound_and_dispatch(
+        self,
+        model: str,
+        expected_key: str,
+        global_defaults: dict[str, int],
+        call_cap: dict[str, int],
+    ) -> None:
+        client, response = _openai_client()
+        client.chat.completions.create = AsyncMock(spec=_create_completion, return_value=response)
+        solwyn = AsyncSolwyn(
+            client,
+            api_key=VALID_API_KEY,
+            default_params=global_defaults,
+        )
+
+        try:
+            with (
+                patch.object(
+                    solwyn._budget,
+                    "check_budget",
+                    AsyncMock(return_value=_lease_result()),
+                ) as check,
+                patch.object(solwyn._reporter, "report_settlement"),
+                solwyn_pkg.run("async-alias-precedence"),
+            ):
+                await solwyn.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "Hello"}],
+                    **call_cap,
+                )
+
+            assert check.call_args.kwargs["estimated_output_bound"] == 256
+            dispatched = client.chat.completions.create.call_args.kwargs
+            assert dispatched[expected_key] == 256
+            assert ({"max_tokens", "max_completion_tokens"} - {expected_key}).isdisjoint(dispatched)
+        finally:
+            await solwyn._reporter._http.aclose()
+            await solwyn._budget._http.aclose()
+
+    def test_an_uncapped_call_sends_the_configured_default_bound(self) -> None:
+        client, _ = _openai_client()
+        solwyn = _build_solwyn(client, lease_output_bound_default=777)
 
         with (
             patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
@@ -1054,9 +1989,93 @@ class TestClientLeasePlumbing:
                 model="gpt-5.5", messages=[{"role": "user", "content": "Hello"}]
             )
 
-        assert check.call_args.kwargs["estimated_output_bound"] is None
+        assert check.call_args.kwargs["estimated_output_bound"] == 777
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
+
+    @pytest.mark.parametrize(
+        ("dialect", "kwargs", "global_defaults", "expected"),
+        [
+            ("google", {"config": {"max_output_tokens": 2_048}}, {}, 2_048),
+            ("bedrock", {"inferenceConfig": {"maxTokens": 3_072}}, {}, 3_072),
+            ("openai", {}, {"max_completion_tokens": 4_096}, 4_096),
+        ],
+    )
+    def test_effective_bound_reads_nested_and_global_caps(
+        self,
+        dialect: str,
+        kwargs: dict[str, object],
+        global_defaults: dict[str, object],
+        expected: int,
+    ) -> None:
+        provider = ProviderName(dialect)
+        runtime = ProviderRuntime(
+            entry=ProviderEntry(provider=provider, model="model-primary"),
+            sdk_client=object(),
+            adapter=SimpleNamespace(name=provider.value, dialect=dialect),
+        )
+
+        bound = _effective_output_bound(
+            primary=runtime,
+            runtimes=[runtime],
+            global_defaults=global_defaults,
+            kwargs={"model": "model-primary", **kwargs},
+            default_bound=777,
+        )
+
+        assert bound == expected
+
+    def test_effective_bound_uses_the_largest_failover_entry_cap(self) -> None:
+        primary = ProviderRuntime(
+            entry=ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5"),
+            sdk_client=object(),
+            adapter=SimpleNamespace(name="openai", dialect="openai"),
+        )
+        fallback = ProviderRuntime(
+            entry=ProviderEntry(
+                provider=ProviderName.GROQ,
+                model="llama-4",
+                default_params={"max_completion_tokens": 8_192},
+            ),
+            sdk_client=object(),
+            adapter=SimpleNamespace(name="groq", dialect="openai"),
+        )
+
+        bound = _effective_output_bound(
+            primary=primary,
+            runtimes=[primary, fallback],
+            global_defaults={"max_tokens": 1_024},
+            kwargs={"model": "gpt-5.5"},
+            default_bound=777,
+        )
+
+        assert bound == 8_192
+
+    def test_per_call_alias_beats_a_failover_entry_alias_for_every_hop(self) -> None:
+        primary = ProviderRuntime(
+            entry=ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5"),
+            sdk_client=object(),
+            adapter=SimpleNamespace(name="openai", dialect="openai"),
+        )
+        fallback = ProviderRuntime(
+            entry=ProviderEntry(
+                provider=ProviderName.GROQ,
+                model="llama-4",
+                default_params={"max_completion_tokens": 4_096},
+            ),
+            sdk_client=object(),
+            adapter=SimpleNamespace(name="groq", dialect="openai"),
+        )
+
+        bound = _effective_output_bound(
+            primary=primary,
+            runtimes=[primary, fallback],
+            global_defaults={},
+            kwargs={"model": "gpt-5.5", "max_tokens": 256},
+            default_bound=777,
+        )
+
+        assert bound == 256
 
     def test_a_lease_funded_success_settles_on_the_lease(self) -> None:
         client, _ = _openai_client()
@@ -1095,7 +2114,10 @@ class TestClientLeasePlumbing:
                 model="gpt-5.5", messages=[{"role": "user", "content": "Hello"}]
             )
 
-        release.assert_called_once_with(check.call_args.kwargs["call_id"])
+        release.assert_called_once_with(
+            check.call_args.kwargs["call_id"],
+            lease_claim_token=123,
+        )
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
@@ -1118,7 +2140,10 @@ class TestClientLeasePlumbing:
                 model="gpt-5.5", messages=[{"role": "user", "content": "Hello"}]
             )
 
-        release.assert_called_once_with(check.call_args.kwargs["call_id"])
+        release.assert_called_once_with(
+            check.call_args.kwargs["call_id"],
+            lease_claim_token=123,
+        )
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
@@ -1174,7 +2199,10 @@ class TestClientLeasePlumbing:
         ):
             solwyn._media_call(spec, model="text-embedding-3-small", input="hello")
 
-        release.assert_called_once_with(check.call_args.kwargs["call_id"])
+        release.assert_called_once_with(
+            check.call_args.kwargs["call_id"],
+            lease_claim_token=123,
+        )
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 

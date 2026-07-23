@@ -181,6 +181,37 @@ _TOOL_REQUEST = {
 
 @pytest.mark.unit
 class TestToolExchangeFailover:
+    def test_legacy_openai_model_call_cap_beats_global_alias_during_translation(
+        self,
+    ) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = _Status(429)
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_text_response()
+
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-4o",
+            default_params={"max_completion_tokens": 4_096},
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 8_192})],
+        )
+
+        with patch.object(
+            solwyn._budget,
+            "check_budget",
+            return_value=_allow_budget(),
+        ) as check:
+            solwyn.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=256,
+            )
+
+        assert check.call_args.kwargs["estimated_output_bound"] == 256
+        assert anthropic.messages.create.call_args.kwargs["max_tokens"] == 256
+
+        _close(solwyn)
+
     def test_target_native_default_params_do_not_enter_source_translation(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.side_effect = _Status(429)

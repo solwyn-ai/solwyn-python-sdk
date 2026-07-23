@@ -35,6 +35,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from contextlib import suppress
 from typing import Any
 
 import httpx
@@ -384,12 +385,21 @@ class TestLeasePartitioning:
             for index in (0, 1)
         ]
         admitted = [0, 0]
+        driver_errors: list[Exception | None] = [None, None]
+        initial_generations = [0, 0]
+        both_holders_ready = threading.Event()
+        overlap_barrier = threading.Barrier(2, action=both_holders_ready.set)
+        resume_drivers = threading.Event()
+        both_holders_renewed = threading.Event()
+        renewed_barrier = threading.Barrier(2, action=both_holders_renewed.set)
+        resume_after_renewal = threading.Event()
 
         def drive(index: int) -> None:
             enforcer = enforcers[index]
             drawn = 0
-            for _ in range(25):
-                call_id = str(uuid.uuid4())
+
+            def admit_and_settle(call_id: str) -> None:
+                nonlocal drawn
                 result = _admit(
                     enforcer,
                     run_id,
@@ -398,11 +408,8 @@ class TestLeasePartitioning:
                     call_id=call_id,
                 )
                 if not (result.allowed and result.lease_id is not None):
-                    continue
+                    return
                 drawn += per_call
-                # Settle exactly what was reserved: the lease-tagged confirm is
-                # the only writer of settled tokens, so skipping it would let a
-                # renewal re-grant float the server still believes is unspent.
                 _send_confirm(
                     credentials,
                     enforcer.build_confirm_request(
@@ -413,45 +420,135 @@ class TestLeasePartitioning:
                         provider="openai",
                         call_id=call_id,
                         lease_id=result.lease_id,
+                        lease_claim_token=result.lease_claim_token,
                     ),
                 )
+
+            first_call_id = str(uuid.uuid4())
+            try:
+                first = _admit(
+                    enforcer,
+                    run_id,
+                    estimated_input_tokens=input_tokens,
+                    estimated_output_bound=output_bound,
+                    call_id=first_call_id,
+                )
+                if not (first.allowed and first.lease_id is not None):
+                    raise AssertionError(
+                        f"holder {index} did not receive lease authority on its first admission"
+                    )
+                first_state = enforcer._lease.state_for(run_id)
+                if first_state is None or first_state.lease_id is None:
+                    raise AssertionError(f"holder {index} installed no first lease")
+                initial_generations[index] = first_state.generation
+                # Both first admissions (and therefore both grant responses)
+                # must be installed before either holder settles or advances.
+                # This creates a guaranteed overlap window for the assertion
+                # below instead of hoping a periodic sampler catches one.
+                overlap_barrier.wait(timeout=180)
+                resume_drivers.wait(timeout=180)
+                drawn += per_call
+                _send_confirm(
+                    credentials,
+                    enforcer.build_confirm_request(
+                        model=MODEL,
+                        token_details=TokenDetails(
+                            input_tokens=input_tokens,
+                            output_tokens=output_bound,
+                        ),
+                        provider="openai",
+                        call_id=first_call_id,
+                        lease_id=first.lease_id,
+                        lease_claim_token=first.lease_claim_token,
+                    ),
+                )
+
+                renewed = False
+                for _ in range(24):
+                    call_id = str(uuid.uuid4())
+                    admit_and_settle(call_id)
+                    _join_renewals(enforcer)
+                    state = enforcer._lease.state_for(run_id)
+                    if (
+                        not renewed
+                        and state is not None
+                        and state.lease_id is not None
+                        and state.generation > initial_generations[index]
+                    ):
+                        renewed = True
+                        renewed_barrier.wait(timeout=180)
+                        resume_after_renewal.wait(timeout=180)
+                if not renewed:
+                    raise AssertionError(f"holder {index} never completed a renewal")
+            except Exception as exc:
+                driver_errors[index] = exc
+                both_holders_ready.set()
+                both_holders_renewed.set()
+                with suppress(Exception):
+                    overlap_barrier.abort()
+                with suppress(Exception):
+                    renewed_barrier.abort()
+                resume_drivers.set()
+                resume_after_renewal.set()
+                return
+
             admitted[index] = drawn
 
         threads = [threading.Thread(target=drive, args=(index,)) for index in (0, 1)]
-        stop_sampling = threading.Event()
-        joint_peak = 0
-
-        def sample_joint_authority() -> None:
-            # Sampling races the drivers, and it races them in the SAFE
-            # direction: a sample landing between one holder's grant and the
-            # other's sees LESS joint authority, never more. So the race can
-            # only make this test miss a violation, never invent one.
-            nonlocal joint_peak
-            while not stop_sampling.is_set():
-                held = 0
-                for enforcer in enforcers:
-                    state = enforcer._lease.state_for(run_id)
-                    if state is not None and state.lease_id is not None:
-                        held += state.granted_tokens
-                joint_peak = max(joint_peak, held)
-                time.sleep(0.01)
-
-        sampler = threading.Thread(target=sample_joint_authority, daemon=True)
-        sampler.start()
         for thread in threads:
             thread.start()
+        initial_joint_authority = 0
+        renewed_joint_authority = 0
+        try:
+            assert both_holders_ready.wait(timeout=180), (
+                f"holders did not reach the forced overlap: {driver_errors}"
+            )
+            assert driver_errors == [None, None]
+            initial_states = [enforcer._lease.state_for(run_id) for enforcer in enforcers]
+            assert all(state is not None and state.lease_id is not None for state in initial_states)
+            initial_joint_authority = sum(
+                state.granted_tokens for state in initial_states if state is not None
+            )
+            resume_drivers.set()
+
+            assert both_holders_renewed.wait(timeout=180), (
+                f"holders did not reach the renewed overlap: {driver_errors}"
+            )
+            assert driver_errors == [None, None]
+            renewed_states = [enforcer._lease.state_for(run_id) for enforcer in enforcers]
+            assert all(
+                state is not None
+                and state.lease_id is not None
+                and state.generation > initial_generations[index]
+                for index, state in enumerate(renewed_states)
+            )
+            renewed_joint_authority = sum(
+                state.granted_tokens for state in renewed_states if state is not None
+            )
+        finally:
+            resume_drivers.set()
+            resume_after_renewal.set()
+            with suppress(Exception):
+                overlap_barrier.abort()
+            with suppress(Exception):
+                renewed_barrier.abort()
+
         for thread in threads:
             thread.join(timeout=180)
-        stop_sampling.set()
-        sampler.join(timeout=10)
         for thread in threads:
             assert not thread.is_alive(), "a holder thread did not finish"
+        assert driver_errors == [None, None]
 
         assert sum(admitted) > 0, "neither holder ever admitted on lease authority"
-        assert joint_peak > 0, "the sampler never observed a live lease"
-        assert joint_peak <= solo_bound, (
+        assert initial_joint_authority > 0, "the forced overlap held no live lease"
+        assert initial_joint_authority <= solo_bound, (
             "two holders jointly held more token authority "
-            f"({joint_peak}) than a single holder's bound ({solo_bound})"
+            f"({initial_joint_authority}) than a single holder's bound ({solo_bound})"
+        )
+        assert renewed_joint_authority > 0, "the renewed overlap held no live lease"
+        assert renewed_joint_authority <= solo_bound, (
+            "two renewed holders jointly held more token authority "
+            f"({renewed_joint_authority}) than a single holder's bound ({solo_bound})"
         )
 
     @pytest.mark.integration
@@ -516,6 +613,7 @@ class TestLeasePartitioning:
                     provider="openai",
                     call_id=call_id,
                     lease_id=result.lease_id,
+                    lease_claim_token=result.lease_claim_token,
                 ),
             )
 
@@ -549,7 +647,10 @@ class TestLeaseReclaim:
         assert first.lease_id is not None
         # Genuinely idle: hand the triggering call's reservation back so the
         # renewals report neither spend nor in-flight demand.
-        enforcer.release_reservation(call_id)
+        enforcer.release_reservation(
+            call_id,
+            lease_claim_token=first.lease_claim_token,
+        )
 
         state = enforcer._lease.state_for(run_id)
         assert state is not None

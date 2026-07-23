@@ -68,6 +68,19 @@ class _FixedRandom(random.Random):
         return a + (b - a) * self.ratio
 
 
+class _NoReservationScan(dict[str, Any]):
+    """Dict guard proving hot-path admission never walks existing calls."""
+
+    def items(self):  # type: ignore[no-untyped-def]
+        raise AssertionError("admission scanned every open reservation")
+
+    def values(self):  # type: ignore[no-untyped-def]
+        raise AssertionError("admission scanned every open reservation")
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        raise AssertionError("admission scanned every open reservation")
+
+
 def _ledger(**kwargs: Any) -> LeaseLedger:
     kwargs.setdefault("holder_id", HOLDER)
     kwargs.setdefault("rng", _FixedRandom(1.0))
@@ -96,6 +109,24 @@ def _admit(ledger: LeaseLedger, **kwargs: Any) -> LeaseAdmission:
     }
     params.update(kwargs)
     return ledger.admit(**params)
+
+
+def _claim_token(ledger: LeaseLedger, call_id: str) -> int | None:
+    """Current test-call capability, or None for an unknown/expired call."""
+    claim = ledger._call_claims.get(call_id)
+    return claim.token if claim is not None else None
+
+
+def _true_up(ledger: LeaseLedger, call_id: str, actual_tokens: int) -> None:
+    ledger.true_up(
+        call_id,
+        actual_tokens,
+        claim_token=_claim_token(ledger, call_id),
+    )
+
+
+def _release(ledger: LeaseLedger, call_id: str) -> None:
+    ledger.release(call_id, claim_token=_claim_token(ledger, call_id))
 
 
 @pytest.mark.unit
@@ -170,8 +201,14 @@ class TestAdmissionGates:
         ledger.mark_ineligible(RUN, now=1_000.0, retry_after=INELIGIBLE_RETRY_AFTER_S)
 
         # Act / Assert
-        assert _admit(ledger, now=1_029.0).decision is LeaseDecision.LEGACY_CHECK
-        assert _admit(ledger, now=1_030.0).decision is LeaseDecision.NEED_GRANT
+        assert (
+            _admit(ledger, call_id="ineligible-window", now=1_029.0).decision
+            is LeaseDecision.LEGACY_CHECK
+        )
+        assert (
+            _admit(ledger, call_id="retry-after-window", now=1_030.0).decision
+            is LeaseDecision.NEED_GRANT
+        )
 
 
 @pytest.mark.unit
@@ -291,8 +328,14 @@ class TestGrantApplication:
 
         assert outcome is GrantOutcome.MALFORMED
         assert ledger.lease_id_for(RUN) is None
-        assert _admit(ledger, now=1_010.0).decision is LeaseDecision.LEGACY_CHECK
-        assert _admit(ledger, now=1_031.0).decision is LeaseDecision.NEED_GRANT
+        assert (
+            _admit(ledger, call_id="malformed-window", now=1_010.0).decision
+            is LeaseDecision.LEGACY_CHECK
+        )
+        assert (
+            _admit(ledger, call_id="malformed-retry", now=1_031.0).decision
+            is LeaseDecision.NEED_GRANT
+        )
 
     def test_zero_token_grant_falls_through_to_the_legacy_path(self) -> None:
         # granted_tokens=0 (alert_only past cap) is a live lease with an empty
@@ -523,7 +566,7 @@ class TestReservationLifecycle:
         _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
 
         # Act
-        ledger.true_up("a", 400)
+        _true_up(ledger, "a", 400)
 
         # Assert — the unspent 1_100 comes back and the spend is reportable.
         state = ledger.state_for(RUN)
@@ -537,7 +580,7 @@ class TestReservationLifecycle:
         ledger = _granted_ledger(granted_tokens=2_000)
         _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
 
-        ledger.true_up("a", 9_000)
+        _true_up(ledger, "a", 9_000)
 
         state = ledger.state_for(RUN)
         assert state is not None
@@ -547,7 +590,7 @@ class TestReservationLifecycle:
     def test_next_admission_after_overshoot_follows_the_normal_path(self) -> None:
         ledger = _granted_ledger(granted_tokens=2_000)
         _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
-        ledger.true_up("a", 9_000)
+        _true_up(ledger, "a", 9_000)
 
         plane_up = _admit(ledger, call_id="b", breaker_open=False)
         plane_down = _admit(ledger, call_id="c", breaker_open=True)
@@ -559,7 +602,7 @@ class TestReservationLifecycle:
         ledger = _granted_ledger()
         _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
 
-        ledger.release("a")
+        _release(ledger, "a")
 
         state = ledger.state_for(RUN)
         assert state is not None
@@ -569,8 +612,8 @@ class TestReservationLifecycle:
     def test_true_up_and_release_of_an_unknown_call_are_no_ops(self) -> None:
         ledger = _granted_ledger()
 
-        ledger.true_up("never-admitted", 100)
-        ledger.release("never-admitted")
+        _true_up(ledger, "never-admitted", 100)
+        _release(ledger, "never-admitted")
 
         state = ledger.state_for(RUN)
         assert state is not None
@@ -590,7 +633,7 @@ class TestReservationLifecycle:
         )
 
         # Act
-        ledger.true_up("a", 9_000)
+        _true_up(ledger, "a", 9_000)
 
         # Assert
         state = ledger.state_for(RUN)
@@ -608,7 +651,7 @@ class TestReservationLifecycle:
             breaker_open=True,
         )
 
-        ledger.true_up("a", 900)
+        _true_up(ledger, "a", 900)
 
         state = ledger.state_for(RUN)
         assert state is not None
@@ -648,18 +691,201 @@ class TestReservationLifecycle:
         assert "abandoned" not in state.reservations
         assert state.granted_remaining_tokens == 100_000 - 1_500
 
-    def test_a_repeated_call_id_releases_the_orphaned_reservation(self) -> None:
-        # Nothing on today's call path re-admits the same call_id, but a silent
-        # orphan would strand tokens until the 900s sweep.
+    def test_high_fanout_admission_does_not_scan_open_reservations(self) -> None:
+        ledger = _granted_ledger(
+            granted_tokens=10_000_000,
+            lease_length_s=10_000.0,
+        )
+        for index in range(2_000):
+            _admit(
+                ledger,
+                call_id=f"fanout-{index}",
+                estimated_input_tokens=1,
+                output_bound=1,
+            )
+        state = ledger.state_for(RUN)
+        assert state is not None
+        state.reservations = _NoReservationScan(state.reservations)
+
+        admission = _admit(
+            ledger,
+            call_id="fanout-fresh",
+            estimated_input_tokens=1,
+            output_bound=1,
+            now=1_002.0,
+        )
+
+        assert admission.decision is LeaseDecision.ADMIT_LOCAL
+
+    def test_a_repeated_call_id_is_rejected_before_a_second_drawdown(self) -> None:
         ledger = _granted_ledger()
         _admit(ledger, call_id="dup", estimated_input_tokens=1_000, output_bound=500)
 
-        _admit(ledger, call_id="dup", estimated_input_tokens=1_000, output_bound=500)
+        with pytest.raises(RuntimeError, match="call_id"):
+            _admit(ledger, call_id="dup", estimated_input_tokens=1_000, output_bound=500)
 
         state = ledger.state_for(RUN)
         assert state is not None
         assert len(state.reservations) == 1
         assert state.granted_remaining_tokens == 100_000 - 1_500
+
+    def test_cold_start_claims_call_id_and_only_the_grant_owner_may_reenter(self) -> None:
+        ledger = _ledger()
+
+        first = _admit(ledger, call_id="cold-start")
+
+        assert first.decision is LeaseDecision.NEED_GRANT
+        with pytest.raises(RuntimeError, match="call_id"):
+            _admit(ledger, call_id="cold-start")
+
+        ledger.apply_grant_response(
+            RUN,
+            _response(),
+            now=1_002.0,
+            declared_models=["gpt-5.5"],
+        )
+        reentry = _admit(
+            ledger,
+            call_id="cold-start",
+            now=1_003.0,
+            claim_token=first.claim_token,
+        )
+
+        assert reentry.decision is LeaseDecision.ADMIT_LOCAL
+        state = ledger.state_for(RUN)
+        assert state is not None
+        remaining = state.granted_remaining_tokens
+        with pytest.raises(RuntimeError, match="reservation"):
+            _admit(
+                ledger,
+                call_id="cold-start",
+                now=1_004.0,
+                claim_token=first.claim_token,
+            )
+        assert state.granted_remaining_tokens == remaining
+
+    def test_expired_claim_rejects_a_stale_owner_after_the_id_is_reused(self) -> None:
+        ledger = _ledger()
+        original = _admit(ledger, call_id="aba", now=1_000.0)
+        assert original.decision is LeaseDecision.NEED_GRANT
+        assert original.claim_token is not None
+
+        ledger.apply_grant_response(
+            RUN,
+            _response(lease_length_s=10_000.0),
+            now=1_900.0,
+            declared_models=["gpt-5.5"],
+        )
+        successor = _admit(ledger, call_id="aba", now=1_901.0)
+        assert successor.decision is LeaseDecision.ADMIT_LOCAL
+        assert successor.claim_token != original.claim_token
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        remaining = state.granted_remaining_tokens
+        with pytest.raises(RuntimeError, match="claim"):
+            _admit(
+                ledger,
+                call_id="aba",
+                now=1_902.0,
+                claim_token=original.claim_token,
+            )
+
+        assert state.granted_remaining_tokens == remaining
+        assert list(state.reservations) == ["aba"]
+
+    def test_expired_owner_cannot_settle_or_release_a_successor_reservation(self) -> None:
+        ledger = _granted_ledger(lease_length_s=10_000.0)
+        original = _admit(ledger, call_id="settlement-aba", now=1_001.0)
+        assert original.claim_token is not None
+
+        ledger.sweep(1_001.0 + RESERVATION_MAX_AGE_S)
+        successor = _admit(
+            ledger,
+            call_id="settlement-aba",
+            now=1_002.0 + RESERVATION_MAX_AGE_S,
+        )
+        assert successor.claim_token is not None
+        assert successor.claim_token != original.claim_token
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        remaining = state.granted_remaining_tokens
+        ledger.true_up(
+            "settlement-aba",
+            9_000,
+            claim_token=original.claim_token,
+        )
+        ledger.release(
+            "settlement-aba",
+            claim_token=original.claim_token,
+        )
+
+        assert state.granted_remaining_tokens == remaining
+        assert state.reservations["settlement-aba"].claim_token == successor.claim_token
+
+    def test_legacy_fallback_claims_call_id_for_the_calls_lifecycle(self) -> None:
+        ledger = _granted_ledger()
+
+        first = _admit(ledger, call_id="legacy", model="gpt-4.1")
+
+        assert first.decision is LeaseDecision.LEGACY_CHECK
+        with pytest.raises(RuntimeError, match="call_id"):
+            _admit(ledger, call_id="legacy", model="gpt-4.1")
+
+    def test_settled_call_id_claim_expires_with_the_maximum_call_lifecycle(self) -> None:
+        ledger = _granted_ledger(lease_length_s=10_000.0)
+        _admit(ledger, call_id="bounded", estimated_input_tokens=1_000, output_bound=500)
+        _true_up(ledger, "bounded", 1_000)
+
+        with pytest.raises(RuntimeError, match="call_id"):
+            _admit(
+                ledger,
+                call_id="bounded",
+                estimated_input_tokens=1_000,
+                output_bound=500,
+                now=1_002.0,
+            )
+
+        ledger.sweep(now=1_001.0 + RESERVATION_MAX_AGE_S)
+        reused = _admit(
+            ledger,
+            call_id="bounded",
+            estimated_input_tokens=1_000,
+            output_bound=500,
+            now=1_002.0 + RESERVATION_MAX_AGE_S,
+        )
+
+        assert reused.decision is LeaseDecision.ADMIT_LOCAL
+
+    def test_a_call_id_cannot_move_the_global_index_to_another_run(self) -> None:
+        ledger = _granted_ledger()
+        other_run = "run-other"
+        ledger.apply_grant_response(
+            other_run,
+            _response(lease_id="lse_other"),
+            now=1_000.0,
+            declared_models=["gpt-5.5"],
+        )
+        _admit(ledger, call_id="global-dup", estimated_input_tokens=1_000, output_bound=500)
+
+        with pytest.raises(RuntimeError, match="call_id"):
+            ledger.admit(
+                run_id=other_run,
+                call_id="global-dup",
+                estimated_input_tokens=1_000,
+                output_bound=500,
+                model="gpt-5.5",
+                now=1_002.0,
+                breaker_open=False,
+            )
+
+        original = ledger.state_for(RUN)
+        other = ledger.state_for(other_run)
+        assert original is not None and other is not None
+        assert original.reservations["global-dup"].tokens == 1_500
+        assert other.granted_remaining_tokens == 100_000
+        assert other.reservations == {}
 
     def test_superseded_reservations_do_not_inflate_the_demand_hint(self) -> None:
         # A reservation funded by a dropped lease no-ops at true-up; it must
@@ -772,7 +998,7 @@ class TestRenewalBookkeeping:
         for _ in range(3):
             ledger.record_uncounted(RUN, 300)
         _admit(ledger, call_id="settled", estimated_input_tokens=1_000, output_bound=500)
-        ledger.true_up("settled", 800)
+        _true_up(ledger, "settled", 800)
         _admit(ledger, call_id="in-flight", estimated_input_tokens=1_000, output_bound=500)
 
         # Act
@@ -796,6 +1022,18 @@ class TestRenewalBookkeeping:
         assert request is not None
         assert request.model == "gpt-5.5-mini"
 
+    def test_claiming_a_renewal_rejects_a_second_in_flight_request(self) -> None:
+        ledger = _granted_ledger()
+
+        first = ledger.claim_renewal_request(RUN)
+        second = ledger.claim_renewal_request(RUN)
+
+        assert first is not None
+        assert second is None
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.renewal_in_flight is True
+
     def test_renewal_request_is_none_without_a_lease(self) -> None:
         ledger = _ledger()
 
@@ -806,7 +1044,7 @@ class TestRenewalBookkeeping:
         # lands. Only the acknowledged 800 may clear.
         ledger = _granted_ledger()
         _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
-        ledger.true_up("a", 800)
+        _true_up(ledger, "a", 800)
         state = ledger.state_for(RUN)
         assert state is not None
         for _ in range(2):
@@ -815,7 +1053,7 @@ class TestRenewalBookkeeping:
         request = ledger.build_renewal_request(RUN)
         assert request is not None
         _admit(ledger, call_id="b", estimated_input_tokens=1_000, output_bound=500)
-        ledger.true_up("b", 200)
+        _true_up(ledger, "b", 200)
 
         # Act
         ledger.apply_grant_response(RUN, _response(generation=2), now=1_020.0)
@@ -838,10 +1076,54 @@ class TestRenewalBookkeeping:
         assert state.uncounted_calls == 2
         assert state.uncounted_tokens == 500
 
+    def test_old_renewal_results_cannot_mutate_a_replacement_lease(self) -> None:
+        ledger = _granted_ledger()
+        old_request = ledger.claim_renewal_request(RUN)
+        assert old_request is not None
+
+        ledger.drop(RUN)
+        ledger.apply_grant_response(
+            RUN,
+            _response(lease_id="lse_replacement", generation=1, granted_tokens=77_000),
+            now=1_010.0,
+            declared_models=["gpt-5.5"],
+        )
+        replacement_request = ledger.claim_renewal_request(RUN)
+        assert replacement_request is not None
+
+        outcome = ledger.apply_grant_response(
+            RUN,
+            _response(lease_id="lse_abc", generation=2, granted_tokens=1),
+            now=1_020.0,
+            expected_lease_id=old_request.lease_id,
+            expected_generation=old_request.generation,
+        )
+        failed = ledger.renewal_failed(
+            RUN,
+            now=1_021.0,
+            expected_lease_id=old_request.lease_id,
+            expected_generation=old_request.generation,
+        )
+        dropped = ledger.drop_if_current(
+            RUN,
+            lease_id=old_request.lease_id,
+            generation=old_request.generation,
+        )
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert outcome is GrantOutcome.STALE
+        assert failed is False
+        assert dropped is False
+        assert state.lease_id == "lse_replacement"
+        assert state.generation == 1
+        assert state.granted_remaining_tokens == 77_000
+        assert state.renewal_in_flight is True
+
     def test_surrender_request_carries_the_final_true_up(self) -> None:
         ledger = _granted_ledger()
         _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
-        ledger.true_up("a", 700)
+        _true_up(ledger, "a", 700)
 
         request = ledger.build_surrender_request(RUN)
 
@@ -873,12 +1155,12 @@ class TestRenewalNetting:
         state = ledger.state_for(RUN)
         assert state is not None
         _admit(ledger, call_id="reported", estimated_input_tokens=1_000, output_bound=500)
-        ledger.true_up("reported", 800)
+        _true_up(ledger, "reported", 800)
         request = ledger.build_renewal_request(RUN)
         assert request is not None
         assert request.spent_tokens == 800
         _admit(ledger, call_id="in-window", estimated_input_tokens=4_000, output_bound=2_000)
-        ledger.true_up("in-window", 5_000)
+        _true_up(ledger, "in-window", 5_000)
 
         # Act
         outcome = ledger.apply_grant_response(
@@ -898,7 +1180,7 @@ class TestRenewalNetting:
         assert state is not None
         ledger.build_renewal_request(RUN)
         _admit(ledger, call_id="burn", estimated_input_tokens=9_000, output_bound=1_000)
-        ledger.true_up("burn", 10_000)
+        _true_up(ledger, "burn", 10_000)
 
         # Act
         ledger.apply_grant_response(RUN, _response(generation=2, granted_tokens=3_000), now=1_020.0)
@@ -929,7 +1211,7 @@ class TestRenewalNetting:
         # Assert — nothing settled in the window, but 1_500 is still committed.
         assert state.granted_remaining_tokens == 48_500
 
-    def test_a_share_pool_reservation_in_flight_does_not_net_the_new_grant(self) -> None:
+    def test_a_share_pool_reservation_in_flight_is_carried_onto_the_new_share(self) -> None:
         # Arrange — an empty grant with the plane believed down: the call is
         # metered against the headroom share, so its bound never touched the
         # granted pool at all.
@@ -951,16 +1233,13 @@ class TestRenewalNetting:
             RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
         )
 
-        # Assert — only GRANTED-pool bounds may be carried. Charging this one
-        # to the grant would be a charge the grant can never get back: the
-        # unwind is pool-dispatched and lands on the share counter.
+        # Assert — the share reservation stays backed by the replacement
+        # share. It never touches the grant, and settling it leaves the fresh
+        # share net of the call's actual spend.
         assert state.granted_remaining_tokens == 50_000
-        ledger.true_up("share-crossing", 1_200)
+        _true_up(ledger, "share-crossing", 1_200)
         assert state.granted_remaining_tokens == 50_000
-        # The share side is untouched BY THE NETTING; that it takes the delta
-        # against a counter the apply already reset is the pre-existing
-        # over-credit (review M2), tracked separately and not this fix's.
-        assert state.share_remaining_tokens == 500_300
+        assert state.share_remaining_tokens == 500_000 - 1_200
 
     def test_a_share_pool_reservation_released_after_a_renewal_leaves_the_grant_whole(self) -> None:
         # Arrange — same outage admission, but the call dies on an error path.
@@ -980,12 +1259,12 @@ class TestRenewalNetting:
         )
 
         # Act
-        ledger.release("share-crossing")
+        _release(ledger, "share-crossing")
 
-        # Assert — the refund goes to the share pool, so the grant must never
-        # have been charged in the first place.
+        # Assert — releasing the carried reservation restores exactly the
+        # replacement share, without touching the grant.
         assert state.granted_remaining_tokens == 50_000
-        assert state.share_remaining_tokens == 501_500  # review M2, as above
+        assert state.share_remaining_tokens == 500_000
 
     def test_a_grant_that_lands_heavily_pre_committed_is_renewal_due_at_once(self) -> None:
         # Arrange — 4_000 settled in-window against a 5_000 renewal, so the
@@ -995,7 +1274,7 @@ class TestRenewalNetting:
         assert state is not None
         ledger.build_renewal_request(RUN)
         _admit(ledger, call_id="burn", estimated_input_tokens=3_000, output_bound=1_000)
-        ledger.true_up("burn", 4_000)
+        _true_up(ledger, "burn", 4_000)
         ledger.apply_grant_response(RUN, _response(generation=2, granted_tokens=5_000), now=1_020.0)
         assert state.granted_remaining_tokens == 1_000
 
@@ -1018,7 +1297,7 @@ class TestRenewalNetting:
         assert state is not None
         ledger.build_renewal_request(RUN)
         _admit(ledger, call_id="settled", estimated_input_tokens=3_000, output_bound=1_000)
-        ledger.true_up("settled", 4_000)
+        _true_up(ledger, "settled", 4_000)
         _admit(ledger, call_id="crossing", estimated_input_tokens=1_000, output_bound=500)
         ledger.apply_grant_response(
             RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
@@ -1026,7 +1305,7 @@ class TestRenewalNetting:
         assert state.granted_remaining_tokens == 44_500  # 50_000 - 4_000 - 1_500
 
         # Act — the crossing call settles under its bound.
-        ledger.true_up("crossing", 1_200)
+        _true_up(ledger, "crossing", 1_200)
 
         # Assert — true-up's delta (-300) unwinds the carried bound exactly,
         # leaving the grant net of the settled window and the call's ACTUAL.
@@ -1039,14 +1318,14 @@ class TestRenewalNetting:
         assert state is not None
         ledger.build_renewal_request(RUN)
         _admit(ledger, call_id="settled", estimated_input_tokens=3_000, output_bound=1_000)
-        ledger.true_up("settled", 4_000)
+        _true_up(ledger, "settled", 4_000)
         _admit(ledger, call_id="crossing", estimated_input_tokens=1_000, output_bound=500)
         ledger.apply_grant_response(
             RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
         )
 
         # Act
-        ledger.release("crossing")
+        _release(ledger, "crossing")
 
         # Assert — no spend happened, so the carried bound is fully returned.
         assert state.granted_remaining_tokens == 46_000  # 50_000 - 4_000
@@ -1061,7 +1340,7 @@ class TestRenewalNetting:
         request = ledger.build_renewal_request(RUN)
         assert request is not None
         assert request.reserved_tokens == 1_500
-        ledger.true_up("x", 1_200)
+        _true_up(ledger, "x", 1_200)
 
         # Act
         ledger.apply_grant_response(
@@ -1080,7 +1359,7 @@ class TestRenewalNetting:
 
         ledger.build_renewal_request(RUN)
         _admit(ledger, call_id="c1", estimated_input_tokens=1_000, output_bound=500)
-        ledger.true_up("c1", 2_000)
+        _true_up(ledger, "c1", 2_000)
         ledger.apply_grant_response(
             RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
         )
@@ -1090,7 +1369,7 @@ class TestRenewalNetting:
 
         ledger.build_renewal_request(RUN)
         _admit(ledger, call_id="c2", estimated_input_tokens=1_000, output_bound=500, now=1_021.0)
-        ledger.true_up("c2", 3_000)
+        _true_up(ledger, "c2", 3_000)
         ledger.apply_grant_response(
             RUN, _response(generation=3, granted_tokens=50_000), now=1_030.0
         )
@@ -1106,7 +1385,7 @@ class TestRenewalNetting:
         state = ledger.state_for(RUN)
         assert state is not None
         _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
-        ledger.true_up("a", 4_000)
+        _true_up(ledger, "a", 4_000)
 
         # Act
         ledger.apply_grant_response(
@@ -1125,7 +1404,7 @@ class TestRenewalNetting:
         assert state is not None
         ledger.build_renewal_request(RUN)
         _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
-        ledger.true_up("a", 4_000)
+        _true_up(ledger, "a", 4_000)
         _admit(ledger, call_id="crossing", estimated_input_tokens=1_000, output_bound=500)
 
         # Act
@@ -1142,7 +1421,7 @@ class TestRenewalNetting:
         # standing behind it.
         assert ledger.lease_id_for(RUN) == "lse_new"
         assert state.granted_remaining_tokens == 50_000
-        ledger.true_up("crossing", 1_200)
+        _true_up(ledger, "crossing", 1_200)
         assert state.granted_remaining_tokens == 50_000
 
     def test_a_regrant_after_a_drop_replaces_the_remainder_wholesale(self) -> None:
@@ -1152,7 +1431,7 @@ class TestRenewalNetting:
         assert state is not None
         ledger.build_renewal_request(RUN)
         _admit(ledger, call_id="orphan", estimated_input_tokens=1_000, output_bound=500)
-        ledger.true_up("orphan", 4_000)
+        _true_up(ledger, "orphan", 4_000)
         ledger.drop(RUN)
 
         # Act
@@ -1176,7 +1455,7 @@ class TestRenewalNetting:
         assert state is not None
         ledger.build_renewal_request(RUN)
         _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
-        ledger.true_up("a", 4_000)
+        _true_up(ledger, "a", 4_000)
         ledger.apply_grant_response(
             RUN, _response(generation=5, granted_tokens=50_000), now=1_020.0
         )
@@ -1221,7 +1500,7 @@ class TestLeaseStateLifecycle:
         assert ledger.state_for(RUN) is None
         assert ledger.active_run_ids() == []
         # A late true-up for the discarded run is a no-op, not a KeyError.
-        ledger.true_up("a", 100)
+        _true_up(ledger, "a", 100)
 
     def test_fork_reset_drops_all_lease_state(self) -> None:
         # A forked child must re-grant: the parent's lease is bound to the
