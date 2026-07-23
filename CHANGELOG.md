@@ -13,12 +13,17 @@ derived from git tags (hatch-vcs).
   keyword-only, both optional). `call_id` keys the in-process lease
   reservation the call draws down so settlement can true it up against actual
   usage — the same id the confirm and the metadata event already join on, now
-  threaded one step earlier. `estimated_output_bound` is the call's own
-  `max_tokens`-family cap, which sizes the output half of that reservation; a
-  call that declares no cap reserves `lease_output_bound_default` instead. A
-  caller that supplies neither still admits — the enforcer mints a `call_id`
-  and falls back to the default bound — so the signature is additive for
-  anyone driving the enforcer directly.
+  threaded one step earlier. `estimated_output_bound` is the conservative
+  output half of that reservation: the `Solwyn` wrapper derives the largest
+  effective cap across every configured provider hop after applying
+  per-call-over-entry-over-global precedence and provider-specific aliases; a
+  direct enforcer caller can supply the already-resolved scalar. A call with
+  no explicit cap reserves `lease_output_bound_default` instead. A caller that
+  supplies neither still admits — the enforcer mints a `call_id` and falls
+  back to the default bound — so the signature remains additive for direct
+  enforcer users. A direct caller that intends to settle or release a
+  lease-funded call must supply and retain its own `call_id`; an anonymous
+  synthetic reservation can only age out on the 900-second sweep.
 - **`build_confirm_request` is now fully keyword-only and its settlement key
   is exclusive.** `reservation_id` moved from a required positional to an
   optional keyword and gained a sibling, `lease_id`: a confirm settles EITHER
@@ -27,18 +32,28 @@ derived from git tags (hatch-vcs).
   call's local reservation up from its bound to actual token usage, so the
   in-memory remainder and the server's float move on the same event. Lease
   authority wins if a caller somehow passes both keys — the authority the call
-  actually drew down is the one that must be settled.
-- **`BudgetCheckResult` gained `lease_id`**, set when the call was admitted on
-  lease authority instead of a per-call reservation. Callers thread whichever
-  of `reservation_id` / `lease_id` is populated straight into
-  `build_confirm_request`; exactly one of them is ever non-`None`.
+  actually drew down is the one that must be settled. A lease-keyed confirm
+  must also echo the process-local `lease_claim_token`; omitting it raises
+  `RuntimeError` before local authority is mutated.
+- **`BudgetCheckResult` gained `lease_id` and `lease_claim_token`.** `lease_id`
+  is set when the call was admitted on lease authority instead of a per-call
+  reservation. `lease_claim_token` is the opaque capability for that exact
+  local call-ID claim; it is excluded from serialization and never reaches
+  Solwyn Cloud. Direct enforcer callers thread whichever of `reservation_id`
+  / `lease_id` is populated into `build_confirm_request`, plus
+  `lease_claim_token` when `lease_id` is present. Exactly one settlement key
+  is ever non-`None`. A lease-funded error path echoes the same token to
+  `release_reservation`.
 
 - **`call_id` now pins the canonical UUID text form** on both wires that carry
   it — `BudgetConfirmRequest.call_id` and `MetadataEvent.call_id` — matching
   what the API has required since its idempotency ledger landed
-  (`^[0-9a-f]{8}-...$`, max 36 chars). The SDK has only ever emitted
-  `str(uuid.uuid4())` here and no caller supplies one, so nothing the SDK sends
-  changes; what changes is that a drifted id fails at the seam that built it
+  (`^[0-9a-f]{8}-...$`, max 36 chars). The top-level wrapper has only ever
+  emitted `str(uuid.uuid4())`, so nothing it sends changes. Direct
+  `check_budget` callers must provide the canonical form when a run-scoped
+  text call participates in leasing; non-run, media, and lease-disabled calls
+  preserve the legacy behavior and do not validate an otherwise-unused
+  descriptive value. A drifted wire id now fails at the seam that built it
   instead of arriving as a 422 that loses the settlement it was carrying.
   `call_id` is durable spend identity — the API's cost-event ledger dedups on
   it — and it is the join key between an event and its confirm, so both halves
@@ -197,9 +212,14 @@ derived from git tags (hatch-vcs).
   for the async one — and are driven by admission (≥75% depleted, or the
   refresh deadline passed) rather than by a timer, so an idle run costs
   nothing: breaker-guarded, jittered, one in flight at a time, with 1s→30s
-  full-jitter backoff. Every grant carries a `generation`, and a response
-  applies only if its generation exceeds the local one, so a slow renewal
-  landing out of order can never rewind the ledger. A grant that arrives
+  full-jitter backoff. Every grant carries a `generation`; an advancing
+  generation is required before it installs, and a renewal additionally
+  applies only while its originating lease id and generation still match, so
+  a slow response can neither rewind the ledger nor mutate a replacement
+  lease. A same-lease renewal lands net of spend settled after its request
+  snapshot and every still-live reservation in both the granted and
+  headroom-share pools, so the replacement generation never recreates
+  authority already spent or committed. A grant that arrives
   `final_grant=True` logs a wind-down warning; a deny verdict at grant or
   renewal feeds the existing sticky-deny machinery unchanged.
 - **The lease admission ladder never lets a Solwyn outage block a customer
@@ -227,10 +247,14 @@ derived from git tags (hatch-vcs).
   carrying `estimated_media`, and calls whose model or fallback chain is
   outside the lease's declared set take the legacy per-call path automatically.
 - **A held lease is handed back at close AND at interpreter exit.** The
-  enforcer's `close()` surrenders every live lease best-effort on a short
-  timeout, and the shipped `atexit` machinery does the same for a process that
-  exits without closing — DHCPRELEASE, not merely a flush: surrendering lets
-  the server re-lend the float immediately instead of waiting out the lease
+  enforcer's `close()` first seals the lifecycle, captures every unacknowledged
+  renewal delta, and atomically drains the ledger before waiting or doing I/O.
+  It then surrenders every captured lease best-effort on one short deadline.
+  A grant or renewal landing after that fence can never repopulate local state:
+  its returned authority is surrendered instead, together with any spend its
+  predecessor snapshot did not report. The shipped `atexit` machinery performs
+  the same DHCPRELEASE-style cleanup for a process that exits without closing,
+  letting the server re-lend float immediately instead of waiting out the lease
   deadline. Exit surrenders ride the control-plane breaker's admission exactly
   like exit confirms (a known-down plane refuses them instantly) and run on a
   daemon worker joined at a wall-clock deadline, so an unreachable Solwyn can
@@ -267,6 +291,30 @@ derived from git tags (hatch-vcs).
 
 ### Fixed
 
+- **Lease call IDs are fenced for one bounded call lifecycle instead of the
+  client's entire lifetime.** Every lease-participating outcome — including a
+  cold-start grant and a dynamic legacy fallback — claims the reconciliation
+  id before I/O. A second owner reusing it during the 900-second retention
+  window raises `RuntimeError` before a second drawdown. Claims expire from a
+  heap-backed map, and each later reuse receives a new opaque token, so a stale
+  owner cannot re-enter, settle, or release its successor after an ABA-style
+  id reuse.
+- **Renewal and shutdown races no longer lose spend or resurrect authority.**
+  Renewal results are fenced to their originating lease generation;
+  post-snapshot settlements and in-flight bounds carry into the successor
+  generation exactly once. Close seals and drains state atomically, late
+  initial grants are surrendered rather than installed, and async close waits
+  for or cancels renewal tasks within the same shared deadline.
+- **Output-cap alias precedence now matches dispatch on every provider hop.**
+  Per-call caps beat provider-entry and global defaults even when one layer
+  uses `max_tokens` and another uses `max_completion_tokens`, including
+  pre-`gpt-5` OpenAI/Azure models, OpenAI-compatible failovers, and
+  cross-dialect translation. Lease reservations therefore cannot silently use
+  a lower-priority, larger cap.
+- **A refused `HALF_OPEN` control-plane follower now records fail-open usage.**
+  When another call owns the recovery probe, an allowed call without usable
+  lease authority enters the same uncounted episode and tally as every other
+  control-plane outage path, so its debt reaches the next successful renewal.
 - **Breaker-report writes now recognize read-only keys.** The breaker-report
   POST was the only Cloud write not routed through the one-time read-only-key
   diagnostic (#32): with a key that can read budget checks but not write, each
