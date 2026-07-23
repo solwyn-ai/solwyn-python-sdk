@@ -36,6 +36,10 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.4",
     "mypy>=1.10",
+    # Lease wire tests mock the control-plane endpoints with respx. Listed
+    # here AND in [dependency-groups] dev: CI installs `pip install -e ".[dev]"`
+    # (this extra); local `uv sync` reads the dependency group.
+    "respx>=0.21",
     # Test-only provider SDKs. Two sanctioned uses: the integration harness
     # constructs real wrapped clients against the fake provider server, and
     # tests/unit/test_real_sdk_*.py validate duck-typed detection/extraction
@@ -94,3 +98,8 @@ strict = true
 [[tool.mypy.overrides]]
 module = "tiktoken"
 ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "respx>=0.21",
+]

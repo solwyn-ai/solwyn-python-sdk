@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from conftest import SAMPLE_TOKEN_DETAILS
 
@@ -52,7 +54,7 @@ class TestAsyncBudgetConfirm:
             model="gpt-5.5",
             token_details=SAMPLE_TOKEN_DETAILS,
             provider="openai",
-            call_id="call_async_integration_confirm_valid",
+            call_id=str(uuid.uuid4()),
         )
         await async_metadata_reporter._send_confirm(confirm)
 
@@ -69,6 +71,6 @@ class TestAsyncBudgetConfirm:
             model="gpt-5.5",
             token_details=SAMPLE_TOKEN_DETAILS,
             provider="openai",
-            call_id="call_async_integration_confirm_invalid",
+            call_id=str(uuid.uuid4()),
         )
         await async_metadata_reporter._send_confirm(confirm)

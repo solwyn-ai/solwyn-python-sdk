@@ -35,7 +35,7 @@ from typing import Any, get_args
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, call_uuid
 from pydantic import ValidationError
 
 from solwyn import _constants as wire_constants
@@ -48,6 +48,9 @@ from solwyn._types import (
     BudgetConfirmRequest,
     CallStatus,
     FailoverDirective,
+    LeaseGrantRequest,
+    LeaseRenewRequest,
+    LeaseSurrenderRequest,
     MediaUsage,
     MetadataEvent,
     ProviderName,
@@ -98,6 +101,7 @@ EXPECTED_CHECK_RESPONSE_FIELDS = {
 
 EXPECTED_CONFIRM_FIELDS = {
     "reservation_id",
+    "lease_id",
     "model",
     "provider",
     "modality",
@@ -112,7 +116,9 @@ EXPECTED_CONFIRM_FIELDS = {
 # The optional confirm fields the None-skipping serializer drops when unset —
 # bearer-key providers' confirm wire bytes stay byte-identical to pre-Bedrock;
 # media_usage (window 2) is dropped on every chat/token confirm the same way.
-_NONE_SKIPPED_CONFIRM_FIELDS = {"provider_region", "service_tier", "media_usage"}
+# lease_id is dropped on every reservation-settled confirm (the settlement key
+# is exactly-one-of, enforced by a model validator).
+_NONE_SKIPPED_CONFIRM_FIELDS = {"provider_region", "service_tier", "media_usage", "lease_id"}
 
 # Provider identifiers ARE wire values (events/confirms/checks carry them).
 # Adding one is an API-first deploy: the Cloud API must accept it BEFORE any
@@ -315,7 +321,7 @@ def _confirm(**overrides: Any) -> BudgetConfirmRequest:
         "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
         "token_details": TokenDetails(input_tokens=10, output_tokens=5),
-        "call_id": "call-fixed",
+        "call_id": call_uuid("call-fixed"),
     }
     base.update(overrides)
     return BudgetConfirmRequest(**base)
@@ -332,7 +338,7 @@ def _metadata_event(**overrides: object) -> MetadataEvent:
         "is_model_fallback": False,
         "sdk_instance_id": "sdk_abc",
         "timestamp": datetime(2026, 6, 2, tzinfo=UTC),
-        "call_id": "call-test-123",
+        "call_id": call_uuid("call-test-123"),
     }
     base.update(overrides)
     return MetadataEvent(**base)  # type: ignore[arg-type]
@@ -487,7 +493,7 @@ class TestWireModelDumpSnapshots:
             model="gpt-5.5",
             provider=ProviderName.OPENAI,
             token_details=TokenDetails(input_tokens=10, output_tokens=5),
-            call_id="call-fixed",
+            call_id=call_uuid("call-fixed"),
         )
         # The None-skipping serializer drops the unset optional fields for the
         # bearer-key providers, so their confirm wire bytes are unchanged —
@@ -592,13 +598,13 @@ class TestWireModelDumpSnapshots:
         # every None-valued optional (possibly_succeeded among them) so the wire
         # stays byte-compatible with the pre-failover event, BUT call_id (the
         # always-present reconciliation join key) is NEVER skipped.
-        ev = _metadata_event(call_id="call-fixed-123")
+        ev = _metadata_event(call_id=call_uuid("call-fixed-123"))
         dumped = ev.model_dump(mode="json")
 
         assert "possibly_succeeded" not in dumped  # None -> skipped
         assert "failover_reason" not in dumped  # None -> skipped
         assert "requested_provider" not in dumped  # None -> skipped
-        assert dumped["call_id"] == "call-fixed-123"  # always on the wire
+        assert dumped["call_id"] == call_uuid("call-fixed-123")  # always on the wire
 
     def test_failover_metadata_dump_includes_reconciliation_fields(self) -> None:
         # A reconciliation abort event: possibly_succeeded=True is on the wire,
@@ -609,13 +615,13 @@ class TestWireModelDumpSnapshots:
             is_provider_fallback=False,
             failover_error_class="APITimeoutError",
             possibly_succeeded=True,
-            call_id="call-abort-9",
+            call_id=call_uuid("call-abort-9"),
         )
         dumped = ev.model_dump(mode="json")
 
         assert dumped["possibly_succeeded"] is True
         assert dumped["failover_error_class"] == "APITimeoutError"
-        assert dumped["call_id"] == "call-abort-9"
+        assert dumped["call_id"] == call_uuid("call-abort-9")
 
 
 # --------------------------------------------------------------------------- #
@@ -663,6 +669,32 @@ class TestWireModelFieldConstraints:
     def test_confirm_call_id_is_required(self) -> None:
         assert BudgetConfirmRequest.model_fields["call_id"].is_required() is True
 
+    def test_confirm_call_id_must_be_a_canonical_uuid(self) -> None:
+        # call_id is DURABLE SPEND IDENTITY: the API's cost-event ledger dedups
+        # on it, so the wire pins the canonical lowercase RFC 4122 text form
+        # that str(uuid.uuid4()) emits (core's shared CALL_ID_PATTERN) and 422s
+        # anything else. The SDK has always SENT that shape; pinning it here
+        # makes a drifted id fail at the seam that built it instead of arriving
+        # as a rejected settlement whose spend then goes unconfirmed.
+        assert wire_constants.CALL_ID_PATTERN == (
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+        )
+
+        canonical = "3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b"
+        assert _confirm(call_id=canonical).call_id == canonical
+
+        for rejected in (
+            "",
+            "call-fixed",
+            canonical.upper(),
+            f"{{{canonical}}}",
+            f"urn:uuid:{canonical}",
+            f" {canonical}",
+            "x" * 36,
+        ):
+            with pytest.raises(ValidationError):
+                _confirm(call_id=rejected)
+
     def test_confirm_without_provider_raises_validation_error(self) -> None:
         # Constructing a confirm with no provider must hard-fail, not default.
         with pytest.raises(ValidationError):
@@ -683,6 +715,26 @@ class TestWireModelFieldConstraints:
 
     def test_metadata_call_id_is_required(self) -> None:
         assert MetadataEvent.model_fields["call_id"].is_required() is True
+
+    def test_metadata_call_id_must_be_a_canonical_uuid(self) -> None:
+        # The OTHER half of the same identity contract: the metadata event and
+        # its confirm carry the SAME call_id (the reconciliation join key), and
+        # the API pins the canonical UUID form on both. A shape only one side
+        # accepts would let an event through that its confirm could never join.
+        canonical = "3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b"
+        assert _metadata_event(call_id=canonical).call_id == canonical
+
+        for rejected in (
+            "",
+            "call-test-123",
+            canonical.upper(),
+            f"{{{canonical}}}",
+            f"urn:uuid:{canonical}",
+            f" {canonical}",
+            "x" * 36,
+        ):
+            with pytest.raises(ValidationError):
+                _metadata_event(call_id=rejected)
 
     def test_metadata_tags_bounds_are_pinned(self) -> None:
         assert wire_constants.TAGS_MAX_KEYS == 10
@@ -747,6 +799,24 @@ class TestWireModelFieldConstraints:
                 fallback_providers=[ProviderName.ANTHROPIC],
                 fallback_models=["x" * 2049],
             )
+
+    def test_lease_request_fallback_chain_max_items_pinned(self) -> None:
+        # Core's lease schemas cap the declared chain at 8. Without the SDK
+        # mirror a 9-model chain validates here and 422s server-side, so the
+        # bound is pinned on BOTH lease requests that carry a chain.
+        for schema in (
+            LeaseGrantRequest.model_json_schema(),
+            LeaseRenewRequest.model_json_schema(),
+        ):
+            assert schema["properties"]["fallback_models"]["maxItems"] == 8
+
+    def test_lease_id_max_length_pinned(self) -> None:
+        # The lease id echoed back to the API is bounded lock-step with core.
+        assert wire_constants.LEASE_ID_MAX_LENGTH == 64
+        for model in (LeaseRenewRequest, LeaseSurrenderRequest):
+            field = model.model_fields["lease_id"]
+            max_lengths = [m.max_length for m in field.metadata if hasattr(m, "max_length")]
+            assert 64 in max_lengths
 
     def test_metadata_provider_region_omitted_when_none_present_when_set(self) -> None:
         # provider_region rides the None-skipping serializer: absent for the

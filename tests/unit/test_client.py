@@ -398,15 +398,20 @@ class TestBudgetCheckBeforeCall:
         client, _ = _mock_openai_client()
         solwyn = _make_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
 
+        # Run-scoped traffic asks for a LEASE first (PJ-2), so the denial this
+        # test is about now arrives on the grant response. The intent is
+        # unchanged: an authoritative run denial must raise, report a
+        # budget_denied event tagged with the run, and the request that carried
+        # it must name the run.
         deny_response = {
+            "eligible": True,
             "allowed": False,
-            "remaining_budget": 0.0,
-            "reservation_id": None,
+            "denied_by_period": "agent_run",
+            "project_id": VALID_PROJECT_ID,
             "mode": "hard_deny",
             "budget_limit": 10.0,
             "current_usage": 10.0,
-            "denied_by_period": "agent_run",
-            "project_id": VALID_PROJECT_ID,
+            "remaining_budget": 0.0,
         }
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = deny_response

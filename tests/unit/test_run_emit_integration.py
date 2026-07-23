@@ -6,7 +6,7 @@ import asyncio
 from unittest.mock import MagicMock
 
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, call_uuid
 
 import solwyn
 from solwyn._base import _SolwynBase
@@ -38,7 +38,7 @@ def _build(base: _SolwynBase) -> MetadataEvent:
         latency_ms=12.3,
         status=CallStatus.SUCCESS,
         is_model_fallback=False,
-        call_id="call_run_emit",
+        call_id=call_uuid("call_run_emit"),
     )
 
 
@@ -78,7 +78,7 @@ class TestEmitWithActiveRun:
                 provider="openai",
                 latency_ms=12.3,
                 is_model_fallback=False,
-                call_id="call_run_emit_error",
+                call_id=call_uuid("call_run_emit_error"),
             )
         assert event.agent_run_id == run_id
         assert event.agent_run_name == "nightly-batch"
@@ -98,7 +98,7 @@ class TestEmitWithActiveRun:
             latency_ms=12.3,
             status=CallStatus.SUCCESS,
             is_model_fallback=False,
-            call_id="call_run_snapshot",
+            call_id=call_uuid("call_run_snapshot"),
             agent_run=snapshot,
         )
         assert event.agent_run_id == run_id

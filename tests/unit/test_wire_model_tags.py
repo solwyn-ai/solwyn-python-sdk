@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from conftest import call_uuid
 from pydantic import ValidationError
 
 from solwyn._types import MetadataEvent, ProviderName
@@ -21,7 +22,7 @@ def _make_event(**overrides: object) -> MetadataEvent:
         "is_model_fallback": False,
         "sdk_instance_id": "test-instance-001",
         "timestamp": datetime.now(UTC),
-        "call_id": "call_tags_event",
+        "call_id": call_uuid("call_tags_event"),
     }
     defaults.update(overrides)
     return MetadataEvent(**defaults)  # type: ignore[arg-type]

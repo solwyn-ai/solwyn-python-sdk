@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, _accepted_response
+from conftest import VALID_API_KEY, _accepted_response, call_uuid
 from pydantic import ValidationError
 
 from solwyn._token_details import TokenDetails
@@ -40,7 +40,7 @@ def _make_event(**overrides) -> MetadataEvent:
         "is_model_fallback": False,
         "sdk_instance_id": "test-instance-001",
         "timestamp": datetime.now(UTC),
-        "call_id": "call_reporter_event",
+        "call_id": call_uuid("call_reporter_event"),
     }
     defaults.update(overrides)
     return MetadataEvent(**defaults)
@@ -51,7 +51,7 @@ def _make_confirm_request(**overrides) -> BudgetConfirmRequest:
         "reservation_id": "res_123",
         "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
-        "call_id": "call_sync_confirm",
+        "call_id": call_uuid("call_sync_confirm"),
         "token_details": TokenDetails(input_tokens=10, output_tokens=5),
     }
     defaults.update(overrides)
@@ -400,7 +400,7 @@ class TestMetadataReporter:
 
     def test_flush_remaining_sends_queued_confirms_before_success_events(self) -> None:
         reporter = _quiet_sync_reporter()
-        call_id = "call_stream_settlement"
+        call_id = call_uuid("call_stream_settlement")
         reporter.report(_make_event(call_id=call_id))
         # Enqueue directly: report_confirm gates on the shutdown flag that
         # _quiet_sync_reporter sets to stop the background thread.
@@ -421,8 +421,8 @@ class TestMetadataReporter:
 
     def test_settlement_enqueued_during_metadata_send_waits_for_confirm_first(self) -> None:
         reporter = _unstarted_sync_reporter(batch_size=1)
-        older_call_id = "call_older_metadata"
-        settlement_call_id = "call_mid_flush_settlement"
+        older_call_id = call_uuid("call_older_metadata")
+        settlement_call_id = call_uuid("call_mid_flush_settlement")
         reporter.report(_make_event(call_id=older_call_id))
         settlement_confirm = _make_confirm_request(call_id=settlement_call_id)
         settlement_event = _make_event(call_id=settlement_call_id)

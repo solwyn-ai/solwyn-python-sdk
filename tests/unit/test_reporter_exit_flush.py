@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, call_uuid
 
 from solwyn._lifecycle import _drain_queues_blocking, blocking_exit_flush
 from solwyn._token_details import TokenDetails
@@ -38,7 +38,7 @@ def _make_confirm_request(**overrides) -> BudgetConfirmRequest:
         "reservation_id": "res_123",
         "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
-        "call_id": "call_exit_confirm",
+        "call_id": call_uuid("call_exit_confirm"),
         "token_details": TokenDetails(input_tokens=10, output_tokens=5),
     }
     defaults.update(overrides)
@@ -56,7 +56,7 @@ def _make_event(**overrides) -> MetadataEvent:
         "is_model_fallback": False,
         "sdk_instance_id": "exit-instance",
         "timestamp": datetime.now(UTC),
-        "call_id": "call_exit_event",
+        "call_id": call_uuid("call_exit_event"),
     }
     defaults.update(overrides)
     return MetadataEvent(**defaults)
@@ -97,6 +97,10 @@ class _RecordingServer:
         self._server.server_close()
 
 
+# The child runs in a fresh interpreter with no test helpers, and the confirm
+# wire pins call_id to the canonical UUID text form — so its id is a literal.
+EXIT_CALL_ID = "33333333-3333-4333-8333-333333333333"
+
 _CHILD = """
 from datetime import UTC, datetime
 
@@ -108,7 +112,7 @@ confirm = BudgetConfirmRequest(
     reservation_id="res_exit",
     model="gpt-5.5",
     provider=ProviderName.OPENAI,
-    call_id="call_exit",
+    call_id="{call_id}",
     token_details=TokenDetails(input_tokens=10, output_tokens=5),
 )
 event = MetadataEvent(
@@ -121,7 +125,7 @@ event = MetadataEvent(
     is_model_fallback=False,
     sdk_instance_id="child-instance",
     timestamp=datetime.now(UTC),
-    call_id="call_exit",
+    call_id="{call_id}",
 )
 rep = r.MetadataReporter("http://127.0.0.1:{port}", "sk_test_key", flush_interval=60.0)
 rep.report_settlement(confirm, event)
@@ -134,7 +138,7 @@ def test_interpreter_exit_without_close_flushes_settlements() -> None:
     server = _RecordingServer()
     try:
         result = subprocess.run(
-            [sys.executable, "-c", _CHILD.format(port=server.port)],
+            [sys.executable, "-c", _CHILD.format(port=server.port, call_id=EXIT_CALL_ID)],
             capture_output=True,
             text=True,
             timeout=30,
@@ -341,8 +345,8 @@ async def test_cancelled_close_keeps_exit_rescue_armed(
     the cancelled close left queued."""
     reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
     reporter.start()
-    reporter.report_confirm(_make_confirm_request(call_id="in_hand"))
-    reporter.report_confirm(_make_confirm_request(call_id="queued_behind"))
+    reporter.report_confirm(_make_confirm_request(call_id=call_uuid("in_hand")))
+    reporter.report_confirm(_make_confirm_request(call_id=call_uuid("queued_behind")))
     started = asyncio.Event()
 
     async def hung_post(url: str, **_kw: object) -> _RecordingResponse:
@@ -365,7 +369,7 @@ async def test_cancelled_close_keeps_exit_rescue_armed(
     assert reporter._close_completed is False
     assert reporter._finalizer is not None and reporter._finalizer.alive
     assert len(reporter._confirm_queue) == 2
-    assert reporter._confirm_queue[0].request.call_id == "in_hand"  # FIFO kept
+    assert reporter._confirm_queue[0].request.call_id == call_uuid("in_hand")  # FIFO kept
     assert "confirm.shutdown_deadline" not in reporter.dropped_counts
 
     # The atexit-style blocking flush still delivers the WHOLE backlog.
@@ -398,8 +402,8 @@ def test_exit_flush_breaker_open_still_ships_events(
     breaker.record_failure()  # OPEN, not recovery-eligible
     reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, control_plane_breaker=breaker)
     reporter.report_confirm(_make_confirm_request())
-    reporter.report_settlement(_make_confirm_request(), _make_event(call_id="pair"))
-    reporter.report(_make_event(call_id="standalone"))
+    reporter.report_settlement(_make_confirm_request(), _make_event(call_id=call_uuid("pair")))
+    reporter.report(_make_event(call_id=call_uuid("standalone")))
 
     with caplog.at_level("ERROR"):
         blocking_exit_flush(reporter)
@@ -481,8 +485,8 @@ def test_exit_flush_counts_202_rejections(monkeypatch: pytest.MonkeyPatch) -> No
         httpx, "Client", _make_recording_client(sink, lambda _url: _PartialRejectResponse())
     )
     reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
-    reporter.report_settlement(_make_confirm_request(), _make_event(call_id="pair"))
-    reporter.report(_make_event(call_id="standalone"))
+    reporter.report_settlement(_make_confirm_request(), _make_event(call_id=call_uuid("pair")))
+    reporter.report(_make_event(call_id=call_uuid("standalone")))
 
     blocking_exit_flush(reporter)
 
@@ -510,8 +514,8 @@ def test_exit_flush_partial_deadline_counts_unsent_remainder(
 
     monkeypatch.setattr(httpx, "Client", _make_recording_client(sink, _consume_budget))
     reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, shutdown_deadline=5.0)
-    reporter.report_confirm(_make_confirm_request(call_id="sent"))
-    reporter.report_confirm(_make_confirm_request(call_id="expired"))
+    reporter.report_confirm(_make_confirm_request(call_id=call_uuid("sent")))
+    reporter.report_confirm(_make_confirm_request(call_id=call_uuid("expired")))
 
     blocking_exit_flush(reporter)
 
@@ -538,7 +542,7 @@ def test_exit_flush_open_breaker_gets_single_recovery_probe(
     breaker = _eligible_open_breaker()
     reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, control_plane_breaker=breaker)
     for i in range(3):
-        reporter.report_confirm(_make_confirm_request(call_id=f"c{i}"))
+        reporter.report_confirm(_make_confirm_request(call_id=call_uuid(f"c{i}")))
     reporter.report_settlement(_make_confirm_request(), _make_event())
 
     blocking_exit_flush(reporter)
@@ -563,7 +567,7 @@ def test_exit_flush_recovered_breaker_drains_backlog(monkeypatch: pytest.MonkeyP
     breaker = _eligible_open_breaker()
     reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, control_plane_breaker=breaker)
     for i in range(3):
-        reporter.report_confirm(_make_confirm_request(call_id=f"c{i}"))
+        reporter.report_confirm(_make_confirm_request(call_id=call_uuid(f"c{i}")))
 
     blocking_exit_flush(reporter)
 

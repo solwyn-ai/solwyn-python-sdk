@@ -43,3 +43,6 @@ todos/
 
 # Git worktrees
 .worktrees
+
+# Superpowers/SDD scratch (workflow ledger, not repo content)
+.superpowers/

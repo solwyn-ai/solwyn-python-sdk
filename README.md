@@ -333,13 +333,33 @@ client = Solwyn(
 | `alert_only` | Log a warning when budget is exceeded (default) |
 | `hard_deny` | Raise `BudgetExceededError` and block the call |
 
-Inside `solwyn.run(...)`, every preflight check carries the active run ID. Run-scoped
-checks bypass the SDK's global allow cache, so a cached allow for one run cannot
-authorize another run. Cloud usage visibility is asynchronous, however: with the
-defaults, the conservative transition/leak upper bound after a cap is crossed is
-approximately 10 seconds — up to the 5-second global allow-cache TTL plus the
-reporter's 5-second flush interval. This describes pre-existing/global cached work
-and delayed server visibility; it does not mean ingest is synchronous.
+### Run-scoped leases
+
+Token-billed calls inside `solwyn.run(...)` use budget leases by default. The first
+eligible call requests a server grant; later calls reserve tokens from that grant
+in memory, while renewal runs in the background at the refresh deadline or 75%
+depletion. `close()` surrenders held leases. Non-run traffic, non-token/media
+traffic, lease-ineligible runs or models, and clients with `lease_enabled=False`
+keep using the per-call `/budgets/check` path.
+
+Each reservation includes the input estimate plus the largest effective output
+cap across the configured provider chain, including global defaults, provider
+defaults, and Google/Bedrock nested cap fields. When a hop has no explicit cap,
+`lease_output_bound_default` supplies that hop’s conservative output allowance.
+
+During a control-plane outage, a live lease spends its remaining grant and then
+its holder-specific headroom share. Exhausting both follows the customer’s
+`budget_mode`: `hard_deny` blocks; `alert_only` proceeds with a warning. After a
+lease expires, `fail_open=True` permits explicitly **uncounted** calls and tallies
+them for the next successful renewal; `fail_open=False` enforces the last known
+local bound. Uncounted episodes log `lease.uncounted_entry` immediately and
+`lease.uncounted_continuing` at most every 30 seconds. Installing a fresh grant
+ends the episode, so a later outage emits a new entry warning.
+
+The global allow cache applies only to eligible legacy/non-run checks; it never
+authorizes one run from another run’s state. Cloud usage reporting remains
+asynchronous, so legacy cached work and the reporter flush interval can still
+delay dashboard visibility.
 
 ```python
 from solwyn import BudgetExceededError
@@ -358,6 +378,12 @@ except BudgetExceededError as e:
 | `api_url` | `SOLWYN_API_URL` | `https://api.solwyn.ai` | Solwyn API endpoint |
 | `fail_open` | `SOLWYN_FAIL_OPEN` | `True` | Allow LLM calls when Solwyn API is unreachable |
 | `budget_mode` | `SOLWYN_BUDGET_MODE` | `alert_only` | Budget enforcement mode |
+| `budget_check_cache_ttl` | `SOLWYN_BUDGET_CHECK_CACHE_TTL` | `5` | Allow-cache lifetime for eligible legacy/non-run checks |
+| `budget_check_timeout` | `SOLWYN_BUDGET_CHECK_TIMEOUT` | `1.0` | Hot-path control-plane check/grant timeout in seconds |
+| `lease_enabled` | `SOLWYN_LEASE_ENABLED` | `True` | Use in-memory token leases for eligible run-scoped calls |
+| `lease_output_bound_default` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token allowance when no configured provider hop has an explicit cap |
+| `control_plane_failure_threshold` | `SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD` | `3` | Consecutive Solwyn API failures before local outage posture applies |
+| `control_plane_recovery_timeout` | `SOLWYN_CONTROL_PLANE_RECOVERY_TIMEOUT` | `30.0` | Seconds before probing the Solwyn API after its breaker opens |
 
 Failover and routing (`model=`, `fallback=`, `provider=`, `default_params=`, `selection_policy=`, and the failover tuning knobs) are configured in code only — they take client objects and policies, not strings. See [Provider Failover](https://docs.solwyn.ai/docs/sdk/guides/provider-failover) and [Configuration](https://docs.solwyn.ai/docs/sdk/guides/configuration).
 

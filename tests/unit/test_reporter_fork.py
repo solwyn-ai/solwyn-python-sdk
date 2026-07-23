@@ -87,6 +87,13 @@ class _RecordingServer:
         self._server.server_close()
 
 
+# call_id is pinned to the canonical UUID text form on the confirm wire, so the
+# child's two ids are fixed UUIDs. They are literals inside the child source
+# (it runs in a fresh interpreter with no test helpers), and the parent asserts
+# on the same constants.
+CHILD_CALL_ID = "11111111-1111-4111-8111-111111111111"
+PARENT_CALL_ID = "22222222-2222-4222-8222-222222222222"
+
 _CHILD = """
 import os, sys, time
 from datetime import UTC, datetime
@@ -116,7 +123,7 @@ pid = os.fork()
 if pid == 0:
     # Forked child: only a RELAUNCHED flush thread can deliver this — os._exit
     # forbids the atexit rescue, and the inherited thread is dead.
-    rep.report_settlement(confirm("call_child"), event("call_child"))
+    rep.report_settlement(confirm("{child_id}"), event("{child_id}"))
     time.sleep(1.5)  # >> several flush intervals
     os._exit(0)
 else:
@@ -127,7 +134,7 @@ else:
     # a delivery failure, so the test retries such attempts.
     sys.stderr.write("CHILD_SIGNALED=%s\\n" % os.WIFSIGNALED(status))
     sys.stderr.flush()
-    rep.report_settlement(confirm("call_parent"), event("call_parent"))
+    rep.report_settlement(confirm("{parent_id}"), event("{parent_id}"))
     rep.close()
 """
 
@@ -151,7 +158,13 @@ def test_forked_child_flush_thread_delivers() -> None:
         for _ in range(_FORK_ATTEMPTS):
             server.seen.clear()
             result = subprocess.run(
-                [sys.executable, "-c", _CHILD.format(port=server.port)],
+                [
+                    sys.executable,
+                    "-c",
+                    _CHILD.format(
+                        port=server.port, child_id=CHILD_CALL_ID, parent_id=PARENT_CALL_ID
+                    ),
+                ],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -162,11 +175,11 @@ def test_forked_child_flush_thread_delivers() -> None:
             confirm_ids: set[str | None] = set()
             while time.monotonic() < deadline:
                 confirm_ids = {cid for path, cid in server.seen if "budgets/confirm" in path}
-                if {"call_child", "call_parent"} <= confirm_ids:
+                if {CHILD_CALL_ID, PARENT_CALL_ID} <= confirm_ids:
                     break
                 time.sleep(0.05)
 
-            if "call_child" in confirm_ids:
+            if CHILD_CALL_ID in confirm_ids:
                 break
             if "CHILD_SIGNALED=True" in result.stderr:
                 if not _FORK_CRASH_IS_PLATFORM_ARTIFACT:
@@ -191,11 +204,11 @@ def test_forked_child_flush_thread_delivers() -> None:
                 "on Linux this is a hard failure)"
             )
 
-        assert "call_child" in confirm_ids, (
+        assert CHILD_CALL_ID in confirm_ids, (
             "the forked child's settlement was never delivered — a relaunched "
             f"flush thread is required; confirms seen: {sorted(map(str, confirm_ids))}"
         )
-        assert "call_parent" in confirm_ids, (
+        assert PARENT_CALL_ID in confirm_ids, (
             f"the parent's settlement was not delivered; confirms seen: "
             f"{sorted(map(str, confirm_ids))}"
         )

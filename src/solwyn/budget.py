@@ -10,17 +10,29 @@ Local in-process dict used as fallback when cloud is unreachable.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
+import uuid
 from collections import OrderedDict
+from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import cast, get_args
+from typing import Annotated, Literal, cast, get_args
 
 import httpx
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from solwyn._lifecycle import register_fork_reset
+from solwyn._constants import CALL_ID_MAX_LENGTH, CALL_ID_PATTERN
+from solwyn._lease import (
+    DEFAULT_OUTPUT_BOUND,
+    INELIGIBLE_RETRY_AFTER_S,
+    GrantOutcome,
+    LeaseAdmission,
+    LeaseDecision,
+    LeaseLedger,
+)
+from solwyn._lifecycle import register_fork_reset, register_lease_holder
 from solwyn._read_only_key import handle_read_only_key_error
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
@@ -28,6 +40,11 @@ from solwyn._types import (
     BudgetCheckResponse,
     BudgetConfirmRequest,
     BudgetMode,
+    CircuitState,
+    LeaseGrantRequest,
+    LeaseGrantResponse,
+    LeaseRenewRequest,
+    LeaseSurrenderRequest,
     MediaUsage,
     Modality,
     ProviderName,
@@ -38,16 +55,61 @@ from solwyn.circuit_breaker import CircuitBreaker
 # Fallback per-token cost when cloud API is unreachable.
 DEFAULT_COST_PER_TOKEN: float = 0.00003
 
+# Lease endpoints (PJ-2). The grant rides the caller's budget-check timeout;
+# renewals and surrenders never sit on a customer call.
+_LEASE_PATH = "/api/v1/budgets/lease"
+_LEASE_RENEW_PATH = "/api/v1/budgets/lease/renew"
+_LEASE_SURRENDER_PATH = "/api/v1/budgets/lease/surrender"
+
+# A surrender is a courtesy (the server reclaims the float at expiry anyway):
+# close() must never sit on a down control plane.
+_SURRENDER_TIMEOUT_S = 1.0
+
+# Renewals run off the caller's thread; give them the normal client timeout.
+_RENEWAL_TIMEOUT_S = 5.0
+
+# A burst can make many distinct runs renewal-due at once. Renewal I/O is
+# background work, but background must still be bounded: one client owns at
+# most this many renewal threads/tasks regardless of run cardinality.
+_MAX_RENEWAL_WORKERS = 4
+
+# What a grant round-trip resolved to, from the admission path's point of view.
+# "legacy" means "the plane answered, but this run takes the per-call path".
+_GrantVerdict = Literal["applied", "legacy", "denied", "unreachable"]
+
 # Sticky run denials protect brief Cloud outages but must not retain an
 # unbounded stream of run UUIDs in a long-lived SDK process.
 _MAX_STICKY_RUN_DENIALS = 128
+
+# Uncounted-mode telemetry (§8): loud on ENTRY to a fail-open uncounted
+# episode, then at most one line per this interval while it persists. An
+# hour-long outage must stay visible without one warning per call.
+_UNCOUNTED_WARN_INTERVAL_S = 30.0
+
+# Same footgun as the sticky-deny map: a long-lived process must not retain an
+# episode clock per run id forever. Evicting one only costs an extra ENTRY line.
+_MAX_UNCOUNTED_EPISODES = 128
 
 # The contractual confirm tier values (derived from the ServiceTier literal,
 # never hand-copied). Adapters echo arbitrary bounded strings; only these may
 # ride the value-strict confirm wire.
 _SERVICE_TIER_VALUES: frozenset[str] = frozenset(get_args(ServiceTier))
 
+# Same validator used by the confirm wire models, applied before lease
+# admission so an invalid caller id can never mutate local authority first.
+_CallId = Annotated[
+    str,
+    Field(max_length=CALL_ID_MAX_LENGTH, pattern=CALL_ID_PATTERN),
+]
+_CALL_ID_ADAPTER = TypeAdapter(_CallId)
+
 logger = logging.getLogger(__name__)
+
+
+def _validated_call_id(call_id: str | None) -> str:
+    """Return a canonical reconciliation id, generating one only for None."""
+    candidate = str(uuid.uuid4()) if call_id is None else call_id
+    return _CALL_ID_ADAPTER.validate_python(candidate)
 
 
 class BudgetCheckResult(BaseModel):
@@ -63,6 +125,13 @@ class BudgetCheckResult(BaseModel):
     warning: str | None = None
     budget_limit: float = 0.0
     current_usage: float = 0.0
+    # PJ-2: set when the call drew on LEASE authority instead of a per-call
+    # reservation. Exactly one of reservation_id / lease_id ever settles a call.
+    lease_id: str | None = None
+    # Exact local claim capability for the lease reservation. Excluded from
+    # serialization because it is process-local and never part of the Cloud API
+    # contract; client error/settlement paths must echo it back to the ledger.
+    lease_claim_token: int | None = Field(default=None, exclude=True, repr=False)
     # Server-provided RELATIVE price signal per provider for cost routing
     # (CostPolicy). The SDK never computes price. None on the cache path.
     price_hints: dict[str, float] | None = None
@@ -84,6 +153,9 @@ class _BudgetEnforcerBase:
         fail_open: bool = True,
         cache_ttl: int = 5,
         control_plane_breaker: CircuitBreaker | None = None,
+        holder_id: str | None = None,
+        lease_enabled: bool = True,
+        lease_output_bound_default: int = DEFAULT_OUTPUT_BOUND,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
@@ -117,10 +189,53 @@ class _BudgetEnforcerBase:
         self._last_hard_deny_response: BudgetCheckResponse | None = None
         self._run_hard_deny_responses: OrderedDict[str, BudgetCheckResponse] = OrderedDict()
 
+        # PJ-2 budget leases. The ledger is sans-I/O and takes no locks: every
+        # call into it happens under ``_state_lock`` (the async subclass is
+        # additionally serialized by the event loop). ``holder_id`` is the SDK
+        # instance id — the identity the server binds each lease to.
+        self._lease = LeaseLedger(
+            holder_id=holder_id if holder_id is not None else str(uuid.uuid4()),
+            enabled=lease_enabled,
+            output_bound_default=lease_output_bound_default,
+        )
+        # Runs with a grant round-trip already on the wire. A concurrent burst
+        # must not turn a cold start into N grants, and waiting on the in-flight
+        # one would block a customer call — the losers take the legacy path.
+        self._lease_grants_in_flight: set[str] = set()
+
+        # Uncounted-mode telemetry (§8). run_id -> monotonic time this run's
+        # CURRENT lease-death episode last warned. An absent run is not in an
+        # episode, so its next uncounted admission is an ENTRY; installing a
+        # grant ends the episode. The ledger cannot own this — it is sans-I/O
+        # and must never log.
+        self._uncounted_episodes: OrderedDict[str, float] = OrderedDict()
+        # Renewal workers capture the epoch at dispatch. close() increments it
+        # before draining state, so a response that arrives afterwards cannot
+        # recreate authority; an observed late successor is surrendered.
+        self._close_epoch = 0
+        self._closed = False
+        self._late_renewal_spend: dict[tuple[str, str, int], int] = {}
+
     def _reset_after_fork_in_child(self) -> None:
         """Replace the state lock in a forked child (concrete classes also swap
         the inherited HTTP client — a shared socket across processes corrupts)."""
         self._state_lock = threading.Lock()
+        # A child inherits no lease authority: the parent's leases live in the
+        # parent's process, and its in-flight renewal flags are lies here. The
+        # child must also become a DIFFERENT holder — the client's
+        # ``_sdk_instance_id`` survives a fork unchanged, and the server
+        # releases a same-(project, run, holder) active lease as stale when a
+        # grant lands. A child re-granting under the parent's id would kill the
+        # parent's live lease, the parent's regrant would kill the child's, and
+        # a forked same-run workload would churn one blocking grant per refresh
+        # interval each. A fresh id makes the child a legitimate second holder.
+        self._lease.holder_id = str(uuid.uuid4())
+        self._lease.on_fork_reset()
+        self._lease_grants_in_flight = set()
+        self._uncounted_episodes = OrderedDict()
+        self._close_epoch = 0
+        self._closed = False
+        self._late_renewal_spend = {}
 
     def _build_check_request(
         self,
@@ -413,6 +528,575 @@ class _BudgetEnforcerBase:
             current_usage=current + estimated_cost,
         )
 
+    # ── lease admission (sans-I/O halves; the HTTP lives on the subclasses) ──
+
+    def _lease_path_applies(self, agent_run_id: str | None) -> bool:
+        """Whether this call may consult the lease ledger at all.
+
+        Step 1 of the admission algorithm: a sticky hard deny keeps the run on
+        the authoritative per-call path (a live check re-decides it, an outage
+        preserves it) — local lease authority never outranks a server denial.
+        """
+        if agent_run_id is None or not self._lease.enabled:
+            return False
+        with self._state_lock:
+            if self._closed:
+                return False
+            if self._last_hard_deny_response is not None:
+                return False
+            return agent_run_id not in self._run_hard_deny_responses
+
+    def _lease_breaker_open(self) -> bool:
+        """Is the control plane BELIEVED unreachable? (inspection, never consumption).
+
+        ``admit()`` would consume a HALF_OPEN probe slot just to answer this, so
+        the ladder reads the frozen snapshot instead. An OPEN-but-recovery-
+        eligible breaker counts as reachable: the legacy check that follows owns
+        the probe, and treating fewer situations as an outage only ever routes a
+        call to the server, never blocks it.
+        """
+        breaker = self._control_plane_breaker
+        if breaker is None:
+            return False
+        snapshot = breaker.get_state()
+        return snapshot.state == CircuitState.OPEN and not snapshot.recovery_eligible
+
+    def _lease_reserve_estimate(
+        self, estimated_input_tokens: int, estimated_output_bound: int | None
+    ) -> int:
+        """The bounded token demand the ledger reserves for one call.
+
+        Mirrors ``LeaseLedger._output_bound``: a missing (or non-positive)
+        caller cap uses the configured default rather than trusting an
+        unbounded response to stay small.
+        """
+        bound = (
+            estimated_output_bound
+            if estimated_output_bound is not None and estimated_output_bound > 0
+            else self._lease.output_bound_default
+        )
+        return max(0, estimated_input_tokens) + bound
+
+    def _admit_lease(
+        self,
+        *,
+        agent_run_id: str,
+        call_id: str,
+        estimated_input_tokens: int,
+        model: str,
+        estimated_output_bound: int | None,
+        modality: Modality,
+        estimated_media: MediaUsage | None,
+        fallback_models: Sequence[str],
+        breaker_open_override: bool | None = None,
+        claim_token: int | None = None,
+    ) -> LeaseAdmission:
+        """Run the ladder for one call, entirely inside one lock section."""
+        breaker_open = (
+            self._lease_breaker_open() if breaker_open_override is None else breaker_open_override
+        )
+        with self._state_lock:
+            if self._closed:
+                return LeaseAdmission(
+                    LeaseDecision.LEGACY_CHECK,
+                    reason="enforcer_closed",
+                    claim_token=claim_token,
+                )
+            return self._lease.admit(
+                run_id=agent_run_id,
+                call_id=call_id,
+                estimated_input_tokens=estimated_input_tokens,
+                model=model,
+                now=time.monotonic(),
+                breaker_open=breaker_open,
+                output_bound=estimated_output_bound,
+                modality=modality,
+                has_estimated_media=estimated_media is not None,
+                fallback_models=list(fallback_models),
+                claim_token=claim_token,
+            )
+
+    def _build_grant_request(
+        self,
+        *,
+        agent_run_id: str,
+        estimated_input_tokens: int,
+        model: str,
+        provider: str,
+        fallback_providers: Sequence[str],
+        fallback_models: Sequence[str],
+    ) -> LeaseGrantRequest:
+        """Declare the run's model set and this client's unreachable posture."""
+        return LeaseGrantRequest(
+            agent_run_id=agent_run_id,
+            holder_id=self._lease.holder_id,
+            model=model,
+            provider=ProviderName(provider),
+            fallback_providers=[ProviderName(p) for p in fallback_providers],
+            fallback_models=list(fallback_models),
+            fail_open=self.fail_open,
+            estimated_input_tokens=max(0, estimated_input_tokens),
+        )
+
+    def _claim_grant_work(self, agent_run_id: str) -> int | None:
+        """Claim one grant and return its lifecycle epoch, or None."""
+        with self._state_lock:
+            if self._closed or agent_run_id in self._lease_grants_in_flight:
+                return None
+            self._lease_grants_in_flight.add(agent_run_id)
+            return self._close_epoch
+
+    def _release_grant_slot(self, agent_run_id: str) -> None:
+        with self._state_lock:
+            self._lease_grants_in_flight.discard(agent_run_id)
+
+    def _apply_lease_response(
+        self,
+        agent_run_id: str,
+        response: LeaseGrantResponse,
+        declared_models: Sequence[str],
+        *,
+        renewal_request: LeaseRenewRequest | None = None,
+        close_epoch: int | None = None,
+    ) -> tuple[GrantOutcome, LeaseSurrenderRequest | None]:
+        """Install a grant/renew response under the ledger's serialization."""
+        with self._state_lock:
+            if close_epoch is not None and (self._closed or close_epoch != self._close_epoch):
+                return GrantOutcome.STALE, self._late_lease_surrender_request(response)
+            outcome = self._lease.apply_grant_response(
+                agent_run_id,
+                response,
+                now=time.monotonic(),
+                declared_models=declared_models,
+                expected_lease_id=(
+                    renewal_request.lease_id if renewal_request is not None else None
+                ),
+                expected_generation=(
+                    renewal_request.generation if renewal_request is not None else None
+                ),
+            )
+            if outcome is GrantOutcome.APPLIED:
+                # Live authority again: the uncounted episode is over, so the
+                # next lease death warns on entry as loudly as this one did.
+                self._uncounted_episodes.pop(agent_run_id, None)
+            return outcome, None
+
+    def _classify_lease_failure(
+        self,
+        exc: Exception,
+        agent_run_id: str,
+        *,
+        renewal_request: LeaseRenewRequest | None = None,
+    ) -> _GrantVerdict:
+        """Map a failed lease round-trip onto a verdict, feeding the breaker.
+
+        A REFUSAL is not an outage: 409 (holder cap) and 503 (lease_unavailable)
+        are deliberate answers, so the plane is credited and the run simply
+        drops to the per-call path. Only a transport failure or a non-503 5xx
+        counts as unreachable — the posture ladder then owns the call.
+        """
+        renewal = renewal_request is not None
+        breaker = self._control_plane_breaker
+        status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
+        responded = handle_read_only_key_error(exc) or (status is not None and 400 <= status < 500)
+        if status == 503:
+            responded = True
+        if responded:
+            if breaker is not None:
+                breaker.record_success()
+        else:
+            if breaker is not None:
+                breaker.record_failure()
+            logger.warning(
+                "lease.%s_failed: %s",
+                "renew" if renewal else "grant",
+                type(exc).__name__,
+            )
+            if renewal_request is not None:
+                # The lease stays valid until its own deadline — but the
+                # in-flight flag must clear, under a backoff, or the run never
+                # renews again AND every later admission would retry at once.
+                with self._state_lock:
+                    self._lease.renewal_failed(
+                        agent_run_id,
+                        time.monotonic(),
+                        expected_lease_id=renewal_request.lease_id,
+                        expected_generation=renewal_request.generation,
+                    )
+            return "unreachable"
+
+        now = time.monotonic()
+        with self._state_lock:
+            if renewal_request is not None and status in (404, 409):
+                # The server no longer recognizes this lease (or a newer
+                # generation exists): drop THAT lease and re-grant on the next
+                # call. A late answer for A cannot delete replacement B.
+                self._lease.drop_if_current(
+                    agent_run_id,
+                    lease_id=renewal_request.lease_id,
+                    generation=renewal_request.generation,
+                )
+            elif renewal_request is not None:
+                self._lease.renewal_failed(
+                    agent_run_id,
+                    now,
+                    expected_lease_id=renewal_request.lease_id,
+                    expected_generation=renewal_request.generation,
+                )
+            elif status == 409:
+                # lease_holder_cap_exceeded — permanent for this run.
+                self._lease.mark_ineligible(agent_run_id, now=now, retry_after=None)
+            else:
+                self._lease.mark_ineligible(
+                    agent_run_id, now=now, retry_after=INELIGIBLE_RETRY_AFTER_S
+                )
+        if status is not None:
+            logger.debug("lease.%s_refused: status=%d", "renew" if renewal else "grant", status)
+        return "legacy"
+
+    def _lease_deny_result(
+        self, agent_run_id: str, response: LeaseGrantResponse
+    ) -> BudgetCheckResult:
+        """Feed an authoritative lease denial to the UNCHANGED sticky machinery."""
+        denial = BudgetCheckResponse(
+            allowed=False,
+            remaining_budget=response.remaining_budget,
+            reservation_id=None,
+            mode=response.mode,
+            budget_limit=response.budget_limit,
+            current_usage=response.current_usage,
+            denied_by_period=response.denied_by_period,
+            project_id=response.project_id,
+        )
+        self._cache_response(denial, agent_run_id=agent_run_id)
+        return self._build_result_from_response(denial)
+
+    def _result_from_admission(
+        self, agent_run_id: str, admission: LeaseAdmission
+    ) -> BudgetCheckResult:
+        """Map an admitting / denying ladder verdict onto a check result.
+
+        The display numbers come from the last grant response — the SDK never
+        computes them, and a DENY here is always the CUSTOMER's own mode
+        verdict at true exhaustion, never a Solwyn-availability verdict.
+        """
+        with self._state_lock:
+            snapshot = self._lease.snapshot_for(agent_run_id)
+        return BudgetCheckResult(
+            allowed=admission.admitted,
+            remaining_budget=snapshot.remaining_budget if snapshot is not None else 0.0,
+            project_id=snapshot.project_id if snapshot is not None else None,
+            reservation_id=None,
+            lease_id=admission.lease_id if admission.admitted else None,
+            lease_claim_token=admission.claim_token,
+            mode=(
+                admission.mode
+                if admission.mode is not None
+                else (snapshot.mode if snapshot is not None else self.budget_mode)
+            ),
+            warning=admission.warning,
+            budget_limit=snapshot.budget_limit if snapshot is not None else 0.0,
+            current_usage=snapshot.current_usage if snapshot is not None else 0.0,
+        )
+
+    def _lease_result_when_breaker_refuses(
+        self,
+        *,
+        agent_run_id: str | None,
+        call_id: str | None,
+        estimated_input_tokens: int,
+        model: str,
+        estimated_output_bound: int | None,
+        modality: Modality,
+        estimated_media: MediaUsage | None,
+        fallback_models: Sequence[str],
+        claim_token: int | None,
+    ) -> BudgetCheckResult | None:
+        """Re-run lease authority after a HALF_OPEN follower is refused.
+
+        The first lease pass deliberately treats recovery-eligible OPEN and
+        HALF_OPEN as reachable so one caller can probe the control plane. If
+        that probe slot is already occupied, a follower learns the plane is
+        unavailable only when the generic breaker refuses it. Re-running the
+        ladder with that fact preserves share drawdown and hard-deny authority
+        instead of bypassing both through generic fail-open.
+        """
+        if agent_run_id is None or call_id is None or not self._lease_path_applies(agent_run_id):
+            return None
+        admission = self._admit_lease(
+            agent_run_id=agent_run_id,
+            call_id=call_id,
+            estimated_input_tokens=estimated_input_tokens,
+            model=model,
+            estimated_output_bound=estimated_output_bound,
+            modality=modality,
+            estimated_media=estimated_media,
+            fallback_models=fallback_models,
+            breaker_open_override=True,
+            claim_token=claim_token,
+        )
+        if admission.decision is LeaseDecision.LEGACY_CHECK:
+            return None
+        if admission.decision is LeaseDecision.NEED_GRANT:
+            if self.fail_open:
+                self._record_uncounted_cold_start(
+                    agent_run_id,
+                    self._lease_reserve_estimate(
+                        estimated_input_tokens,
+                        estimated_output_bound,
+                    ),
+                    call_id=call_id,
+                    claim_token=admission.claim_token,
+                )
+                self._note_uncounted_admission(
+                    agent_run_id,
+                    reason="no_lease_breaker_refused",
+                )
+            return self._build_unreachable_result(
+                estimated_input_tokens,
+                agent_run_id,
+            ).model_copy(update={"lease_claim_token": admission.claim_token})
+        if admission.decision is LeaseDecision.ADMIT_UNCOUNTED:
+            self._note_uncounted_admission(
+                agent_run_id, reason=admission.reason or "expired_fail_open"
+            )
+        return self._result_from_admission(agent_run_id, admission)
+
+    def _record_uncounted_cold_start(
+        self,
+        agent_run_id: str,
+        tokens: int,
+        *,
+        call_id: str,
+        claim_token: int | None,
+    ) -> None:
+        """Tally a fail-open admission made with no lease state at all."""
+        with self._state_lock:
+            self._lease.record_uncounted(
+                agent_run_id,
+                tokens,
+                call_id=call_id,
+                claim_token=claim_token,
+            )
+
+    def _note_uncounted_admission(self, agent_run_id: str, *, reason: str) -> None:
+        """Emit the §8 uncounted-mode telemetry for one fail-open admission.
+
+        Uncounted means no counter anywhere covers the call until the run's
+        next successful renewal reports the tally — the customer must be able
+        to see that from their logs, so this is loud on ENTRY to the episode
+        (lease death or absence) and rate-limited to 1/30s while it persists.
+        The episode ends when a grant installs (``_apply_lease_response``).
+        """
+        now = time.monotonic()
+        with self._state_lock:
+            last_warned = self._uncounted_episodes.get(agent_run_id)
+            if last_warned is not None and now - last_warned < _UNCOUNTED_WARN_INTERVAL_S:
+                return
+            entry = last_warned is None
+            self._uncounted_episodes[agent_run_id] = now
+            self._uncounted_episodes.move_to_end(agent_run_id)
+            while len(self._uncounted_episodes) > _MAX_UNCOUNTED_EPISODES:
+                self._uncounted_episodes.popitem(last=False)
+
+        if entry:
+            logger.warning(
+                "lease.uncounted_entry: Solwyn is unreachable and this run holds no live "
+                "lease; calls proceed UNCOUNTED under fail_open and are tallied for the "
+                "next successful renewal to report (reason=%s)",
+                reason,
+            )
+        else:
+            logger.warning(
+                "lease.uncounted_continuing: still admitting UNCOUNTED under fail_open (reason=%s)",
+                reason,
+            )
+
+    def release_reservation(
+        self,
+        call_id: str,
+        lease_claim_token: int | None = None,
+    ) -> None:
+        """Hand a lease reservation back when the call will never settle.
+
+        Safe to call for any call id: a call that never drew on lease authority
+        (legacy reservation, non-run traffic, uncounted admit) is a no-op.
+        """
+        with self._state_lock:
+            self._lease.release(call_id, claim_token=lease_claim_token)
+
+    def lease_surrender_payloads(self) -> list[LeaseSurrenderRequest]:
+        """Drain every held lease into surrender payloads (best-effort release).
+
+        Every run record is evicted, including inactive/uncounted-only state,
+        so a close() followed by the interpreter-exit hook cannot retain or
+        surrender anything twice.
+        """
+        with self._state_lock:
+            return self._lease.drain_surrender_requests()
+
+    def _begin_close(self) -> list[LeaseSurrenderRequest] | None:
+        """Fence and atomically drain state before any shutdown wait."""
+        with self._state_lock:
+            if self._closed:
+                return None
+            # Capture the unacknowledged part of every renewal before the
+            # ledger is drained. A late response may prove the server already
+            # advanced past the old generation, in which case this delta must
+            # follow the successor surrender.
+            self._late_renewal_spend.update(self._lease.pending_renewal_spend_deltas())
+            self._closed = True
+            self._close_epoch += 1
+            return self._lease.drain_surrender_requests()
+
+    def _late_lease_surrender_request(
+        self,
+        response: LeaseGrantResponse,
+        *,
+        spent_tokens: int = 0,
+    ) -> LeaseSurrenderRequest | None:
+        """Build a release for authority returned after its lifecycle fence."""
+        if (
+            not response.eligible
+            or not response.allowed
+            or response.lease_id is None
+            or response.generation is None
+        ):
+            return None
+        return LeaseSurrenderRequest(
+            lease_id=response.lease_id,
+            holder_id=self._lease.holder_id,
+            generation=response.generation,
+            spent_tokens=max(0, spent_tokens),
+        )
+
+    def _claim_renewal_work(
+        self,
+        agent_run_id: str,
+        *,
+        model: str,
+        provider: str,
+        fallback_providers: Sequence[str],
+        fallback_models: Sequence[str],
+    ) -> tuple[LeaseRenewRequest, int] | None:
+        """Atomically claim renewal identity plus the current lifecycle epoch."""
+        with self._state_lock:
+            if self._closed:
+                return None
+            request = self._lease.claim_renewal_request(
+                agent_run_id,
+                model=model,
+                provider=ProviderName(provider),
+                fallback_providers=[ProviderName(p) for p in fallback_providers],
+                fallback_models=list(fallback_models),
+            )
+            if request is None:
+                return None
+            return request, self._close_epoch
+
+    def _build_renewal(
+        self,
+        agent_run_id: str,
+        *,
+        model: str,
+        provider: str,
+        fallback_providers: Sequence[str],
+        fallback_models: Sequence[str],
+    ) -> LeaseRenewRequest | None:
+        """Build + arm a renewal, or None when there is nothing to renew."""
+        work = self._claim_renewal_work(
+            agent_run_id,
+            model=model,
+            provider=provider,
+            fallback_providers=fallback_providers,
+            fallback_models=fallback_models,
+        )
+        return work[0] if work is not None else None
+
+    def _finish_renewal(
+        self,
+        agent_run_id: str,
+        request: LeaseRenewRequest,
+        response: LeaseGrantResponse,
+        declared_models: Sequence[str],
+        *,
+        close_epoch: int | None = None,
+    ) -> LeaseSurrenderRequest | None:
+        """Apply a fenced renewal or return a successor that close must release."""
+        with self._state_lock:
+            if close_epoch is not None and (self._closed or close_epoch != self._close_epoch):
+                spent_tokens = self._late_renewal_spend.pop(
+                    (agent_run_id, request.lease_id, request.generation),
+                    0,
+                )
+                return self._late_lease_surrender_request(
+                    response,
+                    spent_tokens=spent_tokens,
+                )
+
+            outcome = self._lease.apply_grant_response(
+                agent_run_id,
+                response,
+                now=time.monotonic(),
+                declared_models=declared_models,
+                expected_lease_id=request.lease_id,
+                expected_generation=request.generation,
+            )
+            if outcome is GrantOutcome.APPLIED:
+                self._uncounted_episodes.pop(agent_run_id, None)
+            elif outcome is GrantOutcome.STALE:
+                # A duplicate-generation response for the still-current lease
+                # needs a backoff; an origin-stale response no-ops by fence.
+                self._lease.renewal_failed(
+                    agent_run_id,
+                    time.monotonic(),
+                    expected_lease_id=request.lease_id,
+                    expected_generation=request.generation,
+                )
+
+        if outcome is GrantOutcome.DENIED:
+            self._lease_deny_result(agent_run_id, response)
+        return None
+
+    def _install_grant(
+        self,
+        agent_run_id: str,
+        resp: httpx.Response,
+        *,
+        declared_models: list[str],
+        close_epoch: int,
+    ) -> tuple[
+        _GrantVerdict,
+        LeaseGrantResponse | None,
+        LeaseSurrenderRequest | None,
+    ]:
+        """Validate + apply a grant body. A malformed body is never fatal."""
+        try:
+            response = LeaseGrantResponse.model_validate(resp.json())
+        except Exception as exc:
+            logger.warning("lease.grant_response_unreadable: %s", type(exc).__name__)
+            with self._state_lock:
+                if not self._closed and close_epoch == self._close_epoch:
+                    self._lease.mark_ineligible(
+                        agent_run_id,
+                        now=time.monotonic(),
+                        retry_after=INELIGIBLE_RETRY_AFTER_S,
+                    )
+            return "legacy", None, None
+        outcome, late_surrender = self._apply_lease_response(
+            agent_run_id,
+            response,
+            declared_models,
+            close_epoch=close_epoch,
+        )
+        if late_surrender is not None:
+            return "legacy", response, late_surrender
+        if outcome is GrantOutcome.APPLIED:
+            return "applied", response, None
+        if outcome is GrantOutcome.DENIED:
+            return "denied", response, None
+        return "legacy", response, None
+
     def _auth_headers(self) -> dict[str, str]:
         """Return authorization headers for cloud API requests."""
         return {
@@ -422,13 +1106,15 @@ class _BudgetEnforcerBase:
 
     def build_confirm_request(
         self,
-        reservation_id: str,
+        *,
         model: str,
         token_details: TokenDetails,
-        *,
         provider: str,
-        is_provider_fallback: bool = False,
         call_id: str,
+        reservation_id: str | None = None,
+        lease_id: str | None = None,
+        lease_claim_token: int | None = None,
+        is_provider_fallback: bool = False,
         provider_region: str | None = None,
         service_tier: str | None = None,
         modality: Modality = "text",
@@ -439,6 +1125,12 @@ class _BudgetEnforcerBase:
         Stream completion builds this synchronously (no I/O) and enqueues
         it on the reporter thread, avoiding a blocking httpx.post. ``provider``
         is the provider that actually served the call (required).
+        ``lease_id`` settles a call that drew on LEASE authority (PJ-2): the
+        settlement key is exclusive, so a lease-settled confirm carries no
+        ``reservation_id``, and building one ALSO trues the call's local
+        reservation up from its bound to the actual token usage. Lease
+        authority wins if a caller somehow supplies both keys — the reservation
+        it drew down is the one that must be settled.
         ``call_id`` is the required per-call reconciliation join key.
         ``provider_region`` is the served endpoint's region for per-region
         pricing (Bedrock); None for providers without regional pricing.
@@ -458,8 +1150,11 @@ class _BudgetEnforcerBase:
         if service_tier is not None and service_tier not in _SERVICE_TIER_VALUES:
             logger.debug("budget.confirm_service_tier_unrecognized: settling at Standard rates")
             service_tier = None
-        return BudgetConfirmRequest(
+        if lease_id is not None:
+            reservation_id = None
+        confirm = BudgetConfirmRequest(
             reservation_id=reservation_id,
+            lease_id=lease_id,
             model=model,
             provider=ProviderName(provider),
             modality=modality,
@@ -470,6 +1165,19 @@ class _BudgetEnforcerBase:
             provider_region=provider_region,
             service_tier=cast("ServiceTier | None", service_tier),
         )
+        if lease_id is not None:
+            if lease_claim_token is None:
+                raise RuntimeError("lease_claim_token is required for local lease settlement")
+            # Validate the complete wire request BEFORE mutating authority.
+            # Settlement of a lease-funded call then moves the local
+            # reservation from its bound to the actual spend.
+            with self._state_lock:
+                self._lease.true_up(
+                    call_id,
+                    token_details.total_tokens,
+                    claim_token=lease_claim_token,
+                )
+        return confirm
 
 
 class BudgetEnforcer(_BudgetEnforcerBase):
@@ -487,6 +1195,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         fail_open: bool = True,
         cache_ttl: int = 5,
         control_plane_breaker: CircuitBreaker | None = None,
+        holder_id: str | None = None,
+        lease_enabled: bool = True,
+        lease_output_bound_default: int = DEFAULT_OUTPUT_BOUND,
     ) -> None:
         super().__init__(
             api_url=api_url,
@@ -495,9 +1206,17 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             fail_open=fail_open,
             cache_ttl=cache_ttl,
             control_plane_breaker=control_plane_breaker,
+            holder_id=holder_id,
+            lease_enabled=lease_enabled,
+            lease_output_bound_default=lease_output_bound_default,
         )
         self._http = httpx.Client(timeout=5.0)
+        # Daemon renewal workers, tracked so close() can let an in-flight
+        # renewal finish before the transport goes away.
+        self._renewal_threads: set[threading.Thread] = set()
+        self._renewal_slots = threading.BoundedSemaphore(_MAX_RENEWAL_WORKERS)
         register_fork_reset(self)
+        register_lease_holder(self)
 
     def _reset_after_fork_in_child(self) -> None:
         """Fresh state lock AND a fresh sync client for the forked child.
@@ -507,6 +1226,10 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         """
         super()._reset_after_fork_in_child()
         self._http = httpx.Client(timeout=5.0)
+        # Only the forking thread survives in the child: the parent's renewal
+        # workers do not exist here.
+        self._renewal_threads = set()
+        self._renewal_slots = threading.BoundedSemaphore(_MAX_RENEWAL_WORKERS)
 
     def check_budget(
         self,
@@ -520,6 +1243,8 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         modality: Modality = "text",
         estimated_media: MediaUsage | None = None,
         agent_run_id: str | None = None,
+        call_id: str | None = None,
+        estimated_output_bound: int | None = None,
     ) -> BudgetCheckResult:
         """Check whether a call is within budget.
 
@@ -530,6 +1255,15 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         non-text surface's pre-flight non-token quantities for a precise
         check-time cost; None for chat/token calls.
 
+        Run-scoped, token-billed traffic meets the LEASE path first (PJ-2):
+        ``call_id`` keys the reservation the call draws down (so settlement can
+        true it up) and ``estimated_output_bound`` is the call's own
+        ``max_tokens``-family cap. Everything else — non-run traffic, media,
+        an ineligible run, the kill switch — falls through to the per-call
+        path below, unchanged. A caller that omits ``call_id`` still admits,
+        under a synthetic key: its reservation simply cannot be trued up or
+        released and comes back on the 900s abandoned-reservation sweep.
+
         Behaviour matrix:
         - Cloud reachable + allowed: return allowed=True
         - Cloud reachable + denied + alert_only: return allowed=True + warning
@@ -538,6 +1272,34 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         - Cloud unreachable + fail_open=True: return allowed=True + warning
         - Cloud unreachable + fail_open=False: enforce locally
         """
+        lease_call_id: str | None = None
+        lease_claim_token: int | None = None
+        if (
+            modality == "text"
+            and estimated_media is None
+            and self._lease_path_applies(agent_run_id)
+        ):
+            if agent_run_id is None:
+                raise RuntimeError("lease path requires an agent_run_id")
+            lease_call_id = (
+                _validated_call_id(call_id) if call_id is not None else _validated_call_id(None)
+            )
+            leased, lease_claim_token = self._check_lease(
+                agent_run_id=agent_run_id,
+                call_id=lease_call_id,
+                estimated_input_tokens=estimated_input_tokens,
+                model=model,
+                provider=provider,
+                fallback_providers=fallback_providers,
+                fallback_models=fallback_models,
+                timeout=timeout,
+                modality=modality,
+                estimated_media=estimated_media,
+                estimated_output_bound=estimated_output_bound,
+            )
+            if leased is not None:
+                return leased
+
         # Use cache if valid (only allow decisions are cached).
         # Snapshot under the lock to avoid a TOCTOU race between the validity
         # check and reading the cached fields.
@@ -565,6 +1327,19 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             # Negative cache: a recent streak of control-plane failures means
             # the posture applies instantly instead of paying the timeout.
             logger.debug("budget.check_skipped_breaker_open")
+            leased = self._lease_result_when_breaker_refuses(
+                agent_run_id=agent_run_id,
+                call_id=lease_call_id,
+                estimated_input_tokens=estimated_input_tokens,
+                model=model,
+                estimated_output_bound=estimated_output_bound,
+                modality=modality,
+                estimated_media=estimated_media,
+                fallback_models=fallback_models,
+                claim_token=lease_claim_token,
+            )
+            if leased is not None:
+                return leased
             return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
 
         request = self._build_check_request(
@@ -622,8 +1397,381 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             if breaker is not None:
                 breaker.release_probe(admission)
 
+    # ── lease path ───────────────────────────────────────────────────────
+
+    def _check_lease(
+        self,
+        *,
+        agent_run_id: str,
+        call_id: str,
+        estimated_input_tokens: int,
+        model: str,
+        provider: str,
+        fallback_providers: list[str],
+        fallback_models: list[str],
+        timeout: float | None,
+        modality: Modality,
+        estimated_media: MediaUsage | None,
+        estimated_output_bound: int | None,
+    ) -> tuple[BudgetCheckResult | None, int | None]:
+        """Admit one run-scoped call on lease authority, or None for the legacy path.
+
+        The ladder (steps 2-6) lives in the ledger; this method performs the
+        I/O it prescribes — a blocking grant when there is no usable lease, an
+        ASYNC renewal when one is due — and maps the verdict onto a result.
+        """
+        admission = self._admit_lease(
+            agent_run_id=agent_run_id,
+            call_id=call_id,
+            estimated_input_tokens=estimated_input_tokens,
+            model=model,
+            estimated_output_bound=estimated_output_bound,
+            modality=modality,
+            estimated_media=estimated_media,
+            fallback_models=fallback_models,
+        )
+
+        if admission.decision is LeaseDecision.NEED_GRANT:
+            verdict, response = self._grant_lease(
+                agent_run_id=agent_run_id,
+                estimated_input_tokens=estimated_input_tokens,
+                model=model,
+                provider=provider,
+                fallback_providers=fallback_providers,
+                fallback_models=fallback_models,
+                timeout=timeout,
+            )
+            if verdict == "denied" and response is not None:
+                return self._lease_deny_result(agent_run_id, response), admission.claim_token
+            if verdict == "unreachable":
+                if self.fail_open:
+                    # Nothing counts this call anywhere: no lease exists yet, so
+                    # the tally is what the next lease's first renewal owes.
+                    self._record_uncounted_cold_start(
+                        agent_run_id,
+                        self._lease_reserve_estimate(
+                            estimated_input_tokens, estimated_output_bound
+                        ),
+                        call_id=call_id,
+                        claim_token=admission.claim_token,
+                    )
+                    self._note_uncounted_admission(agent_run_id, reason="no_lease_unreachable")
+                result = self._build_unreachable_result(
+                    estimated_input_tokens,
+                    agent_run_id,
+                ).model_copy(update={"lease_claim_token": admission.claim_token})
+                return result, admission.claim_token
+            if verdict != "applied":
+                return None, admission.claim_token
+            admission = self._admit_lease(
+                agent_run_id=agent_run_id,
+                call_id=call_id,
+                estimated_input_tokens=estimated_input_tokens,
+                model=model,
+                estimated_output_bound=estimated_output_bound,
+                modality=modality,
+                estimated_media=estimated_media,
+                fallback_models=fallback_models,
+                claim_token=admission.claim_token,
+            )
+            if admission.decision is LeaseDecision.NEED_GRANT:
+                # One grant per call, always: never loop against the server.
+                return None, admission.claim_token
+
+        if admission.renewal_due:
+            self._start_renewal(
+                agent_run_id,
+                model=model,
+                provider=provider,
+                fallback_providers=fallback_providers,
+                fallback_models=fallback_models,
+            )
+
+        if admission.decision is LeaseDecision.LEGACY_CHECK:
+            return None, admission.claim_token
+        if admission.decision is LeaseDecision.ADMIT_UNCOUNTED:
+            self._note_uncounted_admission(
+                agent_run_id, reason=admission.reason or "expired_fail_open"
+            )
+        return self._result_from_admission(agent_run_id, admission), admission.claim_token
+
+    def _grant_lease(
+        self,
+        *,
+        agent_run_id: str,
+        estimated_input_tokens: int,
+        model: str,
+        provider: str,
+        fallback_providers: list[str],
+        fallback_models: list[str],
+        timeout: float | None,
+    ) -> tuple[_GrantVerdict, LeaseGrantResponse | None]:
+        """Blocking grant round-trip on the caller's thread (budget-check timeout)."""
+        close_epoch = self._claim_grant_work(agent_run_id)
+        if close_epoch is None:
+            # Another caller is already granting for this run; pay one per-call
+            # check instead of stacking a second grant on the same cold start.
+            return "legacy", None
+        breaker = self._control_plane_breaker
+        admission = breaker.admit() if breaker is not None else None
+        try:
+            if admission is not None and not admission.allowed:
+                logger.debug("lease.grant_skipped_breaker_open")
+                return "unreachable", None
+            request = self._build_grant_request(
+                agent_run_id=agent_run_id,
+                estimated_input_tokens=estimated_input_tokens,
+                model=model,
+                provider=provider,
+                fallback_providers=fallback_providers,
+                fallback_models=fallback_models,
+            )
+            payload = request.model_dump(mode="json")
+            try:
+                if timeout is not None:
+                    resp = self._http.post(
+                        f"{self.api_url}{_LEASE_PATH}",
+                        json=payload,
+                        headers=self._auth_headers(),
+                        timeout=timeout,
+                    )
+                else:
+                    resp = self._http.post(
+                        f"{self.api_url}{_LEASE_PATH}",
+                        json=payload,
+                        headers=self._auth_headers(),
+                    )
+                resp.raise_for_status()
+            except Exception as exc:
+                return self._classify_lease_failure(exc, agent_run_id), None
+
+            if breaker is not None:
+                breaker.record_success()
+            verdict, response, late_surrender = self._install_grant(
+                agent_run_id,
+                resp,
+                declared_models=[model, *fallback_models],
+                close_epoch=close_epoch,
+            )
+            if late_surrender is not None:
+                self._surrender_late_renewal(late_surrender)
+            return verdict, response
+        finally:
+            if breaker is not None:
+                breaker.release_probe(admission)
+            self._release_grant_slot(agent_run_id)
+
+    def _start_renewal(
+        self,
+        agent_run_id: str,
+        *,
+        model: str,
+        provider: str,
+        fallback_providers: list[str],
+        fallback_models: list[str],
+    ) -> None:
+        """Fire a renewal OFF the caller's thread — admission never waits on it."""
+        if not self._renewal_slots.acquire(blocking=False):
+            logger.debug("lease.renew_worker_limit")
+            return
+        work = self._claim_renewal_work(
+            agent_run_id,
+            model=model,
+            provider=provider,
+            fallback_providers=fallback_providers,
+            fallback_models=fallback_models,
+        )
+        if work is None:
+            self._renewal_slots.release()
+            return
+        request, close_epoch = work
+        thread = threading.Thread(
+            target=self._run_renewal_worker,
+            args=(agent_run_id, request, [model, *fallback_models], close_epoch),
+            name="solwyn-lease-renew",
+            daemon=True,
+        )
+        with self._state_lock:
+            self._renewal_threads = {t for t in self._renewal_threads if t.is_alive()}
+            self._renewal_threads.add(thread)
+        try:
+            thread.start()
+        except Exception as exc:
+            # Thread exhaustion (or an interpreter shutting down) must not
+            # leave the lease believing a renewal is in flight: that flag is
+            # what suppresses the next attempt, so without this the run coasts
+            # to expiry without ever renewing again.
+            logger.warning("lease.renew_dispatch_failed: %s", type(exc).__name__)
+            with self._state_lock:
+                self._renewal_threads.discard(thread)
+                self._lease.renewal_failed(
+                    agent_run_id,
+                    time.monotonic(),
+                    expected_lease_id=request.lease_id,
+                    expected_generation=request.generation,
+                )
+            self._renewal_slots.release()
+
+    def _run_renewal_worker(
+        self,
+        agent_run_id: str,
+        request: LeaseRenewRequest,
+        declared_models: list[str],
+        close_epoch: int,
+    ) -> None:
+        """Run one renewal and always return its bounded worker slot."""
+        try:
+            self._renew_lease(
+                agent_run_id,
+                request,
+                declared_models,
+                close_epoch=close_epoch,
+            )
+        finally:
+            self._renewal_slots.release()
+
+    def _renew_lease(
+        self,
+        agent_run_id: str,
+        request: LeaseRenewRequest,
+        declared_models: list[str],
+        *,
+        close_epoch: int | None = None,
+    ) -> None:
+        """Renewal worker: breaker-guarded, never raises, never blocks a call."""
+        breaker = self._control_plane_breaker
+        admission = breaker.admit() if breaker is not None else None
+        try:
+            if admission is not None and not admission.allowed:
+                logger.debug("lease.renew_skipped_breaker_open")
+                with self._state_lock:
+                    self._lease.renewal_failed(
+                        agent_run_id,
+                        time.monotonic(),
+                        expected_lease_id=request.lease_id,
+                        expected_generation=request.generation,
+                    )
+                return
+            try:
+                resp = self._http.post(
+                    f"{self.api_url}{_LEASE_RENEW_PATH}",
+                    json=request.model_dump(mode="json"),
+                    headers=self._auth_headers(),
+                    timeout=_RENEWAL_TIMEOUT_S,
+                )
+                resp.raise_for_status()
+            except Exception as exc:
+                self._classify_lease_failure(exc, agent_run_id, renewal_request=request)
+                return
+            if breaker is not None:
+                breaker.record_success()
+            try:
+                response = LeaseGrantResponse.model_validate(resp.json())
+            except Exception as exc:
+                logger.warning("lease.renew_response_unreadable: %s", type(exc).__name__)
+                with self._state_lock:
+                    self._lease.renewal_failed(
+                        agent_run_id,
+                        time.monotonic(),
+                        expected_lease_id=request.lease_id,
+                        expected_generation=request.generation,
+                    )
+                return
+            late_surrender = self._finish_renewal(
+                agent_run_id,
+                request,
+                response,
+                declared_models,
+                close_epoch=close_epoch,
+            )
+            if late_surrender is not None:
+                self._surrender_late_renewal(late_surrender)
+        except Exception as exc:  # pragma: no cover — a worker must never raise
+            logger.warning("lease.renew_worker_failed: %s", type(exc).__name__)
+        finally:
+            if breaker is not None:
+                breaker.release_probe(admission)
+
+    def _surrender_payloads(
+        self,
+        payloads: Sequence[LeaseSurrenderRequest],
+        deadline: float,
+    ) -> None:
+        """Send releases over a temporary client until one global deadline."""
+        client = httpx.Client(timeout=_SURRENDER_TIMEOUT_S)
+        try:
+            for request in payloads:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                breaker = self._control_plane_breaker
+                admission = breaker.admit() if breaker is not None else None
+                try:
+                    if admission is not None and not admission.allowed:
+                        logger.debug("lease.surrender_skipped_breaker_open")
+                        continue
+                    client.post(
+                        f"{self.api_url}{_LEASE_SURRENDER_PATH}",
+                        json=request.model_dump(mode="json"),
+                        headers=self._auth_headers(),
+                        timeout=max(0.001, min(_SURRENDER_TIMEOUT_S, remaining)),
+                    ).raise_for_status()
+                    if breaker is not None:
+                        breaker.record_success()
+                except Exception as exc:
+                    # The server reclaims an unsurrendered lease at its
+                    # deadline; a failed courtesy release never surfaces.
+                    logger.debug("lease.surrender_failed: %s", type(exc).__name__)
+                    if breaker is not None and not handle_read_only_key_error(exc):
+                        breaker.record_failure()
+                finally:
+                    if breaker is not None:
+                        breaker.release_probe(admission)
+        finally:
+            client.close()
+
+    def _surrender_late_renewal(self, request: LeaseSurrenderRequest) -> None:
+        """Release a successor observed after close fenced its installation."""
+        self._surrender_payloads(
+            [request],
+            time.monotonic() + _SURRENDER_TIMEOUT_S,
+        )
+
+    def _surrender_leases(self) -> None:
+        """Compatibility helper for explicit best-effort drains."""
+        self._surrender_payloads(
+            self.lease_surrender_payloads(),
+            time.monotonic() + _SURRENDER_TIMEOUT_S,
+        )
+
     def close(self) -> None:
-        """Close the underlying HTTP client."""
+        """Fence renewals, drain state, and surrender within one deadline."""
+        payloads = self._begin_close()
+        if payloads is None:
+            self._http.close()
+            return
+        drain_deadline = time.monotonic() + _SURRENDER_TIMEOUT_S
+        with self._state_lock:
+            threads = list(self._renewal_threads)
+
+        surrender_worker: threading.Thread | None = None
+        if payloads:
+            surrender_worker = threading.Thread(
+                target=self._surrender_payloads,
+                args=(payloads, drain_deadline),
+                name="solwyn-lease-surrender",
+                daemon=True,
+            )
+            try:
+                surrender_worker.start()
+            except RuntimeError:
+                logger.debug("lease.surrender_dispatch_failed")
+                surrender_worker = None
+
+        for thread in threads:
+            thread.join(timeout=max(0.0, drain_deadline - time.monotonic()))
+        if surrender_worker is not None:
+            surrender_worker.join(timeout=max(0.0, drain_deadline - time.monotonic()))
         self._http.close()
 
 
@@ -641,6 +1789,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         fail_open: bool = True,
         cache_ttl: int = 5,
         control_plane_breaker: CircuitBreaker | None = None,
+        holder_id: str | None = None,
+        lease_enabled: bool = True,
+        lease_output_bound_default: int = DEFAULT_OUTPUT_BOUND,
     ) -> None:
         super().__init__(
             api_url=api_url,
@@ -649,9 +1800,16 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             fail_open=fail_open,
             cache_ttl=cache_ttl,
             control_plane_breaker=control_plane_breaker,
+            holder_id=holder_id,
+            lease_enabled=lease_enabled,
+            lease_output_bound_default=lease_output_bound_default,
         )
         self._http = httpx.AsyncClient(timeout=5.0)
+        # Renewal tasks, held strongly so the loop cannot collect them mid-flight.
+        self._renewal_tasks: set[asyncio.Task[None]] = set()
+        self._renewal_slots_in_use = 0
         register_fork_reset(self)
+        register_lease_holder(self)
 
     def _reset_after_fork_in_child(self) -> None:
         """Fresh state lock AND a fresh async client for the forked child.
@@ -661,6 +1819,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         """
         super()._reset_after_fork_in_child()
         self._http = httpx.AsyncClient(timeout=5.0)
+        # The parent's tasks belong to a loop that does not exist here.
+        self._renewal_tasks = set()
+        self._renewal_slots_in_use = 0
 
     async def check_budget(
         self,
@@ -674,8 +1835,38 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         modality: Modality = "text",
         estimated_media: MediaUsage | None = None,
         agent_run_id: str | None = None,
+        call_id: str | None = None,
+        estimated_output_bound: int | None = None,
     ) -> BudgetCheckResult:
         """Async version of budget check. See BudgetEnforcer.check_budget."""
+        lease_call_id: str | None = None
+        lease_claim_token: int | None = None
+        if (
+            modality == "text"
+            and estimated_media is None
+            and self._lease_path_applies(agent_run_id)
+        ):
+            if agent_run_id is None:
+                raise RuntimeError("lease path requires an agent_run_id")
+            lease_call_id = (
+                _validated_call_id(call_id) if call_id is not None else _validated_call_id(None)
+            )
+            leased, lease_claim_token = await self._check_lease(
+                agent_run_id=agent_run_id,
+                call_id=lease_call_id,
+                estimated_input_tokens=estimated_input_tokens,
+                model=model,
+                provider=provider,
+                fallback_providers=fallback_providers,
+                fallback_models=fallback_models,
+                timeout=timeout,
+                modality=modality,
+                estimated_media=estimated_media,
+                estimated_output_bound=estimated_output_bound,
+            )
+            if leased is not None:
+                return leased
+
         if agent_run_id is None and self._should_use_cache():
             cached = self._cached_response
             if cached is None:
@@ -696,6 +1887,19 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             # Negative cache: a recent streak of control-plane failures means
             # the posture applies instantly instead of paying the timeout.
             logger.debug("budget.check_skipped_breaker_open")
+            leased = self._lease_result_when_breaker_refuses(
+                agent_run_id=agent_run_id,
+                call_id=lease_call_id,
+                estimated_input_tokens=estimated_input_tokens,
+                model=model,
+                estimated_output_bound=estimated_output_bound,
+                modality=modality,
+                estimated_media=estimated_media,
+                fallback_models=fallback_models,
+                claim_token=lease_claim_token,
+            )
+            if leased is not None:
+                return leased
             return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
 
         request = self._build_check_request(
@@ -753,6 +1957,364 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             if breaker is not None:
                 breaker.release_probe(admission)
 
+    # ── lease path ───────────────────────────────────────────────────────
+
+    async def _check_lease(
+        self,
+        *,
+        agent_run_id: str,
+        call_id: str,
+        estimated_input_tokens: int,
+        model: str,
+        provider: str,
+        fallback_providers: list[str],
+        fallback_models: list[str],
+        timeout: float | None,
+        modality: Modality,
+        estimated_media: MediaUsage | None,
+        estimated_output_bound: int | None,
+    ) -> tuple[BudgetCheckResult | None, int | None]:
+        """Async twin of ``BudgetEnforcer._check_lease``."""
+        admission = self._admit_lease(
+            agent_run_id=agent_run_id,
+            call_id=call_id,
+            estimated_input_tokens=estimated_input_tokens,
+            model=model,
+            estimated_output_bound=estimated_output_bound,
+            modality=modality,
+            estimated_media=estimated_media,
+            fallback_models=fallback_models,
+        )
+
+        if admission.decision is LeaseDecision.NEED_GRANT:
+            verdict, response = await self._grant_lease(
+                agent_run_id=agent_run_id,
+                estimated_input_tokens=estimated_input_tokens,
+                model=model,
+                provider=provider,
+                fallback_providers=fallback_providers,
+                fallback_models=fallback_models,
+                timeout=timeout,
+            )
+            if verdict == "denied" and response is not None:
+                return self._lease_deny_result(agent_run_id, response), admission.claim_token
+            if verdict == "unreachable":
+                if self.fail_open:
+                    self._record_uncounted_cold_start(
+                        agent_run_id,
+                        self._lease_reserve_estimate(
+                            estimated_input_tokens, estimated_output_bound
+                        ),
+                        call_id=call_id,
+                        claim_token=admission.claim_token,
+                    )
+                    self._note_uncounted_admission(agent_run_id, reason="no_lease_unreachable")
+                result = self._build_unreachable_result(
+                    estimated_input_tokens,
+                    agent_run_id,
+                ).model_copy(update={"lease_claim_token": admission.claim_token})
+                return result, admission.claim_token
+            if verdict != "applied":
+                return None, admission.claim_token
+            admission = self._admit_lease(
+                agent_run_id=agent_run_id,
+                call_id=call_id,
+                estimated_input_tokens=estimated_input_tokens,
+                model=model,
+                estimated_output_bound=estimated_output_bound,
+                modality=modality,
+                estimated_media=estimated_media,
+                fallback_models=fallback_models,
+                claim_token=admission.claim_token,
+            )
+            if admission.decision is LeaseDecision.NEED_GRANT:
+                return None, admission.claim_token
+
+        if admission.renewal_due:
+            self._start_renewal(
+                agent_run_id,
+                model=model,
+                provider=provider,
+                fallback_providers=fallback_providers,
+                fallback_models=fallback_models,
+            )
+
+        if admission.decision is LeaseDecision.LEGACY_CHECK:
+            return None, admission.claim_token
+        if admission.decision is LeaseDecision.ADMIT_UNCOUNTED:
+            self._note_uncounted_admission(
+                agent_run_id, reason=admission.reason or "expired_fail_open"
+            )
+        return self._result_from_admission(agent_run_id, admission), admission.claim_token
+
+    async def _grant_lease(
+        self,
+        *,
+        agent_run_id: str,
+        estimated_input_tokens: int,
+        model: str,
+        provider: str,
+        fallback_providers: list[str],
+        fallback_models: list[str],
+        timeout: float | None,
+    ) -> tuple[_GrantVerdict, LeaseGrantResponse | None]:
+        """Awaited grant round-trip (the caller's coroutine, check timeout)."""
+        close_epoch = self._claim_grant_work(agent_run_id)
+        if close_epoch is None:
+            return "legacy", None
+        breaker = self._control_plane_breaker
+        admission = breaker.admit() if breaker is not None else None
+        try:
+            if admission is not None and not admission.allowed:
+                logger.debug("lease.grant_skipped_breaker_open")
+                return "unreachable", None
+            request = self._build_grant_request(
+                agent_run_id=agent_run_id,
+                estimated_input_tokens=estimated_input_tokens,
+                model=model,
+                provider=provider,
+                fallback_providers=fallback_providers,
+                fallback_models=fallback_models,
+            )
+            payload = request.model_dump(mode="json")
+            try:
+                if timeout is not None:
+                    resp = await self._http.post(
+                        f"{self.api_url}{_LEASE_PATH}",
+                        json=payload,
+                        headers=self._auth_headers(),
+                        timeout=timeout,
+                    )
+                else:
+                    resp = await self._http.post(
+                        f"{self.api_url}{_LEASE_PATH}",
+                        json=payload,
+                        headers=self._auth_headers(),
+                    )
+                resp.raise_for_status()
+            except Exception as exc:
+                return self._classify_lease_failure(exc, agent_run_id), None
+
+            if breaker is not None:
+                breaker.record_success()
+            verdict, response, late_surrender = self._install_grant(
+                agent_run_id,
+                resp,
+                declared_models=[model, *fallback_models],
+                close_epoch=close_epoch,
+            )
+            if late_surrender is not None:
+                await self._surrender_late_renewal(late_surrender)
+            return verdict, response
+        finally:
+            if breaker is not None:
+                breaker.release_probe(admission)
+            self._release_grant_slot(agent_run_id)
+
+    def _start_renewal(
+        self,
+        agent_run_id: str,
+        *,
+        model: str,
+        provider: str,
+        fallback_providers: list[str],
+        fallback_models: list[str],
+    ) -> None:
+        """Schedule a renewal TASK — the admission returns without awaiting it."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.warning("lease.renew_dispatch_failed: RuntimeError")
+            return
+        with self._state_lock:
+            if self._closed:
+                return
+            if self._renewal_slots_in_use >= _MAX_RENEWAL_WORKERS:
+                logger.debug("lease.renew_worker_limit")
+                return
+            request = self._lease.claim_renewal_request(
+                agent_run_id,
+                model=model,
+                provider=ProviderName(provider),
+                fallback_providers=[ProviderName(p) for p in fallback_providers],
+                fallback_models=list(fallback_models),
+            )
+            if request is None:
+                return
+            self._renewal_slots_in_use += 1
+            close_epoch = self._close_epoch
+        coroutine = self._renew_lease(
+            agent_run_id,
+            request,
+            [model, *fallback_models],
+            close_epoch=close_epoch,
+        )
+        try:
+            task = loop.create_task(coroutine)
+        except Exception as exc:
+            coroutine.close()
+            logger.warning("lease.renew_dispatch_failed: %s", type(exc).__name__)
+            with self._state_lock:
+                self._renewal_slots_in_use -= 1
+                self._lease.renewal_failed(
+                    agent_run_id,
+                    time.monotonic(),
+                    expected_lease_id=request.lease_id,
+                    expected_generation=request.generation,
+                )
+            return
+        with self._state_lock:
+            self._renewal_tasks.add(task)
+        task.add_done_callback(self._renewal_task_done)
+
+    def _renewal_task_done(self, task: asyncio.Task[None]) -> None:
+        """Release one async worker slot after any task outcome."""
+        with self._state_lock:
+            self._renewal_tasks.discard(task)
+            self._renewal_slots_in_use = max(0, self._renewal_slots_in_use - 1)
+
+    async def _renew_lease(
+        self,
+        agent_run_id: str,
+        request: LeaseRenewRequest,
+        declared_models: list[str],
+        *,
+        close_epoch: int | None = None,
+    ) -> None:
+        """Renewal task: breaker-guarded, never raises into the loop."""
+        breaker = self._control_plane_breaker
+        admission = breaker.admit() if breaker is not None else None
+        try:
+            if admission is not None and not admission.allowed:
+                logger.debug("lease.renew_skipped_breaker_open")
+                with self._state_lock:
+                    self._lease.renewal_failed(
+                        agent_run_id,
+                        time.monotonic(),
+                        expected_lease_id=request.lease_id,
+                        expected_generation=request.generation,
+                    )
+                return
+            try:
+                resp = await self._http.post(
+                    f"{self.api_url}{_LEASE_RENEW_PATH}",
+                    json=request.model_dump(mode="json"),
+                    headers=self._auth_headers(),
+                    timeout=_RENEWAL_TIMEOUT_S,
+                )
+                resp.raise_for_status()
+            except Exception as exc:
+                self._classify_lease_failure(exc, agent_run_id, renewal_request=request)
+                return
+            if breaker is not None:
+                breaker.record_success()
+            try:
+                response = LeaseGrantResponse.model_validate(resp.json())
+            except Exception as exc:
+                logger.warning("lease.renew_response_unreadable: %s", type(exc).__name__)
+                with self._state_lock:
+                    self._lease.renewal_failed(
+                        agent_run_id,
+                        time.monotonic(),
+                        expected_lease_id=request.lease_id,
+                        expected_generation=request.generation,
+                    )
+                return
+            late_surrender = self._finish_renewal(
+                agent_run_id,
+                request,
+                response,
+                declared_models,
+                close_epoch=close_epoch,
+            )
+            if late_surrender is not None:
+                await self._surrender_late_renewal(late_surrender)
+        except asyncio.CancelledError:
+            with self._state_lock:
+                self._lease.renewal_failed(
+                    agent_run_id,
+                    time.monotonic(),
+                    expected_lease_id=request.lease_id,
+                    expected_generation=request.generation,
+                )
+            raise
+        except Exception as exc:  # pragma: no cover — a task must never raise
+            logger.warning("lease.renew_worker_failed: %s", type(exc).__name__)
+        finally:
+            if breaker is not None:
+                breaker.release_probe(admission)
+
+    async def _surrender_payloads(
+        self,
+        payloads: Sequence[LeaseSurrenderRequest],
+        deadline: float,
+    ) -> None:
+        """Async release drain bounded by one monotonic deadline."""
+        async with httpx.AsyncClient(timeout=_SURRENDER_TIMEOUT_S) as client:
+            for request in payloads:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                breaker = self._control_plane_breaker
+                admission = breaker.admit() if breaker is not None else None
+                try:
+                    if admission is not None and not admission.allowed:
+                        logger.debug("lease.surrender_skipped_breaker_open")
+                        continue
+                    resp = await client.post(
+                        f"{self.api_url}{_LEASE_SURRENDER_PATH}",
+                        json=request.model_dump(mode="json"),
+                        headers=self._auth_headers(),
+                        timeout=max(0.001, min(_SURRENDER_TIMEOUT_S, remaining)),
+                    )
+                    resp.raise_for_status()
+                    if breaker is not None:
+                        breaker.record_success()
+                except Exception as exc:
+                    logger.debug("lease.surrender_failed: %s", type(exc).__name__)
+                    if breaker is not None and not handle_read_only_key_error(exc):
+                        breaker.record_failure()
+                finally:
+                    if breaker is not None:
+                        breaker.release_probe(admission)
+
+    async def _surrender_late_renewal(self, request: LeaseSurrenderRequest) -> None:
+        """Release a renewal successor observed after the close epoch changed."""
+        await self._surrender_payloads(
+            [request],
+            time.monotonic() + _SURRENDER_TIMEOUT_S,
+        )
+
+    async def _surrender_leases(self) -> None:
+        """Compatibility helper for explicit best-effort drains."""
+        await self._surrender_payloads(
+            self.lease_surrender_payloads(),
+            time.monotonic() + _SURRENDER_TIMEOUT_S,
+        )
+
     async def close(self) -> None:
-        """Close the underlying async HTTP client."""
+        """Await renewals and release drained leases within one deadline."""
+        payloads = self._begin_close()
+        if payloads is None:
+            await self._http.aclose()
+            return
+        drain_deadline = time.monotonic() + _SURRENDER_TIMEOUT_S
+        with self._state_lock:
+            renewal_tasks = list(self._renewal_tasks)
+
+        waitables: list[asyncio.Task[None]] = renewal_tasks
+        if payloads:
+            waitables.append(
+                asyncio.create_task(self._surrender_payloads(payloads, drain_deadline))
+            )
+        if waitables:
+            _, pending = await asyncio.wait(
+                waitables,
+                timeout=max(0.0, drain_deadline - time.monotonic()),
+            )
+            for task in pending:
+                task.cancel()
+            # Let cooperative cancellation run without adding another
+            # unbounded shutdown wait.
+            await asyncio.sleep(0)
         await self._http.aclose()

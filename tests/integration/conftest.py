@@ -37,6 +37,18 @@ class Credentials:
     api_key: str
 
 
+@dataclass(frozen=True)
+class ProjectCredentials(Credentials):
+    """Credentials plus the project id, for tests that read budget status.
+
+    The lease tests (PJ-2) observe server-side reclaim through
+    ``GET /projects/{id}/budget`` — ``outage_overspend_ceiling_usd`` and
+    ``current_usage`` — so they need the id the API key resolves to.
+    """
+
+    project_id: str
+
+
 @pytest.fixture(scope="session")
 def api_url() -> str:
     """Solwyn API base URL."""
@@ -92,8 +104,8 @@ def _create_project(
     name: str,
     budget_limit: float,
     budget_mode: str,
-) -> str:
-    """Create a project via the API and return its auto-generated API key."""
+) -> dict[str, Any]:
+    """Create a project via the API and return the created project body."""
     r = http.post(
         "/api/v1/projects",
         json={
@@ -105,7 +117,88 @@ def _create_project(
         headers={"Authorization": f"Bearer {token}"},
     )
     r.raise_for_status()
-    return r.json()["key"]
+    body = r.json()
+    if not isinstance(body, dict):
+        pytest.fail(f"project create returned non-object JSON: {body!r}")
+    return body
+
+
+def provision_project(
+    api_url: str, *, name: str, budget_limit: float, budget_mode: str
+) -> ProjectCredentials:
+    """Sign up a throwaway account and create ONE project on it.
+
+    One account per project, deliberately: the free tier caps how many projects
+    an account may hold, so every test that needs its own budget posture brings
+    its own account — the pattern ``hard_denied_credentials`` and
+    ``run_capped_credentials`` already follow.
+    """
+    session_id = uuid.uuid4().hex[:12]
+    with httpx.Client(base_url=api_url, timeout=10) as http:
+        token = _signup_token(http, session_id)
+        project = _create_project(
+            http,
+            token,
+            name=f"{name}-{session_id}",
+            budget_limit=budget_limit,
+            budget_mode=budget_mode,
+        )
+    return ProjectCredentials(api_url=api_url, api_key=project["key"], project_id=project["id"])
+
+
+def burn_budget(
+    credentials: Credentials,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    model: str = "gpt-5.5",
+) -> None:
+    """Drive real server-side spend: one legacy check + its confirm.
+
+    Used to place a project on the far side of its cap before the lease path is
+    exercised. Fails loudly rather than silently under-burning — a denied check
+    hands back no reservation, so there would be nothing to confirm.
+    """
+    with httpx.Client(base_url=credentials.api_url, timeout=15) as http:
+        headers = {"Authorization": f"Bearer {credentials.api_key}"}
+        r = http.post(
+            "/api/v1/budgets/check",
+            json={"estimated_input_tokens": 100, "model": model, "provider": "openai"},
+            headers=headers,
+        )
+        r.raise_for_status()
+        reservation_id = r.json().get("reservation_id")
+        if not isinstance(reservation_id, str):
+            pytest.fail(f"burn_budget: no reservation to confirm against: {r.json()}")
+        r = http.post(
+            "/api/v1/budgets/confirm",
+            json={
+                "reservation_id": reservation_id,
+                "model": model,
+                "provider": "openai",
+                "call_id": str(uuid.uuid4()),
+                "token_details": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                },
+            },
+            headers=headers,
+        )
+        r.raise_for_status()
+
+
+def budget_status(credentials: ProjectCredentials) -> dict[str, Any]:
+    """The project's live budget status (usage + the lease overspend ceiling)."""
+    with httpx.Client(base_url=credentials.api_url, timeout=10) as http:
+        r = http.get(
+            f"/api/v1/projects/{credentials.project_id}/budget",
+            headers={"Authorization": f"Bearer {credentials.api_key}"},
+        )
+        r.raise_for_status()
+        body = r.json()
+    if not isinstance(body, dict):
+        pytest.fail(f"budget status returned non-object JSON: {body!r}")
+    return body
 
 
 def _bootstrap_credentials(api_url: str) -> Credentials:
@@ -113,14 +206,14 @@ def _bootstrap_credentials(api_url: str) -> Credentials:
     session_id = uuid.uuid4().hex[:12]
     with httpx.Client(base_url=api_url, timeout=10) as http:
         token = _signup_token(http, session_id)
-        key = _create_project(
+        project = _create_project(
             http,
             token,
             name=f"sdk-integ-{session_id}",
             budget_limit=100.0,
             budget_mode="alert_only",
         )
-    return Credentials(api_url=api_url, api_key=key)
+    return Credentials(api_url=api_url, api_key=project["key"])
 
 
 @pytest.fixture(scope="session")
@@ -218,7 +311,7 @@ def hard_denied_credentials(api_url: str) -> Credentials:
             name=f"sdk-deny-{session_id}",
             budget_limit=0.05,
             budget_mode="hard_deny",
-        )
+        )["key"]
 
     burner = BudgetEnforcer(
         api_url=api_url, api_key=key, budget_mode=BudgetMode.HARD_DENY, fail_open=False
@@ -235,7 +328,9 @@ def hard_denied_credentials(api_url: str) -> Credentials:
             model="gpt-5.5",
             token_details=TokenDetails(input_tokens=200_000, output_tokens=200_000),
             provider="openai",
-            call_id=f"harness-burn-{session_id}",
+            # The API pins call_id to the uuid4 shape the SDK's client emits
+            # (shared CALL_ID_PATTERN); a descriptive label is a 422.
+            call_id=str(uuid.uuid4()),
         )
         burn_reporter = MetadataReporter(api_url=api_url, api_key=key)
         try:

@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, call_uuid
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
@@ -47,7 +47,7 @@ def _make_event(**overrides) -> MetadataEvent:
         "is_model_fallback": False,
         "sdk_instance_id": "test-instance-001",
         "timestamp": datetime.now(UTC),
-        "call_id": "call_shutdown_event",
+        "call_id": call_uuid("call_shutdown_event"),
     }
     defaults.update(overrides)
     return MetadataEvent(**defaults)
@@ -58,7 +58,7 @@ def _make_confirm_request(**overrides) -> BudgetConfirmRequest:
         "reservation_id": "res_123",
         "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
-        "call_id": "call_shutdown_confirm",
+        "call_id": call_uuid("call_shutdown_confirm"),
         "token_details": TokenDetails(input_tokens=10, output_tokens=5),
     }
     defaults.update(overrides)

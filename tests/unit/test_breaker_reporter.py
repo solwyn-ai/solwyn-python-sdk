@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, VALID_PROJECT_ID, _accepted_response
+from conftest import VALID_API_KEY, VALID_PROJECT_ID, _accepted_response, call_uuid
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, CallStatus, MetadataEvent, ProviderName
@@ -59,7 +59,7 @@ def _event() -> MetadataEvent:
         is_model_fallback=False,
         sdk_instance_id=SDK_INSTANCE_ID,
         timestamp=datetime.now(UTC),
-        call_id="call-breaker-report",
+        call_id=call_uuid("call-breaker-report"),
     )
 
 
@@ -69,7 +69,7 @@ def _confirm() -> BudgetConfirmRequest:
         model="gpt-5.5",
         provider=ProviderName.OPENAI,
         token_details=TokenDetails(input_tokens=10, output_tokens=5),
-        call_id="call-breaker-report",
+        call_id=call_uuid("call-breaker-report"),
     )
 
 

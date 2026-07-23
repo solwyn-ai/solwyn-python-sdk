@@ -53,6 +53,17 @@ def _make_async_enforcer(**overrides) -> AsyncBudgetEnforcer:
     return AsyncBudgetEnforcer(**defaults)
 
 
+def _make_legacy_async_enforcer(**overrides) -> AsyncBudgetEnforcer:
+    """An AsyncBudgetEnforcer with the PJ-2 lease kill switch OFF.
+
+    Same rationale as the sync suite: these tests pin the per-call
+    ``/budgets/check`` contract that the kill switch preserves byte-for-byte.
+    Lease-path coverage lives in tests/unit/test_budget_lease.py.
+    """
+    overrides.setdefault("lease_enabled", False)
+    return _make_async_enforcer(**overrides)
+
+
 # ---------------------------------------------------------------------------
 # Cloud allow
 # ---------------------------------------------------------------------------
@@ -175,7 +186,7 @@ class TestAsyncScopedCacheAndStickyDenials:
     async def test_hot_global_allow_does_not_skip_or_get_overwritten_by_scoped_checks(
         self,
     ) -> None:
-        enforcer = _make_async_enforcer()
+        enforcer = _make_legacy_async_enforcer()
         enforcer._http.post = AsyncMock(
             side_effect=[
                 _response({**ALLOW_BUDGET_RESPONSE, "reservation_id": "res_global"}),
@@ -211,7 +222,7 @@ class TestAsyncScopedCacheAndStickyDenials:
 
     @pytest.mark.asyncio
     async def test_run_deny_is_sticky_only_for_same_run_during_outage(self) -> None:
-        enforcer = _make_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer = _make_legacy_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
         enforcer._http.post = AsyncMock(
             side_effect=[
                 _response(_RUN_DENY_RESPONSE),
@@ -248,7 +259,7 @@ class TestAsyncScopedCacheAndStickyDenials:
     async def test_run_hard_deny_clears_older_global_project_deny_for_other_runs(
         self,
     ) -> None:
-        enforcer = _make_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer = _make_legacy_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
         enforcer._http.post = AsyncMock(
             side_effect=[
                 _response(_DENY_RESPONSE),
@@ -286,7 +297,7 @@ class TestAsyncScopedCacheAndStickyDenials:
     async def test_scoped_project_alert_only_response_clears_older_run_hard_deny(
         self,
     ) -> None:
-        enforcer = _make_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer = _make_legacy_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
         enforcer._http.post = AsyncMock(
             side_effect=[
                 _response(_RUN_DENY_RESPONSE),
@@ -323,7 +334,7 @@ class TestAsyncScopedCacheAndStickyDenials:
 
     @pytest.mark.asyncio
     async def test_project_period_deny_received_in_scope_stays_globally_sticky(self) -> None:
-        enforcer = _make_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer = _make_legacy_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
         enforcer._http.post = AsyncMock(
             side_effect=[
                 _response(_DENY_RESPONSE),

@@ -6,6 +6,7 @@ import ast
 from pathlib import Path
 
 import pytest
+from conftest import call_uuid
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest
@@ -95,7 +96,7 @@ def test_build_confirm_request_returns_pydantic_model() -> None:
         model="gpt-5.5",
         token_details=token_details,
         provider="openai",
-        call_id="call_stream_confirm",
+        call_id=call_uuid("call_stream_confirm"),
     )
     assert isinstance(request, BudgetConfirmRequest)
     assert request.reservation_id == "r_test_123"
@@ -122,7 +123,7 @@ def test_build_confirm_request_narrows_service_tier_to_wire_literals() -> None:
             model="gpt-5.5",
             token_details=token_details,
             provider="openai",
-            call_id="call_tier",
+            call_id=call_uuid("call_tier"),
             service_tier=tier,
         )
 

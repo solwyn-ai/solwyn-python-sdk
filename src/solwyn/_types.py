@@ -27,6 +27,10 @@ from pydantic import (
 from solwyn._constants import (
     AGENT_RUN_ID_MAX_LENGTH,
     AGENT_RUN_NAME_MAX_LENGTH,
+    CALL_ID_MAX_LENGTH,
+    CALL_ID_PATTERN,
+    HOLDER_ID_MAX_LENGTH,
+    LEASE_ID_MAX_LENGTH,
     MODEL_NAME_MAX_LENGTH,
     PROVIDER_REGION_MAX_LENGTH,
     SERVICE_TIER_MAX_LENGTH,
@@ -309,9 +313,13 @@ class MetadataEvent(BaseModel):
     attempt_index: int = Field(default=0, ge=0, description="0=primary, 1=first fallback")
     call_id: str = Field(
         ...,
+        max_length=CALL_ID_MAX_LENGTH,
+        pattern=CALL_ID_PATTERN,
         description=(
             "uuid per intercepted call; join key for cache-hit spend reconciliation. "
-            "Always present on the wire — it is NOT content."
+            "Always present on the wire — it is NOT content. Canonical lowercase "
+            "UUID, matching the API's own pin: this id and its confirm's are the "
+            "SAME id, so both halves of the join key answer to one shape."
         ),
     )
     possibly_succeeded: bool | None = Field(
@@ -483,6 +491,260 @@ class BudgetCheckResponse(BaseModel):
     )
 
 
+class LeaseGrantRequest(BaseModel):
+    """Ask the API for a token-denominated budget lease for a run.
+
+    The lease replaces the per-call ``/budgets/check`` for run-scoped,
+    token-billed traffic: the SDK draws the grant down in memory and renews
+    ahead of need. ``fail_open`` declares the client's configured unreachable
+    posture, echoed back as ``posture.on_unreachable`` so the grant is the
+    single self-describing artifact the outage ladder reads.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_none(
+        self,
+        handler: SerializerFunctionWrapHandler,
+        _info: SerializationInfo,
+    ) -> dict[str, Any]:
+        """Serialize grant requests without null-valued optional fields."""
+        data = handler(self)
+        if not isinstance(data, dict):
+            raise RuntimeError("LeaseGrantRequest serializer expected dict output")
+        serialized = cast(dict[str, Any], data)
+        return {key: value for key, value in serialized.items() if value is not None}
+
+    agent_run_id: str = Field(
+        ...,
+        max_length=AGENT_RUN_ID_MAX_LENGTH,
+        description="Stable id for the solwyn.run() scope the lease is drawn for",
+    )
+    holder_id: str = Field(
+        ...,
+        max_length=HOLDER_ID_MAX_LENGTH,
+        description="SDK instance id — the lease holder identity",
+    )
+    model: str = Field(
+        ..., max_length=MODEL_NAME_MAX_LENGTH, description="Primary model for the run"
+    )
+    provider: ProviderName = Field(..., description="Primary provider for the run")
+    fallback_providers: list[ProviderName] = Field(
+        default_factory=list,
+        description="Configured failover providers, in attempt order (declared set)",
+    )
+    fallback_models: list[Annotated[str, Field(max_length=MODEL_NAME_MAX_LENGTH)]] = Field(
+        default_factory=list,
+        max_length=8,
+        description="Failover models aligned element-for-element with fallback_providers",
+    )
+    fail_open: bool = Field(
+        default=True,
+        description="Client's configured unreachable posture (echoed as posture.on_unreachable)",
+    )
+    estimated_input_tokens: int = Field(
+        default=0, ge=0, description="Triggering call's input estimate (demand hint)"
+    )
+
+    @model_validator(mode="after")
+    def _check_chain_hint_alignment(self) -> LeaseGrantRequest:
+        """fallback_providers and fallback_models must align element-for-element."""
+        if len(self.fallback_models) != len(self.fallback_providers):
+            raise ValueError("fallback_models and fallback_providers must have equal length")
+        return self
+
+
+class LeaseRenewRequest(BaseModel):
+    """Renew a lease, acknowledging the generation the holder operates under.
+
+    Doubles as the periodic report: ``spent_tokens`` is the trued-up drawdown
+    since the last successful report, ``uncounted_*`` the outage fail-open
+    tally. ``model``/``provider``/chain optionally re-declare the model set —
+    the server UNIONS them into the lease's declared set.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_none(
+        self,
+        handler: SerializerFunctionWrapHandler,
+        _info: SerializationInfo,
+    ) -> dict[str, Any]:
+        """Serialize renewals without null-valued optional fields.
+
+        The optional re-declaration fields are skipped when None so a renewal
+        that re-declares nothing keeps its wire bytes minimal (the Cloud-API
+        model forbids unknown keys).
+        """
+        data = handler(self)
+        if not isinstance(data, dict):
+            raise RuntimeError("LeaseRenewRequest serializer expected dict output")
+        serialized = cast(dict[str, Any], data)
+        return {key: value for key, value in serialized.items() if value is not None}
+
+    lease_id: str = Field(..., max_length=LEASE_ID_MAX_LENGTH, description="Lease being renewed")
+    holder_id: str = Field(
+        ..., max_length=HOLDER_ID_MAX_LENGTH, description="SDK instance id — the lease holder"
+    )
+    generation: int = Field(
+        ...,
+        ge=0,
+        description="ECHO of the grant the holder operates under — also acknowledges it",
+    )
+    spent_tokens: int = Field(
+        default=0, ge=0, description="Trued-up drawdown since the last successful report"
+    )
+    reserved_tokens: int = Field(
+        default=0, ge=0, description="Currently in-flight reservations (demand hint)"
+    )
+    uncounted_calls: int = Field(
+        default=0, ge=0, description="Outage fail-open call tally since the last report"
+    )
+    uncounted_tokens: int = Field(
+        default=0, ge=0, description="Outage fail-open token tally since the last report"
+    )
+    model: str | None = Field(
+        default=None,
+        max_length=MODEL_NAME_MAX_LENGTH,
+        description="Optional re-declaration; the server unions it into the declared set",
+    )
+    provider: ProviderName | None = Field(
+        default=None, description="Optional provider re-declaration"
+    )
+    fallback_providers: list[ProviderName] = Field(
+        default_factory=list, description="Optional failover provider re-declaration"
+    )
+    fallback_models: list[Annotated[str, Field(max_length=MODEL_NAME_MAX_LENGTH)]] = Field(
+        default_factory=list,
+        max_length=8,
+        description="Failover models aligned element-for-element with fallback_providers",
+    )
+
+    @model_validator(mode="after")
+    def _check_chain_hint_alignment(self) -> LeaseRenewRequest:
+        """fallback_providers and fallback_models must align element-for-element."""
+        if len(self.fallback_models) != len(self.fallback_providers):
+            raise ValueError("fallback_models and fallback_providers must have equal length")
+        return self
+
+
+class LeaseSurrenderRequest(BaseModel):
+    """Release a lease cleanly (DHCPRELEASE-style) with a final true-up."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_none(
+        self,
+        handler: SerializerFunctionWrapHandler,
+        _info: SerializationInfo,
+    ) -> dict[str, Any]:
+        """Serialize surrenders without null-valued optional fields."""
+        data = handler(self)
+        if not isinstance(data, dict):
+            raise RuntimeError("LeaseSurrenderRequest serializer expected dict output")
+        serialized = cast(dict[str, Any], data)
+        return {key: value for key, value in serialized.items() if value is not None}
+
+    lease_id: str = Field(
+        ..., max_length=LEASE_ID_MAX_LENGTH, description="Lease being surrendered"
+    )
+    holder_id: str = Field(
+        ..., max_length=HOLDER_ID_MAX_LENGTH, description="SDK instance id — the lease holder"
+    )
+    generation: int = Field(..., ge=0, description="Generation the holder operates under")
+    spent_tokens: int = Field(default=0, ge=0, description="Final true-up report")
+
+
+class LeasePosture(BaseModel):
+    """The customer-chosen verdicts the outage ladder reads off a grant."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: BudgetMode = Field(..., description="The CUSTOMER's configured project budget mode")
+    on_unreachable: Literal["fail_open", "local_enforce"] = Field(
+        ..., description="Posture when Solwyn is unreachable (echo of the client's fail_open)"
+    )
+
+
+class LeaseGrantResponse(BaseModel):
+    """API response to a lease grant OR renewal.
+
+    The lease fields are present iff the run is eligible AND allowed; the
+    display snapshot is always present. Core serializes directive-v1 style
+    (``exclude_none``), so the conditionally-omitted fields carry explicit
+    ``None`` defaults per repo convention — their server-side drift is caught
+    by tests/integration/test_live_contract.py, not by required-field
+    validation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    eligible: bool = Field(
+        ..., description="False → the run is lease-ineligible; the SDK uses the legacy path"
+    )
+    ineligible_reason: str | None = Field(
+        default=None,
+        description=(
+            "Why the run is lease-ineligible (e.g. 'unit_priced_model', "
+            "'zero_rate_model', 'scoped_rules_present'). Omitted when eligible."
+        ),
+    )
+    allowed: bool = Field(
+        ..., description="False → authoritative HARD DENY verdict (feeds sticky-deny)"
+    )
+    denied_by_period: str | None = Field(
+        default=None,
+        description=(
+            "Which budget period triggered denial (e.g. 'daily', 'agent_run'). "
+            "Deny-only; omitted on allow responses."
+        ),
+    )
+    lease_id: str | None = Field(
+        default=None,
+        max_length=LEASE_ID_MAX_LENGTH,
+        description=(
+            "Granted lease id. Bounded lock-step with the renew/surrender "
+            "REQUEST bound: a drifted id must fail HERE, where the enforcer "
+            "treats a malformed grant as ineligible and drops to the per-call "
+            "path, not later when the renewal/surrender request is built on a "
+            "customer call."
+        ),
+    )
+    generation: int | None = Field(
+        default=None, description="Grant generation — starts at 1, +1 per renewal (fencing)"
+    )
+    granted_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Tokens granted for local drawdown. May be 0 (e.g. alert_only past "
+            "cap): admission then falls to the legacy per-call path."
+        ),
+    )
+    refresh_interval_s: float | None = Field(
+        default=None, description="Seconds until a renewal is due (server jittered)"
+    )
+    lease_length_s: float | None = Field(
+        default=None, description="Seconds of granted authority from receipt (monotonic)"
+    )
+    headroom_share_tokens: int | None = Field(
+        default=None, description="This holder's apportioned share of run headroom"
+    )
+    posture: LeasePosture | None = Field(
+        default=None, description="Customer's mode + unreachable posture for the outage ladder"
+    )
+    final_grant: bool | None = Field(
+        default=None, description="True → wind-down; no further renewal will be granted"
+    )
+    project_id: str = Field(..., description="Project identifier resolved from the API key")
+    mode: BudgetMode = Field(..., description="Current budget enforcement mode")
+    budget_limit: float = Field(..., description="Total budget limit for current period in USD")
+    current_usage: float = Field(..., description="Current spend in USD for this period")
+    remaining_budget: float = Field(..., description="Remaining budget in USD for current period")
+
+
 class BudgetConfirmRequest(BaseModel):
     """Post-call budget confirmation sent after an LLM call completes."""
 
@@ -496,8 +758,11 @@ class BudgetConfirmRequest(BaseModel):
     ) -> dict[str, Any]:
         """Serialize confirms without null-valued optional fields.
 
-        provider_region is the only optional field; skipping it when None keeps
-        the bearer-key providers' confirm wire bytes unchanged (the Cloud-API
+        Every optional field is skipped when None. That keeps the bearer-key
+        providers' confirm wire bytes unchanged (provider_region/service_tier/
+        media_usage) AND makes the settlement key exclusive on the wire: a
+        reservation-settled confirm carries no ``lease_id`` key and a
+        lease-settled confirm carries no ``reservation_id`` key (the Cloud-API
         model forbids unknown keys).
         """
         data = handler(self)
@@ -506,8 +771,19 @@ class BudgetConfirmRequest(BaseModel):
         serialized = cast(dict[str, Any], data)
         return {key: value for key, value in serialized.items() if value is not None}
 
-    reservation_id: str = Field(
-        ..., description="Budget reservation ID returned by BudgetCheckResponse"
+    reservation_id: str | None = Field(
+        default=None,
+        description=(
+            "Budget reservation ID returned by BudgetCheckResponse. Exactly one "
+            "of reservation_id / lease_id must be set."
+        ),
+    )
+    lease_id: str | None = Field(
+        default=None,
+        description=(
+            "Lease the call drew down (PJ-2 lease settlement). Exactly one of "
+            "reservation_id / lease_id must be set."
+        ),
     )
     model: str = Field(
         ..., max_length=MODEL_NAME_MAX_LENGTH, description="LLM model name used for the call"
@@ -529,7 +805,14 @@ class BudgetConfirmRequest(BaseModel):
     )
     call_id: str = Field(
         ...,
-        description=("uuid per intercepted call; dedups confirm vs metadata reconciliation"),
+        max_length=CALL_ID_MAX_LENGTH,
+        pattern=CALL_ID_PATTERN,
+        description=(
+            "uuid per intercepted call; dedups confirm vs metadata reconciliation. "
+            "Canonical lowercase UUID, matching the API's own pin — a confirm is "
+            "the settlement of real spend, so an id the server would 422 must fail "
+            "here, at the seam that built it."
+        ),
     )
     token_details: TokenDetails = Field(
         ..., description="Actual token breakdown from the provider adapter"
@@ -562,3 +845,10 @@ class BudgetConfirmRequest(BaseModel):
             "providers without per-tier pricing."
         ),
     )
+
+    @model_validator(mode="after")
+    def _check_exactly_one_settlement_key(self) -> BudgetConfirmRequest:
+        """A confirm settles EITHER a reservation OR a lease — never both/neither."""
+        if (self.reservation_id is None) == (self.lease_id is None):
+            raise ValueError("exactly one of reservation_id / lease_id must be set")
+        return self

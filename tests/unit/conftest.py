@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -20,6 +21,23 @@ VALID_PROJECT_ID = "proj_" + "a" * 24
 # A minimal one-link provider chain, enough to satisfy SolwynConfig's
 # required ``providers`` invariant in tests that don't care about routing.
 DEFAULT_PROVIDER_CHAIN = [ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")]
+
+# Namespace for call_uuid below. Arbitrary but FIXED: the ids it derives are
+# stable across runs, so a queue-order assertion can name them.
+_CALL_ID_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+
+
+def call_uuid(label: str) -> str:
+    """A canonical-UUID call_id derived from a readable *label*.
+
+    ``BudgetConfirmRequest.call_id`` is pinned to the canonical lowercase UUID
+    text form (the wire contract — see ``_constants.CALL_ID_PATTERN``), so a
+    test cannot say ``call_id="a"`` any more. Deriving the id from the label
+    keeps the intent legible at both ends: ``call_uuid("a")`` in the arrangement
+    and ``call_uuid("a")`` in the assertion are the same id, and it is stable
+    across runs and processes.
+    """
+    return str(uuid.uuid5(_CALL_ID_NAMESPACE, label))
 
 
 # Loggers written by the reporter's BACKGROUND delivery machinery (flush

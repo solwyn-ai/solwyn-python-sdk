@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, _accepted_response
+from conftest import VALID_API_KEY, _accepted_response, call_uuid
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
@@ -27,7 +27,7 @@ def _make_event(**overrides) -> MetadataEvent:
         "is_model_fallback": False,
         "sdk_instance_id": "test-instance-001",
         "timestamp": datetime.now(UTC),
-        "call_id": "call_async_reporter_event",
+        "call_id": call_uuid("call_async_reporter_event"),
     }
     defaults.update(overrides)
     return MetadataEvent(**defaults)
@@ -38,7 +38,7 @@ def _make_confirm_request(**overrides) -> BudgetConfirmRequest:
         "reservation_id": "res_123",
         "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
-        "call_id": "call_async_confirm",
+        "call_id": call_uuid("call_async_confirm"),
         "token_details": TokenDetails(input_tokens=10, output_tokens=5),
     }
     defaults.update(overrides)
@@ -157,7 +157,7 @@ class TestAsyncReporterLifecycle:
 
         mock_post.assert_called_once()
         assert "budgets/confirm" in mock_post.call_args.args[0]
-        assert mock_post.call_args.kwargs["json"]["call_id"] == "call_async_confirm"
+        assert mock_post.call_args.kwargs["json"]["call_id"] == call_uuid("call_async_confirm")
 
 
 # ---------------------------------------------------------------------------
@@ -554,7 +554,7 @@ class TestAsyncReporterBatchFlush:
             "https://api.test.solwyn.ai",
             VALID_API_KEY,
         )
-        call_id = "call_async_stream_settlement"
+        call_id = call_uuid("call_async_stream_settlement")
         reporter.report(_make_event(call_id=call_id))
         reporter.report_confirm(_make_confirm_request(call_id=call_id))
 
@@ -583,8 +583,8 @@ class TestAsyncReporterBatchFlush:
             VALID_API_KEY,
             batch_size=1,
         )
-        older_call_id = "call_async_older_metadata"
-        settlement_call_id = "call_async_mid_flush_settlement"
+        older_call_id = call_uuid("call_async_older_metadata")
+        settlement_call_id = call_uuid("call_async_mid_flush_settlement")
         reporter.report(_make_event(call_id=older_call_id))
         settlement_confirm = _make_confirm_request(call_id=settlement_call_id)
         settlement_event = _make_event(call_id=settlement_call_id)

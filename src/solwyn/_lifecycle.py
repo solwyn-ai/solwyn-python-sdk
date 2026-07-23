@@ -30,6 +30,7 @@ import httpx
 from solwyn._read_only_key import handle_read_only_key_error
 
 if TYPE_CHECKING:
+    from solwyn.budget import _BudgetEnforcerBase
     from solwyn.circuit_breaker import CircuitBreaker
     from solwyn.reporter import (
         AsyncMetadataReporter,
@@ -101,7 +102,16 @@ _atexit_registered = False
 _FORK_RESETTABLE: weakref.WeakSet[_ForkResettable] = weakref.WeakSet()
 _fork_registered = False
 
+# Budget enforcers holding PJ-2 leases. Held weakly, like the reporters: a
+# closed enforcer has already surrendered and drops out on its own.
+_LIVE_LEASE_HOLDERS: weakref.WeakSet[_BudgetEnforcerBase] = weakref.WeakSet()
+
 _EXIT_BATCH_SIZE = 50
+
+# Whole-process budget for handing leases back at exit. A surrender is a
+# courtesy — the server reclaims the float at the lease deadline anyway — so it
+# gets a small, hard bound AFTER the reporters have flushed real spend.
+_EXIT_SURRENDER_BUDGET_S = 2.0
 
 
 def register_fork_reset(obj: _ForkResettable) -> None:
@@ -193,6 +203,79 @@ def register_async_reporter(reporter: AsyncMetadataReporter) -> None:
     # only, so mypy rejects the assignment it cannot see.
     finalizer.atexit = False  # type: ignore[misc]
     reporter._finalizer = finalizer
+
+
+def register_lease_holder(enforcer: _BudgetEnforcerBase) -> None:
+    """Track a budget enforcer so its held leases are released at exit."""
+    _ensure_atexit_registered()
+    _LIVE_LEASE_HOLDERS.add(enforcer)
+
+
+def _exit_surrender_all() -> None:
+    """Hand every still-held lease back (spec §5: release, not just flush).
+
+    Runs AFTER the reporter flush — settled spend is the durable truth and owns
+    the shutdown deadline; this is the DHCPRELEASE-style courtesy that lets the
+    server re-lend the float immediately instead of waiting out the lease. It
+    is breaker-admission gated exactly like exit confirms. Both enforcer
+    flavours are drained over a temporary SYNC client: no event loop exists at
+    interpreter exit.
+
+    The budget is a TRUE WALL-CLOCK bound, the same way the reporter's exit
+    flush gets one: the releases run on a daemon worker JOINED at the deadline.
+    httpx timeouts cap socket operations, not total response time, so a
+    trickling server would otherwise hold exit well past the budget — and
+    unlike spend, nothing here is worth waiting for (an unsurrendered lease is
+    simply reclaimed at its deadline). Nothing needs counting when the join
+    times out: the payloads were already drained out of the ledger, and the
+    server reclaims what it never heard about.
+    """
+    holders = list(_LIVE_LEASE_HOLDERS)
+    if not holders:
+        return
+    deadline = _monotonic() + _EXIT_SURRENDER_BUDGET_S
+
+    def _run() -> None:
+        client: httpx.Client | None = None
+        try:
+            for holder in holders:
+                try:
+                    payloads = holder.lease_surrender_payloads()
+                except Exception as exc:
+                    logger.warning(
+                        "lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__
+                    )
+                    continue
+                for request in payloads:
+                    if _monotonic() >= deadline:
+                        logger.debug("lifecycle.exit_surrender_expired")
+                        return
+                    if client is None:
+                        client = httpx.Client(timeout=5.0)
+                    _post_confirm_blocking(
+                        client,
+                        f"{holder.api_url}/api/v1/budgets/lease/surrender",
+                        request.model_dump(mode="json"),
+                        holder._auth_headers(),
+                        holder._control_plane_breaker,
+                        deadline,
+                    )
+        except Exception as exc:  # the exit hook must never raise
+            logger.warning("lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__)
+        finally:
+            if client is not None:
+                # Best-effort transport teardown (NOT the bound — the join is).
+                client.close()
+
+    # At interpreter shutdown new threads can be refused; the inline fallback
+    # keeps the per-request deadline clamps as the only bound there.
+    try:
+        worker = threading.Thread(target=_run, daemon=True, name="solwyn-exit-surrender")
+        worker.start()
+    except RuntimeError:
+        _run()
+    else:
+        worker.join(timeout=max(0.0, deadline - _monotonic()))
 
 
 def _gc_drop_counter(kind: str, reason: str, n: int = 1) -> None:
@@ -695,3 +778,7 @@ def _exit_flush_all() -> None:
                 blocking_exit_flush(async_reporter)
         except Exception as exc:
             logger.warning("lifecycle.exit_flush_failed: exc_type=%s", type(exc).__name__)
+    try:
+        _exit_surrender_all()
+    except Exception as exc:
+        logger.warning("lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__)

@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from conftest import call_uuid
 from pydantic import ValidationError
 
 from solwyn._token_details import TokenDetails
@@ -89,7 +90,7 @@ def _metadata_event(**overrides: object) -> MetadataEvent:
         "is_model_fallback": False,
         "sdk_instance_id": "sdk_abc",
         "timestamp": datetime(2026, 6, 2, tzinfo=UTC),
-        "call_id": "call-test-123",
+        "call_id": call_uuid("call-test-123"),
     }
     base.update(overrides)
     return MetadataEvent(**base)  # type: ignore[arg-type]
@@ -176,16 +177,16 @@ class TestMetadataEventReconciliationFields:
             )
 
     def test_explicit_call_id_threaded_through(self) -> None:
-        ev = _metadata_event(call_id="call-fixed-123")
+        ev = _metadata_event(call_id=call_uuid("call-fixed-123"))
 
-        assert ev.call_id == "call-fixed-123"
+        assert ev.call_id == call_uuid("call-fixed-123")
 
     def test_call_id_always_on_the_wire(self) -> None:
         # call_id is the join key for cache-hit reconciliation — never None-skipped.
-        ev = _metadata_event(call_id="call-fixed-123")
+        ev = _metadata_event(call_id=call_uuid("call-fixed-123"))
         dumped = ev.model_dump()
 
-        assert dumped["call_id"] == "call-fixed-123"
+        assert dumped["call_id"] == call_uuid("call-fixed-123")
 
     def test_possibly_succeeded_defaults_none_and_is_skipped(self) -> None:
         # None default so the None-skipping serializer keeps non-abort events clean.
@@ -256,7 +257,7 @@ def _confirm_request(**overrides: object) -> BudgetConfirmRequest:
         "model": "gpt-5.5",
         "provider": ProviderName.OPENAI,
         "token_details": TokenDetails(input_tokens=10, output_tokens=5),
-        "call_id": "call-test-123",
+        "call_id": call_uuid("call-test-123"),
     }
     base.update(overrides)
     return BudgetConfirmRequest(**base)  # type: ignore[arg-type]
@@ -276,7 +277,7 @@ class TestBudgetConfirmRequestCallId:
             )
 
     def test_explicit_call_id_threaded_through(self) -> None:
-        req = _confirm_request(call_id="call-fixed-123")
+        req = _confirm_request(call_id=call_uuid("call-fixed-123"))
 
-        assert req.call_id == "call-fixed-123"
-        assert req.model_dump()["call_id"] == "call-fixed-123"
+        assert req.call_id == call_uuid("call-fixed-123")
+        assert req.model_dump()["call_id"] == call_uuid("call-fixed-123")

@@ -62,6 +62,20 @@ def _make_enforcer(**overrides):
     return BudgetEnforcer(**defaults)
 
 
+def _make_legacy_enforcer(**overrides):
+    """A BudgetEnforcer with the PJ-2 lease kill switch OFF.
+
+    Run-scoped traffic meets the lease path first; these tests are about the
+    per-call ``/budgets/check`` contract (scoped cache isolation, sticky
+    denials), so they pin the legacy path explicitly rather than being
+    re-pointed at ``/budgets/lease`` — the behaviour under test is the one the
+    kill switch preserves byte-for-byte. Lease-path coverage of the same run
+    scoping lives in tests/unit/test_budget_lease.py.
+    """
+    overrides.setdefault("lease_enabled", False)
+    return _make_enforcer(**overrides)
+
+
 # ---------------------------------------------------------------------------
 # Base class (sans-I/O) tests
 # ---------------------------------------------------------------------------
@@ -607,7 +621,7 @@ class TestScopedCacheAndStickyDenials:
     """Run-scoped decisions bypass global allows and preserve deny isolation."""
 
     def test_hot_global_allow_does_not_skip_or_get_overwritten_by_scoped_checks(self) -> None:
-        enforcer = _make_enforcer()
+        enforcer = _make_legacy_enforcer()
         global_allow = _response({**ALLOW_BUDGET_RESPONSE, "reservation_id": "res_global"})
         run_a_allow = _response({**ALLOW_BUDGET_RESPONSE, "reservation_id": "res_run_a"})
         run_b_allow = _response({**ALLOW_BUDGET_RESPONSE, "reservation_id": "res_run_b"})
@@ -642,7 +656,7 @@ class TestScopedCacheAndStickyDenials:
         assert unscoped.reservation_id is None
 
     def test_run_deny_is_sticky_only_for_same_run_during_outage(self) -> None:
-        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer = _make_legacy_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
 
         with patch.object(
             enforcer._http,
@@ -679,7 +693,7 @@ class TestScopedCacheAndStickyDenials:
         assert "preserving prior hard deny" in outage_a.warning.lower()
 
     def test_run_hard_deny_clears_older_global_project_deny_for_other_runs(self) -> None:
-        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer = _make_legacy_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
 
         with patch.object(
             enforcer._http,
@@ -715,7 +729,7 @@ class TestScopedCacheAndStickyDenials:
         assert "fail-open" in outage_b.warning.lower()
 
     def test_authoritative_allow_clears_only_same_run_sticky_deny(self) -> None:
-        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer = _make_legacy_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
 
         with patch.object(
             enforcer._http,
@@ -763,7 +777,7 @@ class TestScopedCacheAndStickyDenials:
         assert outage_b.allowed is False
 
     def test_project_period_deny_received_in_scope_stays_globally_sticky(self) -> None:
-        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer = _make_legacy_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
 
         with patch.object(
             enforcer._http,
@@ -790,7 +804,7 @@ class TestScopedCacheAndStickyDenials:
         assert outage_b.allowed is False
 
     def test_scoped_project_alert_only_response_clears_older_run_hard_deny(self) -> None:
-        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer = _make_legacy_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
 
         with patch.object(
             enforcer._http,
@@ -827,7 +841,7 @@ class TestScopedCacheAndStickyDenials:
         assert "fail-open" in outage.warning.lower()
 
     def test_run_sticky_denials_are_bounded_and_evict_least_recently_used(self) -> None:
-        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer = _make_legacy_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
         response = BudgetCheckResponse(**_RUN_DENY_RESPONSE)
 
         for index in range(128):

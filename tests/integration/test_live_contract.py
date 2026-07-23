@@ -13,6 +13,12 @@ behavior-bearing fields in the shapes the SDK reads:
   exclude_none), present with the denying period on deny; the ``"agent_run"``
   literal keys run-scoped sticky denial (budget.py ``_cache_response``).
 
+The PJ-2 lease block below does the same job for the lease wire: every
+grant/renew field the SDK's admission ladder reads, every refusal status it
+dispatches on (S2 classifies by STATUS alone — these pins are what make that
+safe), the three endpoint paths budget.py hardcodes, and the lease-tagged
+confirm.
+
 If one of these fails against a running API, that is a cross-repo contract
 bug — fix the drift, don't loosen the assertion.
 """
@@ -20,12 +26,31 @@ bug — fix the drift, don't loosen the assertion.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 import httpx
 import pytest
-from conftest import Credentials, _signup_token
+from conftest import (
+    Credentials,
+    ProjectCredentials,
+    _signup_token,
+    budget_status,
+    provision_project,
+)
 
-from solwyn._types import BudgetCheckRequest, BudgetCheckResponse, ProviderName
+from solwyn._token_details import TokenDetails
+from solwyn._types import (
+    BudgetCheckRequest,
+    BudgetCheckResponse,
+    BudgetConfirmRequest,
+    BudgetMode,
+    LeaseGrantRequest,
+    LeaseGrantResponse,
+    LeaseRenewRequest,
+    LeaseSurrenderRequest,
+    ProviderName,
+)
+from solwyn.budget import _LEASE_PATH, _LEASE_RENEW_PATH, _LEASE_SURRENDER_PATH
 
 # Sized to gpt-5.5 prices ($5/M input, $30/M output): the first check's
 # estimate (1000 input tokens + projected output) stays under the cap, and the
@@ -177,7 +202,8 @@ class TestLiveDeniedByPeriodContract:
                     "reservation_id": reservation_id,
                     "model": "gpt-5.5",
                     "provider": "openai",
-                    "call_id": f"live-contract-burn-{run_id}",
+                    # uuid4 shape, per the API's call_id pattern.
+                    "call_id": str(uuid.uuid4()),
                     "token_details": {"input_tokens": 1000, "output_tokens": 2000},
                 },
                 headers={"Authorization": f"Bearer {run_capped_credentials.api_key}"},
@@ -198,3 +224,421 @@ class TestLiveDeniedByPeriodContract:
             run_capped_credentials, _check_payload(agent_run_id=f"run-{uuid.uuid4().hex[:12]}")
         )
         assert fresh["allowed"] is True
+
+
+# ── PJ-2 budget leases (Task S5) ─────────────────────────────────────────────
+#
+# One assertion block per wire shape. Every request goes out as the SDK's own
+# serialized bytes (``LeaseGrantRequest``/``LeaseRenewRequest``/
+# ``LeaseSurrenderRequest``/``BudgetConfirmRequest``) and every response is
+# checked BOTH as raw JSON (so an exclude-none omission is visible as a missing
+# key) and through ``LeaseGrantResponse.model_validate`` (so SDK-side drift is
+# visible too).
+
+LEASE_MODEL = "gpt-5.5"
+# Core issues ``lse_`` + token_urlsafe(24); both repos bound the field at 64.
+LEASE_ID_MAX_LENGTH = 64
+# The keys that exist ONLY on a grant that carries a lease.
+LEASE_BLOCK_KEYS = (
+    "lease_id",
+    "generation",
+    "granted_tokens",
+    "refresh_interval_s",
+    "lease_length_s",
+    "headroom_share_tokens",
+    "posture",
+    "final_grant",
+)
+
+
+def _lease_headers(credentials: Credentials) -> dict[str, str]:
+    return {"Authorization": f"Bearer {credentials.api_key}"}
+
+
+def _post_lease(credentials: Credentials, path: str, payload: dict[str, object]) -> httpx.Response:
+    with httpx.Client(base_url=credentials.api_url, timeout=15) as http:
+        return http.post(path, json=payload, headers=_lease_headers(credentials))
+
+
+def _grant_payload(
+    run_id: str, holder_id: str, *, model: str = LEASE_MODEL, fail_open: bool = True
+) -> dict[str, Any]:
+    """The SDK's exact grant wire bytes (mirrors ``_build_grant_request``)."""
+    return LeaseGrantRequest(
+        agent_run_id=run_id,
+        holder_id=holder_id,
+        model=model,
+        provider=ProviderName.OPENAI,
+        fallback_providers=[],
+        fallback_models=[],
+        fail_open=fail_open,
+        estimated_input_tokens=1000,
+    ).model_dump(mode="json")
+
+
+def _grant(credentials: Credentials, run_id: str, holder_id: str, **kwargs: Any) -> dict[str, Any]:
+    response = _post_lease(credentials, _LEASE_PATH, _grant_payload(run_id, holder_id, **kwargs))
+    response.raise_for_status()
+    body = response.json()
+    if not isinstance(body, dict):
+        pytest.fail(f"lease grant returned non-object JSON: {body!r}")
+    return body
+
+
+def _renew(
+    credentials: Credentials, lease_id: str, holder_id: str, generation: int
+) -> httpx.Response:
+    payload = LeaseRenewRequest(
+        lease_id=lease_id, holder_id=holder_id, generation=generation
+    ).model_dump(mode="json")
+    return _post_lease(credentials, _LEASE_RENEW_PATH, payload)
+
+
+def _surrender(
+    credentials: Credentials, lease_id: str, holder_id: str, generation: int
+) -> httpx.Response:
+    payload = LeaseSurrenderRequest(
+        lease_id=lease_id, holder_id=holder_id, generation=generation
+    ).model_dump(mode="json")
+    return _post_lease(credentials, _LEASE_SURRENDER_PATH, payload)
+
+
+def _run_id() -> str:
+    return f"lease-contract-{uuid.uuid4().hex[:12]}"
+
+
+def _holder_id() -> str:
+    return f"holder-{uuid.uuid4().hex[:8]}"
+
+
+@pytest.fixture
+def lease_contract_project(api_url: str) -> ProjectCredentials:
+    """A fresh alert_only project with ample budget, per test.
+
+    Per test, not per session: a held lease claims budget while it is held, so a
+    shared project would make one pin's leftovers another pin's headroom.
+    """
+    return provision_project(
+        api_url, name="sdk-lease-contract", budget_limit=20.0, budget_mode="alert_only"
+    )
+
+
+@pytest.mark.integration
+class TestLiveLeaseGrantContract:
+    @pytest.mark.integration
+    def test_grant_carries_every_behavior_bearing_field(
+        self, lease_contract_project: ProjectCredentials
+    ) -> None:
+        holder = _holder_id()
+        payload = _grant(lease_contract_project, _run_id(), holder)
+
+        assert payload["eligible"] is True
+        assert payload["allowed"] is True
+        # Refusals only: an eligible allow never explains itself.
+        assert "ineligible_reason" not in payload
+        assert "denied_by_period" not in payload
+
+        lease_id = payload["lease_id"]
+        assert isinstance(lease_id, str)
+        assert 0 < len(lease_id) <= LEASE_ID_MAX_LENGTH
+        assert payload["generation"] == 1, "a fresh grant starts at generation 1"
+        assert isinstance(payload["granted_tokens"], int)
+        assert payload["granted_tokens"] > 0
+        assert payload["refresh_interval_s"] > 0
+        assert payload["lease_length_s"] > 0
+        assert payload["refresh_interval_s"] < payload["lease_length_s"], (
+            "a holder must get at least one renewal window inside its lease"
+        )
+        assert isinstance(payload["headroom_share_tokens"], int)
+        assert payload["headroom_share_tokens"] > 0
+        assert payload["posture"] == {"mode": "alert_only", "on_unreachable": "fail_open"}
+        assert payload["final_grant"] is False
+
+        # The always-present display snapshot the SDK logs a last-known
+        # position from (never computed SDK-side).
+        assert isinstance(payload["project_id"], str)
+        assert payload["mode"] == "alert_only"
+        assert payload["budget_limit"] == 20.0
+        assert isinstance(payload["current_usage"], float)
+        assert isinstance(payload["remaining_budget"], float)
+
+        parsed = LeaseGrantResponse.model_validate(payload)
+        assert parsed.lease_id == lease_id
+        assert parsed.posture is not None
+        assert parsed.posture.mode is BudgetMode.ALERT_ONLY
+        assert parsed.posture.on_unreachable == "fail_open"
+        assert parsed.final_grant is False
+
+        _surrender(lease_contract_project, lease_id, holder, payload["generation"])
+
+    @pytest.mark.integration
+    def test_grant_echoes_the_clients_unreachable_posture(
+        self, lease_contract_project: ProjectCredentials
+    ) -> None:
+        # posture.on_unreachable is the ladder's input for "share exhausted and
+        # Solwyn unreachable": it must echo the client's own fail_open.
+        holder = _holder_id()
+        payload = _grant(lease_contract_project, _run_id(), holder, fail_open=False)
+
+        assert payload["posture"]["on_unreachable"] == "local_enforce"
+        _surrender(lease_contract_project, payload["lease_id"], holder, payload["generation"])
+
+    @pytest.mark.integration
+    def test_grant_on_a_hard_deny_project_echoes_hard_deny_posture(self, api_url: str) -> None:
+        """posture.mode is the customer's cap verdict, and it must not drift.
+
+        The §4 ladder keys share-exhaustion entirely off ``posture.mode``:
+        silent drift to ``alert_only`` would keep spending a hard_deny
+        customer's money during exactly the outage their cap exists for. Every
+        other live grant pin runs alert_only — this is the negative space, on
+        an UNDER-cap hard_deny project (so the grant carries a real lease block
+        rather than the deny shape pinned below).
+        """
+        credentials = provision_project(
+            api_url, name="sdk-lease-posture-deny", budget_limit=100.0, budget_mode="hard_deny"
+        )
+        holder = _holder_id()
+        payload = _grant(credentials, _run_id(), holder)
+
+        assert payload["eligible"] is True
+        assert payload["allowed"] is True, "an under-cap hard_deny project still gets a lease"
+        assert payload["posture"]["mode"] == "hard_deny", (
+            f"the grant must echo the project's hard_deny posture: {payload}"
+        )
+        assert payload["mode"] == "hard_deny"
+
+        parsed = LeaseGrantResponse.model_validate(payload)
+        assert parsed.posture is not None
+        assert parsed.posture.mode is BudgetMode.HARD_DENY
+
+        _surrender(credentials, payload["lease_id"], holder, payload["generation"])
+
+    @pytest.mark.integration
+    def test_ineligible_grant_omits_the_lease_block(
+        self, lease_contract_project: ProjectCredentials
+    ) -> None:
+        # A model tokens cannot price cannot denominate a grant. The SDK marks
+        # the run ineligible and uses the legacy path — it must never find a
+        # lease block (or a null one) on this shape.
+        payload = _grant(
+            lease_contract_project, _run_id(), _holder_id(), model="no-such-model-for-leases"
+        )
+
+        assert payload["eligible"] is False
+        assert payload["ineligible_reason"] == "zero_rate_model"
+        assert payload["allowed"] is True, "ineligible is not a denial"
+        for key in LEASE_BLOCK_KEYS:
+            assert key not in payload, f"ineligible response leaked lease key {key}: {payload}"
+        assert LeaseGrantResponse.model_validate(payload).lease_id is None
+
+    @pytest.mark.integration
+    def test_deny_grant_omits_the_lease_block_and_reason(
+        self, hard_denied_credentials: Credentials
+    ) -> None:
+        payload = _grant(hard_denied_credentials, _run_id(), _holder_id())
+
+        assert payload["eligible"] is True
+        assert payload["allowed"] is False
+        assert payload["denied_by_period"] == "monthly", (
+            f"a lease deny must name the denying period like a check does: {payload}"
+        )
+        assert "ineligible_reason" not in payload
+        for key in LEASE_BLOCK_KEYS:
+            assert key not in payload, f"deny response leaked lease key {key}: {payload}"
+
+        parsed = LeaseGrantResponse.model_validate(payload)
+        assert parsed.allowed is False
+        assert parsed.denied_by_period == "monthly"
+        assert parsed.lease_id is None
+
+
+@pytest.mark.integration
+class TestLiveLeaseRefusalContract:
+    """The statuses S2 dispatches on (status-only classification, no body read)."""
+
+    @pytest.mark.integration
+    def test_holder_cap_is_409_lease_holder_cap_exceeded(self, api_url: str) -> None:
+        credentials = provision_project(
+            api_url, name="sdk-lease-cap", budget_limit=20.0, budget_mode="alert_only"
+        )
+        run_id = _run_id()
+        refusal = None
+        for index in range(40):
+            response = _post_lease(
+                credentials, _LEASE_PATH, _grant_payload(run_id, f"cap-holder-{index}")
+            )
+            if response.status_code != 200:
+                refusal = response
+                break
+
+        assert refusal is not None, "the active-holder cap never fired within 40 holders"
+        assert refusal.status_code == 409
+        assert refusal.json()["detail"]["code"] == "lease_holder_cap_exceeded"
+
+    @pytest.mark.integration
+    def test_unknown_lease_renew_is_404_lease_not_found(
+        self, lease_contract_project: ProjectCredentials
+    ) -> None:
+        response = _renew(lease_contract_project, "lse_not-a-real-lease", _holder_id(), 1)
+
+        assert response.status_code == 404
+        assert response.json()["detail"]["code"] == "lease_not_found"
+
+    @pytest.mark.integration
+    def test_unfenceable_generation_is_409_lease_generation_conflict(
+        self, lease_contract_project: ProjectCredentials
+    ) -> None:
+        holder = _holder_id()
+        grant = _grant(lease_contract_project, _run_id(), holder)
+
+        response = _renew(lease_contract_project, grant["lease_id"], holder, 99)
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "lease_generation_conflict"
+        _surrender(lease_contract_project, grant["lease_id"], holder, grant["generation"])
+
+
+@pytest.mark.integration
+class TestLiveLeaseRenewalContract:
+    @pytest.mark.integration
+    def test_renew_echoing_g_returns_g_plus_one(
+        self, lease_contract_project: ProjectCredentials
+    ) -> None:
+        holder = _holder_id()
+        grant = _grant(lease_contract_project, _run_id(), holder)
+
+        response = _renew(lease_contract_project, grant["lease_id"], holder, grant["generation"])
+        response.raise_for_status()
+        renewed = response.json()
+
+        assert renewed["generation"] == grant["generation"] + 1
+        assert renewed["lease_id"] == grant["lease_id"]
+        assert renewed["eligible"] is True
+        assert renewed["allowed"] is True
+        assert isinstance(renewed["granted_tokens"], int)
+        assert renewed["posture"]["mode"] == "alert_only"
+        LeaseGrantResponse.model_validate(renewed)
+
+        _surrender(lease_contract_project, grant["lease_id"], holder, renewed["generation"])
+
+    @pytest.mark.integration
+    def test_surrender_returns_released_tokens_only(
+        self, lease_contract_project: ProjectCredentials
+    ) -> None:
+        holder = _holder_id()
+        grant = _grant(lease_contract_project, _run_id(), holder)
+
+        response = _surrender(
+            lease_contract_project, grant["lease_id"], holder, grant["generation"]
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert set(body) == {"released_tokens"}
+        assert isinstance(body["released_tokens"], int)
+        assert body["released_tokens"] > 0
+
+        # Idempotent: a retried release from an exiting process is not an error.
+        again = _surrender(lease_contract_project, grant["lease_id"], holder, grant["generation"])
+        assert again.status_code == 200
+        assert again.json() == {"released_tokens": 0}
+
+
+@pytest.mark.integration
+class TestLiveLeaseEndpointPaths:
+    @pytest.mark.integration
+    def test_sdk_hardcoded_paths_are_the_live_routes(
+        self, lease_contract_project: ProjectCredentials
+    ) -> None:
+        # budget.py hardcodes these three strings; a router rename would show up
+        # here as a 404 with FastAPI's string detail rather than a lease code.
+        assert _LEASE_PATH == "/api/v1/budgets/lease"
+        assert _LEASE_RENEW_PATH == "/api/v1/budgets/lease/renew"
+        assert _LEASE_SURRENDER_PATH == "/api/v1/budgets/lease/surrender"
+
+        holder = _holder_id()
+        grant = _post_lease(lease_contract_project, _LEASE_PATH, _grant_payload(_run_id(), holder))
+        assert grant.status_code == 200
+        body = grant.json()
+
+        renew = _renew(lease_contract_project, body["lease_id"], holder, body["generation"])
+        assert renew.status_code == 200
+
+        surrender = _surrender(
+            lease_contract_project, body["lease_id"], holder, renew.json()["generation"]
+        )
+        assert surrender.status_code == 200
+
+
+@pytest.mark.integration
+class TestLiveLeaseConfirmContract:
+    @pytest.mark.integration
+    def test_lease_tagged_confirm_settles_and_replays_without_double_settling(
+        self, lease_contract_project: ProjectCredentials
+    ) -> None:
+        holder = _holder_id()
+        grant = _grant(lease_contract_project, _run_id(), holder)
+        lease_id = grant["lease_id"]
+
+        confirm = BudgetConfirmRequest(
+            lease_id=lease_id,
+            model=LEASE_MODEL,
+            provider=ProviderName.OPENAI,
+            call_id=str(uuid.uuid4()),
+            # Deliberately past what the grant's claim covers: spend INSIDE the
+            # claim is already counted, so only an overshoot is observable in
+            # the project's usage.
+            token_details=TokenDetails(input_tokens=100_000, output_tokens=500_000),
+        )
+        wire = confirm.model_dump(mode="json")
+        assert "reservation_id" not in wire, (
+            "the settlement key is exclusive on the wire: a lease-settled confirm "
+            f"must carry no reservation_id: {wire}"
+        )
+        assert wire["lease_id"] == lease_id
+
+        before = budget_status(lease_contract_project)["current_usage"]
+        response = _post_lease(lease_contract_project, "/api/v1/budgets/confirm", wire)
+        assert response.status_code == 204, response.text
+        settled = budget_status(lease_contract_project)["current_usage"]
+        assert settled > before, (
+            f"a lease-tagged confirm past the claim never reached the budget: {before} -> {settled}"
+        )
+
+        # C3 replay: the same call_id settles nothing a second time.
+        replay = _post_lease(lease_contract_project, "/api/v1/budgets/confirm", wire)
+        assert replay.status_code == 204, replay.text
+        assert budget_status(lease_contract_project)["current_usage"] == settled, (
+            "a replayed lease-tagged confirm settled the same call twice"
+        )
+
+        _surrender(lease_contract_project, lease_id, holder, grant["generation"])
+
+    @pytest.mark.integration
+    def test_confirm_requires_exactly_one_settlement_key(
+        self, lease_contract_project: ProjectCredentials
+    ) -> None:
+        # The SDK model refuses to BUILD either shape (model validator), so the
+        # pin posts raw bytes: what is being verified is that the server refuses
+        # them too, which is what makes the exclusive key a wire contract rather
+        # than an SDK convention.
+        base: dict[str, Any] = {
+            "model": LEASE_MODEL,
+            "provider": "openai",
+            "call_id": str(uuid.uuid4()),
+            "token_details": {"input_tokens": 10, "output_tokens": 10},
+        }
+        holder = _holder_id()
+        grant = _grant(lease_contract_project, _run_id(), holder)
+
+        both = _post_lease(
+            lease_contract_project,
+            "/api/v1/budgets/confirm",
+            {**base, "lease_id": grant["lease_id"], "reservation_id": "res_not_real"},
+        )
+        assert both.status_code == 422, both.text
+
+        neither = _post_lease(lease_contract_project, "/api/v1/budgets/confirm", dict(base))
+        assert neither.status_code == 422, neither.text
+
+        _surrender(lease_contract_project, grant["lease_id"], holder, grant["generation"])
