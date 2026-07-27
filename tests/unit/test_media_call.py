@@ -142,6 +142,31 @@ class TestMediaCallSync:
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
+    def test_custom_hop_read_timeout_flows_to_media_dispatch(self) -> None:
+        # The media dispatch site must pass the CONFIGURED per-hop read bound.
+        # The assertions above only ever see the 600.0 default, so a hardcoded
+        # 600.0 (or a read/connect swap) here would pass unnoticed.
+        client, resp = _sync_client()
+        solwyn = _build_sync(client, failover_hop_read_timeout=37.0)
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow(None)),
+            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+        ):
+            result = solwyn._media_call(
+                _spec(),
+                model="text-embedding-3-small",
+                input="hello world",
+            )
+
+        assert result is resp
+        bound = client.with_options.call_args.kwargs["timeout"]
+        assert bound.read == 37.0
+        assert bound.write == 37.0
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
     def test_success_confirms_and_reports_primary_only(self) -> None:
         client, resp = _sync_client()
         solwyn = _build_sync(client)

@@ -401,7 +401,7 @@ client = Solwyn(OpenAI())  # picks up from environment
 
 ### Failover timeouts
 
-Failover is bounded by two independent timeouts. Like the rest of the failover tuning they are constructor-only (no `SOLWYN_*` env var) and server-governed: on a plan without the failover-tuning entitlement a custom value is replaced by the SDK default, warned once per client.
+Failover is bounded by two independent timeouts. Both are constructor-only (no `SOLWYN_*` env var) and server-governed: on a plan without the failover-tuning entitlement a custom value is replaced by the SDK default, warned once per client.
 
 | Knob | Default | What it bounds |
 |------|---------|----------------|

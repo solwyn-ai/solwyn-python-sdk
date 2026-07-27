@@ -566,8 +566,9 @@ class TestFailoverHopReadTimeout:
 
     def test_default_matches_provider_sdk_default(self) -> None:
         solwyn = _make_solwyn(_mock_openai_client(), api_key=VALID_API_KEY)
-        # 600s is the openai/anthropic SDK default: the wrap must never time a
-        # call out earlier than the unwrapped SDK would (drop-in contract).
+        # 600s is the openai/anthropic SDK's READ/WRITE default: the wrapped
+        # read/write bound must never fire earlier than the unwrapped SDK's
+        # would (connect/pool instead track the shrinking failover window).
         assert solwyn._config.failover_hop_read_timeout == 600.0
         solwyn.close()
 

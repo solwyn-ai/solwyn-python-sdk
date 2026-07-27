@@ -48,8 +48,9 @@ class SolwynConfig(BaseModel):
     # budget pre-flight, per-hop connect slices, Retry-After sleeps, and
     # between-hop advancement - while this field alone bounds how long one
     # dispatched hop may spend reading a legitimate (possibly slow) response.
-    # 600.0 matches the openai/anthropic SDK default so a wrapped call never
-    # times out earlier than the unwrapped SDK would (drop-in contract). A read
+    # 600.0 matches the openai/anthropic SDK's READ/WRITE default, so the
+    # wrapped read/write bound never fires earlier than the unwrapped SDK's
+    # would; connect/pool instead track the shrinking failover window. A read
     # timeout is POST_SEND_AMBIGUOUS (re-raised, never failed over, under the
     # default idempotency), so a small value converts slow legitimate
     # generations into ambiguous spend - lower it deliberately.

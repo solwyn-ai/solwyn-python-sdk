@@ -1408,6 +1408,35 @@ class TestDecoupledHopReadTimeout:
         assert client.with_options.call_args.kwargs["timeout"].read == 42.0
         _close(solwyn)
 
+    @pytest.mark.asyncio
+    async def test_async_custom_hop_read_timeout_flows_to_dispatch(self) -> None:
+        # Async mirror of the sync case: the async chat walk must hand its own
+        # dispatch the CONFIGURED read bound. Pinned with a custom value because
+        # a hardcoded 600.0 (or a read/connect swap) on this call site would
+        # otherwise satisfy every default-valued assertion in the suite.
+        client = _openai_client()
+        client.chat.completions.create = AsyncMock(return_value=_openai_response())
+        solwyn = AsyncSolwyn(
+            client,
+            api_key=VALID_API_KEY,
+            model="gpt-5.5",
+            failover_hop_read_timeout=37.0,
+        )
+        solwyn._reporter.report = MagicMock()
+
+        with patch.object(
+            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+        ):
+            await solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        bound = client.with_options.call_args.kwargs["timeout"]
+        assert isinstance(bound, httpx.Timeout)
+        assert bound.read == 37.0
+        assert bound.write == 37.0
+
+        await solwyn._reporter._http.aclose()
+        await solwyn._budget._http.aclose()
+
     def test_directive_suppression_resets_hop_read_bound(self) -> None:
         # Server disallows custom tuning: the custom 120s read bound must be
         # suppressed back to the 600s default ON THIS SAME CALL.
