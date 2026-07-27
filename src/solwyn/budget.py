@@ -1981,10 +1981,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 breaker.record_success()
             return self._build_result_from_response(cloud_response)
         finally:
-            # Cancellation (or any BaseException) bypasses the handler above; a
-            # consumed HALF_OPEN probe slot must be freed or every later
-            # recovery probe is refused. No-op once a success/failure verdict
-            # has already released the slot.
+            # Cancellation (or any BaseException) bypasses the handlers above;
+            # a consumed HALF_OPEN probe slot must be freed or every later
+            # recovery probe is refused. No-op once a verdict released it.
             if breaker is not None:
                 breaker.release_probe(admission)
 

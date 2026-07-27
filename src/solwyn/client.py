@@ -1579,6 +1579,8 @@ class Solwyn(_SolwynBase):
         accumulator = runtime.adapter.create_stream_accumulator(
             estimated_input_tokens=estimated_input_tokens
         )
+        # Accumulator construction is not fail-soft wrapped: it is a pure
+        # constructor with no response parsing or extraction to degrade.
         # Per-region pricing attribution for the SERVED runtime (None for
         # providers without regional pricing). Captured once, closed over.
         provider_region = _safe_extract_region(runtime)
@@ -2578,6 +2580,8 @@ class AsyncSolwyn(_SolwynBase):
         accumulator = runtime.adapter.create_stream_accumulator(
             estimated_input_tokens=estimated_input_tokens
         )
+        # Accumulator construction is not fail-soft wrapped: it is a pure
+        # constructor with no response parsing or extraction to degrade.
         # Per-region pricing attribution for the SERVED runtime (None for
         # providers without regional pricing). Captured once, closed over.
         provider_region = _safe_extract_region(runtime)
