@@ -155,6 +155,7 @@ _PLAIN_REQUEST = {
 
 _FAILOVER_TUNING_FIELDS = (
     "failover_total_timeout",
+    "failover_hop_read_timeout",
     "failover_idempotency",
     "same_provider_retries",
     "circuit_breaker_recovery_timeout_jitter",
@@ -164,6 +165,7 @@ _FAILOVER_TUNING_FIELDS = (
 )
 _CUSTOM_FAILOVER_TUNING = {
     "failover_total_timeout": 91.0,
+    "failover_hop_read_timeout": 120.0,
     "failover_idempotency": "never",
     "same_provider_retries": 4,
     "circuit_breaker_recovery_timeout_jitter": 0.05,

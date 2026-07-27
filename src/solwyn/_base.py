@@ -59,6 +59,7 @@ _LATENCY_MIN_SAMPLES = 3
 # are deliberately outside this boundary.
 _FAILOVER_TUNING_FIELDS = (
     "failover_total_timeout",
+    "failover_hop_read_timeout",
     "failover_idempotency",
     "same_provider_retries",
     "circuit_breaker_recovery_timeout_jitter",

@@ -43,6 +43,17 @@ class SolwynConfig(BaseModel):
 
     # Failover knobs
     failover_total_timeout: float = 30.0
+    # Per-hop READ/WRITE bound (seconds), decoupled from the chain deadline
+    # (PJ-8/R7). failover_total_timeout is the FAILOVER WINDOW - it bounds the
+    # budget pre-flight, per-hop connect slices, Retry-After sleeps, and
+    # between-hop advancement - while this field alone bounds how long one
+    # dispatched hop may spend reading a legitimate (possibly slow) response.
+    # 600.0 matches the openai/anthropic SDK default so a wrapped call never
+    # times out earlier than the unwrapped SDK would (drop-in contract). A read
+    # timeout is POST_SEND_AMBIGUOUS (re-raised, never failed over, under the
+    # default idempotency), so a small value converts slow legitimate
+    # generations into ambiguous spend - lower it deliberately.
+    failover_hop_read_timeout: float = Field(default=600.0, gt=0)
     failover_idempotency: Literal["safe", "never", "always"] = "safe"
     # Max same-provider retries on a 429 whose Retry-After the provider asked us
     # to honor, BEFORE failing over cross-provider. On such a 429 the dispatch
