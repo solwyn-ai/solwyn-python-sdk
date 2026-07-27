@@ -558,3 +558,33 @@ class TestFailoverKnobDefaults:
         with pytest.raises(ConfigurationError) as exc_info:
             _make_solwyn(client, api_key=VALID_API_KEY, same_provider_retries=-1)
         assert exc_info.value.field == "same_provider_retries"
+
+
+@pytest.mark.unit
+class TestFailoverHopReadTimeout:
+    """PJ-8/R7: the per-hop READ bound is decoupled from the chain deadline."""
+
+    def test_default_matches_provider_sdk_default(self) -> None:
+        solwyn = _make_solwyn(_mock_openai_client(), api_key=VALID_API_KEY)
+        # 600s is the openai/anthropic SDK's READ/WRITE default: the wrapped
+        # read/write bound must never fire earlier than the unwrapped SDK's
+        # would (connect/pool instead track the shrinking failover window).
+        assert solwyn._config.failover_hop_read_timeout == 600.0
+        solwyn.close()
+
+    def test_zero_rejected(self) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_solwyn(
+                _mock_openai_client(),
+                api_key=VALID_API_KEY,
+                failover_hop_read_timeout=0,
+            )
+        assert exc_info.value.field == "failover_hop_read_timeout"
+
+    def test_negative_rejected(self) -> None:
+        with pytest.raises(ConfigurationError):
+            _make_solwyn(
+                _mock_openai_client(),
+                api_key=VALID_API_KEY,
+                failover_hop_read_timeout=-1.0,
+            )

@@ -28,6 +28,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any, NamedTuple, cast
 
+import httpx
 from pydantic import ValidationError
 
 from solwyn._base import (
@@ -265,8 +266,11 @@ def _extract_usage_fail_soft(
     return _FailSoftUsage(token_details, unmeasured=False)
 
 
-def _hop_timeout(deadline: Deadline, remaining_candidates: int) -> float:
-    """Timeout for one provider hop, never exceeding the remaining deadline."""
+def _hop_connect_slice(deadline: Deadline, remaining_candidates: int) -> float:
+    """CONNECT/POOL slice for one hop, never exceeding the remaining failover
+    window. Pre-send hangs are failover-safe, so they must stay inside the
+    window; the hop's READ is deliberately NOT derived from the deadline
+    (see _hop_httpx_timeout)."""
     remaining = deadline.remaining()
     if remaining <= 0:
         return 0.001
@@ -274,13 +278,36 @@ def _hop_timeout(deadline: Deadline, remaining_candidates: int) -> float:
     return min(remaining, max(_MIN_HOP_TIMEOUT, slice_timeout))
 
 
+def _hop_httpx_timeout(connect_slice: float, read_timeout: float) -> httpx.Timeout:
+    """Granular per-hop bound for with_options clients (PJ-8/R7).
+
+    connect/pool take the deadline-derived slice: a pre-send hang is provably
+    failover-safe, so it must fail inside the failover window. read/write take
+    the decoupled hop read bound: a read timeout is POST_SEND_AMBIGUOUS and
+    re-raises under default idempotency - cutting it at the failover window
+    buys no failover, it only converts legitimate slow generations into
+    ambiguous spend.
+    """
+    return httpx.Timeout(
+        connect=connect_slice,
+        read=read_timeout,
+        write=read_timeout,
+        pool=connect_slice,
+    )
+
+
 class Deadline:
-    """A monotonic chain deadline.
+    """A monotonic FAILOVER-WINDOW deadline.
 
     Stamped once at ``_intercepted_call`` entry from ``failover_total_timeout``;
-    it encompasses the budget pre-flight and every per-hop dispatch. Per-hop
-    timeouts are derived from ``remaining()`` so a hung-but-connected provider
-    cannot stack the 600s SDK read default across the chain.
+    it bounds the budget pre-flight, each hop's CONNECT/POOL slice, Retry-After
+    sleeps, and between-hop advancement. It deliberately does NOT bound an
+    in-flight hop's READ (PJ-8/R7): a read timeout is POST_SEND_AMBIGUOUS and
+    re-raises under default idempotency, so cutting a legitimate slow
+    generation at the failover window would only convert it into ambiguous
+    spend. Reads are bounded per hop by ``failover_hop_read_timeout`` instead;
+    because expiry gates advancement BETWEEN hops, at most ONE hop can consume
+    the full read bound in a single call.
     """
 
     def __init__(self, total: float) -> None:
@@ -883,30 +910,30 @@ class Solwyn(_SolwynBase):
         *,
         is_streaming: bool,
         timeout: float,
+        read_timeout: float,
         max_retries: int,
     ) -> Any:
-        """Dispatch one hop to the runtime's SDK client. Pure I/O — no metrics.
+        """Dispatch one hop to the runtime's SDK client. Pure I/O - no metrics.
 
-        Applies the mandatory per-hop bound via ``with_options`` (kills the
-        600s SDK read default and any internal retry stacking); SDKs without
-        ``with_options`` apply their own bound inside ``prepare_call``.
-
-        The served hop's stream-method selection is driven by the dispatch-level
-        ``is_streaming`` boolean — NOT the original ``_force_stream``/canonical
-        flag (fix [A]). A caller who streamed via OpenAI/Anthropic ``stream=True``
-        and fails over to Google/Bedrock must still hit the dedicated stream
-        method, and vice versa. Every provider-specific quirk (stream kwarg vs
-        dedicated method, model-key rename, HTTP bound) lives on the adapter's
-        ``prepare_call`` — adding a provider never touches this method.
+        ``timeout`` is the CONNECT/POOL slice of the failover window;
+        ``read_timeout`` is the decoupled per-hop READ/WRITE bound (PJ-8/R7).
+        with_options clients receive the granular httpx.Timeout (kills the
+        SDK's own retry stacking via max_retries too); SDKs without
+        ``with_options`` apply their own bound inside ``prepare_call``, which
+        receives the READ bound (google can only set one whole-request
+        timeout; a slow legitimate generation must survive it).
         """
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
-            client = client.with_options(timeout=timeout, max_retries=max_retries)
+            client = client.with_options(
+                timeout=_hop_httpx_timeout(timeout, read_timeout),
+                max_retries=max_retries,
+            )
         method, call_kwargs = runtime.adapter.prepare_call(
             client,
             cast("dict[str, Any]", kwargs),
             is_streaming=is_streaming,
-            timeout=timeout,
+            timeout=read_timeout,
             max_retries=max_retries,
         )
         return method(**call_kwargs)
@@ -918,20 +945,26 @@ class Solwyn(_SolwynBase):
         kwargs: dict[str, object],
         *,
         timeout: float,
+        read_timeout: float,
         max_retries: int,
     ) -> Any:
         """Dispatch one media hop to the runtime's SDK client. Pure I/O — no metrics.
 
-        The media analogue of ``_sync_dispatch``: applies the per-hop bound via
-        ``with_options`` where available, then hands off to the adapter's
-        ``prepare_media_call`` seam. No streaming and no candidate walk — a media
-        call is served by the primary runtime alone.
+        The media analogue of ``_sync_dispatch``: ``timeout`` is the
+        CONNECT/POOL slice of the failover window, ``read_timeout`` is the
+        decoupled per-hop READ/WRITE bound (PJ-8/R7), applied via
+        ``with_options`` where available and handed to the adapter's
+        ``prepare_media_call`` seam otherwise. No streaming and no candidate
+        walk — a media call is served by the primary runtime alone.
         """
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
-            client = client.with_options(timeout=timeout, max_retries=max_retries)
+            client = client.with_options(
+                timeout=_hop_httpx_timeout(timeout, read_timeout),
+                max_retries=max_retries,
+            )
         method, call_kwargs = _media_prepare(
-            runtime.adapter, surface, client, kwargs, timeout=timeout, max_retries=max_retries
+            runtime.adapter, surface, client, kwargs, timeout=read_timeout, max_retries=max_retries
         )
         return method(**call_kwargs)
 
@@ -986,11 +1019,13 @@ class Solwyn(_SolwynBase):
             agent_run_id=agent_run[0],
             call_id=call_id,
         )
-        effective_total = self._apply_failover_tuning_directive(
+        # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
+        # must never re-read self._config (the directive writer mutates it
+        # under a lock; unlocked re-reads can tear).
+        tuning = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
         )
-        if effective_total is not None:
-            deadline.replace_total(effective_total)
+        deadline.replace_total(tuning.failover_total_timeout)
         self._reporter.observe_project_id(budget.project_id)
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
@@ -1028,7 +1063,25 @@ class Solwyn(_SolwynBase):
                 mode=budget.mode.value,
             )
 
-        # 3. Provider call — PRIMARY only. A dispatch error is reported (parity
+        # 3. Deadline gate, mirroring the chat walk (PJ-8/R7 follow-up). Since
+        #    connect and read are decoupled, an expired window no longer bounds
+        #    the call on its own: _hop_connect_slice returns its 0.001s floor,
+        #    which a WARM POOLED connection satisfies, and the hop would then
+        #    read for the full (default 600s) bound. Whether an expired media
+        #    call escapes would come down to pool state. Gate it explicitly
+        #    instead — chat rejects this exact state, and no provider I/O may
+        #    start outside the window.
+        if deadline.expired():
+            self._budget.release_reservation(
+                call_id,
+                lease_claim_token=_lease_claim_token(budget),
+            )
+            raise ProviderUnavailableError(
+                "failover deadline expired",
+                attempted=[provider],
+            )
+
+        # 4. Provider call — PRIMARY only. A dispatch error is reported (parity
         #    with the chat error path) then re-raised unchanged (drop-in contract).
         start = time.monotonic()
         try:
@@ -1036,7 +1089,8 @@ class Solwyn(_SolwynBase):
                 runtime,
                 spec.surface,
                 kwargs,
-                timeout=_hop_timeout(deadline, 1),
+                timeout=_hop_connect_slice(deadline, 1),
+                read_timeout=tuning.failover_hop_read_timeout,
                 max_retries=0,
             )
         except Exception as exc:
@@ -1061,7 +1115,7 @@ class Solwyn(_SolwynBase):
             raise
         latency_ms = (time.monotonic() - start) * 1000
 
-        # 4. Billable quantities: TOKEN basis (response usage first, request-
+        # 5. Billable quantities: TOKEN basis (response usage first, request-
         #    derived fallback) AND, when the surface has a media channel, the
         #    non-token MediaUsage basis. BOTH ride the confirm when observable —
         #    the server's pricing card unit picks (e.g. native gpt-image sends
@@ -1097,7 +1151,7 @@ class Solwyn(_SolwynBase):
                     type(exc).__name__,
                 )
 
-        # 5. Settle OFF the hot path: build the confirm sans-I/O and enqueue it
+        # 6. Settle OFF the hot path: build the confirm sans-I/O and enqueue it
         #    with the metadata event as one ordered settlement (same path as
         #    chat + streaming). Confirm fires when EITHER basis is observable;
         #    skipped only when both are None (never settle a real $0 price).
@@ -1183,11 +1237,13 @@ class Solwyn(_SolwynBase):
                 default_bound=self._config.lease_output_bound_default,
             ),
         )
-        effective_total = self._apply_failover_tuning_directive(
+        # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
+        # must never re-read self._config (the directive writer mutates it
+        # under a lock; unlocked re-reads can tear).
+        tuning = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
         )
-        if effective_total is not None:
-            deadline.replace_total(effective_total)
+        deadline.replace_total(tuning.failover_total_timeout)
         self._reporter.observe_project_id(budget.project_id)
         # Refresh the CostPolicy signal from the server. Price hints are advisory
         # and slow-moving, so they PERSIST across hint-less responses — a budget
@@ -1239,7 +1295,7 @@ class Solwyn(_SolwynBase):
         elif idempotent_override is False:
             effective_idempotency = "safe"
         else:
-            effective_idempotency = self._config.failover_idempotency
+            effective_idempotency = tuning.failover_idempotency
         allow_cross_provider = effective_idempotency != "never"
         allow_ambiguous_failover = effective_idempotency == "always"
 
@@ -1329,7 +1385,7 @@ class Solwyn(_SolwynBase):
 
             # Same-provider retry budget for THIS chain entry (config seam,
             # default 0). Consumed inside the inner attempt loop below.
-            same_retries_left = self._config.same_provider_retries
+            same_retries_left = tuning.same_provider_retries
             advanced = False
             while True:
                 ctx = _AttemptContext(
@@ -1343,10 +1399,14 @@ class Solwyn(_SolwynBase):
                         rt,
                         call_kwargs,
                         is_streaming=is_streaming,
-                        # Shrinking per-hop slice: divide what's left of the
-                        # chain deadline across the candidates not yet attempted so a
-                        # single hung hop cannot consume the whole budget.
-                        timeout=_hop_timeout(deadline, len(candidates) - idx),
+                        # Per-hop bounds (PJ-8/R7): connect/pool get a
+                        # shrinking slice of the remaining FAILOVER window so a
+                        # pre-send hang cannot eat the whole budget; read/write
+                        # get the decoupled hop read bound (a read timeout is
+                        # POST_SEND_AMBIGUOUS - never failover - so the chain
+                        # deadline must not cut legitimate slow generations).
+                        timeout=_hop_connect_slice(deadline, len(candidates) - idx),
+                        read_timeout=tuning.failover_hop_read_timeout,
                         max_retries=0,
                     )
                     if is_streaming and rt.adapter.dialect == "google":
@@ -1949,25 +2009,30 @@ class AsyncSolwyn(_SolwynBase):
         *,
         is_streaming: bool,
         timeout: float,
+        read_timeout: float,
         max_retries: int,
     ) -> Any:
         """Dispatch one hop to the runtime's async SDK client. Pure I/O.
 
-        Mirrors ``_sync_dispatch``: the per-hop bound applies via
-        ``with_options`` where available, every provider-specific quirk lives
-        on the adapter's ``prepare_call``, and the served hop's stream-method
+        Mirrors ``_sync_dispatch``: ``timeout`` is the CONNECT/POOL slice of
+        the failover window, ``read_timeout`` is the decoupled per-hop
+        READ/WRITE bound (PJ-8/R7); every provider-specific quirk lives on
+        the adapter's ``prepare_call``, and the served hop's stream-method
         selection is driven by the dispatch-level ``is_streaming`` boolean
         (fix [A]). The adapter returns the same attribute path on an async
         client — only the await differs here.
         """
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
-            client = client.with_options(timeout=timeout, max_retries=max_retries)
+            client = client.with_options(
+                timeout=_hop_httpx_timeout(timeout, read_timeout),
+                max_retries=max_retries,
+            )
         method, call_kwargs = runtime.adapter.prepare_call(
             client,
             cast("dict[str, Any]", kwargs),
             is_streaming=is_streaming,
-            timeout=timeout,
+            timeout=read_timeout,
             max_retries=max_retries,
         )
         return await method(**call_kwargs)
@@ -1979,20 +2044,26 @@ class AsyncSolwyn(_SolwynBase):
         kwargs: dict[str, object],
         *,
         timeout: float,
+        read_timeout: float,
         max_retries: int,
     ) -> Any:
         """Dispatch one media hop to the runtime's async SDK client. Pure I/O.
 
-        Mirrors the sync ``_media_dispatch``: the per-hop bound applies via
-        ``with_options`` where available, then the adapter's ``prepare_media_call``
-        seam returns the same attribute path on the async client — only the await
-        differs here. No streaming and no candidate walk (primary-only).
+        Mirrors the sync ``_media_dispatch``: ``timeout`` is the CONNECT/POOL
+        slice of the failover window, ``read_timeout`` is the decoupled
+        per-hop READ/WRITE bound (PJ-8/R7), applied via ``with_options`` where
+        available; the adapter's ``prepare_media_call`` seam returns the same
+        attribute path on the async client — only the await differs here. No
+        streaming and no candidate walk (primary-only).
         """
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
-            client = client.with_options(timeout=timeout, max_retries=max_retries)
+            client = client.with_options(
+                timeout=_hop_httpx_timeout(timeout, read_timeout),
+                max_retries=max_retries,
+            )
         method, call_kwargs = _media_prepare(
-            runtime.adapter, surface, client, kwargs, timeout=timeout, max_retries=max_retries
+            runtime.adapter, surface, client, kwargs, timeout=read_timeout, max_retries=max_retries
         )
         return await method(**call_kwargs)
 
@@ -2026,11 +2097,13 @@ class AsyncSolwyn(_SolwynBase):
             agent_run_id=agent_run[0],
             call_id=call_id,
         )
-        effective_total = self._apply_failover_tuning_directive(
+        # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
+        # must never re-read self._config (the directive writer mutates it
+        # under a lock; unlocked re-reads can tear).
+        tuning = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
         )
-        if effective_total is not None:
-            deadline.replace_total(effective_total)
+        deadline.replace_total(tuning.failover_total_timeout)
         self._reporter.observe_project_id(budget.project_id)
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
@@ -2068,13 +2141,28 @@ class AsyncSolwyn(_SolwynBase):
                 mode=budget.mode.value,
             )
 
+        # Deadline gate, mirroring the sync media path and the chat walk: with
+        # connect and read decoupled (PJ-8/R7), an expired window would
+        # otherwise let a warm pooled connection clear the 0.001s connect floor
+        # and read for the full hop bound. See the sync mirror.
+        if deadline.expired():
+            self._budget.release_reservation(
+                call_id,
+                lease_claim_token=_lease_claim_token(budget),
+            )
+            raise ProviderUnavailableError(
+                "failover deadline expired",
+                attempted=[provider],
+            )
+
         start = time.monotonic()
         try:
             response = await self._media_dispatch(
                 runtime,
                 spec.surface,
                 kwargs,
-                timeout=_hop_timeout(deadline, 1),
+                timeout=_hop_connect_slice(deadline, 1),
+                read_timeout=tuning.failover_hop_read_timeout,
                 max_retries=0,
             )
         except Exception as exc:
@@ -2210,11 +2298,13 @@ class AsyncSolwyn(_SolwynBase):
                 default_bound=self._config.lease_output_bound_default,
             ),
         )
-        effective_total = self._apply_failover_tuning_directive(
+        # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
+        # must never re-read self._config (the directive writer mutates it
+        # under a lock; unlocked re-reads can tear).
+        tuning = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
         )
-        if effective_total is not None:
-            deadline.replace_total(effective_total)
+        deadline.replace_total(tuning.failover_total_timeout)
         self._reporter.observe_project_id(budget.project_id)
         # Refresh the CostPolicy signal from the server. Hints PERSIST across
         # hint-less responses (cache hits) until the server sends new ones — see
@@ -2260,7 +2350,7 @@ class AsyncSolwyn(_SolwynBase):
         elif idempotent_override is False:
             effective_idempotency = "safe"
         else:
-            effective_idempotency = self._config.failover_idempotency
+            effective_idempotency = tuning.failover_idempotency
         allow_cross_provider = effective_idempotency != "never"
         allow_ambiguous_failover = effective_idempotency == "always"
 
@@ -2348,7 +2438,7 @@ class AsyncSolwyn(_SolwynBase):
 
             # Same-provider retry budget for THIS chain entry (mirrors the sync
             # walk); consumed inside the inner attempt loop below.
-            same_retries_left = self._config.same_provider_retries
+            same_retries_left = tuning.same_provider_retries
             advanced = False
             while True:
                 ctx = _AttemptContext(
@@ -2362,10 +2452,14 @@ class AsyncSolwyn(_SolwynBase):
                         rt,
                         call_kwargs,
                         is_streaming=is_streaming,
-                        # Shrinking per-hop slice: divide what's left of the
-                        # chain deadline across the candidates not yet attempted so a
-                        # single hung hop cannot consume the whole budget.
-                        timeout=_hop_timeout(deadline, len(candidates) - idx),
+                        # Per-hop bounds (PJ-8/R7): connect/pool get a
+                        # shrinking slice of the remaining FAILOVER window so a
+                        # pre-send hang cannot eat the whole budget; read/write
+                        # get the decoupled hop read bound (a read timeout is
+                        # POST_SEND_AMBIGUOUS - never failover - so the chain
+                        # deadline must not cut legitimate slow generations).
+                        timeout=_hop_connect_slice(deadline, len(candidates) - idx),
+                        read_timeout=tuning.failover_hop_read_timeout,
                         max_retries=0,
                     )
                     if is_streaming and rt.adapter.dialect == "google":

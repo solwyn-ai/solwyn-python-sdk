@@ -16,7 +16,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -59,6 +59,7 @@ _LATENCY_MIN_SAMPLES = 3
 # are deliberately outside this boundary.
 _FAILOVER_TUNING_FIELDS = (
     "failover_total_timeout",
+    "failover_hop_read_timeout",
     "failover_idempotency",
     "same_provider_retries",
     "circuit_breaker_recovery_timeout_jitter",
@@ -66,6 +67,48 @@ _FAILOVER_TUNING_FIELDS = (
     "circuit_breaker_recovery_timeout",
     "circuit_breaker_success_threshold",
 )
+
+
+class FailoverTuning(NamedTuple):
+    """One COHERENT per-call snapshot of the server-governed failover tuning.
+
+    The directive writer mutates self._config's tuning fields under
+    _breaker_lock (_apply_failover_tuning_directive); an unlocked mid-call
+    re-read of self._config can observe a torn mix of old and new tuning
+    (PJ-8/R12). The dispatch path therefore consumes tuning ONLY through this
+    immutable snapshot, captured once per call under that same lock.
+    """
+
+    failover_total_timeout: float
+    failover_idempotency: Literal["safe", "never", "always"]
+    same_provider_retries: int
+    failover_hop_read_timeout: float
+
+
+_BEDROCK_UNBOUNDED_READ_WARNING = (
+    "Bedrock client (model %r) was built with botocore Config(read_timeout=None): "
+    "Solwyn cannot bound Bedrock hops per-call (boto3 has no per-call timeout "
+    "override) and only checks the failover deadline BETWEEN hops, so one stuck "
+    "Converse read can hang the call indefinitely. Set a finite read_timeout on "
+    "the client's botocore Config, e.g. Config(read_timeout=60)."
+)
+
+
+def _bedrock_read_timeout_is_unbounded(sdk_client: object) -> bool:
+    """True when a bedrock-runtime client carries read_timeout=None (duck-typed).
+
+    botocore's default Config has read_timeout=60, so None is always an
+    explicit caller choice - the one shape neither Solwyn (no per-call
+    override) nor botocore will ever bound. Never imports botocore: the
+    ``client.meta.config.read_timeout`` path is read defensively, and any
+    missing attribute (test doubles, exotic wrappers) reads as bounded.
+    """
+    config = getattr(getattr(sdk_client, "meta", None), "config", None)
+    if config is None:
+        return False
+    sentinel = object()
+    return getattr(config, "read_timeout", sentinel) is None
+
 
 # CostPolicy is inert until the server sends a relative price hint: with no hint
 # on any candidate it degrades to health-based ordering. Warn ONCE per process
@@ -532,6 +575,16 @@ class _SolwynBase:
             if provider not in self._circuit_breakers:
                 self._circuit_breakers[provider] = self._new_circuit_breaker()
 
+        # PJ-8/R8: Solwyn's per-hop bound is unenforceable on boto3 (no
+        # per-call timeout override; the deadline is only checked between
+        # hops). An explicitly unbounded botocore read is therefore the one
+        # configuration that can hang a call forever - warn loudly at build.
+        for runtime in runtimes:
+            if runtime.adapter.dialect == "bedrock" and _bedrock_read_timeout_is_unbounded(
+                runtime.sdk_client
+            ):
+                logger.warning(_BEDROCK_UNBOUNDED_READ_WARNING, runtime.entry.model)
+
         # ONE control-plane breaker per client instance, shared by the budget
         # enforcer (check) and the reporter (confirm): the SDK discovers a
         # Solwyn outage once, not once per call. Never provider-reported.
@@ -567,17 +620,20 @@ class _SolwynBase:
             recovery_timeout_jitter=self._config.circuit_breaker_recovery_timeout_jitter,
         )
 
-    def _apply_failover_tuning_directive(self, allowed: bool | None) -> float | None:
-        """Apply the server's tuning decision and return its effective deadline.
+    def _apply_failover_tuning_directive(self, allowed: bool | None) -> FailoverTuning:
+        """Apply the server's tuning decision; return the call's effective tuning.
 
-        ``None`` is advisory-delivery failure or a legacy/missing directive and
-        is therefore a no-op. Config mutation and retuning every existing
-        breaker share the breaker-management lock with lazy breaker creation,
-        so existing and newly created breakers receive coherent tuning before
-        the current call continues into post-check routing.
+        ``None`` is advisory-delivery failure or a legacy/missing directive:
+        no mutation, but the call still receives ONE coherent snapshot read
+        under the breaker-management lock (never a torn unlocked re-read).
+        Config mutation and retuning every existing breaker share that lock
+        with lazy breaker creation, so existing and newly created breakers
+        receive coherent tuning before the current call continues into
+        post-check routing.
         """
         if allowed is None:
-            return None
+            with self._breaker_lock:
+                return self._tuning_snapshot_locked()
 
         if allowed:
             effective = dict(self._requested_failover_tuning)
@@ -615,12 +671,22 @@ class _SolwynBase:
             ):
                 self._failover_tuning_suppression_logged = True
                 should_log_suppression = True
+            snapshot = self._tuning_snapshot_locked()
 
         if should_log_suppression:
             logger.warning(
                 "Custom failover tuning is unavailable for this plan; SDK defaults applied"
             )
-        return float(effective["failover_total_timeout"])
+        return snapshot
+
+    def _tuning_snapshot_locked(self) -> FailoverTuning:
+        """Read one coherent tuning snapshot. Caller must hold _breaker_lock."""
+        return FailoverTuning(
+            failover_total_timeout=self._config.failover_total_timeout,
+            failover_idempotency=self._config.failover_idempotency,
+            same_provider_retries=self._config.same_provider_retries,
+            failover_hop_read_timeout=self._config.failover_hop_read_timeout,
+        )
 
     def _get_circuit_breaker(self, provider: str) -> CircuitBreaker:
         """Get the circuit breaker for a provider.

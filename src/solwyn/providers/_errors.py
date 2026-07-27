@@ -22,6 +22,23 @@ and silently double-spend. The same trap exists in ``httpx``: ``ConnectTimeout``
 subclasses ``TimeoutException`` (the generic, ambiguous case), and both
 ``ConnectError`` and ``RemoteProtocolError`` subclass ``TransportError``.
 
+THE MIRROR TRAP (why ``APITimeoutError`` is not simply post-send). Both SDKs
+wrap the WHOLE ``httpx.TimeoutException`` family in ``APITimeoutError`` — so a
+provably pre-send ``ConnectTimeout``/``PoolTimeout`` arrives wearing the same
+class name as a post-send ``ReadTimeout``. Treating the name as post-send would
+strand every connect-slice timeout on a dead primary: default-safe idempotency
+re-raises and the chain never advances. Since PJ-8/R7 gave connect its own
+short deadline-derived slice (while read keeps a long decoupled bound), the
+connect slice is the one that fires FIRST on a stalled provider, making this the
+common case rather than the corner. Both wrapper branches therefore inspect the
+chained httpx cause; their DEFAULTS are deliberately opposite, each falling back
+to the canonical meaning of its own class name:
+
+  * ``APITimeoutError``    with no inspectable cause -> POST_SEND_AMBIGUOUS
+                            (a bare timeout is canonically a read timeout)
+  * ``APIConnectionError`` with no inspectable cause -> FAILOVER
+                            (a bare connection error is canonically refused)
+
 The same duck-typing covers botocore (Bedrock): service errors are
 ``ClientError`` subclasses whose class NAME equals the AWS error code and whose
 HTTP status lives at ``exc.response["ResponseMetadata"]["HTTPStatusCode"]`` (a
@@ -39,7 +56,9 @@ classify purely by name; note ``ReadTimeoutError`` subclasses
 Consequently the checks MUST run in this exact order, narrowest-and-safest
 first:
 
-  1. ``APITimeoutError`` (by MRO name)        -> POST_SEND_AMBIGUOUS
+  1. ``APITimeoutError`` (by MRO name) -> classify by its chained httpx cause:
+       pre-send httpx (ConnectTimeout/PoolTimeout/ConnectError) -> FAILOVER
+       read/write/any other/no cause (post-send possible) -> POST_SEND_AMBIGUOUS
   2. httpx ReadTimeout / WriteTimeout, and
      botocore ``ReadTimeoutError`` (by name)  -> POST_SEND_AMBIGUOUS
   3. httpx ConnectTimeout / PoolTimeout /
@@ -70,11 +89,12 @@ precede step 4 (specific pre-send timeouts before the generic ambiguous
 timeout). Step 4b MUST precede step 5 (Bedrock's post-send 408/424 names win
 over their misleading statuses). Step 6 (bare connection failure) MUST come
 AFTER the status check so a connection error that somehow carries a status is
-classified by status first. The cause-inspection in step 6 closes a subtle
-double-spend vector: the openai/anthropic ``APIConnectionError`` wrapper covers
-BOTH provably pre-send failures AND post-send transport drops (a server
-disconnect mid-response surfaces as ``httpx.RemoteProtocolError``), so the
-class name alone does not prove the request never landed.
+classified by status first. The cause-inspection in steps 1 and 6 closes the
+double-spend/stranded-chain vector from both sides: each wrapper covers BOTH
+provably pre-send failures AND post-send ones (a server disconnect mid-response
+surfaces as ``httpx.RemoteProtocolError``; a connect stall surfaces as
+``httpx.ConnectTimeout``), so neither class name alone settles whether the
+request landed.
 """
 
 from __future__ import annotations
@@ -100,6 +120,11 @@ _BOTOCORE_PRE_SEND_NAMES = frozenset(
 _POST_SEND_BY_NAME = frozenset(
     {"ModelTimeoutException", "ModelErrorException", "ConnectionClosedError"}
 )
+# httpx classes that PROVE the request never reached the model: the TCP/TLS
+# connect never completed, or we never even got a connection out of the pool.
+# Used both directly (step 3) and as the cause-inspection allowlist for the
+# openai/anthropic wrappers (steps 1 and 6).
+_PRE_SEND_HTTPX = (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ConnectError)
 
 
 class Disposition(StrEnum):
@@ -152,8 +177,17 @@ def classify_exception(exc: BaseException) -> Disposition:
     names = {cls.__name__ for cls in type(exc).__mro__}
 
     # 1. APITimeoutError subclasses APIConnectionError — it MUST win first.
-    #    A read timeout is post-send and ambiguous; never failover.
+    #    But the openai/anthropic SDKs wrap EVERY httpx.TimeoutException in it,
+    #    and ConnectTimeout/PoolTimeout subclass TimeoutException — so the class
+    #    name alone does NOT prove the request landed. Inspect the chained cause
+    #    exactly like step 6: a provably pre-send cause is failover-safe.
+    #    The DEFAULT here is the MIRROR IMAGE of step 6's: a bare timeout with no
+    #    inspectable cause is canonically a READ timeout (post-send), whereas a
+    #    bare connection wrapper is canonically connect-refused (pre-send).
     if "APITimeoutError" in names:
+        cause = exc.__cause__ or exc.__context__
+        if isinstance(cause, _PRE_SEND_HTTPX):
+            return Disposition.FAILOVER
         return Disposition.POST_SEND_AMBIGUOUS
 
     # 2. httpx read/write timeouts are post-send: bytes were already sent.
@@ -169,7 +203,7 @@ def classify_exception(exc: BaseException) -> Disposition:
     #    before the generic TimeoutException branch (step 4) below. The
     #    botocore pre-send names are the boto equivalents (never the bare
     #    "ConnectionError" — that name collides with the Python builtin).
-    if isinstance(exc, httpx.ConnectTimeout | httpx.PoolTimeout | httpx.ConnectError):
+    if isinstance(exc, _PRE_SEND_HTTPX):
         return Disposition.FAILOVER
     if names & _BOTOCORE_PRE_SEND_NAMES:
         return Disposition.FAILOVER
@@ -209,7 +243,7 @@ def classify_exception(exc: BaseException) -> Disposition:
     #    the canonical connect-refused outage case failover exists to handle.
     if "APIConnectionError" in names:
         cause = exc.__cause__ or exc.__context__
-        if isinstance(cause, httpx.ConnectTimeout | httpx.PoolTimeout | httpx.ConnectError):
+        if isinstance(cause, _PRE_SEND_HTTPX):
             return Disposition.FAILOVER
         if isinstance(cause, httpx.TransportError):
             return Disposition.POST_SEND_AMBIGUOUS

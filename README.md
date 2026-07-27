@@ -126,7 +126,7 @@ Notes:
 
 - Model identity is reported exactly as you pass it — foundation-model ids, cross-region inference profiles (`us.` / `eu.` / `jp.` / `global.` …), or full ARNs — together with the client's region, because Bedrock pricing is keyed per model **and** region. Prompt-cache reads/writes (including the 1h-TTL tier via `usage.cacheDetails`) and the latency/service pricing tier are captured for exact repricing.
 - `invoke_model` / `invoke_model_with_response_stream` / `start_async_invoke` raise `ConfigurationError` instead of bypassing budget tracking: their usage is buried in a consume-once body (or lands out-of-band in S3, for `start_async_invoke`) alongside response content. Use Converse, or call the unwrapped boto3 client for deliberately untracked calls.
-- boto3 has no per-call timeout override, so the failover deadline cannot shorten an in-flight Bedrock hop — set `read_timeout` in your botocore `Config`.
+- boto3 has no per-call timeout override, so neither the failover window nor `failover_hop_read_timeout` can shorten an in-flight Bedrock hop — set `read_timeout` in your botocore `Config` (building a client with `read_timeout=None` logs a warning; see [Failover timeouts](#failover-timeouts)).
 - Async works with [aioboto3](https://github.com/terricain/aioboto3): `AsyncSolwyn(client)` inside `async with session.client("bedrock-runtime") as client`.
 - Bedrock participates in cross-provider failover in both directions (e.g. Bedrock-Claude ⇄ direct Anthropic) via the same canonical translation subset as the other providers.
 
@@ -398,6 +398,29 @@ export SOLWYN_API_KEY="sk_proj_..."
 ```python
 client = Solwyn(OpenAI())  # picks up from environment
 ```
+
+### Failover timeouts
+
+Failover is bounded by two independent timeouts. Both are constructor-only (no `SOLWYN_*` env var) and server-governed: on a plan without the failover-tuning entitlement a custom value is replaced by the SDK default, warned once per client.
+
+| Knob | Default | What it bounds |
+|------|---------|----------------|
+| `failover_total_timeout` | `30.0` | The **failover window** — the budget pre-flight, each hop's connect/pool slice, Retry-After sleeps, and advancement between hops |
+| `failover_hop_read_timeout` | `600.0` | The **per-hop read/write bound** — how long one dispatched hop may spend reading a response |
+
+The failover window deliberately does *not* cap a dispatched hop's read. A pre-send hang (connect, pool wait) is provably failover-safe, so it must fail inside the window; a read timeout is post-send *ambiguous* — the request may already have been served and billed — and under the default `failover_idempotency="safe"` it re-raises instead of failing over. Cutting a slow read at the failover window therefore buys no failover, only ambiguous spend.
+
+`600.0` matches the openai/anthropic SDK's read/write default, so a wrapped call's read/write bound never fires earlier than the unwrapped SDK's would — connect/pool instead track the shrinking failover window. Because window expiry gates advancement *between* hops, at most one hop per call can consume the full read bound: worst-case wall clock is roughly one failover window plus one `failover_hop_read_timeout`.
+
+Lower `failover_hop_read_timeout` if you would rather fail fast than wait out a slow generation (reasoning models, large `max_tokens`) — remembering that the fast failure is an ambiguous re-raise, not a failover:
+
+```python
+client = Solwyn(OpenAI(), api_key="sk_proj_...", failover_hop_read_timeout=120.0)
+```
+
+**google-genai limitation.** google-genai supports only a single whole-request timeout — it cannot split connect from read (a client-level `httpx.Timeout` via `client_args` is overridden per-request by the SDK itself). Solwyn therefore gives a google hop the read bound (`failover_hop_read_timeout`, default 600s) as its whole-request timeout. Consequence: a google **pre-send hang** (TCP/TLS connect, pool wait) is *not* bounded by `failover_total_timeout` — a single hung google hop can block up to the read bound and exhaust the failover window without ever failing over. (OS TCP timeouts typically cap a dead-host connect at ~1–2 minutes.) If you run google as primary with fallbacks and want a tighter failover guarantee, lower `failover_hop_read_timeout` — for google it bounds the entire request.
+
+**Bedrock limitation.** boto3 has no per-call timeout override, so Solwyn cannot bound a Bedrock hop at all — the caller's botocore `Config(read_timeout=...)` governs. Building a Bedrock client whose botocore `Config` sets `read_timeout=None` logs a warning at build time: that is the one shape neither Solwyn nor botocore will bound.
 
 ## Error Handling
 

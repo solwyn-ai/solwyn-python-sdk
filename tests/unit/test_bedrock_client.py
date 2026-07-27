@@ -925,3 +925,64 @@ class TestAsyncBedrockConverse:
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Unbounded botocore read timeout (PJ-8/R8)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestUnboundedReadTimeoutWarning:
+    """PJ-8/R8: Solwyn cannot bound boto3 hops per-call, so an explicitly
+    unbounded botocore read (Config(read_timeout=None)) must warn at build."""
+
+    def test_read_timeout_none_warns_at_build(self, caplog: pytest.LogCaptureFixture) -> None:
+        client = _mock_bedrock_client()
+        client.meta.config = SimpleNamespace(read_timeout=None)
+        caplog.set_level("WARNING", logger="solwyn._base")
+        solwyn = _make_solwyn(client, model=BEDROCK_MODEL)
+        messages = [r.getMessage() for r in caplog.records if r.name == "solwyn._base"]
+        assert any("read_timeout=None" in m for m in messages)
+        assert any(BEDROCK_MODEL in m for m in messages)
+        solwyn.close()
+
+    def test_finite_read_timeout_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        client = _mock_bedrock_client()
+        client.meta.config = SimpleNamespace(read_timeout=60)
+        caplog.set_level("WARNING", logger="solwyn._base")
+        solwyn = _make_solwyn(client, model=BEDROCK_MODEL)
+        assert not any(
+            "read_timeout" in r.getMessage() for r in caplog.records if r.name == "solwyn._base"
+        )
+        solwyn.close()
+
+    def test_missing_config_attribute_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        # A client without the meta.config path (exotic wrapper, test double
+        # without the attribute) must read as bounded - never a false alarm.
+        client = _mock_bedrock_client()
+        client.meta.config = None
+        caplog.set_level("WARNING", logger="solwyn._base")
+        solwyn = _make_solwyn(client, model=BEDROCK_MODEL)
+        assert not any(
+            "read_timeout" in r.getMessage() for r in caplog.records if r.name == "solwyn._base"
+        )
+        solwyn.close()
+
+    def test_unbounded_bedrock_fallback_also_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        # The check covers EVERY runtime in the chain, not just the primary.
+        primary = _mock_openai_client()
+        bedrock = _mock_bedrock_client()
+        bedrock.meta.config = SimpleNamespace(read_timeout=None)
+        caplog.set_level("WARNING", logger="solwyn._base")
+        solwyn = _make_solwyn(
+            primary,
+            model="gpt-5.5",
+            fallback=[(bedrock, BEDROCK_MODEL)],
+        )
+        assert any(
+            "read_timeout=None" in r.getMessage()
+            for r in caplog.records
+            if r.name == "solwyn._base"
+        )
+        solwyn.close()

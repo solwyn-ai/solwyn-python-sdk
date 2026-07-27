@@ -9,6 +9,30 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **The chain deadline no longer caps an in-flight hop's read.**
+  `failover_total_timeout` (default `30.0`) is now purely the FAILOVER WINDOW:
+  it bounds the budget pre-flight, each hop's connect/pool slice, Retry-After
+  sleeps, and advancement between hops. Reads are bounded separately by the new
+  `failover_hop_read_timeout`, so a call may now run up to roughly one failover
+  window plus one hop read timeout — window expiry still gates advancement
+  BETWEEN hops, so at most one hop per call can consume the full read bound.
+  Previously a slow-but-connected provider was cut at 30 seconds and re-raised
+  as `APITimeoutError`; because a read timeout is post-send ambiguous and
+  re-raises WITHOUT failing over under the default
+  `failover_idempotency="safe"`, that cut bought no failover — it only
+  converted legitimately slow generations (reasoning models, large
+  `max_tokens`) into ambiguous spend. Clients exposing `with_options` (openai,
+  anthropic, every OpenAI-compatible provider, together) now receive a granular
+  `httpx.Timeout` — connect/pool from the window slice, read/write from the hop
+  read bound. Callers who prefer fast ambiguous failure lower
+  `failover_hop_read_timeout`.
+- **`failover_total_timeout` no longer bounds a google hop's pre-send phase.**
+  google-genai supports only a single whole-request timeout — it cannot split
+  connect from read — so Solwyn gives a google hop the read bound as its
+  whole-request timeout. A google pre-send hang (TCP/TLS connect, pool wait)
+  can therefore block up to `failover_hop_read_timeout` and exhaust the
+  failover window without ever failing over. Lower `failover_hop_read_timeout`
+  to tighten that guarantee; see the README's *Failover timeouts* section.
 - **`check_budget` gained `call_id` and `estimated_output_bound`** (both
   keyword-only, both optional). `call_id` keys the in-process lease
   reservation the call draws down so settlement can true it up against actual
@@ -192,6 +216,21 @@ derived from git tags (hatch-vcs).
 
 ### Added
 
+- **`failover_hop_read_timeout` (default `600.0`) bounds each hop's
+  read/write**, decoupled from the failover window. `600.0` matches the
+  openai/anthropic SDK's read/write default, so a wrapped call's read/write
+  bound never fires earlier than the unwrapped SDK's would; connect/pool
+  instead track the shrinking failover window. It is constructor-only
+  (deliberately no `SOLWYN_*` env var) and server-governed: on a plan without
+  the failover-tuning entitlement a custom value is suppressed back to `600.0`,
+  warned once per client. Values must be greater than zero.
+- **Building a Bedrock client with an unbounded botocore read timeout now warns
+  at build time.** Solwyn cannot bound a Bedrock hop per call (boto3 has no
+  per-call timeout override), so the caller's botocore
+  `Config(read_timeout=...)` governs — and `read_timeout=None` is the one shape
+  neither Solwyn nor botocore will ever bound, letting a single stuck Converse
+  read hang the call indefinitely. Detection stays zero-import and defensive:
+  an unreadable or absent config reads as bounded.
 - **Run-scoped token leases replace the per-call `/budgets/check` on the hot
   path.** A call carrying an `agent_run_id` used to pay a blocking budget
   round-trip to Solwyn before every provider request. The enforcer now takes
@@ -291,6 +330,31 @@ derived from git tags (hatch-vcs).
 
 ### Fixed
 
+- **A connect/pool timeout wrapped by the provider SDK now fails over.** Both
+  openai and anthropic wrap the ENTIRE `httpx.TimeoutException` family in
+  `APITimeoutError`, so a provably pre-send `ConnectTimeout`/`PoolTimeout`
+  reached classification wearing the same class name as a post-send read
+  timeout — and was classified post-send ambiguous, which under the default
+  `failover_idempotency="safe"` re-raises without ever trying the next
+  candidate. A stalled primary therefore took the whole call down instead of
+  failing over. `APITimeoutError` is now classified by its chained cause, the
+  same way `APIConnectionError` already was: a pre-send httpx cause fails over,
+  read/write/unknown/no-cause stays ambiguous. This matters most now that the
+  connect slice is short and deadline-derived (above) — it is the bound that
+  fires first on a stalled provider.
+- **A media call whose failover window expired during the budget pre-flight no
+  longer starts provider I/O.** With connect and read decoupled (above), the
+  expired path's floor connect slice is satisfied by a warm pooled connection,
+  after which the hop could read for the full hop read bound — so whether an
+  out-of-window media call escaped came down to pool state. Both the sync and
+  async media paths now gate on window expiry before dispatch and release the
+  reservation, matching the chat walk.
+- **Server-pushed failover tuning is now snapshotted once per call.** The
+  directive writer mutates the config's tuning fields under the breaker lock,
+  while the dispatch path re-read them unlocked mid-call — so a call could
+  observe a torn mix of old and new tuning (e.g. the new total timeout with the
+  old idempotency mode). Each call now captures one immutable `FailoverTuning`
+  snapshot under that same lock and consumes only that.
 - **Lease call IDs are fenced for one bounded call lifecycle instead of the
   client's entire lifetime.** Every lease-participating outcome — including a
   cold-start grant and a dynamic legacy fallback — claims the reconciliation
