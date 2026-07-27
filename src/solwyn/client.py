@@ -194,6 +194,66 @@ def _lease_claim_token(budget: Any) -> int | None:
     return token if isinstance(token, int) and not isinstance(token, bool) else None
 
 
+def _safe_extract_region(runtime: ProviderRuntime) -> str | None:
+    """Fail-soft region read (R5): bookkeeping must never raise into the caller."""
+    try:
+        return runtime.adapter.extract_region(runtime.sdk_client)
+    except Exception as exc:
+        logger.warning(
+            "settlement.extract_region_failed_fail_soft: %s", type(exc).__name__
+        )
+        return None
+
+
+def _safe_extract_service_tier(runtime: ProviderRuntime, response: Any) -> str | None:
+    """Fail-soft tier read from the RAW served response (R5)."""
+    try:
+        return runtime.adapter.extract_service_tier(response)
+    except Exception as exc:
+        logger.warning(
+            "settlement.extract_service_tier_failed_fail_soft: %s", type(exc).__name__
+        )
+        return None
+
+
+def _extract_usage_fail_soft(
+    runtime: ProviderRuntime, response: Any, *, estimated_input_tokens: int
+) -> TokenDetails:
+    """Usage for settlement, degrading to estimates instead of raising (R5).
+
+    Ladder: provider-reported usage -> adapter estimate -> synthetic
+    length-based estimate. An adapter raise on an unexpected response shape
+    must never destroy a paid, successful response — the worst case is
+    estimated spend telemetry (is_estimated=True), which the API already
+    prices distinctly.
+    """
+    token_details: TokenDetails | None = None
+    try:
+        token_details = runtime.adapter.extract_usage(response)
+    except Exception as exc:
+        logger.warning(
+            "settlement.extract_usage_failed_fail_soft: %s", type(exc).__name__
+        )
+    # Explicit-degradation fallback (pre-existing semantics): a non-None
+    # estimate REPLACES the extracted details.
+    estimated: TokenDetails | None = None
+    try:
+        estimated = runtime.adapter.estimate_missing_usage(
+            response, estimated_input_tokens=estimated_input_tokens
+        )
+    except Exception as exc:
+        logger.warning(
+            "settlement.estimate_usage_failed_fail_soft: %s", type(exc).__name__
+        )
+    if estimated is not None:
+        token_details = estimated
+    if token_details is None:
+        token_details = TokenDetails(
+            input_tokens=estimated_input_tokens, output_tokens=0, is_estimated=True
+        )
+    return token_details
+
+
 def _hop_timeout(deadline: Deadline, remaining_candidates: int) -> float:
     """Timeout for one provider hop, never exceeding the remaining deadline."""
     remaining = deadline.remaining()
