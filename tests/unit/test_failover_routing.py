@@ -14,8 +14,10 @@ a ``_Status(status_code=429)`` classifies as FAILOVER (advance the chain) while
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -25,7 +27,8 @@ import pytest
 from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
 from solwyn._base import FailoverTuning
-from solwyn._types import CircuitState
+from solwyn._routing import CostPolicy, HealthBasedPolicy, LatencyPolicy, RoutingRequest
+from solwyn._types import CircuitState, ProviderName
 from solwyn.client import AsyncSolwyn, Deadline, Solwyn
 from solwyn.config import SolwynConfig
 from solwyn.exceptions import ProviderUnavailableError, UntranslatableRequestError
@@ -151,6 +154,17 @@ def _close(solwyn: Solwyn) -> None:
     solwyn._budget._http.close()
 
 
+@pytest.fixture
+def wrapped_client() -> Iterator[Solwyn]:
+    solwyn = _make_solwyn(
+        _openai_client(),
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
+    )
+    yield solwyn
+    _close(solwyn)
+
+
 _PLAIN_REQUEST = {
     "model": "gpt-5.5",
     "messages": [{"role": "user", "content": "hi"}],
@@ -180,6 +194,74 @@ _CUSTOM_FAILOVER_TUNING = {
 
 def _current_failover_tuning(solwyn: Solwyn | AsyncSolwyn) -> dict[str, object]:
     return {name: getattr(solwyn._config, name) for name in _FAILOVER_TUNING_FIELDS}
+
+
+# ── policy signal capabilities ───────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_routing_request_is_a_frozen_dataclass() -> None:
+    # Arrange
+    request = RoutingRequest(requested_provider=ProviderName.OPENAI)
+
+    # Assert
+    assert dataclasses.is_dataclass(RoutingRequest)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        request.estimated_input_tokens = 1
+
+
+@pytest.mark.unit
+class TestRoutingSignalCapabilities:
+    def test_health_policy_skips_latency_median(
+        self, wrapped_client: Solwyn, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _boom(provider: str) -> None:
+            raise AssertionError("observed_p50 must not be called under HealthBasedPolicy")
+
+        monkeypatch.setattr(wrapped_client, "observed_p50", _boom)
+        req = RoutingRequest(requested_provider=wrapped_client._runtimes[0].entry.provider)
+        candidates = wrapped_client._select_candidates(req)
+        assert candidates
+
+    def test_latency_policy_still_receives_p50(
+        self, wrapped_client: Solwyn, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wrapped_client._policy = LatencyPolicy()
+        calls: list[str] = []
+        monkeypatch.setattr(
+            wrapped_client,
+            "observed_p50",
+            lambda provider: calls.append(provider) or None,
+        )
+        req = RoutingRequest(requested_provider=wrapped_client._runtimes[0].entry.provider)
+        wrapped_client._select_candidates(req)
+        assert len(calls) == len(wrapped_client._runtimes)
+
+    def test_unknown_custom_policy_gets_full_signals(
+        self, wrapped_client: Solwyn, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class LegacyPolicy:
+            def order(self, candidates: list, req: RoutingRequest) -> list:
+                return list(candidates)
+
+        wrapped_client._policy = LegacyPolicy()
+        calls: list[str] = []
+        monkeypatch.setattr(
+            wrapped_client,
+            "observed_p50",
+            lambda provider: calls.append(provider) or None,
+        )
+        req = RoutingRequest(requested_provider=wrapped_client._runtimes[0].entry.provider)
+        wrapped_client._select_candidates(req)
+        assert len(calls) == len(wrapped_client._runtimes)
+
+    def test_builtin_policy_signal_declarations(self) -> None:
+        assert HealthBasedPolicy.uses_latency_signal is False
+        assert HealthBasedPolicy.uses_price_signal is False
+        assert LatencyPolicy.uses_latency_signal is True
+        assert LatencyPolicy.uses_price_signal is False
+        assert CostPolicy.uses_latency_signal is False
+        assert CostPolicy.uses_price_signal is True
 
 
 # ── cross-provider failover (the core case) ──────────────────────────────

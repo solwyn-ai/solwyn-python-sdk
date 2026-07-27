@@ -35,7 +35,7 @@ _SolwynBase          # Shared sans-I/O logic (config, token estimation, metadata
 - All business logic in `_base.py` (sans-I/O); client classes are thin I/O wrappers
 - httpx for HTTP (already a transitive dep of openai/anthropic SDKs)
 - Never import provider SDKs in core code — detection is duck-typed (the Bedrock adapter never imports boto3; `solwyn[bedrock]` is a convenience extra only)
-- tiktoken is optional — always provide heuristic fallback
+- Token estimation is heuristic and length-based (`_privacy.py` char→token ratios) — the SDK has no tokenizer dependency; provider-reported usage is always the settled truth
 - Runtime invariants use `raise RuntimeError(...)`, not `assert` — Python's `-O` strips asserts. Enforced by `tests/unit/test_no_production_asserts.py`.
 - Pydantic v2 only — `ConfigDict(...)`, `@model_validator`, `.model_dump()`. No v1 patterns.
 

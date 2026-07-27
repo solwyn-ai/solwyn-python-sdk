@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -84,8 +86,132 @@ def _quiet_sync_reporter(**kwargs: object) -> MetadataReporter:
     return reporter
 
 
+@pytest.fixture
+def reporter_with_two_providers() -> Iterator[
+    tuple[MetadataReporter, dict[ProviderName, CircuitBreaker], MagicMock]
+]:
+    breakers = {
+        ProviderName.OPENAI: CircuitBreaker(failure_threshold=1),
+        ProviderName.ANTHROPIC: CircuitBreaker(failure_threshold=1),
+    }
+    reporter = _quiet_sync_reporter(
+        breaker_snapshots=lambda: [
+            (provider, breaker.get_state()) for provider, breaker in breakers.items()
+        ],
+        sdk_instance_id=SDK_INSTANCE_ID,
+    )
+    reporter.observe_project_id(VALID_PROJECT_ID)
+    with patch.object(reporter._http, "post", return_value=_ok_response()) as post:
+        yield reporter, breakers, post
+    reporter._http.close()
+
+
+def _async_reporter_with_two_providers() -> tuple[
+    AsyncMetadataReporter, dict[ProviderName, CircuitBreaker]
+]:
+    breakers = {
+        ProviderName.OPENAI: CircuitBreaker(failure_threshold=1),
+        ProviderName.ANTHROPIC: CircuitBreaker(failure_threshold=1),
+    }
+    reporter = AsyncMetadataReporter(
+        "https://api.test.solwyn.ai",
+        VALID_API_KEY,
+        breaker_snapshots=lambda: [
+            (provider, breaker.get_state()) for provider, breaker in breakers.items()
+        ],
+        sdk_instance_id=SDK_INSTANCE_ID,
+    )
+    reporter.observe_project_id(VALID_PROJECT_ID)
+    return reporter, breakers
+
+
 @pytest.mark.unit
 class TestSyncBreakerReporter:
+    def test_steady_state_sends_nothing_after_first_cycle(
+        self,
+        reporter_with_two_providers: tuple[
+            MetadataReporter, dict[ProviderName, CircuitBreaker], MagicMock
+        ],
+    ) -> None:
+        reporter, _breakers, post = reporter_with_two_providers
+
+        reporter._flush_breaker_reports()
+        first = post.call_count
+        assert first == 2
+        reporter._flush_breaker_reports()
+
+        assert post.call_count == first
+
+    def test_state_change_sends_only_changed_provider(
+        self,
+        reporter_with_two_providers: tuple[
+            MetadataReporter, dict[ProviderName, CircuitBreaker], MagicMock
+        ],
+    ) -> None:
+        reporter, breakers, post = reporter_with_two_providers
+        reporter._flush_breaker_reports()
+        before = post.call_count
+
+        breakers[ProviderName.OPENAI].record_failure()
+        reporter._flush_breaker_reports()
+
+        assert post.call_count == before + 1
+
+    def test_heartbeat_resends_all(
+        self,
+        reporter_with_two_providers: tuple[
+            MetadataReporter, dict[ProviderName, CircuitBreaker], MagicMock
+        ],
+    ) -> None:
+        reporter, _breakers, post = reporter_with_two_providers
+        reporter._flush_breaker_reports()
+        before = post.call_count
+
+        reporter._breaker_heartbeat_at = 0.0
+        reporter._flush_breaker_reports()
+
+        assert post.call_count == before + 2
+
+    def test_failed_send_retries_next_cycle(
+        self,
+        reporter_with_two_providers: tuple[
+            MetadataReporter, dict[ProviderName, CircuitBreaker], MagicMock
+        ],
+    ) -> None:
+        reporter, _breakers, post = reporter_with_two_providers
+        post.side_effect = ConnectionError("down")
+        reporter._flush_breaker_reports()
+
+        post.side_effect = None
+        reporter._flush_breaker_reports()
+
+        assert post.call_count == 4
+
+    def test_force_sends_regardless_of_gating(
+        self,
+        reporter_with_two_providers: tuple[
+            MetadataReporter, dict[ProviderName, CircuitBreaker], MagicMock
+        ],
+    ) -> None:
+        reporter, _breakers, post = reporter_with_two_providers
+        reporter._flush_breaker_reports()
+        before = post.call_count
+
+        reporter._flush_breaker_reports(force=True)
+
+        assert post.call_count == before + 2
+
+    def test_reports_due_false_in_steady_state(
+        self,
+        reporter_with_two_providers: tuple[
+            MetadataReporter, dict[ProviderName, CircuitBreaker], MagicMock
+        ],
+    ) -> None:
+        reporter, _breakers, _post = reporter_with_two_providers
+        reporter._flush_breaker_reports()
+
+        assert reporter._breaker_reports_due() is False
+
     def test_blocked_breaker_cycle_does_not_block_later_metadata_or_spawn_more_cycles(
         self,
     ) -> None:
@@ -133,28 +259,32 @@ class TestSyncBreakerReporter:
                 release_breaker.set()
                 reporter.close()
 
-    def test_close_adopts_active_breaker_cycle_and_closes_http_after_it_finishes(
+    def test_close_waits_for_active_breaker_cycle_then_forces_full_final_cycle(
         self,
     ) -> None:
         breaker_started = threading.Event()
         release_breaker = threading.Event()
         close_finished = threading.Event()
-        breaker_calls = 0
-        reporter = MetadataReporter(
-            "https://api.test.solwyn.ai",
-            VALID_API_KEY,
-            flush_interval=0.01,
-            breaker_snapshots=lambda: [(ProviderName.OPENAI, CircuitBreaker().get_state())],
+        sent_providers: list[str] = []
+        openai = CircuitBreaker(failure_threshold=1)
+        anthropic = CircuitBreaker(failure_threshold=1)
+        reporter = _quiet_sync_reporter(
+            breaker_snapshots=lambda: [
+                (ProviderName.OPENAI, openai.get_state()),
+                (ProviderName.ANTHROPIC, anthropic.get_state()),
+            ],
             sdk_instance_id=SDK_INSTANCE_ID,
         )
         real_close = reporter._http.close
 
-        def send(url: str, **_kwargs: object) -> MagicMock:
-            nonlocal breaker_calls
+        def send(url: str, **kwargs: object) -> MagicMock:
             if url.endswith("/breaker-reports"):
-                breaker_calls += 1
-                breaker_started.set()
-                assert release_breaker.wait(timeout=2.0)
+                payload = kwargs["json"]
+                assert isinstance(payload, dict)
+                sent_providers.append(str(payload["provider"]))
+                if len(sent_providers) == 1:
+                    breaker_started.set()
+                    assert release_breaker.wait(timeout=2.0)
             return _ok_response()
 
         def close_reporter() -> None:
@@ -164,26 +294,71 @@ class TestSyncBreakerReporter:
         close_thread: threading.Thread | None = None
         try:
             with (
-                patch.object(reporter._http, "post", side_effect=send),
+                patch.object(reporter._http, "post", return_value=_ok_response()) as post,
                 patch.object(reporter._http, "close") as http_close,
             ):
                 reporter.observe_project_id(VALID_PROJECT_ID)
+                reporter._flush_breaker_reports()
+                post.reset_mock()
+                openai.record_failure()
+                post.side_effect = send
+                reporter._start_breaker_cycle()
                 assert breaker_started.wait(timeout=1.0)
                 close_thread = threading.Thread(target=close_reporter)
                 close_thread.start()
 
                 assert not close_finished.wait(timeout=0.05)
+                assert sent_providers == ["openai"]
                 http_close.assert_not_called()
                 release_breaker.set()
                 assert close_finished.wait(timeout=2.0)
                 close_thread.join(timeout=2.0)
 
-                assert breaker_calls == 1
+                assert sent_providers == ["openai", "openai", "anthropic"]
                 http_close.assert_called_once_with()
         finally:
             release_breaker.set()
             if close_thread is not None:
                 close_thread.join(timeout=2.0)
+            real_close()
+
+    def test_close_deadline_closes_http_with_active_breaker_worker_stuck(self) -> None:
+        breaker_started = threading.Event()
+        release_breaker = threading.Event()
+        reporter = _quiet_sync_reporter(
+            breaker_snapshots=lambda: [(ProviderName.OPENAI, CircuitBreaker().get_state())],
+            sdk_instance_id=SDK_INSTANCE_ID,
+        )
+        reporter.observe_project_id(VALID_PROJECT_ID)
+        real_close = reporter._http.close
+
+        def send(url: str, **_kwargs: object) -> MagicMock:
+            if url.endswith("/breaker-reports"):
+                breaker_started.set()
+                assert release_breaker.wait(timeout=2.0)
+            return _ok_response()
+
+        worker: threading.Thread | None = None
+        try:
+            with (
+                patch.object(reporter._http, "post", side_effect=send),
+                patch.object(reporter._http, "close") as http_close,
+            ):
+                worker = reporter._start_breaker_cycle()
+                assert worker is not None
+                assert breaker_started.wait(timeout=1.0)
+
+                started_at = time.monotonic()
+                reporter.close(timeout=0.01)
+                elapsed = time.monotonic() - started_at
+
+                assert elapsed < 0.5
+                assert worker.is_alive()
+                http_close.assert_called_once_with()
+        finally:
+            release_breaker.set()
+            if worker is not None:
+                worker.join(timeout=2.0)
             real_close()
 
     def test_client_supplies_distinct_provider_snapshots_and_instance_config(self) -> None:
@@ -377,9 +552,130 @@ class TestSyncBreakerReporter:
         flush.assert_not_called()
         reporter._http.close()
 
+    def test_idle_flush_tick_does_not_start_breaker_worker(self) -> None:
+        reporter = _quiet_sync_reporter()
+        shutdown = MagicMock()
+        shutdown.is_set.side_effect = [False, True]
+        shutdown.wait.return_value = False
+        reporter._shutdown = shutdown
+
+        with (
+            patch.object(reporter, "_flush_remaining"),
+            patch.object(reporter, "_breaker_reports_due", return_value=False) as due,
+            patch.object(reporter, "_start_breaker_cycle") as start_cycle,
+        ):
+            reporter._flush_loop()
+
+        due.assert_called_once_with()
+        start_cycle.assert_not_called()
+        reporter._http.close()
+
+    def test_close_forces_final_breaker_cycle(self) -> None:
+        reporter = _quiet_sync_reporter()
+
+        with patch.object(reporter, "_start_breaker_cycle", return_value=None) as start_cycle:
+            reporter.close()
+
+        start_cycle.assert_called_once_with(
+            during_shutdown=True,
+            deadline=start_cycle.call_args.kwargs["deadline"],
+            force=True,
+        )
+
 
 @pytest.mark.unit
 class TestAsyncBreakerReporter:
+    @pytest.mark.asyncio
+    async def test_steady_state_sends_nothing_after_first_cycle(self) -> None:
+        reporter, _breakers = _async_reporter_with_two_providers()
+
+        with patch.object(
+            reporter._http,
+            "post",
+            new_callable=AsyncMock,
+            return_value=_ok_response(),
+        ) as post:
+            await reporter._flush_breaker_reports()
+            first = post.call_count
+            assert first == 2
+            await reporter._flush_breaker_reports()
+
+            assert post.call_count == first
+
+        await reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_resends_all(self) -> None:
+        reporter, _breakers = _async_reporter_with_two_providers()
+
+        with patch.object(
+            reporter._http,
+            "post",
+            new_callable=AsyncMock,
+            return_value=_ok_response(),
+        ) as post:
+            await reporter._flush_breaker_reports()
+            before = post.call_count
+            reporter._breaker_heartbeat_at = 0.0
+            await reporter._flush_breaker_reports()
+
+            assert post.call_count == before + 2
+
+        await reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_failed_send_retries_next_cycle(self) -> None:
+        reporter, _breakers = _async_reporter_with_two_providers()
+
+        with patch.object(
+            reporter._http,
+            "post",
+            new_callable=AsyncMock,
+            return_value=_ok_response(),
+        ) as post:
+            post.side_effect = ConnectionError("down")
+            await reporter._flush_breaker_reports()
+            post.side_effect = None
+            await reporter._flush_breaker_reports()
+
+            assert post.call_count == 4
+
+        await reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_force_sends_regardless_of_gating(self) -> None:
+        reporter, _breakers = _async_reporter_with_two_providers()
+
+        with patch.object(
+            reporter._http,
+            "post",
+            new_callable=AsyncMock,
+            return_value=_ok_response(),
+        ) as post:
+            await reporter._flush_breaker_reports()
+            before = post.call_count
+            await reporter._flush_breaker_reports(force=True)
+
+            assert post.call_count == before + 2
+
+        await reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_reports_due_false_in_steady_state(self) -> None:
+        reporter, _breakers = _async_reporter_with_two_providers()
+
+        with patch.object(
+            reporter._http,
+            "post",
+            new_callable=AsyncMock,
+            return_value=_ok_response(),
+        ):
+            await reporter._flush_breaker_reports()
+
+            assert reporter._breaker_reports_due() is False
+
+        await reporter._http.aclose()
+
     @pytest.mark.asyncio
     async def test_blocked_breaker_cycle_does_not_block_later_metadata_or_spawn_more_cycles(
         self,
@@ -435,51 +731,108 @@ class TestAsyncBreakerReporter:
                 await reporter.close()
 
     @pytest.mark.asyncio
-    async def test_close_adopts_active_breaker_cycle_and_closes_http_after_it_finishes(
+    async def test_close_waits_for_active_breaker_cycle_then_forces_full_final_cycle(
         self,
     ) -> None:
         breaker_started = asyncio.Event()
         release_breaker = asyncio.Event()
-        breaker_calls = 0
+        sent_providers: list[str] = []
+        openai = CircuitBreaker(failure_threshold=1)
+        anthropic = CircuitBreaker(failure_threshold=1)
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
             VALID_API_KEY,
-            flush_interval=0.01,
-            breaker_snapshots=lambda: [(ProviderName.OPENAI, CircuitBreaker().get_state())],
+            breaker_snapshots=lambda: [
+                (ProviderName.OPENAI, openai.get_state()),
+                (ProviderName.ANTHROPIC, anthropic.get_state()),
+            ],
             sdk_instance_id=SDK_INSTANCE_ID,
         )
         real_aclose = reporter._http.aclose
 
-        async def send(url: str, **_kwargs: object) -> MagicMock:
-            nonlocal breaker_calls
+        async def send(url: str, **kwargs: object) -> MagicMock:
             if url.endswith("/breaker-reports"):
-                breaker_calls += 1
-                breaker_started.set()
-                await release_breaker.wait()
+                payload = kwargs["json"]
+                assert isinstance(payload, dict)
+                sent_providers.append(str(payload["provider"]))
+                if len(sent_providers) == 1:
+                    breaker_started.set()
+                    await release_breaker.wait()
             return _ok_response()
 
         try:
             with (
-                patch.object(reporter._http, "post", new=AsyncMock(side_effect=send)),
+                patch.object(
+                    reporter._http,
+                    "post",
+                    new=AsyncMock(return_value=_ok_response()),
+                ) as post,
                 patch.object(reporter._http, "aclose", new=AsyncMock()) as http_close,
             ):
                 reporter.observe_project_id(VALID_PROJECT_ID)
-                reporter.start()
+                await reporter._flush_breaker_reports()
+                post.reset_mock()
+                openai.record_failure()
+                post.side_effect = send
+                reporter._start_breaker_cycle()
                 await asyncio.wait_for(breaker_started.wait(), timeout=1.0)
                 close_task = asyncio.create_task(reporter.close())
                 await asyncio.sleep(0)
 
                 assert not close_task.done()
+                assert sent_providers == ["openai"]
                 http_close.assert_not_awaited()
                 release_breaker.set()
                 await asyncio.wait_for(close_task, timeout=2.0)
 
-                assert breaker_calls == 1
+                assert sent_providers == ["openai", "openai", "anthropic"]
                 http_close.assert_awaited_once_with()
         finally:
             release_breaker.set()
             if reporter._flush_task is not None and not reporter._flush_task.done():
                 await reporter._flush_task
+            await real_aclose()
+
+    @pytest.mark.asyncio
+    async def test_close_deadline_cancels_active_breaker_task_and_closes_http(self) -> None:
+        breaker_started = asyncio.Event()
+        release_breaker = asyncio.Event()
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+            breaker_snapshots=lambda: [(ProviderName.OPENAI, CircuitBreaker().get_state())],
+            sdk_instance_id=SDK_INSTANCE_ID,
+        )
+        reporter.observe_project_id(VALID_PROJECT_ID)
+        real_aclose = reporter._http.aclose
+
+        async def send(url: str, **_kwargs: object) -> MagicMock:
+            if url.endswith("/breaker-reports"):
+                breaker_started.set()
+                await release_breaker.wait()
+            return _ok_response()
+
+        task: asyncio.Task[None] | None = None
+        try:
+            with (
+                patch.object(reporter._http, "post", new=AsyncMock(side_effect=send)),
+                patch.object(reporter._http, "aclose", new=AsyncMock()) as http_close,
+            ):
+                task = reporter._start_breaker_cycle()
+                assert task is not None
+                await asyncio.wait_for(breaker_started.wait(), timeout=1.0)
+
+                started_at = time.monotonic()
+                await reporter.close(timeout=0.01)
+                elapsed = time.monotonic() - started_at
+
+                assert elapsed < 0.5
+                assert task.done()
+                http_close.assert_awaited_once_with()
+        finally:
+            release_breaker.set()
+            if task is not None and not task.done():
+                await task
             await real_aclose()
 
     @pytest.mark.asyncio
@@ -573,3 +926,41 @@ class TestAsyncBreakerReporter:
 
         flush.assert_not_awaited()
         await reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_idle_flush_tick_does_not_start_breaker_task(self) -> None:
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+        )
+        shutdown = MagicMock()
+        shutdown.is_set.side_effect = [False, True]
+        shutdown.wait = AsyncMock(side_effect=TimeoutError)
+        reporter._shutdown_event = shutdown
+
+        with (
+            patch.object(reporter, "_flush_remaining", new=AsyncMock()),
+            patch.object(reporter, "_breaker_reports_due", return_value=False) as due,
+            patch.object(reporter, "_start_breaker_cycle") as start_cycle,
+        ):
+            await reporter._flush_loop()
+
+        due.assert_called_once_with()
+        start_cycle.assert_not_called()
+        await reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_close_forces_final_breaker_cycle(self) -> None:
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai",
+            VALID_API_KEY,
+        )
+
+        with patch.object(reporter, "_start_breaker_cycle", return_value=None) as start_cycle:
+            await reporter.close()
+
+        start_cycle.assert_called_once_with(
+            during_shutdown=True,
+            deadline=start_cycle.call_args.kwargs["deadline"],
+            force=True,
+        )

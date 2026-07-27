@@ -103,6 +103,10 @@ class SolwynConfig(BaseModel):
     reporter_max_queue_size: int = Field(default=10_000, ge=1)
     reporter_max_in_flight: int = 3
     breaker_reporting_enabled: bool = True
+    # Breaker reports POST only when a provider's snapshot changed since the
+    # last successful send, plus a periodic full-refresh heartbeat so the
+    # dashboard's advisory view never goes stale silently.
+    breaker_report_heartbeat: float = Field(default=60.0, gt=0)
 
     # Reporter at-least-once delivery: these bound the retry/backoff the reporter
     # applies to confirms, settlements, and metadata batches so acknowledged
@@ -141,6 +145,7 @@ class SolwynConfig(BaseModel):
             "reporter_max_queue_size": "REPORTER_MAX_QUEUE_SIZE",
             "reporter_max_in_flight": "REPORTER_MAX_IN_FLIGHT",
             "breaker_reporting_enabled": "BREAKER_REPORTING_ENABLED",
+            "breaker_report_heartbeat": "BREAKER_REPORT_HEARTBEAT",
             "reporter_max_send_attempts": "REPORTER_MAX_SEND_ATTEMPTS",
             "reporter_retry_backoff_base": "REPORTER_RETRY_BACKOFF_BASE",
             "reporter_retry_backoff_cap": "REPORTER_RETRY_BACKOFF_CAP",

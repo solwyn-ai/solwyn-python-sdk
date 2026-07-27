@@ -515,6 +515,24 @@ def _build_hop_kwargs(
     function never logs, never stringifies content, and passes dicts straight
     through to ``_translation`` (a content-privileged module).
     """
+    if (
+        is_primary
+        and not is_provider_fallback
+        and not global_defaults
+        and not rt.entry.default_params
+        and "solwyn_tags" not in kwargs
+        and (
+            rt.adapter.dialect != ProviderName.OPENAI.value
+            or ("max_tokens" not in kwargs and "max_completion_tokens" not in kwargs)
+        )
+    ):
+        # PJ-9/P7 fast path: PRIMARY native passthrough with nothing to merge,
+        # filter, or normalize — one defensive shallow copy (downstream
+        # prepare_call may mutate) instead of the five dict builds below. The
+        # output-cap guard keeps _normalized_openai_output_cap_layer
+        # authoritative whenever an OpenAI-dialect hop carries a cap key.
+        return dict(kwargs)
+
     provider_global_defaults = {
         key: value for key, value in global_defaults.items() if key != "solwyn_tags"
     }
@@ -782,6 +800,7 @@ class Solwyn(_SolwynBase):
             breaker_snapshots=self._get_breaker_snapshots,
             sdk_instance_id=self._sdk_instance_id,
             breaker_reporting_enabled=config.breaker_reporting_enabled,
+            breaker_report_heartbeat=config.breaker_report_heartbeat,
             control_plane_breaker=self._control_plane_breaker,
             max_send_attempts=config.reporter_max_send_attempts,
             retry_backoff_base=config.reporter_retry_backoff_base,
@@ -1883,6 +1902,7 @@ class AsyncSolwyn(_SolwynBase):
             breaker_snapshots=self._get_breaker_snapshots,
             sdk_instance_id=self._sdk_instance_id,
             breaker_reporting_enabled=config.breaker_reporting_enabled,
+            breaker_report_heartbeat=config.breaker_report_heartbeat,
             control_plane_breaker=self._control_plane_breaker,
             max_send_attempts=config.reporter_max_send_attempts,
             retry_backoff_base=config.reporter_retry_backoff_base,

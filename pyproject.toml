@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-openai = ["openai>=2.0", "tiktoken>=0.7"]
+openai = ["openai>=2.0"]
 anthropic = ["anthropic>=0.50"]
 google = ["google-genai>=1.0"]
 # Convenience only: the SDK never imports boto3 — Bedrock clients are
@@ -94,10 +94,6 @@ select = ["E", "F", "I", "UP", "B", "SIM", "S101"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-
-[[tool.mypy.overrides]]
-module = "tiktoken"
-ignore_missing_imports = true
 
 [dependency-groups]
 dev = [

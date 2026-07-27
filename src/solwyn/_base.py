@@ -40,7 +40,6 @@ from solwyn._types import (
 )
 from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
 from solwyn.config import SolwynConfig
-from solwyn.tokenizer import TokenizerManager
 
 if TYPE_CHECKING:
     from solwyn._registry import ProviderRuntime
@@ -526,7 +525,6 @@ class _SolwynBase:
     """Shared sans-I/O base class for Solwyn sync and async clients.
 
     Provides:
-    - Token estimation seam (via TokenizerManager)
     - Metadata event construction
     - Circuit breaker management and pure candidate selection
     - SDK instance identity
@@ -545,7 +543,6 @@ class _SolwynBase:
         }
         self._failover_tuning_suppression_logged = False
         self._sdk_instance_id = str(uuid.uuid4())
-        self._tokenizer = TokenizerManager()
         # Injectable routing policy: defaults to the health-only policy.
         # Swapping in LatencyPolicy/CostPolicy reorders candidates with ZERO
         # changes to dispatch / translation / budget.
@@ -752,11 +749,21 @@ class _SolwynBase:
         (which consumes a probe). Probe consumption happens exactly once, on the
         single candidate actually attempted, in the dispatch loop.
         """
-        # Snapshot the price hints once under the lock so every candidate in this
-        # selection sees a consistent view (the setter may replace the dict
-        # concurrently on another thread).
-        with self._signal_lock:
-            price_hints = dict(self._last_price_hints)
+        # Signal capability gate (PJ-9/P4): the default HealthBasedPolicy
+        # ignores latency_p50 and price_hint, so skip the median (lock + copy +
+        # statistics.median per provider) and the hint snapshot unless the
+        # configured policy declares it consumes them. Unknown injected
+        # policies default to True and keep receiving full signals.
+        wants_latency = getattr(self._policy, "uses_latency_signal", True)
+        wants_price = getattr(self._policy, "uses_price_signal", True)
+        if wants_price:
+            # Snapshot the price hints once under the lock so every candidate in
+            # this selection sees a consistent view (the setter may replace the
+            # dict concurrently on another thread).
+            with self._signal_lock:
+                price_hints = dict(self._last_price_hints)
+        else:
+            price_hints = {}
         candidates: list[ProviderCandidate] = []
         for runtime in self._runtimes:
             breaker = self._get_circuit_breaker(runtime.adapter.name)
@@ -770,7 +777,9 @@ class _SolwynBase:
                     # Routing signals: observed p50 latency (LatencyPolicy) and the
                     # server-provided relative price hint (CostPolicy). Both default to
                     # None when unavailable; HealthBasedPolicy ignores them.
-                    latency_p50=self.observed_p50(runtime.adapter.name),
+                    latency_p50=(
+                        self.observed_p50(runtime.adapter.name) if wants_latency else None
+                    ),
                     price_hint=price_hints.get(runtime.adapter.name),
                 )
             )

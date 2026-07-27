@@ -175,8 +175,8 @@ def test_candidate_is_frozen_and_defaults_price_hint_none() -> None:
 
 @pytest.mark.unit
 def test_routing_request_rejects_extra_fields() -> None:
-    # Assert — extra="forbid" is preserved on the wire-adjacent model
-    with pytest.raises(ValueError):
+    # Assert — the dataclass constructor preserves unexpected-kwarg rejection
+    with pytest.raises(TypeError):
         RoutingRequest(requested_provider=ProviderName.OPENAI, bogus=1)  # type: ignore[call-arg]
 
 
