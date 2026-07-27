@@ -70,7 +70,14 @@ class RoutingRequest(BaseModel):
 
 
 class SelectionPolicy(Protocol):
-    """Pure, side-effect-free ordering of candidates into attempt order."""
+    """Pure, side-effect-free ordering of candidates into attempt order.
+
+    Policies MAY declare two class attributes, ``uses_latency_signal`` and
+    ``uses_price_signal`` (bool). ``_select_candidates`` reads them via
+    ``getattr(..., True)`` and skips computing a signal every candidate in a
+    selection would carry as ``None`` anyway. An absent attribute defaults to
+    True — an injected policy that declares nothing receives full signals.
+    """
 
     def order(
         self, candidates: list[ProviderCandidate], req: RoutingRequest
@@ -128,6 +135,12 @@ class HealthBasedPolicy:
     snapshots only — never calls ``admit()`` or mutates a breaker.
     """
 
+    # Signal capability flags (read via getattr, default True for unknown
+    # policies): this policy orders on health tiers only, so _select_candidates
+    # skips the per-call p50 median and price-hint snapshot entirely.
+    uses_latency_signal = False
+    uses_price_signal = False
+
     def order(
         self, candidates: list[ProviderCandidate], req: RoutingRequest
     ) -> list[ProviderCandidate]:
@@ -149,6 +162,9 @@ class LatencyPolicy:
     never mutates a breaker, does no I/O, and computes no price. Swapping this in
     for ``HealthBasedPolicy`` changes routing order with zero dispatch changes.
     """
+
+    uses_latency_signal = True
+    uses_price_signal = False
 
     def order(
         self, candidates: list[ProviderCandidate], req: RoutingRequest
@@ -180,6 +196,9 @@ class CostPolicy:
     PURE drop-in: only REORDERS the usable set. Never calls ``admit()``,
     never mutates a breaker, does no I/O, and does no price arithmetic.
     """
+
+    uses_latency_signal = False
+    uses_price_signal = True
 
     def order(
         self, candidates: list[ProviderCandidate], req: RoutingRequest
