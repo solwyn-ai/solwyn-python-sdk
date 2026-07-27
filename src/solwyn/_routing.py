@@ -21,8 +21,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from pydantic import BaseModel, ConfigDict
-
 from solwyn._types import CircuitState, ProviderName
 
 if TYPE_CHECKING:
@@ -60,10 +58,14 @@ class ProviderCandidate:
     latency_p50: float | None = None
 
 
-class RoutingRequest(BaseModel):
-    """Inputs a policy may consider when ordering candidates (additive-only)."""
+@dataclass(frozen=True)
+class RoutingRequest:
+    """Inputs a policy may consider when ordering candidates (additive-only).
 
-    model_config = ConfigDict(extra="forbid")
+    A frozen dataclass, not a BaseModel: constructed once per call on the hot
+    path, consumed attribute-wise by pure policies, never serialized —
+    validation overhead buys nothing here and mypy still checks the kwargs.
+    """
 
     requested_provider: ProviderName
     estimated_input_tokens: int = 0

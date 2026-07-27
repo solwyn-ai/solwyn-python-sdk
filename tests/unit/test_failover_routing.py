@@ -14,6 +14,7 @@ a ``_Status(status_code=429)`` classifies as FAILOVER (advance the chain) while
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import threading
 import time
 from collections.abc import Iterator
@@ -27,7 +28,7 @@ from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
 from solwyn._base import FailoverTuning
 from solwyn._routing import CostPolicy, HealthBasedPolicy, LatencyPolicy, RoutingRequest
-from solwyn._types import CircuitState
+from solwyn._types import CircuitState, ProviderName
 from solwyn.client import AsyncSolwyn, Deadline, Solwyn
 from solwyn.config import SolwynConfig
 from solwyn.exceptions import ProviderUnavailableError, UntranslatableRequestError
@@ -196,6 +197,17 @@ def _current_failover_tuning(solwyn: Solwyn | AsyncSolwyn) -> dict[str, object]:
 
 
 # ── policy signal capabilities ───────────────────────────────────────────
+
+
+@pytest.mark.unit
+def test_routing_request_is_a_frozen_dataclass() -> None:
+    # Arrange
+    request = RoutingRequest(requested_provider=ProviderName.OPENAI)
+
+    # Assert
+    assert dataclasses.is_dataclass(RoutingRequest)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        request.estimated_input_tokens = 1
 
 
 @pytest.mark.unit
