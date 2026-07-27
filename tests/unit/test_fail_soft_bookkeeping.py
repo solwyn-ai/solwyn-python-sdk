@@ -242,6 +242,16 @@ class TestPaidResponseSurvivesBookkeepingFailure:
 
         assert len(recorder.confirms) == 1  # reservation NOT leaked
 
+        # The 'with none' half the test name promises: MetadataEvent's
+        # None-skipping serializer OMITS provider_region/service_tier from
+        # the wire entirely when they're None, rather than emitting a
+        # literal null — so absence, not a None value, is the contract.
+        success_events = [e for e in recorder.events if e["status"] == "success"]
+        assert len(success_events) == 1
+        event = success_events[0]
+        assert "provider_region" not in event
+        assert "service_tier" not in event
+
     async def test_async_extract_usage_raise_returns_response_and_settles(
         self,
     ) -> None:
