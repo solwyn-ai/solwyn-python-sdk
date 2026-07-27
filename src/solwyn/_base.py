@@ -85,6 +85,31 @@ class FailoverTuning(NamedTuple):
     failover_hop_read_timeout: float
 
 
+_BEDROCK_UNBOUNDED_READ_WARNING = (
+    "Bedrock client (model %r) was built with botocore Config(read_timeout=None): "
+    "Solwyn cannot bound Bedrock hops per-call (boto3 has no per-call timeout "
+    "override) and only checks the failover deadline BETWEEN hops, so one stuck "
+    "Converse read can hang the call indefinitely. Set a finite read_timeout on "
+    "the client's botocore Config, e.g. Config(read_timeout=60)."
+)
+
+
+def _bedrock_read_timeout_is_unbounded(sdk_client: object) -> bool:
+    """True when a bedrock-runtime client carries read_timeout=None (duck-typed).
+
+    botocore's default Config has read_timeout=60, so None is always an
+    explicit caller choice - the one shape neither Solwyn (no per-call
+    override) nor botocore will ever bound. Never imports botocore: the
+    ``client.meta.config.read_timeout`` path is read defensively, and any
+    missing attribute (test doubles, exotic wrappers) reads as bounded.
+    """
+    config = getattr(getattr(sdk_client, "meta", None), "config", None)
+    if config is None:
+        return False
+    sentinel = object()
+    return getattr(config, "read_timeout", sentinel) is None
+
+
 # CostPolicy is inert until the server sends a relative price hint: with no hint
 # on any candidate it degrades to health-based ordering. Warn ONCE per process
 # when that fallback is in effect so the no-op is visible without logging on
@@ -549,6 +574,16 @@ class _SolwynBase:
             provider = runtime.entry.provider.value
             if provider not in self._circuit_breakers:
                 self._circuit_breakers[provider] = self._new_circuit_breaker()
+
+        # PJ-8/R8: Solwyn's per-hop bound is unenforceable on boto3 (no
+        # per-call timeout override; the deadline is only checked between
+        # hops). An explicitly unbounded botocore read is therefore the one
+        # configuration that can hang a call forever - warn loudly at build.
+        for runtime in runtimes:
+            if runtime.adapter.dialect == "bedrock" and _bedrock_read_timeout_is_unbounded(
+                runtime.sdk_client
+            ):
+                logger.warning(_BEDROCK_UNBOUNDED_READ_WARNING, runtime.entry.model)
 
         # ONE control-plane breaker per client instance, shared by the budget
         # enforcer (check) and the reporter (confirm): the SDK discovers a

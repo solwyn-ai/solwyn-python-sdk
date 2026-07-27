@@ -246,8 +246,10 @@ class BedrockAdapter:
         The uniform internal ``model`` key renames back to boto3's ``modelId``,
         and Converse takes no ``stream`` kwarg — streaming intent selects the
         dedicated method. timeout/max_retries are unusable: boto3 has no
-        ``with_options`` / per-call timeout override, so the chain Deadline
-        plus the caller's botocore Config govern this hop.
+        ``with_options`` / per-call timeout override, so the per-hop read bound
+        this ``timeout`` carries cannot be applied — only the caller's botocore
+        Config bounds this hop's read. The chain deadline governs nothing here;
+        it is checked BETWEEN hops, never during one.
         """
         kwargs = dict(kwargs)
         kwargs["modelId"] = kwargs.pop("model")
