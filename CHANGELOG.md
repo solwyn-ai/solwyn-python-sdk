@@ -9,6 +9,24 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **The SDK now does less work on per-call and background hot paths while
+  preserving routing behavior and wire-model validation.** Provider
+  circuit-breaker reports are sent only when state changes, with a full refresh
+  controlled by `breaker_report_heartbeat` /
+  `SOLWYN_BREAKER_REPORT_HEARTBEAT` (default
+  `60.0` seconds): a failed send remains due, `close()` attempts one final
+  forced full snapshot within the shared shutdown deadline (an already-active
+  cycle can consume that deadline before the send starts), and an idle reporter
+  tick spawns no work when nothing is due.
+  Default routing policies now declare whether they need latency medians or
+  price hints, so unused signals are not computed; compatible streams stop
+  accumulating response length once provider usage latches while continuing to
+  extract usage and service-tier details; and trivial primary passthrough uses
+  a narrow fresh-copy kwargs path. `RoutingRequest` is now a frozen dataclass.
+  The unused `TokenizerManager` path and the `tiktoken` dependency were removed,
+  so the `openai` extra no longer installs `tiktoken`. Validated Pydantic
+  construction remains: a 100,000-iteration benchmark found `model_construct`
+  was `2.905373 µs` slower per logical call, so it was not adopted.
 - **The chain deadline no longer caps an in-flight hop's read.**
   `failover_total_timeout` (default `30.0`) is now purely the FAILOVER WINDOW:
   it bounds the budget pre-flight, each hop's connect/pool slice, Retry-After
