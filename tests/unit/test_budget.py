@@ -920,6 +920,7 @@ class TestContractDriftTaxonomy:
         assert result.allowed is True  # fail_open honored, same as today
         breaker.record_success.assert_called_once()
         breaker.record_failure.assert_not_called()
+        breaker.release_probe.assert_called_once_with(None)
 
     def test_transport_error_still_records_breaker_failure(self) -> None:
         breaker = MagicMock()
@@ -959,6 +960,7 @@ class TestContractDriftTaxonomy:
 
         assert result.allowed is True
         breaker.record_success.assert_called_once()
+        breaker.record_failure.assert_not_called()
 
     def test_parse_error_with_fail_open_false_enforces_locally(self) -> None:
         enforcer = _make_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY)
@@ -966,8 +968,11 @@ class TestContractDriftTaxonomy:
             result = enforcer.check_budget(
                 estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
-        # Local-enforcement posture, unchanged shape from the outage path.
+        # No prior cloud contact -> local enforcement fails closed, mirroring
+        # TestLocalEnforcement::test_denies_when_cloud_never_reached.
+        assert result.allowed is False
         assert result.warning is not None
+        assert "no prior budget limit" in result.warning.lower()
 
 
 def test_budget_check_result_is_pydantic_model() -> None:
