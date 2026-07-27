@@ -1119,6 +1119,7 @@ class _BudgetEnforcerBase:
         service_tier: str | None = None,
         modality: Modality = "text",
         media_usage: MediaUsage | None = None,
+        usage_unmeasured: bool = False,
     ) -> BudgetConfirmRequest:
         """Build a validated confirm request for fire-and-forget callers.
 
@@ -1144,6 +1145,14 @@ class _BudgetEnforcerBase:
         ``media_usage`` carries a non-text surface's settled non-token quantities
         so the API settles the enforcement counter on the per-unit basis; None
         for chat/token confirms.
+        ``usage_unmeasured`` marks the fail-soft SYNTHETIC tier — every usage
+        read for this call raised, so ``token_details`` carries the pre-flight
+        input estimate and NO output at all. The wire confirm is unchanged
+        (the cloud sees the honest ``is_estimated`` value it already prices
+        distinctly), but the LOCAL lease reservation settles at its reserved
+        bound instead of being trued up to that under-measure: crediting the
+        unspent-looking output back would re-lend authority a paid response
+        already consumed, weakening the run's hard token cap.
         """
         if not call_id:
             raise RuntimeError("call_id is required for budget confirm reconciliation")
@@ -1170,12 +1179,14 @@ class _BudgetEnforcerBase:
                 raise RuntimeError("lease_claim_token is required for local lease settlement")
             # Validate the complete wire request BEFORE mutating authority.
             # Settlement of a lease-funded call then moves the local
-            # reservation from its bound to the actual spend.
+            # reservation from its bound to the actual spend — or holds it AT
+            # the bound when the usage was never measurable.
             with self._state_lock:
                 self._lease.true_up(
                     call_id,
                     token_details.total_tokens,
                     claim_token=lease_claim_token,
+                    floor_at_reservation=usage_unmeasured,
                 )
         return confirm
 
@@ -1354,46 +1365,61 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         )
 
         try:
-            if timeout is not None:
-                resp = self._http.post(
-                    f"{self.api_url}/api/v1/budgets/check",
-                    json=request.model_dump(mode="json"),
-                    headers=self._auth_headers(),
-                    timeout=timeout,
-                )
-            else:
-                resp = self._http.post(
-                    f"{self.api_url}/api/v1/budgets/check",
-                    json=request.model_dump(mode="json"),
-                    headers=self._auth_headers(),
-                )
-            resp.raise_for_status()
+            # ── Phase 1: transport + HTTP status. Failures here are OUTAGE
+            # semantics — unchanged from before the split.
+            try:
+                if timeout is not None:
+                    resp = self._http.post(
+                        f"{self.api_url}/api/v1/budgets/check",
+                        json=request.model_dump(mode="json"),
+                        headers=self._auth_headers(),
+                        timeout=timeout,
+                    )
+                else:
+                    resp = self._http.post(
+                        f"{self.api_url}/api/v1/budgets/check",
+                        json=request.model_dump(mode="json"),
+                        headers=self._auth_headers(),
+                    )
+                resp.raise_for_status()
+            except Exception as exc:
+                # A read-only-key error means the control plane RESPONDED —
+                # record success. Anything else is an outage: record failure.
+                # Log the exception TYPE only (never a body).
+                if handle_read_only_key_error(exc):
+                    if breaker is not None:
+                        breaker.record_success()
+                else:
+                    if breaker is not None:
+                        breaker.record_failure()
+                    logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
+                return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
 
-            cloud_response = BudgetCheckResponse.model_validate(resp.json())
+            # ── Phase 2: response processing (R6). The plane RESPONDED 2xx;
+            # a body we cannot parse is server contract drift, NOT an outage:
+            # credit the breaker (drift must not open it), signal at ERROR
+            # with a distinct event, and degrade to the same posture ladder.
+            try:
+                cloud_response = BudgetCheckResponse.model_validate(resp.json())
+            except Exception as exc:
+                if breaker is not None:
+                    breaker.record_success()
+                logger.error(
+                    "budget.check_response_unreadable: %s — possible server "
+                    "contract drift; enforcement degraded (fail_open=%s)",
+                    type(exc).__name__,
+                    self.fail_open,
+                )
+                return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
+
             self._cache_response(cloud_response, agent_run_id=agent_run_id)
             if breaker is not None:
                 breaker.record_success()
             return self._build_result_from_response(cloud_response)
-
-        except Exception as exc:
-            # A read-only-key error means the control plane RESPONDED — record
-            # success. Anything else is an outage: record failure. Log the
-            # exception TYPE only (never interpolate a body that could carry
-            # response text).
-            if handle_read_only_key_error(exc):
-                if breaker is not None:
-                    breaker.record_success()
-            else:
-                if breaker is not None:
-                    breaker.record_failure()
-                logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
-
-            return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
         finally:
-            # Cancellation (or any BaseException) bypasses the handler above; a
-            # consumed HALF_OPEN probe slot must be freed or every later
-            # recovery probe is refused. No-op once a success/failure verdict
-            # has already released the slot.
+            # Cancellation (or any BaseException) bypasses the handlers above;
+            # a consumed HALF_OPEN probe slot must be freed or every later
+            # recovery probe is refused. No-op once a verdict released it.
             if breaker is not None:
                 breaker.release_probe(admission)
 
@@ -1914,46 +1940,61 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         )
 
         try:
-            if timeout is not None:
-                resp = await self._http.post(
-                    f"{self.api_url}/api/v1/budgets/check",
-                    json=request.model_dump(mode="json"),
-                    headers=self._auth_headers(),
-                    timeout=timeout,
-                )
-            else:
-                resp = await self._http.post(
-                    f"{self.api_url}/api/v1/budgets/check",
-                    json=request.model_dump(mode="json"),
-                    headers=self._auth_headers(),
-                )
-            resp.raise_for_status()
+            # ── Phase 1: transport + HTTP status. Failures here are OUTAGE
+            # semantics — unchanged from before the split.
+            try:
+                if timeout is not None:
+                    resp = await self._http.post(
+                        f"{self.api_url}/api/v1/budgets/check",
+                        json=request.model_dump(mode="json"),
+                        headers=self._auth_headers(),
+                        timeout=timeout,
+                    )
+                else:
+                    resp = await self._http.post(
+                        f"{self.api_url}/api/v1/budgets/check",
+                        json=request.model_dump(mode="json"),
+                        headers=self._auth_headers(),
+                    )
+                resp.raise_for_status()
+            except Exception as exc:
+                # A read-only-key error means the control plane RESPONDED —
+                # record success. Anything else is an outage: record failure.
+                # Log the exception TYPE only (never a body).
+                if handle_read_only_key_error(exc):
+                    if breaker is not None:
+                        breaker.record_success()
+                else:
+                    if breaker is not None:
+                        breaker.record_failure()
+                    logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
+                return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
 
-            cloud_response = BudgetCheckResponse.model_validate(resp.json())
+            # ── Phase 2: response processing (R6). The plane RESPONDED 2xx;
+            # a body we cannot parse is server contract drift, NOT an outage:
+            # credit the breaker (drift must not open it), signal at ERROR
+            # with a distinct event, and degrade to the same posture ladder.
+            try:
+                cloud_response = BudgetCheckResponse.model_validate(resp.json())
+            except Exception as exc:
+                if breaker is not None:
+                    breaker.record_success()
+                logger.error(
+                    "budget.check_response_unreadable: %s — possible server "
+                    "contract drift; enforcement degraded (fail_open=%s)",
+                    type(exc).__name__,
+                    self.fail_open,
+                )
+                return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
+
             self._cache_response(cloud_response, agent_run_id=agent_run_id)
             if breaker is not None:
                 breaker.record_success()
             return self._build_result_from_response(cloud_response)
-
-        except Exception as exc:
-            # A read-only-key error means the control plane RESPONDED — record
-            # success. Anything else is an outage: record failure. Log the
-            # exception TYPE only (never interpolate a body that could carry
-            # response text).
-            if handle_read_only_key_error(exc):
-                if breaker is not None:
-                    breaker.record_success()
-            else:
-                if breaker is not None:
-                    breaker.record_failure()
-                logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
-
-            return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
         finally:
-            # Cancellation (or any BaseException) bypasses the handler above; a
-            # consumed HALF_OPEN probe slot must be freed or every later
-            # recovery probe is refused. No-op once a success/failure verdict
-            # has already released the slot.
+            # Cancellation (or any BaseException) bypasses the handlers above;
+            # a consumed HALF_OPEN probe slot must be freed or every later
+            # recovery probe is refused. No-op once a verdict released it.
             if breaker is not None:
                 breaker.release_probe(admission)
 
