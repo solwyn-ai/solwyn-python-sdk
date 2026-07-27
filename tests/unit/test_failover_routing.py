@@ -1242,6 +1242,8 @@ class TestCircuitBreakerLazyCreation:
         assert len({id(breaker) for breaker in breakers}) == 1
         assert len(created) == 1
 
+        _close(solwyn)
+
 
 @pytest.mark.unit
 class TestFailoverTuningSnapshot:
@@ -1364,6 +1366,4 @@ class TestFailoverTuningSnapshot:
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
         assert openai.chat.completions.create.call_count == 2
         assert result.choices[0].message.content == "ok from gpt"
-        _close(solwyn)
-
         _close(solwyn)
