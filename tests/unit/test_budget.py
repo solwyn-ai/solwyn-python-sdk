@@ -896,6 +896,80 @@ class TestBudgetCheckResult:
 # confirm POST + error accounting is covered by tests/unit/test_reporter.py.
 
 
+@pytest.mark.unit
+class TestContractDriftTaxonomy:
+    """R6: a 2xx body the SDK cannot parse is contract drift, not an outage."""
+
+    def _drifted_response(self) -> MagicMock:
+        response = MagicMock(spec=httpx.Response)
+        # Valid JSON, wrong shape: model_validate raises ValidationError.
+        response.json.return_value = {"totally": "unexpected"}
+        response.raise_for_status = MagicMock()
+        return response
+
+    def test_parse_error_records_breaker_success_not_failure(self) -> None:
+        breaker = MagicMock()
+        breaker.admit.return_value = None
+        enforcer = _make_enforcer(control_plane_breaker=breaker)
+
+        with patch.object(enforcer._http, "post", return_value=self._drifted_response()):
+            result = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+            )
+
+        assert result.allowed is True  # fail_open honored, same as today
+        breaker.record_success.assert_called_once()
+        breaker.record_failure.assert_not_called()
+
+    def test_transport_error_still_records_breaker_failure(self) -> None:
+        breaker = MagicMock()
+        breaker.admit.return_value = None
+        enforcer = _make_enforcer(control_plane_breaker=breaker)
+
+        with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
+            result = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+            )
+
+        assert result.allowed is True
+        breaker.record_failure.assert_called_once()
+        breaker.record_success.assert_not_called()
+
+    def test_parse_error_logs_distinct_error_event(self, caplog) -> None:
+        enforcer = _make_enforcer()
+        with (
+            patch.object(enforcer._http, "post", return_value=self._drifted_response()),
+            caplog.at_level("ERROR", logger="solwyn.budget"),
+        ):
+            enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
+        assert any("budget.check_response_unreadable" in r.message for r in caplog.records)
+
+    def test_json_decode_error_is_also_drift(self) -> None:
+        breaker = MagicMock()
+        breaker.admit.return_value = None
+        enforcer = _make_enforcer(control_plane_breaker=breaker)
+        response = MagicMock(spec=httpx.Response)
+        response.raise_for_status = MagicMock()
+        response.json.side_effect = ValueError("not json")
+
+        with patch.object(enforcer._http, "post", return_value=response):
+            result = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+            )
+
+        assert result.allowed is True
+        breaker.record_success.assert_called_once()
+
+    def test_parse_error_with_fail_open_false_enforces_locally(self) -> None:
+        enforcer = _make_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY)
+        with patch.object(enforcer._http, "post", return_value=self._drifted_response()):
+            result = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+            )
+        # Local-enforcement posture, unchanged shape from the outage path.
+        assert result.warning is not None
+
+
 def test_budget_check_result_is_pydantic_model() -> None:
     """BudgetCheckResult must be a Pydantic BaseModel, not a dataclass."""
     assert issubclass(BudgetCheckResult, BaseModel)
