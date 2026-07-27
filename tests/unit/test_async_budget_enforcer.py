@@ -574,3 +574,101 @@ class TestAsyncClose:
             await enforcer.close()
 
         mock_aclose.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Contract drift taxonomy (R6 async twin)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAsyncContractDriftTaxonomy:
+    """R6 async twin: a 2xx body the SDK cannot parse is contract drift, not an outage."""
+
+    def _drifted_response(self) -> MagicMock:
+        response = MagicMock(spec=httpx.Response)
+        # Valid JSON, wrong shape: model_validate raises ValidationError.
+        response.json.return_value = {"totally": "unexpected"}
+        response.raise_for_status = MagicMock()
+        return response
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_parse_error_records_breaker_success_not_failure(self) -> None:
+        breaker = MagicMock()
+        breaker.admit.return_value = None
+        enforcer = _make_async_enforcer(control_plane_breaker=breaker)
+
+        with patch.object(enforcer._http, "post", AsyncMock(return_value=self._drifted_response())):
+            result = await enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+            )
+
+        assert result.allowed is True  # fail_open honored, same as today
+        breaker.record_success.assert_called_once()
+        breaker.record_failure.assert_not_called()
+        breaker.release_probe.assert_called_once_with(None)
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_transport_error_still_records_breaker_failure(self) -> None:
+        breaker = MagicMock()
+        breaker.admit.return_value = None
+        enforcer = _make_async_enforcer(control_plane_breaker=breaker)
+
+        with patch.object(
+            enforcer._http, "post", AsyncMock(side_effect=httpx.ConnectError("unreachable"))
+        ):
+            result = await enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+            )
+
+        assert result.allowed is True
+        breaker.record_failure.assert_called_once()
+        breaker.record_success.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_parse_error_logs_distinct_error_event(self, caplog) -> None:
+        enforcer = _make_async_enforcer()
+        with (
+            patch.object(enforcer._http, "post", AsyncMock(return_value=self._drifted_response())),
+            caplog.at_level("ERROR", logger="solwyn.budget"),
+        ):
+            await enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+            )
+        assert any("budget.check_response_unreadable" in r.message for r in caplog.records)
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_json_decode_error_is_also_drift(self) -> None:
+        breaker = MagicMock()
+        breaker.admit.return_value = None
+        enforcer = _make_async_enforcer(control_plane_breaker=breaker)
+        response = MagicMock(spec=httpx.Response)
+        response.raise_for_status = MagicMock()
+        response.json.side_effect = ValueError("not json")
+
+        with patch.object(enforcer._http, "post", AsyncMock(return_value=response)):
+            result = await enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+            )
+
+        assert result.allowed is True
+        breaker.record_success.assert_called_once()
+        breaker.record_failure.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_parse_error_with_fail_open_false_enforces_locally(self) -> None:
+        enforcer = _make_async_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY)
+        with patch.object(enforcer._http, "post", AsyncMock(return_value=self._drifted_response())):
+            result = await enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+            )
+        # No prior cloud contact -> local enforcement fails closed, mirroring
+        # TestLocalEnforcement::test_denies_when_cloud_never_reached.
+        assert result.allowed is False
+        assert result.warning is not None
+        assert "no prior budget limit" in result.warning.lower()
