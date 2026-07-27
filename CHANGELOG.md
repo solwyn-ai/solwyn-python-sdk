@@ -405,6 +405,31 @@ derived from git tags (hatch-vcs).
   `failover_directive.failover_tuning_allowed`) are now verified against the
   live API by `tests/integration/test_live_contract.py`.
 
+### Reliability
+
+- **Post-success bookkeeping is now fail-soft.** Usage/region/tier extraction
+  in sync/async non-streaming and media success blocks, and region extraction
+  in streaming pre-wrapper and error-event paths, now degrade on adapter raise:
+  usage degrades to an estimate (`is_estimated=true`), while region/tier degrade
+  to `None` (omitted from wire) — instead of destroying the paid provider
+  response. (`_translation.normalize_response(...)` still raises loudly per
+  contract.) (R5).
+- **An UNMEASURABLE call settles its lease at the reserved bound.** When every
+  usage read for a call raises, the synthetic fallback carries the pre-flight
+  input estimate and no output at all. `build_confirm_request` now takes
+  `usage_unmeasured` (keyword-only, default `False`): the wire confirm is
+  unchanged — the honest `is_estimated=true` under-measure the cloud
+  reconciles — but the local `LeaseLedger.true_up` settles that call at its
+  reserved bound instead of crediting the untouched-looking output allowance
+  back. Refunding it would re-lend authority a paid response already consumed
+  and let later admissions exceed the run's hard token cap (R5).
+- **Budget check distinguishes unparseable 2xx bodies from transport outages.**
+  When Solwyn returns a 2xx status with an unreadable response body, it now
+  logs `budget.check_response_unreadable` at ERROR level and records breaker
+  success (server contract drift), distinct from transport-level failures that
+  record breaker failure. The distinction is implemented in both sync and async
+  enforcers (R6).
+
 ## [0.3.0] - 2026-07-16
 
 Run-scoped budget enforcement, explicit customer tags, and server-governed

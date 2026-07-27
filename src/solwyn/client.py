@@ -26,7 +26,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 import httpx
 from pydantic import ValidationError
@@ -193,6 +193,77 @@ def _lease_claim_token(budget: Any) -> int | None:
     """Return the exact local reservation capability, never a mock sentinel."""
     token = getattr(budget, "lease_claim_token", None)
     return token if isinstance(token, int) and not isinstance(token, bool) else None
+
+
+def _safe_extract_region(runtime: ProviderRuntime) -> str | None:
+    """Fail-soft region read (R5): bookkeeping must never raise into the caller."""
+    try:
+        return runtime.adapter.extract_region(runtime.sdk_client)
+    except Exception as exc:
+        logger.warning("settlement.extract_region_failed_fail_soft: %s", type(exc).__name__)
+        return None
+
+
+def _safe_extract_service_tier(runtime: ProviderRuntime, response: Any) -> str | None:
+    """Fail-soft tier read from the RAW served response (R5)."""
+    try:
+        return runtime.adapter.extract_service_tier(response)
+    except Exception as exc:
+        logger.warning("settlement.extract_service_tier_failed_fail_soft: %s", type(exc).__name__)
+        return None
+
+
+class _FailSoftUsage(NamedTuple):
+    """Settlement usage plus whether ANY of it was actually measured.
+
+    ``unmeasured`` is the synthetic bottom of the ladder: no adapter read
+    succeeded, so ``token_details`` is a pre-flight input estimate with no
+    output term. It is deliberately NOT a field on ``TokenDetails`` — that is
+    a wire model, and this distinction is local bookkeeping about the read,
+    not a new fact for the API to parse.
+    """
+
+    token_details: TokenDetails
+    unmeasured: bool
+
+
+def _extract_usage_fail_soft(
+    runtime: ProviderRuntime, response: Any, *, estimated_input_tokens: int
+) -> _FailSoftUsage:
+    """Usage for settlement, degrading to estimates instead of raising (R5).
+
+    Ladder: provider-reported usage -> adapter estimate -> synthetic
+    length-based estimate. An adapter raise on an unexpected response shape
+    must never destroy a paid, successful response — the worst case is
+    estimated spend telemetry (is_estimated=True), which the API already
+    prices distinctly.
+
+    The synthetic tier is flagged ``unmeasured``: it carries no output term at
+    all, so a lease-funded call must settle its local reservation at the
+    reserved bound rather than true it up to this under-measure.
+    """
+    token_details: TokenDetails | None = None
+    try:
+        token_details = runtime.adapter.extract_usage(response)
+    except Exception as exc:
+        logger.warning("settlement.extract_usage_failed_fail_soft: %s", type(exc).__name__)
+    # Explicit-degradation fallback (pre-existing semantics): a non-None
+    # estimate REPLACES the extracted details.
+    estimated: TokenDetails | None = None
+    try:
+        estimated = runtime.adapter.estimate_missing_usage(
+            response, estimated_input_tokens=estimated_input_tokens
+        )
+    except Exception as exc:
+        logger.warning("settlement.estimate_usage_failed_fail_soft: %s", type(exc).__name__)
+    if estimated is not None:
+        token_details = estimated
+    if token_details is None:
+        return _FailSoftUsage(
+            TokenDetails(input_tokens=estimated_input_tokens, output_tokens=0, is_estimated=True),
+            unmeasured=True,
+        )
+    return _FailSoftUsage(token_details, unmeasured=False)
 
 
 def _hop_connect_slice(deadline: Deadline, remaining_candidates: int) -> float:
@@ -1049,12 +1120,36 @@ class Solwyn(_SolwynBase):
         #    non-token MediaUsage basis. BOTH ride the confirm when observable —
         #    the server's pricing card unit picks (e.g. native gpt-image sends
         #    token usage with image buckets AND request-derived image quantities).
-        token_details = spec.extract_usage(response)
+        #
+        # Fail-soft bookkeeping (R5): the provider has answered — a surface-spec
+        # or adapter raise must not destroy the paid media response. Usage
+        # degrades to the request-derived measure, then to None; a None/None
+        # pair simply skips the confirm exactly as before.
+        token_details: TokenDetails | None = None
+        try:
+            token_details = spec.extract_usage(response)
+        except Exception as exc:
+            logger.warning(
+                "settlement.media_extract_usage_failed_fail_soft: %s",
+                type(exc).__name__,
+            )
         if token_details is None:
-            token_details = spec.measure_request(kwargs)
-        media_usage = (
-            spec.measure_media(kwargs, response) if spec.measure_media is not None else None
-        )
+            try:
+                token_details = spec.measure_request(kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "settlement.media_measure_request_failed_fail_soft: %s",
+                    type(exc).__name__,
+                )
+        media_usage = None
+        if spec.measure_media is not None:
+            try:
+                media_usage = spec.measure_media(kwargs, response)
+            except Exception as exc:
+                logger.warning(
+                    "settlement.media_measure_media_failed_fail_soft: %s",
+                    type(exc).__name__,
+                )
 
         # 6. Settle OFF the hot path: build the confirm sans-I/O and enqueue it
         #    with the metadata event as one ordered settlement (same path as
@@ -1062,7 +1157,7 @@ class Solwyn(_SolwynBase):
         #    skipped only when both are None (never settle a real $0 price).
         #    When only media is observed, a zeroed TokenDetails carries the
         #    confirm's required token field.
-        service_tier = runtime.adapter.extract_service_tier(response)
+        service_tier = _safe_extract_service_tier(runtime, response)
         confirm = None
         reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
         if (reservation_id or lease_id) and (token_details is not None or media_usage is not None):
@@ -1390,7 +1485,7 @@ class Solwyn(_SolwynBase):
                             call_id=call_id,
                             possibly_succeeded=True if possibly_succeeded else None,
                             agent_run=agent_run,
-                            provider_region=rt.adapter.extract_region(rt.sdk_client),
+                            provider_region=_safe_extract_region(rt),
                         )
                     )
                     if disp is Disposition.FAIL_FAST:
@@ -1450,24 +1545,18 @@ class Solwyn(_SolwynBase):
             # settles. Pure signal store — no I/O, no routing change here.
             self.record_latency(provider, ctx.elapsed_ms())
 
-            token_details = rt.adapter.extract_usage(response)
-            # Explicit-degradation fallback: a compat provider that omitted the
-            # usage block yields a length-based estimate (is_estimated=True)
-            # instead of silently recording zero spend. None when usage was
-            # present or the adapter always reports usage.
-            estimated_details = rt.adapter.estimate_missing_usage(
-                response, estimated_input_tokens=est_in
+            # Fail-soft bookkeeping (R5): a paid, successful response is never
+            # destroyed by extraction — usage degrades to estimates
+            # (is_estimated=True), region/tier degrade to None.
+            token_details, usage_unmeasured = _extract_usage_fail_soft(
+                rt, response, estimated_input_tokens=est_in
             )
-            if estimated_details is not None:
-                token_details = estimated_details
-            # Per-region pricing attribution: the SERVED runtime's endpoint
-            # region (None for providers without regional pricing).
-            provider_region = rt.adapter.extract_region(rt.sdk_client)
+            # Per-region pricing attribution: the SERVED runtime's endpoint region.
+            provider_region = _safe_extract_region(rt)
             # The tier echoed on the RAW served response is the billing ground
             # truth. Extracted ONCE: confirm and metadata for one call_id must
-            # carry the same tier or the enforcement counter and the durable
-            # tier-repriced cost diverge.
-            service_tier = rt.adapter.extract_service_tier(response)
+            # carry the same tier.
+            service_tier = _safe_extract_service_tier(rt, response)
             result = response
             if is_provider_fallback and rt.adapter.dialect != primary.adapter.dialect:
                 # Cross-DIALECT hop: reshape the served response back to the
@@ -1497,6 +1586,9 @@ class Solwyn(_SolwynBase):
                     call_id=call_id,
                     provider_region=provider_region,
                     service_tier=service_tier,
+                    # Nothing about this call's usage was measurable: settle the
+                    # local lease reservation at its bound, never below it.
+                    usage_unmeasured=usage_unmeasured,
                 )
             event = self._build_metadata_event(
                 model=served_model,
@@ -1571,9 +1663,11 @@ class Solwyn(_SolwynBase):
         accumulator = runtime.adapter.create_stream_accumulator(
             estimated_input_tokens=estimated_input_tokens
         )
+        # Accumulator construction is not fail-soft wrapped: it is a pure
+        # constructor with no response parsing or extraction to degrade.
         # Per-region pricing attribution for the SERVED runtime (None for
         # providers without regional pricing). Captured once, closed over.
-        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
+        provider_region = _safe_extract_region(runtime)
 
         def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             self._get_circuit_breaker(provider).record_success()
@@ -2093,18 +2187,42 @@ class AsyncSolwyn(_SolwynBase):
             raise
         latency_ms = (time.monotonic() - start) * 1000
 
-        token_details = spec.extract_usage(response)
+        # Fail-soft bookkeeping (R5): the provider has answered — a surface-spec
+        # or adapter raise must not destroy the paid media response. Usage
+        # degrades to the request-derived measure, then to None; a None/None
+        # pair simply skips the confirm exactly as before. Mirrors the sync
+        # ``_media_call``.
+        token_details: TokenDetails | None = None
+        try:
+            token_details = spec.extract_usage(response)
+        except Exception as exc:
+            logger.warning(
+                "settlement.media_extract_usage_failed_fail_soft: %s",
+                type(exc).__name__,
+            )
         if token_details is None:
-            token_details = spec.measure_request(kwargs)
-        media_usage = (
-            spec.measure_media(kwargs, response) if spec.measure_media is not None else None
-        )
+            try:
+                token_details = spec.measure_request(kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "settlement.media_measure_request_failed_fail_soft: %s",
+                    type(exc).__name__,
+                )
+        media_usage = None
+        if spec.measure_media is not None:
+            try:
+                media_usage = spec.measure_media(kwargs, response)
+            except Exception as exc:
+                logger.warning(
+                    "settlement.media_measure_media_failed_fail_soft: %s",
+                    type(exc).__name__,
+                )
 
         # Settle OFF the hot path: build the confirm sans-I/O and enqueue it
         # with the metadata event as one ordered settlement (same path as chat
         # + streaming). Confirm fires when EITHER basis is observable; skipped
         # only when both are None. See the sync mirror.
-        service_tier = runtime.adapter.extract_service_tier(response)
+        service_tier = _safe_extract_service_tier(runtime, response)
         confirm = None
         reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
         if (reservation_id or lease_id) and (token_details is not None or media_usage is not None):
@@ -2414,7 +2532,7 @@ class AsyncSolwyn(_SolwynBase):
                             call_id=call_id,
                             possibly_succeeded=True if possibly_succeeded else None,
                             agent_run=agent_run,
-                            provider_region=rt.adapter.extract_region(rt.sdk_client),
+                            provider_region=_safe_extract_region(rt),
                         )
                     )
                     if disp is Disposition.FAIL_FAST:
@@ -2470,22 +2588,17 @@ class AsyncSolwyn(_SolwynBase):
             # settles. Pure signal store — no I/O, no routing change here.
             self.record_latency(provider, ctx.elapsed_ms())
 
-            token_details = rt.adapter.extract_usage(response)
-            # Explicit-degradation fallback: a compat provider that omitted the
-            # usage block yields a length-based estimate (is_estimated=True)
-            # instead of silently recording zero spend. None when usage was
-            # present or the adapter always reports usage.
-            estimated_details = rt.adapter.estimate_missing_usage(
-                response, estimated_input_tokens=est_in
+            # Fail-soft bookkeeping (R5): a paid, successful response is never
+            # destroyed by extraction — usage degrades to estimates
+            # (is_estimated=True), region/tier degrade to None.
+            token_details, usage_unmeasured = _extract_usage_fail_soft(
+                rt, response, estimated_input_tokens=est_in
             )
-            if estimated_details is not None:
-                token_details = estimated_details
-            # Per-region pricing attribution: the SERVED runtime's endpoint
-            # region (None for providers without regional pricing).
-            provider_region = rt.adapter.extract_region(rt.sdk_client)
+            # Per-region pricing attribution: the SERVED runtime's endpoint region.
+            provider_region = _safe_extract_region(rt)
             # Extracted ONCE from the RAW served response — confirm and
             # metadata must carry the same tier (see the sync path).
-            service_tier = rt.adapter.extract_service_tier(response)
+            service_tier = _safe_extract_service_tier(rt, response)
             result = response
             if is_provider_fallback and rt.adapter.dialect != primary.adapter.dialect:
                 # Cross-DIALECT hop: reshape the served response back to the
@@ -2515,6 +2628,9 @@ class AsyncSolwyn(_SolwynBase):
                     call_id=call_id,
                     provider_region=provider_region,
                     service_tier=service_tier,
+                    # Nothing about this call's usage was measurable: settle the
+                    # local lease reservation at its bound, never below it.
+                    usage_unmeasured=usage_unmeasured,
                 )
             event = self._build_metadata_event(
                 model=served_model,
@@ -2587,9 +2703,11 @@ class AsyncSolwyn(_SolwynBase):
         accumulator = runtime.adapter.create_stream_accumulator(
             estimated_input_tokens=estimated_input_tokens
         )
+        # Accumulator construction is not fail-soft wrapped: it is a pure
+        # constructor with no response parsing or extraction to degrade.
         # Per-region pricing attribution for the SERVED runtime (None for
         # providers without regional pricing). Captured once, closed over.
-        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
+        provider_region = _safe_extract_region(runtime)
 
         async def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             self._get_circuit_breaker(provider).record_success()

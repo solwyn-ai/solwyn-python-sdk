@@ -749,12 +749,23 @@ class LeaseLedger:
         actual_tokens: int,
         *,
         claim_token: int | None,
+        floor_at_reservation: bool = False,
     ) -> None:
         """Settle a reservation against the call's ACTUAL token usage.
 
         Overshoot is applied in full and may drive the remainder negative:
         the next admission then sees an exhausted lease and follows the
         normal path (renew, or the outage ladder).
+
+        ``floor_at_reservation`` settles at the reserved bound instead, for a
+        call whose usage could NOT be measured at all (the fail-soft synthetic
+        tier: bookkeeping raised, so ``actual_tokens`` carries only the input
+        estimate and no output). Refunding that phantom underspend would hand
+        already-consumed output authority back to the lease and let later
+        admissions re-lend it past the run's hard token cap. An unmeasurable
+        call is charged what it was authorized to spend — the conservative
+        direction for a cap — and the cloud reconciles the durable cost from
+        the ``is_estimated`` confirm.
         """
         state, reservation = self._take_reservation(call_id, claim_token)
         if state is None or reservation is None:
@@ -763,6 +774,8 @@ class LeaseLedger:
             # The lease that funded this call is gone; its counters are dead.
             return
         actual = max(0, actual_tokens)
+        if floor_at_reservation:
+            actual = max(actual, reservation.tokens)
         delta = actual - reservation.tokens
         if reservation.pool is _Pool.GRANTED:
             state.granted_remaining_tokens -= delta

@@ -575,6 +575,44 @@ class TestReservationLifecycle:
         assert state.spent_tokens_since_report == 400
         assert state.reservations == {}
 
+    def test_unmeasurable_usage_settles_at_the_reserved_bound(self) -> None:
+        # R5 fail-soft: every usage read raised, so `actual` is the input
+        # estimate with NO output term. Trueing that up would refund the whole
+        # 500-token output allowance the paid response already consumed, and
+        # later admissions would re-lend it past the run's hard cap.
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+
+        ledger.true_up(
+            "a",
+            1_000,
+            claim_token=_claim_token(ledger, "a"),
+            floor_at_reservation=True,
+        )
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.granted_remaining_tokens == 100_000 - 1_500
+        assert state.spent_tokens_since_report == 1_500
+        assert state.reservations == {}
+
+    def test_the_floor_never_masks_a_measured_overshoot(self) -> None:
+        # The floor is a floor, not a clamp: a real overrun still lands in full.
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+
+        ledger.true_up(
+            "a",
+            9_000,
+            claim_token=_claim_token(ledger, "a"),
+            floor_at_reservation=True,
+        )
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.granted_remaining_tokens == 100_000 - 9_000
+        assert state.spent_tokens_since_report == 9_000
+
     def test_overshoot_drives_the_remainder_negative(self) -> None:
         # DoD 8 / spec §2: an uncapped call's overshoot is applied in FULL.
         ledger = _granted_ledger(granted_tokens=2_000)
