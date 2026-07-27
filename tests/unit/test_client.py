@@ -19,7 +19,7 @@ import solwyn as solwyn_pkg
 from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn._privacy import estimate_content_length
 from solwyn._types import BudgetMode, ProviderName
-from solwyn.client import Solwyn
+from solwyn.client import Solwyn, _build_hop_kwargs
 from solwyn.exceptions import BudgetExceededError, ProviderUnavailableError
 from solwyn.providers import get_adapter_for_client
 from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
@@ -99,6 +99,23 @@ def _allow_budget_result() -> SimpleNamespace:
     )
 
 
+def _fake_runtime(
+    *,
+    dialect: str = "anthropic",
+    name: str = "anthropic",
+    model: str = "claude-x",
+    defaults: dict[str, object] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        adapter=SimpleNamespace(dialect=dialect, name=name),
+        entry=SimpleNamespace(
+            model=model,
+            default_params=defaults or {},
+            provider=SimpleNamespace(value=name),
+        ),
+    )
+
+
 class _Status(Exception):
     """A duck-typed transport error carrying an HTTP status_code.
 
@@ -110,6 +127,65 @@ class _Status(Exception):
     def __init__(self, status_code: int, message: str = "boom") -> None:
         super().__init__(message)
         self.status_code = status_code
+
+
+# ---------------------------------------------------------------------------
+# Hop kwargs fast path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestBuildHopKwargsFastPath:
+    def test_primary_fast_path_returns_fresh_copy(self) -> None:
+        rt = _fake_runtime()
+        kwargs: dict[str, object] = {
+            "model": "claude-x",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        out = _build_hop_kwargs(
+            primary=rt,
+            rt=rt,
+            is_primary=True,
+            is_provider_fallback=False,
+            is_streaming=False,
+            global_defaults={},
+            kwargs=kwargs,
+        )
+        assert out == kwargs
+        assert out is not kwargs
+
+    def test_primary_openai_cap_key_still_normalizes(self) -> None:
+        rt = _fake_runtime(dialect="openai", name="openai", model="gpt-4o")
+        kwargs: dict[str, object] = {
+            "model": "gpt-4o",
+            "max_completion_tokens": 64,
+            "messages": [],
+        }
+        out = _build_hop_kwargs(
+            primary=rt,
+            rt=rt,
+            is_primary=True,
+            is_provider_fallback=False,
+            is_streaming=False,
+            global_defaults={},
+            kwargs=kwargs,
+        )
+        assert "max_completion_tokens" not in out
+        assert out["max_tokens"] == 64
+
+    def test_primary_with_defaults_still_merges(self) -> None:
+        rt = _fake_runtime(defaults={"temperature": 0.2})
+        kwargs: dict[str, object] = {"model": "claude-x", "messages": []}
+        out = _build_hop_kwargs(
+            primary=rt,
+            rt=rt,
+            is_primary=True,
+            is_provider_fallback=False,
+            is_streaming=False,
+            global_defaults={},
+            kwargs=kwargs,
+        )
+        assert out["temperature"] == 0.2
 
 
 # ---------------------------------------------------------------------------
