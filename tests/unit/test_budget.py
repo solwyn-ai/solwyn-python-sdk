@@ -15,6 +15,7 @@ from solwyn.budget import (
     BudgetEnforcer,
     _BudgetEnforcerBase,
 )
+from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerAdmission
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -901,15 +902,23 @@ class TestContractDriftTaxonomy:
     """R6: a 2xx body the SDK cannot parse is contract drift, not an outage."""
 
     def _drifted_response(self) -> MagicMock:
+        # spec=httpx.Response already supplies a non-raising raise_for_status;
+        # a 2xx that the SDK cannot PARSE is the shape under test.
         response = MagicMock(spec=httpx.Response)
         # Valid JSON, wrong shape: model_validate raises ValidationError.
         response.json.return_value = {"totally": "unexpected"}
-        response.raise_for_status = MagicMock()
         return response
 
+    def _breaker(self) -> MagicMock:
+        """A closed control-plane breaker double, constrained to the real API."""
+        breaker = MagicMock(spec=CircuitBreaker)
+        # What a CLOSED breaker actually returns — never None, and it owns no
+        # HALF_OPEN probe slot.
+        breaker.admit.return_value = CircuitBreakerAdmission(allowed=True)
+        return breaker
+
     def test_parse_error_records_breaker_success_not_failure(self) -> None:
-        breaker = MagicMock()
-        breaker.admit.return_value = None
+        breaker = self._breaker()
         enforcer = _make_enforcer(control_plane_breaker=breaker)
 
         with patch.object(enforcer._http, "post", return_value=self._drifted_response()):
@@ -920,11 +929,10 @@ class TestContractDriftTaxonomy:
         assert result.allowed is True  # fail_open honored, same as today
         breaker.record_success.assert_called_once()
         breaker.record_failure.assert_not_called()
-        breaker.release_probe.assert_called_once_with(None)
+        breaker.release_probe.assert_called_once_with(breaker.admit.return_value)
 
     def test_transport_error_still_records_breaker_failure(self) -> None:
-        breaker = MagicMock()
-        breaker.admit.return_value = None
+        breaker = self._breaker()
         enforcer = _make_enforcer(control_plane_breaker=breaker)
 
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
@@ -946,11 +954,9 @@ class TestContractDriftTaxonomy:
         assert any("budget.check_response_unreadable" in r.message for r in caplog.records)
 
     def test_json_decode_error_is_also_drift(self) -> None:
-        breaker = MagicMock()
-        breaker.admit.return_value = None
+        breaker = self._breaker()
         enforcer = _make_enforcer(control_plane_breaker=breaker)
         response = MagicMock(spec=httpx.Response)
-        response.raise_for_status = MagicMock()
         response.json.side_effect = ValueError("not json")
 
         with patch.object(enforcer._http, "post", return_value=response):
