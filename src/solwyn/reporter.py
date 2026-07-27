@@ -39,7 +39,13 @@ from solwyn._lifecycle import (
     register_sync_reporter,
 )
 from solwyn._read_only_key import handle_read_only_key_error
-from solwyn._types import BreakerStateReport, BudgetConfirmRequest, MetadataEvent, ProviderName
+from solwyn._types import (
+    BreakerStateReport,
+    BudgetConfirmRequest,
+    CircuitState,
+    MetadataEvent,
+    ProviderName,
+)
 from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
 
 logger = logging.getLogger(__name__)
@@ -131,6 +137,7 @@ class _ReporterBase:
         | None = None,
         sdk_instance_id: str | None = None,
         breaker_reporting_enabled: bool = True,
+        breaker_report_heartbeat: float = 60.0,
         control_plane_breaker: CircuitBreaker | None = None,
         max_send_attempts: int = 5,
         retry_backoff_base: float = 1.0,
@@ -158,6 +165,7 @@ class _ReporterBase:
         self._breaker_snapshots = breaker_snapshots
         self._sdk_instance_id = sdk_instance_id
         self._breaker_reporting_enabled = breaker_reporting_enabled
+        self._breaker_report_heartbeat = breaker_report_heartbeat
         # Shared with the budget enforcer's check path: a streak of confirm
         # failures opens this breaker so a known-down confirm is HELD (not
         # dropped) without paying the timeout. Never a provider — excluded from
@@ -165,6 +173,12 @@ class _ReporterBase:
         self._control_plane_breaker = control_plane_breaker
         self._breaker_project_id: str | None = None
         self._breaker_project_lock = threading.Lock()
+        self._breaker_report_lock = threading.Lock()
+        # provider -> (state, failure_count, success_count) of the last report
+        # that got a 2xx. Written on successful POST only, so a failed send
+        # keeps differing from its snapshot and self-retries next cycle.
+        self._breaker_last_sent: dict[str, tuple[CircuitState, int, int]] = {}
+        self._breaker_heartbeat_at = 0.0
 
         # Plain deques (NO maxlen): bounds are enforced by _enqueue_owned so an
         # overflow is COUNTED, not silently dropped by the deque itself. The
@@ -217,7 +231,9 @@ class _ReporterBase:
         with self._breaker_project_lock:
             return self._breaker_project_id
 
-    def _build_breaker_reports(self) -> list[tuple[str, BreakerStateReport]]:
+    def _build_breaker_reports(
+        self, *, force: bool = False
+    ) -> list[tuple[str, BreakerStateReport]]:
         """Eagerly build one timestamped current-state report cycle."""
         reports: list[tuple[str, BreakerStateReport]] = []
         project_id = self._breaker_reporting_project_id()
@@ -232,8 +248,17 @@ class _ReporterBase:
                 type(exc).__name__,
             )
             return reports
+        now = time.monotonic()
+        with self._breaker_report_lock:
+            heartbeat_due = now - self._breaker_heartbeat_at >= self._breaker_report_heartbeat
+            if force or heartbeat_due:
+                self._breaker_heartbeat_at = now
+            last_sent = dict(self._breaker_last_sent)
         for provider, snapshot in snapshots:
             try:
+                key = (snapshot.state, snapshot.failure_count, snapshot.success_count)
+                if not force and not heartbeat_due and last_sent.get(provider.value) == key:
+                    continue
                 reports.append(
                     (
                         project_id,
@@ -254,6 +279,24 @@ class _ReporterBase:
                     type(exc).__name__,
                 )
         return reports
+
+    def _breaker_reports_due(self) -> bool:
+        """Cheap pre-check so idle flush ticks never spawn a breaker cycle."""
+        if self._breaker_reporting_project_id() is None or self._breaker_snapshots is None:
+            return False
+        with self._breaker_report_lock:
+            if time.monotonic() - self._breaker_heartbeat_at >= self._breaker_report_heartbeat:
+                return True
+            last_sent = dict(self._breaker_last_sent)
+        try:
+            snapshots = self._breaker_snapshots()
+        except Exception:
+            return False
+        return any(
+            last_sent.get(provider.value)
+            != (snapshot.state, snapshot.failure_count, snapshot.success_count)
+            for provider, snapshot in snapshots
+        )
 
     # ------------------------------------------------------------------
     # Queueing + bounds
@@ -627,6 +670,7 @@ class MetadataReporter(_ReporterBase):
         | None = None,
         sdk_instance_id: str | None = None,
         breaker_reporting_enabled: bool = True,
+        breaker_report_heartbeat: float = 60.0,
         control_plane_breaker: CircuitBreaker | None = None,
         max_send_attempts: int = 5,
         retry_backoff_base: float = 1.0,
@@ -643,6 +687,7 @@ class MetadataReporter(_ReporterBase):
             breaker_snapshots=breaker_snapshots,
             sdk_instance_id=sdk_instance_id,
             breaker_reporting_enabled=breaker_reporting_enabled,
+            breaker_report_heartbeat=breaker_report_heartbeat,
             control_plane_breaker=control_plane_breaker,
             max_send_attempts=max_send_attempts,
             retry_backoff_base=retry_backoff_base,
@@ -709,6 +754,7 @@ class MetadataReporter(_ReporterBase):
         set — see below).
         """
         self._breaker_project_lock = threading.Lock()
+        self._breaker_report_lock = threading.Lock()
         self._drop_lock = threading.Lock()
         self._in_flight_lock = threading.Lock()
         self._breaker_worker_lock = threading.Lock()
@@ -749,8 +795,9 @@ class MetadataReporter(_ReporterBase):
         """
         budget = self.shutdown_deadline if timeout is None else timeout
         deadline = _monotonic() + budget
-        # Serialize shutdown with cadence-triggered breaker launches. If a
-        # breaker cycle is active now, it is adopted as the final cycle.
+        # Serialize shutdown with cadence-triggered breaker launches. An active
+        # cycle is drained first; shutdown then takes a distinct forced snapshot
+        # so a state-change-only cycle cannot stand in for the final full view.
         with self._breaker_worker_lock:
             active_breaker_worker = self._breaker_worker
             if active_breaker_worker is not None and not active_breaker_worker.is_alive():
@@ -764,12 +811,17 @@ class MetadataReporter(_ReporterBase):
         self._final_flush_bounded(deadline)
         self._seal_delivery()
 
-        if active_breaker_worker is None:
-            active_breaker_worker = self._start_breaker_cycle(
-                during_shutdown=True, deadline=deadline
-            )
         if active_breaker_worker is not None:
             active_breaker_worker.join(timeout=max(0.0, deadline - _monotonic()))
+        if active_breaker_worker is None or not self._deadline_expired(deadline):
+            final_breaker_worker = self._start_breaker_cycle(
+                during_shutdown=True, deadline=deadline, force=True
+            )
+            if final_breaker_worker is not None:
+                final_breaker_worker.join(timeout=max(0.0, deadline - _monotonic()))
+        # A worker still alive here consumed the absolute deadline. Preserve
+        # bounded shutdown by tearing down its stuck transport, as close() did
+        # before breaker state-change gating.
         self._http.close()
 
     def _final_flush_bounded(self, deadline: float) -> None:
@@ -819,7 +871,8 @@ class MetadataReporter(_ReporterBase):
                 # transport edge, a concurrent-close artifact): a dead flush
                 # thread strands ALL queued spend until overflow, silently.
                 logger.warning("reporter.flush_cycle_failed: exc_type=%s", type(exc).__name__)
-            self._start_breaker_cycle()
+            if self._breaker_reports_due():
+                self._start_breaker_cycle()
 
     def _flush_remaining(self, *, deadline: float | None = None, final: bool = False) -> None:
         """Flush queued confirms, settlements, then metadata events in batches.
@@ -1100,6 +1153,7 @@ class MetadataReporter(_ReporterBase):
         *,
         during_shutdown: bool = False,
         deadline: float | None = None,
+        force: bool = False,
     ) -> threading.Thread | None:
         """Start one tracked breaker cycle, or coalesce into the active one."""
         with self._breaker_worker_lock:
@@ -1110,7 +1164,7 @@ class MetadataReporter(_ReporterBase):
                 return worker
             worker = threading.Thread(
                 target=self._flush_breaker_reports,
-                kwargs={"deadline": deadline},
+                kwargs={"deadline": deadline, "force": force},
                 daemon=True,
                 name="solwyn-breaker-reporter",
             )
@@ -1118,14 +1172,14 @@ class MetadataReporter(_ReporterBase):
             worker.start()
             return worker
 
-    def _flush_breaker_reports(self, deadline: float | None = None) -> None:
+    def _flush_breaker_reports(self, deadline: float | None = None, *, force: bool = False) -> None:
         """POST current breaker snapshots independently and drop every failure.
 
         Bounded by the shared shutdown ``deadline`` when set: remaining providers
         are skipped once it is reached. Breaker snapshots are advisory — dropping
         them is fine and is NOT counted as a spend drop.
         """
-        for project_id, report in self._build_breaker_reports():
+        for project_id, report in self._build_breaker_reports(force=force):
             if self._deadline_expired(deadline):
                 return
             try:
@@ -1136,6 +1190,12 @@ class MetadataReporter(_ReporterBase):
                     timeout=self._send_timeout(deadline),
                 )
                 response.raise_for_status()
+                with self._breaker_report_lock:
+                    self._breaker_last_sent[report.provider.value] = (
+                        report.state,
+                        report.failure_count,
+                        report.success_count,
+                    )
             except Exception as exc:
                 if handle_read_only_key_error(exc):
                     # A read-only key denies every write: end the cycle instead
@@ -1296,6 +1356,7 @@ class AsyncMetadataReporter(_ReporterBase):
         | None = None,
         sdk_instance_id: str | None = None,
         breaker_reporting_enabled: bool = True,
+        breaker_report_heartbeat: float = 60.0,
         control_plane_breaker: CircuitBreaker | None = None,
         max_send_attempts: int = 5,
         retry_backoff_base: float = 1.0,
@@ -1312,6 +1373,7 @@ class AsyncMetadataReporter(_ReporterBase):
             breaker_snapshots=breaker_snapshots,
             sdk_instance_id=sdk_instance_id,
             breaker_reporting_enabled=breaker_reporting_enabled,
+            breaker_report_heartbeat=breaker_report_heartbeat,
             control_plane_breaker=control_plane_breaker,
             max_send_attempts=max_send_attempts,
             retry_backoff_base=retry_backoff_base,
@@ -1352,6 +1414,7 @@ class AsyncMetadataReporter(_ReporterBase):
         into the child by fork are deliberately KEPT: the server dedups.
         """
         self._breaker_project_lock = threading.Lock()
+        self._breaker_report_lock = threading.Lock()
         self._drop_lock = threading.Lock()
         self._ownership_lock = threading.Lock()
         self._in_flight = 0
@@ -1487,10 +1550,16 @@ class AsyncMetadataReporter(_ReporterBase):
         # cancelled close leaves delivery open for the lifecycle rescue paths.
         self._seal_delivery()
 
-        if active_breaker_task is None:
-            active_breaker_task = self._start_breaker_cycle(during_shutdown=True, deadline=deadline)
         if active_breaker_task is not None:
             await self._await_within(active_breaker_task, deadline)
+        if active_breaker_task is None or not self._deadline_expired(deadline):
+            final_breaker_task = self._start_breaker_cycle(
+                during_shutdown=True,
+                deadline=deadline,
+                force=True,
+            )
+            if final_breaker_task is not None:
+                await self._await_within(final_breaker_task, deadline)
         await self._http.aclose()
         # A COMPLETED close supersedes the exit-flush safety nets: drop the GC
         # finalizer so it can never double-flush drained queues, and tell the
@@ -1561,7 +1630,8 @@ class AsyncMetadataReporter(_ReporterBase):
                     # The flush task must survive anything a drain raises: a
                     # dead flush task strands ALL queued spend until overflow.
                     logger.warning("reporter.flush_cycle_failed: exc_type=%s", type(exc).__name__)
-                self._start_breaker_cycle()
+                if self._breaker_reports_due():
+                    self._start_breaker_cycle()
             else:
                 break
 
@@ -1739,6 +1809,7 @@ class AsyncMetadataReporter(_ReporterBase):
         *,
         during_shutdown: bool = False,
         deadline: float | None = None,
+        force: bool = False,
     ) -> asyncio.Task[None] | None:
         """Start one tracked breaker task, or coalesce into the active task."""
         if (
@@ -1751,19 +1822,21 @@ class AsyncMetadataReporter(_ReporterBase):
         if task is not None and not task.done():
             return task
         task = asyncio.create_task(
-            self._flush_breaker_reports(deadline=deadline),
+            self._flush_breaker_reports(deadline=deadline, force=force),
             name="solwyn-breaker-reporter",
         )
         self._breaker_task = task
         return task
 
-    async def _flush_breaker_reports(self, deadline: float | None = None) -> None:
+    async def _flush_breaker_reports(
+        self, deadline: float | None = None, *, force: bool = False
+    ) -> None:
         """POST current breaker snapshots independently and drop every failure.
 
         Bounded by the shared shutdown ``deadline`` when set (advisory snapshots
         are dropped, not counted as spend).
         """
-        for project_id, report in self._build_breaker_reports():
+        for project_id, report in self._build_breaker_reports(force=force):
             if self._deadline_expired(deadline):
                 return
             try:
@@ -1774,6 +1847,12 @@ class AsyncMetadataReporter(_ReporterBase):
                     timeout=self._send_timeout(deadline),
                 )
                 response.raise_for_status()
+                with self._breaker_report_lock:
+                    self._breaker_last_sent[report.provider.value] = (
+                        report.state,
+                        report.failure_count,
+                        report.success_count,
+                    )
             except Exception as exc:
                 if handle_read_only_key_error(exc):
                     # A read-only key denies every write: end the cycle instead

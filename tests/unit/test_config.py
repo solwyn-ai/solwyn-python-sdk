@@ -355,6 +355,34 @@ class TestReporterRetryConfig:
                 reporter_max_queue_size=0,
             )
 
+    def test_breaker_report_heartbeat_defaults_to_sixty_seconds(self) -> None:
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+        )
+
+        assert config.breaker_report_heartbeat == 60.0
+
+    def test_breaker_report_heartbeat_loads_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.setenv("SOLWYN_BREAKER_REPORT_HEARTBEAT", "12.5")
+
+        solwyn = _make_solwyn(_mock_openai_client())
+
+        assert solwyn._config.breaker_report_heartbeat == 12.5
+        assert solwyn._reporter._breaker_report_heartbeat == 12.5
+
+        solwyn.close()
+
+    def test_breaker_report_heartbeat_must_be_positive(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            SolwynConfig(
+                api_key=VALID_API_KEY,
+                providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+                breaker_report_heartbeat=0,
+            )
+        assert exc_info.value.errors()[0]["type"] == "greater_than"
+
 
 @pytest.mark.unit
 class TestConfigurationErrorFromBadCredentials:
@@ -454,6 +482,20 @@ class TestAsyncSolwynConstructors:
 
         assert solwyn._config.api_key == VALID_API_KEY
         assert not hasattr(solwyn._config, "project_id")
+
+        await solwyn.close()
+
+    @pytest.mark.asyncio
+    async def test_async_client_wires_breaker_report_heartbeat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.setenv("SOLWYN_BREAKER_REPORT_HEARTBEAT", "12.5")
+
+        solwyn = _make_async_solwyn(_mock_openai_client())
+
+        assert solwyn._config.breaker_report_heartbeat == 12.5
+        assert solwyn._reporter._breaker_report_heartbeat == 12.5
 
         await solwyn.close()
 
