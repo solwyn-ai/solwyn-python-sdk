@@ -40,7 +40,6 @@ from solwyn._types import (
 )
 from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
 from solwyn.config import SolwynConfig
-from solwyn.tokenizer import TokenizerManager
 
 if TYPE_CHECKING:
     from solwyn._registry import ProviderRuntime
@@ -526,7 +525,6 @@ class _SolwynBase:
     """Shared sans-I/O base class for Solwyn sync and async clients.
 
     Provides:
-    - Token estimation seam (via TokenizerManager)
     - Metadata event construction
     - Circuit breaker management and pure candidate selection
     - SDK instance identity
@@ -545,7 +543,6 @@ class _SolwynBase:
         }
         self._failover_tuning_suppression_logged = False
         self._sdk_instance_id = str(uuid.uuid4())
-        self._tokenizer = TokenizerManager()
         # Injectable routing policy: defaults to the health-only policy.
         # Swapping in LatencyPolicy/CostPolicy reorders candidates with ZERO
         # changes to dispatch / translation / budget.

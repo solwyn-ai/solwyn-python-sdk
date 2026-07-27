@@ -15,7 +15,7 @@ Solwyn wraps your existing LLM client. Calls go directly to the provider — the
 pip install solwyn
 ```
 
-Optional extras pin tested provider-SDK floors — `solwyn[openai]` (also enables tiktoken-based token estimation), `solwyn[anthropic]`, `solwyn[google]`, `solwyn[bedrock]` (convenience only — the SDK never imports boto3), `solwyn[together]` (Together SDK 2.0+), or `solwyn[all]`:
+Optional extras pin tested provider-SDK floors — `solwyn[openai]`, `solwyn[anthropic]`, `solwyn[google]`, `solwyn[bedrock]` (convenience only — the SDK never imports boto3), `solwyn[together]` (Together SDK 2.0+), or `solwyn[all]`:
 
 ```sh
 pip install solwyn[openai]
