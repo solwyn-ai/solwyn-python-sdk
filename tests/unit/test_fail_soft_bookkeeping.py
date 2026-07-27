@@ -1,17 +1,25 @@
 """R5: post-success bookkeeping must never destroy a paid response.
 
-Helper-level tests. End-to-end coverage (response survives an adapter raise)
-lives in the settlement-parity-style tests added by the next task.
+Helper-level tests, plus end-to-end coverage that a paid, successful response
+still reaches the caller (and still settles, with degraded usage) when the
+sync or async non-streaming success block's adapter bookkeeping raises.
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+import json
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, make_mock_client
 
 from solwyn._token_details import TokenDetails
 from solwyn.client import (
+    AsyncSolwyn,
+    Solwyn,
     _extract_usage_fail_soft,
     _safe_extract_region,
     _safe_extract_service_tier,
@@ -33,9 +41,7 @@ class TestExtractUsageFailSoft:
         adapter.extract_usage.return_value = reported
         adapter.estimate_missing_usage.return_value = None
 
-        result = _extract_usage_fail_soft(
-            _runtime(adapter), object(), estimated_input_tokens=99
-        )
+        result = _extract_usage_fail_soft(_runtime(adapter), object(), estimated_input_tokens=99)
 
         assert result is reported
         assert result.is_estimated is False
@@ -48,9 +54,7 @@ class TestExtractUsageFailSoft:
         estimated = TokenDetails(input_tokens=99, output_tokens=0, is_estimated=True)
         adapter.estimate_missing_usage.return_value = estimated
 
-        result = _extract_usage_fail_soft(
-            _runtime(adapter), object(), estimated_input_tokens=99
-        )
+        result = _extract_usage_fail_soft(_runtime(adapter), object(), estimated_input_tokens=99)
 
         assert result is estimated
 
@@ -60,9 +64,7 @@ class TestExtractUsageFailSoft:
         estimated = TokenDetails(input_tokens=42, is_estimated=True)
         adapter.estimate_missing_usage.return_value = estimated
 
-        result = _extract_usage_fail_soft(
-            _runtime(adapter), object(), estimated_input_tokens=42
-        )
+        result = _extract_usage_fail_soft(_runtime(adapter), object(), estimated_input_tokens=42)
 
         assert result is estimated
 
@@ -71,9 +73,7 @@ class TestExtractUsageFailSoft:
         adapter.extract_usage.side_effect = RuntimeError("boom")
         adapter.estimate_missing_usage.side_effect = ValueError("boom too")
 
-        result = _extract_usage_fail_soft(
-            _runtime(adapter), object(), estimated_input_tokens=123
-        )
+        result = _extract_usage_fail_soft(_runtime(adapter), object(), estimated_input_tokens=123)
 
         assert result.input_tokens == 123
         assert result.output_tokens == 0
@@ -84,9 +84,7 @@ class TestExtractUsageFailSoft:
         adapter.extract_usage.side_effect = RuntimeError("boom")
         adapter.estimate_missing_usage.return_value = None
 
-        result = _extract_usage_fail_soft(
-            _runtime(adapter), object(), estimated_input_tokens=7
-        )
+        result = _extract_usage_fail_soft(_runtime(adapter), object(), estimated_input_tokens=7)
 
         assert result.input_tokens == 7
         assert result.is_estimated is True
@@ -113,3 +111,151 @@ class TestSafeExtractRegionAndTier:
         adapter = MagicMock()
         adapter.extract_service_tier.return_value = "priority"
         assert _safe_extract_service_tier(_runtime(adapter), object()) == "priority"
+
+
+# --- End-to-end harness, duplicated from tests/unit/test_settlement_parity.py ---
+#
+# Copied rather than imported: these are private test-module fixtures, not a
+# shared library. Duplication here documents that this suite's assertions
+# stand on their own without a cross-test-module dependency.
+
+
+class _ControlPlaneRecorder:
+    """Record control-plane traffic at the HTTP transport boundary.
+
+    Serves ``/budgets/check`` (allow, with this recorder's ``reservation_id``),
+    ``/budgets/confirm``, ``/metadata/ingest``, and breaker reports; every
+    request lands in ``requests`` as an ordered ``(path, body)`` pair.
+    """
+
+    def __init__(self, *, reservation_id: str | None = "res_123") -> None:
+        self.reservation_id = reservation_id
+        self.requests: list[tuple[str, Any]] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        body = json.loads(request.content) if request.content else None
+        self.requests.append((path, body))
+        if path.endswith("/budgets/check"):
+            return httpx.Response(
+                200, json={**ALLOW_BUDGET_RESPONSE, "reservation_id": self.reservation_id}
+            )
+        if path.endswith("/budgets/confirm"):
+            return httpx.Response(200, json={"status": "confirmed"})
+        if path.endswith("/metadata/ingest"):
+            return httpx.Response(202, json={"rejected": []})
+        if path.endswith("/breaker-reports"):
+            return httpx.Response(202, json={})
+        return httpx.Response(404, json={})
+
+    def client(self) -> httpx.Client:
+        return httpx.Client(transport=httpx.MockTransport(self.handler), timeout=5.0)
+
+    def aclient(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(self.handler), timeout=5.0)
+
+    @property
+    def confirms(self) -> list[dict[str, Any]]:
+        return [body for path, body in self.requests if path.endswith("/budgets/confirm")]
+
+    @property
+    def events(self) -> list[dict[str, Any]]:
+        return [
+            event
+            for path, body in self.requests
+            if path.endswith("/metadata/ingest")
+            for event in body
+        ]
+
+
+def _openai_response() -> SimpleNamespace:
+    message = SimpleNamespace(role="assistant", content="ok", tool_calls=None)
+    choice = SimpleNamespace(index=0, message=message, finish_reason="stop")
+    return SimpleNamespace(
+        choices=[choice],
+        model="gpt-5.5",
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+    )
+
+
+def _make_solwyn(client: object, recorder: _ControlPlaneRecorder) -> Solwyn:
+    solwyn = Solwyn(client, api_key=VALID_API_KEY, model="gpt-5.5")
+    solwyn._budget._http.close()
+    solwyn._budget._http = recorder.client()
+    solwyn._reporter._http.close()
+    solwyn._reporter._http = recorder.client()
+    return solwyn
+
+
+async def _make_async_solwyn(client: object, recorder: _ControlPlaneRecorder) -> AsyncSolwyn:
+    solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, model="gpt-5.5")
+    await solwyn._budget._http.aclose()
+    solwyn._budget._http = recorder.aclient()
+    await solwyn._reporter._http.aclose()
+    solwyn._reporter._http = recorder.aclient()
+    return solwyn
+
+
+_PLAIN_REQUEST = {
+    "model": "gpt-5.5",
+    "messages": [{"role": "user", "content": "hi"}],
+}
+
+
+@pytest.mark.unit
+class TestPaidResponseSurvivesBookkeepingFailure:
+    def test_sync_extract_usage_raise_returns_response_and_settles_estimated(
+        self,
+    ) -> None:
+        client = make_mock_client()
+        client.chat.completions.create.return_value = _openai_response()
+        recorder = _ControlPlaneRecorder()
+        solwyn = _make_solwyn(client, recorder)
+        adapter = solwyn._runtimes[0].adapter
+
+        with patch.object(type(adapter), "extract_usage", side_effect=RuntimeError("shape drift")):
+            response = solwyn.chat.completions.create(**_PLAIN_REQUEST)
+            # The paid response reached the caller — R5's core assertion.
+            assert response.choices[0].message.content == "ok"
+        solwyn.close()  # drain the settlement queue to the wire
+
+        # Settlement still happened, with degraded (estimated) usage.
+        assert len(recorder.confirms) == 1
+        success_events = [e for e in recorder.events if e["status"] == "success"]
+        assert len(success_events) == 1
+        assert success_events[0]["token_details"]["is_estimated"] is True
+
+    def test_sync_tier_and_region_raise_settle_with_none(self) -> None:
+        client = make_mock_client()
+        client.chat.completions.create.return_value = _openai_response()
+        recorder = _ControlPlaneRecorder()
+        solwyn = _make_solwyn(client, recorder)
+        adapter = solwyn._runtimes[0].adapter
+
+        with (
+            patch.object(type(adapter), "extract_service_tier", side_effect=KeyError("tier")),
+            patch.object(type(adapter), "extract_region", side_effect=AttributeError("region")),
+        ):
+            response = solwyn.chat.completions.create(**_PLAIN_REQUEST)
+            assert response.choices[0].message.content == "ok"
+        solwyn.close()
+
+        assert len(recorder.confirms) == 1  # reservation NOT leaked
+
+    async def test_async_extract_usage_raise_returns_response_and_settles(
+        self,
+    ) -> None:
+        client = make_mock_client(name="AsyncOpenAI")
+        client.chat.completions.create = AsyncMock(return_value=_openai_response())
+        recorder = _ControlPlaneRecorder()
+        solwyn = await _make_async_solwyn(client, recorder)
+        adapter = solwyn._runtimes[0].adapter
+
+        with patch.object(type(adapter), "extract_usage", side_effect=RuntimeError("shape drift")):
+            response = await solwyn.chat.completions.create(**_PLAIN_REQUEST)
+            assert response.choices[0].message.content == "ok"
+        await solwyn.close()
+
+        assert len(recorder.confirms) == 1
+        success_events = [e for e in recorder.events if e["status"] == "success"]
+        assert success_events[0]["token_details"]["is_estimated"] is True

@@ -199,9 +199,7 @@ def _safe_extract_region(runtime: ProviderRuntime) -> str | None:
     try:
         return runtime.adapter.extract_region(runtime.sdk_client)
     except Exception as exc:
-        logger.warning(
-            "settlement.extract_region_failed_fail_soft: %s", type(exc).__name__
-        )
+        logger.warning("settlement.extract_region_failed_fail_soft: %s", type(exc).__name__)
         return None
 
 
@@ -210,9 +208,7 @@ def _safe_extract_service_tier(runtime: ProviderRuntime, response: Any) -> str |
     try:
         return runtime.adapter.extract_service_tier(response)
     except Exception as exc:
-        logger.warning(
-            "settlement.extract_service_tier_failed_fail_soft: %s", type(exc).__name__
-        )
+        logger.warning("settlement.extract_service_tier_failed_fail_soft: %s", type(exc).__name__)
         return None
 
 
@@ -231,9 +227,7 @@ def _extract_usage_fail_soft(
     try:
         token_details = runtime.adapter.extract_usage(response)
     except Exception as exc:
-        logger.warning(
-            "settlement.extract_usage_failed_fail_soft: %s", type(exc).__name__
-        )
+        logger.warning("settlement.extract_usage_failed_fail_soft: %s", type(exc).__name__)
     # Explicit-degradation fallback (pre-existing semantics): a non-None
     # estimate REPLACES the extracted details.
     estimated: TokenDetails | None = None
@@ -242,9 +236,7 @@ def _extract_usage_fail_soft(
             response, estimated_input_tokens=estimated_input_tokens
         )
     except Exception as exc:
-        logger.warning(
-            "settlement.estimate_usage_failed_fail_soft: %s", type(exc).__name__
-        )
+        logger.warning("settlement.estimate_usage_failed_fail_soft: %s", type(exc).__name__)
     if estimated is not None:
         token_details = estimated
     if token_details is None:
@@ -1450,24 +1442,16 @@ class Solwyn(_SolwynBase):
             # settles. Pure signal store — no I/O, no routing change here.
             self.record_latency(provider, ctx.elapsed_ms())
 
-            token_details = rt.adapter.extract_usage(response)
-            # Explicit-degradation fallback: a compat provider that omitted the
-            # usage block yields a length-based estimate (is_estimated=True)
-            # instead of silently recording zero spend. None when usage was
-            # present or the adapter always reports usage.
-            estimated_details = rt.adapter.estimate_missing_usage(
-                response, estimated_input_tokens=est_in
-            )
-            if estimated_details is not None:
-                token_details = estimated_details
-            # Per-region pricing attribution: the SERVED runtime's endpoint
-            # region (None for providers without regional pricing).
-            provider_region = rt.adapter.extract_region(rt.sdk_client)
+            # Fail-soft bookkeeping (R5): a paid, successful response is never
+            # destroyed by extraction — usage degrades to estimates
+            # (is_estimated=True), region/tier degrade to None.
+            token_details = _extract_usage_fail_soft(rt, response, estimated_input_tokens=est_in)
+            # Per-region pricing attribution: the SERVED runtime's endpoint region.
+            provider_region = _safe_extract_region(rt)
             # The tier echoed on the RAW served response is the billing ground
             # truth. Extracted ONCE: confirm and metadata for one call_id must
-            # carry the same tier or the enforcement counter and the durable
-            # tier-repriced cost diverge.
-            service_tier = rt.adapter.extract_service_tier(response)
+            # carry the same tier.
+            service_tier = _safe_extract_service_tier(rt, response)
             result = response
             if is_provider_fallback and rt.adapter.dialect != primary.adapter.dialect:
                 # Cross-DIALECT hop: reshape the served response back to the
@@ -2436,22 +2420,15 @@ class AsyncSolwyn(_SolwynBase):
             # settles. Pure signal store — no I/O, no routing change here.
             self.record_latency(provider, ctx.elapsed_ms())
 
-            token_details = rt.adapter.extract_usage(response)
-            # Explicit-degradation fallback: a compat provider that omitted the
-            # usage block yields a length-based estimate (is_estimated=True)
-            # instead of silently recording zero spend. None when usage was
-            # present or the adapter always reports usage.
-            estimated_details = rt.adapter.estimate_missing_usage(
-                response, estimated_input_tokens=est_in
-            )
-            if estimated_details is not None:
-                token_details = estimated_details
-            # Per-region pricing attribution: the SERVED runtime's endpoint
-            # region (None for providers without regional pricing).
-            provider_region = rt.adapter.extract_region(rt.sdk_client)
+            # Fail-soft bookkeeping (R5): a paid, successful response is never
+            # destroyed by extraction — usage degrades to estimates
+            # (is_estimated=True), region/tier degrade to None.
+            token_details = _extract_usage_fail_soft(rt, response, estimated_input_tokens=est_in)
+            # Per-region pricing attribution: the SERVED runtime's endpoint region.
+            provider_region = _safe_extract_region(rt)
             # Extracted ONCE from the RAW served response — confirm and
             # metadata must carry the same tier (see the sync path).
-            service_tier = rt.adapter.extract_service_tier(response)
+            service_tier = _safe_extract_service_tier(rt, response)
             result = response
             if is_provider_fallback and rt.adapter.dialect != primary.adapter.dialect:
                 # Cross-DIALECT hop: reshape the served response back to the
