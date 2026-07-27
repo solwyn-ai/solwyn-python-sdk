@@ -3,6 +3,10 @@
 Helper-level tests, plus end-to-end coverage that a paid, successful response
 still reaches the caller (and still settles, with degraded usage) when the
 sync or async non-streaming success block's adapter bookkeeping raises.
+
+Degrading must not weaken enforcement either: a lease-funded call whose usage
+was never measurable settles at its reserved bound rather than handing back
+output authority the paid response already consumed.
 """
 
 from __future__ import annotations
@@ -14,10 +18,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, make_mock_client
+from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID, make_mock_client
 
+import solwyn as solwyn_pkg
 from solwyn._base import MediaSurfaceSpec
+from solwyn._registry import ProviderRuntime
 from solwyn._token_details import TokenDetails
+from solwyn._types import ProviderEntry, ProviderName
 from solwyn.client import (
     AsyncSolwyn,
     Solwyn,
@@ -25,91 +32,108 @@ from solwyn.client import (
     _safe_extract_region,
     _safe_extract_service_tier,
 )
+from solwyn.providers._protocol import ProviderAdapter
 
 
-def _runtime(adapter: MagicMock) -> MagicMock:
-    rt = MagicMock()
-    rt.adapter = adapter
-    rt.sdk_client = MagicMock()
-    return rt
+def _adapter() -> MagicMock:
+    """An adapter double constrained to the real ProviderAdapter interface."""
+    return MagicMock(spec=ProviderAdapter)
+
+
+def _runtime(adapter: MagicMock) -> ProviderRuntime:
+    """A REAL ProviderRuntime — only the adapter and SDK client are doubles."""
+    return ProviderRuntime(
+        entry=ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5"),
+        sdk_client=make_mock_client(),
+        adapter=adapter,
+    )
 
 
 @pytest.mark.unit
 class TestExtractUsageFailSoft:
     def test_provider_reported_usage_passes_through(self) -> None:
-        adapter = MagicMock()
+        adapter = _adapter()
         reported = TokenDetails(input_tokens=10, output_tokens=5)
         adapter.extract_usage.return_value = reported
         adapter.estimate_missing_usage.return_value = None
 
         result = _extract_usage_fail_soft(_runtime(adapter), object(), estimated_input_tokens=99)
 
-        assert result is reported
-        assert result.is_estimated is False
+        assert result.token_details is reported
+        assert result.token_details.is_estimated is False
+        assert result.unmeasured is False
 
     def test_adapter_estimate_preferred_when_present(self) -> None:
         # Mirrors the existing inline behavior: a non-None estimate REPLACES
         # the extracted details (compat provider omitted its usage block).
-        adapter = MagicMock()
+        adapter = _adapter()
         adapter.extract_usage.return_value = TokenDetails()
         estimated = TokenDetails(input_tokens=99, output_tokens=0, is_estimated=True)
         adapter.estimate_missing_usage.return_value = estimated
 
         result = _extract_usage_fail_soft(_runtime(adapter), object(), estimated_input_tokens=99)
 
-        assert result is estimated
+        assert result.token_details is estimated
+        # An ADAPTER estimate is a real measurement of the response — the lease
+        # trues up against it normally.
+        assert result.unmeasured is False
 
     def test_extract_usage_raise_degrades_to_adapter_estimate(self) -> None:
-        adapter = MagicMock()
+        adapter = _adapter()
         adapter.extract_usage.side_effect = RuntimeError("unexpected shape")
         estimated = TokenDetails(input_tokens=42, is_estimated=True)
         adapter.estimate_missing_usage.return_value = estimated
 
         result = _extract_usage_fail_soft(_runtime(adapter), object(), estimated_input_tokens=42)
 
-        assert result is estimated
+        assert result.token_details is estimated
+        assert result.unmeasured is False
 
     def test_both_raises_degrade_to_synthetic_estimate(self) -> None:
-        adapter = MagicMock()
+        adapter = _adapter()
         adapter.extract_usage.side_effect = RuntimeError("boom")
         adapter.estimate_missing_usage.side_effect = ValueError("boom too")
 
         result = _extract_usage_fail_soft(_runtime(adapter), object(), estimated_input_tokens=123)
 
-        assert result.input_tokens == 123
-        assert result.output_tokens == 0
-        assert result.is_estimated is True
+        assert result.token_details.input_tokens == 123
+        assert result.token_details.output_tokens == 0
+        assert result.token_details.is_estimated is True
+        # Nothing was measured — the flag that keeps a lease from re-lending
+        # the output allowance this response already consumed.
+        assert result.unmeasured is True
 
     def test_raise_then_none_estimate_degrades_to_synthetic(self) -> None:
-        adapter = MagicMock()
+        adapter = _adapter()
         adapter.extract_usage.side_effect = RuntimeError("boom")
         adapter.estimate_missing_usage.return_value = None
 
         result = _extract_usage_fail_soft(_runtime(adapter), object(), estimated_input_tokens=7)
 
-        assert result.input_tokens == 7
-        assert result.is_estimated is True
+        assert result.token_details.input_tokens == 7
+        assert result.token_details.is_estimated is True
+        assert result.unmeasured is True
 
 
 @pytest.mark.unit
 class TestSafeExtractRegionAndTier:
     def test_region_raise_degrades_to_none(self) -> None:
-        adapter = MagicMock()
+        adapter = _adapter()
         adapter.extract_region.side_effect = AttributeError("no client attr")
         assert _safe_extract_region(_runtime(adapter)) is None
 
     def test_region_passthrough(self) -> None:
-        adapter = MagicMock()
+        adapter = _adapter()
         adapter.extract_region.return_value = "us-east-1"
         assert _safe_extract_region(_runtime(adapter)) == "us-east-1"
 
     def test_tier_raise_degrades_to_none(self) -> None:
-        adapter = MagicMock()
+        adapter = _adapter()
         adapter.extract_service_tier.side_effect = KeyError("service_tier")
         assert _safe_extract_service_tier(_runtime(adapter), object()) is None
 
     def test_tier_passthrough(self) -> None:
-        adapter = MagicMock()
+        adapter = _adapter()
         adapter.extract_service_tier.return_value = "priority"
         assert _safe_extract_service_tier(_runtime(adapter), object()) == "priority"
 
@@ -121,12 +145,41 @@ class TestSafeExtractRegionAndTier:
 # stand on their own without a cross-test-module dependency.
 
 
+_GRANTED_TOKENS = 100_000
+
+# The declared per-call output cap: also the lease reserve's output half, so
+# the lease-funded assertions below can name the exact bound at stake.
+_OUTPUT_BOUND = 256
+
+
+def _grant_payload() -> dict[str, Any]:
+    """An eligible, allowed lease grant with room to spare (PJ-2 shape)."""
+    return {
+        "eligible": True,
+        "allowed": True,
+        "lease_id": "lease_1",
+        "generation": 1,
+        "granted_tokens": _GRANTED_TOKENS,
+        "refresh_interval_s": 300.0,
+        "lease_length_s": 600.0,
+        "headroom_share_tokens": 50_000,
+        "posture": {"mode": "alert_only", "on_unreachable": "fail_open"},
+        "final_grant": False,
+        "project_id": VALID_PROJECT_ID,
+        "mode": "alert_only",
+        "budget_limit": 100.0,
+        "current_usage": 20.0,
+        "remaining_budget": 80.0,
+    }
+
+
 class _ControlPlaneRecorder:
     """Record control-plane traffic at the HTTP transport boundary.
 
     Serves ``/budgets/check`` (allow, with this recorder's ``reservation_id``),
-    ``/budgets/confirm``, ``/metadata/ingest``, and breaker reports; every
-    request lands in ``requests`` as an ordered ``(path, body)`` pair.
+    the ``/budgets/lease`` grant + surrender pair, ``/budgets/confirm``,
+    ``/metadata/ingest``, and breaker reports; every request lands in
+    ``requests`` as an ordered ``(path, body)`` pair.
     """
 
     def __init__(self, *, reservation_id: str | None = "res_123") -> None:
@@ -141,6 +194,10 @@ class _ControlPlaneRecorder:
             return httpx.Response(
                 200, json={**ALLOW_BUDGET_RESPONSE, "reservation_id": self.reservation_id}
             )
+        if path.endswith("/budgets/lease"):
+            return httpx.Response(200, json=_grant_payload())
+        if path.endswith("/budgets/lease/surrender"):
+            return httpx.Response(200, json={})
         if path.endswith("/budgets/confirm"):
             return httpx.Response(200, json={"status": "confirmed"})
         if path.endswith("/metadata/ingest"):
@@ -289,6 +346,124 @@ class TestPaidResponseSurvivesBookkeepingFailure:
         assert len(recorder.confirms) == 1
         success_events = [e for e in recorder.events if e["status"] == "success"]
         assert success_events[0]["token_details"]["is_estimated"] is True
+
+
+@pytest.mark.unit
+class TestLeaseFundedUnmeasurableCall:
+    """A call whose usage was never measurable must not refund its allowance.
+
+    The fail-soft synthetic tier reports the pre-flight INPUT estimate and no
+    output at all. Trued up naively, that hands a lease back the entire output
+    reservation a paid response already consumed, and later admissions re-lend
+    already-spent authority past the run's hard token cap. The local
+    reservation settles at its bound instead; the wire confirm keeps the honest
+    ``is_estimated`` under-measure for the cloud to reconcile.
+    """
+
+    def test_sync_unmeasurable_usage_settles_the_lease_at_its_reserved_bound(self) -> None:
+        client = make_mock_client()
+        client.chat.completions.create.return_value = _openai_response()
+        recorder = _ControlPlaneRecorder()
+        solwyn = _make_solwyn(client, recorder)
+        adapter = solwyn._runtimes[0].adapter
+
+        with (
+            patch.object(type(adapter), "extract_usage", side_effect=RuntimeError("shape drift")),
+            solwyn_pkg.run("fail-soft-lease"),
+        ):
+            run_id = solwyn_pkg.current_run()[0]
+            response = solwyn.chat.completions.create(
+                max_completion_tokens=_OUTPUT_BOUND, **_PLAIN_REQUEST
+            )
+            assert response.choices[0].message.content == "ok"
+            # Snapshot BEFORE close(): the lease is surrendered on shutdown.
+            state = solwyn._budget._lease.state_for(run_id)
+            assert state is not None
+            granted_remaining = state.granted_remaining_tokens
+            spent = state.spent_tokens_since_report
+            open_reservations = dict(state.reservations)
+        solwyn.close()  # drain the settlement queue to the wire
+
+        _assert_lease_held_at_bound(recorder, granted_remaining, spent, open_reservations)
+
+    async def test_async_unmeasurable_usage_settles_the_lease_at_its_reserved_bound(
+        self,
+    ) -> None:
+        client = make_mock_client(name="AsyncOpenAI")
+        client.chat.completions.create = AsyncMock(return_value=_openai_response())
+        recorder = _ControlPlaneRecorder()
+        solwyn = await _make_async_solwyn(client, recorder)
+        adapter = solwyn._runtimes[0].adapter
+
+        with (
+            patch.object(type(adapter), "extract_usage", side_effect=RuntimeError("shape drift")),
+            solwyn_pkg.run("fail-soft-lease-async"),
+        ):
+            run_id = solwyn_pkg.current_run()[0]
+            response = await solwyn.chat.completions.create(
+                max_completion_tokens=_OUTPUT_BOUND, **_PLAIN_REQUEST
+            )
+            assert response.choices[0].message.content == "ok"
+            state = solwyn._budget._lease.state_for(run_id)
+            assert state is not None
+            granted_remaining = state.granted_remaining_tokens
+            spent = state.spent_tokens_since_report
+            open_reservations = dict(state.reservations)
+        await solwyn.close()
+
+        _assert_lease_held_at_bound(recorder, granted_remaining, spent, open_reservations)
+
+    def test_sync_measured_usage_still_trues_the_lease_down(self) -> None:
+        # The twin that proves the floor is scoped to the UNMEASURABLE tier:
+        # a provider-reported response still hands its unspent bound back.
+        client = make_mock_client()
+        client.chat.completions.create.return_value = _openai_response()
+        recorder = _ControlPlaneRecorder()
+        solwyn = _make_solwyn(client, recorder)
+
+        with solwyn_pkg.run("measured-lease"):
+            run_id = solwyn_pkg.current_run()[0]
+            solwyn.chat.completions.create(max_completion_tokens=_OUTPUT_BOUND, **_PLAIN_REQUEST)
+            state = solwyn._budget._lease.state_for(run_id)
+            assert state is not None
+            granted_remaining = state.granted_remaining_tokens
+            spent = state.spent_tokens_since_report
+        solwyn.close()
+
+        # _openai_response() reports 10 in / 5 out — the whole 256-token bound
+        # minus the 5 actually produced goes back to the lease.
+        assert spent == 15
+        assert granted_remaining == _GRANTED_TOKENS - 15
+        # is_estimated is omitted from the wire when False — measured usage.
+        assert "is_estimated" not in recorder.confirms[0]["token_details"]
+
+
+def _assert_lease_held_at_bound(
+    recorder: _ControlPlaneRecorder,
+    granted_remaining: int,
+    spent: int,
+    open_reservations: dict[str, Any],
+) -> None:
+    """Assert the wire confirm and the local counters for an unmeasurable call."""
+    assert len(recorder.confirms) == 1
+    confirm = recorder.confirms[0]
+    # Wire shape is UNCHANGED: the lease settlement key plus the honest,
+    # explicitly-estimated under-measure the cloud reconciles.
+    assert confirm["lease_id"] == "lease_1"
+    # The settlement key is exclusive, and an absent key is OMITTED (not null).
+    assert "reservation_id" not in confirm
+    details = confirm["token_details"]
+    assert details["is_estimated"] is True
+    assert details["output_tokens"] == 0
+    reported = details["input_tokens"] + details["output_tokens"]
+
+    # Local authority is charged the RESERVED bound, not the under-measure:
+    # the output allowance the paid response consumed is never re-lent.
+    reserved = reported + _OUTPUT_BOUND
+    assert spent == reserved
+    assert granted_remaining == _GRANTED_TOKENS - reserved
+    assert reported < reserved  # the gap this test exists to keep unrefunded
+    assert open_reservations == {}
 
 
 def _route_media_to_embeddings(surface, client, kwargs, *, timeout, max_retries):

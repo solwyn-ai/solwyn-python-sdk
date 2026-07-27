@@ -26,7 +26,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
-from typing import Any, cast
+from typing import Any, NamedTuple, cast
 
 from pydantic import ValidationError
 
@@ -212,9 +212,23 @@ def _safe_extract_service_tier(runtime: ProviderRuntime, response: Any) -> str |
         return None
 
 
+class _FailSoftUsage(NamedTuple):
+    """Settlement usage plus whether ANY of it was actually measured.
+
+    ``unmeasured`` is the synthetic bottom of the ladder: no adapter read
+    succeeded, so ``token_details`` is a pre-flight input estimate with no
+    output term. It is deliberately NOT a field on ``TokenDetails`` — that is
+    a wire model, and this distinction is local bookkeeping about the read,
+    not a new fact for the API to parse.
+    """
+
+    token_details: TokenDetails
+    unmeasured: bool
+
+
 def _extract_usage_fail_soft(
     runtime: ProviderRuntime, response: Any, *, estimated_input_tokens: int
-) -> TokenDetails:
+) -> _FailSoftUsage:
     """Usage for settlement, degrading to estimates instead of raising (R5).
 
     Ladder: provider-reported usage -> adapter estimate -> synthetic
@@ -222,6 +236,10 @@ def _extract_usage_fail_soft(
     must never destroy a paid, successful response — the worst case is
     estimated spend telemetry (is_estimated=True), which the API already
     prices distinctly.
+
+    The synthetic tier is flagged ``unmeasured``: it carries no output term at
+    all, so a lease-funded call must settle its local reservation at the
+    reserved bound rather than true it up to this under-measure.
     """
     token_details: TokenDetails | None = None
     try:
@@ -240,10 +258,11 @@ def _extract_usage_fail_soft(
     if estimated is not None:
         token_details = estimated
     if token_details is None:
-        token_details = TokenDetails(
-            input_tokens=estimated_input_tokens, output_tokens=0, is_estimated=True
+        return _FailSoftUsage(
+            TokenDetails(input_tokens=estimated_input_tokens, output_tokens=0, is_estimated=True),
+            unmeasured=True,
         )
-    return token_details
+    return _FailSoftUsage(token_details, unmeasured=False)
 
 
 def _hop_timeout(deadline: Deadline, remaining_candidates: int) -> float:
@@ -1469,7 +1488,9 @@ class Solwyn(_SolwynBase):
             # Fail-soft bookkeeping (R5): a paid, successful response is never
             # destroyed by extraction — usage degrades to estimates
             # (is_estimated=True), region/tier degrade to None.
-            token_details = _extract_usage_fail_soft(rt, response, estimated_input_tokens=est_in)
+            token_details, usage_unmeasured = _extract_usage_fail_soft(
+                rt, response, estimated_input_tokens=est_in
+            )
             # Per-region pricing attribution: the SERVED runtime's endpoint region.
             provider_region = _safe_extract_region(rt)
             # The tier echoed on the RAW served response is the billing ground
@@ -1505,6 +1526,9 @@ class Solwyn(_SolwynBase):
                     call_id=call_id,
                     provider_region=provider_region,
                     service_tier=service_tier,
+                    # Nothing about this call's usage was measurable: settle the
+                    # local lease reservation at its bound, never below it.
+                    usage_unmeasured=usage_unmeasured,
                 )
             event = self._build_metadata_event(
                 model=served_model,
@@ -2473,7 +2497,9 @@ class AsyncSolwyn(_SolwynBase):
             # Fail-soft bookkeeping (R5): a paid, successful response is never
             # destroyed by extraction — usage degrades to estimates
             # (is_estimated=True), region/tier degrade to None.
-            token_details = _extract_usage_fail_soft(rt, response, estimated_input_tokens=est_in)
+            token_details, usage_unmeasured = _extract_usage_fail_soft(
+                rt, response, estimated_input_tokens=est_in
+            )
             # Per-region pricing attribution: the SERVED runtime's endpoint region.
             provider_region = _safe_extract_region(rt)
             # Extracted ONCE from the RAW served response — confirm and
@@ -2508,6 +2534,9 @@ class AsyncSolwyn(_SolwynBase):
                     call_id=call_id,
                     provider_region=provider_region,
                     service_tier=service_tier,
+                    # Nothing about this call's usage was measurable: settle the
+                    # local lease reservation at its bound, never below it.
+                    usage_unmeasured=usage_unmeasured,
                 )
             event = self._build_metadata_event(
                 model=served_model,

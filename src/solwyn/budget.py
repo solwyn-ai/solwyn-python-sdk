@@ -1119,6 +1119,7 @@ class _BudgetEnforcerBase:
         service_tier: str | None = None,
         modality: Modality = "text",
         media_usage: MediaUsage | None = None,
+        usage_unmeasured: bool = False,
     ) -> BudgetConfirmRequest:
         """Build a validated confirm request for fire-and-forget callers.
 
@@ -1144,6 +1145,14 @@ class _BudgetEnforcerBase:
         ``media_usage`` carries a non-text surface's settled non-token quantities
         so the API settles the enforcement counter on the per-unit basis; None
         for chat/token confirms.
+        ``usage_unmeasured`` marks the fail-soft SYNTHETIC tier — every usage
+        read for this call raised, so ``token_details`` carries the pre-flight
+        input estimate and NO output at all. The wire confirm is unchanged
+        (the cloud sees the honest ``is_estimated`` value it already prices
+        distinctly), but the LOCAL lease reservation settles at its reserved
+        bound instead of being trued up to that under-measure: crediting the
+        unspent-looking output back would re-lend authority a paid response
+        already consumed, weakening the run's hard token cap.
         """
         if not call_id:
             raise RuntimeError("call_id is required for budget confirm reconciliation")
@@ -1170,12 +1179,14 @@ class _BudgetEnforcerBase:
                 raise RuntimeError("lease_claim_token is required for local lease settlement")
             # Validate the complete wire request BEFORE mutating authority.
             # Settlement of a lease-funded call then moves the local
-            # reservation from its bound to the actual spend.
+            # reservation from its bound to the actual spend — or holds it AT
+            # the bound when the usage was never measurable.
             with self._state_lock:
                 self._lease.true_up(
                     call_id,
                     token_details.total_tokens,
                     claim_token=lease_claim_token,
+                    floor_at_reservation=usage_unmeasured,
                 )
         return confirm
 
