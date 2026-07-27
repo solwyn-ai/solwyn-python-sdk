@@ -150,9 +150,10 @@ class ProviderAdapter(Protocol):
         attribute path; the caller invokes/awaits it) plus a shaped COPY of
         kwargs. Owns every provider-specific dispatch quirk: streaming intent
         (``stream=True`` kwarg vs a dedicated method), per-request HTTP bounds
-        for SDKs without ``with_options`` (timeout/max_retries; others ignore
-        them), and any model-key rename. Must not mutate the input kwargs and
-        must never read prompt content — key-level shaping only.
+        for SDKs without ``with_options`` (``timeout`` carries the decoupled
+        per-hop READ bound, PJ-8/R7; max_retries; others ignore them), and any
+        model-key rename. Must not mutate the input kwargs and must never read
+        prompt content — key-level shaping only.
         """
         ...
 

@@ -142,8 +142,9 @@ def _with_google_http_bound(
 
     google-genai accepts ``config={"http_options": ...}`` for generate_content
     calls, and its timeout is milliseconds. We preserve caller config/http_options
-    but override the timeout and retry attempts because the chain deadline is a
-    mandatory Solwyn bound.
+    but override the timeout and retry attempts because the hop read bound is a
+    mandatory Solwyn bound (google-genai cannot split connect from read; the
+    failover window still gates advancement between hops).
     """
     bounded = dict(kwargs)
     config = _mapping_from_config(bounded.get("config"))

@@ -137,7 +137,8 @@ class TestMediaCallSync:
 
         assert result is resp
         assert solwyn._config.failover_total_timeout == 30.0
-        assert 0.0 < client.with_options.call_args.kwargs["timeout"] <= 30.0
+        assert 0.0 < client.with_options.call_args.kwargs["timeout"].connect <= 30.0
+        assert client.with_options.call_args.kwargs["timeout"].read == 600.0
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
@@ -396,7 +397,8 @@ class TestMediaCallAsync:
 
         assert result is resp
         assert solwyn._config.failover_total_timeout == 30.0
-        assert 0.0 < client.with_options.call_args.kwargs["timeout"] <= 30.0
+        assert 0.0 < client.with_options.call_args.kwargs["timeout"].connect <= 30.0
+        assert client.with_options.call_args.kwargs["timeout"].read == 600.0
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()
 

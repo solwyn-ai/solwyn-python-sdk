@@ -355,7 +355,7 @@ class TestDeadlineBoundsThroughDispatch:
                 solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
             budget_timeout = check_spy.call_args.kwargs["timeout"]
-            hop_timeout = openai.with_options.call_args.kwargs["timeout"]
+            hop_timeout = openai.with_options.call_args.kwargs["timeout"].connect
             assert 0 < budget_timeout <= 0.25
             assert 0 < hop_timeout <= 0.25
         finally:

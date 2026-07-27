@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
@@ -682,7 +683,7 @@ class TestFailoverTuningDirective:
                 name: SolwynConfig.model_fields[name].default for name in _FAILOVER_TUNING_FIELDS
             }
             assert _current_failover_tuning(solwyn) == defaults
-            assert openai.with_options.call_args.kwargs["timeout"] <= 30.0
+            assert openai.with_options.call_args.kwargs["timeout"].connect <= 30.0
 
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
             assert _current_failover_tuning(solwyn) == _CUSTOM_FAILOVER_TUNING
@@ -736,7 +737,7 @@ class TestFailoverTuningDirective:
         assert _current_failover_tuning(solwyn) == defaults
         assert [runtime.entry for runtime in solwyn._runtimes] == runtime_order
         openai.chat.completions.create.assert_awaited_once()
-        assert openai.with_options.call_args.kwargs["timeout"] <= 30.0
+        assert openai.with_options.call_args.kwargs["timeout"].connect <= 30.0
 
         await solwyn._reporter._http.aclose()
         await solwyn._budget._http.aclose()
@@ -789,8 +790,9 @@ class TestPerHopDeadline:
         call = client.with_options.call_args
         assert call.kwargs["max_retries"] == 0
         timeout = call.kwargs["timeout"]
-        assert isinstance(timeout, int | float)
-        assert 0.0 < timeout < float("inf")
+        assert isinstance(timeout, httpx.Timeout)
+        assert timeout.connect is not None and 0.0 < timeout.connect < float("inf")
+        assert timeout.read == 600.0
 
         _close(solwyn)
 
@@ -809,7 +811,8 @@ class TestPerHopDeadline:
                 },
             },
             is_streaming=False,
-            timeout=0.25,
+            timeout=0.05,
+            read_timeout=0.25,
             max_retries=0,
         )
 
@@ -842,7 +845,8 @@ class TestPerHopDeadline:
                 solwyn._runtimes[0],
                 {"model": "gemini-3.5-flash", "contents": "hi"},
                 is_streaming=False,
-                timeout=0.001,
+                timeout=0.05,
+                read_timeout=0.001,
                 max_retries=0,
             )
         elapsed = time.perf_counter() - started
@@ -864,7 +868,8 @@ class TestPerHopDeadline:
                 "config": {"http_options": {"timeout": 999_999}},
             },
             is_streaming=False,
-            timeout=0.125,
+            timeout=0.05,
+            read_timeout=0.125,
             max_retries=0,
         )
 
@@ -897,7 +902,8 @@ class TestPerHopDeadline:
                 solwyn._runtimes[0],
                 {"model": "gemini-3.5-flash", "contents": "hi"},
                 is_streaming=False,
-                timeout=0.001,
+                timeout=0.05,
+                read_timeout=0.001,
                 max_retries=0,
             )
         elapsed = time.perf_counter() - started
@@ -925,13 +931,16 @@ class TestPerHopDeadline:
         with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-        hop0 = openai.with_options.call_args.kwargs["timeout"]
-        hop1 = anthropic.with_options.call_args.kwargs["timeout"]
+        hop0 = openai.with_options.call_args.kwargs["timeout"].connect
+        hop1 = anthropic.with_options.call_args.kwargs["timeout"].connect
         # hop0 was divided by 2 candidates (≈15), proving it is not the full 30s.
         assert hop0 < 25.0
         # The last hop gets the remaining slice (÷1), strictly larger than hop0.
         assert hop1 > hop0
         assert hop1 <= 30.0
+        # The read bound is per-hop constant - never sliced by the window.
+        assert openai.with_options.call_args.kwargs["timeout"].read == 600.0
+        assert anthropic.with_options.call_args.kwargs["timeout"].read == 600.0
 
         _close(solwyn)
 
@@ -1366,4 +1375,50 @@ class TestFailoverTuningSnapshot:
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
         assert openai.chat.completions.create.call_count == 2
         assert result.choices[0].message.content == "ok from gpt"
+        _close(solwyn)
+
+
+@pytest.mark.unit
+class TestDecoupledHopReadTimeout:
+    """PJ-8/R7: the chain deadline must not cap a legitimate slow read."""
+
+    def test_read_bound_survives_small_failover_window(self) -> None:
+        # THE R7 regression: a 0.25s failover window previously became the hop
+        # read timeout, killing any generation slower than 0.25s. Now connect
+        # stays inside the window while read keeps the SDK-default 600s.
+        client = _openai_client()
+        client.chat.completions.create.return_value = _openai_response()
+        solwyn = _make_solwyn(client, model="gpt-5.5", failover_total_timeout=0.25)
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+        bound = client.with_options.call_args.kwargs["timeout"]
+        assert isinstance(bound, httpx.Timeout)
+        assert bound.connect is not None and bound.connect <= 0.25
+        assert bound.pool is not None and bound.pool <= 0.25
+        assert bound.read == 600.0
+        assert bound.write == 600.0
+        _close(solwyn)
+
+    def test_custom_hop_read_timeout_flows_to_dispatch(self) -> None:
+        client = _openai_client()
+        client.chat.completions.create.return_value = _openai_response()
+        solwyn = _make_solwyn(client, model="gpt-5.5", failover_hop_read_timeout=42.0)
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+        assert client.with_options.call_args.kwargs["timeout"].read == 42.0
+        _close(solwyn)
+
+    def test_directive_suppression_resets_hop_read_bound(self) -> None:
+        # Server disallows custom tuning: the custom 120s read bound must be
+        # suppressed back to the 600s default ON THIS SAME CALL.
+        client = _openai_client()
+        client.chat.completions.create.return_value = _openai_response()
+        solwyn = _make_solwyn(client, model="gpt-5.5", **_CUSTOM_FAILOVER_TUNING)
+        with patch.object(
+            solwyn._budget,
+            "check_budget",
+            return_value=_allow_budget(failover_tuning_allowed=False),
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+        assert client.with_options.call_args.kwargs["timeout"].read == 600.0
         _close(solwyn)
