@@ -1422,7 +1422,7 @@ class TestDecoupledHopReadTimeout:
             model="gpt-5.5",
             failover_hop_read_timeout=37.0,
         )
-        solwyn._reporter.report = MagicMock()
+        solwyn._reporter.report = MagicMock(spec=solwyn._reporter.report)
 
         with patch.object(
             solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())

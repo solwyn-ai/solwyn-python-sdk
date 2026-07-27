@@ -184,8 +184,12 @@ class TestAudioSpeechProxy:
         # Raw kwargs only — no injected op marker on the carve-out path.
         assert _AUDIO_OP_KEY not in client.audio.speech.create.call_args_list[0].kwargs
         # One warning per process, however many carved-out calls are made.
-        assert len(caplog.records) == 1
-        message = caplog.records[0].getMessage()
+        # foreground_records, not caplog.records: caplog handles the ROOT logger,
+        # so a background delivery/exit-hook WARNING from a reporter left live by
+        # an earlier test lands in this window and inflates the count.
+        records = foreground_records(caplog)
+        assert len(records) == 1
+        message = records[0].getMessage()
         assert "untracked" in message.lower()
         assert "unobservable" in message.lower()
         # Never echoes request content.
@@ -207,7 +211,7 @@ class TestAudioSpeechProxy:
         check.assert_not_called()
         report.assert_not_called()
         client.audio.speech.create.assert_called_once()
-        assert len(caplog.records) == 1
+        assert len(foreground_records(caplog)) == 1
         _close_sync(solwyn)
 
     def test_speech_getattr_passthrough_is_silent(self, caplog: pytest.LogCaptureFixture) -> None:
@@ -290,7 +294,8 @@ class TestAsyncAudioSpeechProxy:
         check.assert_not_called()
         report.assert_not_called()
         client.audio.speech.create.assert_awaited_once()
-        assert len(caplog.records) == 1
-        assert "untracked" in caplog.records[0].getMessage().lower()
+        records = foreground_records(caplog)
+        assert len(records) == 1
+        assert "untracked" in records[0].getMessage().lower()
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

@@ -992,7 +992,25 @@ class Solwyn(_SolwynBase):
                 mode=budget.mode.value,
             )
 
-        # 3. Provider call — PRIMARY only. A dispatch error is reported (parity
+        # 3. Deadline gate, mirroring the chat walk (PJ-8/R7 follow-up). Since
+        #    connect and read are decoupled, an expired window no longer bounds
+        #    the call on its own: _hop_connect_slice returns its 0.001s floor,
+        #    which a WARM POOLED connection satisfies, and the hop would then
+        #    read for the full (default 600s) bound. Whether an expired media
+        #    call escapes would come down to pool state. Gate it explicitly
+        #    instead — chat rejects this exact state, and no provider I/O may
+        #    start outside the window.
+        if deadline.expired():
+            self._budget.release_reservation(
+                call_id,
+                lease_claim_token=_lease_claim_token(budget),
+            )
+            raise ProviderUnavailableError(
+                "failover deadline expired",
+                attempted=[provider],
+            )
+
+        # 4. Provider call — PRIMARY only. A dispatch error is reported (parity
         #    with the chat error path) then re-raised unchanged (drop-in contract).
         start = time.monotonic()
         try:
@@ -1026,7 +1044,7 @@ class Solwyn(_SolwynBase):
             raise
         latency_ms = (time.monotonic() - start) * 1000
 
-        # 4. Billable quantities: TOKEN basis (response usage first, request-
+        # 5. Billable quantities: TOKEN basis (response usage first, request-
         #    derived fallback) AND, when the surface has a media channel, the
         #    non-token MediaUsage basis. BOTH ride the confirm when observable —
         #    the server's pricing card unit picks (e.g. native gpt-image sends
@@ -1038,7 +1056,7 @@ class Solwyn(_SolwynBase):
             spec.measure_media(kwargs, response) if spec.measure_media is not None else None
         )
 
-        # 5. Settle OFF the hot path: build the confirm sans-I/O and enqueue it
+        # 6. Settle OFF the hot path: build the confirm sans-I/O and enqueue it
         #    with the metadata event as one ordered settlement (same path as
         #    chat + streaming). Confirm fires when EITHER basis is observable;
         #    skipped only when both are None (never settle a real $0 price).
@@ -2027,6 +2045,20 @@ class AsyncSolwyn(_SolwynBase):
                 estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
                 budget_period="unknown",
                 mode=budget.mode.value,
+            )
+
+        # Deadline gate, mirroring the sync media path and the chat walk: with
+        # connect and read decoupled (PJ-8/R7), an expired window would
+        # otherwise let a warm pooled connection clear the 0.001s connect floor
+        # and read for the full hop bound. See the sync mirror.
+        if deadline.expired():
+            self._budget.release_reservation(
+                call_id,
+                lease_claim_token=_lease_claim_token(budget),
+            )
+            raise ProviderUnavailableError(
+                "failover deadline expired",
+                attempted=[provider],
             )
 
         start = time.monotonic()

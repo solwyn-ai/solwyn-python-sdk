@@ -330,6 +330,25 @@ derived from git tags (hatch-vcs).
 
 ### Fixed
 
+- **A connect/pool timeout wrapped by the provider SDK now fails over.** Both
+  openai and anthropic wrap the ENTIRE `httpx.TimeoutException` family in
+  `APITimeoutError`, so a provably pre-send `ConnectTimeout`/`PoolTimeout`
+  reached classification wearing the same class name as a post-send read
+  timeout — and was classified post-send ambiguous, which under the default
+  `failover_idempotency="safe"` re-raises without ever trying the next
+  candidate. A stalled primary therefore took the whole call down instead of
+  failing over. `APITimeoutError` is now classified by its chained cause, the
+  same way `APIConnectionError` already was: a pre-send httpx cause fails over,
+  read/write/unknown/no-cause stays ambiguous. This matters most now that the
+  connect slice is short and deadline-derived (above) — it is the bound that
+  fires first on a stalled provider.
+- **A media call whose failover window expired during the budget pre-flight no
+  longer starts provider I/O.** With connect and read decoupled (above), the
+  expired path's floor connect slice is satisfied by a warm pooled connection,
+  after which the hop could read for the full hop read bound — so whether an
+  out-of-window media call escaped came down to pool state. Both the sync and
+  async media paths now gate on window expiry before dispatch and release the
+  reservation, matching the chat walk.
 - **Server-pushed failover tuning is now snapshotted once per call.** The
   directive writer mutates the config's tuning fields under the breaker lock,
   while the dispatch path re-read them unlocked mid-call — so a call could

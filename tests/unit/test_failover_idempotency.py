@@ -13,13 +13,13 @@ maps it by MRO name to POST_SEND_AMBIGUOUS without importing any provider SDK.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
-from solwyn.client import Solwyn
+from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import ProviderUnavailableError
 from solwyn.providers._errors import Disposition, classify_exception
 
@@ -30,7 +30,25 @@ class APITimeoutError(Exception):
     classify_exception matches provider classes by MRO *name*, so naming this
     class ``APITimeoutError`` is sufficient to drive the POST_SEND_AMBIGUOUS
     branch — no real SDK import needed.
+
+    NOTE the deliberate absence of a ``__cause__``: that is the CANONICAL read
+    timeout, and a causeless wrapper stays POST_SEND_AMBIGUOUS. Use
+    :func:`_wrapped_timeout` to build the pre-send-caused variant.
     """
+
+
+def _wrapped_timeout(cause: Exception) -> APITimeoutError:
+    """An ``APITimeoutError`` chaining ``cause``, as the real SDKs raise it.
+
+    Both openai and anthropic catch the whole ``httpx.TimeoutException`` family
+    and ``raise APITimeoutError(...) from err`` — so the pre-send
+    ConnectTimeout/PoolTimeout cases are indistinguishable from a read timeout
+    by class name alone. The chained cause is the only signal. Pinned against
+    the real SDKs in tests/unit/test_real_sdk_error_wrapping.py.
+    """
+    exc = APITimeoutError(str(cause) or type(cause).__name__)
+    exc.__cause__ = cause
+    return exc
 
 
 class _Status(Exception):
@@ -125,6 +143,146 @@ def test_apitimeouterror_classifies_post_send_ambiguous() -> None:
 @pytest.mark.unit
 def test_status_429_classifies_failover() -> None:
     assert classify_exception(_Status(429)) is Disposition.FAILOVER
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "cause",
+    [httpx.ConnectTimeout("connect stalled"), httpx.PoolTimeout("pool exhausted")],
+    ids=["connect", "pool"],
+)
+def test_wrapped_pre_send_timeout_classifies_failover(cause: Exception) -> None:
+    # Same class NAME as the read-timeout case above, opposite disposition:
+    # the connect/pool cause proves the request never reached the model.
+    assert classify_exception(_wrapped_timeout(cause)) is Disposition.FAILOVER
+
+
+@pytest.mark.unit
+def test_wrapped_read_timeout_still_ambiguous() -> None:
+    # The cause inspection must not weaken the post-send case it protects.
+    assert (
+        classify_exception(_wrapped_timeout(httpx.ReadTimeout("read stalled")))
+        is Disposition.POST_SEND_AMBIGUOUS
+    )
+
+
+# ── the connect-slice regression (safe policy MUST still advance) ────────
+
+
+@pytest.mark.unit
+class TestWrappedConnectTimeoutAdvances:
+    """PJ-8/R7 made the connect slice short and deadline-derived, so on a stalled
+    primary it is the bound that fires FIRST. Classifying the resulting
+    ``APITimeoutError`` by name alone stranded the chain: default-safe
+    idempotency re-raised and the fallback was never attempted. These are the
+    end-to-end controls for that regression."""
+
+    def test_connect_slice_timeout_fails_over_under_safe_default(self) -> None:
+        # Arrange: primary raises the SDK-shaped wrapper over a ConnectTimeout.
+        # No idempotency override — this is the DEFAULT "safe" policy.
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = _wrapped_timeout(
+            httpx.ConnectTimeout("connect slice expired")
+        )
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
+        )
+
+        # Act
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        # Assert: the chain ADVANCED — a pre-send failure cannot double-spend.
+        anthropic.messages.create.assert_called_once()
+        assert result.choices[0].message.content == "ok from claude"
+
+        _close(solwyn)
+
+    def test_pool_timeout_fails_over_under_safe_default(self) -> None:
+        # PoolTimeout is the other pre-send cause the connect slice produces:
+        # the request never even got a connection out of the pool.
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = _wrapped_timeout(
+            httpx.PoolTimeout("pool slice expired")
+        )
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
+        )
+
+        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        anthropic.messages.create.assert_called_once()
+        assert result.choices[0].message.content == "ok from claude"
+
+        _close(solwyn)
+
+    def test_read_timeout_still_reraises_under_safe_default(self) -> None:
+        # The guard on the guard: the SAME wrapper class over a READ cause must
+        # keep its post-send protection. If this ever goes green-by-failover the
+        # cause inspection has been widened into a double-spend.
+        openai = _openai_client()
+        original = _wrapped_timeout(httpx.ReadTimeout("read stalled"))
+        openai.chat.completions.create.side_effect = original
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
+        )
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            pytest.raises(APITimeoutError) as exc_info,
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        assert exc_info.value is original
+        anthropic.messages.create.assert_not_called()
+
+        _close(solwyn)
+
+    @pytest.mark.asyncio
+    async def test_async_connect_slice_timeout_fails_over_under_safe_default(self) -> None:
+        # Async mirror: the walk is a separate code path, and the classification
+        # seam it calls must be reached identically.
+        openai = _openai_client()
+        openai.chat.completions.create = AsyncMock(
+            side_effect=_wrapped_timeout(httpx.ConnectTimeout("connect slice expired"))
+        )
+        anthropic = _anthropic_client()
+        anthropic.messages.create = AsyncMock(return_value=_anthropic_response())
+
+        solwyn = AsyncSolwyn(
+            openai,
+            api_key=VALID_API_KEY,
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
+        )
+        solwyn._reporter.report = MagicMock(spec=solwyn._reporter.report)
+
+        with patch.object(
+            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+        ):
+            result = await solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        anthropic.messages.create.assert_awaited_once()
+        assert result.choices[0].message.content == "ok from claude"
+
+        await solwyn._reporter._http.aclose()
+        await solwyn._budget._http.aclose()
 
 
 # ── safe (default) ───────────────────────────────────────────────────────

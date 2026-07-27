@@ -9,6 +9,8 @@ report, with ``is_model_fallback`` always False and no candidate walk.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,7 +22,17 @@ from solwyn._base import MediaSurfaceSpec
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetMode, CallStatus, MediaUsage
 from solwyn.client import AsyncSolwyn, Solwyn
-from solwyn.exceptions import BudgetExceededError, UnsupportedSurfaceError
+from solwyn.exceptions import (
+    BudgetExceededError,
+    ProviderUnavailableError,
+    UnsupportedSurfaceError,
+)
+
+# A failover window small enough that a slow budget pre-flight outlives it, and
+# a pre-flight that reliably does. Only the SLEEP can overshoot, so the expiry
+# is deterministic in both directions.
+_TINY_WINDOW = 0.05
+_SLOW_PREFLIGHT = 0.15
 
 
 def _extract_prompt_tokens(response: object) -> TokenDetails | None:
@@ -386,6 +398,183 @@ class TestMediaCallSync:
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
+
+
+@pytest.mark.unit
+class TestMediaDeadlineExpiry:
+    """No media I/O may START outside the failover window.
+
+    PJ-8/R7 decoupled connect from read, so an expired window no longer bounds
+    the call on its own: _hop_connect_slice falls to its 0.001s floor, which a
+    WARM POOLED connection satisfies — and the hop would then read for the full
+    (default 600s) bound. Before the split, the single whole-request timeout
+    made that impossible. The chat walk rejects this exact state; media must
+    too, rather than letting pool warmth decide.
+    """
+
+    def test_expired_preflight_never_calls_provider(self) -> None:
+        # Arrange: the budget pre-flight outlives the whole failover window.
+        client, _ = _sync_client()
+        solwyn = _build_sync(client, failover_total_timeout=_TINY_WINDOW)
+
+        def slow_check(**_kwargs):
+            time.sleep(_SLOW_PREFLIGHT)
+            return _allow()
+
+        # Act + Assert
+        with (
+            patch.object(solwyn._budget, "check_budget", side_effect=slow_check),
+            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            pytest.raises(ProviderUnavailableError) as exc_info,
+        ):
+            solwyn._media_call(_spec(), model="text-embedding-3-small", input="hello world")
+
+        assert "deadline expired" in str(exc_info.value)
+        assert exc_info.value.attempted == ["openai"]
+        # THE point of the test: no request was ever sent.
+        client.embeddings.create.assert_not_called()
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_expired_preflight_releases_the_reservation(self) -> None:
+        # Nothing will settle this call, so the reservation must be handed back
+        # rather than stranded until the 900s sweep (parity with the chat gate
+        # and with the media dispatch-error path).
+        client, _ = _sync_client()
+        solwyn = _build_sync(client, failover_total_timeout=_TINY_WINDOW)
+
+        def slow_check(**_kwargs):
+            time.sleep(_SLOW_PREFLIGHT)
+            return _allow("res_media")
+
+        with (
+            patch.object(solwyn._budget, "check_budget", side_effect=slow_check),
+            patch.object(solwyn._budget, "release_reservation") as release,
+            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            pytest.raises(ProviderUnavailableError),
+        ):
+            solwyn._media_call(_spec(), model="text-embedding-3-small", input="hello world")
+
+        release.assert_called_once()
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_budget_denial_still_wins_over_expiry(self) -> None:
+        # Ordering control: a denied budget is the more specific answer, and the
+        # gate must not mask it. Both conditions hold here.
+        client, _ = _sync_client()
+        solwyn = _build_sync(client, failover_total_timeout=_TINY_WINDOW)
+
+        def slow_deny(**_kwargs):
+            time.sleep(_SLOW_PREFLIGHT)
+            return _deny()
+
+        with (
+            patch.object(solwyn._budget, "check_budget", side_effect=slow_deny),
+            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            pytest.raises(BudgetExceededError),
+        ):
+            solwyn._media_call(_spec(), model="text-embedding-3-small", input="hello world")
+
+        client.embeddings.create.assert_not_called()
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_live_window_still_dispatches(self) -> None:
+        # The guard on the guard: a healthy window must NOT be gated. Without
+        # this, a gate that always fired would pass every assertion above.
+        client, resp = _sync_client()
+        solwyn = _build_sync(client, failover_total_timeout=30.0)
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow(None)),
+            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+        ):
+            result = solwyn._media_call(
+                _spec(), model="text-embedding-3-small", input="hello world"
+            )
+
+        assert result is resp
+        client.embeddings.create.assert_called_once()
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    @pytest.mark.asyncio
+    async def test_async_expired_preflight_never_calls_provider(self) -> None:
+        # Async mirror — a separate _media_call implementation, so it needs its
+        # own control rather than inheriting the sync one's coverage.
+        client, _ = _async_client()
+        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, failover_total_timeout=_TINY_WINDOW)
+
+        async def slow_check(**_kwargs):
+            await asyncio.sleep(_SLOW_PREFLIGHT)
+            return _allow()
+
+        with (
+            patch.object(solwyn._budget, "check_budget", new=AsyncMock(side_effect=slow_check)),
+            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            pytest.raises(ProviderUnavailableError) as exc_info,
+        ):
+            await solwyn._media_call(_spec(), model="text-embedding-3-small", input="hello world")
+
+        assert "deadline expired" in str(exc_info.value)
+        assert exc_info.value.attempted == ["openai"]
+        client.embeddings.create.assert_not_awaited()
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_async_expired_preflight_releases_the_reservation(self) -> None:
+        client, _ = _async_client()
+        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, failover_total_timeout=_TINY_WINDOW)
+
+        async def slow_check(**_kwargs):
+            await asyncio.sleep(_SLOW_PREFLIGHT)
+            return _allow("res_media")
+
+        with (
+            patch.object(solwyn._budget, "check_budget", new=AsyncMock(side_effect=slow_check)),
+            patch.object(solwyn._budget, "release_reservation") as release,
+            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            pytest.raises(ProviderUnavailableError),
+        ):
+            await solwyn._media_call(_spec(), model="text-embedding-3-small", input="hello world")
+
+        release.assert_called_once()
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_async_live_window_still_dispatches(self) -> None:
+        client, resp = _async_client()
+        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, failover_total_timeout=30.0)
+
+        with (
+            patch.object(solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow(None))),
+            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+        ):
+            result = await solwyn._media_call(
+                _spec(), model="text-embedding-3-small", input="hello world"
+            )
+
+        assert result is resp
+        client.embeddings.create.assert_awaited_once()
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
 
 
 def _async_client() -> tuple[MagicMock, SimpleNamespace]:
