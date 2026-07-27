@@ -137,6 +137,11 @@ class _FixedDeadline:
     def remaining(self) -> float:
         return 5.0
 
+    def replace_total(self, total: float) -> None:
+        # PJ-8/R12: the dispatch path now unconditionally applies the
+        # per-call tuning snapshot's total to the deadline.
+        pass
+
 
 _PLAIN_REQUEST = {
     "model": "gpt-5.5",

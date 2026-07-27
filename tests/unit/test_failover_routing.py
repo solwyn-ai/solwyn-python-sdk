@@ -14,6 +14,7 @@ a ``_Status(status_code=429)`` classifies as FAILOVER (advance the chain) while
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
+from solwyn._base import FailoverTuning
 from solwyn._types import CircuitState
 from solwyn.client import AsyncSolwyn, Deadline, Solwyn
 from solwyn.config import SolwynConfig
@@ -986,6 +988,11 @@ class TestPerHopDeadline:
             def remaining(self) -> float:
                 return 5.0
 
+            def replace_total(self, total: float) -> None:
+                # PJ-8/R12: the dispatch path now unconditionally applies the
+                # per-call tuning snapshot's total to the deadline.
+                pass
+
         with (
             patch("solwyn.client.Deadline", _FakeDeadline),
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
@@ -1234,5 +1241,129 @@ class TestCircuitBreakerLazyCreation:
 
         assert len({id(breaker) for breaker in breakers}) == 1
         assert len(created) == 1
+
+
+@pytest.mark.unit
+class TestFailoverTuningSnapshot:
+    """PJ-8/R12: the call path consumes ONE immutable tuning snapshot."""
+
+    def test_directive_none_returns_coherent_current_tuning(self) -> None:
+        solwyn = _make_solwyn(_openai_client(), model="gpt-5.5", **_CUSTOM_FAILOVER_TUNING)
+        snap = solwyn._apply_failover_tuning_directive(None)
+        assert snap == FailoverTuning(
+            failover_total_timeout=91.0,
+            failover_idempotency="never",
+            same_provider_retries=4,
+            failover_hop_read_timeout=120.0,
+        )
+        # None is advisory-delivery failure: a snapshot, never a mutation.
+        assert _current_failover_tuning(solwyn) == _CUSTOM_FAILOVER_TUNING
+        _close(solwyn)
+
+    def test_directive_false_returns_default_snapshot(self) -> None:
+        solwyn = _make_solwyn(_openai_client(), model="gpt-5.5", **_CUSTOM_FAILOVER_TUNING)
+        snap = solwyn._apply_failover_tuning_directive(False)
+        assert snap == FailoverTuning(
+            failover_total_timeout=30.0,
+            failover_idempotency="safe",
+            same_provider_retries=0,
+            failover_hop_read_timeout=600.0,
+        )
+        _close(solwyn)
+
+    def test_snapshot_never_tears_under_concurrent_directives(self) -> None:
+        # The R12 race itself: a writer thread flips tuning between the full
+        # custom set and the full default set; every snapshot the reader takes
+        # must be ENTIRELY one or the other - never a torn mix.
+        solwyn = _make_solwyn(_openai_client(), model="gpt-5.5", **_CUSTOM_FAILOVER_TUNING)
+        stop = threading.Event()
+
+        def flip() -> None:
+            allowed = False
+            while not stop.is_set():
+                solwyn._apply_failover_tuning_directive(allowed)
+                allowed = not allowed
+
+        custom = FailoverTuning(
+            failover_total_timeout=91.0,
+            failover_idempotency="never",
+            same_provider_retries=4,
+            failover_hop_read_timeout=120.0,
+        )
+        defaults = FailoverTuning(
+            failover_total_timeout=30.0,
+            failover_idempotency="safe",
+            same_provider_retries=0,
+            failover_hop_read_timeout=600.0,
+        )
+        writer = threading.Thread(target=flip)
+        writer.start()
+        try:
+            for _ in range(500):
+                snap = solwyn._apply_failover_tuning_directive(None)
+                assert snap in (custom, defaults)
+        finally:
+            stop.set()
+            writer.join(timeout=5.0)
+        _close(solwyn)
+
+    def test_call_path_consumes_snapshot_not_config(self) -> None:
+        # Wiring proof: config says "safe" but the snapshot says "never" -
+        # the walk must obey the snapshot (no cross-provider candidates), so
+        # the primary's 429 exhausts the chain and re-raises.
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = _Status(429)
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 64})],
+        )
+        never_snapshot = FailoverTuning(
+            failover_total_timeout=30.0,
+            failover_idempotency="never",
+            same_provider_retries=0,
+            failover_hop_read_timeout=600.0,
+        )
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(
+                solwyn,
+                "_apply_failover_tuning_directive",
+                return_value=never_snapshot,
+            ),
+            pytest.raises(_Status),
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+        anthropic.messages.create.assert_not_called()
+        _close(solwyn)
+
+    def test_call_path_consumes_snapshot_same_provider_retries(self) -> None:
+        # Wiring proof for the retry budget: config says 0 retries, snapshot
+        # says 1 - a Retry-After 429 must re-attempt the SAME provider once.
+        openai = _openai_client()
+        retry_exc = _Status(429)
+        retry_exc.response = SimpleNamespace(headers={"retry-after": "0"})
+        openai.chat.completions.create.side_effect = [retry_exc, _openai_response()]
+        solwyn = _make_solwyn(openai, model="gpt-5.5")
+        retry_snapshot = FailoverTuning(
+            failover_total_timeout=30.0,
+            failover_idempotency="safe",
+            same_provider_retries=1,
+            failover_hop_read_timeout=600.0,
+        )
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(
+                solwyn,
+                "_apply_failover_tuning_directive",
+                return_value=retry_snapshot,
+            ),
+        ):
+            result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
+        assert openai.chat.completions.create.call_count == 2
+        assert result.choices[0].message.content == "ok from gpt"
+        _close(solwyn)
 
         _close(solwyn)

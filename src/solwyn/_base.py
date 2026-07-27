@@ -16,7 +16,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -67,6 +67,23 @@ _FAILOVER_TUNING_FIELDS = (
     "circuit_breaker_recovery_timeout",
     "circuit_breaker_success_threshold",
 )
+
+
+class FailoverTuning(NamedTuple):
+    """One COHERENT per-call snapshot of the server-governed failover tuning.
+
+    The directive writer mutates self._config's tuning fields under
+    _breaker_lock (_apply_failover_tuning_directive); an unlocked mid-call
+    re-read of self._config can observe a torn mix of old and new tuning
+    (PJ-8/R12). The dispatch path therefore consumes tuning ONLY through this
+    immutable snapshot, captured once per call under that same lock.
+    """
+
+    failover_total_timeout: float
+    failover_idempotency: Literal["safe", "never", "always"]
+    same_provider_retries: int
+    failover_hop_read_timeout: float
+
 
 # CostPolicy is inert until the server sends a relative price hint: with no hint
 # on any candidate it degrades to health-based ordering. Warn ONCE per process
@@ -568,17 +585,20 @@ class _SolwynBase:
             recovery_timeout_jitter=self._config.circuit_breaker_recovery_timeout_jitter,
         )
 
-    def _apply_failover_tuning_directive(self, allowed: bool | None) -> float | None:
-        """Apply the server's tuning decision and return its effective deadline.
+    def _apply_failover_tuning_directive(self, allowed: bool | None) -> FailoverTuning:
+        """Apply the server's tuning decision; return the call's effective tuning.
 
-        ``None`` is advisory-delivery failure or a legacy/missing directive and
-        is therefore a no-op. Config mutation and retuning every existing
-        breaker share the breaker-management lock with lazy breaker creation,
-        so existing and newly created breakers receive coherent tuning before
-        the current call continues into post-check routing.
+        ``None`` is advisory-delivery failure or a legacy/missing directive:
+        no mutation, but the call still receives ONE coherent snapshot read
+        under the breaker-management lock (never a torn unlocked re-read).
+        Config mutation and retuning every existing breaker share that lock
+        with lazy breaker creation, so existing and newly created breakers
+        receive coherent tuning before the current call continues into
+        post-check routing.
         """
         if allowed is None:
-            return None
+            with self._breaker_lock:
+                return self._tuning_snapshot_locked()
 
         if allowed:
             effective = dict(self._requested_failover_tuning)
@@ -616,12 +636,22 @@ class _SolwynBase:
             ):
                 self._failover_tuning_suppression_logged = True
                 should_log_suppression = True
+            snapshot = self._tuning_snapshot_locked()
 
         if should_log_suppression:
             logger.warning(
                 "Custom failover tuning is unavailable for this plan; SDK defaults applied"
             )
-        return float(effective["failover_total_timeout"])
+        return snapshot
+
+    def _tuning_snapshot_locked(self) -> FailoverTuning:
+        """Read one coherent tuning snapshot. Caller must hold _breaker_lock."""
+        return FailoverTuning(
+            failover_total_timeout=self._config.failover_total_timeout,
+            failover_idempotency=self._config.failover_idempotency,
+            same_provider_retries=self._config.same_provider_retries,
+            failover_hop_read_timeout=self._config.failover_hop_read_timeout,
+        )
 
     def _get_circuit_breaker(self, provider: str) -> CircuitBreaker:
         """Get the circuit breaker for a provider.

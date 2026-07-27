@@ -915,11 +915,13 @@ class Solwyn(_SolwynBase):
             agent_run_id=agent_run[0],
             call_id=call_id,
         )
-        effective_total = self._apply_failover_tuning_directive(
+        # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
+        # must never re-read self._config (the directive writer mutates it
+        # under a lock; unlocked re-reads can tear).
+        tuning = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
         )
-        if effective_total is not None:
-            deadline.replace_total(effective_total)
+        deadline.replace_total(tuning.failover_total_timeout)
         self._reporter.observe_project_id(budget.project_id)
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
@@ -1088,11 +1090,13 @@ class Solwyn(_SolwynBase):
                 default_bound=self._config.lease_output_bound_default,
             ),
         )
-        effective_total = self._apply_failover_tuning_directive(
+        # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
+        # must never re-read self._config (the directive writer mutates it
+        # under a lock; unlocked re-reads can tear).
+        tuning = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
         )
-        if effective_total is not None:
-            deadline.replace_total(effective_total)
+        deadline.replace_total(tuning.failover_total_timeout)
         self._reporter.observe_project_id(budget.project_id)
         # Refresh the CostPolicy signal from the server. Price hints are advisory
         # and slow-moving, so they PERSIST across hint-less responses — a budget
@@ -1144,7 +1148,7 @@ class Solwyn(_SolwynBase):
         elif idempotent_override is False:
             effective_idempotency = "safe"
         else:
-            effective_idempotency = self._config.failover_idempotency
+            effective_idempotency = tuning.failover_idempotency
         allow_cross_provider = effective_idempotency != "never"
         allow_ambiguous_failover = effective_idempotency == "always"
 
@@ -1234,7 +1238,7 @@ class Solwyn(_SolwynBase):
 
             # Same-provider retry budget for THIS chain entry (config seam,
             # default 0). Consumed inside the inner attempt loop below.
-            same_retries_left = self._config.same_provider_retries
+            same_retries_left = tuning.same_provider_retries
             advanced = False
             while True:
                 ctx = _AttemptContext(
@@ -1932,11 +1936,13 @@ class AsyncSolwyn(_SolwynBase):
             agent_run_id=agent_run[0],
             call_id=call_id,
         )
-        effective_total = self._apply_failover_tuning_directive(
+        # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
+        # must never re-read self._config (the directive writer mutates it
+        # under a lock; unlocked re-reads can tear).
+        tuning = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
         )
-        if effective_total is not None:
-            deadline.replace_total(effective_total)
+        deadline.replace_total(tuning.failover_total_timeout)
         self._reporter.observe_project_id(budget.project_id)
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
@@ -2092,11 +2098,13 @@ class AsyncSolwyn(_SolwynBase):
                 default_bound=self._config.lease_output_bound_default,
             ),
         )
-        effective_total = self._apply_failover_tuning_directive(
+        # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
+        # must never re-read self._config (the directive writer mutates it
+        # under a lock; unlocked re-reads can tear).
+        tuning = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
         )
-        if effective_total is not None:
-            deadline.replace_total(effective_total)
+        deadline.replace_total(tuning.failover_total_timeout)
         self._reporter.observe_project_id(budget.project_id)
         # Refresh the CostPolicy signal from the server. Hints PERSIST across
         # hint-less responses (cache hits) until the server sends new ones — see
@@ -2142,7 +2150,7 @@ class AsyncSolwyn(_SolwynBase):
         elif idempotent_override is False:
             effective_idempotency = "safe"
         else:
-            effective_idempotency = self._config.failover_idempotency
+            effective_idempotency = tuning.failover_idempotency
         allow_cross_provider = effective_idempotency != "never"
         allow_ambiguous_failover = effective_idempotency == "always"
 
@@ -2230,7 +2238,7 @@ class AsyncSolwyn(_SolwynBase):
 
             # Same-provider retry budget for THIS chain entry (mirrors the sync
             # walk); consumed inside the inner attempt loop below.
-            same_retries_left = self._config.same_provider_retries
+            same_retries_left = tuning.same_provider_retries
             advanced = False
             while True:
                 ctx = _AttemptContext(
