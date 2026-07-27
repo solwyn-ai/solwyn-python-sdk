@@ -218,11 +218,13 @@ derived from git tags (hatch-vcs).
 
 - **`failover_hop_read_timeout` (default `600.0`) bounds each hop's
   read/write**, decoupled from the failover window. `600.0` matches the
-  openai/anthropic SDK defaults, so a wrapped call never times out earlier than
-  the unwrapped SDK would. Like every other failover knob it is constructor-only
-  (deliberately no `SOLWYN_*` env var) and server-governed: on a plan without
-  the failover-tuning entitlement a custom value is suppressed back to `600.0`,
-  warned once per client. Values must be greater than zero.
+  openai/anthropic SDK's read/write default, so a wrapped call's read/write
+  bound never fires earlier than the unwrapped SDK's would; connect/pool
+  instead track the shrinking failover window. Like every other failover knob
+  it is constructor-only (deliberately no `SOLWYN_*` env var) and
+  server-governed: on a plan without the failover-tuning entitlement a custom
+  value is suppressed back to `600.0`, warned once per client. Values must be
+  greater than zero.
 - **Building a Bedrock client with an unbounded botocore read timeout now warns
   at build time.** Solwyn cannot bound a Bedrock hop per call (boto3 has no
   per-call timeout override), so the caller's botocore

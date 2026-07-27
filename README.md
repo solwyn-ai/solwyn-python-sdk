@@ -410,7 +410,7 @@ Failover is bounded by two independent timeouts. Like the rest of the failover t
 
 The failover window deliberately does *not* cap a dispatched hop's read. A pre-send hang (connect, pool wait) is provably failover-safe, so it must fail inside the window; a read timeout is post-send *ambiguous* — the request may already have been served and billed — and under the default `failover_idempotency="safe"` it re-raises instead of failing over. Cutting a slow read at the failover window therefore buys no failover, only ambiguous spend.
 
-`600.0` matches the openai/anthropic SDK defaults, so a wrapped call never times out earlier than the unwrapped SDK would. Because window expiry gates advancement *between* hops, at most one hop per call can consume the full read bound: worst-case wall clock is roughly one failover window plus one `failover_hop_read_timeout`.
+`600.0` matches the openai/anthropic SDK's read/write default, so a wrapped call's read/write bound never fires earlier than the unwrapped SDK's would — connect/pool instead track the shrinking failover window. Because window expiry gates advancement *between* hops, at most one hop per call can consume the full read bound: worst-case wall clock is roughly one failover window plus one `failover_hop_read_timeout`.
 
 Lower `failover_hop_read_timeout` if you would rather fail fast than wait out a slow generation (reasoning models, large `max_tokens`) — remembering that the fast failure is an ambiguous re-raise, not a failover:
 
