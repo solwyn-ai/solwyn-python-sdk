@@ -16,6 +16,7 @@ import httpx
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, make_mock_client
 
+from solwyn._base import MediaSurfaceSpec
 from solwyn._token_details import TokenDetails
 from solwyn.client import (
     AsyncSolwyn,
@@ -178,6 +179,25 @@ def _openai_response() -> SimpleNamespace:
     )
 
 
+def _openai_stream_chunks() -> list[SimpleNamespace]:
+    # Copied from tests/unit/test_settlement_parity.py:95-110.
+    return [
+        SimpleNamespace(
+            usage=None,
+            choices=[SimpleNamespace(delta=SimpleNamespace(content="Hi"))],
+        ),
+        SimpleNamespace(
+            usage=SimpleNamespace(
+                prompt_tokens=100,
+                completion_tokens=50,
+                prompt_tokens_details=None,
+                completion_tokens_details=None,
+            ),
+            choices=[],
+        ),
+    ]
+
+
 def _make_solwyn(client: object, recorder: _ControlPlaneRecorder) -> Solwyn:
     solwyn = Solwyn(client, api_key=VALID_API_KEY, model="gpt-5.5")
     solwyn._budget._http.close()
@@ -269,3 +289,98 @@ class TestPaidResponseSurvivesBookkeepingFailure:
         assert len(recorder.confirms) == 1
         success_events = [e for e in recorder.events if e["status"] == "success"]
         assert success_events[0]["token_details"]["is_estimated"] is True
+
+
+def _route_media_to_embeddings(surface, client, kwargs, *, timeout, max_retries):
+    """Stand-in ``prepare_media_call``: route the embeddings surface to the SDK."""
+    return client.embeddings.create, dict(kwargs)
+
+
+@pytest.mark.unit
+class TestStreamingAndMediaBookkeepingFailSoft:
+    def test_stream_region_raise_still_yields_stream_and_settles(self) -> None:
+        client = make_mock_client()
+        client.chat.completions.create.return_value = iter(_openai_stream_chunks())
+        recorder = _ControlPlaneRecorder()
+        solwyn = _make_solwyn(client, recorder)
+        adapter = solwyn._runtimes[0].adapter
+
+        with patch.object(type(adapter), "extract_region", side_effect=AttributeError("region")):
+            stream = solwyn.chat.completions.create(stream=True, **_PLAIN_REQUEST)
+            chunks = list(stream)  # consuming settles via on_complete
+        solwyn.close()
+
+        assert len(chunks) == 2
+        assert len(recorder.confirms) == 1
+
+    def test_error_event_region_raise_preserves_original_error(self) -> None:
+        client = make_mock_client()
+        client.chat.completions.create.side_effect = RuntimeError("provider down")
+        recorder = _ControlPlaneRecorder()
+        solwyn = _make_solwyn(client, recorder)
+        adapter = solwyn._runtimes[0].adapter
+
+        with (
+            patch.object(type(adapter), "extract_region", side_effect=AttributeError("region")),
+            pytest.raises(RuntimeError, match="provider down"),
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+        solwyn.close()
+
+    def test_media_extract_usage_raise_still_returns_response_and_settles(self) -> None:
+        client = make_mock_client()
+        resp = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=42))
+        client.embeddings.create.return_value = resp
+        recorder = _ControlPlaneRecorder()
+        solwyn = _make_solwyn(client, recorder)
+
+        def _raising_extract_usage(_response: Any) -> TokenDetails | None:
+            raise RuntimeError("usage extraction failed")
+
+        spec = MediaSurfaceSpec(
+            surface="embeddings",
+            modality="embedding",
+            extract_usage=_raising_extract_usage,
+            measure_request=lambda _kwargs: TokenDetails(input_tokens=7),
+        )
+
+        with patch.object(
+            solwyn._runtimes[0].adapter, "prepare_media_call", _route_media_to_embeddings
+        ):
+            result = solwyn._media_call(spec, model="text-embedding-3-small", input="hello world")
+        solwyn.close()
+
+        # The paid media response reached the caller despite the raise — R5's
+        # core assertion, mirrored from the chat success-block tests above.
+        assert result is resp
+        assert len(recorder.confirms) == 1
+
+    async def test_async_media_extract_usage_raise_still_returns_response_and_settles(
+        self,
+    ) -> None:
+        client = make_mock_client(name="AsyncOpenAI")
+        resp = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=42))
+        client.embeddings.create = AsyncMock(return_value=resp)
+        recorder = _ControlPlaneRecorder()
+        solwyn = await _make_async_solwyn(client, recorder)
+
+        def _raising_extract_usage(_response: Any) -> TokenDetails | None:
+            raise RuntimeError("usage extraction failed")
+
+        spec = MediaSurfaceSpec(
+            surface="embeddings",
+            modality="embedding",
+            extract_usage=_raising_extract_usage,
+            measure_request=lambda _kwargs: TokenDetails(input_tokens=7),
+        )
+
+        with patch.object(
+            solwyn._runtimes[0].adapter, "prepare_media_call", _route_media_to_embeddings
+        ):
+            result = await solwyn._media_call(
+                spec, model="text-embedding-3-small", input="hello world"
+            )
+        await solwyn.close()
+
+        assert result is resp
+        assert len(recorder.confirms) == 1

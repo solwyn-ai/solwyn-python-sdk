@@ -1047,12 +1047,36 @@ class Solwyn(_SolwynBase):
         #    non-token MediaUsage basis. BOTH ride the confirm when observable —
         #    the server's pricing card unit picks (e.g. native gpt-image sends
         #    token usage with image buckets AND request-derived image quantities).
-        token_details = spec.extract_usage(response)
+        #
+        # Fail-soft bookkeeping (R5): the provider has answered — a surface-spec
+        # or adapter raise must not destroy the paid media response. Usage
+        # degrades to the request-derived measure, then to None; a None/None
+        # pair simply skips the confirm exactly as before.
+        token_details: TokenDetails | None = None
+        try:
+            token_details = spec.extract_usage(response)
+        except Exception as exc:
+            logger.warning(
+                "settlement.media_extract_usage_failed_fail_soft: %s",
+                type(exc).__name__,
+            )
         if token_details is None:
-            token_details = spec.measure_request(kwargs)
-        media_usage = (
-            spec.measure_media(kwargs, response) if spec.measure_media is not None else None
-        )
+            try:
+                token_details = spec.measure_request(kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "settlement.media_measure_request_failed_fail_soft: %s",
+                    type(exc).__name__,
+                )
+        media_usage = None
+        if spec.measure_media is not None:
+            try:
+                media_usage = spec.measure_media(kwargs, response)
+            except Exception as exc:
+                logger.warning(
+                    "settlement.media_measure_media_failed_fail_soft: %s",
+                    type(exc).__name__,
+                )
 
         # 5. Settle OFF the hot path: build the confirm sans-I/O and enqueue it
         #    with the metadata event as one ordered settlement (same path as
@@ -1060,7 +1084,7 @@ class Solwyn(_SolwynBase):
         #    skipped only when both are None (never settle a real $0 price).
         #    When only media is observed, a zeroed TokenDetails carries the
         #    confirm's required token field.
-        service_tier = runtime.adapter.extract_service_tier(response)
+        service_tier = _safe_extract_service_tier(runtime, response)
         confirm = None
         reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
         if (reservation_id or lease_id) and (token_details is not None or media_usage is not None):
@@ -1382,7 +1406,7 @@ class Solwyn(_SolwynBase):
                             call_id=call_id,
                             possibly_succeeded=True if possibly_succeeded else None,
                             agent_run=agent_run,
-                            provider_region=rt.adapter.extract_region(rt.sdk_client),
+                            provider_region=_safe_extract_region(rt),
                         )
                     )
                     if disp is Disposition.FAIL_FAST:
@@ -1557,7 +1581,7 @@ class Solwyn(_SolwynBase):
         )
         # Per-region pricing attribution for the SERVED runtime (None for
         # providers without regional pricing). Captured once, closed over.
-        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
+        provider_region = _safe_extract_region(runtime)
 
         def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             self._get_circuit_breaker(provider).record_success()
@@ -2049,18 +2073,42 @@ class AsyncSolwyn(_SolwynBase):
             raise
         latency_ms = (time.monotonic() - start) * 1000
 
-        token_details = spec.extract_usage(response)
+        # Fail-soft bookkeeping (R5): the provider has answered — a surface-spec
+        # or adapter raise must not destroy the paid media response. Usage
+        # degrades to the request-derived measure, then to None; a None/None
+        # pair simply skips the confirm exactly as before. Mirrors the sync
+        # ``_media_call``.
+        token_details: TokenDetails | None = None
+        try:
+            token_details = spec.extract_usage(response)
+        except Exception as exc:
+            logger.warning(
+                "settlement.media_extract_usage_failed_fail_soft: %s",
+                type(exc).__name__,
+            )
         if token_details is None:
-            token_details = spec.measure_request(kwargs)
-        media_usage = (
-            spec.measure_media(kwargs, response) if spec.measure_media is not None else None
-        )
+            try:
+                token_details = spec.measure_request(kwargs)
+            except Exception as exc:
+                logger.warning(
+                    "settlement.media_measure_request_failed_fail_soft: %s",
+                    type(exc).__name__,
+                )
+        media_usage = None
+        if spec.measure_media is not None:
+            try:
+                media_usage = spec.measure_media(kwargs, response)
+            except Exception as exc:
+                logger.warning(
+                    "settlement.media_measure_media_failed_fail_soft: %s",
+                    type(exc).__name__,
+                )
 
         # Settle OFF the hot path: build the confirm sans-I/O and enqueue it
         # with the metadata event as one ordered settlement (same path as chat
         # + streaming). Confirm fires when EITHER basis is observable; skipped
         # only when both are None. See the sync mirror.
-        service_tier = runtime.adapter.extract_service_tier(response)
+        service_tier = _safe_extract_service_tier(runtime, response)
         confirm = None
         reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
         if (reservation_id or lease_id) and (token_details is not None or media_usage is not None):
@@ -2364,7 +2412,7 @@ class AsyncSolwyn(_SolwynBase):
                             call_id=call_id,
                             possibly_succeeded=True if possibly_succeeded else None,
                             agent_run=agent_run,
-                            provider_region=rt.adapter.extract_region(rt.sdk_client),
+                            provider_region=_safe_extract_region(rt),
                         )
                     )
                     if disp is Disposition.FAIL_FAST:
@@ -2532,7 +2580,7 @@ class AsyncSolwyn(_SolwynBase):
         )
         # Per-region pricing attribution for the SERVED runtime (None for
         # providers without regional pricing). Captured once, closed over.
-        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
+        provider_region = _safe_extract_region(runtime)
 
         async def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             self._get_circuit_breaker(provider).record_success()
