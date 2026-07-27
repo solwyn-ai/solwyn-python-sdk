@@ -639,9 +639,56 @@ def _compat_acc(estimated_input_tokens: int = 0, name: str = "groq") -> CompatSt
     )
 
 
+def _compat_content_chunk(text: str) -> SimpleNamespace:
+    delta = SimpleNamespace(content=text, reasoning_content=None, tool_calls=None)
+    return SimpleNamespace(choices=[SimpleNamespace(delta=delta)], usage=None, x_groq=None)
+
+
+def _compat_usage_chunk(prompt: int, completion: int) -> SimpleNamespace:
+    usage = SimpleNamespace(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=prompt + completion,
+    )
+    return SimpleNamespace(choices=[], usage=usage, x_groq=None)
+
+
 @pytest.mark.unit
 class TestCompatStreamAccumulator:
     """Compat tiers: standard usage -> x_groq.usage -> explicit estimation."""
+
+    def test_content_accumulation_stops_after_usage_latch(self) -> None:
+        acc = _compat_acc(estimated_input_tokens=10)
+
+        acc.observe(_compat_usage_chunk(10, 5))
+        acc.observe(_compat_content_chunk("a" * 500))
+        acc.observe(_compat_content_chunk("b" * 500))
+
+        assert acc._content_chars == 0
+        result = acc.finalize()
+        assert result.input_tokens == 10
+        assert result.output_tokens == 5
+        assert result.is_estimated is False
+
+    def test_content_accumulation_runs_until_usage_latch(self) -> None:
+        acc = _compat_acc()
+
+        acc.observe(_compat_content_chunk("a" * 100))
+        assert acc._content_chars == 100
+        acc.observe(_compat_usage_chunk(10, 5))
+        acc.observe(_compat_content_chunk("b" * 100))
+
+        assert acc._content_chars == 100
+
+    def test_estimation_tier_still_accumulates_without_usage(self) -> None:
+        acc = _compat_acc()
+
+        acc.observe(_compat_content_chunk("a" * 400))
+        acc.observe(_compat_content_chunk("b" * 400))
+
+        result = acc.finalize()
+        assert result.is_estimated is True
+        assert result.output_tokens > 0
 
     def test_tier1_last_nonzero_usage_wins(self) -> None:
         acc = _compat_acc()

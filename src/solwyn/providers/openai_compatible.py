@@ -527,7 +527,8 @@ class CompatStreamAccumulator:
         # endpoint must never raise out of observe — the stream wrapper would
         # settle a deliverable stream as a provider FAILURE (breaker hit
         # against a content-healthy provider). A failed tier degrades to
-        # estimation; content-length accumulation below always runs.
+        # estimation; content-length accumulation below runs until a usage tier
+        # latches.
         try:
             if getattr(chunk, "usage", None) is not None:
                 extracted = _extract_openai_usage(chunk)
@@ -552,7 +553,11 @@ class CompatStreamAccumulator:
                         self._x_groq_details = x_details
         except Exception:
             pass  # unreadable/garbage usage values — estimation tier covers it
-        self._content_chars += estimate_stream_chunk_content_length(chunk)
+        if self._usage_details is None and self._x_groq_details is None:
+            # Once either usage tier latches it never un-latches, and
+            # _content_chars feeds ONLY finalize()'s tier-3 estimate — which is
+            # unreachable after a latch. Skip the per-chunk length walk then.
+            self._content_chars += estimate_stream_chunk_content_length(chunk)
 
     def finalize(self) -> TokenDetails:
         if self._usage_details is not None:
