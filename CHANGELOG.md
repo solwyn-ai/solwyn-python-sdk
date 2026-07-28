@@ -7,6 +7,17 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-28
+
+The control plane comes off the hot path: run-scoped token leases replace the
+per-call budget check, all settlement rides the reporter off the caller's thread,
+and spend telemetry is delivered at least once across outages, forks, and
+interpreter exit. Failover timeouts split the failover window from each hop's
+read bound, and post-success bookkeeping is fail-soft. Wire-contract changes are
+API-first: Solwyn Cloud accepts every field below before this SDK releases.
+Ships #36–#45; includes pre-launch breaking changes to the enforcer and
+confirm-builder APIs, noted under *Changed*.
+
 ### Changed
 
 - **The SDK now does less work on per-call and background hot paths while
@@ -447,6 +458,8 @@ derived from git tags (hatch-vcs).
   success (server contract drift), distinct from transport-level failures that
   record breaker failure. The distinction is implemented in both sync and async
   enforcers (R6).
+
+---
 
 ## [0.3.0] - 2026-07-16
 
