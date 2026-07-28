@@ -30,8 +30,11 @@ jobs:
         with:
           name: Packages
           path: dist
-      - run: pip install dist/*.whl
-      - run: pip install pytest pytest-asyncio
+      # Install the BUILT wheel plus its own [dev] extra, so the unit suite runs
+      # against the artifact we are about to publish while its test-only deps
+      # (respx, the real provider SDKs) come from pyproject's single source of
+      # truth. A hand-copied list here silently drifted once already.
+      - run: pip install "$(ls dist/*.whl)[dev]"
       - run: pytest tests/ -m unit -v --tb=short
 
   publish:
