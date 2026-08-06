@@ -224,6 +224,8 @@ The "never sent" entries above describe Solwyn's own injection policy. A `stream
 
 **Known limitation.** Circuit-breaker health, latency signals, and failover labeling key off the provider *name*. Two chain entries that resolve to the same name (two Azure resources, two unnamed gateways both detected as `openai_compatible`) share one health domain and are reported as model fallbacks of each other. For the same reason, a hop between same-name entries skips cross-provider request sanitization — `stream_options` stripping, the `max_completion_tokens` → `max_tokens` rewrite, and endpoint-scoped param stripping (`extra_headers`/`extra_query`/`extra_body`). A `stream_options` or gateway header you authored for the first endpoint reaches the second untouched and can 4xx there. Give distinct endpoints distinct provider identities where possible — explicit `provider=` on the constructor, or the 4th element of a fallback spec.
 
+**Known limitation.** `solwyn_tags` is removed only on intercepted provider calls. On non-intercepted surfaces such as `client.files.create(...)`, it is passed through to the provider SDK, which can raise `TypeError` for the unexpected keyword. Call those surfaces without `solwyn_tags`.
+
 ## Media surfaces
 
 Beyond chat, Solwyn tracks the non-text surfaces that spend money. Each rides the same budget-check → provider call → confirm lifecycle as a chat call, tagged with its modality (`embedding`, `image`, `audio`, `video`) so Solwyn Cloud's PricingService prices it on the right card. There is no cross-provider failover for these surfaces — an embedding vector or a generated image isn't interchangeable across providers.
@@ -322,6 +324,8 @@ with solwyn.run("orchestrator", tags={"team": "research", "workflow": "eval"}):
 Use the reserved `solwyn_tags=` keyword as a call argument, not in `default_params`; it is removed before provider dispatch. Precedence is client defaults, then the active run scope, then per-call tags, with the higher-precedence value kept on conflicts. Each supplied mapping allows at most 10 string keys, keys must contain 1–64 characters, and string values may contain 0–256 characters. The SDK validates and copies mappings at client or run creation and at call start, so invalid input fails eagerly and later caller mutation cannot change attribution.
 
 The combined map can exceed 10 keys even when each supplied mapping is valid. In that case the SDK keeps 10 deterministically: per-call keys first, then active-scope keys, then client-default keys, preserving insertion order within each layer. It emits one `SolwynTagsClampedWarning` for the overflowing call and still dispatches the provider request; lower-priority excess tags are absent from that call's event.
+
+Use `solwyn.current_run_context()` to read the active `RunContext(id, name, tags)`. Its tag mapping is a fresh copy, so caller mutation cannot change the active scope. `solwyn.current_run()` returns the `(id, name)` pair.
 
 Works the same with `async with` and is safe across concurrent asyncio tasks — each task sees only its own active run. Calls made outside a `solwyn.run(...)` scope are still tracked; the API groups them into `_auto-{sdk_instance_id}-{YYYY-MM-DD}` using the event's UTC timestamp.
 

@@ -31,7 +31,7 @@ from contextlib import AbstractAsyncContextManager, AbstractContextManager, supp
 from contextvars import ContextVar, Token, copy_context
 from dataclasses import dataclass
 from types import FrameType, TracebackType
-from typing import ParamSpec, TypeVar
+from typing import NamedTuple, ParamSpec, TypeVar
 
 from solwyn._constants import (
     AGENT_RUN_NAME_MAX_LENGTH,
@@ -44,6 +44,15 @@ from solwyn.exceptions import SolwynTagsClampedWarning
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 _RunContextSnapshot = tuple[str | None, str | None, dict[str, str] | None]
+
+
+class RunContext(NamedTuple):
+    """Public snapshot of the active agent-run scope."""
+
+    id: str | None
+    name: str | None
+    tags: dict[str, str] | None
+
 
 # Single contextvar holding either None or one run payload. Storing all values
 # together makes the swap atomic across async task transitions.
@@ -83,6 +92,15 @@ def current_run() -> tuple[str | None, str | None]:
     if active is None:
         return (None, None)
     return (active[0], active[1])
+
+
+def current_run_context() -> RunContext:
+    """Return the active run id, name, and a defensive copy of its tags."""
+    active = _active_run.get()
+    if active is None:
+        return RunContext(None, None, None)
+    tags = dict(active[2]) if active[2] is not None else None
+    return RunContext(active[0], active[1], tags)
 
 
 def _copy_tags(

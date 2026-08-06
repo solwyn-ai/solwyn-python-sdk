@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 import solwyn._validation as validation
-from solwyn._validation import validate_project_id, validate_project_key_format
+from solwyn._validation import validate_project_key_format
 
 
 @pytest.mark.unit
@@ -36,22 +36,6 @@ def test_legacy_validate_api_key_format_symbol_is_removed() -> None:
 
 
 @pytest.mark.unit
-def test_validate_project_id_accepts_public_copy_id() -> None:
-    project_id = "proj_" + "a" * 24
-
-    assert validate_project_id(project_id) == project_id
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    "project_id",
-    [
-        "proj_" + "a" * 8,
-        "proj_" + "A" * 24,
-        "proj_" + "g" * 24,
-        "proj_" + "a" * 25,
-    ],
-)
-def test_validate_project_id_rejects_old_or_non_hex_formats(project_id: str) -> None:
-    with pytest.raises(ValueError, match="24 lowercase hex"):
-        validate_project_id(project_id)
+def test_dead_project_id_validator_is_absent_while_project_key_validator_remains() -> None:
+    assert not hasattr(validation, "validate_project_id")
+    assert callable(validation.validate_project_key_format)

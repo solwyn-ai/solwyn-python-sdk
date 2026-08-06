@@ -1041,6 +1041,7 @@ class Solwyn(_SolwynBase):
             modality=spec.modality,
             estimated_media=estimated_media,
             agent_run_id=agent_run[0],
+            tags=agent_run[2],
             call_id=call_id,
         )
         # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
@@ -1255,6 +1256,7 @@ class Solwyn(_SolwynBase):
             fallback_models=[r.entry.model for r in self._runtimes[1:]],
             timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
             agent_run_id=agent_run[0],
+            tags=agent_run[2],
             call_id=call_id,
             estimated_output_bound=_effective_output_bound(
                 primary=primary,
@@ -2128,6 +2130,7 @@ class AsyncSolwyn(_SolwynBase):
             modality=spec.modality,
             estimated_media=estimated_media,
             agent_run_id=agent_run[0],
+            tags=agent_run[2],
             call_id=call_id,
         )
         # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
@@ -2325,6 +2328,7 @@ class AsyncSolwyn(_SolwynBase):
             fallback_models=[r.entry.model for r in self._runtimes[1:]],
             timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
             agent_run_id=agent_run[0],
+            tags=agent_run[2],
             call_id=call_id,
             estimated_output_bound=_effective_output_bound(
                 primary=primary,

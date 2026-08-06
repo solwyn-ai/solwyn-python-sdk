@@ -42,6 +42,13 @@ _RUN_DENY_RESPONSE = {
     "denied_by_period": "agent_run",
 }
 
+_TAG_DENY_RESPONSE = {
+    **_DENY_RESPONSE,
+    "budget_limit": 25.0,
+    "current_usage": 24.5,
+    "denied_by_period": "tag",
+}
+
 
 def _response(payload: dict[str, object]) -> MagicMock:
     response = MagicMock(spec=httpx.Response)
@@ -113,6 +120,23 @@ class TestBudgetEnforcerBase:
         )
 
         assert req.agent_run_id == "run_abc"
+
+    def test_build_check_request_carries_copied_tags(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+        tags = {"team": "research"}
+
+        req = base._build_check_request(
+            500,
+            "gpt-5.5",
+            "openai",
+            tags=tags,
+        )
+        tags["team"] = "mutated"
+
+        assert req.tags == {"team": "research"}
 
     def test_local_cost_tracking(self) -> None:
         base = _BudgetEnforcerBase(
@@ -223,6 +247,28 @@ class TestCloudAllow:
         assert result.reservation_id == "res_123"
         assert result.warning is None
         assert result.failover_tuning_allowed is True
+
+    def test_tagged_run_uses_per_call_check_and_sends_tags(self) -> None:
+        enforcer = _make_enforcer()
+        mock_response = MagicMock()
+        mock_response.json.return_value = ALLOW_BUDGET_RESPONSE
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(enforcer._http, "post", return_value=mock_response) as post:
+            result = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_tagged",
+                call_id="3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b",
+                estimated_output_bound=100,
+                tags={"team": "research"},
+            )
+
+        assert result.allowed is True
+        post.assert_called_once()
+        assert post.call_args.args[0].endswith("/api/v1/budgets/check")
+        assert post.call_args.kwargs["json"]["tags"] == {"team": "research"}
 
     def test_shared_allow_fixture_propagates_non_none_price_hints(self) -> None:
         enforcer = _make_enforcer()
@@ -615,6 +661,256 @@ class TestCacheBehaviour:
 
             # Both calls should hit HTTP (deny is never cached)
             assert mock_post.call_count == 2
+
+    def test_tagged_checks_bypass_and_do_not_replace_global_allow_cache(self) -> None:
+        enforcer = _make_enforcer()
+        global_allow = _response({**ALLOW_BUDGET_RESPONSE, "reservation_id": "res_global"})
+        tagged_allow = _response(
+            {
+                **ALLOW_BUDGET_RESPONSE,
+                "reservation_id": "res_tagged",
+                "budget_limit": 75.0,
+                "current_usage": 12.5,
+            }
+        )
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[global_allow, tagged_allow],
+        ) as post:
+            first = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+            )
+            tagged = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                tags={"team": "research"},
+            )
+            cached = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+            )
+
+        assert first.reservation_id == "res_global"
+        assert tagged.reservation_id == "res_tagged"
+        assert cached.reservation_id is None
+        assert enforcer._cached_response is not None
+        assert enforcer._cached_response.reservation_id == "res_global"
+        assert enforcer._last_known_budget_limit == 75.0
+        assert enforcer._last_known_current_usage == 12.5
+        assert post.call_count == 2
+
+    def test_tagged_allow_does_not_populate_global_cache_and_clears_project_sticky(
+        self,
+    ) -> None:
+        enforcer = _make_legacy_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        tagged_allow = {
+            **ALLOW_BUDGET_RESPONSE,
+            "budget_limit": 80.0,
+            "current_usage": 20.0,
+        }
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[_response(_DENY_RESPONSE), _response(tagged_allow)],
+        ) as post:
+            enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+            )
+            allowed = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                tags={"team": "research"},
+            )
+
+        assert allowed.allowed is True
+        assert post.call_count == 2
+        assert enforcer._cached_response is None
+        assert enforcer._last_hard_deny_response is None
+        assert enforcer._last_known_budget_limit == 80.0
+        assert enforcer._last_known_current_usage == 20.0
+
+    def test_tagged_allow_clears_same_run_sticky_deny(self) -> None:
+        enforcer = _make_legacy_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[_response(_RUN_DENY_RESPONSE), _response(ALLOW_BUDGET_RESPONSE)],
+        ):
+            enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+            allowed = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_a",
+                tags={"team": "research"},
+            )
+
+        assert allowed.allowed is True
+        assert "run_a" not in enforcer._run_hard_deny_responses
+
+    def test_tag_scoped_hard_deny_does_not_poison_global_or_run_sticky_state(
+        self,
+    ) -> None:
+        enforcer = _make_legacy_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[
+                _response(_TAG_DENY_RESPONSE),
+                httpx.ConnectError("unreachable"),
+            ],
+        ):
+            denied = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_a",
+                tags={"team": "research"},
+            )
+            outage = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+
+        assert denied.allowed is False
+        assert outage.allowed is True
+        assert enforcer._last_hard_deny_response is None
+        assert "run_a" not in enforcer._run_hard_deny_responses
+        assert enforcer._last_known_budget_limit == 25.0
+        assert enforcer._last_known_current_usage == 24.5
+
+    def test_tag_scoped_hard_deny_preserves_existing_same_run_authority(self) -> None:
+        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        run_denial = BudgetCheckResponse(**_RUN_DENY_RESPONSE)
+        enforcer._cache_response(run_denial, agent_run_id="run_a")
+        enforcer._cache_response(BudgetCheckResponse(**_DENY_RESPONSE))
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[
+                _response(_TAG_DENY_RESPONSE),
+                httpx.ConnectError("unreachable"),
+            ],
+        ) as post:
+            tagged_denial = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_a",
+                tags={"team": "research"},
+            )
+
+            assert tagged_denial.allowed is False
+            assert enforcer._last_hard_deny_response is None
+            assert enforcer._run_hard_deny_responses["run_a"] == run_denial
+            assert enforcer._lease_path_applies("run_a") is False
+
+            outage = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+
+        assert outage.allowed is False
+        assert outage.warning is not None
+        assert "preserving prior hard deny" in outage.warning.lower()
+        assert post.call_count == 2
+
+    def test_tagged_project_period_hard_deny_invalidates_global_allow_and_sticks(
+        self,
+    ) -> None:
+        enforcer = _make_legacy_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[
+                _response(ALLOW_BUDGET_RESPONSE),
+                _response(_DENY_RESPONSE),
+                httpx.ConnectError("unreachable"),
+            ],
+        ) as post:
+            enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+            )
+            denied = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                tags={"team": "research"},
+            )
+            outage = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+            )
+
+        assert denied.allowed is False
+        assert outage.allowed is False
+        assert post.call_count == 3
+        assert enforcer._cached_response is None
+        assert enforcer._last_hard_deny_response is not None
+
+    def test_tagged_agent_run_hard_deny_remains_run_scoped(self) -> None:
+        enforcer = _make_legacy_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[
+                _response(_RUN_DENY_RESPONSE),
+                httpx.ConnectError("unreachable"),
+                httpx.ConnectError("unreachable"),
+            ],
+        ):
+            denied = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_a",
+                tags={"team": "research"},
+            )
+            outage_b = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_b",
+            )
+            outage_a = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+
+        assert denied.allowed is False
+        assert outage_b.allowed is True
+        assert outage_a.allowed is False
+        assert enforcer._last_hard_deny_response is None
+        assert set(enforcer._run_hard_deny_responses) == {"run_a"}
 
 
 @pytest.mark.unit

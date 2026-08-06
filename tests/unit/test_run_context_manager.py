@@ -60,6 +60,43 @@ class TestRunContextManagerSync:
         # Before any scope is entered, no run is active.
         assert current_run() == (None, None)
 
+    def test_current_run_context_outside_scope_returns_empty_named_tuple(self) -> None:
+        assert solwyn.current_run_context() == solwyn.RunContext(None, None, None)
+
+    def test_current_run_context_exposes_active_id_name_and_tags(self) -> None:
+        with solwyn.run("tagged", tags={"team": "research"}) as run_id:
+            context = solwyn.current_run_context()
+
+            assert context == solwyn.RunContext(run_id, "tagged", {"team": "research"})
+            assert context.id == run_id
+            assert context.name == "tagged"
+            assert current_run() == (run_id, "tagged")
+
+    def test_current_run_context_returns_defensive_tag_copies(self) -> None:
+        with solwyn.run("tagged", tags={"team": "research"}):
+            first = solwyn.current_run_context()
+            assert first.tags is not None
+
+            first.tags["team"] = "mutated"
+
+            second = solwyn.current_run_context()
+            assert second.tags == {"team": "research"}
+            assert second.tags is not first.tags
+
+    def test_current_run_context_restores_outer_scope_after_nesting(self) -> None:
+        with solwyn.run("outer", tags={"scope": "outer"}) as outer_id:
+            outer = solwyn.current_run_context()
+            with solwyn.run("inner", tags={"scope": "inner"}) as inner_id:
+                inner = solwyn.current_run_context()
+                assert inner == solwyn.RunContext(inner_id, "inner", {"scope": "inner"})
+
+            assert solwyn.current_run_context() == solwyn.RunContext(
+                outer_id,
+                "outer",
+                {"scope": "outer"},
+            )
+            assert solwyn.current_run_context().tags is not outer.tags
+
     def test_exit_clears_active_run(self) -> None:
         with solwyn.run("foo"):
             pass

@@ -229,6 +229,7 @@ class TestMediaCallSync:
         assert event.modality == "embedding"
         assert event.agent_run_id == run_id
         assert event.tags == {"team": "platform", "job": "embed"}
+        assert check.call_args.kwargs["tags"] == event.tags
         assert "solwyn_tags" not in client.embeddings.create.call_args.kwargs
 
         solwyn._reporter._http.close()
@@ -655,6 +656,7 @@ class TestMediaCallAsync:
         assert event.modality == "embedding"
         assert event.agent_run_id == run_id
         assert event.tags == {"team": "platform", "job": "embed"}
+        assert check.call_args.kwargs["tags"] == event.tags
         assert "solwyn_tags" not in client.embeddings.create.call_args.kwargs
 
         await solwyn._budget._http.aclose()

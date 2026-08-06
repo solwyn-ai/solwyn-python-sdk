@@ -33,3 +33,19 @@ def test_unsupported_surface_error_is_publicly_exported() -> None:
     assert "UnsupportedSurfaceError" in solwyn.__all__
     assert solwyn.UnsupportedSurfaceError is exceptions.UnsupportedSurfaceError
     assert issubclass(solwyn.UnsupportedSurfaceError, solwyn.SolwynError)
+
+
+@pytest.mark.unit
+def test_run_context_and_tag_bounds_are_publicly_exported() -> None:
+    expected = {
+        "current_run_context",
+        "RunContext",
+        "TAGS_MAX_KEYS",
+        "TAG_KEY_MAX_LENGTH",
+        "TAG_VALUE_MAX_LENGTH",
+    }
+
+    assert expected <= set(solwyn.__all__)
+    assert solwyn.TAGS_MAX_KEYS == 10
+    assert solwyn.TAG_KEY_MAX_LENGTH == 64
+    assert solwyn.TAG_VALUE_MAX_LENGTH == 256

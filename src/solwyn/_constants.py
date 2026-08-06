@@ -24,6 +24,8 @@ LEASE_ID_MAX_LENGTH = 64
 CALL_ID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 # Length of that canonical form; bounds the API's DB column and dedup key.
 CALL_ID_MAX_LENGTH = 36
+# Vendored lock-step with core's shared tag constants. Core's cross-repo
+# parity test pins all three values so either definition cannot drift silently.
 TAGS_MAX_KEYS = 10
 TAG_KEY_MAX_LENGTH = 64
 TAG_VALUE_MAX_LENGTH = 256

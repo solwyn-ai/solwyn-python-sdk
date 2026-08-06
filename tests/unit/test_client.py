@@ -625,6 +625,25 @@ class TestGetAttrPassThrough:
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
+    def test_solwyn_tags_reaches_non_intercepted_surface_and_provider_rejects_it(self) -> None:
+        class FilesResource:
+            def create(self, *, purpose: str) -> object:
+                return object()
+
+        client, _ = _mock_openai_client()
+        client.files = FilesResource()
+        solwyn = _make_solwyn(client)
+
+        assert solwyn.files is client.files
+        with pytest.raises(TypeError, match="solwyn_tags"):
+            solwyn.files.create(
+                purpose="assistants",
+                solwyn_tags={"team": "research"},
+            )
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
 
 @pytest.mark.unit
 class TestUnshippedSpendSurfacePosture:
@@ -885,6 +904,7 @@ class TestRichTokenExtraction:
 
         assert len(reported_events) == 1
         assert check.call_args.kwargs["agent_run_id"] == run_id
+        assert check.call_args.kwargs["tags"] == reported_events[0].tags
         assert reported_events[0].agent_run_id == run_id
         assert reported_events[0].agent_run_name == "nightly-batch"
         assert reported_events[0].tags == {
@@ -1027,6 +1047,7 @@ class TestRichTokenExtraction:
             **{f"default-{index}": "default" for index in range(2)},
         }
         assert len(reported_events[0].tags) == 10
+        assert check.call_args.kwargs["tags"] == reported_events[0].tags
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
@@ -1834,7 +1855,7 @@ class TestAsyncNonStreamingInterception:
             solwyn._budget,
             "check_budget",
             new=AsyncMockFn(return_value=_allow_budget_result()),
-        ):
+        ) as check:
             async with solwyn_pkg.run(
                 "precedence",
                 tags={"shared": "scope", "scope": "only"},
@@ -1851,6 +1872,7 @@ class TestAsyncNonStreamingInterception:
             "scope": "only",
             "call": "only",
         }
+        assert check.call_args.kwargs["tags"] == reported_events[0].tags
         assert "solwyn_tags" not in client.chat.completions.create.call_args.kwargs
 
         await solwyn._budget._http.aclose()
