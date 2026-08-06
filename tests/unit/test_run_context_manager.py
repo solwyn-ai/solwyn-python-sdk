@@ -129,6 +129,7 @@ class TestRunContextManagerSync:
                 run_id,
                 "tagged",
                 {"team": "research"},
+                None,
             )
 
     def test_nested_scope_restores_outer_tags(self) -> None:
@@ -138,12 +139,34 @@ class TestRunContextManagerSync:
                     inner_id,
                     "inner",
                     {"inner": "kept", "outer": "kept"},
+                    outer_id,
                 )
             assert _run._capture_run_context() == (
                 outer_id,
                 "outer",
                 {"outer": "kept"},
+                None,
             )
+
+    def test_sibling_snapshots_share_the_same_parent(self) -> None:
+        with solwyn.run("orchestrator") as parent_run_id:
+            with solwyn.run("first-child") as first_child_id:
+                first_snapshot = _run._capture_run_context()
+            with solwyn.run("second-child") as second_child_id:
+                second_snapshot = _run._capture_run_context()
+
+        assert first_snapshot == (first_child_id, "first-child", None, parent_run_id)
+        assert second_snapshot == (second_child_id, "second-child", None, parent_run_id)
+
+    def test_grandchild_snapshot_points_to_child(self) -> None:
+        with (
+            solwyn.run("orchestrator"),
+            solwyn.run("child") as child_run_id,
+            solwyn.run("grandchild") as grandchild_run_id,
+        ):
+            snapshot = _run._capture_run_context()
+
+        assert snapshot == (grandchild_run_id, "grandchild", None, child_run_id)
 
     def test_nested_scope_overwrites_only_conflicting_parent_keys(self) -> None:
         with (
@@ -173,11 +196,13 @@ class TestRunContextManagerSync:
                     inner_id,
                     "inner",
                     {"inner": "fresh"},
+                    outer_id,
                 )
             assert _run._capture_run_context() == (
                 outer_id,
                 "outer",
                 {"outer": "isolated"},
+                None,
             )
 
     def test_scope_copies_caller_mapping_and_private_snapshot(self) -> None:
@@ -348,14 +373,14 @@ class TestRunContextManagerSync:
         )
 
     def test_empty_merged_mapping_is_absent(self) -> None:
-        assert _run._capture_run_context({}) == (None, None, None)
+        assert _run._capture_run_context({}) == (None, None, None, None)
 
     def test_per_call_only_mapping_is_copied(self) -> None:
         tags = {"job": "batch"}
         captured = _run._capture_run_context(tags)
         tags["job"] = "mutated"
 
-        assert captured == (None, None, {"job": "batch"})
+        assert captured == (None, None, {"job": "batch"}, None)
 
     def test_exception_propagates_and_resets_state(self) -> None:
         with pytest.raises(RuntimeError, match="boom"), solwyn.run("foo"):

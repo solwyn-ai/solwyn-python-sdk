@@ -212,6 +212,7 @@ EXPECTED_METADATA_FIELDS = {
     "sdk_instance_id",
     "timestamp",
     "agent_run_id",
+    "parent_agent_run_id",
     "agent_run_name",
     "is_provider_fallback",
     "requested_provider",
@@ -771,6 +772,14 @@ class TestWireModelFieldConstraints:
         assert wire_constants.TAGS_MAX_KEYS == 10
         assert wire_constants.TAG_KEY_MAX_LENGTH == 64
         assert wire_constants.TAG_VALUE_MAX_LENGTH == 256
+
+    def test_metadata_parent_agent_run_id_matches_agent_run_id_bound(self) -> None:
+        schema = MetadataEvent.model_json_schema()["properties"]
+
+        assert (
+            schema["parent_agent_run_id"]["anyOf"][0]["maxLength"]
+            == schema["agent_run_id"]["anyOf"][0]["maxLength"]
+        )
 
     def test_metadata_tags_schema_exposes_all_wire_bounds(self) -> None:
         tags_schema = MetadataEvent.model_json_schema()["properties"]["tags"]["anyOf"][0]

@@ -346,6 +346,14 @@ class MetadataEvent(BaseModel):
             "server-side from the event timestamp."
         ),
     )
+    parent_agent_run_id: str | None = Field(
+        default=None,
+        max_length=AGENT_RUN_ID_MAX_LENGTH,
+        description=(
+            "Immediate enclosing solwyn.run() scope id for orchestrator-to-child "
+            "hierarchies. None for top-level and unscoped events."
+        ),
+    )
     agent_run_name: str | None = Field(
         default=None,
         max_length=AGENT_RUN_NAME_MAX_LENGTH,

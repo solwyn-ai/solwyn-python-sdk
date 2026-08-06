@@ -43,7 +43,12 @@ from solwyn.exceptions import SolwynTagsClampedWarning
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
-_RunContextSnapshot = tuple[str | None, str | None, dict[str, str] | None]
+_RunContextSnapshot = tuple[
+    str | None,
+    str | None,
+    dict[str, str] | None,
+    str | None,
+]
 
 
 class RunContext(NamedTuple):
@@ -66,6 +71,8 @@ _DISALLOWED_NAME_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 @dataclass(frozen=True)
 class _RunFrame:
     scope_id: int
+    run_id: str
+    parent_run_id: str | None
     token: Token[tuple[str, str, dict[str, str] | None] | None]
     prior_active: tuple[str, str, dict[str, str] | None] | None
 
@@ -137,14 +144,18 @@ def _capture_run_context(
     *,
     default_tags: object | None = None,
 ) -> _RunContextSnapshot:
-    """Capture the active run plus client, scope, and per-call tags."""
+    """Capture the active run, immediate parent, and merged tag layers."""
     active = _active_run.get()
     run_id: str | None = None
     run_name: str | None = None
+    parent_run_id: str | None = None
     defaults = _copy_tags(default_tags, parameter="client tags")
     scope_tags: dict[str, str] | None = None
     if active is not None:
         run_id, run_name, scope_tags = active
+        frames = _run_frames.get()
+        if frames:
+            parent_run_id = frames[-1].parent_run_id
     override = _copy_tags(per_call_tags, parameter="solwyn_tags")
 
     merged: dict[str, str] = {}
@@ -167,7 +178,7 @@ def _capture_run_context(
                 SolwynTagsClampedWarning,
                 stacklevel=2,
             )
-    return (run_id, run_name, merged or None)
+    return (run_id, run_name, merged or None, parent_run_id)
 
 
 def _name_has_disallowed_char(name: str) -> bool:
@@ -228,14 +239,24 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
             )
         run_id = _new_run_id()
         prior_active = _active_run.get()
+        frames = _run_frames.get()
+        parent_run_id = frames[-1].run_id if frames else None
         scope_tags = dict(self._tags or {})
         if self._inherit_tags and prior_active is not None and prior_active[2] is not None:
             for key, value in prior_active[2].items():
                 scope_tags.setdefault(key, value)
         token = _active_run.set((run_id, self._name, scope_tags or None))
-        frames = _run_frames.get()
         _run_frames.set(
-            (*frames, _RunFrame(scope_id=self._scope_id, token=token, prior_active=prior_active))
+            (
+                *frames,
+                _RunFrame(
+                    scope_id=self._scope_id,
+                    run_id=run_id,
+                    parent_run_id=parent_run_id,
+                    token=token,
+                    prior_active=prior_active,
+                ),
+            )
         )
         return run_id
 

@@ -50,6 +50,7 @@ class TestEmitWithActiveRun:
         base = _make_base()
         event = _build(base)
         assert event.agent_run_id is None
+        assert event.parent_agent_run_id is None
         assert event.agent_run_name is None
         assert event.tags is None
 
@@ -58,8 +59,43 @@ class TestEmitWithActiveRun:
         with solwyn.run("nightly-batch", tags={"team": "research"}) as run_id:
             event = _build(base)
         assert event.agent_run_id == run_id
+        assert event.parent_agent_run_id is None
         assert event.agent_run_name == "nightly-batch"
         assert event.tags == {"team": "research"}
+
+    def test_nested_scope_emits_immediate_parent_run_id(self) -> None:
+        base = _make_base()
+        with solwyn.run("orchestrator") as parent_run_id:
+            with solwyn.run("child") as child_run_id:
+                child_event = _build(base)
+            restored_event = _build(base)
+
+        assert child_event.agent_run_id == child_run_id
+        assert child_event.parent_agent_run_id == parent_run_id
+        assert restored_event.agent_run_id == parent_run_id
+        assert restored_event.parent_agent_run_id is None
+
+    def test_sibling_events_point_to_same_parent(self) -> None:
+        base = _make_base()
+        with solwyn.run("orchestrator") as parent_run_id:
+            with solwyn.run("first-child"):
+                first_event = _build(base)
+            with solwyn.run("second-child"):
+                second_event = _build(base)
+
+        assert first_event.parent_agent_run_id == parent_run_id
+        assert second_event.parent_agent_run_id == parent_run_id
+
+    def test_grandchild_event_points_to_child(self) -> None:
+        base = _make_base()
+        with (
+            solwyn.run("orchestrator"),
+            solwyn.run("child") as child_run_id,
+            solwyn.run("grandchild"),
+        ):
+            event = _build(base)
+
+        assert event.parent_agent_run_id == child_run_id
 
     def test_after_scope_fields_revert_to_none(self) -> None:
         base = _make_base()
@@ -67,6 +103,7 @@ class TestEmitWithActiveRun:
             pass
         event = _build(base)
         assert event.agent_run_id is None
+        assert event.parent_agent_run_id is None
         assert event.agent_run_name is None
         assert event.tags is None
 
@@ -86,7 +123,10 @@ class TestEmitWithActiveRun:
 
     def test_explicit_snapshot_survives_scope_exit(self) -> None:
         base = _make_base()
-        with solwyn.run("nightly-batch", tags={"team": "research"}) as run_id:
+        with (
+            solwyn.run("orchestrator") as parent_run_id,
+            solwyn.run("nightly-batch", tags={"team": "research"}) as run_id,
+        ):
             snapshot = _capture_run_context()
 
         event = base._build_metadata_event(
@@ -102,8 +142,23 @@ class TestEmitWithActiveRun:
             agent_run=snapshot,
         )
         assert event.agent_run_id == run_id
+        assert event.parent_agent_run_id == parent_run_id
         assert event.agent_run_name == "nightly-batch"
         assert event.tags == {"team": "research"}
+
+    @pytest.mark.asyncio
+    async def test_async_nested_scope_emits_immediate_parent_run_id(self) -> None:
+        base = _make_base()
+
+        async with (
+            solwyn.run("orchestrator") as parent_run_id,
+            solwyn.run("child") as child_run_id,
+        ):
+            await asyncio.sleep(0)
+            event = _build(base)
+
+        assert event.agent_run_id == child_run_id
+        assert event.parent_agent_run_id == parent_run_id
 
     @pytest.mark.asyncio
     async def test_async_concurrent_tasks_tag_independently(self) -> None:

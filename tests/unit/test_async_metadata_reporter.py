@@ -235,6 +235,7 @@ class TestAsyncReporterSendBatch:
 
         event = _make_event(
             agent_run_id="run_test_xyz",
+            parent_agent_run_id="run_parent_xyz",
             agent_run_name="async-batch",
         )
         with patch.object(
@@ -244,6 +245,7 @@ class TestAsyncReporterSendBatch:
 
         payload = mock_post.call_args.kwargs["json"][0]
         assert payload["agent_run_id"] == "run_test_xyz"
+        assert payload["parent_agent_run_id"] == "run_parent_xyz"
         assert payload["agent_run_name"] == "async-batch"
         await reporter._http.aclose()
 
@@ -264,6 +266,7 @@ class TestAsyncReporterSendBatch:
 
         payload = mock_post.call_args.kwargs["json"][0]
         assert "agent_run_id" not in payload
+        assert "parent_agent_run_id" not in payload
         assert "agent_run_name" not in payload
         await reporter._http.aclose()
 

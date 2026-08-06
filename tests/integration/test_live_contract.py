@@ -26,6 +26,7 @@ bug — fix the drift, don't loosen the assertion.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -48,6 +49,7 @@ from solwyn._types import (
     LeaseGrantResponse,
     LeaseRenewRequest,
     LeaseSurrenderRequest,
+    MetadataEvent,
     ProviderName,
 )
 from solwyn.budget import _LEASE_PATH, _LEASE_RENEW_PATH, _LEASE_SURRENDER_PATH
@@ -82,6 +84,38 @@ def _post_check(credentials: Credentials, payload: dict[str, object]) -> dict[st
     if not isinstance(data, dict):
         pytest.fail(f"budget check returned non-object JSON: {data!r}")
     return data
+
+
+@pytest.mark.integration
+def test_metadata_ingest_accepts_parent_agent_run_id(
+    test_credentials: Credentials,
+) -> None:
+    event = MetadataEvent(
+        model="gpt-5.5",
+        provider=ProviderName.OPENAI,
+        input_tokens=10,
+        output_tokens=5,
+        latency_ms=12.0,
+        status="success",
+        is_model_fallback=False,
+        sdk_instance_id=uuid.uuid4().hex,
+        timestamp=datetime.now(UTC),
+        agent_run_id=f"run-{uuid.uuid4().hex[:12]}",
+        parent_agent_run_id=f"run-{uuid.uuid4().hex[:12]}",
+        agent_run_name="child-contract-run",
+        call_id=str(uuid.uuid4()),
+    )
+
+    with httpx.Client(base_url=test_credentials.api_url, timeout=10) as http:
+        response = http.post(
+            "/api/v1/metadata/ingest",
+            json=[event.model_dump(mode="json")],
+            headers={"Authorization": f"Bearer {test_credentials.api_key}"},
+        )
+
+    response.raise_for_status()
+    assert response.status_code == 202
+    assert response.json() == {"ingested": 1, "rejected": []}
 
 
 @pytest.fixture(scope="session")

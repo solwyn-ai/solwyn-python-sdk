@@ -192,6 +192,7 @@ class TestMediaCallSync:
             patch.object(solwyn._budget, "check_budget", return_value=_allow()) as check,
             patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            solwyn_pkg.run("orchestrator") as parent_run_id,
             solwyn_pkg.run("sync-media", tags={"team": "platform"}) as run_id,
         ):
             result = solwyn._media_call(
@@ -228,6 +229,7 @@ class TestMediaCallSync:
         assert event.input_tokens == 42
         assert event.modality == "embedding"
         assert event.agent_run_id == run_id
+        assert event.parent_agent_run_id == parent_run_id
         assert event.tags == {"team": "platform", "job": "embed"}
         assert check.call_args.kwargs["tags"] == event.tags
         assert "solwyn_tags" not in client.embeddings.create.call_args.kwargs
@@ -634,13 +636,14 @@ class TestMediaCallAsync:
             patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
         ):
-            async with solwyn_pkg.run("async-media", tags={"team": "platform"}) as run_id:
-                result = await solwyn._media_call(
-                    _spec(),
-                    model="text-embedding-3-small",
-                    input="hello",
-                    solwyn_tags={"job": "embed"},
-                )
+            async with solwyn_pkg.run("orchestrator") as parent_run_id:
+                async with solwyn_pkg.run("async-media", tags={"team": "platform"}) as run_id:
+                    result = await solwyn._media_call(
+                        _spec(),
+                        model="text-embedding-3-small",
+                        input="hello",
+                        solwyn_tags={"job": "embed"},
+                    )
 
         assert result is resp
         client.embeddings.create.assert_awaited_once()
@@ -655,6 +658,7 @@ class TestMediaCallAsync:
         assert event.is_model_fallback is False
         assert event.modality == "embedding"
         assert event.agent_run_id == run_id
+        assert event.parent_agent_run_id == parent_run_id
         assert event.tags == {"team": "platform", "job": "embed"}
         assert check.call_args.kwargs["tags"] == event.tags
         assert "solwyn_tags" not in client.embeddings.create.call_args.kwargs

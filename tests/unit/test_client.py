@@ -894,6 +894,7 @@ class TestRichTokenExtraction:
             patch.object(
                 solwyn._budget, "check_budget", return_value=_allow_budget_result()
             ) as check,
+            solwyn_pkg.run("orchestrator") as parent_run_id,
             solwyn_pkg.run("nightly-batch", tags={"team": "platform", "env": "prod"}) as run_id,
         ):
             solwyn.chat.completions.create(
@@ -906,6 +907,7 @@ class TestRichTokenExtraction:
         assert check.call_args.kwargs["agent_run_id"] == run_id
         assert check.call_args.kwargs["tags"] == reported_events[0].tags
         assert reported_events[0].agent_run_id == run_id
+        assert reported_events[0].parent_agent_run_id == parent_run_id
         assert reported_events[0].agent_run_name == "nightly-batch"
         assert reported_events[0].tags == {
             "team": "platform",
@@ -1263,6 +1265,7 @@ class TestSyncStreamingInterception:
         call_tags = {"env": "stage", "job": "stream"}
         with (
             patch.object(solwyn._budget._http, "post", return_value=mock_budget_response),
+            solwyn_pkg.run("orchestrator") as parent_run_id,
             solwyn_pkg.run("nightly", tags=scope_tags) as run_id,
         ):
             stream = solwyn.chat.completions.create(
@@ -1278,6 +1281,7 @@ class TestSyncStreamingInterception:
 
         assert len(reported_events) == 1
         assert reported_events[0].agent_run_id == run_id
+        assert reported_events[0].parent_agent_run_id == parent_run_id
         assert reported_events[0].agent_run_name == "nightly"
         assert reported_events[0].tags == {
             "team": "platform",
@@ -1621,13 +1625,14 @@ class TestAsyncStreamingInterception:
         scope_tags = {"team": "platform", "env": "prod"}
         call_tags = {"env": "stage", "job": "stream"}
         with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
-            async with solwyn_pkg.run("nightly", tags=scope_tags) as run_id:
-                stream = await solwyn.chat.completions.create(
-                    model="gpt-5.5",
-                    messages=[{"role": "user", "content": "Hello"}],
-                    stream=True,
-                    solwyn_tags=call_tags,
-                )
+            async with solwyn_pkg.run("orchestrator") as parent_run_id:
+                async with solwyn_pkg.run("nightly", tags=scope_tags) as run_id:
+                    stream = await solwyn.chat.completions.create(
+                        model="gpt-5.5",
+                        messages=[{"role": "user", "content": "Hello"}],
+                        stream=True,
+                        solwyn_tags=call_tags,
+                    )
 
         scope_tags["team"] = "mutated"
         call_tags["job"] = "mutated"
@@ -1635,6 +1640,7 @@ class TestAsyncStreamingInterception:
 
         assert len(reported_events) == 1
         assert reported_events[0].agent_run_id == run_id
+        assert reported_events[0].parent_agent_run_id == parent_run_id
         assert reported_events[0].agent_run_name == "nightly"
         assert reported_events[0].tags == {
             "team": "platform",
@@ -2007,15 +2013,17 @@ class TestAsyncNonStreamingInterception:
             "check_budget",
             new=AsyncMockFn(return_value=_allow_budget_result()),
         ) as check:
-            async with solwyn_pkg.run("async-nightly-batch") as run_id:
-                await solwyn.chat.completions.create(
-                    model="gpt-5.5",
-                    messages=[{"role": "user", "content": "Hello"}],
-                )
+            async with solwyn_pkg.run("orchestrator") as parent_run_id:
+                async with solwyn_pkg.run("async-nightly-batch") as run_id:
+                    await solwyn.chat.completions.create(
+                        model="gpt-5.5",
+                        messages=[{"role": "user", "content": "Hello"}],
+                    )
 
         assert len(reported_events) == 1
         assert check.call_args.kwargs["agent_run_id"] == run_id
         assert reported_events[0].agent_run_id == run_id
+        assert reported_events[0].parent_agent_run_id == parent_run_id
         assert reported_events[0].agent_run_name == "async-nightly-batch"
 
         await solwyn._budget._http.aclose()
