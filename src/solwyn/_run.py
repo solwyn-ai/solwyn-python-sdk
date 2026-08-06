@@ -114,12 +114,17 @@ def _copy_tags(
 
 def _capture_run_context(
     per_call_tags: object | None = None,
+    *,
+    default_tags: object | None = None,
 ) -> _RunContextSnapshot:
-    """Capture the active run plus a copied shallow merge of per-call tags."""
+    """Capture the active run plus client, scope, and per-call tags."""
     active = _active_run.get()
     run_id: str | None = None
     run_name: str | None = None
     merged: dict[str, str] = {}
+    defaults = _copy_tags(default_tags, parameter="client tags")
+    if defaults is not None:
+        merged.update(defaults)
     if active is not None:
         run_id, run_name, scope_tags = active
         if scope_tags is not None:

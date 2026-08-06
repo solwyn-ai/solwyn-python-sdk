@@ -25,7 +25,7 @@ import functools
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from typing import Any, NamedTuple, cast
 
 import httpx
@@ -730,6 +730,7 @@ class Solwyn(_SolwynBase):
         provider: str | None = None,
         fallback: object = None,
         default_params: dict[str, Any] | None = None,
+        tags: Mapping[str, str] | None = None,
         selection_policy: SelectionPolicy | None = None,
         **config_kwargs: object,
     ) -> None:
@@ -761,6 +762,7 @@ class Solwyn(_SolwynBase):
         cfg_kwargs: dict[str, Any] = {
             "providers": [rt.entry for rt in runtimes],
             "default_params": default_params or {},
+            "tags": tags,
             **config_kwargs,
         }
         if api_key is not None:
@@ -1002,7 +1004,10 @@ class Solwyn(_SolwynBase):
         (``measure_request``). An unobservable quantity stays None — never a
         zero-filled default — so a real $0 price is never settled.
         """
-        agent_run = _capture_run_context(kwargs.pop("solwyn_tags", None))
+        agent_run = _capture_run_context(
+            kwargs.pop("solwyn_tags", None),
+            default_tags=self._config.tags,
+        )
         requested_model = cast(str, kwargs["model"])
         call_id = str(uuid.uuid4())
         runtime = self._runtimes[0]
@@ -1219,7 +1224,10 @@ class Solwyn(_SolwynBase):
 
     def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Core interception logic: the classified candidate walk."""
-        agent_run = _capture_run_context(kwargs.pop("solwyn_tags", None))
+        agent_run = _capture_run_context(
+            kwargs.pop("solwyn_tags", None),
+            default_tags=self._config.tags,
+        )
         requested_model = cast(str, kwargs["model"])
         is_streaming = bool(kwargs.get("stream", False)) or _force_stream
         # One reconciliation join key per intercepted call: threaded into
@@ -1840,6 +1848,7 @@ class AsyncSolwyn(_SolwynBase):
         provider: str | None = None,
         fallback: object = None,
         default_params: dict[str, Any] | None = None,
+        tags: Mapping[str, str] | None = None,
         selection_policy: SelectionPolicy | None = None,
         **config_kwargs: object,
     ) -> None:
@@ -1865,6 +1874,7 @@ class AsyncSolwyn(_SolwynBase):
         cfg_kwargs: dict[str, Any] = {
             "providers": [rt.entry for rt in runtimes],
             "default_params": default_params or {},
+            "tags": tags,
             **config_kwargs,
         }
         if api_key is not None:
@@ -2096,7 +2106,10 @@ class AsyncSolwyn(_SolwynBase):
         runtime alone. Billable quantity comes from the spec hooks (response
         usage first, request-derived fallback) and stays None when unobservable.
         """
-        agent_run = _capture_run_context(kwargs.pop("solwyn_tags", None))
+        agent_run = _capture_run_context(
+            kwargs.pop("solwyn_tags", None),
+            default_tags=self._config.tags,
+        )
         requested_model = cast(str, kwargs["model"])
         call_id = str(uuid.uuid4())
         runtime = self._runtimes[0]
@@ -2285,7 +2298,10 @@ class AsyncSolwyn(_SolwynBase):
 
     async def _intercepted_call(self, *, _force_stream: bool = False, **kwargs: object) -> Any:
         """Async core interception logic: the classified candidate walk."""
-        agent_run = _capture_run_context(kwargs.pop("solwyn_tags", None))
+        agent_run = _capture_run_context(
+            kwargs.pop("solwyn_tags", None),
+            default_tags=self._config.tags,
+        )
         requested_model = cast(str, kwargs["model"])
         is_streaming = bool(kwargs.get("stream", False)) or _force_stream
         # One reconciliation join key per intercepted call: see the sync

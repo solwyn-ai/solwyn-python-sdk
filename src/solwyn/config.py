@@ -9,15 +9,20 @@ from __future__ import annotations
 import os
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from solwyn._lease import DEFAULT_OUTPUT_BOUND
+from solwyn._run import _copy_tags
 from solwyn._types import BudgetMode, ProviderEntry
 from solwyn._validation import validate_project_key_format
 from solwyn.exceptions import ConfigurationError
 
 # Environment variable prefix for automatic loading.
 _ENV_PREFIX = "SOLWYN_"
+
+
+class _EnvTags(str):
+    """Tag string originating from ``SOLWYN_TAGS``."""
 
 
 class SolwynConfig(BaseModel):
@@ -40,6 +45,7 @@ class SolwynConfig(BaseModel):
     providers: list[ProviderEntry] = Field(default_factory=list)
     # Global fill-absent defaults (per-entry default_params wins).
     default_params: dict[str, Any] = Field(default_factory=dict)
+    tags: dict[str, str] | None = None
 
     # Failover knobs
     failover_total_timeout: float = 30.0
@@ -129,6 +135,7 @@ class SolwynConfig(BaseModel):
         field_env_map = {
             "api_key": "API_KEY",
             "api_url": "API_URL",
+            "tags": "TAGS",
             "fail_open": "FAIL_OPEN",
             "budget_mode": "BUDGET_MODE",
             "circuit_breaker_failure_threshold": "CIRCUIT_BREAKER_FAILURE_THRESHOLD",
@@ -157,12 +164,27 @@ class SolwynConfig(BaseModel):
                 env_val = os.environ.get(f"{_ENV_PREFIX}{env_suffix}")
                 if env_val is not None:
                     # Coerce boolean-looking strings
-                    if field in {"fail_open", "breaker_reporting_enabled", "lease_enabled"}:
+                    if field == "tags":
+                        values[field] = _EnvTags(env_val)
+                    elif field in {"fail_open", "breaker_reporting_enabled", "lease_enabled"}:
                         values[field] = env_val.lower() in ("true", "1", "yes")
                     else:
                         values[field] = env_val
 
         return values
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _validate_tags(cls, value: object | None) -> dict[str, str] | None:
+        if isinstance(value, _EnvTags):
+            try:
+                value = dict(entry.split("=", 1) for entry in value.split(","))
+            except ValueError as exc:
+                raise ValueError("SOLWYN_TAGS entries must use key=value") from exc
+        try:
+            return _copy_tags(value, parameter="tags")
+        except TypeError as exc:
+            raise ValueError(str(exc)) from exc
 
     @model_validator(mode="after")
     def _validate_credentials(self) -> SolwynConfig:

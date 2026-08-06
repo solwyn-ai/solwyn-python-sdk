@@ -921,6 +921,43 @@ class TestRichTokenExtraction:
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
+    def test_client_tags_take_part_in_precedence_while_default_params_tags_are_discarded(
+        self,
+    ) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(
+            client,
+            tags={"shared": "client", "client": "only"},
+            default_params={"solwyn_tags": {"discarded": "default_params"}},
+        )
+        reported_events: list = []
+        solwyn._reporter.report = lambda event: reported_events.append(event)
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()),
+            solwyn_pkg.run(
+                "precedence",
+                tags={"shared": "scope", "scope": "only"},
+            ),
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                solwyn_tags={"shared": "call", "call": "only"},
+            )
+
+        assert reported_events[0].tags == {
+            "shared": "call",
+            "client": "only",
+            "scope": "only",
+            "call": "only",
+        }
+        assert "discarded" not in reported_events[0].tags
+        assert "solwyn_tags" not in client.chat.completions.create.call_args.kwargs
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
     @pytest.mark.parametrize(
         "tags",
         [
@@ -1755,6 +1792,44 @@ class TestAsyncNonStreamingInterception:
         assert confirm.reservation_id == "res_123"
         assert confirm.call_id == event.call_id
         assert reported_events == []
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_client_tags_use_scope_and_call_precedence(self) -> None:
+        client, mock_response = _mock_openai_client()
+        client.chat.completions.create = AsyncMockFn(return_value=mock_response)
+        solwyn = _make_async_solwyn(
+            client,
+            tags={"shared": "client", "client": "only"},
+        )
+        reported_events: list = []
+        solwyn._reporter.report = lambda event: reported_events.append(event)
+
+        with patch.object(
+            solwyn._budget,
+            "check_budget",
+            new=AsyncMockFn(return_value=_allow_budget_result()),
+        ):
+            async with solwyn_pkg.run(
+                "precedence",
+                tags={"shared": "scope", "scope": "only"},
+            ):
+                await solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "Hello"}],
+                    solwyn_tags={"shared": "call", "call": "only"},
+                )
+
+        assert reported_events[0].tags == {
+            "shared": "call",
+            "client": "only",
+            "scope": "only",
+            "call": "only",
+        }
+        assert "solwyn_tags" not in client.chat.completions.create.call_args.kwargs
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

@@ -145,6 +145,51 @@ class TestRunContextManagerSync:
                 "env": "prod",
             }
 
+    @pytest.mark.parametrize(
+        ("client_tags", "scope_tags", "call_tags", "expected"),
+        [
+            (None, None, None, None),
+            (
+                {"shared": "client", "client": "only"},
+                None,
+                None,
+                {"shared": "client", "client": "only"},
+            ),
+            (
+                {"shared": "client", "client": "only"},
+                {"shared": "scope", "scope": "only"},
+                None,
+                {"shared": "scope", "client": "only", "scope": "only"},
+            ),
+            (
+                {"shared": "client", "client": "only"},
+                {"shared": "scope", "scope": "only"},
+                {"shared": "call", "call": "only"},
+                {
+                    "shared": "call",
+                    "client": "only",
+                    "scope": "only",
+                    "call": "only",
+                },
+            ),
+            ({"empty": ""}, None, None, {"empty": ""}),
+        ],
+    )
+    def test_private_snapshot_uses_client_scope_call_precedence(
+        self,
+        client_tags: dict[str, str] | None,
+        scope_tags: dict[str, str] | None,
+        call_tags: dict[str, str] | None,
+        expected: dict[str, str] | None,
+    ) -> None:
+        if scope_tags is None:
+            captured = _run._capture_run_context(call_tags, default_tags=client_tags)
+        else:
+            with solwyn.run("precedence", tags=scope_tags):
+                captured = _run._capture_run_context(call_tags, default_tags=client_tags)
+
+        assert captured[2] == expected
+
     def test_empty_merged_mapping_is_absent(self) -> None:
         assert _run._capture_run_context({}) == (None, None, None)
 
