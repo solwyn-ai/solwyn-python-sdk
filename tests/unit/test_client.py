@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -16,6 +17,7 @@ from conftest import (
 )
 
 import solwyn as solwyn_pkg
+from solwyn import exceptions as solwyn_exceptions
 from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn._privacy import estimate_content_length
 from solwyn._types import BudgetMode, ProviderName
@@ -988,23 +990,43 @@ class TestRichTokenExtraction:
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
-    def test_merged_tag_limit_fails_before_budget_or_provider(self) -> None:
+    def test_merged_tag_limit_survives_warning_as_error_and_dispatches(self) -> None:
         client, _ = _mock_openai_client()
-        solwyn = _make_solwyn(client)
+        solwyn = _make_solwyn(
+            client,
+            tags={f"default-{index}": "default" for index in range(4)},
+        )
+        reported_events: list = []
+        solwyn._reporter.report = lambda event: reported_events.append(event)
 
-        with (
-            patch.object(solwyn._budget, "check_budget") as check,
-            solwyn_pkg.run("too-many", tags={f"scope-{i}": "v" for i in range(6)}),
-            pytest.raises(ValueError, match="at most 10"),
-        ):
-            solwyn.chat.completions.create(
-                model="gpt-5.5",
-                messages=[{"role": "user", "content": "Hello"}],
-                solwyn_tags={f"call-{i}": "v" for i in range(5)},
-            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", solwyn_exceptions.SolwynTagsClampedWarning)
+            with (
+                patch.object(
+                    solwyn._budget,
+                    "check_budget",
+                    return_value=_allow_budget_result(),
+                ) as check,
+                solwyn_pkg.run(
+                    "too-many",
+                    tags={f"scope-{index}": "scope" for index in range(4)},
+                ),
+            ):
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "Hello"}],
+                    solwyn_tags={f"call-{index}": "call" for index in range(4)},
+                )
 
-        check.assert_not_called()
-        client.chat.completions.create.assert_not_called()
+        check.assert_called_once()
+        client.chat.completions.create.assert_called_once()
+        assert len(reported_events) == 1
+        assert reported_events[0].tags == {
+            **{f"call-{index}": "call" for index in range(4)},
+            **{f"scope-{index}": "scope" for index in range(4)},
+            **{f"default-{index}": "default" for index in range(2)},
+        }
+        assert len(reported_events[0].tags) == 10
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 

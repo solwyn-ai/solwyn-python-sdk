@@ -283,7 +283,11 @@ Wrap a unit of work with `solwyn.run(name, tags=...)` to attribute every LLM cal
 import solwyn
 from openai import OpenAI
 
-client = solwyn.Solwyn(OpenAI(), api_key="sk_proj_...")
+client = solwyn.Solwyn(
+    OpenAI(),
+    api_key="sk_proj_...",
+    tags={"environment": "prod", "service": "research"},
+)
 
 with solwyn.run("nightly-batch", tags={"team": "research", "env": "prod"}) as run_id:
     client.chat.completions.create(model="gpt-5.5", messages=[...])
@@ -294,7 +298,30 @@ with solwyn.run("nightly-batch", tags={"team": "research", "env": "prod"}) as ru
     )
 ```
 
-Use the reserved `solwyn_tags=` keyword as a call argument, not in `default_params`; it is removed before provider dispatch. Per-call keys shallow-merge over run tags. Tag mappings allow at most 10 string keys, keys must contain 1–64 characters, and string values may contain 0–256 characters. The SDK copies mappings at scope entry and call start, so later caller mutation cannot change attribution.
+The constructor's `tags=` mapping supplies client defaults to every intercepted call. You can set the same defaults from the environment with comma-separated `key=value` entries:
+
+```sh
+export SOLWYN_TAGS="environment=prod,service=research"
+```
+
+The environment format splits each entry at its first `=`, so values may contain `=` but cannot contain commas. Use constructor `tags={"segment": "east,canary"}` when a value contains a comma.
+
+Nested runs inherit outer tags additively. Inner tags overwrite only keys they reuse, so a sub-agent keeps its orchestrator's attribution without repeating it:
+
+```python
+with solwyn.run("orchestrator", tags={"team": "research", "workflow": "eval"}):
+    with solwyn.run("critic", tags={"agent": "critic", "team": "safety"}):
+        client.chat.completions.create(model="gpt-5.5", messages=[...])
+        # Tags: team=safety, workflow=eval, agent=critic
+
+    with solwyn.run("isolated", tags={"agent": "one-off"}, inherit_tags=False):
+        client.chat.completions.create(model="gpt-5.5", messages=[...])
+        # Tags: agent=one-off
+```
+
+Use the reserved `solwyn_tags=` keyword as a call argument, not in `default_params`; it is removed before provider dispatch. Precedence is client defaults, then the active run scope, then per-call tags, with the higher-precedence value kept on conflicts. Each supplied mapping allows at most 10 string keys, keys must contain 1–64 characters, and string values may contain 0–256 characters. The SDK validates and copies mappings at client or run creation and at call start, so invalid input fails eagerly and later caller mutation cannot change attribution.
+
+The combined map can exceed 10 keys even when each supplied mapping is valid. In that case the SDK keeps 10 deterministically: per-call keys first, then active-scope keys, then client-default keys, preserving insertion order within each layer. It emits one `SolwynTagsClampedWarning` for the overflowing call and still dispatches the provider request; lower-priority excess tags are absent from that call's event.
 
 Works the same with `async with` and is safe across concurrent asyncio tasks — each task sees only its own active run. Calls made outside a `solwyn.run(...)` scope are still tracked; the API groups them into `_auto-{sdk_instance_id}-{YYYY-MM-DD}` using the event's UTC timestamp.
 
@@ -376,6 +403,7 @@ except BudgetExceededError as e:
 |-----------|---------|---------|-------------|
 | `api_key` | `SOLWYN_API_KEY` | *required* | Solwyn project API key |
 | `api_url` | `SOLWYN_API_URL` | `https://api.solwyn.ai` | Solwyn API endpoint |
+| `tags` | `SOLWYN_TAGS` | `None` | Default spend tags for intercepted calls; env format is comma-separated `key=value` entries |
 | `fail_open` | `SOLWYN_FAIL_OPEN` | `True` | Allow LLM calls when Solwyn API is unreachable |
 | `budget_mode` | `SOLWYN_BUDGET_MODE` | `alert_only` | Budget enforcement mode |
 | `budget_check_cache_ttl` | `SOLWYN_BUDGET_CHECK_CACHE_TTL` | `5` | Allow-cache lifetime for eligible legacy/non-run checks |

@@ -24,9 +24,10 @@ import inspect
 import sys
 import unicodedata
 import uuid
+import warnings
 from collections.abc import Callable, Mapping
 from concurrent.futures import Executor, Future
-from contextlib import AbstractAsyncContextManager, AbstractContextManager
+from contextlib import AbstractAsyncContextManager, AbstractContextManager, suppress
 from contextvars import ContextVar, Token, copy_context
 from dataclasses import dataclass
 from types import FrameType, TracebackType
@@ -38,6 +39,7 @@ from solwyn._constants import (
     TAG_VALUE_MAX_LENGTH,
     TAGS_MAX_KEYS,
 )
+from solwyn.exceptions import SolwynTagsClampedWarning
 
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
@@ -121,18 +123,33 @@ def _capture_run_context(
     active = _active_run.get()
     run_id: str | None = None
     run_name: str | None = None
-    merged: dict[str, str] = {}
     defaults = _copy_tags(default_tags, parameter="client tags")
-    if defaults is not None:
-        merged.update(defaults)
+    scope_tags: dict[str, str] | None = None
     if active is not None:
         run_id, run_name, scope_tags = active
-        if scope_tags is not None:
-            merged.update(scope_tags)
     override = _copy_tags(per_call_tags, parameter="solwyn_tags")
-    if override is not None:
-        merged.update(override)
-    return (run_id, run_name, _copy_tags(merged, parameter="merged tags"))
+
+    merged: dict[str, str] = {}
+    clamped = False
+    for layer in (override, scope_tags, defaults):
+        if layer is None:
+            continue
+        for key, value in layer.items():
+            if key in merged:
+                continue
+            if len(merged) == TAGS_MAX_KEYS:
+                clamped = True
+                continue
+            merged[key] = value
+
+    if clamped:
+        with suppress(Exception):
+            warnings.warn(
+                f"merged tags exceed {TAGS_MAX_KEYS} keys; lower-priority tags were dropped",
+                SolwynTagsClampedWarning,
+                stacklevel=2,
+            )
+    return (run_id, run_name, merged or None)
 
 
 def _name_has_disallowed_char(name: str) -> bool:
@@ -155,12 +172,18 @@ def _called_from_async_generator() -> bool:
 class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
     """Context manager returned by ``solwyn.run(name)``.
 
-    Supports both ``with`` and ``async with``. Nesting replaces the outer
-    scope for the inner's duration — matches OpenTelemetry span semantics.
+    Supports both ``with`` and ``async with``. Nested scopes inherit tags by
+    default, with inner values winning only on conflicting keys.
     The outer scope is restored automatically on exit via ``ContextVar.reset``.
     """
 
-    def __init__(self, name: str, tags: Mapping[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        name: str,
+        tags: Mapping[str, str] | None = None,
+        *,
+        inherit_tags: bool = True,
+    ) -> None:
         if not isinstance(name, str):
             raise TypeError(f"solwyn.run(name) requires str, got {type(name).__name__}")
         if not name.strip():
@@ -176,6 +199,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
             )
         self._name = name
         self._tags = _copy_tags(tags, parameter="solwyn.run(tags)")
+        self._inherit_tags = inherit_tags
         self._scope_id = id(self)
 
     def _enter(self) -> str:
@@ -186,7 +210,11 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
             )
         run_id = _new_run_id()
         prior_active = _active_run.get()
-        token = _active_run.set((run_id, self._name, self._tags))
+        scope_tags = dict(self._tags or {})
+        if self._inherit_tags and prior_active is not None and prior_active[2] is not None:
+            for key, value in prior_active[2].items():
+                scope_tags.setdefault(key, value)
+        token = _active_run.set((run_id, self._name, scope_tags or None))
         frames = _run_frames.get()
         _run_frames.set(
             (*frames, _RunFrame(scope_id=self._scope_id, token=token, prior_active=prior_active))
@@ -269,7 +297,12 @@ def run_in_executor(
     return executor.submit(run_with_context)
 
 
-def run(name: str, tags: Mapping[str, str] | None = None) -> _RunScope:
+def run(
+    name: str,
+    tags: Mapping[str, str] | None = None,
+    *,
+    inherit_tags: bool = True,
+) -> _RunScope:
     """Open an agent-run scope.
 
     Cost events emitted inside the scope are tagged with a fresh stable
@@ -282,9 +315,11 @@ def run(name: str, tags: Mapping[str, str] | None = None) -> _RunScope:
         async with solwyn.run("ingest-job") as run_id:
             await aclient.chat.completions.create(...)
 
-    Nesting replaces the outer scope: the inner ``run()`` gets its own id,
-    and the outer is restored after the inner ``__exit__``. Sequential
-    scopes always get distinct ids — the API aggregates by id, not name.
+    Nested runs inherit outer tags additively by default. Inner values win
+    only where they reuse an outer key. Pass ``inherit_tags=False`` to start
+    a fresh tag scope. The inner run always gets its own id, and the outer
+    context is restored after the inner ``__exit__``. Sequential scopes get
+    distinct ids — the API aggregates by id, not name.
 
     Tasks created with ``asyncio.create_task(...)`` inside a scope capture
     that task-local context. Calls made by those tasks after the scope exits
@@ -295,4 +330,4 @@ def run(name: str, tags: Mapping[str, str] | None = None) -> _RunScope:
     opened before ``yield`` would remain active in the consumer's ``async for``
     body, so the SDK raises at scope entry instead.
     """
-    return _RunScope(name, tags)
+    return _RunScope(name, tags, inherit_tags=inherit_tags)

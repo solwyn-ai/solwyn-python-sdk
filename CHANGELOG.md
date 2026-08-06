@@ -7,6 +7,27 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
+### Added
+
+- **Clients accept default spend tags through `tags={...}` or `SOLWYN_TAGS`.**
+  The environment value uses comma-separated `key=value` entries and splits
+  each entry at the first `=`. Values containing commas use the constructor
+  mapping instead. Run-scope tags override client defaults key by key, and
+  per-call `solwyn_tags=` values have the highest precedence.
+
+### Changed
+
+- **Nested `solwyn.run(...)` scopes inherit tags additively by default.** A
+  child keeps all non-conflicting outer tags and overwrites only keys it
+  supplies itself. `inherit_tags=False` starts a fresh tag scope, and exiting
+  either form restores the exact outer context.
+- **A combined tag map over 10 keys clamps without aborting the live LLM
+  call.** The event keeps per-call keys first, then active-scope keys, then
+  client-default keys, preserving insertion order within each layer and the
+  highest-precedence value on conflicts. Each overflowing capture emits one
+  `SolwynTagsClampedWarning`; lower-priority excess tags are dropped from that
+  event while the provider request continues.
+
 ## [0.4.0] - 2026-07-28
 
 The control plane comes off the hot path: run-scoped token leases replace the

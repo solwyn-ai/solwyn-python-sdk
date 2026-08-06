@@ -6,6 +6,7 @@ ConfigurationError -- raised when configuration is invalid.
 UntranslatableRequestError -- raised when a cross-provider hop cannot translate a request.
 UntranslatableModelError -- raised when a model id is not configured for a target provider.
 UnsupportedSurfaceError -- raised when an adapter does not serve a requested media surface.
+SolwynTagsClampedWarning -- emitted when merged tags exceed the event cap.
 """
 
 from __future__ import annotations
@@ -20,6 +21,10 @@ class SolwynError(Exception):
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.args!r})"
+
+
+class SolwynTagsClampedWarning(UserWarning):
+    """Warns that lower-priority tags were dropped from an event snapshot."""
 
 
 class BudgetExceededError(SolwynError):

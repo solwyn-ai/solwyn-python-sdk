@@ -9,6 +9,7 @@ server-side auto-fallback engages.
 from __future__ import annotations
 
 import asyncio
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 
@@ -16,6 +17,7 @@ import pytest
 
 import solwyn
 from solwyn import _run
+from solwyn import exceptions as solwyn_exceptions
 from solwyn._constants import AGENT_RUN_ID_MAX_LENGTH
 from solwyn._run import current_run
 
@@ -93,17 +95,52 @@ class TestRunContextManagerSync:
             )
 
     def test_nested_scope_restores_outer_tags(self) -> None:
-        with solwyn.run("outer", tags={"scope": "outer"}) as outer_id:
-            with solwyn.run("inner", tags={"scope": "inner"}) as inner_id:
+        with solwyn.run("outer", tags={"outer": "kept"}) as outer_id:
+            with solwyn.run("inner", tags={"inner": "kept"}) as inner_id:
                 assert _run._capture_run_context() == (
                     inner_id,
                     "inner",
-                    {"scope": "inner"},
+                    {"inner": "kept", "outer": "kept"},
                 )
             assert _run._capture_run_context() == (
                 outer_id,
                 "outer",
-                {"scope": "outer"},
+                {"outer": "kept"},
+            )
+
+    def test_nested_scope_overwrites_only_conflicting_parent_keys(self) -> None:
+        with (
+            solwyn.run(
+                "outer",
+                tags={"shared": "outer", "outer": "kept"},
+            ),
+            solwyn.run(
+                "inner",
+                tags={"shared": "inner", "inner": "kept"},
+            ),
+        ):
+            assert _run._capture_run_context()[2] == {
+                "shared": "inner",
+                "inner": "kept",
+                "outer": "kept",
+            }
+
+    def test_nested_scope_can_start_fresh_without_inherited_tags(self) -> None:
+        with solwyn.run("outer", tags={"outer": "isolated"}) as outer_id:
+            with solwyn.run(
+                "inner",
+                tags={"inner": "fresh"},
+                inherit_tags=False,
+            ) as inner_id:
+                assert _run._capture_run_context() == (
+                    inner_id,
+                    "inner",
+                    {"inner": "fresh"},
+                )
+            assert _run._capture_run_context() == (
+                outer_id,
+                "outer",
+                {"outer": "isolated"},
             )
 
     def test_scope_copies_caller_mapping_and_private_snapshot(self) -> None:
@@ -189,6 +226,89 @@ class TestRunContextManagerSync:
                 captured = _run._capture_run_context(call_tags, default_tags=client_tags)
 
         assert captured[2] == expected
+
+    @pytest.mark.parametrize(
+        ("default_tags", "scope_tags", "call_tags", "expected"),
+        [
+            (
+                {f"default-{index}": "default" for index in range(10)},
+                {"scope": "scope"},
+                None,
+                {
+                    "scope": "scope",
+                    **{f"default-{index}": "default" for index in range(9)},
+                },
+            ),
+            (
+                {f"default-{index}": "default" for index in range(10)},
+                {f"scope-{index}": "scope" for index in range(10)},
+                {"call": "call"},
+                {
+                    "call": "call",
+                    **{f"scope-{index}": "scope" for index in range(9)},
+                },
+            ),
+            (
+                {"shared": "default", **{f"default-{index}": "default" for index in range(9)}},
+                {"shared": "scope", **{f"scope-{index}": "scope" for index in range(9)}},
+                {"shared": "call", "call": "call"},
+                {
+                    "shared": "call",
+                    "call": "call",
+                    **{f"scope-{index}": "scope" for index in range(8)},
+                },
+            ),
+        ],
+    )
+    def test_private_snapshot_clamps_by_call_scope_default_priority(
+        self,
+        default_tags: dict[str, str],
+        scope_tags: dict[str, str],
+        call_tags: dict[str, str] | None,
+        expected: dict[str, str],
+    ) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with solwyn.run("clamped", tags=scope_tags):
+                captured = _run._capture_run_context(
+                    call_tags,
+                    default_tags=default_tags,
+                )
+
+        assert captured[2] == expected
+        assert len(caught) == 1
+        assert caught[0].category is solwyn_exceptions.SolwynTagsClampedWarning
+
+    def test_parent_and_child_full_layers_clamp_to_child_priority(self) -> None:
+        parent_tags = {f"parent-{index}": "parent" for index in range(10)}
+        child_tags = {f"child-{index}": "child" for index in range(10)}
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with (
+                solwyn.run("parent", tags=parent_tags),
+                solwyn.run("child", tags=child_tags),
+            ):
+                captured = _run._capture_run_context()
+
+        assert captured[2] == child_tags
+        assert len(caught) == 1
+        assert caught[0].category is solwyn_exceptions.SolwynTagsClampedWarning
+
+    def test_each_overflowing_capture_emits_exactly_one_warning(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with solwyn.run(
+                "overflow",
+                tags={f"scope-{index}": "scope" for index in range(10)},
+            ):
+                for _ in range(2):
+                    _run._capture_run_context({"call": "call"})
+
+        assert len(caught) == 2
+        assert all(
+            warning.category is solwyn_exceptions.SolwynTagsClampedWarning for warning in caught
+        )
 
     def test_empty_merged_mapping_is_absent(self) -> None:
         assert _run._capture_run_context({}) == (None, None, None)
