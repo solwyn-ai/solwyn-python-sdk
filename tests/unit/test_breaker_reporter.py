@@ -167,7 +167,9 @@ class TestSyncBreakerReporter:
         reporter._flush_breaker_reports()
         before = post.call_count
 
-        reporter._breaker_heartbeat_at = 0.0
+        # -inf, not 0.0: monotonic's epoch is arbitrary (boot time on Linux), so
+        # 0.0 only makes the heartbeat due once the machine is heartbeat-old.
+        reporter._breaker_heartbeat_at = float("-inf")
         reporter._flush_breaker_reports()
 
         assert post.call_count == before + 2
@@ -616,7 +618,10 @@ class TestAsyncBreakerReporter:
         ) as post:
             await reporter._flush_breaker_reports()
             before = post.call_count
-            reporter._breaker_heartbeat_at = 0.0
+            # -inf, not 0.0: monotonic's epoch is arbitrary (boot time on
+            # Linux), so 0.0 only makes the heartbeat due once the machine is
+            # heartbeat-old.
+            reporter._breaker_heartbeat_at = float("-inf")
             await reporter._flush_breaker_reports()
 
             assert post.call_count == before + 2
