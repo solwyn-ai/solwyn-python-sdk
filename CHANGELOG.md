@@ -7,6 +7,14 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-07
+
+Spend attribution becomes first-class: clients carry default tags, nested run
+scopes inherit and refine them key by key, one immutable per-call snapshot
+feeds both budget admission and spend events, and nested runs report their
+immediate parent run. Wire-contract changes are API-first: Solwyn Cloud
+accepts every field below before this SDK releases. Ships #50.
+
 ### Added
 
 - **Clients accept default spend tags through `tags={...}` or `SOLWYN_TAGS`.**
@@ -14,6 +22,22 @@ derived from git tags (hatch-vcs).
   each entry at the first `=`. Values containing commas use the constructor
   mapping instead. Run-scope tags override client defaults key by key, and
   per-call `solwyn_tags=` values have the highest precedence.
+- **Budget admission observes the call's tags, and tag-cap denials stay
+  selector-scoped.** A tagged call's `/budgets/check` carries the same
+  immutable tag snapshot its spend event reports. A denial with
+  `denied_by_period == "tag"` denies only traffic matching that selector — it
+  never creates project-wide or run-wide sticky denial authority. Tagged calls
+  always take a fresh budget check, bypassing the project allow cache and the
+  run lease path, because tag selectors can carry independent caps.
+- **Nested runs report their immediate parent.** Spend events from a nested
+  `solwyn.run(...)` scope carry `parent_agent_run_id` — the raw id of the
+  immediately enclosing run; root runs omit the field. Parent context restores
+  after normal exits and exceptions, including across concurrent asyncio tasks.
+- **`solwyn.current_run_context()` returns the active `RunContext(id, name,
+  tags)`.** The tag mapping is a defensive copy, so caller mutation cannot
+  change the active scope. `RunContext` and the attribution bounds
+  (`TAGS_MAX_KEYS`, `TAG_KEY_MAX_LENGTH`, `TAG_VALUE_MAX_LENGTH`) are package
+  exports.
 
 ### Changed
 
