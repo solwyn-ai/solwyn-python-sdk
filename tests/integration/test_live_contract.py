@@ -11,7 +11,8 @@ behavior-bearing fields in the shapes the SDK reads:
   failover tuning; the SDK opts in via ``failover_directive_version="1"``.
 * ``denied_by_period`` — OMITTED on allow (directive-v1 responses serialize
   exclude_none), present with the denying period on deny; the ``"agent_run"``
-  literal keys run-scoped sticky denial (budget.py ``_cache_response``).
+  literal keys run-scoped sticky denial and the ``"tag"`` literal keeps tag
+  denials non-sticky (budget.py ``_cache_response``).
 
 The PJ-2 lease block below does the same job for the lease wire: every
 grant/renew field the SDK's admission ladder reads, every refusal status it
@@ -58,15 +59,21 @@ from solwyn.budget import _LEASE_PATH, _LEASE_RENEW_PATH, _LEASE_SURRENDER_PATH
 # estimate (1000 input tokens + projected output) stays under the cap, and the
 # burn below ($0.005 input + $0.06 output = $0.065) crosses it.
 RUN_CAP_USD = 0.05
+TAG_CAP_USD = 0.05
 
 
-def _check_payload(agent_run_id: str | None = None) -> dict[str, object]:
+def _check_payload(
+    agent_run_id: str | None = None,
+    *,
+    tags: dict[str, str] | None = None,
+) -> dict[str, object]:
     """The SDK's exact check wire bytes: directive v1 opt-in, None-skipping."""
     request = BudgetCheckRequest(
         estimated_input_tokens=1000,
         model="gpt-5.5",
         provider=ProviderName.OPENAI,
         agent_run_id=agent_run_id,
+        tags=tags,
         failover_directive_version="1",
     )
     return request.model_dump(mode="json")
@@ -84,6 +91,23 @@ def _post_check(credentials: Credentials, payload: dict[str, object]) -> dict[st
     if not isinstance(data, dict):
         pytest.fail(f"budget check returned non-object JSON: {data!r}")
     return data
+
+
+def _confirm_reservation(credentials: Credentials, reservation_id: str) -> None:
+    """Settle enough gpt-5.5 usage to cross either $0.05 scoped cap."""
+    with httpx.Client(base_url=credentials.api_url, timeout=10) as http:
+        r = http.post(
+            "/api/v1/budgets/confirm",
+            json={
+                "reservation_id": reservation_id,
+                "model": "gpt-5.5",
+                "provider": "openai",
+                "call_id": str(uuid.uuid4()),
+                "token_details": {"input_tokens": 1000, "output_tokens": 2000},
+            },
+            headers={"Authorization": f"Bearer {credentials.api_key}"},
+        )
+        r.raise_for_status()
 
 
 @pytest.mark.integration
@@ -164,6 +188,52 @@ def run_capped_credentials(api_url: str) -> Credentials:
     return Credentials(api_url=api_url, api_key=key)
 
 
+@pytest.fixture(scope="session")
+def tag_capped_credentials(api_url: str) -> Credentials:
+    """A hard_deny project with a $0.05 customer=acme tag cap."""
+    session_id = uuid.uuid4().hex[:12]
+    with httpx.Client(base_url=api_url, timeout=10) as http:
+        token = _signup_token(http, session_id)
+        jwt_headers = {"Authorization": f"Bearer {token}"}
+        r = http.post(
+            "/api/v1/projects",
+            json={
+                "name": f"sdk-tagcap-{session_id}",
+                "budget_limit": 100.0,
+                "budget_period": "monthly",
+                "budget_mode": "hard_deny",
+            },
+            headers=jwt_headers,
+        )
+        r.raise_for_status()
+        project_id = r.json()["id"]
+        key = r.json()["key"]
+
+        r = http.put(
+            f"/api/v1/projects/{project_id}/budget",
+            json={
+                "limit_usd": 100.0,
+                "period": "monthly",
+                "mode": "hard_deny",
+                "thresholds": [
+                    {
+                        "type": "scoped_budget",
+                        "scope": "tag",
+                        "match": "customer",
+                        "match_value": "acme",
+                        "limit": TAG_CAP_USD,
+                        "mode": "hard_deny",
+                        "channel_ids": [],
+                    }
+                ],
+            },
+            headers=jwt_headers,
+        )
+        if r.status_code != 200:
+            pytest.fail(f"tag-scoped budget rule PUT failed: {r.status_code} {r.text}")
+    return Credentials(api_url=api_url, api_key=key)
+
+
 @pytest.mark.integration
 class TestLiveFailoverDirectiveContract:
     @pytest.mark.integration
@@ -229,20 +299,7 @@ class TestLiveDeniedByPeriodContract:
         assert isinstance(reservation_id, str), f"expected a reservation: {first}"
 
         # Burn past the $0.05 run cap: $0.005 input + $0.06 output = $0.065.
-        with httpx.Client(base_url=run_capped_credentials.api_url, timeout=10) as http:
-            r = http.post(
-                "/api/v1/budgets/confirm",
-                json={
-                    "reservation_id": reservation_id,
-                    "model": "gpt-5.5",
-                    "provider": "openai",
-                    # uuid4 shape, per the API's call_id pattern.
-                    "call_id": str(uuid.uuid4()),
-                    "token_details": {"input_tokens": 1000, "output_tokens": 2000},
-                },
-                headers={"Authorization": f"Bearer {run_capped_credentials.api_key}"},
-            )
-            r.raise_for_status()
+        _confirm_reservation(run_capped_credentials, reservation_id)
 
         denied = _post_check(run_capped_credentials, _check_payload(agent_run_id=run_id))
         assert denied["allowed"] is False
@@ -258,6 +315,32 @@ class TestLiveDeniedByPeriodContract:
             run_capped_credentials, _check_payload(agent_run_id=f"run-{uuid.uuid4().hex[:12]}")
         )
         assert fresh["allowed"] is True
+
+    @pytest.mark.integration
+    def test_tag_cap_denial_reports_tag_and_remains_selector_scoped(
+        self, tag_capped_credentials: Credentials
+    ) -> None:
+        tags = {"customer": "acme"}
+        first = _post_check(tag_capped_credentials, _check_payload(tags=tags))
+        assert first["allowed"] is True
+        reservation_id = first.get("reservation_id")
+        assert isinstance(reservation_id, str), f"expected a reservation: {first}"
+
+        # Burn past the $0.05 tag cap: $0.005 input + $0.06 output = $0.065.
+        _confirm_reservation(tag_capped_credentials, reservation_id)
+
+        denied = _post_check(tag_capped_credentials, _check_payload(tags=tags))
+        assert denied["allowed"] is False
+        assert denied.get("denied_by_period") == "tag", (
+            "tag-cap denial must carry the exact literal the SDK's non-sticky "
+            f"branch keys on (budget.py); live API returned: {denied}"
+        )
+        assert BudgetCheckResponse.model_validate(denied).denied_by_period == "tag"
+
+        # A tag denial is selector-scoped, not project-sticky: untagged traffic
+        # on the same project remains allowed.
+        untagged = _post_check(tag_capped_credentials, _check_payload())
+        assert untagged["allowed"] is True
 
 
 # ── PJ-2 budget leases (Task S5) ─────────────────────────────────────────────

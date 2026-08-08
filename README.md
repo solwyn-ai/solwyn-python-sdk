@@ -321,9 +321,11 @@ with solwyn.run("orchestrator", tags={"team": "research", "workflow": "eval"}):
         # Tags: agent=one-off
 ```
 
-Use the reserved `solwyn_tags=` keyword as a call argument, not in `default_params`; it is removed before provider dispatch. Precedence is client defaults, then the active run scope, then per-call tags, with the higher-precedence value kept on conflicts. Each supplied mapping allows at most 10 string keys, keys must contain 1–64 characters, and string values may contain 0–256 characters. The SDK validates and copies mappings at client or run creation and at call start, so invalid input fails eagerly and later caller mutation cannot change attribution.
+Use the reserved `solwyn_tags=` keyword as a call argument, not in `default_params`; it is removed before provider dispatch. Precedence is client defaults, then the active run scope, then per-call tags, with the higher-precedence value kept on conflicts. Each supplied mapping allows at most 10 string keys, keys must contain 1–64 characters, and string values may contain 0–256 characters. Keys and values cannot contain NUL characters. The SDK validates and copies mappings at client or run creation and at call start, so invalid input fails eagerly and later caller mutation cannot change attribution.
 
 The combined map can exceed 10 keys even when each supplied mapping is valid. In that case the SDK keeps 10 deterministically: per-call keys first, then active-scope keys, then client-default keys, preserving insertion order within each layer. It emits one `SolwynTagsClampedWarning` for the overflowing call and still dispatches the provider request; lower-priority excess tags are absent from that call's event.
+
+Tagged calls always perform a fresh budget check because tag selectors can carry independent spending caps. They cannot use the project allow cache or the agent-run budget lease path. Setting constructor `tags=` therefore puts every intercepted call on the control-plane request path; leave client defaults unset when that attribution is not needed.
 
 Use `solwyn.current_run_context()` to read the active `RunContext(id, name, tags)`. Its tag mapping is a fresh copy, so caller mutation cannot change the active scope. `solwyn.current_run()` returns the `(id, name)` pair.
 

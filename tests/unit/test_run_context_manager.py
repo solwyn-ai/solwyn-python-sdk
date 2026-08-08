@@ -232,6 +232,17 @@ class TestRunContextManagerSync:
         with pytest.raises((TypeError, ValueError)):
             solwyn.run("invalid", tags=tags)  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize(
+        "tags",
+        [
+            {"customer\x00segment": "acme"},
+            {"customer": "acme\x00corp"},
+        ],
+    )
+    def test_nul_in_scope_tag_key_or_value_fails_before_entry(self, tags: dict[str, str]) -> None:
+        with pytest.raises(ValueError, match="must not contain NUL characters"):
+            solwyn.run("invalid", tags=tags)
+
     def test_private_snapshot_shallow_merges_per_call_tags(self) -> None:
         with solwyn.run("merged", tags={"team": "platform", "env": "prod"}):
             assert _run._capture_run_context({"env": "stage", "job": "batch"})[2] == {

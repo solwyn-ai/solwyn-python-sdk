@@ -36,6 +36,13 @@ def test_unsupported_surface_error_is_publicly_exported() -> None:
 
 
 @pytest.mark.unit
+def test_tags_clamped_warning_is_publicly_exported() -> None:
+    assert "SolwynTagsClampedWarning" in solwyn.__all__
+    assert solwyn.SolwynTagsClampedWarning is exceptions.SolwynTagsClampedWarning
+    assert issubclass(solwyn.SolwynTagsClampedWarning, UserWarning)
+
+
+@pytest.mark.unit
 def test_run_context_and_tag_bounds_are_publicly_exported() -> None:
     expected = {
         "current_run_context",

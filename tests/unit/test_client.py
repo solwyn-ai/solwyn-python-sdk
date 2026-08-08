@@ -989,6 +989,8 @@ class TestRichTokenExtraction:
             {"": "value"},
             {"k" * 65: "value"},
             {"key": "v" * 257},
+            {"customer\x00segment": "acme"},
+            {"customer": "acme\x00corp"},
             {1: "value"},
             {"key": 1},
         ],

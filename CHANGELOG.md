@@ -25,8 +25,11 @@ derived from git tags (hatch-vcs).
   call.** The event keeps per-call keys first, then active-scope keys, then
   client-default keys, preserving insertion order within each layer and the
   highest-precedence value on conflicts. Each overflowing capture emits one
-  `SolwynTagsClampedWarning`; lower-priority excess tags are dropped from that
-  event while the provider request continues.
+  `SolwynTagsClampedWarning`, exported from the package root; lower-priority
+  excess tags are dropped from that event while the provider request continues.
+- **Tag keys and values containing NUL are rejected eagerly.** This mirrors the
+  control plane's storage and selector constraints, so invalid tags cannot turn
+  budget checks into control-plane outage failures.
 
 ## [0.4.0] - 2026-07-28
 

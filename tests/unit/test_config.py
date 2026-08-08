@@ -191,6 +191,26 @@ class TestEnvVarConstruction:
         assert exc_info.value.field == "tags"
         assert "values must be strings" in exc_info.value.message
 
+    @pytest.mark.parametrize(
+        "tags",
+        [
+            {"customer\x00segment": "acme"},
+            {"customer": "acme\x00corp"},
+        ],
+    )
+    def test_sync_nul_in_default_tags_raises_configuration_error(
+        self, tags: dict[str, str]
+    ) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_solwyn(
+                _mock_openai_client(),
+                api_key=VALID_API_KEY,
+                tags=tags,
+            )
+
+        assert exc_info.value.field == "tags"
+        assert "must not contain NUL characters" in exc_info.value.message
+
     def test_budget_mode_loads_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """SOLWYN_BUDGET_MODE env var overrides the default budget_mode."""
         monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)

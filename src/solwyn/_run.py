@@ -131,10 +131,14 @@ def _copy_tags(
             raise ValueError(f"{parameter} keys must be non-empty")
         if len(key) > TAG_KEY_MAX_LENGTH:
             raise ValueError(f"{parameter} key exceeds max length {TAG_KEY_MAX_LENGTH}")
+        if "\x00" in key:
+            raise ValueError(f"{parameter} keys must not contain NUL characters")
         if not isinstance(value, str):
             raise TypeError(f"{parameter} values must be strings")
         if len(value) > TAG_VALUE_MAX_LENGTH:
             raise ValueError(f"{parameter} value exceeds max length {TAG_VALUE_MAX_LENGTH}")
+        if "\x00" in value:
+            raise ValueError(f"{parameter} values must not contain NUL characters")
         copied[key] = value
     return copied or None
 
