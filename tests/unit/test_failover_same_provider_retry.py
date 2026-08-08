@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
+from solwyn import run
 from solwyn._types import CircuitState
 from solwyn.client import AsyncSolwyn, Solwyn
 
@@ -154,7 +155,7 @@ _PLAIN_REQUEST = {
 
 @pytest.mark.unit
 class TestSameProviderRetryOn429:
-    def test_retry_same_provider_then_succeeds(self) -> None:
+    def test_retry_same_provider_then_succeeds_with_tags_and_agent_run(self) -> None:
         # 429 with a 2s Retry-After, then the SAME provider succeeds on retry.
         # The fallback is never touched and the retried-then-succeeded 429
         # records NO breaker failure.
@@ -171,10 +172,13 @@ class TestSameProviderRetryOn429:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
+        events: list = []
+        solwyn._reporter.report = lambda event: events.append(event)
 
         with (
             patch("solwyn.client.time.sleep") as sleep,
             patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            run("retry-agent", tags={"route": "same-provider"}) as run_id,
         ):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -184,6 +188,11 @@ class TestSameProviderRetryOn429:
         sleep.assert_called_once_with(2.0)
         assert openai_cb.failure_count == 0
         assert openai_cb.state == CircuitState.CLOSED
+        success_events = [event for event in events if event.status.value == "success"]
+        assert len(success_events) == 1
+        assert success_events[0].tags == {"route": "same-provider"}
+        assert success_events[0].agent_run_id == run_id
+        assert success_events[0].agent_run_name == "retry-agent"
 
         _close(solwyn)
 

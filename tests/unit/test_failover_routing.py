@@ -26,6 +26,7 @@ import httpx
 import pytest
 from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
+from solwyn import run
 from solwyn._base import FailoverTuning
 from solwyn._routing import CostPolicy, HealthBasedPolicy, LatencyPolicy, RoutingRequest
 from solwyn._types import CircuitState, ProviderName
@@ -337,7 +338,9 @@ class TestCrossProviderFailover:
 
         _close(solwyn)
 
-    def test_cross_provider_success_event_attribution(self) -> None:
+    def test_cross_provider_success_event_attribution_preserves_tags_and_agent_run(
+        self,
+    ) -> None:
         # The success MetadataEvent must be attributed to the SERVED provider,
         # flagged as a provider fallback, and carry requested_provider/model +
         # failover_reason for the dashboard. Here the primary
@@ -355,7 +358,10 @@ class TestCrossProviderFailover:
         events: list = []
         solwyn._reporter.report = lambda e: events.append(e)
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            run("fallback-agent", tags={"route": "cross-provider"}) as run_id,
+        ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         success = [e for e in events if e.status.value == "success"]
@@ -370,6 +376,9 @@ class TestCrossProviderFailover:
         # Primary was attempted-and-errored -> reactive failover -> PRIMARY_ERROR.
         assert ev.failover_reason is not None and ev.failover_reason.value == "primary_error"
         assert ev.attempt_index == 1
+        assert ev.tags == {"route": "cross-provider"}
+        assert ev.agent_run_id == run_id
+        assert ev.agent_run_name == "fallback-agent"
 
         _close(solwyn)
 

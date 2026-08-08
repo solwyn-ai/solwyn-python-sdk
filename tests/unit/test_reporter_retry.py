@@ -295,18 +295,42 @@ class TestSyncReporterRetry:
         assert len(control._settlement_queue) == 2
         control._http.close()
 
-    def test_batch_5xx_requeues_members_in_order(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_batch_5xx_requeues_tags_and_agent_run_in_order(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         clock = _FakeClock()
         monkeypatch.setattr("solwyn.reporter._monotonic", clock)
         reporter = _quiet(batch_size=10, max_send_attempts=5)
         for i in range(3):
-            reporter.report(_make_event(input_tokens=i))
+            reporter.report(
+                _make_event(
+                    input_tokens=i,
+                    tags={"attempt": str(i)},
+                    agent_run_id=f"run_retry_{i}",
+                    agent_run_name=f"retry-agent-{i}",
+                )
+            )
 
         with patch.object(reporter._http, "post", return_value=_error_response(500)):
             reporter._flush_remaining()
 
         assert len(reporter._queue) == 3
         assert [p.event.input_tokens for p in reporter._queue] == [0, 1, 2]
+        assert [p.event.tags for p in reporter._queue] == [
+            {"attempt": "0"},
+            {"attempt": "1"},
+            {"attempt": "2"},
+        ]
+        assert [p.event.agent_run_id for p in reporter._queue] == [
+            "run_retry_0",
+            "run_retry_1",
+            "run_retry_2",
+        ]
+        assert [p.event.agent_run_name for p in reporter._queue] == [
+            "retry-agent-0",
+            "retry-agent-1",
+            "retry-agent-2",
+        ]
         assert all(p.attempts == 1 for p in reporter._queue)
 
         clock.advance(2.0)
@@ -445,7 +469,7 @@ class TestSyncReporterRetry:
         assert len(reporter._queue) == 0
         reporter._http.close()
 
-    def test_settlement_overflow_ships_event_and_counts_confirm(
+    def test_settlement_overflow_ships_tagged_agent_run_event_and_counts_confirm(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # P2 review pin: an overflow-evicted settlement loses only its confirm
@@ -454,7 +478,13 @@ class TestSyncReporterRetry:
         monkeypatch.setattr("solwyn.reporter._MAX_PENDING_CONTROL", 1)
         reporter = _unstarted()
         reporter.report_settlement(
-            _make_confirm_request(call_id=call_uuid("old")), _make_event(call_id=call_uuid("old"))
+            _make_confirm_request(call_id=call_uuid("old")),
+            _make_event(
+                call_id=call_uuid("old"),
+                tags={"priority": "evicted"},
+                agent_run_id="run_evicted",
+                agent_run_name="evicted-agent",
+            ),
         )
         reporter.report_settlement(
             _make_confirm_request(call_id=call_uuid("new")), _make_event(call_id=call_uuid("new"))
@@ -464,6 +494,10 @@ class TestSyncReporterRetry:
         assert len(reporter._settlement_queue) == 1
         assert reporter._settlement_queue[0].confirm.request.call_id == call_uuid("new")
         assert [p.event.call_id for p in reporter._queue] == [call_uuid("old")]
+        evicted_event = reporter._queue[0].event
+        assert evicted_event.tags == {"priority": "evicted"}
+        assert evicted_event.agent_run_id == "run_evicted"
+        assert evicted_event.agent_run_name == "evicted-agent"
         assert "event.overflow" not in reporter.dropped_counts
         # Items are deliberately left queued — keep the atexit hook off them.
         reporter._shutdown.set()

@@ -15,6 +15,7 @@ try:
 except PackageNotFoundError:
     __version__ = "0.0.0-dev"
 
+from solwyn._constants import TAG_KEY_MAX_LENGTH, TAG_VALUE_MAX_LENGTH, TAGS_MAX_KEYS
 from solwyn._routing import (
     CostPolicy,
     HealthBasedPolicy,
@@ -23,7 +24,7 @@ from solwyn._routing import (
     RoutingRequest,
     SelectionPolicy,
 )
-from solwyn._run import current_run, run, run_in_executor
+from solwyn._run import RunContext, current_run, current_run_context, run, run_in_executor
 from solwyn._types import CircuitState, FailoverReason, ProviderEntry, ProviderName
 from solwyn.circuit_breaker import CircuitBreakerState
 from solwyn.client import AsyncSolwyn, Solwyn
@@ -33,6 +34,7 @@ from solwyn.exceptions import (
     ConfigurationError,
     ProviderUnavailableError,
     SolwynError,
+    SolwynTagsClampedWarning,
     UnsupportedSurfaceError,
     UntranslatableModelError,
     UntranslatableRequestError,
@@ -44,6 +46,7 @@ __all__ = [
     "AsyncSolwyn",
     "SolwynConfig",
     "SolwynError",
+    "SolwynTagsClampedWarning",
     "BudgetExceededError",
     "ProviderUnavailableError",
     "ConfigurationError",
@@ -65,4 +68,9 @@ __all__ = [
     "run",
     "run_in_executor",
     "current_run",
+    "current_run_context",
+    "RunContext",
+    "TAGS_MAX_KEYS",
+    "TAG_KEY_MAX_LENGTH",
+    "TAG_VALUE_MAX_LENGTH",
 ]

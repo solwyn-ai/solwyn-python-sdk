@@ -247,6 +247,7 @@ class _BudgetEnforcerBase:
         modality: Modality = "text",
         estimated_media: MediaUsage | None = None,
         agent_run_id: str | None = None,
+        tags: dict[str, str] | None = None,
     ) -> BudgetCheckRequest:
         """Build a BudgetCheckRequest for the cloud API.
 
@@ -268,6 +269,7 @@ class _BudgetEnforcerBase:
             fallback_providers=[ProviderName(p) for p in (fallback_providers or [])],
             fallback_models=list(fallback_models or []),
             agent_run_id=agent_run_id,
+            tags=dict(tags) if tags is not None else None,
             failover_directive_version="1",
         )
 
@@ -285,6 +287,7 @@ class _BudgetEnforcerBase:
         response: BudgetCheckResponse,
         *,
         agent_run_id: str | None = None,
+        cache_allowed_response: bool = True,
     ) -> None:
         """Cache an allow response. Never cache deny responses.
 
@@ -292,7 +295,9 @@ class _BudgetEnforcerBase:
         so that local enforcement can use it when the cloud becomes unreachable.
         Scoped checks never read or populate the global allow cache. Run-specific
         hard denials are sticky only for their raw run id; project-period hard
-        denials remain global and invalidate a stale global allow.
+        denials remain global and invalidate a stale global allow. Tag-period
+        denials stay selector-local: they clear stale project state without
+        creating or erasing run sticky state.
         """
         with self._state_lock:
             # Always remember the limit for local enforcement fallback
@@ -303,7 +308,7 @@ class _BudgetEnforcerBase:
                 self._last_hard_deny_response = None
                 if agent_run_id is not None:
                     self._run_hard_deny_responses.pop(agent_run_id, None)
-                else:
+                elif cache_allowed_response:
                     self._cached_response = response
                     self._cache_expires_at = time.monotonic() + self.cache_ttl
                 return
@@ -314,6 +319,10 @@ class _BudgetEnforcerBase:
                     self._run_hard_deny_responses.pop(agent_run_id, None)
                 self._cached_response = None
                 self._cache_expires_at = 0.0
+                return
+
+            if response.denied_by_period == "tag":
+                self._last_hard_deny_response = None
                 return
 
             if agent_run_id is not None and response.denied_by_period == "agent_run":
@@ -1254,6 +1263,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         modality: Modality = "text",
         estimated_media: MediaUsage | None = None,
         agent_run_id: str | None = None,
+        tags: dict[str, str] | None = None,
         call_id: str | None = None,
         estimated_output_bound: int | None = None,
     ) -> BudgetCheckResult:
@@ -1288,6 +1298,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         if (
             modality == "text"
             and estimated_media is None
+            and tags is None
             and self._lease_path_applies(agent_run_id)
         ):
             if agent_run_id is None:
@@ -1314,7 +1325,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         # Use cache if valid (only allow decisions are cached).
         # Snapshot under the lock to avoid a TOCTOU race between the validity
         # check and reading the cached fields.
-        if agent_run_id is None:
+        if agent_run_id is None and tags is None:
             with self._state_lock:
                 cached = self._cached_response
                 if (
@@ -1362,6 +1373,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             modality,
             estimated_media,
             agent_run_id,
+            tags,
         )
 
         try:
@@ -1412,7 +1424,11 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 )
                 return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
 
-            self._cache_response(cloud_response, agent_run_id=agent_run_id)
+            self._cache_response(
+                cloud_response,
+                agent_run_id=agent_run_id,
+                cache_allowed_response=tags is None,
+            )
             if breaker is not None:
                 breaker.record_success()
             return self._build_result_from_response(cloud_response)
@@ -1861,6 +1877,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         modality: Modality = "text",
         estimated_media: MediaUsage | None = None,
         agent_run_id: str | None = None,
+        tags: dict[str, str] | None = None,
         call_id: str | None = None,
         estimated_output_bound: int | None = None,
     ) -> BudgetCheckResult:
@@ -1870,6 +1887,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         if (
             modality == "text"
             and estimated_media is None
+            and tags is None
             and self._lease_path_applies(agent_run_id)
         ):
             if agent_run_id is None:
@@ -1893,7 +1911,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             if leased is not None:
                 return leased
 
-        if agent_run_id is None and self._should_use_cache():
+        if agent_run_id is None and tags is None and self._should_use_cache():
             cached = self._cached_response
             if cached is None:
                 raise RuntimeError("_should_use_cache returned True but cache is None")
@@ -1937,6 +1955,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             modality,
             estimated_media,
             agent_run_id,
+            tags,
         )
 
         try:
@@ -1987,7 +2006,11 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 )
                 return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
 
-            self._cache_response(cloud_response, agent_run_id=agent_run_id)
+            self._cache_response(
+                cloud_response,
+                agent_run_id=agent_run_id,
+                cache_allowed_response=tags is None,
+            )
             if breaker is not None:
                 breaker.record_success()
             return self._build_result_from_response(cloud_response)

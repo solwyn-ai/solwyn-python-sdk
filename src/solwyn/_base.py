@@ -838,7 +838,7 @@ class _SolwynBase:
         """
         if not call_id:
             raise RuntimeError("call_id is required for metadata reconciliation")
-        agent_run_id, agent_run_name, tags = (
+        agent_run_id, agent_run_name, tags, parent_agent_run_id = (
             _capture_run_context() if agent_run is None else agent_run
         )
         return MetadataEvent(
@@ -863,6 +863,7 @@ class _SolwynBase:
             sdk_instance_id=sdk_instance_id or self._sdk_instance_id,
             timestamp=timestamp or datetime.now(UTC),
             agent_run_id=agent_run_id,
+            parent_agent_run_id=parent_agent_run_id,
             agent_run_name=agent_run_name,
             call_id=call_id,
             provider_region=provider_region,

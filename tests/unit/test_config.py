@@ -103,6 +103,114 @@ class TestEnvVarConstruction:
 
         solwyn.close()
 
+    def test_tags_load_from_env_using_first_equals(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.setenv("SOLWYN_TAGS", "env=prod,expression=left=right")
+
+        solwyn = _make_solwyn(_mock_openai_client())
+
+        assert getattr(solwyn._config, "tags", None) == {
+            "env": "prod",
+            "expression": "left=right",
+        }
+
+        solwyn.close()
+
+    def test_tags_from_env_preserve_whitespace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.setenv("SOLWYN_TAGS", " env = prod ")
+
+        solwyn = _make_solwyn(_mock_openai_client())
+
+        assert getattr(solwyn._config, "tags", None) == {" env ": " prod "}
+
+        solwyn.close()
+
+    def test_tags_from_env_allow_empty_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.setenv("SOLWYN_TAGS", "environment=")
+
+        solwyn = _make_solwyn(_mock_openai_client())
+
+        assert getattr(solwyn._config, "tags", None) == {"environment": ""}
+
+        solwyn.close()
+
+    def test_tags_from_env_reject_comma_in_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.setenv("SOLWYN_TAGS", "description=alpha,beta")
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_solwyn(_mock_openai_client())
+
+        assert exc_info.value.field == "tags"
+
+    def test_sync_constructor_copies_default_tags(self) -> None:
+        tags = {"environment": "prod"}
+
+        solwyn = _make_solwyn(
+            _mock_openai_client(),
+            api_key=VALID_API_KEY,
+            tags=tags,
+        )
+        tags["environment"] = "mutated"
+
+        assert solwyn._config.tags == {"environment": "prod"}
+
+        solwyn.close()
+
+    def test_sync_constructor_allows_commas_in_tag_values(self) -> None:
+        solwyn = _make_solwyn(
+            _mock_openai_client(),
+            api_key=VALID_API_KEY,
+            tags={"description": "alpha,beta"},
+        )
+
+        assert solwyn._config.tags == {"description": "alpha,beta"}
+
+        solwyn.close()
+
+    def test_sync_constructor_rejects_string_default_tags(self) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_solwyn(
+                _mock_openai_client(),
+                api_key=VALID_API_KEY,
+                tags="team=research",
+            )
+
+        assert exc_info.value.field == "tags"
+
+    def test_sync_invalid_default_tags_raise_configuration_error(self) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_solwyn(
+                _mock_openai_client(),
+                api_key=VALID_API_KEY,
+                tags={"environment": 1},
+            )
+
+        assert exc_info.value.field == "tags"
+        assert "values must be strings" in exc_info.value.message
+
+    @pytest.mark.parametrize(
+        "tags",
+        [
+            {"customer\x00segment": "acme"},
+            {"customer": "acme\x00corp"},
+        ],
+    )
+    def test_sync_nul_in_default_tags_raises_configuration_error(
+        self, tags: dict[str, str]
+    ) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_solwyn(
+                _mock_openai_client(),
+                api_key=VALID_API_KEY,
+                tags=tags,
+            )
+
+        assert exc_info.value.field == "tags"
+        assert "must not contain NUL characters" in exc_info.value.message
+
     def test_budget_mode_loads_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """SOLWYN_BUDGET_MODE env var overrides the default budget_mode."""
         monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
@@ -498,6 +606,32 @@ class TestAsyncSolwynConstructors:
         assert solwyn._reporter._breaker_report_heartbeat == 12.5
 
         await solwyn.close()
+
+    @pytest.mark.asyncio
+    async def test_async_constructor_copies_default_tags(self) -> None:
+        tags = {"environment": "prod"}
+
+        solwyn = _make_async_solwyn(
+            _mock_openai_client(),
+            api_key=VALID_API_KEY,
+            tags=tags,
+        )
+        tags["environment"] = "mutated"
+
+        assert solwyn._config.tags == {"environment": "prod"}
+
+        await solwyn.close()
+
+    def test_async_invalid_default_tags_raise_configuration_error(self) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_async_solwyn(
+                _mock_openai_client(),
+                api_key=VALID_API_KEY,
+                tags={"environment": 1},
+            )
+
+        assert exc_info.value.field == "tags"
+        assert "values must be strings" in exc_info.value.message
 
     def test_async_bad_api_key_raises_configuration_error(self) -> None:
         """AsyncSolwyn raises ConfigurationError for malformed api_key."""

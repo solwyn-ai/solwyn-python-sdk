@@ -346,6 +346,14 @@ class MetadataEvent(BaseModel):
             "server-side from the event timestamp."
         ),
     )
+    parent_agent_run_id: str | None = Field(
+        default=None,
+        max_length=AGENT_RUN_ID_MAX_LENGTH,
+        description=(
+            "Immediate enclosing solwyn.run() scope id for orchestrator-to-child "
+            "hierarchies. None for top-level and unscoped events."
+        ),
+    )
     agent_run_name: str | None = Field(
         default=None,
         max_length=AGENT_RUN_NAME_MAX_LENGTH,
@@ -440,6 +448,14 @@ class BudgetCheckRequest(BaseModel):
         default=None,
         max_length=AGENT_RUN_ID_MAX_LENGTH,
         description="Stable id for the active solwyn.run() scope, when present.",
+    )
+    tags: dict[TagKey, TagValue] | None = Field(
+        default=None,
+        max_length=TAGS_MAX_KEYS,
+        description=(
+            "Exact explicit tag snapshot captured for the pending call, used for "
+            "tag-scoped budget admission."
+        ),
     )
     failover_directive_version: Literal["1"] | None = Field(
         default=None,

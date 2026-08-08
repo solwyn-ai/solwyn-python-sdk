@@ -74,6 +74,7 @@ EXPECTED_CHECK_FIELDS = {
     "fallback_providers",
     "fallback_models",
     "agent_run_id",
+    "tags",
     "failover_directive_version",
 }
 
@@ -83,6 +84,7 @@ EXPECTED_CHECK_FIELDS = {
 _NONE_SKIPPED_CHECK_FIELDS = {
     "estimated_media",
     "agent_run_id",
+    "tags",
     "failover_directive_version",
 }
 
@@ -210,6 +212,7 @@ EXPECTED_METADATA_FIELDS = {
     "sdk_instance_id",
     "timestamp",
     "agent_run_id",
+    "parent_agent_run_id",
     "agent_run_name",
     "is_provider_fallback",
     "requested_provider",
@@ -402,9 +405,37 @@ class TestWireModelDumpSnapshots:
 
         assert set(dumped) == EXPECTED_CHECK_FIELDS - {
             "estimated_media",
+            "tags",
             "failover_directive_version",
         }
         assert dumped["agent_run_id"] == "run_abc"
+
+    def test_budget_check_request_tagged_dump_carries_bounded_tags(self) -> None:
+        req = BudgetCheckRequest(
+            estimated_input_tokens=10,
+            model="gpt-5.5",
+            provider=ProviderName.OPENAI,
+            tags={"team": "research"},
+        )
+
+        dumped = req.model_dump(mode="json")
+
+        assert dumped["tags"] == {"team": "research"}
+        tags_schema = BudgetCheckRequest.model_json_schema()["properties"]["tags"]["anyOf"][0]
+        assert tags_schema == {
+            "type": "object",
+            "maxProperties": 10,
+            "propertyNames": {"minLength": 1, "maxLength": 64},
+            "additionalProperties": {"type": "string", "maxLength": 256},
+        }
+
+        with pytest.raises(ValidationError):
+            BudgetCheckRequest(
+                estimated_input_tokens=10,
+                model="gpt-5.5",
+                provider=ProviderName.OPENAI,
+                tags={f"key-{index}": "value" for index in range(11)},
+            )
 
     def test_budget_check_request_agent_run_id_length_boundary(self) -> None:
         accepted = BudgetCheckRequest(
@@ -436,6 +467,7 @@ class TestWireModelDumpSnapshots:
         dumped = req.model_dump(mode="json")
         assert set(dumped) == EXPECTED_CHECK_FIELDS - {
             "agent_run_id",
+            "tags",
             "failover_directive_version",
         }
         assert dumped["estimated_media"]["image_count"] == 2
@@ -740,6 +772,14 @@ class TestWireModelFieldConstraints:
         assert wire_constants.TAGS_MAX_KEYS == 10
         assert wire_constants.TAG_KEY_MAX_LENGTH == 64
         assert wire_constants.TAG_VALUE_MAX_LENGTH == 256
+
+    def test_metadata_parent_agent_run_id_matches_agent_run_id_bound(self) -> None:
+        schema = MetadataEvent.model_json_schema()["properties"]
+
+        assert (
+            schema["parent_agent_run_id"]["anyOf"][0]["maxLength"]
+            == schema["agent_run_id"]["anyOf"][0]["maxLength"]
+        )
 
     def test_metadata_tags_schema_exposes_all_wire_bounds(self) -> None:
         tags_schema = MetadataEvent.model_json_schema()["properties"]["tags"]["anyOf"][0]

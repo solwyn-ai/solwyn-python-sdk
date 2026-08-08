@@ -1,6 +1,6 @@
-"""Tests for agent_run_id / agent_run_name fields on MetadataEvent.
+"""Tests for agent-run hierarchy fields on MetadataEvent.
 
-The API-side wire model (solwyn-shared) accepts both fields as optional.
+The API-side wire model (solwyn-shared) accepts these fields as optional.
 The SDK's vendored MetadataEvent must mirror that shape so the cross-repo
 contract-parity test in solwyn-ai/core stays green.
 """
@@ -36,32 +36,36 @@ def _make_event(**overrides: object) -> MetadataEvent:
 
 @pytest.mark.unit
 class TestMetadataEventAgentRunFields:
-    """The two new optional fields must be accepted and round-trip cleanly."""
+    """Optional agent-run hierarchy fields must round-trip cleanly."""
 
     def test_defaults_to_none(self) -> None:
         # Arrange / Act
         event = _make_event()
 
-        # Assert — backward-compat: events emitted outside a run scope
-        # produce no agent_run_* in the payload (API auto-fallback engages).
+        # Assert — events emitted outside a run scope produce no agent_run_*
+        # hierarchy in the payload (API auto-fallback engages).
         assert event.agent_run_id is None
+        assert event.parent_agent_run_id is None
         assert event.agent_run_name is None
 
     def test_accepts_explicit_values(self) -> None:
         # Arrange / Act
         event = _make_event(
             agent_run_id="run_K7qZ3xR1pNvL9wMs",
+            parent_agent_run_id="run_parent_3xR1pNvL9wMs",
             agent_run_name="nightly-batch",
         )
 
         # Assert
         assert event.agent_run_id == "run_K7qZ3xR1pNvL9wMs"
+        assert event.parent_agent_run_id == "run_parent_3xR1pNvL9wMs"
         assert event.agent_run_name == "nightly-batch"
 
     def test_round_trip_through_json(self) -> None:
         # Arrange
         original = _make_event(
             agent_run_id="run_K7qZ3xR1pNvL9wMs",
+            parent_agent_run_id="run_parent_3xR1pNvL9wMs",
             agent_run_name="nightly-batch",
         )
 
@@ -71,6 +75,7 @@ class TestMetadataEventAgentRunFields:
 
         # Assert
         assert restored.agent_run_id == "run_K7qZ3xR1pNvL9wMs"
+        assert restored.parent_agent_run_id == "run_parent_3xR1pNvL9wMs"
         assert restored.agent_run_name == "nightly-batch"
 
     def test_default_serialization_omits_no_scope_agent_run_fields(self) -> None:
@@ -82,8 +87,10 @@ class TestMetadataEventAgentRunFields:
         raw = event.model_dump_json()
 
         assert "agent_run_id" not in payload
+        assert "parent_agent_run_id" not in payload
         assert "agent_run_name" not in payload
         assert "agent_run_id" not in raw
+        assert "parent_agent_run_id" not in raw
         assert "agent_run_name" not in raw
 
     def test_no_scope_json_wire_shape_omits_agent_run_fields(self) -> None:
@@ -95,8 +102,10 @@ class TestMetadataEventAgentRunFields:
         restored = MetadataEvent.model_validate_json(raw)
 
         assert "agent_run_id" not in raw
+        assert "parent_agent_run_id" not in raw
         assert "agent_run_name" not in raw
         assert restored.agent_run_id is None
+        assert restored.parent_agent_run_id is None
         assert restored.agent_run_name is None
 
     def test_extra_field_still_forbidden(self) -> None:
@@ -110,6 +119,11 @@ class TestMetadataEventAgentRunFields:
         with pytest.raises(ValidationError):
             _make_event(agent_run_id="x" * 257)
 
+    def test_parent_agent_run_id_max_length_enforced(self) -> None:
+        assert _make_event(parent_agent_run_id="x" * 256).parent_agent_run_id == "x" * 256
+        with pytest.raises(ValidationError):
+            _make_event(parent_agent_run_id="x" * 257)
+
     def test_agent_run_name_max_length_enforced(self) -> None:
         with pytest.raises(ValidationError):
             _make_event(agent_run_name="x" * 256)
@@ -121,10 +135,16 @@ class TestMetadataEventAgentRunFields:
         event = _make_event()
         payload = event.model_dump(mode="json", exclude_none=True)
         assert "agent_run_id" not in payload
+        assert "parent_agent_run_id" not in payload
         assert "agent_run_name" not in payload
 
     def test_exclude_none_keeps_set_fields(self) -> None:
-        event = _make_event(agent_run_id="run_abc", agent_run_name="batch")
+        event = _make_event(
+            agent_run_id="run_abc",
+            parent_agent_run_id="run_parent",
+            agent_run_name="batch",
+        )
         payload = event.model_dump(mode="json", exclude_none=True)
         assert payload["agent_run_id"] == "run_abc"
+        assert payload["parent_agent_run_id"] == "run_parent"
         assert payload["agent_run_name"] == "batch"

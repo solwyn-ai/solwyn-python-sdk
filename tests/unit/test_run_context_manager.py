@@ -9,6 +9,7 @@ server-side auto-fallback engages.
 from __future__ import annotations
 
 import asyncio
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 
@@ -16,6 +17,7 @@ import pytest
 
 import solwyn
 from solwyn import _run
+from solwyn import exceptions as solwyn_exceptions
 from solwyn._constants import AGENT_RUN_ID_MAX_LENGTH
 from solwyn._run import current_run
 
@@ -58,6 +60,43 @@ class TestRunContextManagerSync:
         # Before any scope is entered, no run is active.
         assert current_run() == (None, None)
 
+    def test_current_run_context_outside_scope_returns_empty_named_tuple(self) -> None:
+        assert solwyn.current_run_context() == solwyn.RunContext(None, None, None)
+
+    def test_current_run_context_exposes_active_id_name_and_tags(self) -> None:
+        with solwyn.run("tagged", tags={"team": "research"}) as run_id:
+            context = solwyn.current_run_context()
+
+            assert context == solwyn.RunContext(run_id, "tagged", {"team": "research"})
+            assert context.id == run_id
+            assert context.name == "tagged"
+            assert current_run() == (run_id, "tagged")
+
+    def test_current_run_context_returns_defensive_tag_copies(self) -> None:
+        with solwyn.run("tagged", tags={"team": "research"}):
+            first = solwyn.current_run_context()
+            assert first.tags is not None
+
+            first.tags["team"] = "mutated"
+
+            second = solwyn.current_run_context()
+            assert second.tags == {"team": "research"}
+            assert second.tags is not first.tags
+
+    def test_current_run_context_restores_outer_scope_after_nesting(self) -> None:
+        with solwyn.run("outer", tags={"scope": "outer"}) as outer_id:
+            outer = solwyn.current_run_context()
+            with solwyn.run("inner", tags={"scope": "inner"}) as inner_id:
+                inner = solwyn.current_run_context()
+                assert inner == solwyn.RunContext(inner_id, "inner", {"scope": "inner"})
+
+            assert solwyn.current_run_context() == solwyn.RunContext(
+                outer_id,
+                "outer",
+                {"scope": "outer"},
+            )
+            assert solwyn.current_run_context().tags is not outer.tags
+
     def test_exit_clears_active_run(self) -> None:
         with solwyn.run("foo"):
             pass
@@ -90,20 +129,80 @@ class TestRunContextManagerSync:
                 run_id,
                 "tagged",
                 {"team": "research"},
+                None,
             )
 
     def test_nested_scope_restores_outer_tags(self) -> None:
-        with solwyn.run("outer", tags={"scope": "outer"}) as outer_id:
-            with solwyn.run("inner", tags={"scope": "inner"}) as inner_id:
+        with solwyn.run("outer", tags={"outer": "kept"}) as outer_id:
+            with solwyn.run("inner", tags={"inner": "kept"}) as inner_id:
                 assert _run._capture_run_context() == (
                     inner_id,
                     "inner",
-                    {"scope": "inner"},
+                    {"inner": "kept", "outer": "kept"},
+                    outer_id,
                 )
             assert _run._capture_run_context() == (
                 outer_id,
                 "outer",
-                {"scope": "outer"},
+                {"outer": "kept"},
+                None,
+            )
+
+    def test_sibling_snapshots_share_the_same_parent(self) -> None:
+        with solwyn.run("orchestrator") as parent_run_id:
+            with solwyn.run("first-child") as first_child_id:
+                first_snapshot = _run._capture_run_context()
+            with solwyn.run("second-child") as second_child_id:
+                second_snapshot = _run._capture_run_context()
+
+        assert first_snapshot == (first_child_id, "first-child", None, parent_run_id)
+        assert second_snapshot == (second_child_id, "second-child", None, parent_run_id)
+
+    def test_grandchild_snapshot_points_to_child(self) -> None:
+        with (
+            solwyn.run("orchestrator"),
+            solwyn.run("child") as child_run_id,
+            solwyn.run("grandchild") as grandchild_run_id,
+        ):
+            snapshot = _run._capture_run_context()
+
+        assert snapshot == (grandchild_run_id, "grandchild", None, child_run_id)
+
+    def test_nested_scope_overwrites_only_conflicting_parent_keys(self) -> None:
+        with (
+            solwyn.run(
+                "outer",
+                tags={"shared": "outer", "outer": "kept"},
+            ),
+            solwyn.run(
+                "inner",
+                tags={"shared": "inner", "inner": "kept"},
+            ),
+        ):
+            assert _run._capture_run_context()[2] == {
+                "shared": "inner",
+                "inner": "kept",
+                "outer": "kept",
+            }
+
+    def test_nested_scope_can_start_fresh_without_inherited_tags(self) -> None:
+        with solwyn.run("outer", tags={"outer": "isolated"}) as outer_id:
+            with solwyn.run(
+                "inner",
+                tags={"inner": "fresh"},
+                inherit_tags=False,
+            ) as inner_id:
+                assert _run._capture_run_context() == (
+                    inner_id,
+                    "inner",
+                    {"inner": "fresh"},
+                    outer_id,
+                )
+            assert _run._capture_run_context() == (
+                outer_id,
+                "outer",
+                {"outer": "isolated"},
+                None,
             )
 
     def test_scope_copies_caller_mapping_and_private_snapshot(self) -> None:
@@ -133,6 +232,17 @@ class TestRunContextManagerSync:
         with pytest.raises((TypeError, ValueError)):
             solwyn.run("invalid", tags=tags)  # type: ignore[arg-type]
 
+    @pytest.mark.parametrize(
+        "tags",
+        [
+            {"customer\x00segment": "acme"},
+            {"customer": "acme\x00corp"},
+        ],
+    )
+    def test_nul_in_scope_tag_key_or_value_fails_before_entry(self, tags: dict[str, str]) -> None:
+        with pytest.raises(ValueError, match="must not contain NUL characters"):
+            solwyn.run("invalid", tags=tags)
+
     def test_private_snapshot_shallow_merges_per_call_tags(self) -> None:
         with solwyn.run("merged", tags={"team": "platform", "env": "prod"}):
             assert _run._capture_run_context({"env": "stage", "job": "batch"})[2] == {
@@ -145,15 +255,143 @@ class TestRunContextManagerSync:
                 "env": "prod",
             }
 
+    @pytest.mark.parametrize(
+        ("client_tags", "scope_tags", "call_tags", "expected"),
+        [
+            (None, None, None, None),
+            (
+                {"shared": "client", "client": "only"},
+                None,
+                None,
+                {"shared": "client", "client": "only"},
+            ),
+            (
+                {"shared": "client", "client": "only"},
+                {"shared": "scope", "scope": "only"},
+                None,
+                {"shared": "scope", "client": "only", "scope": "only"},
+            ),
+            (
+                {"shared": "client", "client": "only"},
+                {"shared": "scope", "scope": "only"},
+                {"shared": "call", "call": "only"},
+                {
+                    "shared": "call",
+                    "client": "only",
+                    "scope": "only",
+                    "call": "only",
+                },
+            ),
+            ({"empty": ""}, None, None, {"empty": ""}),
+        ],
+    )
+    def test_private_snapshot_uses_client_scope_call_precedence(
+        self,
+        client_tags: dict[str, str] | None,
+        scope_tags: dict[str, str] | None,
+        call_tags: dict[str, str] | None,
+        expected: dict[str, str] | None,
+    ) -> None:
+        if scope_tags is None:
+            captured = _run._capture_run_context(call_tags, default_tags=client_tags)
+        else:
+            with solwyn.run("precedence", tags=scope_tags):
+                captured = _run._capture_run_context(call_tags, default_tags=client_tags)
+
+        assert captured[2] == expected
+
+    @pytest.mark.parametrize(
+        ("default_tags", "scope_tags", "call_tags", "expected"),
+        [
+            (
+                {f"default-{index}": "default" for index in range(10)},
+                {"scope": "scope"},
+                None,
+                {
+                    "scope": "scope",
+                    **{f"default-{index}": "default" for index in range(9)},
+                },
+            ),
+            (
+                {f"default-{index}": "default" for index in range(10)},
+                {f"scope-{index}": "scope" for index in range(10)},
+                {"call": "call"},
+                {
+                    "call": "call",
+                    **{f"scope-{index}": "scope" for index in range(9)},
+                },
+            ),
+            (
+                {"shared": "default", **{f"default-{index}": "default" for index in range(9)}},
+                {"shared": "scope", **{f"scope-{index}": "scope" for index in range(9)}},
+                {"shared": "call", "call": "call"},
+                {
+                    "shared": "call",
+                    "call": "call",
+                    **{f"scope-{index}": "scope" for index in range(8)},
+                },
+            ),
+        ],
+    )
+    def test_private_snapshot_clamps_by_call_scope_default_priority(
+        self,
+        default_tags: dict[str, str],
+        scope_tags: dict[str, str],
+        call_tags: dict[str, str] | None,
+        expected: dict[str, str],
+    ) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with solwyn.run("clamped", tags=scope_tags):
+                captured = _run._capture_run_context(
+                    call_tags,
+                    default_tags=default_tags,
+                )
+
+        assert captured[2] == expected
+        assert len(caught) == 1
+        assert caught[0].category is solwyn_exceptions.SolwynTagsClampedWarning
+
+    def test_parent_and_child_full_layers_clamp_to_child_priority(self) -> None:
+        parent_tags = {f"parent-{index}": "parent" for index in range(10)}
+        child_tags = {f"child-{index}": "child" for index in range(10)}
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with (
+                solwyn.run("parent", tags=parent_tags),
+                solwyn.run("child", tags=child_tags),
+            ):
+                captured = _run._capture_run_context()
+
+        assert captured[2] == child_tags
+        assert len(caught) == 1
+        assert caught[0].category is solwyn_exceptions.SolwynTagsClampedWarning
+
+    def test_each_overflowing_capture_emits_exactly_one_warning(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with solwyn.run(
+                "overflow",
+                tags={f"scope-{index}": "scope" for index in range(10)},
+            ):
+                for _ in range(2):
+                    _run._capture_run_context({"call": "call"})
+
+        assert len(caught) == 2
+        assert all(
+            warning.category is solwyn_exceptions.SolwynTagsClampedWarning for warning in caught
+        )
+
     def test_empty_merged_mapping_is_absent(self) -> None:
-        assert _run._capture_run_context({}) == (None, None, None)
+        assert _run._capture_run_context({}) == (None, None, None, None)
 
     def test_per_call_only_mapping_is_copied(self) -> None:
         tags = {"job": "batch"}
         captured = _run._capture_run_context(tags)
         tags["job"] = "mutated"
 
-        assert captured == (None, None, {"job": "batch"})
+        assert captured == (None, None, {"job": "batch"}, None)
 
     def test_exception_propagates_and_resets_state(self) -> None:
         with pytest.raises(RuntimeError, match="boom"), solwyn.run("foo"):

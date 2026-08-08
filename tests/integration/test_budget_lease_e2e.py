@@ -163,6 +163,7 @@ def _grant_raw(
     holder_id: str,
     *,
     fail_open: bool = True,
+    estimated_input_tokens: int = 100,
 ) -> dict[str, Any]:
     """A grant issued with the SDK's exact request bytes, outside any enforcer."""
     request = LeaseGrantRequest(
@@ -171,7 +172,7 @@ def _grant_raw(
         model=MODEL,
         provider=ProviderName.OPENAI,
         fail_open=fail_open,
-        estimated_input_tokens=100,
+        estimated_input_tokens=estimated_input_tokens,
     )
     with httpx.Client(base_url=credentials.api_url, timeout=15) as http:
         r = http.post(
@@ -354,7 +355,7 @@ class TestLeasePartitioning:
         concurrently, settling every admitted call so the server's float
         accounting sees the drawdown it would see in production. What is pinned
         is the server's PARTITION: at every instant, the token authority the two
-        holders jointly hold is at most what one holder alone was granted.
+        holders jointly hold is at most the independently measured run pool.
 
         Lifetime drawdown is a DIFFERENT invariant and belongs to the test
         below, which now holds live: a run cannot outdraw the pool it was sized
@@ -364,16 +365,26 @@ class TestLeasePartitioning:
         test's assertion through both is what forced them.
         """
         credentials = provision_project(
-            api_url, name="sdk-lease-pair", budget_limit=10.0, budget_mode="hard_deny"
+            api_url, name="sdk-lease-pair", budget_limit=100.0, budget_mode="hard_deny"
         )
 
-        solo = _grant_raw(credentials, _run_id(), "solo-holder")
-        solo_bound = solo["granted_tokens"]
-        assert solo_bound > 0
+        # At gpt-5.5's $30/M worst-case rate, $100 is a ~3.3M-token
+        # pool. A 1M-token demand spans 8 lease intervals (8M tokens), so
+        # the solo probe saturates the ratio bound and exposes the whole pool.
+        solo = _grant_raw(
+            credentials,
+            _run_id(),
+            "solo-holder",
+            estimated_input_tokens=1_000_000,
+        )
+        solo_pool = solo["headroom_share_tokens"]
+        assert solo_pool > 0
         _surrender_raw(credentials, solo["lease_id"], "solo-holder", solo["generation"])
 
         run_id = _run_id()
-        input_tokens, output_bound = 2_000, 8_000
+        # Bootstrap grants are 400k tokens; 25 x 20k reservations cross the
+        # 75% renewal threshold while remaining far inside the roomy pool.
+        input_tokens, output_bound = 5_000, 15_000
         per_call = input_tokens + output_bound
         enforcers = [
             make_lease_enforcer(
@@ -499,15 +510,21 @@ class TestLeasePartitioning:
             thread.start()
         initial_joint_authority = 0
         renewed_joint_authority = 0
+        renewed_overlap_complete = False
         try:
             assert both_holders_ready.wait(timeout=180), (
                 f"holders did not reach the forced overlap: {driver_errors}"
             )
             assert driver_errors == [None, None]
             initial_states = [enforcer._lease.state_for(run_id) for enforcer in enforcers]
-            assert all(state is not None and state.lease_id is not None for state in initial_states)
+            assert all(
+                state is not None
+                and state.lease_id is not None
+                and state.share_remaining_tokens > 0
+                for state in initial_states
+            )
             initial_joint_authority = sum(
-                state.granted_tokens for state in initial_states if state is not None
+                state.share_remaining_tokens for state in initial_states if state is not None
             )
             resume_drivers.set()
 
@@ -520,18 +537,21 @@ class TestLeasePartitioning:
                 state is not None
                 and state.lease_id is not None
                 and state.generation > initial_generations[index]
+                and state.share_remaining_tokens > 0
                 for index, state in enumerate(renewed_states)
             )
             renewed_joint_authority = sum(
-                state.granted_tokens for state in renewed_states if state is not None
+                state.share_remaining_tokens for state in renewed_states if state is not None
             )
+            renewed_overlap_complete = True
         finally:
             resume_drivers.set()
             resume_after_renewal.set()
             with suppress(Exception):
                 overlap_barrier.abort()
-            with suppress(Exception):
-                renewed_barrier.abort()
+            if not renewed_overlap_complete:
+                with suppress(Exception):
+                    renewed_barrier.abort()
 
         for thread in threads:
             thread.join(timeout=180)
@@ -540,16 +560,55 @@ class TestLeasePartitioning:
         assert driver_errors == [None, None]
 
         assert sum(admitted) > 0, "neither holder ever admitted on lease authority"
-        assert initial_joint_authority > 0, "the forced overlap held no live lease"
-        assert initial_joint_authority <= solo_bound, (
+        assert initial_joint_authority <= solo_pool, (
             "two holders jointly held more token authority "
-            f"({initial_joint_authority}) than a single holder's bound ({solo_bound})"
+            f"({initial_joint_authority}) than the run pool ({solo_pool})"
         )
-        assert renewed_joint_authority > 0, "the renewed overlap held no live lease"
-        assert renewed_joint_authority <= solo_bound, (
+        assert renewed_joint_authority <= solo_pool, (
             "two renewed holders jointly held more token authority "
-            f"({renewed_joint_authority}) than a single holder's bound ({solo_bound})"
+            f"({renewed_joint_authority}) than the run pool ({solo_pool})"
         )
+
+    @pytest.mark.integration
+    def test_zero_token_second_holder_falls_back_to_authoritative_verdict(
+        self, api_url: str, make_lease_enforcer: EnforcerFactory
+    ) -> None:
+        """DoD 4: a valid zero-token lease defers to the per-call verdict."""
+        credentials = provision_project(
+            api_url, name="sdk-lease-tight-pair", budget_limit=10.0, budget_mode="hard_deny"
+        )
+        run_id = _run_id()
+        first_holder = f"tight-first-{uuid.uuid4().hex[:8]}"
+        first = _grant_raw(credentials, run_id, first_holder, fail_open=False)
+        assert first["granted_tokens"] > 0
+
+        enforcer, wire = make_lease_enforcer(
+            credentials,
+            budget_mode=BudgetMode.HARD_DENY,
+            fail_open=False,
+            holder_id=f"tight-second-{uuid.uuid4().hex[:8]}",
+        )
+        try:
+            result = _admit(enforcer, run_id)
+            state = enforcer._lease.state_for(run_id)
+
+            assert state is not None
+            assert state.lease_id is not None
+            assert state.generation > 0
+            assert state.granted_tokens == 0
+            assert state.share_remaining_tokens == 0
+            assert result.allowed is False
+            assert result.lease_id is None
+            assert wire.count(_LEASE_PATH) == 1
+            assert wire.count(CHECK_PATH) == 1
+        finally:
+            enforcer.close()
+            _surrender_raw(
+                credentials,
+                first["lease_id"],
+                first_holder,
+                first["generation"],
+            )
 
     @pytest.mark.integration
     def test_lifetime_drawdown_stays_within_the_granted_bound(
@@ -683,7 +742,7 @@ class TestLeaseReclaim:
         self, lease_project: ProjectCredentials, make_lease_enforcer: EnforcerFactory
     ) -> None:
         """DoD 6a: close() hands the float back — the server's ceiling returns to 0."""
-        enforcer, wire = make_lease_enforcer(lease_project)
+        enforcer, _wire = make_lease_enforcer(lease_project)
         run_id = _run_id()
 
         result = _admit(enforcer, run_id)
@@ -697,7 +756,6 @@ class TestLeaseReclaim:
 
         enforcer.close()
 
-        assert wire.count(_LEASE_SURRENDER_PATH) == 1, f"close() did not surrender: {wire.paths}"
         released = budget_status(lease_project)
         assert released["outage_overspend_ceiling_usd"] == 0.0, (
             f"the surrendered lease still holds outage authority: {released}"

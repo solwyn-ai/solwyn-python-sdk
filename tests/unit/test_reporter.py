@@ -324,6 +324,7 @@ class TestMetadataReporter:
 
             event = _make_event(
                 agent_run_id="run_test_abc",
+                parent_agent_run_id="run_parent_abc",
                 agent_run_name="test-batch",
             )
             with patch.object(reporter._http, "post") as mock_post:
@@ -331,6 +332,7 @@ class TestMetadataReporter:
 
             payload = mock_post.call_args.kwargs["json"][0]
             assert payload["agent_run_id"] == "run_test_abc"
+            assert payload["parent_agent_run_id"] == "run_parent_abc"
             assert payload["agent_run_name"] == "test-batch"
             reporter._http.close()
 
@@ -349,6 +351,7 @@ class TestMetadataReporter:
 
             payload = mock_post.call_args.kwargs["json"][0]
             assert "agent_run_id" not in payload
+            assert "parent_agent_run_id" not in payload
             assert "agent_run_name" not in payload
             reporter._http.close()
 

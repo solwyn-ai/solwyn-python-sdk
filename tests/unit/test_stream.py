@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1001,3 +1001,61 @@ class TestAsyncStreamWrapperInnerClose:
 
         assert inner.close_called == 1
         assert completion_count == 1
+
+
+@pytest.mark.unit
+class TestStreamingSettlementAttribution:
+    def test_run_tags_and_agent_run_survive_stream_settlement(self) -> None:
+        from conftest import VALID_API_KEY
+
+        from solwyn import run
+        from solwyn.client import Solwyn
+
+        provider = MagicMock()
+        provider.__class__.__module__ = "openai._client"
+        provider.__class__.__name__ = "OpenAI"
+        provider.with_options.return_value = provider
+        provider.chat.completions.create.return_value = iter(
+            [
+                SimpleNamespace(
+                    usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+                    service_tier=None,
+                )
+            ]
+        )
+        with patch("solwyn.reporter.MetadataReporter._flush_loop"):
+            solwyn = Solwyn(provider, api_key=VALID_API_KEY, model="gpt-5.5")
+        solwyn._reporter._shutdown.set()
+        solwyn._reporter._thread.join(timeout=2.0)
+        settlements: list[tuple[object, object]] = []
+        solwyn._reporter.report_settlement = lambda confirm, event: settlements.append(
+            (confirm, event)
+        )
+        budget = SimpleNamespace(
+            allowed=True,
+            reservation_id="res_stream_attribution",
+            project_id=None,
+            budget_limit=100.0,
+            current_usage=0.0,
+            mode=SimpleNamespace(value="alert_only"),
+            price_hints=None,
+        )
+
+        with (
+            patch.object(solwyn._budget, "check_budget", return_value=budget),
+            run("stream-agent", tags={"team": "research"}) as run_id,
+        ):
+            stream = solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "hi"}],
+                stream=True,
+            )
+            list(stream)
+
+        assert len(settlements) == 1
+        _confirm, event = settlements[0]
+        assert event.tags == {"team": "research"}
+        assert event.agent_run_id == run_id
+        assert event.agent_run_name == "stream-agent"
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()

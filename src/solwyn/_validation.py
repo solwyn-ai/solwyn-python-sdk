@@ -1,8 +1,6 @@
-"""Project ID and project API key validation.
+"""Project API key format validation.
 
-Project key and project ID format validation.
-
-Security features applied to every validator:
+Security checks applied to the validator:
 - Unicode NFC normalization to prevent homograph attacks
 - ASCII-only enforcement to prevent encoding exploits
 - Regex pattern validation for allowed characters
@@ -13,7 +11,6 @@ import re
 import unicodedata
 from typing import Final
 
-PROJECT_ID_PATTERN: Final = re.compile(r"^proj_[a-f0-9]{24}$")
 PROJECT_KEY_PATTERN: Final = re.compile(r"^sk_proj_[a-f0-9]{64}$")
 
 
@@ -31,19 +28,6 @@ def _security_checks(value: str, label: str) -> str:
         raise ValueError(f"Invalid {label}: path traversal patterns not allowed")
 
     return value
-
-
-def validate_project_id(project_id: str) -> str:
-    """Validate and return a project ID (canonical implementation)."""
-    project_id = _security_checks(project_id, "project ID")
-
-    if not PROJECT_ID_PATTERN.match(project_id):
-        display = f"{project_id[:24]}..." if len(project_id) > 24 else project_id
-        raise ValueError(
-            f"Invalid project ID: must match proj_<24 lowercase hex chars>. Got: {display}"
-        )
-
-    return project_id
 
 
 def validate_project_key_format(api_key: str) -> str:
