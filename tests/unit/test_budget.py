@@ -9,7 +9,7 @@ import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 from pydantic import BaseModel
 
-from solwyn._types import BudgetCheckResponse, BudgetMode
+from solwyn._types import BudgetCheckResponse, BudgetMode, LeaseGrantResponse
 from solwyn.budget import (
     BudgetCheckResult,
     BudgetEnforcer,
@@ -40,6 +40,11 @@ _ALERT_ONLY_DENY_RESPONSE = {
 _RUN_DENY_RESPONSE = {
     **_DENY_RESPONSE,
     "denied_by_period": "agent_run",
+}
+
+_STOPPED_RUN_DENY_RESPONSE = {
+    **_DENY_RESPONSE,
+    "denied_by_period": "run_stopped",
 }
 
 _TAG_DENY_RESPONSE = {
@@ -214,6 +219,52 @@ class TestBudgetEnforcerBase:
 
         assert result.allowed is expected_allowed
         assert result.failover_tuning_allowed is False
+        assert result.denied_by_period == response.denied_by_period
+
+    def test_lease_run_stopped_denial_is_filed_under_only_its_run(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+        response = LeaseGrantResponse.model_validate(
+            {
+                "eligible": True,
+                "allowed": False,
+                "denied_by_period": "run_stopped",
+                "project_id": VALID_PROJECT_ID,
+                "mode": "hard_deny",
+                "budget_limit": 100.0,
+                "current_usage": 100.0,
+                "remaining_budget": 0.0,
+            }
+        )
+
+        result = base._lease_deny_result("run_a", response)
+
+        assert result.denied_by_period == "run_stopped"
+        assert base._last_hard_deny_response is None
+        same_run = base._build_prior_hard_deny_unavailable_result("run_a")
+        unrelated_run = base._build_prior_hard_deny_unavailable_result("run_b")
+        assert same_run is not None
+        assert same_run.denied_by_period == "run_stopped"
+        assert unrelated_run is None
+
+    @pytest.mark.parametrize("denied_by_period", ["agent_run", "run_stopped"])
+    def test_run_scoped_denial_without_run_id_never_becomes_global(
+        self, denied_by_period: str
+    ) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+        response = BudgetCheckResponse.model_validate(
+            {**_DENY_RESPONSE, "denied_by_period": denied_by_period}
+        )
+
+        base._cache_response(response)
+
+        assert base._last_hard_deny_response is None
+        assert base._build_prior_hard_deny_unavailable_result("unrelated") is None
 
 
 # ---------------------------------------------------------------------------
@@ -989,6 +1040,45 @@ class TestScopedCacheAndStickyDenials:
         assert outage_a.warning is not None
         assert "preserving prior hard deny" in outage_a.warning.lower()
 
+    def test_run_stopped_is_sticky_only_for_same_run_during_outage(self) -> None:
+        enforcer = _make_legacy_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[
+                _response(_STOPPED_RUN_DENY_RESPONSE),
+                httpx.ConnectError("unreachable"),
+                httpx.ConnectError("unreachable"),
+            ],
+        ):
+            denied_a = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+            outage_b = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_b",
+            )
+            outage_a = enforcer.check_budget(
+                estimated_input_tokens=500,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_a",
+            )
+
+        assert denied_a.allowed is False
+        assert denied_a.denied_by_period == "run_stopped"
+        assert outage_b.allowed is True
+        assert outage_b.denied_by_period is None
+        assert outage_a.allowed is False
+        assert outage_a.denied_by_period == "run_stopped"
+        assert enforcer._last_hard_deny_response is None
+
     def test_run_hard_deny_clears_older_global_project_deny_for_other_runs(self) -> None:
         enforcer = _make_legacy_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
 
@@ -1168,6 +1258,7 @@ class TestBudgetCheckResult:
         assert result.reservation_id is None
         assert result.mode == BudgetMode.ALERT_ONLY
         assert result.warning is None
+        assert result.denied_by_period is None
         assert result.failover_tuning_allowed is None
 
     def test_all_fields(self) -> None:
@@ -1177,10 +1268,12 @@ class TestBudgetCheckResult:
             reservation_id="res_456",
             mode=BudgetMode.HARD_DENY,
             warning="Budget exceeded",
+            denied_by_period="run_stopped",
         )
         assert result.allowed is False
         assert result.reservation_id == "res_456"
         assert result.mode == BudgetMode.HARD_DENY
+        assert result.denied_by_period == "run_stopped"
 
 
 # ---------------------------------------------------------------------------

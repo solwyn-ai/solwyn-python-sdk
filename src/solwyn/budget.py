@@ -81,6 +81,11 @@ _GrantVerdict = Literal["applied", "legacy", "denied", "unreachable"]
 # unbounded stream of run UUIDs in a long-lived SDK process.
 _MAX_STICKY_RUN_DENIALS = 128
 
+# Both the run budget cap and an operator stop are scoped to one raw run id.
+# Keep the classification shared by per-call and lease denials through
+# ``_cache_response`` so neither can poison unrelated runs during an outage.
+_RUN_SCOPED_DENIAL_PERIODS = frozenset({"agent_run", "run_stopped"})
+
 # Uncounted-mode telemetry (§8): loud on ENTRY to a fail-open uncounted
 # episode, then at most one line per this interval while it persists. An
 # hour-long outage must stay visible without one warning per call.
@@ -125,6 +130,7 @@ class BudgetCheckResult(BaseModel):
     warning: str | None = None
     budget_limit: float = 0.0
     current_usage: float = 0.0
+    denied_by_period: str | None = None
     # PJ-2: set when the call drew on LEASE authority instead of a per-call
     # reservation. Exactly one of reservation_id / lease_id ever settles a call.
     lease_id: str | None = None
@@ -325,10 +331,13 @@ class _BudgetEnforcerBase:
                 self._last_hard_deny_response = None
                 return
 
-            if agent_run_id is not None and response.denied_by_period == "agent_run":
-                # The run limit denied, so every project period passed. Replace
-                # stale global state with the denial scoped to this run only.
+            if response.denied_by_period in _RUN_SCOPED_DENIAL_PERIODS:
+                # The run limit or operator stop denied, so every project
+                # period passed. Never promote run-scoped authority to a
+                # process-wide denial, even if a drifted response lacks a run.
                 self._last_hard_deny_response = None
+                if agent_run_id is None:
+                    return
                 self._run_hard_deny_responses.pop(agent_run_id, None)
                 self._run_hard_deny_responses[agent_run_id] = response
                 if len(self._run_hard_deny_responses) > _MAX_STICKY_RUN_DENIALS:
@@ -372,6 +381,7 @@ class _BudgetEnforcerBase:
             ),
             budget_limit=response.budget_limit,
             current_usage=response.current_usage,
+            denied_by_period=response.denied_by_period,
         )
 
     def _build_unreachable_result(
@@ -435,6 +445,7 @@ class _BudgetEnforcerBase:
                 mode=response.mode,
                 budget_limit=response.budget_limit,
                 current_usage=response.current_usage,
+                denied_by_period=response.denied_by_period,
                 price_hints=price_hints,
                 failover_tuning_allowed=failover_tuning_allowed,
             )
@@ -458,6 +469,7 @@ class _BudgetEnforcerBase:
                 ),
                 budget_limit=response.budget_limit,
                 current_usage=response.current_usage,
+                denied_by_period=response.denied_by_period,
                 price_hints=price_hints,
                 failover_tuning_allowed=failover_tuning_allowed,
             )
@@ -473,6 +485,7 @@ class _BudgetEnforcerBase:
             ),
             budget_limit=response.budget_limit,
             current_usage=response.current_usage,
+            denied_by_period=response.denied_by_period,
             failover_tuning_allowed=failover_tuning_allowed,
         )
 
@@ -766,7 +779,7 @@ class _BudgetEnforcerBase:
     def _lease_deny_result(
         self, agent_run_id: str, response: LeaseGrantResponse
     ) -> BudgetCheckResult:
-        """Feed an authoritative lease denial to the UNCHANGED sticky machinery."""
+        """Feed a lease denial through the shared run/global sticky classification."""
         denial = BudgetCheckResponse(
             allowed=False,
             remaining_budget=response.remaining_budget,
@@ -1341,6 +1354,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                         mode=cached.mode,
                         budget_limit=cached.budget_limit,
                         current_usage=cached.current_usage,
+                        denied_by_period=cached.denied_by_period,
                     )
 
         breaker = self._control_plane_breaker
@@ -1923,6 +1937,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 mode=cached.mode,
                 budget_limit=cached.budget_limit,
                 current_usage=cached.current_usage,
+                denied_by_period=cached.denied_by_period,
             )
 
         breaker = self._control_plane_breaker

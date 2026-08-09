@@ -278,8 +278,12 @@ class TestWireModelFieldSets:
         assert parsed.failover_directive is not None
         assert parsed.failover_directive.failover_tuning_allowed is False
 
-    def test_directive_v1_deny_response_parses_with_agent_run_period(self) -> None:
-        # "agent_run" is the wire literal run-scoped sticky denial keys on
+    @pytest.mark.parametrize("denied_by_period", ["agent_run", "run_stopped"])
+    def test_directive_v1_deny_response_parses_with_run_scoped_period(
+        self, denied_by_period: str
+    ) -> None:
+        # "agent_run" and "run_stopped" are the wire literals that run-scoped
+        # sticky denial keys on.
         # (budget.py _cache_response). This pins the SDK-side parse of the
         # exact deny shape the server emits (exclude_none drops the
         # reservation_id: deny responses reserve nothing).
@@ -289,14 +293,14 @@ class TestWireModelFieldSets:
             "mode": "hard_deny",
             "budget_limit": 100.0,
             "current_usage": 2.5,
-            "denied_by_period": "agent_run",
+            "denied_by_period": denied_by_period,
             "project_id": "proj_abc",
             "failover_directive": {"version": "1", "failover_tuning_allowed": True},
         }
 
         parsed = BudgetCheckResponse.model_validate(payload)
 
-        assert parsed.denied_by_period == "agent_run"
+        assert parsed.denied_by_period == denied_by_period
         assert parsed.reservation_id is None
 
     def test_budget_confirm_request_field_set(self) -> None:

@@ -36,6 +36,13 @@ def test_unsupported_surface_error_is_publicly_exported() -> None:
 
 
 @pytest.mark.unit
+def test_run_stopped_error_is_publicly_exported() -> None:
+    assert "RunStoppedError" in solwyn.__all__
+    assert solwyn.RunStoppedError is exceptions.RunStoppedError
+    assert issubclass(solwyn.RunStoppedError, solwyn.BudgetExceededError)
+
+
+@pytest.mark.unit
 def test_tags_clamped_warning_is_publicly_exported() -> None:
     assert "SolwynTagsClampedWarning" in solwyn.__all__
     assert solwyn.SolwynTagsClampedWarning is exceptions.SolwynTagsClampedWarning

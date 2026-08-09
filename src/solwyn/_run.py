@@ -372,5 +372,10 @@ def run(
     ``solwyn.run(...)`` is not supported inside async generators. A scope
     opened before ``yield`` would remain active in the consumer's ``async for``
     body, so the SDK raises at scope entry instead.
+
+    When an operator stops this run from the Solwyn dashboard, the next
+    Solwyn-wrapped provider call raises :class:`solwyn.RunStoppedError` before
+    provider dispatch. A stop does not abort a provider call already in flight
+    or truncate a stream that has already been returned.
     """
     return _RunScope(name, tags, inherit_tags=inherit_tags)

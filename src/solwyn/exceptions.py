@@ -1,6 +1,7 @@
 """Solwyn SDK exceptions.
 
 BudgetExceededError -- raised when hard-deny mode blocks a request.
+RunStoppedError -- raised when a dashboard stop blocks an agent run.
 ProviderUnavailableError -- raised when all providers are circuit-broken.
 ConfigurationError -- raised when configuration is invalid.
 UntranslatableRequestError -- raised when a cross-provider hop cannot translate a request.
@@ -68,6 +69,36 @@ class BudgetExceededError(SolwynError):
             f"budget_limit={self.budget_limit!r}, "
             f"current_usage={self.current_usage!r})"
         )
+
+
+class RunStoppedError(BudgetExceededError):
+    """Raised when an operator stopped an agent run from the dashboard.
+
+    This is a ``BudgetExceededError`` subclass so existing hard-deny handlers
+    keep catching it. It carries the same budget snapshot fields plus the
+    stopped run id; no prompt or response content is retained.
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_run_id: str | None,
+        project_id: str | None,
+        budget_limit: float,
+        current_usage: float,
+        estimated_cost: float,
+        mode: str,
+    ) -> None:
+        super().__init__(
+            project_id=project_id,
+            budget_limit=budget_limit,
+            current_usage=current_usage,
+            estimated_cost=estimated_cost,
+            budget_period="run_stopped",
+            mode=mode,
+        )
+        self.agent_run_id = agent_run_id
+        self.args = (f"Run {agent_run_id} was stopped from the Solwyn dashboard",)
 
 
 class ProviderUnavailableError(SolwynError):

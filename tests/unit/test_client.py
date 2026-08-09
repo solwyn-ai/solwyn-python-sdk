@@ -22,7 +22,7 @@ from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn._privacy import estimate_content_length
 from solwyn._types import BudgetMode, ProviderName
 from solwyn.client import Solwyn, _build_hop_kwargs
-from solwyn.exceptions import BudgetExceededError, ProviderUnavailableError
+from solwyn.exceptions import BudgetExceededError, ProviderUnavailableError, RunStoppedError
 from solwyn.providers import get_adapter_for_client
 from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
 
@@ -98,6 +98,21 @@ def _allow_budget_result() -> SimpleNamespace:
         reservation_id=None,
         project_id=VALID_PROJECT_ID,
         price_hints=None,
+    )
+
+
+def _deny_budget_result(denied_by_period: str | None) -> SimpleNamespace:
+    """Minimal hard-deny result for client exception-plumbing tests."""
+    return SimpleNamespace(
+        allowed=False,
+        reservation_id=None,
+        project_id=VALID_PROJECT_ID,
+        price_hints=None,
+        failover_tuning_allowed=None,
+        budget_limit=10.0,
+        current_usage=10.0,
+        denied_by_period=denied_by_period,
+        mode=BudgetMode.HARD_DENY,
     )
 
 
@@ -390,6 +405,74 @@ class TestBudgetCheckBeforeCall:
         client.chat.completions.create.assert_not_called()
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
+
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_run_stopped_raises_typed_error_before_chat_dispatch(self, stream: bool) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
+
+        with (
+            patch.object(
+                solwyn._budget,
+                "check_budget",
+                return_value=_deny_budget_result("run_stopped"),
+            ),
+            patch.object(solwyn._reporter, "report"),
+            solwyn_pkg.run("dashboard-stopped") as run_id,
+            pytest.raises(RunStoppedError) as exc_info,
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                stream=stream,
+            )
+
+        client.chat.completions.create.assert_not_called()
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+        error = exc_info.value
+        assert type(error) is RunStoppedError
+        assert isinstance(error, BudgetExceededError)
+        assert str(error) == f"Run {run_id} was stopped from the Solwyn dashboard"
+        assert error.project_id == VALID_PROJECT_ID
+        assert error.budget_limit == 10.0
+        assert error.current_usage == 10.0
+        assert error.estimated_cost > 0.0
+        assert error.budget_period == "run_stopped"
+        assert error.mode == "hard_deny"
+
+    @pytest.mark.parametrize(
+        ("denied_by_period", "expected_budget_period"),
+        [("monthly", "monthly"), ("future_period", "future_period"), (None, "unknown")],
+    )
+    def test_budget_error_uses_cloud_period_or_unknown_fallback(
+        self,
+        denied_by_period: str | None,
+        expected_budget_period: str,
+    ) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
+
+        with (
+            patch.object(
+                solwyn._budget,
+                "check_budget",
+                return_value=_deny_budget_result(denied_by_period),
+            ),
+            patch.object(solwyn._reporter, "report"),
+            pytest.raises(BudgetExceededError) as exc_info,
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+        assert type(exc_info.value) is BudgetExceededError
+        assert exc_info.value.budget_period == expected_budget_period
 
     def test_prior_hard_deny_still_blocks_provider_call_when_cloud_unreachable(self) -> None:
         client, _ = _mock_openai_client()
@@ -1927,6 +2010,47 @@ class TestAsyncNonStreamingInterception:
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_async_run_stopped_raises_typed_error_before_chat_dispatch(
+        self, stream: bool
+    ) -> None:
+        client, _ = _mock_openai_client()
+        client.chat.completions.create = AsyncMockFn()
+        solwyn = _make_async_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
+
+        with (
+            patch.object(
+                solwyn._budget,
+                "check_budget",
+                new=AsyncMockFn(return_value=_deny_budget_result("run_stopped")),
+            ),
+            patch.object(solwyn._reporter, "report"),
+        ):
+            async with solwyn_pkg.run("dashboard-stopped-async") as run_id:
+                with pytest.raises(RunStoppedError) as exc_info:
+                    await solwyn.chat.completions.create(
+                        model="gpt-5.5",
+                        messages=[{"role": "user", "content": "Hello"}],
+                        stream=stream,
+                    )
+
+        client.chat.completions.create.assert_not_called()
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+        error = exc_info.value
+        assert type(error) is RunStoppedError
+        assert isinstance(error, BudgetExceededError)
+        assert str(error) == f"Run {run_id} was stopped from the Solwyn dashboard"
+        assert error.project_id == VALID_PROJECT_ID
+        assert error.budget_limit == 10.0
+        assert error.current_usage == 10.0
+        assert error.estimated_cost > 0.0
+        assert error.budget_period == "run_stopped"
+        assert error.mode == "hard_deny"
 
     @pytest.mark.unit
     @pytest.mark.asyncio
