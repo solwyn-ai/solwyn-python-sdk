@@ -1,6 +1,6 @@
 """Solwyn SDK exceptions.
 
-BudgetExceededError -- raised when hard-deny mode blocks a request.
+BudgetExceededError -- raised when budget enforcement blocks a request.
 RunStoppedError -- raised when a dashboard stop blocks an agent run.
 ProviderUnavailableError -- raised when all providers are circuit-broken.
 ConfigurationError -- raised when configuration is invalid.
