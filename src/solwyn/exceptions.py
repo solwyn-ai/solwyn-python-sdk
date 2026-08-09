@@ -39,7 +39,8 @@ class BudgetExceededError(SolwynError):
         budget_limit: The configured spending cap (dollars).
         current_usage: Spending already consumed in the current period.
         estimated_cost: Estimated cost of the blocked request.
-        budget_period: The budget window (daily / weekly / monthly).
+        budget_period: The Cloud denial label (for example, daily, weekly,
+            monthly, agent_run, tag, or run_stopped).
         mode: The active budget mode when the error was raised.
     """
 

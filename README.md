@@ -463,10 +463,15 @@ All SDK errors inherit from `SolwynError`:
 | Exception | Raised when |
 |-----------|-------------|
 | `BudgetExceededError` | Budget exceeded in `hard_deny` mode |
+| `RunStoppedError` | A dashboard stop is learned for an agent run — on the next budget check for per-call traffic, or after lease renewal or re-grant for leased traffic |
 | `ProviderUnavailableError` | Circuit breaker is open, or the failover chain is exhausted |
 | `ConfigurationError` | Invalid API key format, invalid `provider=` override, or an untracked call surface (e.g. Bedrock `invoke_model`) |
 | `UntranslatableRequestError` | A cross-provider failover hop cannot represent the request (structural labels only — never content) |
 | `UntranslatableModelError` | No model mapping exists for a cross-provider failover hop |
+
+`RunStoppedError` is a `BudgetExceededError` subclass, so existing
+`except BudgetExceededError` handlers continue to catch dashboard stops. A stop
+does not interrupt requests already in flight or streams already returned.
 
 Provider errors (e.g., `openai.RateLimitError`) pass through unmodified.
 
