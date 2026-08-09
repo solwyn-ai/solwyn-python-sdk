@@ -65,7 +65,7 @@ class BudgetExceededError(SolwynError):
 
     def __repr__(self) -> str:
         return (
-            f"BudgetExceededError("
+            f"{type(self).__name__}("
             f"budget_limit={self.budget_limit!r}, "
             f"current_usage={self.current_usage!r})"
         )

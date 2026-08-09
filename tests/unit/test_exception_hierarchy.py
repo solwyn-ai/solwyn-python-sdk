@@ -196,7 +196,7 @@ class TestUntranslatableModelError:
 
 
 @pytest.mark.unit
-def test_exceptions_have_useful_repr() -> None:
+def test_budget_exceeded_error_repr_remains_compatible() -> None:
     exc = BudgetExceededError(
         project_id="proj_" + "a" * 24,
         budget_limit=100.0,
@@ -205,6 +205,19 @@ def test_exceptions_have_useful_repr() -> None:
         budget_period="daily",
         mode="hard_deny",
     )
-    rep = repr(exc)
-    assert "BudgetExceededError" in rep
-    assert "100" in rep
+
+    assert repr(exc) == "BudgetExceededError(budget_limit=100.0, current_usage=120.0)"
+
+
+@pytest.mark.unit
+def test_run_stopped_error_repr_names_its_public_type() -> None:
+    exc = RunStoppedError(
+        agent_run_id="run_abc",
+        project_id="proj_" + "a" * 24,
+        budget_limit=100.0,
+        current_usage=120.0,
+        estimated_cost=5.0,
+        mode="hard_deny",
+    )
+
+    assert repr(exc) == "RunStoppedError(budget_limit=100.0, current_usage=120.0)"

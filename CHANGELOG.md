@@ -12,8 +12,11 @@ derived from git tags (hatch-vcs).
 - **Dashboard-stopped runs raise `RunStoppedError`.** The public exception is
   a `BudgetExceededError` subclass, so existing hard-deny handlers remain
   compatible. It identifies the stopped run, preserves the budget snapshot
-  fields, and is raised before the next provider dispatch; calls already in
-  flight and streams already returned are not interrupted.
+  fields, and per-call traffic raises it on the next budget check. Leased
+  traffic raises only after a lease renewal or re-grant learns the stop.
+  Requests already in flight and streams already returned are not interrupted,
+  and control-plane connectivity failures retain the configured fail-open
+  posture.
 
 ### Changed
 
