@@ -250,21 +250,42 @@ class TestBudgetEnforcerBase:
         assert unrelated_run is None
 
     @pytest.mark.parametrize("denied_by_period", ["agent_run", "run_stopped"])
-    def test_run_scoped_denial_without_run_id_never_becomes_global(
+    def test_run_scoped_denial_without_run_id_invalidates_allow_and_sticks_globally(
         self, denied_by_period: str
     ) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
             api_key=VALID_API_KEY,
         )
+        base._cache_response(BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE))
         response = BudgetCheckResponse.model_validate(
             {**_DENY_RESPONSE, "denied_by_period": denied_by_period}
         )
 
         base._cache_response(response)
 
-        assert base._last_hard_deny_response is None
-        assert base._build_prior_hard_deny_unavailable_result("unrelated") is None
+        assert base._should_use_cache() is False
+        assert base._last_hard_deny_response is response
+        prior = base._build_prior_hard_deny_unavailable_result()
+        assert prior is not None
+        assert prior.denied_by_period == denied_by_period
+
+    def test_run_stopped_denial_preserves_prior_project_period_sticky_deny(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+        project_denial = BudgetCheckResponse(**_DENY_RESPONSE)
+        stopped_denial = BudgetCheckResponse(**_STOPPED_RUN_DENY_RESPONSE)
+        base._cache_response(project_denial)
+
+        base._cache_response(stopped_denial, agent_run_id="run_a")
+
+        assert base._last_hard_deny_response is project_denial
+        assert base._run_hard_deny_responses["run_a"] is stopped_denial
+        unrelated_run = base._build_prior_hard_deny_unavailable_result("run_b")
+        assert unrelated_run is not None
+        assert unrelated_run.denied_by_period == project_denial.denied_by_period
 
 
 # ---------------------------------------------------------------------------

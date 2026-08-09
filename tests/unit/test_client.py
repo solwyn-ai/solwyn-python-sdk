@@ -442,6 +442,32 @@ class TestBudgetCheckBeforeCall:
         assert error.budget_period == "run_stopped"
         assert error.mode == "hard_deny"
 
+    def test_run_stopped_label_without_active_run_raises_plain_budget_error(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
+
+        with (
+            patch.object(
+                solwyn._budget,
+                "check_budget",
+                return_value=_deny_budget_result("run_stopped"),
+            ),
+            patch.object(solwyn._reporter, "report"),
+            pytest.raises(BudgetExceededError) as exc_info,
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+
+        client.chat.completions.create.assert_not_called()
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+        assert type(exc_info.value) is BudgetExceededError
+        assert exc_info.value.budget_period == "run_stopped"
+        assert "Run None" not in str(exc_info.value)
+
     @pytest.mark.parametrize(
         ("denied_by_period", "expected_budget_period"),
         [("monthly", "monthly"), ("future_period", "future_period"), (None, "unknown")],

@@ -95,7 +95,7 @@ def _budget_denial_error(
     budget_period = getattr(budget, "denied_by_period", None)
     if budget_period is None:
         budget_period = "unknown"
-    if budget_period == "run_stopped":
+    if budget_period == "run_stopped" and agent_run_id is not None:
         return RunStoppedError(
             agent_run_id=agent_run_id,
             project_id=budget.project_id,

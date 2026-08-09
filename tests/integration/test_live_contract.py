@@ -11,8 +11,9 @@ behavior-bearing fields in the shapes the SDK reads:
   failover tuning; the SDK opts in via ``failover_directive_version="1"``.
 * ``denied_by_period`` — OMITTED on allow (directive-v1 responses serialize
   exclude_none), present with the denying period on deny; the ``"agent_run"``
-  literal keys run-scoped sticky denial and the ``"tag"`` literal keeps tag
-  denials non-sticky (budget.py ``_cache_response``).
+  and ``"run_stopped"`` literals key run-scoped handling, and the ``"tag"``
+  literal keeps tag denials non-sticky (budget.py ``_cache_response``). Stopped
+  runs must use ``mode="hard_deny"``, even for alert-only projects.
 
 The PJ-2 lease block below does the same job for the lease wire: every
 grant/renew field the SDK's admission ladder reads, every refusal status it
@@ -234,6 +235,67 @@ def tag_capped_credentials(api_url: str) -> Credentials:
     return Credentials(api_url=api_url, api_key=key)
 
 
+@pytest.fixture
+def stopped_run_credentials(api_url: str) -> tuple[Credentials, str]:
+    """An alert-only project with one dashboard-stopped explicit run."""
+    session_id = uuid.uuid4().hex[:12]
+    raw_run_id = f"run-{uuid.uuid4().hex[:12]}"
+    run_name = f"stopped-contract-{session_id}"
+    with httpx.Client(base_url=api_url, timeout=10) as http:
+        token = _signup_token(http, session_id)
+        jwt_headers = {"Authorization": f"Bearer {token}"}
+        project_response = http.post(
+            "/api/v1/projects",
+            json={
+                "name": f"sdk-stopped-run-{session_id}",
+                "budget_limit": 100.0,
+                "budget_period": "monthly",
+                "budget_mode": "alert_only",
+            },
+            headers=jwt_headers,
+        )
+        project_response.raise_for_status()
+        project = project_response.json()
+        project_id = project["id"]
+        credentials = Credentials(api_url=api_url, api_key=project["key"])
+        event = MetadataEvent(
+            model="gpt-5.5",
+            provider=ProviderName.OPENAI,
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=12.0,
+            status="success",
+            is_model_fallback=False,
+            sdk_instance_id=uuid.uuid4().hex,
+            timestamp=datetime.now(UTC),
+            agent_run_id=raw_run_id,
+            agent_run_name=run_name,
+            call_id=str(uuid.uuid4()),
+        )
+        ingest = http.post(
+            "/api/v1/metadata/ingest",
+            json=[event.model_dump(mode="json")],
+            headers={"Authorization": f"Bearer {credentials.api_key}"},
+        )
+        ingest.raise_for_status()
+        runs_response = http.get(
+            f"/api/v1/projects/{project_id}/agent-runs",
+            params={"q": run_name},
+            headers=jwt_headers,
+        )
+        runs_response.raise_for_status()
+        runs = runs_response.json()["runs"]
+        matching_runs = [run for run in runs if run["name"] == run_name]
+        assert len(matching_runs) == 1, runs
+        stop = http.post(
+            f"/api/v1/projects/{project_id}/agent-runs/{matching_runs[0]['id']}/stop",
+            headers=jwt_headers,
+        )
+        stop.raise_for_status()
+
+    return credentials, raw_run_id
+
+
 @pytest.mark.integration
 class TestLiveFailoverDirectiveContract:
     @pytest.mark.integration
@@ -315,6 +377,26 @@ class TestLiveDeniedByPeriodContract:
             run_capped_credentials, _check_payload(agent_run_id=f"run-{uuid.uuid4().hex[:12]}")
         )
         assert fresh["allowed"] is True
+
+    @pytest.mark.integration
+    def test_stopped_run_denial_reports_hard_deny_run_stopped(
+        self, stopped_run_credentials: tuple[Credentials, str]
+    ) -> None:
+        credentials, raw_run_id = stopped_run_credentials
+
+        denied = _post_check(credentials, _check_payload(agent_run_id=raw_run_id))
+
+        assert denied["allowed"] is False
+        assert denied.get("mode") == "hard_deny", (
+            f"dashboard stops must override an alert-only project's mode: {denied}"
+        )
+        assert denied.get("denied_by_period") == "run_stopped", (
+            "the SDK's typed stopped-run error keys on the exact run_stopped "
+            f"literal; live API returned: {denied}"
+        )
+        parsed = BudgetCheckResponse.model_validate(denied)
+        assert parsed.mode is BudgetMode.HARD_DENY
+        assert parsed.denied_by_period == "run_stopped"
 
     @pytest.mark.integration
     def test_tag_cap_denial_reports_tag_and_remains_selector_scoped(

@@ -332,11 +332,21 @@ class _BudgetEnforcerBase:
                 return
 
             if response.denied_by_period in _RUN_SCOPED_DENIAL_PERIODS:
-                # The run limit or operator stop denied, so every project
-                # period passed. Never promote run-scoped authority to a
-                # process-wide denial, even if a drifted response lacks a run.
-                self._last_hard_deny_response = None
+                # A run-cap denial proves every project period passed. A
+                # dashboard stop does not: Core short-circuits stopped runs
+                # before evaluating project periods, so preserve any older
+                # project-period sticky denial in that case.
+                if response.denied_by_period == "agent_run":
+                    self._last_hard_deny_response = None
                 if agent_run_id is None:
+                    # Contract drift left no run identity to scope by. Fall
+                    # back to the safe global posture used before run-scoped
+                    # labels existed: invalidate a cached allow and retain the
+                    # denial unless stronger project-period state already does.
+                    self._cached_response = None
+                    self._cache_expires_at = 0.0
+                    if self._last_hard_deny_response is None:
+                        self._last_hard_deny_response = response
                     return
                 self._run_hard_deny_responses.pop(agent_run_id, None)
                 self._run_hard_deny_responses[agent_run_id] = response
@@ -819,6 +829,7 @@ class _BudgetEnforcerBase:
             warning=admission.warning,
             budget_limit=snapshot.budget_limit if snapshot is not None else 0.0,
             current_usage=snapshot.current_usage if snapshot is not None else 0.0,
+            denied_by_period=("agent_run" if admission.decision is LeaseDecision.DENY else None),
         )
 
     def _lease_result_when_breaker_refuses(

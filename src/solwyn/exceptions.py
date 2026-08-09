@@ -12,6 +12,8 @@ SolwynTagsClampedWarning -- emitted when merged tags exceed the event cap.
 
 from __future__ import annotations
 
+from functools import partial
+
 
 class SolwynError(Exception):
     """Base exception for all Solwyn SDK errors.
@@ -74,6 +76,22 @@ class BudgetExceededError(SolwynError):
             f"current_usage={self.current_usage!r})"
         )
 
+    def __reduce__(self) -> tuple[object, tuple[object, ...], dict[str, object]]:
+        """Reconstruct keyword-only exception state across process boundaries."""
+        return (
+            partial(
+                type(self),
+                project_id=self.project_id,
+                budget_limit=self.budget_limit,
+                current_usage=self.current_usage,
+                estimated_cost=self.estimated_cost,
+                budget_period=self.budget_period,
+                mode=self.mode,
+            ),
+            (),
+            dict(self.__dict__),
+        )
+
 
 class RunStoppedError(BudgetExceededError):
     """Raised when an operator stopped an agent run from the dashboard.
@@ -103,6 +121,22 @@ class RunStoppedError(BudgetExceededError):
         )
         self.agent_run_id = agent_run_id
         self.args = (f"Run {agent_run_id} was stopped from the Solwyn dashboard",)
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...], dict[str, object]]:
+        """Preserve the stopped run id when copying or pickling."""
+        return (
+            partial(
+                type(self),
+                agent_run_id=self.agent_run_id,
+                project_id=self.project_id,
+                budget_limit=self.budget_limit,
+                current_usage=self.current_usage,
+                estimated_cost=self.estimated_cost,
+                mode=self.mode,
+            ),
+            (),
+            dict(self.__dict__),
+        )
 
 
 class ProviderUnavailableError(SolwynError):
