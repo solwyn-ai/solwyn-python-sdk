@@ -462,7 +462,7 @@ All SDK errors inherit from `SolwynError`:
 
 | Exception | Raised when |
 |-----------|-------------|
-| `BudgetExceededError` | Budget exceeded in `hard_deny` mode |
+| `BudgetExceededError` | Cloud denies a budget check in `hard_deny` mode, or local enforcement denies while Cloud is unreachable and `fail_open=False` |
 | `RunStoppedError` | A dashboard stop is learned for an agent run — on the next budget check for per-call traffic, or after lease renewal or re-grant for leased traffic |
 | `ProviderUnavailableError` | Circuit breaker is open, or the failover chain is exhausted |
 | `ConfigurationError` | Invalid API key format, invalid `provider=` override, or an untracked call surface (e.g. Bedrock `invoke_model`) |

@@ -29,18 +29,21 @@ class SolwynTagsClampedWarning(UserWarning):
 
 
 class BudgetExceededError(SolwynError):
-    """Raised when a request would exceed the configured budget limit.
+    """Raised when Solwyn budget enforcement blocks a request.
 
-    Only raised in ``BudgetMode.HARD_DENY`` mode.  In ``ALERT_ONLY`` mode
-    the SDK logs a warning instead.
+    A Cloud denial raises in ``BudgetMode.HARD_DENY`` mode; in ``ALERT_ONLY``
+    mode it logs a warning instead. When Cloud is unreachable and
+    ``fail_open=False``, local fail-closed enforcement can also raise while
+    retaining the configured mode, including ``ALERT_ONLY``.
 
     Attributes:
         project_id: Project identifier resolved by the API, if available.
         budget_limit: The configured spending cap (dollars).
         current_usage: Spending already consumed in the current period.
         estimated_cost: Estimated cost of the blocked request.
-        budget_period: The Cloud denial label (for example, daily, weekly,
-            monthly, agent_run, tag, or run_stopped).
+        budget_period: The Cloud denial label when supplied (for example,
+            daily, weekly, monthly, agent_run, tag, or run_stopped); unknown
+            for local enforcement or a Cloud response without a label.
         mode: The active budget mode when the error was raised.
     """
 
