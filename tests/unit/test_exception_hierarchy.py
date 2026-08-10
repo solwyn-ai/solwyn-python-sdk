@@ -15,6 +15,7 @@ from solwyn import (
     ProviderUnavailableError,
     RunStoppedError,
     SolwynError,
+    UntrackedSpendSurfaceError,
     UntranslatableModelError,
     UntranslatableRequestError,
 )
@@ -32,6 +33,29 @@ def test_all_sdk_exceptions_inherit_from_solwyn_error() -> None:
     assert issubclass(BudgetExceededError, SolwynError)
     assert issubclass(ProviderUnavailableError, SolwynError)
     assert issubclass(ConfigurationError, SolwynError)
+    assert issubclass(UntrackedSpendSurfaceError, SolwynError)
+    assert issubclass(UntrackedSpendSurfaceError, AttributeError)
+
+
+@pytest.mark.unit
+def test_untracked_spend_error_carries_structural_policy_context() -> None:
+    exc = UntrackedSpendSurfaceError(
+        surface="post",
+        token="post",
+        provider="openai",
+        client_shape="openai_sdk",
+        kind="unmetered_spend",
+        capability_scope="arbitrary_endpoint",
+    )
+
+    assert exc.surface == "post"
+    assert exc.token == "post"
+    assert exc.provider == "openai"
+    assert exc.client_shape == "openai_sdk"
+    assert exc.kind == "unmetered_spend"
+    assert exc.capability_scope == "arbitrary_endpoint"
+    assert "post" in str(exc)
+    assert "arbitrary_endpoint" in str(exc)
 
 
 @pytest.mark.unit

@@ -7,6 +7,7 @@ ConfigurationError -- raised when configuration is invalid.
 UntranslatableRequestError -- raised when a cross-provider hop cannot translate a request.
 UntranslatableModelError -- raised when a model id is not configured for a target provider.
 UnsupportedSurfaceError -- raised when an adapter does not serve a requested media surface.
+UntrackedSpendSurfaceError -- raised when strict posture refuses an untracked capability.
 SolwynTagsClampedWarning -- emitted when merged tags exceed the event cap.
 """
 
@@ -235,6 +236,46 @@ class UnsupportedSurfaceError(SolwynError):
 
     def __repr__(self) -> str:
         return f"UnsupportedSurfaceError(surface={self.surface!r}, provider={self.provider!r})"
+
+
+class UntrackedSpendSurfaceError(SolwynError, AttributeError):
+    """Raised before strict mode exposes an untracked provider capability.
+
+    The ``AttributeError`` base preserves Python feature-probe behavior for
+    ``hasattr`` and ``getattr(..., default)``. All attached fields are
+    structural capability labels; the exception never carries request,
+    prompt, response, or credential content.
+    """
+
+    def __init__(
+        self,
+        *,
+        surface: str,
+        token: str,
+        provider: str,
+        client_shape: str,
+        kind: str,
+        capability_scope: str | None,
+    ) -> None:
+        scope = f" (scope: {capability_scope})" if capability_scope is not None else ""
+        super().__init__(
+            f"Solwyn refused untracked surface '{surface}' for provider "
+            f"{provider}{scope}; acknowledge exact token '{token}' or choose "
+            "on_unmetered='warn'/'allow'"
+        )
+        self.surface = surface
+        self.token = token
+        self.provider = provider
+        self.client_shape = client_shape
+        self.kind = kind
+        self.capability_scope = capability_scope
+
+    def __repr__(self) -> str:
+        return (
+            "UntrackedSpendSurfaceError("
+            f"surface={self.surface!r}, provider={self.provider!r}, "
+            f"kind={self.kind!r})"
+        )
 
 
 class ConfigurationError(SolwynError):

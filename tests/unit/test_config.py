@@ -764,3 +764,76 @@ class TestFailoverHopReadTimeout:
                 api_key=VALID_API_KEY,
                 failover_hop_read_timeout=-1.0,
             )
+
+
+@pytest.mark.unit
+class TestUnmeteredPostureConfig:
+    def _config(self, **kwargs: object) -> SolwynConfig:
+        return SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+            **kwargs,
+        )
+
+    def test_defaults_to_warn_with_no_acknowledgments(self) -> None:
+        config = self._config()
+
+        assert config.on_unmetered == "warn"
+        assert config.acknowledge_untracked == frozenset()
+
+    @pytest.mark.parametrize("posture", ["warn", "raise", "allow"])
+    def test_posture_accepts_the_three_contract_literals(self, posture: str) -> None:
+        assert self._config(on_unmetered=posture).on_unmetered == posture
+
+    def test_posture_loads_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOLWYN_ON_UNMETERED", "raise")
+
+        assert self._config().on_unmetered == "raise"
+
+    def test_explicit_posture_overrides_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOLWYN_ON_UNMETERED", "raise")
+
+        assert self._config(on_unmetered="allow").on_unmetered == "allow"
+
+    def test_environment_acknowledgments_trim_and_deduplicate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(
+            "SOLWYN_ACKNOWLEDGE_UNTRACKED",
+            " responses.create,post,responses.create ",
+        )
+
+        assert self._config().acknowledge_untracked == frozenset({"responses.create", "post"})
+
+    def test_empty_environment_acknowledgments_are_an_empty_collection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SOLWYN_ACKNOWLEDGE_UNTRACKED", "")
+
+        assert self._config().acknowledge_untracked == frozenset()
+
+    def test_whitespace_only_environment_acknowledgments_are_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SOLWYN_ACKNOWLEDGE_UNTRACKED", "   ")
+
+        assert self._config().acknowledge_untracked == frozenset()
+
+    def test_environment_rejects_empty_interior_acknowledgments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SOLWYN_ACKNOWLEDGE_UNTRACKED", "post,,responses.create")
+
+        with pytest.raises(ValidationError, match="empty elements"):
+            self._config()
+
+    def test_explicit_empty_acknowledgments_override_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SOLWYN_ACKNOWLEDGE_UNTRACKED", "post")
+
+        assert self._config(acknowledge_untracked=frozenset()).acknowledge_untracked == frozenset()
+
+    def test_constructor_string_is_not_treated_as_comma_delimited(self) -> None:
+        with pytest.raises(ValidationError, match="collection of exact tokens"):
+            self._config(acknowledge_untracked="post,responses.create")
