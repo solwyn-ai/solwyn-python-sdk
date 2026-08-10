@@ -1,6 +1,7 @@
 """Solwyn SDK exceptions.
 
-BudgetExceededError -- raised when hard-deny mode blocks a request.
+BudgetExceededError -- raised when budget enforcement blocks a request.
+RunStoppedError -- raised when a dashboard stop blocks an agent run.
 ProviderUnavailableError -- raised when all providers are circuit-broken.
 ConfigurationError -- raised when configuration is invalid.
 UntranslatableRequestError -- raised when a cross-provider hop cannot translate a request.
@@ -10,6 +11,8 @@ SolwynTagsClampedWarning -- emitted when merged tags exceed the event cap.
 """
 
 from __future__ import annotations
+
+from functools import partial
 
 
 class SolwynError(Exception):
@@ -28,17 +31,21 @@ class SolwynTagsClampedWarning(UserWarning):
 
 
 class BudgetExceededError(SolwynError):
-    """Raised when a request would exceed the configured budget limit.
+    """Raised when Solwyn budget enforcement blocks a request.
 
-    Only raised in ``BudgetMode.HARD_DENY`` mode.  In ``ALERT_ONLY`` mode
-    the SDK logs a warning instead.
+    A Cloud denial raises in ``BudgetMode.HARD_DENY`` mode; in ``ALERT_ONLY``
+    mode it logs a warning instead. When Cloud is unreachable and
+    ``fail_open=False``, local fail-closed enforcement can also raise while
+    retaining the configured mode, including ``ALERT_ONLY``.
 
     Attributes:
         project_id: Project identifier resolved by the API, if available.
         budget_limit: The configured spending cap (dollars).
         current_usage: Spending already consumed in the current period.
         estimated_cost: Estimated cost of the blocked request.
-        budget_period: The budget window (daily / weekly / monthly).
+        budget_period: The Cloud denial label when supplied (for example,
+            daily, weekly, monthly, agent_run, tag, or run_stopped); unknown
+            for local enforcement or a Cloud response without a label.
         mode: The active budget mode when the error was raised.
     """
 
@@ -64,9 +71,71 @@ class BudgetExceededError(SolwynError):
 
     def __repr__(self) -> str:
         return (
-            f"BudgetExceededError("
+            f"{type(self).__name__}("
             f"budget_limit={self.budget_limit!r}, "
             f"current_usage={self.current_usage!r})"
+        )
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...], dict[str, object]]:
+        """Reconstruct keyword-only exception state across process boundaries."""
+        return (
+            partial(
+                type(self),
+                project_id=self.project_id,
+                budget_limit=self.budget_limit,
+                current_usage=self.current_usage,
+                estimated_cost=self.estimated_cost,
+                budget_period=self.budget_period,
+                mode=self.mode,
+            ),
+            (),
+            dict(self.__dict__),
+        )
+
+
+class RunStoppedError(BudgetExceededError):
+    """Raised when an operator stopped an agent run from the dashboard.
+
+    This is a ``BudgetExceededError`` subclass so existing hard-deny handlers
+    keep catching it. It carries the same budget snapshot fields plus the
+    stopped run id; no prompt or response content is retained.
+    """
+
+    def __init__(
+        self,
+        *,
+        agent_run_id: str | None,
+        project_id: str | None,
+        budget_limit: float,
+        current_usage: float,
+        estimated_cost: float,
+        mode: str,
+    ) -> None:
+        super().__init__(
+            project_id=project_id,
+            budget_limit=budget_limit,
+            current_usage=current_usage,
+            estimated_cost=estimated_cost,
+            budget_period="run_stopped",
+            mode=mode,
+        )
+        self.agent_run_id = agent_run_id
+        self.args = (f"Run {agent_run_id} was stopped from the Solwyn dashboard",)
+
+    def __reduce__(self) -> tuple[object, tuple[object, ...], dict[str, object]]:
+        """Preserve the stopped run id when copying or pickling."""
+        return (
+            partial(
+                type(self),
+                agent_run_id=self.agent_run_id,
+                project_id=self.project_id,
+                budget_limit=self.budget_limit,
+                current_usage=self.current_usage,
+                estimated_cost=self.estimated_cost,
+                mode=self.mode,
+            ),
+            (),
+            dict(self.__dict__),
         )
 
 

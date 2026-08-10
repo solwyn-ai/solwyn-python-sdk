@@ -81,6 +81,11 @@ _GrantVerdict = Literal["applied", "legacy", "denied", "unreachable"]
 # unbounded stream of run UUIDs in a long-lived SDK process.
 _MAX_STICKY_RUN_DENIALS = 128
 
+# Both the run budget cap and an operator stop are scoped to one raw run id.
+# Keep the classification shared by per-call and lease denials through
+# ``_cache_response`` so neither can poison unrelated runs during an outage.
+_RUN_SCOPED_DENIAL_PERIODS = frozenset({"agent_run", "run_stopped"})
+
 # Uncounted-mode telemetry (§8): loud on ENTRY to a fail-open uncounted
 # episode, then at most one line per this interval while it persists. An
 # hour-long outage must stay visible without one warning per call.
@@ -125,6 +130,7 @@ class BudgetCheckResult(BaseModel):
     warning: str | None = None
     budget_limit: float = 0.0
     current_usage: float = 0.0
+    denied_by_period: str | None = None
     # PJ-2: set when the call drew on LEASE authority instead of a per-call
     # reservation. Exactly one of reservation_id / lease_id ever settles a call.
     lease_id: str | None = None
@@ -325,10 +331,23 @@ class _BudgetEnforcerBase:
                 self._last_hard_deny_response = None
                 return
 
-            if agent_run_id is not None and response.denied_by_period == "agent_run":
-                # The run limit denied, so every project period passed. Replace
-                # stale global state with the denial scoped to this run only.
-                self._last_hard_deny_response = None
+            if response.denied_by_period in _RUN_SCOPED_DENIAL_PERIODS:
+                # A run-cap denial proves every project period passed. A
+                # dashboard stop does not: Core short-circuits stopped runs
+                # before evaluating project periods, so preserve any older
+                # project-period sticky denial in that case.
+                if response.denied_by_period == "agent_run":
+                    self._last_hard_deny_response = None
+                if agent_run_id is None:
+                    # Contract drift left no run identity to scope by. Fall
+                    # back to the safe global posture used before run-scoped
+                    # labels existed: invalidate a cached allow and retain the
+                    # denial unless stronger project-period state already does.
+                    self._cached_response = None
+                    self._cache_expires_at = 0.0
+                    if self._last_hard_deny_response is None:
+                        self._last_hard_deny_response = response
+                    return
                 self._run_hard_deny_responses.pop(agent_run_id, None)
                 self._run_hard_deny_responses[agent_run_id] = response
                 if len(self._run_hard_deny_responses) > _MAX_STICKY_RUN_DENIALS:
@@ -372,6 +391,7 @@ class _BudgetEnforcerBase:
             ),
             budget_limit=response.budget_limit,
             current_usage=response.current_usage,
+            denied_by_period=response.denied_by_period,
         )
 
     def _build_unreachable_result(
@@ -435,6 +455,7 @@ class _BudgetEnforcerBase:
                 mode=response.mode,
                 budget_limit=response.budget_limit,
                 current_usage=response.current_usage,
+                denied_by_period=response.denied_by_period,
                 price_hints=price_hints,
                 failover_tuning_allowed=failover_tuning_allowed,
             )
@@ -458,6 +479,7 @@ class _BudgetEnforcerBase:
                 ),
                 budget_limit=response.budget_limit,
                 current_usage=response.current_usage,
+                denied_by_period=response.denied_by_period,
                 price_hints=price_hints,
                 failover_tuning_allowed=failover_tuning_allowed,
             )
@@ -473,6 +495,7 @@ class _BudgetEnforcerBase:
             ),
             budget_limit=response.budget_limit,
             current_usage=response.current_usage,
+            denied_by_period=response.denied_by_period,
             failover_tuning_allowed=failover_tuning_allowed,
         )
 
@@ -766,7 +789,7 @@ class _BudgetEnforcerBase:
     def _lease_deny_result(
         self, agent_run_id: str, response: LeaseGrantResponse
     ) -> BudgetCheckResult:
-        """Feed an authoritative lease denial to the UNCHANGED sticky machinery."""
+        """Feed a lease denial through the shared run/global sticky classification."""
         denial = BudgetCheckResponse(
             allowed=False,
             remaining_budget=response.remaining_budget,
@@ -806,6 +829,7 @@ class _BudgetEnforcerBase:
             warning=admission.warning,
             budget_limit=snapshot.budget_limit if snapshot is not None else 0.0,
             current_usage=snapshot.current_usage if snapshot is not None else 0.0,
+            denied_by_period=("agent_run" if admission.decision is LeaseDecision.DENY else None),
         )
 
     def _lease_result_when_breaker_refuses(
@@ -1341,6 +1365,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                         mode=cached.mode,
                         budget_limit=cached.budget_limit,
                         current_usage=cached.current_usage,
+                        denied_by_period=cached.denied_by_period,
                     )
 
         breaker = self._control_plane_breaker
@@ -1923,6 +1948,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 mode=cached.mode,
                 budget_limit=cached.budget_limit,
                 current_usage=cached.current_usage,
+                denied_by_period=cached.denied_by_period,
             )
 
         breaker = self._control_plane_breaker

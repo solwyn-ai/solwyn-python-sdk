@@ -562,6 +562,7 @@ class TestLeaseOutage:
 
         assert first.lease_id == "lease_1"
         assert follower.allowed is False
+        assert follower.denied_by_period == "agent_run"
         assert follower.warning is not None
         assert "hard_deny" in follower.warning
         assert check.call_count == 0

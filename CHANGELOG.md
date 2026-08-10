@@ -7,6 +7,26 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
+### Added
+
+- **Dashboard-stopped runs raise `RunStoppedError`.** The public exception is
+  a `BudgetExceededError` subclass, so existing hard-deny handlers remain
+  compatible. It identifies the stopped run, preserves the budget snapshot
+  fields, and per-call traffic raises it on the next budget check. Leased
+  traffic raises only after a lease renewal or re-grant learns the stop.
+  Requests already in flight and streams already returned are not interrupted,
+  and control-plane connectivity failures retain the configured fail-open
+  posture.
+
+### Changed
+
+- **`run_stopped` denials now stay sticky only for their run.** Per-call and
+  lease denials use the same run-scoped classification as `agent_run`, so a
+  control-plane outage cannot replay a dashboard stop against unrelated run
+  ids. `BudgetCheckResult.denied_by_period` now carries the Cloud/lease label
+  through client error construction; ordinary hard-deny errors expose the
+  actual period and fall back to `unknown` only when no label was supplied.
+
 ## [0.5.0] - 2026-08-07
 
 Spend attribution becomes first-class: clients carry default tags, nested run

@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import copy
+import pickle
+from collections.abc import Callable
+
 import pytest
 
+import solwyn
 from solwyn import (
     BudgetExceededError,
     ConfigurationError,
     ProviderUnavailableError,
+    RunStoppedError,
     SolwynError,
     UntranslatableModelError,
     UntranslatableRequestError,
@@ -26,6 +32,103 @@ def test_all_sdk_exceptions_inherit_from_solwyn_error() -> None:
     assert issubclass(BudgetExceededError, SolwynError)
     assert issubclass(ProviderUnavailableError, SolwynError)
     assert issubclass(ConfigurationError, SolwynError)
+
+
+@pytest.mark.unit
+def test_run_stopped_error_is_public_and_preserves_budget_compatibility() -> None:
+    assert RunStoppedError is solwyn.exceptions.RunStoppedError
+    assert issubclass(RunStoppedError, BudgetExceededError)
+
+    exc = RunStoppedError(
+        agent_run_id="run_abc",
+        project_id="proj_" + "a" * 24,
+        budget_limit=100.0,
+        current_usage=25.0,
+        estimated_cost=1.5,
+        mode="hard_deny",
+    )
+
+    assert isinstance(exc, BudgetExceededError)
+    assert str(exc) == "Run run_abc was stopped from the Solwyn dashboard"
+    assert exc.agent_run_id == "run_abc"
+    assert exc.project_id == "proj_" + "a" * 24
+    assert exc.budget_limit == 100.0
+    assert exc.current_usage == 25.0
+    assert exc.estimated_cost == 1.5
+    assert exc.budget_period == "run_stopped"
+    assert exc.mode == "hard_deny"
+
+
+def _pickle_round_trip(exc: BudgetExceededError) -> BudgetExceededError:
+    restored = pickle.loads(pickle.dumps(exc))
+    assert isinstance(restored, BudgetExceededError)
+    return restored
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "round_trip",
+    [copy.copy, _pickle_round_trip],
+    ids=["copy", "pickle"],
+)
+def test_budget_exceeded_error_supports_exception_round_trips(
+    round_trip: Callable[[BudgetExceededError], BudgetExceededError],
+) -> None:
+    exc = BudgetExceededError(
+        project_id="proj_" + "a" * 24,
+        budget_limit=100.0,
+        current_usage=120.0,
+        estimated_cost=5.0,
+        budget_period="daily",
+        mode="hard_deny",
+    )
+    exc.add_note("diagnostic note")
+
+    restored = round_trip(exc)
+
+    assert type(restored) is BudgetExceededError
+    assert restored.args == exc.args
+    assert restored.project_id == exc.project_id
+    assert restored.budget_limit == exc.budget_limit
+    assert restored.current_usage == exc.current_usage
+    assert restored.estimated_cost == exc.estimated_cost
+    assert restored.budget_period == exc.budget_period
+    assert restored.mode == exc.mode
+    assert restored.__notes__ == exc.__notes__
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "round_trip",
+    [copy.copy, _pickle_round_trip],
+    ids=["copy", "pickle"],
+)
+def test_run_stopped_error_supports_exception_round_trips(
+    round_trip: Callable[[BudgetExceededError], BudgetExceededError],
+) -> None:
+    exc = RunStoppedError(
+        agent_run_id="run_abc",
+        project_id="proj_" + "a" * 24,
+        budget_limit=100.0,
+        current_usage=120.0,
+        estimated_cost=5.0,
+        mode="hard_deny",
+    )
+    exc.add_note("diagnostic note")
+
+    restored = round_trip(exc)
+
+    assert type(restored) is RunStoppedError
+    assert restored.args == exc.args
+    assert isinstance(restored, RunStoppedError)
+    assert restored.agent_run_id == exc.agent_run_id
+    assert restored.project_id == exc.project_id
+    assert restored.budget_limit == exc.budget_limit
+    assert restored.current_usage == exc.current_usage
+    assert restored.estimated_cost == exc.estimated_cost
+    assert restored.budget_period == exc.budget_period
+    assert restored.mode == exc.mode
+    assert restored.__notes__ == exc.__notes__
 
 
 @pytest.mark.unit
@@ -169,7 +272,7 @@ class TestUntranslatableModelError:
 
 
 @pytest.mark.unit
-def test_exceptions_have_useful_repr() -> None:
+def test_budget_exceeded_error_repr_remains_compatible() -> None:
     exc = BudgetExceededError(
         project_id="proj_" + "a" * 24,
         budget_limit=100.0,
@@ -178,6 +281,19 @@ def test_exceptions_have_useful_repr() -> None:
         budget_period="daily",
         mode="hard_deny",
     )
-    rep = repr(exc)
-    assert "BudgetExceededError" in rep
-    assert "100" in rep
+
+    assert repr(exc) == "BudgetExceededError(budget_limit=100.0, current_usage=120.0)"
+
+
+@pytest.mark.unit
+def test_run_stopped_error_repr_names_its_public_type() -> None:
+    exc = RunStoppedError(
+        agent_run_id="run_abc",
+        project_id="proj_" + "a" * 24,
+        budget_limit=100.0,
+        current_usage=120.0,
+        estimated_cost=5.0,
+        mode="hard_deny",
+    )
+
+    assert repr(exc) == "RunStoppedError(budget_limit=100.0, current_usage=120.0)"

@@ -65,6 +65,7 @@ from solwyn._types import CallStatus, FailoverReason, ProviderName
 from solwyn.budget import (
     DEFAULT_COST_PER_TOKEN,
     AsyncBudgetEnforcer,
+    BudgetCheckResult,
     BudgetEnforcer,
 )
 from solwyn.config import SolwynConfig
@@ -72,6 +73,7 @@ from solwyn.exceptions import (
     BudgetExceededError,
     ConfigurationError,
     ProviderUnavailableError,
+    RunStoppedError,
     UnsupportedSurfaceError,
     UntranslatableModelError,
 )
@@ -81,6 +83,35 @@ from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
 
 logger = logging.getLogger(__name__)
+
+
+def _budget_denial_error(
+    *,
+    budget: BudgetCheckResult,
+    agent_run_id: str | None,
+    estimated_cost: float,
+) -> BudgetExceededError:
+    """Build the public typed error for one denied pre-flight."""
+    budget_period = getattr(budget, "denied_by_period", None)
+    if budget_period is None:
+        budget_period = "unknown"
+    if budget_period == "run_stopped" and agent_run_id is not None:
+        return RunStoppedError(
+            agent_run_id=agent_run_id,
+            project_id=budget.project_id,
+            budget_limit=budget.budget_limit,
+            current_usage=budget.current_usage,
+            estimated_cost=estimated_cost,
+            mode=budget.mode.value,
+        )
+    return BudgetExceededError(
+        project_id=budget.project_id,
+        budget_limit=budget.budget_limit,
+        current_usage=budget.current_usage,
+        estimated_cost=estimated_cost,
+        budget_period=budget_period,
+        mode=budget.mode.value,
+    )
 
 
 # Floor for a per-hop dispatch timeout: even when the chain deadline is nearly
@@ -1079,13 +1110,10 @@ class Solwyn(_SolwynBase):
                     "Failed to report budget_denied metadata event: %s",
                     type(exc).__name__,
                 )
-            raise BudgetExceededError(
-                project_id=budget.project_id,
-                budget_limit=budget.budget_limit,
-                current_usage=budget.current_usage,
+            raise _budget_denial_error(
+                budget=budget,
+                agent_run_id=agent_run[0],
                 estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
-                budget_period="unknown",
-                mode=budget.mode.value,
             )
 
         # 3. Deadline gate, mirroring the chat walk (PJ-8/R7 follow-up). Since
@@ -1308,13 +1336,10 @@ class Solwyn(_SolwynBase):
                     type(exc).__name__,
                 )
 
-            raise BudgetExceededError(
-                project_id=budget.project_id,
-                budget_limit=budget.budget_limit,
-                current_usage=budget.current_usage,
+            raise _budget_denial_error(
+                budget=budget,
+                agent_run_id=agent_run[0],
                 estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
-                budget_period="unknown",
-                mode=budget.mode.value,
             )
 
         # 3. Resolve per-call idempotency override (strip before dispatch).
@@ -2168,13 +2193,10 @@ class AsyncSolwyn(_SolwynBase):
                     "Failed to report budget_denied metadata event: %s",
                     type(exc).__name__,
                 )
-            raise BudgetExceededError(
-                project_id=budget.project_id,
-                budget_limit=budget.budget_limit,
-                current_usage=budget.current_usage,
+            raise _budget_denial_error(
+                budget=budget,
+                agent_run_id=agent_run[0],
                 estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
-                budget_period="unknown",
-                mode=budget.mode.value,
             )
 
         # Deadline gate, mirroring the sync media path and the chat walk: with
@@ -2375,13 +2397,10 @@ class AsyncSolwyn(_SolwynBase):
                     type(exc).__name__,
                 )
 
-            raise BudgetExceededError(
-                project_id=budget.project_id,
-                budget_limit=budget.budget_limit,
-                current_usage=budget.current_usage,
+            raise _budget_denial_error(
+                budget=budget,
+                agent_run_id=agent_run[0],
                 estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
-                budget_period="unknown",
-                mode=budget.mode.value,
             )
 
         idempotent_override = cast(bool | None, kwargs.pop("solwyn_idempotent", None))

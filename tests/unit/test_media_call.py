@@ -25,6 +25,7 @@ from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import (
     BudgetExceededError,
     ProviderUnavailableError,
+    RunStoppedError,
     UnsupportedSurfaceError,
 )
 
@@ -96,7 +97,7 @@ def _allow(
     )
 
 
-def _deny() -> SimpleNamespace:
+def _deny(denied_by_period: str | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         allowed=False,
         reservation_id=None,
@@ -104,6 +105,7 @@ def _deny() -> SimpleNamespace:
         project_id=VALID_PROJECT_ID,
         budget_limit=10.0,
         current_usage=10.0,
+        denied_by_period=denied_by_period,
         mode=BudgetMode.HARD_DENY,
     )
 
@@ -382,6 +384,37 @@ class TestMediaCallSync:
 
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
+
+    def test_run_stopped_raises_typed_error_without_media_dispatch(self) -> None:
+        client, _ = _sync_client()
+        solwyn = _build_sync(client, budget_mode=BudgetMode.HARD_DENY)
+
+        with (
+            patch.object(
+                solwyn._budget,
+                "check_budget",
+                return_value=_deny("run_stopped"),
+            ),
+            patch.object(solwyn._reporter, "report"),
+            solwyn_pkg.run("dashboard-stopped-media") as run_id,
+            pytest.raises(RunStoppedError) as exc_info,
+        ):
+            solwyn._media_call(_spec(), model="text-embedding-3-small", input="hi")
+
+        client.embeddings.create.assert_not_called()
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+        error = exc_info.value
+        assert type(error) is RunStoppedError
+        assert isinstance(error, BudgetExceededError)
+        assert str(error) == f"Run {run_id} was stopped from the Solwyn dashboard"
+        assert error.project_id == VALID_PROJECT_ID
+        assert error.budget_limit == 10.0
+        assert error.current_usage == 10.0
+        assert error.estimated_cost == 0.0
+        assert error.budget_period == "run_stopped"
+        assert error.mode == "hard_deny"
 
     def test_unsupported_surface_reports_error_then_raises(self) -> None:
         client, _ = _sync_client()
@@ -713,3 +746,35 @@ class TestMediaCallAsync:
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_run_stopped_raises_typed_error_without_media_dispatch(self) -> None:
+        client, _ = _async_client()
+        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, budget_mode=BudgetMode.HARD_DENY)
+
+        with (
+            patch.object(
+                solwyn._budget,
+                "check_budget",
+                new=AsyncMock(return_value=_deny("run_stopped")),
+            ),
+            patch.object(solwyn._reporter, "report"),
+        ):
+            async with solwyn_pkg.run("dashboard-stopped-media-async") as run_id:
+                with pytest.raises(RunStoppedError) as exc_info:
+                    await solwyn._media_call(_spec(), model="text-embedding-3-small", input="hi")
+
+        client.embeddings.create.assert_not_awaited()
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+        error = exc_info.value
+        assert type(error) is RunStoppedError
+        assert isinstance(error, BudgetExceededError)
+        assert str(error) == f"Run {run_id} was stopped from the Solwyn dashboard"
+        assert error.project_id == VALID_PROJECT_ID
+        assert error.budget_limit == 10.0
+        assert error.current_usage == 10.0
+        assert error.estimated_cost == 0.0
+        assert error.budget_period == "run_stopped"
+        assert error.mode == "hard_deny"
