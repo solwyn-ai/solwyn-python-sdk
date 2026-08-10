@@ -404,6 +404,46 @@ def _validate_surface_path(path: str) -> None:
         raise RuntimeError(f"invalid public surface path: {path!r}")
 
 
+_EAGER_RESOURCE_SHAPE = (AttributeShape(descriptor_category="attribute", return_shape="resource"),)
+_ANTHROPIC_EAGER_RESOURCE_RULES: dict[str, tuple[AttributeShape, ...]] = {
+    # anthropic 0.50.0 eagerly stores these raw/streaming-response resources
+    # on wrapper instances; newer supported versions expose the same
+    # resources as cached properties. Both are reviewed pre-call containers.
+    "surface.with-raw-response-beta.unmetered_spend.6fefd1f0a132": _EAGER_RESOURCE_SHAPE,
+    "surface.with-raw-response-completions.unmetered_spend.9c5ab6f63443": _EAGER_RESOURCE_SHAPE,
+    "surface.with-raw-response-messages.unmetered_spend.a5cc02b05a8a": _EAGER_RESOURCE_SHAPE,
+    "surface.with-raw-response-models.unmetered_spend.fef0355ca914": _EAGER_RESOURCE_SHAPE,
+    "surface.with-streaming-response-beta.unmetered_spend.dd259a5160f5": _EAGER_RESOURCE_SHAPE,
+    (
+        "surface.with-streaming-response-completions.unmetered_spend.c0ad7fd1ab02"
+    ): _EAGER_RESOURCE_SHAPE,
+    "surface.with-streaming-response-messages.unmetered_spend.9e9e5b52fc68": _EAGER_RESOURCE_SHAPE,
+    "surface.with-streaming-response-models.unmetered_spend.27175d4a9a0d": _EAGER_RESOURCE_SHAPE,
+}
+
+
+def _surface_rule_from_payload(
+    row: list[Any],
+    *,
+    rule_id: str,
+    selectors: tuple[SurfaceSelector, ...],
+    shape_additions: tuple[AttributeShape, ...] = (),
+) -> SurfaceRule:
+    return SurfaceRule(
+        rule_id=rule_id,
+        surface=row[1],
+        selectors=selectors,
+        kind=SurfaceKind(row[3]),
+        source=SurfaceSource(row[4]),
+        expected_shapes=tuple(AttributeShape(*shape) for shape in row[5]) + shape_additions,
+        usage_basis=UsageBasis(row[6]) if row[6] is not None else None,
+        acknowledgment_token=row[7],
+        capability_scope=CapabilityScope(row[8]) if row[8] is not None else None,
+        condition=SurfaceCondition(row[9]) if row[9] is not None else None,
+        reason=row[10],
+    )
+
+
 def _build_surface_rules() -> tuple[SurfaceRule, ...]:
     encoded = _GENERATED_SURFACE_RULE_PAYLOAD.encode("ascii")
     try:
@@ -413,24 +453,52 @@ def _build_surface_rules() -> tuple[SurfaceRule, ...]:
     if payload.get("schema_version") != CONTRACT_VERSION:
         raise RuntimeError("unsupported embedded surface rule schema")
 
-    rules = tuple(
-        SurfaceRule(
-            rule_id=row[0],
-            surface=row[1],
-            selectors=tuple(SurfaceSelector(*selector) for selector in row[2]),
-            kind=SurfaceKind(row[3]),
-            source=SurfaceSource(row[4]),
-            expected_shapes=tuple(AttributeShape(*shape) for shape in row[5]),
-            usage_basis=UsageBasis(row[6]) if row[6] is not None else None,
-            acknowledgment_token=row[7],
-            capability_scope=CapabilityScope(row[8]) if row[8] is not None else None,
-            condition=SurfaceCondition(row[9]) if row[9] is not None else None,
-            reason=row[10],
-        )
-        for row in payload["rules"]
-    )
-    if tuple(sorted(rules, key=lambda rule: (rule.surface, rule.rule_id))) != rules:
+    payload_rows: list[list[Any]] = payload["rules"]
+    if sorted(payload_rows, key=lambda row: (row[1], row[0])) != payload_rows:
         raise RuntimeError("embedded surface rules are not deterministically ordered")
+    expanded_rules: list[SurfaceRule] = []
+    expanded_rule_ids: set[str] = set()
+    for row in payload_rows:
+        rule_id = row[0]
+        selectors = tuple(SurfaceSelector(*selector) for selector in row[2])
+        additions = _ANTHROPIC_EAGER_RESOURCE_RULES.get(rule_id)
+        if additions is None:
+            expanded_rules.append(
+                _surface_rule_from_payload(row, rule_id=rule_id, selectors=selectors)
+            )
+            continue
+
+        expanded_rule_ids.add(rule_id)
+        anthropic_selectors = tuple(
+            selector for selector in selectors if selector.provider == "anthropic"
+        )
+        other_selectors = tuple(
+            selector for selector in selectors if selector.provider != "anthropic"
+        )
+        if not anthropic_selectors:
+            raise RuntimeError(f"surface rule {rule_id} has no Anthropic selector")
+        if other_selectors:
+            expanded_rules.append(
+                _surface_rule_from_payload(
+                    row,
+                    rule_id=rule_id,
+                    selectors=other_selectors,
+                )
+            )
+            rule_id = f"{rule_id}.anthropic"
+        expanded_rules.append(
+            _surface_rule_from_payload(
+                row,
+                rule_id=rule_id,
+                selectors=anthropic_selectors,
+                shape_additions=additions,
+            )
+        )
+
+    missing_expansions = set(_ANTHROPIC_EAGER_RESOURCE_RULES) - expanded_rule_ids
+    if missing_expansions:
+        raise RuntimeError("Anthropic shape additions reference unknown surface rules")
+    rules = tuple(sorted(expanded_rules, key=lambda rule: (rule.surface, rule.rule_id)))
     if len({rule.rule_id for rule in rules}) != len(rules):
         raise RuntimeError("embedded surface contract contains duplicate rule ids")
     return rules

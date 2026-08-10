@@ -25,7 +25,7 @@ jobs:
       - run: ruff check src/ tests/ scripts/
       - run: ruff format --check src/ tests/ scripts/
       - run: mypy src/solwyn/
-      - run: pytest tests/ -m unit -v --tb=short
+      - run: pytest tests/ -m unit -v --tb=short --ignore=tests/unit/test_surface_canary.py
 
   provider-surface-matrix:
     runs-on: ubuntu-latest
@@ -54,7 +54,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -e .
-      - run: python -m pip install --upgrade "${{ matrix.packages }}"
+      - run: >-
+          python -m pip install --upgrade
+          "pytest>=8.0"
+          "pytest-asyncio>=0.24"
+          "pyyaml>=6.0"
+          "${{ matrix.packages }}"
       - run: >-
           python scripts/capture_surface_inventory.py
           --check
@@ -70,6 +75,10 @@ jobs:
           --check
           --output build/surface_contract/surface-classification.json
           --reports-dir build/provider_surface_inventory
+      - run: python -m pytest tests/unit/test_surface_canary.py -v --tb=short
+        env:
+          AWS_EC2_METADATA_DISABLED: "true"
+          SOLWYN_SURFACE_CANARY_FAMILY: ${{ matrix.family }}
       - name: Upload provider surface inventory
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
