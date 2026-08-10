@@ -96499,6 +96499,10 @@
       "expected_attribute_shapes": [
         {
           "descriptor_category": "property",
+          "return_shape": "mapping"
+        },
+        {
+          "descriptor_category": "property",
           "return_shape": "unevaluated_descriptor"
         }
       ],
@@ -96727,6 +96731,10 @@
       "condition": null,
       "dispatch_action": "return",
       "expected_attribute_shapes": [
+        {
+          "descriptor_category": "property",
+          "return_shape": "resource"
+        },
         {
           "descriptor_category": "property",
           "return_shape": "unevaluated_descriptor"
@@ -191465,6 +191473,10 @@
       "expected_attribute_shapes": [
         {
           "descriptor_category": "property",
+          "return_shape": "mapping"
+        },
+        {
+          "descriptor_category": "property",
           "return_shape": "unevaluated_descriptor"
         }
       ],
@@ -191557,6 +191569,10 @@
       "condition": null,
       "dispatch_action": "return",
       "expected_attribute_shapes": [
+        {
+          "descriptor_category": "property",
+          "return_shape": "mapping"
+        },
         {
           "descriptor_category": "property",
           "return_shape": "unevaluated_descriptor"
@@ -216373,6 +216389,10 @@
       "expected_attribute_shapes": [
         {
           "descriptor_category": "property",
+          "return_shape": "scalar"
+        },
+        {
+          "descriptor_category": "property",
           "return_shape": "unevaluated_descriptor"
         }
       ],
@@ -219531,6 +219551,10 @@
       "condition": null,
       "dispatch_action": "return",
       "expected_attribute_shapes": [
+        {
+          "descriptor_category": "property",
+          "return_shape": "resource"
+        },
         {
           "descriptor_category": "property",
           "return_shape": "unevaluated_descriptor"
@@ -232411,6 +232435,10 @@
       "expected_attribute_shapes": [
         {
           "descriptor_category": "property",
+          "return_shape": "scalar"
+        },
+        {
+          "descriptor_category": "property",
           "return_shape": "unevaluated_descriptor"
         }
       ],
@@ -238663,6 +238691,10 @@
       "condition": null,
       "dispatch_action": "return",
       "expected_attribute_shapes": [
+        {
+          "descriptor_category": "property",
+          "return_shape": "scalar"
+        },
         {
           "descriptor_category": "property",
           "return_shape": "unevaluated_descriptor"

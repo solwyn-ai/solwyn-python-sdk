@@ -477,6 +477,39 @@ def test_exact_inert_provider_configuration_is_safe_but_raw_callables_are_not() 
 
 
 @pytest.mark.unit
+def test_safe_descriptor_rows_pin_the_evaluated_attribute_shape() -> None:
+    evaluated_shapes = {
+        "auth_headers": "mapping",
+        "base_url": "resource",
+        "default_headers": "mapping",
+        "default_query": "mapping",
+        "model_name": "scalar",
+        "qs": "resource",
+        "user_agent": "scalar",
+        "vertexai": "scalar",
+    }
+    safe_rules = [
+        rule
+        for rule in SURFACE_RULES
+        if rule.kind in {SurfaceKind.METADATA, SurfaceKind.INFRASTRUCTURE}
+    ]
+
+    assert safe_rules
+    for rule in safe_rules:
+        assert any(
+            shape.return_shape != "unevaluated_descriptor" for shape in rule.expected_shapes
+        ), rule.rule_id
+        if rule.surface in evaluated_shapes:
+            assert (
+                AttributeShape(
+                    descriptor_category="property",
+                    return_shape=evaluated_shapes[rule.surface],
+                )
+                in rule.expected_shapes
+            )
+
+
+@pytest.mark.unit
 def test_committed_json_is_the_deterministic_python_export() -> None:
     contract = surface_contract_data()
     expected = json.dumps(contract, indent=2, sort_keys=True) + "\n"
