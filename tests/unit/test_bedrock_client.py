@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY
 
+from solwyn._surfaces import SurfaceSource
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import ConfigurationError
 
@@ -233,6 +234,42 @@ class TestBedrockConverseInterception:
         with pytest.raises(TypeError, match="modelId"):
             solwyn.converse(messages=[{"role": "user", "content": [{"text": "Hi"}]}])
         client.converse.assert_not_called()
+        solwyn.close()
+
+    def test_all_explicit_bedrock_methods_resolve_policy_before_dispatch(self) -> None:
+        solwyn = _make_solwyn(_mock_bedrock_client())
+
+        with (
+            patch.object(
+                solwyn,
+                "_enforce_explicit_surface",
+                wraps=solwyn._enforce_explicit_surface,
+            ) as enforce,
+            patch.object(solwyn, "_intercepted_call", return_value=object()),
+        ):
+            solwyn.converse(modelId=BEDROCK_MODEL)
+            enforce.assert_called_once_with("converse", source=SurfaceSource.WRAPPER)
+            enforce.reset_mock()
+
+            solwyn.converse_stream(modelId=BEDROCK_MODEL)
+            enforce.assert_called_once_with("converse_stream", source=SurfaceSource.WRAPPER)
+            enforce.reset_mock()
+
+            blocked = (
+                ("invoke_model", {"modelId": BEDROCK_MODEL, "body": b"{}"}),
+                (
+                    "invoke_model_with_response_stream",
+                    {"modelId": BEDROCK_MODEL, "body": b"{}"},
+                ),
+                ("start_async_invoke", {"modelId": BEDROCK_MODEL, "modelInput": {}}),
+            )
+            for path, kwargs in blocked:
+                with pytest.raises(ConfigurationError):
+                    getattr(solwyn, path)(**kwargs)
+                assert enforce.call_args.args[0] == path
+                assert enforce.call_args.kwargs["source"] is SurfaceSource.WRAPPER
+                enforce.reset_mock()
+
         solwyn.close()
 
     def test_invoke_model_raises_loudly(self) -> None:
@@ -739,6 +776,47 @@ class TestAsyncBedrockConverse:
         assert len(reported) == 1
         assert reported[0].provider == "bedrock"
         assert reported[0].provider_region == "us-east-1"
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_all_async_explicit_bedrock_methods_resolve_policy_before_dispatch(
+        self,
+    ) -> None:
+        solwyn = _make_async_solwyn(_mock_bedrock_client())
+
+        with (
+            patch.object(
+                solwyn,
+                "_enforce_explicit_surface",
+                wraps=solwyn._enforce_explicit_surface,
+            ) as enforce,
+            patch.object(solwyn, "_intercepted_call", new=AsyncMockFn(return_value=object())),
+        ):
+            await solwyn.converse(modelId=BEDROCK_MODEL)
+            enforce.assert_called_once_with("converse", source=SurfaceSource.WRAPPER)
+            enforce.reset_mock()
+
+            await solwyn.converse_stream(modelId=BEDROCK_MODEL)
+            enforce.assert_called_once_with("converse_stream", source=SurfaceSource.WRAPPER)
+            enforce.reset_mock()
+
+            blocked = (
+                ("invoke_model", {"modelId": BEDROCK_MODEL, "body": b"{}"}),
+                (
+                    "invoke_model_with_response_stream",
+                    {"modelId": BEDROCK_MODEL, "body": b"{}"},
+                ),
+                ("start_async_invoke", {"modelId": BEDROCK_MODEL, "modelInput": {}}),
+            )
+            for path, kwargs in blocked:
+                with pytest.raises(ConfigurationError):
+                    await getattr(solwyn, path)(**kwargs)
+                assert enforce.call_args.args[0] == path
+                assert enforce.call_args.kwargs["source"] is SurfaceSource.WRAPPER
+                enforce.reset_mock()
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()

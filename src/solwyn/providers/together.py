@@ -17,27 +17,6 @@ _TOGETHER_PROFILE = next(profile for profile in COMPAT_PROFILES if profile.name 
 class TogetherAdapter(OpenAICompatibleAdapter):
     """Together adapter with duck-typed native client detection."""
 
-    # Together-specific untracked spend surfaces that the central per-dialect map
-    # (_base._UNSHIPPED_SPEND_SURFACES) does NOT already cover. The warn-once
-    # posture unions this with that map (Together speaks the "openai" dialect):
-    #   - translations: omitted here — the central map's one remaining openai
-    #     warn-once surface, so declaring it again would be redundant.
-    #   - embeddings / images / audio.transcriptions / audio.speech / videos:
-    #     omitted — they are intercepted, so they must NOT advertise themselves as
-    #     untracked (metered surfaces; a videos.create on this compat client fails
-    #     loud with UnsupportedSurfaceError, Sora being OpenAI-only).
-    #   - batches / fine_tuning: omitted — per the posture taxonomy these
-    #     are truly-unrelated resources that pass through SILENTLY, not warn-once.
-    # What remains are Together's genuinely-billable, not-yet-tracked extras.
-    unmetered_spend_surfaces = frozenset(
-        {
-            "completions",
-            "rerank",
-            "code_interpreter",
-            "evals",
-        }
-    )
-
     def __init__(self) -> None:
         super().__init__(_TOGETHER_PROFILE)
 

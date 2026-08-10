@@ -889,9 +889,9 @@ class Solwyn(_SolwynBase):
         native OpenAI and every OpenAI-compatible provider (incl. Groq whisper). On
         a non-openai client ``.transcriptions.create()`` / ``.speech.create()``
         fail loud with ``UnsupportedSurfaceError`` (that adapter serves no audio
-        seam). The proxy's ``translations`` sub-surface warns-once then passes
-        through untracked. Cached: provider is fixed at construction so this is safe
-        to create once.
+        seam). The proxy's ``translations`` sub-surface uses the shared untracked
+        posture. Cached: provider is fixed at construction so this is safe to
+        create once.
         """
         return _SyncAudioProxy(self)
 
@@ -918,7 +918,12 @@ class Solwyn(_SolwynBase):
         """
         if self._dialect == "anthropic":
             return _SyncMessagesProxy(self)
-        return self._client.messages
+        return self._resolve_public_attribute(
+            self._client,
+            name="messages",
+            path="messages",
+            source=SurfaceSource.RAW,
+        )
 
     @functools.cached_property
     def models(self) -> Any:
@@ -929,34 +934,56 @@ class Solwyn(_SolwynBase):
         """
         if self._dialect == "google":
             return _SyncModelsProxy(self)
-        return self._client.models
+        return self._resolve_public_attribute(
+            self._client,
+            name="models",
+            path="models",
+            source=SurfaceSource.RAW,
+        )
 
     def converse(self, **kwargs: Any) -> Any:
         """Bedrock-compatible: client.converse(modelId=...) goes through interception."""
+        self._enforce_explicit_surface("converse", source=SurfaceSource.WRAPPER)
         if self._dialect == "bedrock":
             return self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
         return self._client.converse(**kwargs)
 
     def converse_stream(self, **kwargs: Any) -> Any:
         """Bedrock-compatible streaming: returns the boto3 dict with a wrapped stream."""
+        self._enforce_explicit_surface("converse_stream", source=SurfaceSource.WRAPPER)
         if self._dialect == "bedrock":
             return self._intercepted_call(_force_stream=True, **_bedrock_internal_kwargs(kwargs))
         return self._client.converse_stream(**kwargs)
 
     def invoke_model(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
+        self._enforce_explicit_surface(
+            "invoke_model",
+            source=SurfaceSource.WRAPPER,
+            blocked_reason=_INVOKE_MODEL_GUIDANCE,
+        )
         if self._dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
         return self._client.invoke_model(**kwargs)
 
     def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
+        self._enforce_explicit_surface(
+            "invoke_model_with_response_stream",
+            source=SurfaceSource.WRAPPER,
+            blocked_reason=_INVOKE_MODEL_GUIDANCE,
+        )
         if self._dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
         return self._client.invoke_model_with_response_stream(**kwargs)
 
     def start_async_invoke(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's async invocation surface (untracked video-scale spend)."""
+        self._enforce_explicit_surface(
+            "start_async_invoke",
+            source=SurfaceSource.WRAPPER,
+            blocked_reason=_START_ASYNC_INVOKE_GUIDANCE,
+        )
         if self._dialect == "bedrock":
             raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
         return self._client.start_async_invoke(**kwargs)
@@ -2000,8 +2027,8 @@ class AsyncSolwyn(_SolwynBase):
         native OpenAI and every OpenAI-compatible provider (incl. Groq whisper). On
         a non-openai client ``.transcriptions.create()`` / ``.speech.create()``
         fail loud with ``UnsupportedSurfaceError``. The proxy's ``translations``
-        sub-surface warns-once then passes through untracked. Cached: provider is
-        fixed at construction.
+        sub-surface uses the shared untracked posture. Cached: provider is fixed at
+        construction.
         """
         return _AsyncAudioProxy(self)
 
@@ -2027,7 +2054,12 @@ class AsyncSolwyn(_SolwynBase):
         """
         if self._dialect == "anthropic":
             return _AsyncMessagesProxy(self)
-        return self._client.messages
+        return self._resolve_public_attribute(
+            self._client,
+            name="messages",
+            path="messages",
+            source=SurfaceSource.RAW,
+        )
 
     @functools.cached_property
     def models(self) -> Any:
@@ -2038,16 +2070,23 @@ class AsyncSolwyn(_SolwynBase):
         """
         if self._dialect == "google":
             return _AsyncModelsProxy(self)
-        return self._client.models
+        return self._resolve_public_attribute(
+            self._client,
+            name="models",
+            path="models",
+            source=SurfaceSource.RAW,
+        )
 
     async def converse(self, **kwargs: Any) -> Any:
         """Bedrock-compatible: client.converse(modelId=...) goes through interception."""
+        self._enforce_explicit_surface("converse", source=SurfaceSource.WRAPPER)
         if self._dialect == "bedrock":
             return await self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
         return await self._client.converse(**kwargs)
 
     async def converse_stream(self, **kwargs: Any) -> Any:
         """Bedrock-compatible streaming: returns the boto3 dict with a wrapped stream."""
+        self._enforce_explicit_surface("converse_stream", source=SurfaceSource.WRAPPER)
         if self._dialect == "bedrock":
             return await self._intercepted_call(
                 _force_stream=True, **_bedrock_internal_kwargs(kwargs)
@@ -2056,18 +2095,33 @@ class AsyncSolwyn(_SolwynBase):
 
     async def invoke_model(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
+        self._enforce_explicit_surface(
+            "invoke_model",
+            source=SurfaceSource.WRAPPER,
+            blocked_reason=_INVOKE_MODEL_GUIDANCE,
+        )
         if self._dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
         return await self._client.invoke_model(**kwargs)
 
     async def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
+        self._enforce_explicit_surface(
+            "invoke_model_with_response_stream",
+            source=SurfaceSource.WRAPPER,
+            blocked_reason=_INVOKE_MODEL_GUIDANCE,
+        )
         if self._dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
         return await self._client.invoke_model_with_response_stream(**kwargs)
 
     async def start_async_invoke(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's async invocation surface (untracked video-scale spend)."""
+        self._enforce_explicit_surface(
+            "start_async_invoke",
+            source=SurfaceSource.WRAPPER,
+            blocked_reason=_START_ASYNC_INVOKE_GUIDANCE,
+        )
         if self._dialect == "bedrock":
             raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
         return await self._client.start_async_invoke(**kwargs)

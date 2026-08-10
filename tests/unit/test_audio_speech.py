@@ -23,21 +23,19 @@ from solwyn._proxies import _speech_spec
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetMode, CallStatus
 from solwyn.client import AsyncSolwyn, Solwyn
-from solwyn.exceptions import BudgetExceededError
+from solwyn.exceptions import BudgetExceededError, UntrackedSpendSurfaceError
 from solwyn.providers.openai import (
     _AUDIO_OP_KEY,
     _is_untracked_tts_model,
-    _reset_untracked_tts_warning,
 )
 
-_OPENAI_LOGGER = "solwyn.providers.openai"
+_POSTURE_LOGGER = "solwyn._base"
 
 
 @pytest.fixture(autouse=True)
 def _reset_warn_latches() -> None:
-    """Reset both warn-once latches so warn tests stay order-independent."""
+    """Reset the shared contextual warn-once latch."""
     _reset_unmetered_spend_warnings()
-    _reset_untracked_tts_warning()
 
 
 # ---------------------------------------------------------------------------
@@ -169,7 +167,7 @@ class TestAudioSpeechProxy:
             patch.object(solwyn._budget, "check_budget") as check,
             patch.object(solwyn._reporter, "report_settlement") as settle,
             patch.object(solwyn._reporter, "report") as report,
-            caplog.at_level(logging.WARNING, logger=_OPENAI_LOGGER),
+            caplog.at_level(logging.WARNING, logger=_POSTURE_LOGGER),
         ):
             first = solwyn.audio.speech.create(model="gpt-4o-mini-tts", input="hi", voice="alloy")
             second = solwyn.audio.speech.create(model="gpt-4o-mini-tts", input="again")
@@ -191,7 +189,8 @@ class TestAudioSpeechProxy:
         assert len(records) == 1
         message = records[0].getMessage()
         assert "untracked" in message.lower()
-        assert "unobservable" in message.lower()
+        assert "no budget check" in message.lower()
+        assert "no cost event" in message.lower()
         # Never echoes request content.
         assert "hi" not in message.split()
         _close_sync(solwyn)
@@ -204,7 +203,7 @@ class TestAudioSpeechProxy:
         with (
             patch.object(solwyn._budget, "check_budget") as check,
             patch.object(solwyn._reporter, "report") as report,
-            caplog.at_level(logging.WARNING, logger=_OPENAI_LOGGER),
+            caplog.at_level(logging.WARNING, logger=_POSTURE_LOGGER),
         ):
             solwyn.audio.speech.create(model="gpt-4o-mini-tts-2026-01-01", input="hi")
 
@@ -214,13 +213,43 @@ class TestAudioSpeechProxy:
         assert len(foreground_records(caplog)) == 1
         _close_sync(solwyn)
 
-    def test_speech_getattr_passthrough_is_silent(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_strict_untracked_model_refuses_before_provider_dispatch(self) -> None:
+        client = _mock_speech_client(b"audio")
+        solwyn = _build_sync(client, on_unmetered="raise")
+
+        with pytest.raises(UntrackedSpendSurfaceError) as exc_info:
+            solwyn.audio.speech.create(model="gpt-4o-mini-tts", input="private")
+
+        assert exc_info.value.surface == "audio.speech.create"
+        assert exc_info.value.token == "audio.speech.create:gpt-4o-mini-tts"
+        client.audio.speech.create.assert_not_called()
+        _close_sync(solwyn)
+
+    def test_exact_conditional_acknowledgment_allows_untracked_model(self) -> None:
+        client = _mock_speech_client(b"audio")
+        solwyn = _build_sync(
+            client,
+            on_unmetered="raise",
+            acknowledge_untracked={"audio.speech.create:gpt-4o-mini-tts"},
+        )
+
+        result = solwyn.audio.speech.create(model="gpt-4o-mini-tts", input="private")
+
+        assert result == b"audio"
+        client.audio.speech.create.assert_called_once()
+        _close_sync(solwyn)
+
+    def test_speech_getattr_passthrough_uses_default_warn_posture(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         client = _mock_speech_client(b"audio")
         client.audio.speech.with_streaming_response = MagicMock(return_value="streamed")
         solwyn = _build_sync(client)
         with caplog.at_level(logging.WARNING, logger="solwyn._base"):
             assert solwyn.audio.speech.with_streaming_response() == "streamed"
-        assert foreground_records(caplog) == []
+        records = foreground_records(caplog)
+        assert len(records) == 1
+        assert records[0].args[2] == "audio.speech.with_streaming_response"
         _close_sync(solwyn)
 
     def test_budget_denied_short_circuits(self) -> None:
@@ -286,7 +315,7 @@ class TestAsyncAudioSpeechProxy:
         with (
             patch.object(solwyn._budget, "check_budget", new=AsyncMock()) as check,
             patch.object(solwyn._reporter, "report") as report,
-            caplog.at_level(logging.WARNING, logger=_OPENAI_LOGGER),
+            caplog.at_level(logging.WARNING, logger=_POSTURE_LOGGER),
         ):
             result = await solwyn.audio.speech.create(model="gpt-4o-mini-tts", input="hi")
 
@@ -299,3 +328,31 @@ class TestAsyncAudioSpeechProxy:
         assert "untracked" in records[0].getMessage().lower()
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_async_strict_untracked_model_refuses_before_dispatch(self) -> None:
+        client = _mock_async_speech_client(b"raw-audio")
+        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, on_unmetered="raise")
+
+        with pytest.raises(UntrackedSpendSurfaceError) as exc_info:
+            await solwyn.audio.speech.create(model="gpt-4o-mini-tts", input="private")
+
+        assert exc_info.value.token == "audio.speech.create:gpt-4o-mini-tts"
+        client.audio.speech.create.assert_not_awaited()
+        await solwyn.close()
+
+    @pytest.mark.asyncio
+    async def test_async_conditional_acknowledgment_allows_untracked_model(self) -> None:
+        client = _mock_async_speech_client(b"raw-audio")
+        solwyn = AsyncSolwyn(
+            client,
+            api_key=VALID_API_KEY,
+            on_unmetered="raise",
+            acknowledge_untracked={"audio.speech.create:gpt-4o-mini-tts"},
+        )
+
+        result = await solwyn.audio.speech.create(model="gpt-4o-mini-tts", input="private")
+
+        assert result == b"raw-audio"
+        client.audio.speech.create.assert_awaited_once()
+        await solwyn.close()

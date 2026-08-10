@@ -39,6 +39,7 @@ from solwyn._surfaces import (
     SURFACE_RULES,
     AttributeShape,
     CapabilityScope,
+    SurfaceCondition,
     SurfaceContext,
     SurfaceKind,
     SurfaceRule,
@@ -151,79 +152,15 @@ def _warn_cost_policy_inactive_once() -> None:
     logger.warning("CostPolicy selected but no price hints available; using health-based order")
 
 
-# Recognized spend surfaces that are not yet intercepted: they
-# warn ONCE per process, then pass through untracked. Keyed by DIALECT because
-# the same posture spans every provider that speaks it — OpenAI itself and every
-# OpenAI-compatible provider share the "openai" set. Embeddings, openai
-# images, openai ``audio.transcriptions``, openai ``audio.speech``, openai
-# ``videos`` (Sora), and every google media surface (``embed_content``,
-# ``generate_images``, ``generate_videos``) are deliberately ABSENT: they are
-# intercepted, so they are tracked rather than warned (a surface that is metered
-# must not advertise itself as untracked). The openai ``audio`` attribute is now
-# intercepted machinery (its proxy exposes transcriptions AND speech), so its one
-# still-unwired SUB-surface is all that warns here: ``translations``, reached via
-# ``client.audio.translations``. The google dialect has no still-unwired media
-# surface, so it carries no entry (``.get`` yields the empty frozenset).
-_UNSHIPPED_SPEND_SURFACES: dict[str, frozenset[str]] = {
-    "openai": frozenset({"translations"}),
-}
-
-# Per-PROCESS warn-once latch for untracked spend surfaces (NOT per-instance): a
-# recognized surface logs exactly one warning per process however many client
-# instances or calls touch it — quiet logs for the create-a-client-per-request
-# pattern. Module-level so the latch spans instances; lock-guarded for the
-# multi-threaded sync client. Keyed by surface name to honor "one warning per
-# surface per process". Tests reset it via ``_reset_unmetered_spend_warnings``.
-_warned_spend_surfaces: set[str] = set()
+# Per-process warn-once state is keyed by the complete contextual rule identity,
+# so equal terminal names in different provider graphs cannot suppress each other.
 _warned_contextual_surfaces: set[tuple[str, str, str]] = set()
 _spend_surface_warn_lock = threading.Lock()
-
-
-def _recognized_unshipped_surfaces(adapter: Any, dialect: str) -> frozenset[str]:
-    """Untracked spend surfaces that warn for this adapter.
-
-    The union of the central per-dialect map (modality surfaces that are
-    not yet intercepted) and the adapter's own opt-in
-    ``unmetered_spend_surfaces`` (a provider that declares extra untracked
-    billable surfaces — e.g. Together's rerank/code_interpreter/evals). Adapters
-    that declare nothing get only the central map.
-    """
-    central = _UNSHIPPED_SPEND_SURFACES.get(dialect, frozenset())
-    declared: frozenset[str] = getattr(adapter, "unmetered_spend_surfaces", frozenset())
-    return central | declared
-
-
-def _warn_unmetered_spend_surface_once(*, adapter: Any, dialect: str, surface: str) -> None:
-    """Warn once per process when a recognized spend surface passes through untracked.
-
-    Fires for surfaces in ``_recognized_unshipped_surfaces`` only; every other
-    attribute (files, moderations, models.list, …) passes through silently. The
-    surface itself still passes through after the warning — this is the
-    warn-once pass-through posture, not a refusal. Content-free by construction:
-    only the provider ``name`` and ``surface`` (both structural identifiers) are
-    logged, never request or media data.
-    """
-    if surface not in _recognized_unshipped_surfaces(adapter, dialect):
-        return
-
-    with _spend_surface_warn_lock:
-        if surface in _warned_spend_surfaces:
-            return
-        _warned_spend_surfaces.add(surface)
-
-    # Logging handlers may execute arbitrary code; keep them outside the lock.
-    logger.warning(
-        "Provider '%s' surface '%s' is passed through untracked: no budget check "
-        "and no cost event will be emitted. Tracking for this surface is coming.",
-        adapter.name,
-        surface,
-    )
 
 
 def _reset_unmetered_spend_warnings() -> None:
     """Clear the per-process warn-once latch. Test-support hook only."""
     with _spend_surface_warn_lock:
-        _warned_spend_surfaces.clear()
         _warned_contextual_surfaces.clear()
 
 
@@ -997,6 +934,39 @@ class _SolwynBase:
         if self._has_acknowledged_descendant(path):
             raise RuntimeError(f"acknowledged descendant has unguardable prefix: {path}")
         return value
+
+    def _enforce_explicit_surface(
+        self,
+        path: str,
+        *,
+        source: SurfaceSource,
+        condition: SurfaceCondition | None = None,
+        blocked_reason: str | None = None,
+    ) -> None:
+        """Resolve policy before an explicit wrapper method dispatches."""
+
+        rule = resolve_surface_rule(
+            context=self._surface_context,
+            path=path,
+            source=source,
+            condition=condition,
+        )
+        if rule is None:
+            self._apply_untracked_posture(path, None)
+            return
+        if rule.kind is SurfaceKind.METERED:
+            return
+        if rule.kind is SurfaceKind.UNMETERED_SPEND:
+            self._apply_untracked_posture(path, rule)
+            return
+        if rule.kind is SurfaceKind.BLOCKED:
+            raise ConfigurationError(blocked_reason or rule.reason or "blocked surface", field=path)
+        if rule.kind is SurfaceKind.UNSUPPORTED:
+            raise UnsupportedSurfaceError(
+                surface=path,
+                provider=self._surface_context.provider,
+            )
+        raise RuntimeError(f"non-dispatch surface reached explicit resolver: {path}")
 
     def _resolve_public_attribute(
         self,

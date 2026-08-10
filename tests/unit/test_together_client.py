@@ -25,21 +25,10 @@ from solwyn import _base
 from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn._types import CallStatus, ProviderName
 from solwyn.client import AsyncSolwyn, Solwyn
-from solwyn.providers.together import TogetherAdapter
+from solwyn.exceptions import UnsupportedSurfaceError
 
 MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
-# Together's adapter-DECLARED untracked spend surfaces: provider-specific extras
-# the central per-dialect map does not cover. translations lives in the central
-# openai map; embeddings/images/audio.transcriptions/audio.speech/videos
-# (intercepted) and batches/fine_tuning are no longer warned.
-DECLARED_UNMETERED_SURFACES = frozenset({"completions", "rerank", "code_interpreter", "evals"})
-# Central openai-dialect surfaces every openai-dialect provider (Together
-# included) warns for, sourced from _base._UNSHIPPED_SPEND_SURFACES["openai"].
-# images, audio.transcriptions, audio.speech, and videos are intercepted; only
-# the audio proxy's still-unwired translations sub-surface remains.
-CENTRAL_OPENAI_SURFACES = frozenset({"translations"})
-# Every surface that warns-once for a Together (openai-dialect) client.
-WARNING_SURFACES = DECLARED_UNMETERED_SURFACES | CENTRAL_OPENAI_SURFACES
+WARNING_SURFACES = frozenset({"completions", "rerank", "code_interpreter", "evals", "translations"})
 # Together-billed surfaces Solwyn passes through SILENTLY (truly-unrelated
 # resources, not warned). embeddings and images are NOT here:
 # they are intercepted, so they return the media proxy rather than passing through.
@@ -63,14 +52,6 @@ class _YieldingSet(set[_T]):
         if not present:
             time.sleep(0.05)
         return present
-
-
-@pytest.mark.unit
-def test_together_adapter_declares_unmetered_spend_surfaces() -> None:
-    # Provider-specific extras only; translations rides the central openai dialect
-    # map, and embeddings/images/audio.transcriptions/audio.speech/videos
-    # (intercepted) + batches/fine_tuning are not warned.
-    assert TogetherAdapter().unmetered_spend_surfaces == DECLARED_UNMETERED_SURFACES
 
 
 def _completion_response() -> SimpleNamespace:
@@ -255,6 +236,22 @@ def test_sync_unmetered_surface_warns_and_passes_through(caplog: pytest.LogCaptu
 
 
 @pytest.mark.unit
+def test_native_together_video_is_unsupported_before_dispatch() -> None:
+    solwyn = _make_solwyn(FakeTogetherClient(_completion_response()))
+
+    with (
+        patch.object(solwyn, "_media_call") as dispatch,
+        pytest.raises(UnsupportedSurfaceError) as exc_info,
+    ):
+        solwyn.videos.create(model="video", prompt="private")
+
+    assert exc_info.value.surface == "videos.create"
+    assert exc_info.value.provider == "together"
+    dispatch.assert_not_called()
+    solwyn.close()
+
+
+@pytest.mark.unit
 def test_sync_curated_shape_drift_warns_under_the_compatibility_posture(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -326,12 +323,28 @@ async def test_async_unmetered_surface_warns_and_passes_through(
 
 
 @pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_native_together_video_is_unsupported_before_dispatch() -> None:
+    solwyn = _make_async_solwyn(AsyncTogether(_completion_response()))
+
+    with (
+        patch.object(solwyn, "_media_call", new=AsyncMock()) as dispatch,
+        pytest.raises(UnsupportedSurfaceError) as exc_info,
+    ):
+        await solwyn.videos.create(model="video", prompt="private")
+
+    assert exc_info.value.surface == "videos.create"
+    assert exc_info.value.provider == "together"
+    dispatch.assert_not_awaited()
+    await solwyn.close()
+
+
+@pytest.mark.unit
 def test_sync_warns_once_for_each_warning_surface(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # A Together (openai-dialect) client warns for the union of the central
-    # openai map and its own declared surfaces; each warns exactly once per
-    # process no matter how many times it is accessed.
+    # The contextual surface ledger marks each capability untracked; each exact
+    # rule warns once per process no matter how many times it is accessed.
     client = FakeTogetherClient(_completion_response())
     resources: dict[str, MagicMock] = {}
     for surface in WARNING_SURFACES:
