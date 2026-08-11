@@ -212155,7 +212155,7 @@
       "expected_attribute_shapes": [
         {
           "descriptor_category": "classmethod",
-          "return_shape": "resource"
+          "return_shape": "callable"
         }
       ],
       "id": "surface.from-cached-content.unmetered_spend.7095db2f5c36",

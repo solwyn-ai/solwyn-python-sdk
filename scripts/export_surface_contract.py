@@ -6,10 +6,26 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
-from solwyn._surfaces import surface_contract_data
+from solwyn._surfaces import (
+    AttributeShape,
+    SurfaceContext,
+    SurfaceSource,
+    resolve_surface_rule,
+    surface_contract_data,
+)
 
 DEFAULT_OUTPUT = Path(__file__).parents[1] / "docs" / "contracts" / "surface-classification.json"
+_DIALECT_BY_PROVIDER = {
+    "anthropic": "anthropic",
+    "azure_openai": "openai",
+    "bedrock": "bedrock",
+    "google": "google",
+    "openai": "openai",
+    "openai_compatible": "openai",
+    "together": "openai",
+}
 
 
 def render_contract() -> str:
@@ -33,10 +49,60 @@ def compare_contract(path: Path = DEFAULT_OUTPUT) -> str | None:
     return None
 
 
+def compare_report_contract(report: dict[str, Any], *, label: str) -> tuple[str, ...]:
+    """Return every missing or shape-incompatible raw-surface classification."""
+
+    provider = str(report["provider"])
+    context = SurfaceContext(
+        provider=provider,
+        dialect=_DIALECT_BY_PROVIDER[provider],
+        client_shape=str(report["client_shape"]),
+        mode=str(report["mode"]),
+    )
+    mismatches: list[str] = []
+    for observation in report["observations"]:
+        path = str(observation["path"])
+        rule = resolve_surface_rule(
+            context=context,
+            path=path,
+            source=SurfaceSource.RAW,
+        )
+        if rule is None:
+            mismatches.append(f"{label}: no reviewed raw rule for {path!r} in {context}")
+            continue
+        shape = AttributeShape(
+            descriptor_category=str(observation["descriptor_category"]),
+            return_shape=str(observation["return_shape"]),
+        )
+        if not rule.accepts_shape(shape):
+            mismatches.append(
+                f"{label}: rule {rule.rule_id!r} rejects observed shape {shape} for {path!r}"
+            )
+    return tuple(mismatches)
+
+
+def compare_report_directory(path: Path) -> tuple[str, ...]:
+    """Check every generated full report, failing closed when none are present."""
+
+    report_paths = sorted(path.glob("*.json"))
+    if not report_paths:
+        return (f"no provider surface reports found in {path}",)
+    mismatches: list[str] = []
+    for report_path in report_paths:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        mismatches.extend(compare_report_contract(report, label=report_path.name))
+    return tuple(mismatches)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument(
+        "--reports-dir",
+        type=Path,
+        help="also verify every generated full provider report against the reviewed contract",
+    )
     return parser
 
 
@@ -47,6 +113,12 @@ def main() -> int:
         if mismatch is not None:
             print(mismatch)
             return 1
+        if args.reports_dir is not None:
+            report_mismatches = compare_report_directory(args.reports_dir)
+            if report_mismatches:
+                for report_mismatch in report_mismatches:
+                    print(report_mismatch)
+                return 1
         return 0
     write_contract(args.output)
     print(args.output)

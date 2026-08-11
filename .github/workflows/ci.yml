@@ -63,6 +63,11 @@ jobs:
           --output-dir build/provider_surface_inventory
         env:
           AWS_EC2_METADATA_DISABLED: "true"
+      - name: Verify generated surfaces are classified
+        run: >-
+          python scripts/export_surface_contract.py
+          --check
+          --reports-dir build/provider_surface_inventory
       - name: Upload provider surface inventory
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2

@@ -25,7 +25,6 @@ from solwyn._surfaces import (
 )
 
 ROOT = Path(__file__).parents[2]
-FIXTURE_DIR = ROOT / "tests" / "fixtures" / "provider_surface_inventory"
 CONTRACT_PATH = ROOT / "docs" / "contracts" / "surface-classification.json"
 
 
@@ -230,50 +229,54 @@ def test_rule_invariants_reject_unsafe_or_ambiguous_contract_rows() -> None:
         )
 
 
-def _context_from_report(report: dict[str, object]) -> SurfaceContext:
-    provider = str(report["provider"])
-    return SurfaceContext(
-        provider=provider,
-        dialect={
-            "anthropic": "anthropic",
-            "azure_openai": "openai",
-            "bedrock": "bedrock",
-            "google": "google",
-            "openai": "openai",
-            "openai_compatible": "openai",
-            "together": "openai",
-        }[provider],
-        client_shape=str(report["client_shape"]),
-        mode=str(report["mode"]),
+@pytest.mark.unit
+def test_generated_report_contract_check_covers_rules_and_shapes() -> None:
+    exporter = _export_module()
+    report = {
+        "provider": "openai",
+        "client_shape": "openai_sdk",
+        "mode": "sync",
+        "observations": [
+            {
+                "path": "responses.create",
+                "descriptor_category": "function",
+                "return_shape": "callable",
+            }
+        ],
+    }
+
+    assert exporter.compare_report_contract(report, label="report.json") == ()
+
+    report["observations"][0]["path"] = "not.reviewed"
+    assert (
+        "no reviewed raw rule" in exporter.compare_report_contract(report, label="report.json")[0]
+    )
+
+    report["observations"][0] = {
+        "path": "responses.create",
+        "descriptor_category": "property",
+        "return_shape": "scalar",
+    }
+    assert (
+        "rejects observed shape" in exporter.compare_report_contract(report, label="report.json")[0]
     )
 
 
 @pytest.mark.unit
-def test_every_u0_observation_has_one_reviewed_rule_and_shape_contract() -> None:
-    for fixture_path in sorted(FIXTURE_DIR.glob("*.json")):
-        report = json.loads(fixture_path.read_text(encoding="utf-8"))
-        context = _context_from_report(report)
-        for observation in report["observations"]:
-            rule = resolve_surface_rule(
-                context=context,
-                path=observation["path"],
-                source=SurfaceSource.RAW,
-            )
-            assert rule is not None, (fixture_path.name, context, observation)
-            assert rule.accepts_shape(
-                AttributeShape(
-                    descriptor_category=observation["descriptor_category"],
-                    return_shape=observation["return_shape"],
-                )
-            ), (fixture_path.name, rule.rule_id, observation)
+def test_generated_report_directory_check_fails_closed_when_empty(tmp_path: Path) -> None:
+    exporter = _export_module()
 
-        for operation in report.get("service_model_operations", []):
-            rule = resolve_surface_rule(
-                context=context,
-                path=operation,
-                source=SurfaceSource.RAW,
-            )
-            assert rule is not None, (fixture_path.name, context, operation)
+    assert exporter.compare_report_directory(tmp_path) == (
+        f"no provider surface reports found in {tmp_path}",
+    )
+
+
+@pytest.mark.unit
+def test_provider_matrix_checks_each_generated_report_against_the_contract() -> None:
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert "Verify generated surfaces are classified" in workflow
+    assert "--reports-dir build/provider_surface_inventory" in workflow
 
 
 @pytest.mark.unit
