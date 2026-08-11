@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shlex
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+import yaml
 
 from solwyn._surfaces import (
     SURFACE_RULES,
@@ -33,6 +35,12 @@ OPENAI_SYNC = SurfaceContext(
     dialect="openai",
     client_shape="openai_sdk",
     mode="sync",
+)
+OPENAI_ASYNC = SurfaceContext(
+    provider="openai",
+    dialect="openai",
+    client_shape="openai_sdk",
+    mode="async",
 )
 GROQ_SYNC = SurfaceContext(
     provider="groq",
@@ -274,9 +282,24 @@ def test_generated_report_directory_check_fails_closed_when_empty(tmp_path: Path
 @pytest.mark.unit
 def test_provider_matrix_checks_each_generated_report_against_the_contract() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    workflow_data = yaml.safe_load(workflow)
+    inventory_steps = workflow_data["jobs"]["provider-surface-inventory"]["steps"]
+    verification_steps = [
+        step
+        for step in inventory_steps
+        if step.get("name") == "Verify generated surfaces are classified"
+    ]
 
-    assert "Verify generated surfaces are classified" in workflow
-    assert "--reports-dir build/provider_surface_inventory" in workflow
+    assert len(verification_steps) == 1
+    run_command = verification_steps[0]["run"]
+    command_tokens = shlex.split(run_command)
+    assert command_tokens == [
+        "python",
+        "scripts/export_surface_contract.py",
+        "--check",
+        "--reports-dir",
+        "build/provider_surface_inventory",
+    ]
 
 
 @pytest.mark.unit
@@ -346,6 +369,42 @@ def test_namespace_leaf_and_exact_infrastructure_depth_remain_distinct() -> None
         )
         is None
     )
+
+
+def _assert_audio_translations_source_shapes(context: SurfaceContext) -> None:
+    raw = resolve_surface_rule(
+        context=context,
+        path="audio.translations",
+        source=SurfaceSource.RAW,
+    )
+    wrapper = resolve_surface_rule(
+        context=context,
+        path="audio.translations",
+        source=SurfaceSource.WRAPPER,
+    )
+
+    assert raw is not None and raw.source is SurfaceSource.RAW
+    assert wrapper is not None and wrapper.source is SurfaceSource.WRAPPER
+    assert raw is not wrapper
+    raw_shapes = {
+        AttributeShape(descriptor_category="cached_property", return_shape="resource"),
+        AttributeShape(descriptor_category="function", return_shape="callable"),
+    }
+    wrapper_shape = AttributeShape(descriptor_category="property", return_shape="resource")
+    assert set(raw.expected_shapes) == raw_shapes
+    assert all(raw.accepts_shape(shape) for shape in raw_shapes)
+    assert wrapper.expected_shapes == (wrapper_shape,)
+    assert wrapper.accepts_shape(wrapper_shape)
+
+
+@pytest.mark.unit
+def test_sync_audio_translations_resolves_source_specific_shapes() -> None:
+    _assert_audio_translations_source_shapes(OPENAI_SYNC)
+
+
+@pytest.mark.unit
+def test_async_audio_translations_resolves_source_specific_shapes() -> None:
+    _assert_audio_translations_source_shapes(OPENAI_ASYNC)
 
 
 @pytest.mark.unit

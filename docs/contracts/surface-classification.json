@@ -94522,7 +94522,7 @@
           "return_shape": "callable"
         }
       ],
-      "id": "surface.audio-translations.unmetered_spend.9503ab99097e",
+      "id": "surface.audio-translations.unmetered_spend.00d1ef861892",
       "kind": "unmetered_spend",
       "policy_action": "posture",
       "reason": null,
@@ -94588,7 +94588,89 @@
           "provider": "together"
         }
       ],
-      "source": "both",
+      "source": "raw",
+      "surface": "audio.translations",
+      "token": "audio.translations",
+      "usage_basis": null
+    },
+    {
+      "acknowledgment_token": "audio.translations",
+      "capability_scope": "resource",
+      "condition": null,
+      "dispatch_action": "posture",
+      "expected_attribute_shapes": [
+        {
+          "descriptor_category": "property",
+          "return_shape": "resource"
+        }
+      ],
+      "id": "surface.audio-translations.unmetered_spend.8c6736e7c142",
+      "kind": "unmetered_spend",
+      "policy_action": "posture",
+      "reason": null,
+      "selectors": [
+        {
+          "client_shape": "openai_sdk",
+          "dialect": "openai",
+          "mode": "async",
+          "provider": null
+        },
+        {
+          "client_shape": "openai_sdk",
+          "dialect": "openai",
+          "mode": "sync",
+          "provider": null
+        },
+        {
+          "client_shape": "openai_sdk",
+          "dialect": "openai",
+          "mode": "async",
+          "provider": "azure_openai"
+        },
+        {
+          "client_shape": "openai_sdk",
+          "dialect": "openai",
+          "mode": "sync",
+          "provider": "azure_openai"
+        },
+        {
+          "client_shape": "openai_sdk",
+          "dialect": "openai",
+          "mode": "async",
+          "provider": "openai"
+        },
+        {
+          "client_shape": "openai_sdk",
+          "dialect": "openai",
+          "mode": "sync",
+          "provider": "openai"
+        },
+        {
+          "client_shape": "native_together",
+          "dialect": "openai",
+          "mode": "async",
+          "provider": "together"
+        },
+        {
+          "client_shape": "native_together",
+          "dialect": "openai",
+          "mode": "sync",
+          "provider": "together"
+        },
+        {
+          "client_shape": "openai_sdk",
+          "dialect": "openai",
+          "mode": "async",
+          "provider": "together"
+        },
+        {
+          "client_shape": "openai_sdk",
+          "dialect": "openai",
+          "mode": "sync",
+          "provider": "together"
+        }
+      ],
+      "source": "wrapper",
       "surface": "audio.translations",
       "token": "audio.translations",
       "usage_basis": null
