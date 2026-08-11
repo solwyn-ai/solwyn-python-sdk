@@ -84,7 +84,7 @@ The relevant existing seams are `src/solwyn/_base.py`, `src/solwyn/client.py`, `
 
 **Maintenance and rollout**
 
-- R23. One sans-I/O data module owns classification and JSON export data. The runtime guard, coverage manifest, committed human-reviewable classification ledger, and canary all consume it; the ledger is a current Python SDK audit artifact, not infrastructure justified only by a future TypeScript consumer.
+- R23. One sans-I/O data module owns classification and JSON export data. The runtime guard, coverage manifest, and canary consume it directly; CI generates the expanded ledger as a short-lived audit artifact instead of committing it to the repository.
 - R24. Real-SDK canaries are mandatory for native OpenAI and Azure OpenAI, a representative generic compatible client, Anthropic, both `google-genai` and the still-supported `google.generativeai` shape, native Together, OpenAI configured for Together, sync boto3 Bedrock, and async aioboto3 Bedrock. CI exercises the supported dependency floor, every known public-resource-tree breakpoint, and the latest provider release through solver-compatible matrices.
 - R25. The graph walker statically enumerates public roots and recurses through applicable table-declared namespaces without calling operations. Unknown roots fail the canary before arbitrary traversal.
 - R26. Bedrock discovery uses the union of public client attributes and normalized service-model operation names.
@@ -120,7 +120,7 @@ The relevant existing seams are `src/solwyn/_base.py`, `src/solwyn/client.py`, `
 
 - Local classification, runtime posture, namespace guarding, coverage reporting, CI canaries, generated JSON, and SDK documentation.
 - Exact handling of provider capabilities exposed by the currently supported client families.
-- A committed generated JSON ledger as the reviewable inventory of the Python SDK's classification table and the input to parity and documentation-contract checks.
+- An expanded generated JSON ledger retained as a short-lived CI artifact for diagnostics and parity checks.
 - Removal of `_UNSHIPPED_SPEND_SURFACES` and `TogetherAdapter.unmetered_spend_surfaces` after the new contract is active.
 
 **Deferred to follow-up work**
@@ -151,7 +151,7 @@ The relevant existing seams are `src/solwyn/_base.py`, `src/solwyn/client.py`, `
 - KTD7. **Resolve wrapper ownership before dispatch.** Explicit proxy methods consult applicability before provider I/O. Wrapper ownership takes precedence over an identically named raw path. `videos.create` is tracked for native OpenAI and reports `unsupported` for compatible adapters, including native Together, until their media dispatch implements video.
 - KTD8. **Represent TTS as two rule identities.** The ordinary `audio.speech.create` rule is metered. The `gpt-4o-mini-tts` family adds a conditional untracked rule with a stable condition enum and token `audio.speech.create:gpt-4o-mini-tts`. Rule ID, not surface alone, uniquely keys acknowledgment and the manifest.
 - KTD9. **Prove and share one graph observer before freezing the rule schema.** A permanent minimal `src/solwyn/_surface_graph.py` first proves that every mandatory real client shape can be observed offline without operation calls. Coverage and canaries then extend the same observer. It statically inspects public roots, evaluates only declared resource containers, recurses with cycle and depth protection, and combines observed paths with wrapper-owned and synthetic rows. An inaccessible declared container raises a typed inspection error with its exact path instead of being skipped.
-- KTD10. **Export data, not files, from core.** `src/solwyn/_surfaces.py` returns JSON-ready contract data. A script under `scripts/` owns filesystem output and creates `docs/contracts/` before writing. The committed JSON is the exhaustive, human-reviewable Python classification ledger used by parity, fingerprint, and documentation-contract tests; future cross-SDK consumption is not required to justify it.
+- KTD10. **Export data, not files, from core.** `src/solwyn/_surfaces.py` returns JSON-ready contract data. A script under `scripts/` owns filesystem output under ignored `build/` storage. CI uploads the expanded ledger for diagnostics, while the reviewed Python rules remain the sole canonical contract.
 - KTD11. **Ship runtime control atomically with widened behavior.** The table, posture configuration, exception, guarded resolver, and all pass-through integrations land together. The manifest and documentation follow after that runtime contract is testable.
 - KTD12. **Use total classification precedence and two-dimensional actions.** Deliberate block wins over unsupported, which wins over tracked wrapper ownership, conditional policy, raw classified leaf, and unknown posture. Acknowledgment affects only eligible untracked, unknown, or escape leaves. The manifest records the policy decision separately from whether dispatch is intercepted, returned, guarded, or refused.
 - KTD13. **Report effective usage guarantees over reachable runtimes.** Rules store the basis for one runtime. Coverage combines only the runtimes that the leaf can actually reach, including chat failover candidates, and reports the conservative basis. Media paths remain primary-only unless their dispatch design changes.
@@ -188,7 +188,7 @@ The README OpenAI example uses the exact same literal expectation exercised by t
 
 ### Mandatory Current-State Audit Cases
 
-The committed classification ledger is the exhaustive row inventory; this plan defines its decision policy and mandatory cases without duplicating every generated row.
+The canonical Python classification table is the exhaustive row inventory; this plan defines its decision policy and mandatory cases without duplicating every generated row.
 The initial audit must classify these current cases before the contract is accepted:
 
 - OpenAI resource containers including `responses`, `completions`, `batches`, `beta`, `files`, `chat`, `audio`, `videos`, and `evals`, followed by their exact public leaves.
@@ -202,7 +202,7 @@ The initial audit must classify these current cases before the contract is accep
 
 ### Initial Classification Policy and Review Gate
 
-U0 produces full, versioned inventories as downloadable CI artifacts and commits their compact structural fingerprints; U1 must convert every observed pre-call row from those reports into the committed classification ledger before runtime behavior changes.
+U0 produces full, versioned inventories as downloadable CI artifacts and commits their compact structural fingerprints; U1 must convert every observed pre-call row from those reports into the canonical Python contract before runtime behavior changes.
 The canary discovers paths and shapes but never chooses policy.
 Review applies this precedence to each exact contextual row:
 
@@ -278,7 +278,7 @@ Warn-once state is keyed by provider, client shape, and rule ID so one provider 
 ### Delivery Sequence
 
 1. **Evidence prerequisite (U0):** prove offline static observability and capture raw inventories for every mandatory real-client shape and every known structural version interval.
-2. **Runtime contract change (U1-U3):** contextual exact table and committed classification ledger, posture configuration, exceptions, guarded namespaces, TTS policy, every sync/async call site, and removal of old registries.
+2. **Runtime contract change (U1-U3):** contextual exact table and generated CI ledger, posture configuration, exceptions, guarded namespaces, TTS policy, every sync/async call site, and removal of old registries.
 3. **Audit and manifest change (U4-U6):** required drift canaries, public coverage models, literal audit fingerprints, and documentation.
 
 The first change contains both the new warnings and their `allow` control.
@@ -290,7 +290,7 @@ No release step relies on a claim about current customer count.
 - **Public SDK exports:** adds coverage models, coverage function, and typed errors.
 - **Provider adapters:** classification uses adapter name and raw client shape but does not add provider SDK imports.
 - **Privacy:** graph observation reads attribute names and resource objects only. It never inspects request arguments, prompts, or responses.
-- **Generated classification ledger:** the JSON schema carries stable rule IDs, contextual applicability, source, expected descriptor category, expected attribute-return shape, capability scope, condition enums, and contract-version fields. It is reviewed and tested in this SDK now; a future TypeScript consumer must negotiate its version separately.
+- **Generated classification ledger:** the JSON schema carries stable rule IDs, contextual applicability, source, expected descriptor category, expected attribute-return shape, capability scope, condition enums, and contract-version fields. CI writes it under ignored `build/` storage and uploads it for seven days; it is not committed.
 - **Server:** no request, response, enum, or pricing contract changes; the API repository is not part of this implementation.
 
 ### Risks and Mitigations
@@ -340,8 +340,8 @@ No release step relies on a claim about current customer count.
 - **Goal:** Create the exact capability data model and replace dialect-wide and terminal-name assumptions.
 - **Requirements:** R1-R8, R23, R28; KTD1, KTD3, KTD5-KTD8, KTD10, KTD15.
 - **Dependencies:** U0.
-- **Files:** Create `src/solwyn/_surfaces.py`, `tests/unit/test_surfaces.py`, `scripts/export_surface_contract.py`, and `docs/contracts/surface-classification.json`.
-- **Approach:** Apply the Initial Classification Policy to every U0 inventory row from the generated full reports and check in the resulting exhaustive contextual ledger before runtime behavior changes. Define kinds including `namespace`, `metered`, `blocked`, `unsupported`, `unmetered_spend`, `metadata`, `infrastructure`, and `unknown`. Add stable rule ID, contextual applicability, usage basis, source, capability scope, condition enum, acknowledgment token, `expected_descriptor_category`, and `expected_return_shape`. Resolve rules by exact path and deterministic specificity. Keep the module content-free and sans-I/O; the export script owns filesystem creation and deterministic newline-terminated JSON.
+- **Files:** Create `src/solwyn/_surfaces.py`, `tests/unit/test_surfaces.py`, and `scripts/export_surface_contract.py`.
+- **Approach:** Apply the Initial Classification Policy to every U0 inventory row from the generated full reports and check in the resulting exhaustive contextual Python table before runtime behavior changes. Define kinds including `namespace`, `metered`, `blocked`, `unsupported`, `unmetered_spend`, `metadata`, `infrastructure`, and `unknown`. Add stable rule ID, contextual applicability, usage basis, source, capability scope, condition enum, acknowledgment token, `expected_descriptor_category`, and `expected_return_shape`. Resolve rules by exact path and deterministic specificity. Keep the module content-free and sans-I/O; the export script owns ignored artifact creation and deterministic newline-terminated JSON.
 - **Patterns to follow:** Frozen data rows such as `CompatProfile` in `src/solwyn/providers/openai_compatible.py`; provider name versus dialect separation in `src/solwyn/providers/_protocol.py`; Pydantic v2 and runtime-invariant rules from `AGENTS.md`.
 - **Test scenarios:**
   - Native OpenAI and an OpenAI-compatible client select different rules for the same video path.
@@ -355,7 +355,7 @@ No release step relies on a claim about current customer count.
   - No namespace is acknowledgment-eligible and no escape rule lacks capability scope.
   - Every U0-observed path at each supported structural version interval has a reviewed ledger row; the canary, not a name heuristic, identifies any omission.
   - Metadata and infrastructure rows have explicit expected descriptor categories and expected attribute-return shapes.
-  - JSON-ready export order and contract version are deterministic, the script creates `docs/contracts/`, and the committed ledger matches the Python data.
+  - JSON-ready export order and contract version are deterministic, the script creates the ignored `build/surface_contract/` artifact, and the generated ledger matches the Python data.
 - **Verification:** The classification tests prove exact-path, client-shape, origin, condition, shape, and usage-basis behavior without importing provider SDKs into core code.
 
 ### U2. Posture configuration and guarded resolver
@@ -422,8 +422,8 @@ No release step relies on a claim about current customer count.
   - Table invariants reject duplicate rule IDs, ambiguous applicability, acknowledgment-eligible containers, and terminal-name heuristics.
   - Floor, each known structural breakpoint, and latest supported SDK versions accept a table superset while reporting raw-only rows only when present.
   - Socket denial proves the canary is offline.
-  - The parsed committed JSON equals the versioned in-memory export and ends with a newline.
-- **Verification:** Required canaries do not use `importorskip`; CI runs every supported structural version interval and latest; the committed classification ledger comparison passes.
+  - The generated JSON equals the versioned in-memory export and ends with a newline.
+- **Verification:** Required canaries do not use `importorskip`; CI runs every supported structural version interval and latest, validates every report against the Python rules, and uploads the generated ledger on success or failure.
 
 ### U5. Coverage manifest and literal audit fingerprints
 
@@ -455,7 +455,7 @@ No release step relies on a claim about current customer count.
 - **Requirements:** R18, R22-R28; KTD10-KTD11, KTD14.
 - **Dependencies:** U4, U5.
 - **Files:** Modify `README.md`, `CHANGELOG.md`, and `src/solwyn/CLAUDE.md`; extend `tests/unit/test_coverage_manifest.py` or add a focused documentation contract test.
-- **Approach:** Document all three postures, exact leaf acknowledgments, both environment encodings, guarded namespaces, conditional TTS token, literal OpenAI audit fingerprint, locally computed coverage, and the cooperative trust boundary. Explain that retaining the raw client, using private wrapper state, explicitly acknowledging a scoped raw escape, or invoking native behavior on a returned response/page/stream/job/operation object bypasses pre-call strict enforcement. Describe the generated JSON as this SDK's current reviewable classification ledger; future downstream consumption remains deferred.
+- **Approach:** Document all three postures, exact leaf acknowledgments, both environment encodings, guarded namespaces, conditional TTS token, literal OpenAI audit fingerprint, locally computed coverage, and the cooperative trust boundary. Explain that retaining the raw client, using private wrapper state, explicitly acknowledging a scoped raw escape, or invoking native behavior on a returned response/page/stream/job/operation object bypasses pre-call strict enforcement. Describe the generated JSON as a short-lived CI diagnostic artifact; future downstream consumption remains deferred.
 - **Test scenarios:**
   - The README OpenAI example uses the same exhaustive literal audit fingerprint as the real-client test.
   - The example never feeds any report-derived value back into `expect(...)`.
@@ -474,7 +474,7 @@ No release step relies on a claim about current customer count.
 | `make test` | Entire plan | Unit suite passes with no unexpected skips; both Google families and sync/async Bedrock canaries execute. |
 | `make check` | Entire plan | Ruff lint, Ruff format check, and Mypy pass. |
 | Privacy firewall and no-production-assert tests | U0-U5 | New modules remain outside content access and use runtime exceptions for invariants. |
-| Generated classification-ledger comparison | U1, U4, U5 | Committed JSON equals the versioned Python export. |
+| Generated classification-ledger comparison | U1, U4, U5 | The ignored CI artifact equals the versioned Python export and is uploaded for diagnostics. |
 | Provider structural-interval matrices | U0, U4-U6 | Required provider SDK imports and real-client canaries pass at the supported floor, each known graph breakpoint, and latest. |
 | Offline canary guard | U0, U4 | Client construction and graph traversal attempt no socket access. |
 
@@ -486,7 +486,7 @@ If implementation adds a wire field or enum despite that boundary, stop and vali
 ## Definition of Done
 
 - U0 is done when every mandatory real SDK shape is observably enumerable offline, supported structural version intervals are recorded, and the architecture has not assumed a resource graph that any supported client cannot expose safely.
-- U1 is done when exact contextual rules replace terminal-name and dialect-only classification, every U0-observed row has a reviewed classification and shape contract, the committed ledger matches, and usage basis and conditional policy data are explicit.
+- U1 is done when exact contextual rules replace terminal-name and dialect-only classification, every U0-observed row has a reviewed classification and shape contract, the generated CI ledger matches, and usage basis and conditional policy data are explicit.
 - U2 is done when strict mode resolves policy before descriptor evaluation, blocks unacknowledged terminal capabilities, and keeps namespace traversal guarded.
 - U3 is done when every explicit sync/async dispatch and pass-through seam uses applicability resolution and old registries and warning-only carve-outs are gone.
 - U4 is done when every supported real SDK shape runs at its floor, each known structural breakpoint, and latest in least-privilege CI, and the observer finds no ambiguous, unknown, or shape-drifted current paths.

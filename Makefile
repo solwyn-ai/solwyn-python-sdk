@@ -49,8 +49,8 @@ capture-provider-surfaces: ## Refresh latest real-SDK surface fingerprints
 check-provider-surfaces: ## Verify latest real-SDK surface fingerprints
 	uv run --extra dev --with 'aioboto3>=13.0' python scripts/capture_surface_inventory.py --check --interval latest --output-dir build/provider_surface_inventory
 
-export-surface-contract: ## Refresh the committed contextual surface contract
+export-surface-contract: ## Generate the contextual surface contract artifact under build/
 	uv run python scripts/export_surface_contract.py
 
-check-surface-contract: ## Verify the committed contextual surface contract
+check-surface-contract: ## Generate and verify the contextual surface contract artifact
 	uv run python scripts/export_surface_contract.py --check

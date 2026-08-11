@@ -16,7 +16,9 @@ from solwyn._surfaces import (
     surface_contract_data,
 )
 
-DEFAULT_OUTPUT = Path(__file__).parents[1] / "docs" / "contracts" / "surface-classification.json"
+DEFAULT_OUTPUT = (
+    Path(__file__).parents[1] / "build" / "surface_contract" / "surface-classification.json"
+)
 _DIALECT_BY_PROVIDER = {
     "anthropic": "anthropic",
     "azure_openai": "openai",
@@ -39,14 +41,6 @@ def write_contract(path: Path = DEFAULT_OUTPUT) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_contract(), encoding="utf-8")
-
-
-def compare_contract(path: Path = DEFAULT_OUTPUT) -> str | None:
-    """Return a stable drift message, or ``None`` when the file matches."""
-
-    if not path.exists() or path.read_text(encoding="utf-8") != render_contract():
-        return f"surface contract drift: {path}"
-    return None
 
 
 def compare_report_contract(report: dict[str, Any], *, label: str) -> tuple[str, ...]:
@@ -94,6 +88,19 @@ def compare_report_directory(path: Path) -> tuple[str, ...]:
     return tuple(mismatches)
 
 
+def generate_and_check(
+    output: Path = DEFAULT_OUTPUT,
+    *,
+    reports_dir: Path | None = None,
+) -> tuple[str, ...]:
+    """Write the deterministic ledger and return provider-report mismatches."""
+
+    write_contract(output)
+    if reports_dir is None:
+        return ()
+    return compare_report_directory(reports_dir)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
@@ -109,16 +116,14 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = _parser().parse_args()
     if args.check:
-        mismatch = compare_contract(args.output)
-        if mismatch is not None:
-            print(mismatch)
+        report_mismatches = generate_and_check(
+            args.output,
+            reports_dir=args.reports_dir,
+        )
+        if report_mismatches:
+            for report_mismatch in report_mismatches:
+                print(report_mismatch)
             return 1
-        if args.reports_dir is not None:
-            report_mismatches = compare_report_directory(args.reports_dir)
-            if report_mismatches:
-                for report_mismatch in report_mismatches:
-                    print(report_mismatch)
-                return 1
         return 0
     write_contract(args.output)
     print(args.output)

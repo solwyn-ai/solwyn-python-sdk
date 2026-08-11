@@ -27,7 +27,8 @@ from solwyn._surfaces import (
 )
 
 ROOT = Path(__file__).parents[2]
-CONTRACT_PATH = ROOT / "docs" / "contracts" / "surface-classification.json"
+CONTRACT_PATH = ROOT / "build" / "surface_contract" / "surface-classification.json"
+COMMITTED_CONTRACT_PATH = ROOT / "docs" / "contracts" / "surface-classification.json"
 
 
 OPENAI_SYNC = SurfaceContext(
@@ -291,15 +292,27 @@ def test_provider_matrix_checks_each_generated_report_against_the_contract() -> 
     ]
 
     assert len(verification_steps) == 1
+    assert verification_steps[0]["if"] == "always()"
     run_command = verification_steps[0]["run"]
     command_tokens = shlex.split(run_command)
     assert command_tokens == [
         "python",
         "scripts/export_surface_contract.py",
         "--check",
+        "--output",
+        "build/surface_contract/surface-classification.json",
         "--reports-dir",
         "build/provider_surface_inventory",
     ]
+
+    upload_steps = [
+        step for step in inventory_steps if step.get("name") == "Upload provider surface inventory"
+    ]
+    assert len(upload_steps) == 1
+    assert set(upload_steps[0]["with"]["path"].splitlines()) == {
+        "build/provider_surface_inventory",
+        "build/surface_contract/surface-classification.json",
+    }
 
 
 @pytest.mark.unit
@@ -572,23 +585,29 @@ def test_safe_descriptor_rows_pin_the_evaluated_attribute_shape() -> None:
 
 
 @pytest.mark.unit
-def test_committed_json_is_the_deterministic_python_export() -> None:
+def test_generated_json_is_the_deterministic_python_export(tmp_path: Path) -> None:
+    exporter = _export_module()
+    output = tmp_path / "surface-classification.json"
     contract = surface_contract_data()
     expected = json.dumps(contract, indent=2, sort_keys=True) + "\n"
 
+    exporter.write_contract(output)
+
+    assert exporter.DEFAULT_OUTPUT == CONTRACT_PATH
     assert contract["contract_version"] == 1
     assert all(row["token"] for row in contract["rules"])
-    assert CONTRACT_PATH.read_text(encoding="utf-8") == expected
+    assert output.read_text(encoding="utf-8") == expected
+    assert not COMMITTED_CONTRACT_PATH.exists()
 
 
 @pytest.mark.unit
-def test_export_script_creates_parent_and_detects_drift(tmp_path: Path) -> None:
+def test_check_writes_contract_before_failing_closed_on_empty_reports(tmp_path: Path) -> None:
     exporter = _export_module()
     output = tmp_path / "nested" / "surface-classification.json"
+    reports = tmp_path / "reports"
+    reports.mkdir()
 
-    exporter.write_contract(output)
+    mismatches = exporter.generate_and_check(output, reports_dir=reports)
 
     assert output.read_text(encoding="utf-8") == exporter.render_contract()
-    assert exporter.compare_contract(output) is None
-    output.write_text("{}\n", encoding="utf-8")
-    assert exporter.compare_contract(output) == f"surface contract drift: {output}"
+    assert mismatches == (f"no provider surface reports found in {reports}",)
