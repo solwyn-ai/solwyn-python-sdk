@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "include": [
+    {"family": "openai", "interval": "floor", "packages": "openai==2.0.0"},
+    {"family": "openai", "interval": "openai-videos", "packages": "openai==2.2.0"},
+    {"family": "openai", "interval": "openai-skills", "packages": "openai==2.21.0"},
+    {"family": "openai", "interval": "openai-admin", "packages": "openai==2.34.0"},
+    {"family": "openai", "interval": "openai-content-provenance", "packages": "openai==2.52.0"},
+    {"family": "openai", "interval": "latest", "packages": "openai>=2.0"},
+
+    {"family": "anthropic", "interval": "floor", "packages": "anthropic==0.50.0"},
+    {"family": "anthropic", "interval": "anthropic-parse", "packages": "anthropic==0.80.0"},
+    {"family": "anthropic", "interval": "latest", "packages": "anthropic>=0.50"},
+
+    {"family": "together", "interval": "floor", "packages": "together==2.0.0"},
+    {"family": "together", "interval": "latest", "packages": "together>=2.0"},
+
+    {"family": "google-genai", "interval": "floor", "packages": "google-genai==1.0.0"},
+    {"family": "google-genai", "interval": "google-file-search", "packages": "google-genai==1.60.0"},
+    {"family": "google-genai", "interval": "google-webhooks", "packages": "google-genai==2.0.0"},
+    {"family": "google-genai", "interval": "latest", "packages": "google-genai>=1.0"},
+
+    {"family": "google-generativeai", "interval": "floor", "packages": "google-generativeai==0.8.5"},
+    {"family": "google-generativeai", "interval": "latest", "packages": "google-generativeai>=0.8.5"},
+
+    {"family": "bedrock", "interval": "floor", "packages": "aioboto3==13.0.0"},
+    {"family": "bedrock", "interval": "bedrock-async-invoke", "packages": "aioboto3==13.4.0"},
+    {"family": "bedrock", "interval": "bedrock-bidirectional", "packages": "aioboto3==15.0.0"},
+    {"family": "bedrock", "interval": "bedrock-count-tokens", "packages": "aioboto3==15.5.0"},
+    {"family": "bedrock", "interval": "latest", "packages": "aioboto3>=13.0"}
+  ]
+}

@@ -107,6 +107,24 @@ def test_static_inspection_failure_identifies_the_exact_path() -> None:
 
 
 @pytest.mark.unit
+def test_statically_invisible_dynamic_terminal_is_recorded_without_evaluation() -> None:
+    graph = _surface_graph()
+
+    class DynamicProxy:
+        def __dir__(self) -> list[str]:
+            return ["create"]
+
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError("dynamic terminals must remain unevaluated")
+
+    observations = graph.observe_public_surface(DynamicProxy())
+
+    assert [(item.path, item.descriptor_category, item.return_shape) for item in observations] == [
+        ("create", "dynamic_attribute", "unevaluated_dynamic")
+    ]
+
+
+@pytest.mark.unit
 def test_namespace_evaluation_failure_is_path_exact_and_content_free() -> None:
     graph = _surface_graph()
 
@@ -325,6 +343,25 @@ def test_return_shape_detection_does_not_evaluate_special_attributes() -> None:
     observations = graph.observe_public_surface(TrapClient(), namespaces={"resources"})
 
     assert {item.path: item.return_shape for item in observations}["resources"] == "resource"
+
+
+@pytest.mark.unit
+def test_classmethod_is_recorded_as_a_callable_terminal() -> None:
+    graph = _surface_graph()
+
+    # Arrange
+    class ClassmethodClient:
+        @classmethod
+        def configure(cls) -> type[ClassmethodClient]:
+            raise AssertionError("provider operations must never be invoked")
+
+    # Act
+    observations = graph.observe_public_surface(ClassmethodClient())
+
+    # Assert
+    assert {item.path: (item.descriptor_category, item.return_shape) for item in observations}[
+        "configure"
+    ] == ("classmethod", "callable")
 
 
 @pytest.mark.unit

@@ -1,4 +1,4 @@
-.PHONY: install install-hooks lint fmt fmt-check typecheck test test-unit test-integration check
+.PHONY: install install-hooks lint fmt fmt-check typecheck test test-unit test-integration check capture-provider-surfaces check-provider-surfaces
 
 ##@ Setup
 
@@ -19,14 +19,14 @@ install-hooks: ## Install git pre-commit hook
 ##@ Quality
 
 lint: ## Run ruff linter
-	uv run ruff check src/ tests/
+	uv run ruff check src/ tests/ scripts/
 
 fmt: ## Auto-format code
-	uv run ruff format src/ tests/
-	uv run ruff check --fix src/ tests/
+	uv run ruff format src/ tests/ scripts/
+	uv run ruff check --fix src/ tests/ scripts/
 
 fmt-check: ## Check formatting without changes
-	uv run ruff format --check src/ tests/
+	uv run ruff format --check src/ tests/ scripts/
 
 typecheck: ## Run mypy strict type checking
 	uv run mypy src/solwyn/
@@ -42,3 +42,9 @@ test-unit: ## Run unit tests
 
 test-integration: ## Run integration tests (requires API at localhost:8080)
 	uv run pytest tests/ -m integration -v --tb=short
+
+capture-provider-surfaces: ## Refresh latest real-SDK surface fingerprints
+	uv run --extra dev --with 'aioboto3>=13.0' python scripts/capture_surface_inventory.py --interval latest --output-dir build/provider_surface_inventory
+
+check-provider-surfaces: ## Verify latest real-SDK surface fingerprints
+	uv run --extra dev --with 'aioboto3>=13.0' python scripts/capture_surface_inventory.py --check --interval latest --output-dir build/provider_surface_inventory

@@ -66,6 +66,18 @@ def observe_public_surface(
             try:
                 static_value = _static_attribute(value, name)
             except Exception as exc:
+                if _has_static_attribute(type(value), "__getattr__"):
+                    if path in declared_namespaces:
+                        raise SurfaceInspectionError(path, "dynamic_namespace") from None
+                    observations.append(
+                        SurfaceObservation(
+                            path=path,
+                            descriptor_category="dynamic_attribute",
+                            return_shape="unevaluated_dynamic",
+                        )
+                    )
+                    observed_paths.add(path)
+                    continue
                 raise SurfaceInspectionError(
                     path, "static_inspection", type(exc).__name__
                 ) from None
@@ -182,6 +194,8 @@ def _static_attribute(value: object, name: str) -> object:
 
 
 def _static_return_shape(value: object, descriptor_category: str) -> str:
+    if descriptor_category == "classmethod":
+        return "callable"
     if descriptor_category in {
         "cached_property",
         "property",
