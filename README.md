@@ -243,8 +243,99 @@ Billable quantities are read from the response's usage block where it exists (gp
 **Posture notes.**
 
 - **Whisper needs a JSON `response_format` to be priced.** `whisper-1` reports its billable duration only under a JSON response format. A non-JSON `response_format` (`text` / `srt` / `vtt`) carries no usage, so the call is tracked unpriced with a one-time hint to pass `response_format="json"` (or `"verbose_json"`) for priced tracking.
-- **`gpt-4o-mini-tts` is passed through untracked.** Token-billed TTS models publish no usage metadata, so their audio-output tokens are unobservable. Rather than settle a silent $0, the call passes through untracked (no budget check, no cost event) after a one-time warning.
-- **`audio.translations` is passed through untracked.** The translations sub-surface isn't intercepted yet; it warns once, then passes through untracked.
+- **`gpt-4o-mini-tts` is untracked.** Token-billed TTS models publish no usage metadata, so their audio-output tokens are unobservable. Rather than settle a silent $0, the call follows the configured untracked posture (under the default `warn`, it passes through after a one-time warning with no budget check or cost event).
+- **`audio.translations` is untracked.** The translations sub-surface isn't intercepted yet, so it follows the same configured posture.
+
+## Strict coverage controls
+
+Solwyn classifies the public pre-call capability graph of every supported
+wrapped client. Tracked leaves are intercepted as usual. Resource namespaces
+stay guarded so access to a parent never grants present or future descendants.
+Known untracked leaves and newly observed leaves follow `on_unmetered`:
+
+- `on_unmetered="warn"` logs once and permits the call (the compatibility default).
+- `on_unmetered="raise"` refuses the call before provider I/O with
+  `UntrackedSpendSurfaceError`. This is strict mode.
+- `on_unmetered="allow"` permits the call without warning.
+
+Set the posture in the constructor or with `SOLWYN_ON_UNMETERED=raise`:
+
+```python
+from openai import OpenAI
+from solwyn import Solwyn
+
+client = Solwyn(
+    OpenAI(),
+    api_key="sk_proj_...",
+    on_unmetered="raise",
+    acknowledge_untracked={"responses.create"},
+)
+```
+
+Acknowledgments are narrow, deliberate exceptions to the posture. Each token
+must name an applicable, observed terminal capability; it grants only that
+leaf. Namespace tokens such as `responses` are invalid, as are wildcards,
+typos, tracked leaves, blocked leaves, and unsupported leaves. Namespace
+objects remain guarded after an acknowledgment, so `responses.create` does not
+authorize a future sibling. The equivalent comma-delimited environment
+encoding is
+`SOLWYN_ACKNOWLEDGE_UNTRACKED="responses.create,audio.speech.create:gpt-4o-mini-tts"`.
+The conditional token for token-billed TTS is exactly
+`audio.speech.create:gpt-4o-mini-tts`; acknowledging ordinary
+`audio.speech.create` does not cover that model-specific exception.
+
+Provider applicability is explicit. Native OpenAI video is tracked through
+`videos.create`; video on an OpenAI-compatible provider is unsupported and
+raises `UnsupportedSurfaceError` before dispatch. An acknowledgment cannot
+turn an unsupported adapter surface into a supported one.
+
+Use `solwyn.coverage(client)` to review the exact effective graph without
+calling a provider operation. Coverage is computed locally and transmits
+nothing. It reads structural client metadata only—never prompts, responses,
+credentials, or request content. The report separates policy decisions from
+dispatch behavior and includes provider-chain usage guarantees.
+
+For CI, pin an independently reviewed literal fingerprint. This example is the
+exhaustive strict, unacknowledged fingerprint exercised against
+`openai==2.53.0` by this repository's real-client test:
+
+```python
+from openai import OpenAI
+from solwyn import CoverageFingerprint, Solwyn, coverage
+
+audit_client = Solwyn(
+    OpenAI(),
+    api_key="sk_proj_...",
+    on_unmetered="raise",
+)
+
+OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
+    guarded_namespaces="sha256:f8cd6c254dc5fb2076d33aeff6d9e96cd12b3d63cc89850ba86f0d7b5ed62818",
+    tracked="sha256:ee52e554ddf531bea4560f69fdbef1ca0ac90e433fb9f93fba6e291d39e2aebc",
+    untracked="sha256:989f425b3fd2f431f691fc83fda676879ef3cda89aafa123d1943af957ce7700",
+    unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    scoped_escapes="sha256:d0af403b2b2c96e471446ac7c2c99070da4adb05802c45f29552be614a57f194",
+    blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    unsupported="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    conditional="sha256:ce837f71d1fc97849872c5d0f86b0b1f26e1bc4e46a29c3b1b8004bf4b9bcb77",
+    safe="sha256:9029368e5fa0a7bf4260cc782560c8ec9a53c948fc280102b1c3633eee5234c5",
+)
+
+report = coverage(audit_client)
+report.expect(OPENAI_STRICT_FINGERPRINT)
+```
+
+When a provider SDK changes, inspect `report.entries`, decide whether each
+change is acceptable, and then paste a newly reviewed literal. Never approve a
+report with a fingerprint derived from that same report in the assertion; that
+would make the check tautological.
+
+Strict mode is not a sandbox. It is a cooperative guard around the wrapper's
+public pre-call surface. The following can bypass pre-call strict enforcement:
+retaining the raw provider client, accessing private wrapper state,
+acknowledging a scoped raw escape, or invoking native behavior on a returned
+response, page, stream, job, or operation object. Keep those capabilities out
+of code that relies on strict enforcement, or review their use explicitly.
 
 ## Async
 
@@ -416,6 +507,8 @@ except BudgetExceededError as e:
 | `budget_check_timeout` | `SOLWYN_BUDGET_CHECK_TIMEOUT` | `1.0` | Hot-path control-plane check/grant timeout in seconds |
 | `lease_enabled` | `SOLWYN_LEASE_ENABLED` | `True` | Use in-memory token leases for eligible run-scoped calls |
 | `lease_output_bound_default` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token allowance when no configured provider hop has an explicit cap |
+| `on_unmetered` | `SOLWYN_ON_UNMETERED` | `warn` | Handle untracked or unknown pre-call capabilities with `warn`, `raise`, or `allow` |
+| `acknowledge_untracked` | `SOLWYN_ACKNOWLEDGE_UNTRACKED` | empty | Exact terminal capability tokens; env format is comma-delimited |
 | `control_plane_failure_threshold` | `SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD` | `3` | Consecutive Solwyn API failures before local outage posture applies |
 | `control_plane_recovery_timeout` | `SOLWYN_CONTROL_PLANE_RECOVERY_TIMEOUT` | `30.0` | Seconds before probing the Solwyn API after its breaker opens |
 
@@ -466,6 +559,8 @@ All SDK errors inherit from `SolwynError`:
 | `RunStoppedError` | A dashboard stop is learned for an agent run — on the next budget check for per-call traffic, or after lease renewal or re-grant for leased traffic |
 | `ProviderUnavailableError` | Circuit breaker is open, or the failover chain is exhausted |
 | `ConfigurationError` | Invalid API key format, invalid `provider=` override, or an untracked call surface (e.g. Bedrock `invoke_model`) |
+| `UntrackedSpendSurfaceError` | Strict coverage posture refuses an unacknowledged untracked or unknown capability before provider I/O |
+| `UnsupportedSurfaceError` | The selected provider adapter does not support an explicit Solwyn wrapper surface |
 | `UntranslatableRequestError` | A cross-provider failover hop cannot represent the request (structural labels only — never content) |
 | `UntranslatableModelError` | No model mapping exists for a cross-provider failover hop |
 

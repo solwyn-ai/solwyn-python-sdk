@@ -9,6 +9,20 @@ derived from git tags (hatch-vcs).
 
 ### Added
 
+- **Strict pre-call coverage controls and local coverage manifests.** Clients
+  now classify and guard the reachable public provider-client graph. Set
+  `on_unmetered="raise"` / `SOLWYN_ON_UNMETERED=raise` to refuse untracked or
+  unknown capabilities before provider I/O; `warn` remains the compatibility
+  default and `allow` is the explicit unrestricted posture. The exported
+  `UntrackedSpendSurfaceError` identifies the exact refused capability, while
+  `coverage(client)` returns a deterministic, content-free, sans-I/O audit
+  report with literal bidirectional expectations.
+- **Exact acknowledgment escape controls ship with strict posture.**
+  `acknowledge_untracked` and the comma-delimited
+  `SOLWYN_ACKNOWLEDGE_UNTRACKED` accept reviewed terminal capability tokens
+  only. Namespaces, wildcards, inapplicable tokens, tracked leaves, blocked
+  leaves, and unsupported leaves are rejected; the conditional token-billed
+  TTS exception uses `audio.speech.create:gpt-4o-mini-tts`.
 - **Dashboard-stopped runs raise `RunStoppedError`.** The public exception is
   a `BudgetExceededError` subclass, so existing hard-deny handlers remain
   compatible. It identifies the stopped run, preserves the budget snapshot
@@ -20,6 +34,12 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **Untracked capabilities now warn once by default instead of passing
+  silently.** Guarded namespaces keep descendants inside the same posture
+  decision. Strict mode is a cooperative pre-call guard, not a sandbox:
+  retained raw clients, private wrapper state, explicitly acknowledged scoped
+  raw escapes, and native behavior on returned provider objects remain outside
+  its enforcement boundary.
 - **`run_stopped` denials now stay sticky only for their run.** Per-call and
   lease denials use the same run-scoped classification as `agent_run`, so a
   control-plane outage cannot replay a dashboard stop against unrelated run

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import functools
 import inspect
+import re
+from pathlib import Path
 from types import SimpleNamespace
 
 import openai
@@ -33,6 +36,8 @@ OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
     conditional="sha256:ce837f71d1fc97849872c5d0f86b0b1f26e1bc4e46a29c3b1b8004bf4b9bcb77",
     safe="sha256:9029368e5fa0a7bf4260cc782560c8ec9a53c948fc280102b1c3633eee5234c5",
 )
+
+_PROJECT_ROOT = Path(__file__).parents[2]
 
 
 class _Completions:
@@ -631,3 +636,103 @@ def test_public_coverage_models_are_frozen() -> None:
 
     with pytest.raises(Exception, match="frozen"):
         report.provider = "changed"
+
+
+def _python_fences(markdown: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"```python\n(.*?)```", markdown, flags=re.DOTALL))
+
+
+def _documented_openai_fingerprint(readme: str) -> CoverageFingerprint:
+    snippet = next(
+        fence
+        for fence in _python_fences(readme)
+        if "OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(" in fence
+    )
+    module = ast.parse(snippet)
+    assignment = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "OPENAI_STRICT_FINGERPRINT"
+            for target in node.targets
+        )
+    )
+    assert isinstance(assignment.value, ast.Call)
+    assert isinstance(assignment.value.func, ast.Name)
+    assert assignment.value.func.id == "CoverageFingerprint"
+    assert not assignment.value.args
+    values = {
+        keyword.arg: ast.literal_eval(keyword.value)
+        for keyword in assignment.value.keywords
+        if keyword.arg is not None
+    }
+    return CoverageFingerprint(**values)
+
+
+@pytest.mark.unit
+def test_readme_uses_the_tested_literal_openai_fingerprint_without_self_approval() -> None:
+    readme = (_PROJECT_ROOT / "README.md").read_text()
+
+    assert _documented_openai_fingerprint(readme) == OPENAI_STRICT_FINGERPRINT
+    assert "report.expect(OPENAI_STRICT_FINGERPRINT)" in readme
+    for snippet in _python_fences(readme):
+        assert (
+            re.search(
+                r"\.expect\(\s*[A-Za-z_][A-Za-z0-9_]*\.fingerprint\(\s*\)\s*\)",
+                snippet,
+            )
+            is None
+        )
+
+
+@pytest.mark.unit
+def test_readme_states_the_strict_coverage_and_trust_boundary_contract() -> None:
+    readme = (_PROJECT_ROOT / "README.md").read_text()
+    normalized_readme = " ".join(readme.split())
+    required_claims = (
+        '`on_unmetered="warn"` logs once and permits the call',
+        '`on_unmetered="raise"` refuses the call before provider I/O',
+        '`on_unmetered="allow"` permits the call without warning',
+        "`SOLWYN_ON_UNMETERED=raise`",
+        'acknowledge_untracked={"responses.create"}',
+        '`SOLWYN_ACKNOWLEDGE_UNTRACKED="responses.create,audio.speech.create:gpt-4o-mini-tts"`',
+        "Namespace tokens such as `responses` are invalid",
+        "`audio.speech.create:gpt-4o-mini-tts`",
+        "Coverage is computed locally and transmits nothing.",
+        "Strict mode is not a sandbox.",
+        "retaining the raw provider client",
+        "accessing private wrapper state",
+        "acknowledging a scoped raw escape",
+        "response, page, stream, job, or operation object",
+        "Native OpenAI video is tracked",
+        "video on an OpenAI-compatible provider is unsupported",
+    )
+
+    for claim in required_claims:
+        assert claim in normalized_readme
+
+
+@pytest.mark.unit
+def test_maintainer_docs_own_the_current_python_classification_ledger() -> None:
+    maintainer_docs = (_PROJECT_ROOT / "src" / "solwyn" / "CLAUDE.md").read_text()
+
+    assert "docs/contracts/surface-classification.json" in maintainer_docs
+    assert re.search(r"current Python\s+SDK reviewable classification ledger", maintainer_docs)
+    assert "does not promise a future TypeScript consumer" in maintainer_docs
+
+
+@pytest.mark.unit
+def test_unreleased_changelog_keeps_posture_and_escape_controls_together() -> None:
+    changelog = (_PROJECT_ROOT / "CHANGELOG.md").read_text()
+    unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+
+    for contract_name in (
+        "on_unmetered",
+        "SOLWYN_ON_UNMETERED",
+        "acknowledge_untracked",
+        "SOLWYN_ACKNOWLEDGE_UNTRACKED",
+        "UntrackedSpendSurfaceError",
+        "coverage(client)",
+    ):
+        assert contract_name in unreleased
