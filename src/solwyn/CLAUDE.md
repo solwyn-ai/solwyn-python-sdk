@@ -24,10 +24,10 @@
 
 `src/solwyn/_surfaces.py` is the source of truth consumed by runtime guards,
 coverage manifests, drift canaries, and the generated
-`docs/contracts/surface-classification.json`. That JSON is the current Python
-SDK reviewable classification ledger: it makes every rule and applicability
-decision inspectable in diffs. It does not promise a future TypeScript consumer
-or justify changes for one; cross-SDK consumption remains deferred.
+`build/surface_contract/surface-classification.json`. That JSON is a short-lived
+CI artifact for diagnosing every rule and applicability decision. It is not
+committed; the Python rules remain authoritative, and cross-SDK consumption
+remains deferred.
 
 Keep namespaces and terminal leaves separate. Acknowledgments are exact,
 applicable terminal tokens only and must never authorize a namespace or use a

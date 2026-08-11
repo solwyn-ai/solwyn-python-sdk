@@ -714,12 +714,14 @@ def test_readme_states_the_strict_coverage_and_trust_boundary_contract() -> None
 
 
 @pytest.mark.unit
-def test_maintainer_docs_own_the_current_python_classification_ledger() -> None:
+def test_maintainer_docs_define_python_contract_and_ci_artifact() -> None:
     maintainer_docs = (_PROJECT_ROOT / "src" / "solwyn" / "CLAUDE.md").read_text()
+    normalized_docs = " ".join(maintainer_docs.split())
 
-    assert "docs/contracts/surface-classification.json" in maintainer_docs
-    assert re.search(r"current Python\s+SDK reviewable classification ledger", maintainer_docs)
-    assert "does not promise a future TypeScript consumer" in maintainer_docs
+    assert "build/surface_contract/surface-classification.json" in normalized_docs
+    assert "short-lived CI artifact" in normalized_docs
+    assert "not committed" in normalized_docs
+    assert "cross-SDK consumption remains deferred" in normalized_docs
 
 
 @pytest.mark.unit
