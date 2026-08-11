@@ -23,6 +23,7 @@ from solwyn._surfaces import (
 )
 
 _MISSING = object()
+_TRAVERSABLE_RETURN_SHAPES = frozenset({"resource", "context_manager", "async_context_manager"})
 
 
 class SurfaceInspectionError(RuntimeError):
