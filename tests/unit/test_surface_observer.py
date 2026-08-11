@@ -248,6 +248,59 @@ def test_public_enumeration_failure_is_sanitized() -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("public_name", "expected_path"),
+    [
+        ("a.b", "a.b"),
+        ("", "<root>"),
+    ],
+)
+def test_non_identifier_public_name_is_rejected(
+    public_name: str,
+    expected_path: str,
+) -> None:
+    graph = _surface_graph()
+
+    # Arrange
+    class InvalidPublicNameClient:
+        def __init__(self) -> None:
+            self.__dict__[public_name] = "metadata"
+
+        def __dir__(self) -> list[str]:
+            return [public_name]
+
+    # Act
+    with pytest.raises(graph.SurfaceInspectionError) as caught:
+        graph.observe_public_surface(InvalidPublicNameClient())
+
+    # Assert
+    assert caught.value.path == expected_path
+    assert caught.value.stage == "invalid_public_name"
+
+
+@pytest.mark.unit
+def test_nested_invalid_public_names_report_the_lexically_first_full_path() -> None:
+    graph = _surface_graph()
+
+    # Arrange
+    class InvalidNestedDirectory:
+        def __dir__(self) -> list[str]:
+            return ["z.invalid", "a.invalid"]
+
+    class NestedClient:
+        def __init__(self) -> None:
+            self.resources = InvalidNestedDirectory()
+
+    # Act
+    with pytest.raises(graph.SurfaceInspectionError) as caught:
+        graph.observe_public_surface(NestedClient(), namespaces={"resources"})
+
+    # Assert
+    assert caught.value.path == "resources.a.invalid"
+    assert caught.value.stage == "invalid_public_name"
+
+
+@pytest.mark.unit
 def test_return_shape_detection_does_not_evaluate_special_attributes() -> None:
     graph = _surface_graph()
 
@@ -287,7 +340,42 @@ def test_reobservation_preserves_cached_property_descriptor_category() -> None:
 
 
 @pytest.mark.unit
-def test_declared_namespace_must_return_a_resource() -> None:
+def test_delete_only_descriptor_is_classified_as_data_descriptor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = _surface_graph()
+
+    # Arrange: Python 3.11/3.12 can report this descriptor as both kinds.
+    class DeleteOnlyDescriptor:
+        def __get__(self, instance: object, owner: type[object]) -> str:
+            raise AssertionError("terminal descriptors must remain unevaluated")
+
+        def __delete__(self, instance: object) -> None:
+            raise AssertionError("terminal descriptors must remain unevaluated")
+
+    class DescriptorClient:
+        value = DeleteOnlyDescriptor()
+
+    original_ismethoddescriptor = graph.inspect.ismethoddescriptor
+
+    def python_312_ismethoddescriptor(value: object) -> bool:
+        if isinstance(value, DeleteOnlyDescriptor):
+            return True
+        return original_ismethoddescriptor(value)
+
+    monkeypatch.setattr(graph.inspect, "ismethoddescriptor", python_312_ismethoddescriptor)
+
+    # Act
+    observations = graph.observe_public_surface(DescriptorClient())
+
+    # Assert
+    assert {item.path: (item.descriptor_category, item.return_shape) for item in observations}[
+        "value"
+    ] == ("data_descriptor", "unevaluated_descriptor")
+
+
+@pytest.mark.unit
+def test_declared_plain_callable_namespace_is_rejected() -> None:
     graph = _surface_graph()
 
     with pytest.raises(graph.SurfaceInspectionError) as caught:
@@ -295,6 +383,134 @@ def test_declared_namespace_must_return_a_resource() -> None:
 
     assert caught.value.path == "create"
     assert caught.value.stage == "invalid_namespace_shape"
+
+
+@pytest.mark.unit
+def test_declared_async_iterable_context_manager_namespace_is_traversed() -> None:
+    graph = _surface_graph()
+
+    # Arrange
+    class AsyncIterableContextManagerNamespace:
+        def __aiter__(self) -> object:
+            raise AssertionError("async iteration must never be invoked")
+
+        def __aenter__(self) -> object:
+            raise AssertionError("context-manager hooks must never be invoked")
+
+        def __aexit__(self, *args: object) -> None:
+            raise AssertionError("context-manager hooks must never be invoked")
+
+        def create(self) -> None:
+            raise AssertionError("provider operations must never be invoked")
+
+    class AsyncClient:
+        def __init__(self) -> None:
+            self.aio = AsyncIterableContextManagerNamespace()
+
+    # Act
+    observations = graph.observe_public_surface(AsyncClient(), namespaces={"aio"})
+
+    # Assert
+    assert {item.path: item.return_shape for item in observations} == {
+        "aio": "async_iterable",
+        "aio.create": "callable",
+    }
+
+
+@pytest.mark.unit
+def test_declared_callable_context_manager_namespace_is_traversed() -> None:
+    graph = _surface_graph()
+
+    # Arrange
+    class CallableContextManagerNamespace:
+        def __call__(self) -> None:
+            raise AssertionError("provider operations must never be invoked")
+
+        def __enter__(self) -> object:
+            raise AssertionError("context-manager hooks must never be invoked")
+
+        def __exit__(self, *args: object) -> None:
+            raise AssertionError("context-manager hooks must never be invoked")
+
+        def create(self) -> None:
+            raise AssertionError("provider operations must never be invoked")
+
+    class CallableClient:
+        def __init__(self) -> None:
+            self.resources = CallableContextManagerNamespace()
+
+    # Act
+    observations = graph.observe_public_surface(
+        CallableClient(),
+        namespaces={"resources"},
+    )
+
+    # Assert
+    assert {item.path: item.return_shape for item in observations} == {
+        "resources": "callable",
+        "resources.create": "callable",
+    }
+
+
+@pytest.mark.unit
+def test_declared_context_manager_namespace_is_traversed() -> None:
+    graph = _surface_graph()
+
+    # Arrange
+    class ContextManagerNamespace:
+        def __enter__(self) -> ContextManagerNamespace:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def create(self) -> None:
+            raise AssertionError("provider operations must never be invoked")
+
+    class ContextManagerClient:
+        def __init__(self) -> None:
+            self.resources = ContextManagerNamespace()
+
+    # Act
+    observations = graph.observe_public_surface(
+        ContextManagerClient(),
+        namespaces={"resources"},
+    )
+
+    # Assert
+    assert {item.path: item.return_shape for item in observations} == {
+        "resources": "context_manager",
+        "resources.create": "callable",
+    }
+
+
+@pytest.mark.unit
+def test_declared_async_context_manager_namespace_is_traversed() -> None:
+    graph = _surface_graph()
+
+    # Arrange
+    class AsyncNamespace:
+        async def __aenter__(self) -> AsyncNamespace:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        def create(self) -> None:
+            raise AssertionError("provider operations must never be invoked")
+
+    class AsyncClient:
+        def __init__(self) -> None:
+            self.aio = AsyncNamespace()
+
+    # Act
+    observations = graph.observe_public_surface(AsyncClient(), namespaces={"aio"})
+
+    # Assert
+    assert {item.path: item.return_shape for item in observations} == {
+        "aio": "async_context_manager",
+        "aio.create": "callable",
+    }
 
 
 @pytest.mark.unit

@@ -59,6 +59,9 @@ def observe_public_surface(
             ) from None
 
         for name in public_names:
+            if not name.isidentifier():
+                invalid_path = f"{prefix}.{name}" if prefix else name or "<root>"
+                raise SurfaceInspectionError(invalid_path, "invalid_public_name")
             path = f"{prefix}.{name}" if prefix else name
             try:
                 static_value = _static_attribute(value, name)
@@ -83,7 +86,18 @@ def observe_public_surface(
                         ) from None
                     namespace_value_cache[cache_key] = returned_value
                 return_shape = _return_shape(returned_value)
-                if return_shape != "resource":
+                has_enter = _has_static_attribute(returned_value, "__enter__")
+                has_exit = _has_static_attribute(returned_value, "__exit__")
+                has_async_enter = _has_static_attribute(returned_value, "__aenter__")
+                has_async_exit = _has_static_attribute(returned_value, "__aexit__")
+                has_sync_lifecycle = has_enter and has_exit
+                has_async_lifecycle = has_async_enter and has_async_exit
+                has_any_lifecycle_hook = any((has_enter, has_exit, has_async_enter, has_async_exit))
+                if (
+                    not has_sync_lifecycle
+                    and not has_async_lifecycle
+                    and (return_shape != "resource" or has_any_lifecycle_hook)
+                ):
                     raise SurfaceInspectionError(path, "invalid_namespace_shape", return_shape)
             else:
                 returned_value = None
@@ -148,10 +162,10 @@ def _descriptor_category(value: object) -> str:
         return "classmethod"
     if inspect.isfunction(value):
         return "function"
-    if inspect.ismethoddescriptor(value):
-        return "method_descriptor"
     if inspect.isdatadescriptor(value):
         return "data_descriptor"
+    if inspect.ismethoddescriptor(value):
+        return "method_descriptor"
     if inspect.isroutine(value) or callable(value):
         return "callable"
     if _has_static_attribute(type(value), "__get__"):
