@@ -76,6 +76,7 @@ jobs:
           --output build/surface_contract/surface-classification.json
           --reports-dir build/provider_surface_inventory
       - run: python -m pytest tests/unit/test_surface_canary.py -v --tb=short
+        if: always()
         env:
           AWS_EC2_METADATA_DISABLED: "true"
           SOLWYN_SURFACE_CANARY_FAMILY: ${{ matrix.family }}

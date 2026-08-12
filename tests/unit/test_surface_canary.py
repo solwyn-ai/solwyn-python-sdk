@@ -6,6 +6,7 @@ import asyncio
 import importlib.util
 import os
 import warnings
+from dataclasses import replace
 from importlib.metadata import version
 from pathlib import Path
 from types import ModuleType
@@ -95,33 +96,38 @@ class _Client:
 
 @pytest.mark.unit
 def test_canary_accepts_exact_rules_and_never_invokes_operations() -> None:
+    # Arrange
+    rules = (
+        _rule(
+            "resources",
+            kind=SurfaceKind.NAMESPACE,
+            descriptor_category="attribute",
+            return_shape="resource",
+        ),
+        _rule(
+            "resources.create",
+            kind=SurfaceKind.UNMETERED_SPEND,
+            descriptor_category="function",
+            return_shape="callable",
+        ),
+        _rule(
+            "resources.marker",
+            kind=SurfaceKind.METADATA,
+            descriptor_category="attribute",
+            return_shape="scalar",
+        ),
+    )
+
+    # Act
     rows = audit_public_surface(
         _Client(),
         context=TEST_CONTEXT,
         client_family="test",
         installed_version="1.2.3",
-        rules=(
-            _rule(
-                "resources",
-                kind=SurfaceKind.NAMESPACE,
-                descriptor_category="attribute",
-                return_shape="resource",
-            ),
-            _rule(
-                "resources.create",
-                kind=SurfaceKind.UNMETERED_SPEND,
-                descriptor_category="function",
-                return_shape="callable",
-            ),
-            _rule(
-                "resources.marker",
-                kind=SurfaceKind.METADATA,
-                descriptor_category="attribute",
-                return_shape="scalar",
-            ),
-        ),
+        rules=rules,
     )
 
+    # Assert
     assert [row.path for row in rows] == [
         "resources",
         "resources.create",
@@ -136,6 +142,7 @@ def test_canary_accepts_exact_rules_and_never_invokes_operations() -> None:
 
 @pytest.mark.unit
 def test_new_child_fails_with_family_version_and_exact_unknown_path() -> None:
+    # Arrange
     rules = (
         _rule(
             "resources",
@@ -151,6 +158,7 @@ def test_new_child_fails_with_family_version_and_exact_unknown_path() -> None:
         ),
     )
 
+    # Act
     with pytest.raises(SurfaceCanaryError) as caught:
         audit_public_surface(
             _Client(),
@@ -160,6 +168,7 @@ def test_new_child_fails_with_family_version_and_exact_unknown_path() -> None:
             rules=rules,
         )
 
+    # Assert
     assert caught.value.path == "resources.create"
     assert caught.value.stage == "unknown_classification"
     assert "test-family" in str(caught.value)
@@ -169,6 +178,7 @@ def test_new_child_fails_with_family_version_and_exact_unknown_path() -> None:
 
 @pytest.mark.unit
 def test_declared_resource_without_known_children_is_still_traversed() -> None:
+    # Arrange
     rules = (
         _rule(
             "resources",
@@ -178,6 +188,7 @@ def test_declared_resource_without_known_children_is_still_traversed() -> None:
         ),
     )
 
+    # Act
     with pytest.raises(SurfaceCanaryError) as caught:
         audit_public_surface(
             _Client(),
@@ -187,13 +198,51 @@ def test_declared_resource_without_known_children_is_still_traversed() -> None:
             rules=rules,
         )
 
+    # Assert
     assert caught.value.path == "resources.create"
     assert caught.value.stage == "unknown_classification"
 
 
 @pytest.mark.unit
+def test_ambiguous_rule_resolution_preserves_exact_canary_context() -> None:
+    # Arrange
+    rule = _rule(
+        "resources",
+        kind=SurfaceKind.NAMESPACE,
+        descriptor_category="attribute",
+        return_shape="resource",
+    )
+    client_family = "test-provider/test-client"
+    installed_version = "9.8.7"
+
+    # Act
+    with pytest.raises(SurfaceCanaryError) as caught:
+        audit_public_surface(
+            _Client(),
+            context=TEST_CONTEXT,
+            client_family=client_family,
+            installed_version=installed_version,
+            rules=(rule, replace(rule, rule_id="test.resources.duplicate")),
+        )
+
+    # Assert
+    assert caught.value.stage == "rule_resolution"
+    assert caught.value.client_family == client_family
+    assert caught.value.installed_version == installed_version
+    assert caught.value.path == "resources"
+    assert caught.value.cause_type == "RuntimeError"
+    assert str(caught.value) == (
+        "Surface canary failed for test-provider/test-client 9.8.7 "
+        "at 'resources' during rule_resolution (RuntimeError)"
+    )
+
+
+@pytest.mark.unit
 def test_floor_shape_variants_remain_scoped_to_anthropic() -> None:
+    # Arrange
     eager_shape = AttributeShape("attribute", "resource")
+
+    # Act
     anthropic_rule = resolve_surface_rule(
         context=SurfaceContext(
             provider="anthropic",
@@ -215,6 +264,7 @@ def test_floor_shape_variants_remain_scoped_to_anthropic() -> None:
         source=SurfaceSource.RAW,
     )
 
+    # Assert
     assert anthropic_rule is not None
     assert openai_rule is not None
     assert anthropic_rule.accepts_shape(eager_shape)
@@ -223,6 +273,7 @@ def test_floor_shape_variants_remain_scoped_to_anthropic() -> None:
 
 @pytest.mark.unit
 def test_shape_drift_fails_without_evaluating_a_terminal_descriptor() -> None:
+    # Arrange
     class DriftClient:
         def __init__(self) -> None:
             self.evaluations = 0
@@ -248,6 +299,7 @@ def test_shape_drift_fails_without_evaluating_a_terminal_descriptor() -> None:
         ),
     )
 
+    # Act
     with pytest.raises(SurfaceCanaryError) as caught:
         audit_public_surface(
             client,
@@ -257,6 +309,7 @@ def test_shape_drift_fails_without_evaluating_a_terminal_descriptor() -> None:
             rules=rules,
         )
 
+    # Assert
     assert caught.value.path == "operation"
     assert caught.value.stage == "shape_drift"
     assert client.evaluations == 0
@@ -264,6 +317,7 @@ def test_shape_drift_fails_without_evaluating_a_terminal_descriptor() -> None:
 
 @pytest.mark.unit
 def test_declared_namespace_failure_is_exact_and_content_free() -> None:
+    # Arrange
     class BrokenClient:
         @property
         def resources(self) -> object:
@@ -284,6 +338,7 @@ def test_declared_namespace_failure_is_exact_and_content_free() -> None:
         ),
     )
 
+    # Act
     with pytest.raises(SurfaceCanaryError) as caught:
         audit_public_surface(
             BrokenClient(),
@@ -293,6 +348,7 @@ def test_declared_namespace_failure_is_exact_and_content_free() -> None:
             rules=rules,
         )
 
+    # Assert
     assert caught.value.path == "resources"
     assert caught.value.stage == "namespace_evaluation"
     assert "PRIVATE_DESCRIPTOR_CONTENT" not in str(caught.value)
@@ -300,6 +356,7 @@ def test_declared_namespace_failure_is_exact_and_content_free() -> None:
 
 @pytest.mark.unit
 def test_cycles_fail_deterministically_and_repeated_resources_remain_distinct() -> None:
+    # Arrange
     cycle = _Resource()
     cycle.loop = cycle
 
@@ -333,6 +390,7 @@ def test_cycles_fail_deterministically_and_repeated_resources_remain_distinct() 
             return_shape="callable",
         ),
     )
+    # Act
     with pytest.raises(SurfaceCanaryError) as caught:
         audit_public_surface(
             CycleClient(),
@@ -341,9 +399,11 @@ def test_cycles_fail_deterministically_and_repeated_resources_remain_distinct() 
             installed_version="1",
             rules=cycle_rules,
         )
+    # Assert
     assert caught.value.path == "resources.loop"
     assert caught.value.stage == "cycle"
 
+    # Arrange
     shared = _Resource()
 
     class AliasClient:
@@ -367,6 +427,7 @@ def test_cycles_fail_deterministically_and_repeated_resources_remain_distinct() 
             ("right.marker", SurfaceKind.METADATA, "attribute", "scalar"),
         )
     )
+    # Act
     rows = audit_public_surface(
         AliasClient(),
         context=TEST_CONTEXT,
@@ -374,11 +435,13 @@ def test_cycles_fail_deterministically_and_repeated_resources_remain_distinct() 
         installed_version="1",
         rules=alias_rules,
     )
+    # Assert
     assert {row.path for row in rows} >= {"left.create", "right.create"}
 
 
 @pytest.mark.unit
 def test_bedrock_service_model_only_operation_is_not_invented_as_callable() -> None:
+    # Arrange
     class BedrockLike:
         def converse(self) -> None:
             raise AssertionError("provider operations must never be invoked")
@@ -397,6 +460,7 @@ def test_bedrock_service_model_only_operation_is_not_invented_as_callable() -> N
             return_shape="service_model_only",
         ),
     )
+    # Act
     rows = audit_public_surface(
         BedrockLike(),
         context=TEST_CONTEXT,
@@ -407,6 +471,7 @@ def test_bedrock_service_model_only_operation_is_not_invented_as_callable() -> N
     )
     by_path = {row.path: row for row in rows}
 
+    # Assert
     assert by_path["converse"].observation_source == "public_attribute"
     assert by_path["converse"].return_shape == "callable"
     assert by_path["future_operation"].observation_source == "service_model_operation"
@@ -499,11 +564,14 @@ async def _audit_real_shape(shape_key: str) -> tuple[object, ...]:
 def test_real_sdk_graph_has_no_unknown_ambiguous_or_shape_drifted_paths(
     shape_key: str,
 ) -> None:
+    # Arrange
     _require_provider_sdk(shape_key)
 
+    # Act
     first = asyncio.run(_audit_real_shape(shape_key))
     second = asyncio.run(_audit_real_shape(shape_key))
 
+    # Assert
     assert first == second
     assert first
     assert [row.path for row in first] == sorted(row.path for row in first)
@@ -512,7 +580,10 @@ def test_real_sdk_graph_has_no_unknown_ambiguous_or_shape_drifted_paths(
 
 @pytest.mark.unit
 def test_canary_is_required_by_local_and_structural_interval_gates() -> None:
+    # Arrange
     workflow_path = ROOT / ".github" / "workflows" / "ci.yml"
+
+    # Act
     workflow_text = workflow_path.read_text(encoding="utf-8")
     workflow = yaml.safe_load(workflow_text)
     provider_steps = workflow["jobs"]["provider-surface-inventory"]["steps"]
@@ -522,22 +593,24 @@ def test_canary_is_required_by_local_and_structural_interval_gates() -> None:
         for step in provider_steps
         if "tests/unit/test_surface_canary.py" in str(step.get("run", ""))
     ]
+    standard_test_steps = str(workflow["jobs"]["test"]["steps"])
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    source = Path(__file__).read_text(encoding="utf-8")
 
+    # Assert
     assert "pytest tests/unit/test_surface_canary.py" in provider_commands
     assert "pyyaml>=6.0" in provider_commands
     assert len(canary_steps) == 1
+    assert canary_steps[0]["if"] == "always()"
     assert canary_steps[0]["env"][CANARY_FAMILY_ENV] == "${{ matrix.family }}"
     assert workflow["permissions"] == {"contents": "read"}
-    standard_test_steps = str(workflow["jobs"]["test"]["steps"])
     assert "aioboto3" not in standard_test_steps
     assert "--ignore=tests/unit/test_surface_canary.py" in standard_test_steps
 
-    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
     assert "test: test-unit check-surface-canary" in makefile
     assert "check-surface-canary:" in makefile
     assert "--ignore=tests/unit/test_surface_canary.py" in makefile
     assert "tests/unit/test_surface_canary.py" in makefile
     assert "aioboto3>=13.0" in makefile
 
-    source = Path(__file__).read_text(encoding="utf-8")
     assert "importor" + "skip" not in source
