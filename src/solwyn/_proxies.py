@@ -637,6 +637,7 @@ class _SyncAudioSpeechProxy:
         model rides the media lifecycle with the ``audio`` op marker selecting
         speech.
         """
+        self._solwyn._enforce_explicit_surface("audio.speech.create", source=SurfaceSource.WRAPPER)
         if _is_untracked_tts_model(kwargs.get("model")):
             self._solwyn._enforce_explicit_surface(
                 "audio.speech.create",
@@ -644,7 +645,6 @@ class _SyncAudioSpeechProxy:
                 condition=SurfaceCondition.OPENAI_UNTRACKED_TTS_MODEL,
             )
             return self._solwyn._client.audio.speech.create(**kwargs)
-        self._solwyn._enforce_explicit_surface("audio.speech.create", source=SurfaceSource.WRAPPER)
         return self._solwyn._media_call(self._spec, **{**kwargs, _AUDIO_OP_KEY: "speech"})
 
     def __getattr__(self, name: str) -> Any:
@@ -990,6 +990,7 @@ class _AsyncAudioSpeechProxy:
 
     async def create(self, **kwargs: Any) -> Any:
         """Intercept audio.speech.create(); carve out untracked token-billed TTS models."""
+        self._solwyn._enforce_explicit_surface("audio.speech.create", source=SurfaceSource.WRAPPER)
         if _is_untracked_tts_model(kwargs.get("model")):
             self._solwyn._enforce_explicit_surface(
                 "audio.speech.create",
@@ -997,7 +998,6 @@ class _AsyncAudioSpeechProxy:
                 condition=SurfaceCondition.OPENAI_UNTRACKED_TTS_MODEL,
             )
             return await self._solwyn._client.audio.speech.create(**kwargs)
-        self._solwyn._enforce_explicit_surface("audio.speech.create", source=SurfaceSource.WRAPPER)
         return await self._solwyn._media_call(self._spec, **{**kwargs, _AUDIO_OP_KEY: "speech"})
 
     def __getattr__(self, name: str) -> Any:

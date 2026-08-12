@@ -34,11 +34,20 @@ from pydantic import ValidationError
 from solwyn._base import (
     MediaSurfaceSpec,
     _AttemptContext,
+    _client_shape,
     _effective_output_bound,
     _normalized_openai_output_cap_layer,
     _SolwynBase,
 )
-from solwyn._privacy import estimate_content_length, estimate_tokens_from_length
+from solwyn._privacy import (
+    estimate_content_length,
+    estimate_tokens_from_length,
+    merge_google_generate_content_kwargs,
+    normalize_google_translation_source_kwargs,
+    normalize_legacy_google_generate_content_args,
+    prepare_legacy_google_metering_kwargs,
+    prepare_legacy_google_translation_source_kwargs,
+)
 from solwyn._proxies import (
     _AsyncAudioProxy,
     _AsyncChatProxy,
@@ -76,6 +85,7 @@ from solwyn.exceptions import (
     RunStoppedError,
     UnsupportedSurfaceError,
     UntranslatableModelError,
+    UntranslatableRequestError,
 )
 from solwyn.providers import _translation
 from solwyn.providers._errors import Disposition, classify_exception, retry_after_seconds
@@ -572,8 +582,54 @@ def _build_hop_kwargs(
     }
     provider_kwargs = {key: value for key, value in kwargs.items() if key != "solwyn_tags"}
 
-    merged_defaults = {**provider_global_defaults, **provider_entry_defaults}
-    merged_kwargs: dict[str, object] = {**merged_defaults, **provider_kwargs}
+    same_google_dialect = (
+        primary.adapter.dialect == ProviderName.GOOGLE.value
+        and rt.adapter.dialect == ProviderName.GOOGLE.value
+    )
+    legacy_google_primary = (
+        primary.adapter.dialect == ProviderName.GOOGLE.value
+        and _client_shape(primary.sdk_client, primary.adapter.dialect) == "google_generativeai"
+    )
+    target_shape = (
+        _client_shape(rt.sdk_client, rt.adapter.dialect)
+        if rt.adapter.dialect == ProviderName.GOOGLE.value
+        else ""
+    )
+    if same_google_dialect and not is_primary and legacy_google_primary:
+        # Legacy _prepare_request is the no-I/O source of truth for merging the
+        # model's constructor defaults below Solwyn/global/entry/call layers.
+        # The privacy seam converts its effective request to modern Google shape;
+        # the served-shape merge then adapts it to this fallback client.
+        legacy_explicit = merge_google_generate_content_kwargs(
+            provider_global_defaults,
+            provider_entry_defaults,
+            provider_kwargs,
+            target_shape="google_generativeai",
+        )
+        merged_kwargs = merge_google_generate_content_kwargs(
+            {},
+            prepare_legacy_google_translation_source_kwargs(
+                primary.sdk_client,
+                legacy_explicit,
+            ),
+            target_shape=target_shape,
+        )
+    elif same_google_dialect:
+        # Normalize EACH provenance layer through the content-privileged merge
+        # seam so aliases across Google SDK generations cannot let a lower-
+        # priority default beat a per-call value.
+        merged_kwargs = merge_google_generate_content_kwargs(
+            provider_global_defaults,
+            provider_entry_defaults,
+            provider_kwargs,
+            target_shape=target_shape,
+        )
+    else:
+        merged_kwargs = {
+            **provider_global_defaults,
+            **provider_entry_defaults,
+            **provider_kwargs,
+        }
     if not is_provider_fallback:
         # PRIMARY hop is native passthrough; same-provider hop only swaps model.
         # Same-provider streaming (incl. model swap) keeps working unchanged.
@@ -634,6 +690,14 @@ def _build_hop_kwargs(
         # which key each side used. Do NOT rewrite the merged result again.
         target_name = rt.adapter.name
 
+        if target_dialect == ProviderName.GOOGLE.value:
+            passthrough = {
+                key: value
+                for key, value in merged_kwargs.items()
+                if key not in _ENDPOINT_SCOPED_KEYS
+            }
+            return {**passthrough, "model": rt.entry.model}
+
         def _fallback_target_layer(layer: dict[str, object]) -> dict[str, object]:
             return _normalized_openai_output_cap_layer(
                 target_name,
@@ -680,6 +744,23 @@ def _build_hop_kwargs(
             **_source_layer(source_defaults),
             **_source_layer(provider_kwargs),
         }
+    elif source_dialect == ProviderName.GOOGLE.value:
+        # The canonical translator's Google schema is the modern ``config=``
+        # shape. Normalize each source layer before its precedence merge so a
+        # legacy primary can fail over cross-dialect without leaking old-SDK
+        # aliases into the documented translation subset.
+        google_source_kwargs = merge_google_generate_content_kwargs(
+            provider_global_defaults,
+            source_defaults,
+            provider_kwargs,
+            target_shape=("google_generativeai" if legacy_google_primary else "google_genai"),
+        )
+        if legacy_google_primary:
+            google_source_kwargs = prepare_legacy_google_translation_source_kwargs(
+                primary.sdk_client,
+                google_source_kwargs,
+            )
+        source_kwargs = normalize_google_translation_source_kwargs(google_source_kwargs)
     else:
         source_kwargs = {
             **provider_global_defaults,
@@ -698,8 +779,72 @@ def _build_hop_kwargs(
         _translation.fail_cross_provider_tool_stream(source=source_dialect, target=target_dialect)
 
     call_kwargs = _translation.from_canonical(target_dialect, canonical, model=rt.entry.model)
+    if target_dialect == ProviderName.GOOGLE.value:
+        # Target-native defaults remain fill-absent, while translated caller
+        # values win after both layers are expressed in the served SDK shape.
+        return merge_google_generate_content_kwargs(
+            provider_entry_defaults,
+            call_kwargs,
+            target_shape=target_shape,
+        )
     # Re-apply target entry defaults as fill-absent (e.g. Anthropic max_tokens).
     return {**provider_entry_defaults, **call_kwargs}
+
+
+def _legacy_google_candidate_output_bound(
+    *,
+    primary: ProviderRuntime,
+    runtimes: list[ProviderRuntime],
+    global_defaults: dict[str, Any],
+    kwargs: dict[str, object],
+    is_streaming: bool,
+    default_bound: int,
+) -> int:
+    """Return the largest effective cap among legacy Google candidates."""
+    if primary.adapter.dialect != ProviderName.GOOGLE.value:
+        return 0
+    bounds: list[int] = []
+    for runtime in runtimes:
+        if (
+            runtime.adapter.dialect != ProviderName.GOOGLE.value
+            or _client_shape(runtime.sdk_client, runtime.adapter.dialect) != "google_generativeai"
+        ):
+            continue
+        layers: tuple[dict[str, Any], ...]
+        if runtime is primary:
+            layers = (global_defaults, runtime.entry.default_params, kwargs)
+            projected = prepare_legacy_google_metering_kwargs(runtime.sdk_client, *layers)
+        else:
+            try:
+                hop_kwargs = _build_hop_kwargs(
+                    primary=primary,
+                    rt=runtime,
+                    is_primary=False,
+                    is_provider_fallback=runtime.entry.provider != primary.entry.provider,
+                    is_streaming=is_streaming,
+                    global_defaults=global_defaults,
+                    kwargs=kwargs,
+                )
+                projected = prepare_legacy_google_metering_kwargs(
+                    runtime.sdk_client,
+                    hop_kwargs,
+                )
+            except UntranslatableRequestError:
+                # This candidate cannot be dispatched for the current request,
+                # so it cannot contribute spend. Preserve the ordinary runtime
+                # behavior: a healthy earlier candidate may still serve, while
+                # the structural error remains visible if the walk reaches it.
+                continue
+        bounds.append(
+            _effective_output_bound(
+                primary=runtime,
+                runtimes=[runtime],
+                global_defaults={},
+                kwargs=projected,
+                default_bound=default_bound,
+            )
+        )
+    return max(bounds, default=0)
 
 
 def _media_prepare(
@@ -927,12 +1072,14 @@ class Solwyn(_SolwynBase):
 
     @functools.cached_property
     def models(self) -> Any:
-        """Google-compatible: client.models.generate_content() goes through interception.
+        """google-genai: client.models generation goes through interception.
 
-        Cached: the dialect is fixed at construction, so the conditional
+        The legacy ``google.generativeai`` shape has no ``models`` namespace;
+        its root ``generate_content`` method is intercepted separately. Cached:
+        the client shape is fixed at construction, so the conditional
         result is stable for the lifetime of this client instance.
         """
-        if self._dialect == "google":
+        if self._surface_context.client_shape == "google_genai":
             return _SyncModelsProxy(self)
         return self._resolve_public_attribute(
             self._client,
@@ -940,6 +1087,39 @@ class Solwyn(_SolwynBase):
             path="models",
             source=SurfaceSource.RAW,
         )
+
+    def generate_content(self, *args: Any, **kwargs: Any) -> Any:
+        """Intercept legacy ``google.generativeai`` root generation calls."""
+        if self._surface_context.client_shape != "google_generativeai":
+            method = self._resolve_public_attribute(
+                self._client,
+                name="generate_content",
+                path="generate_content",
+                source=SurfaceSource.RAW,
+            )
+            return method(*args, **kwargs)
+
+        self._enforce_explicit_surface(
+            "generate_content",
+            source=SurfaceSource.WRAPPER,
+        )
+        call_kwargs = normalize_legacy_google_generate_content_args(args, kwargs)
+        if "model" not in call_kwargs:
+            requested_model = self._runtimes[0].entry.model
+            if not requested_model:
+                structural_model = getattr(self._client, "model_name", None)
+                requested_model = (
+                    structural_model.removeprefix("models/")
+                    if isinstance(structural_model, str)
+                    else ""
+                )
+                if not requested_model:
+                    raise ConfigurationError(
+                        "legacy Google client has no usable model_name",
+                        field="model",
+                    )
+            call_kwargs["model"] = requested_model
+        return self._intercepted_call(**call_kwargs)
 
     def converse(self, **kwargs: Any) -> Any:
         """Bedrock-compatible: client.converse(modelId=...) goes through interception."""
@@ -1300,8 +1480,21 @@ class Solwyn(_SolwynBase):
         # Deadline starts here — it encompasses the budget pre-flight.
         deadline = Deadline(self._config.failover_total_timeout)
 
+        # Legacy GenerativeModel constructor defaults are applied by its
+        # no-I/O _prepare_request seam, not exposed in the raw call kwargs.
+        # Build an ephemeral effective view solely for metering; dispatch below
+        # still receives the original kwargs so provider behavior stays native.
+        metering_kwargs = kwargs
+        if _client_shape(primary.sdk_client, primary.adapter.dialect) == "google_generativeai":
+            metering_kwargs = prepare_legacy_google_metering_kwargs(
+                primary.sdk_client,
+                self._config.default_params,
+                primary.entry.default_params,
+                kwargs,
+            )
+
         # 1. Estimate input tokens (length-only; never materializes joined string).
-        char_count = estimate_content_length(kwargs)
+        char_count = estimate_content_length(metering_kwargs)
         est_in = (
             estimate_tokens_from_length(char_count, provider=primary.adapter.name)
             if char_count
@@ -1319,12 +1512,22 @@ class Solwyn(_SolwynBase):
             agent_run_id=agent_run[0],
             tags=agent_run[2],
             call_id=call_id,
-            estimated_output_bound=_effective_output_bound(
-                primary=primary,
-                runtimes=self._runtimes,
-                global_defaults=self._config.default_params,
-                kwargs=kwargs,
-                default_bound=self._config.lease_output_bound_default,
+            estimated_output_bound=max(
+                _legacy_google_candidate_output_bound(
+                    primary=primary,
+                    runtimes=self._runtimes,
+                    global_defaults=self._config.default_params,
+                    kwargs=kwargs,
+                    is_streaming=is_streaming,
+                    default_bound=self._config.lease_output_bound_default,
+                ),
+                _effective_output_bound(
+                    primary=primary,
+                    runtimes=self._runtimes,
+                    global_defaults=self._config.default_params,
+                    kwargs=kwargs,
+                    default_bound=self._config.lease_output_bound_default,
+                ),
             ),
         )
         # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
@@ -1496,19 +1699,19 @@ class Solwyn(_SolwynBase):
                         read_timeout=tuning.failover_hop_read_timeout,
                         max_retries=0,
                     )
-                    if is_streaming and rt.adapter.dialect == "google":
-                        # First-chunk materialization — GOOGLE DIALECT ONLY (fix
-                        # [B]). A Google lazy generator does no network I/O until the
-                        # first pull, so we force it INSIDE this try; an establishment
-                        # error then falls into the candidate-walk except ->
-                        # classify_exception -> failover, exactly like OpenAI/Anthropic's
-                        # eager raise_for_status. OpenAI/Anthropic .create(stream=True)
-                        # ALREADY established eagerly at dispatch (its establishment
-                        # errors raised above and are failover-eligible), so pre-pulling
-                        # their first chunk is unnecessary AND would misclassify a
-                        # post-connect first-chunk read error as pre-send (double-spend
-                        # risk) — so we DON'T materialize them. No double-emit: the
-                        # buffered first chunk is replayed via the wrapper.
+                    if (
+                        is_streaming
+                        and _client_shape(rt.sdk_client, rt.adapter.dialect) == "google_genai"
+                    ):
+                        # Modern google-genai returns a lazy generator, so its
+                        # first pull must establish INSIDE this candidate try.
+                        # Legacy google.generativeai already consumes the first
+                        # provider response while building GenerateContentResponse;
+                        # iterating that wrapper here lookaheads another response
+                        # and could misclassify a later stream error as an
+                        # establishment failure eligible for failover. Key this to
+                        # the SERVED runtime shape so fallback hops behave correctly.
+                        # The buffered modern first chunk is replayed by the wrapper.
                         response = _materialize_stream(response)
                 except Exception as exc:
                     disp = classify_exception(exc)
@@ -2063,12 +2266,12 @@ class AsyncSolwyn(_SolwynBase):
 
     @functools.cached_property
     def models(self) -> Any:
-        """Google-compatible: client.models.generate_content() goes through interception.
+        """google-genai: client.models generation goes through interception.
 
-        Cached: the dialect is fixed at construction, so the conditional
+        Cached: the client shape is fixed at construction, so the conditional
         result is stable for the lifetime of this client instance.
         """
-        if self._dialect == "google":
+        if self._surface_context.client_shape == "google_genai":
             return _AsyncModelsProxy(self)
         return self._resolve_public_attribute(
             self._client,
@@ -2588,15 +2791,15 @@ class AsyncSolwyn(_SolwynBase):
                         read_timeout=tuning.failover_hop_read_timeout,
                         max_retries=0,
                     )
-                    if is_streaming and rt.adapter.dialect == "google":
-                        # First-chunk materialization — GOOGLE DIALECT ONLY (fix
-                        # [B]). Awaiting this runs the eager anext, so a Google
-                        # lazy-generator establishment error falls into THIS except ->
-                        # classify_exception -> failover. OpenAI/Anthropic established
-                        # eagerly at dispatch, so we DON'T materialize them (a
-                        # post-connect first-chunk error must NOT be misread as pre-send
-                        # -> double-spend risk). No double-emit: the buffered first
-                        # chunk is replayed via the wrapper.
+                    if (
+                        is_streaming
+                        and _client_shape(rt.sdk_client, rt.adapter.dialect) == "google_genai"
+                    ):
+                        # Async google-genai is lazy and needs first-chunk
+                        # establishment inside this try. The exact SERVED runtime
+                        # shape keeps fallback hops correct; legacy
+                        # google.generativeai has no async client and its sync
+                        # response wrapper establishes eagerly during dispatch.
                         response = await _materialize_stream_async(response)
                 except Exception as exc:
                     disp = classify_exception(exc)

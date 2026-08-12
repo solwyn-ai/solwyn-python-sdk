@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -24,6 +25,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY
 
+import solwyn._privacy as privacy
 from solwyn._privacy import (
     estimate_embedding_input_tokens,
     measure_google_image_media,
@@ -34,6 +36,7 @@ from solwyn._privacy import (
 )
 from solwyn._types import BudgetCheckRequest, BudgetConfirmRequest, MetadataEvent
 from solwyn.client import Solwyn
+from solwyn.exceptions import UntranslatableRequestError
 
 SDK_SRC = Path(__file__).resolve().parent.parent.parent / "src" / "solwyn"
 
@@ -183,6 +186,232 @@ def test_extract_text_from_kwargs_is_removed() -> None:
         "client.py must not define or call _extract_text_from_kwargs — "
         "use solwyn._privacy.estimate_content_length instead."
     )
+
+
+@pytest.mark.unit
+def test_legacy_google_positional_contents_are_normalized_only_in_privacy_firewall() -> None:
+    contents = object()
+    kwargs = {"request_options": {"timeout": 30.0}}
+
+    normalized = privacy.normalize_legacy_google_generate_content_args((contents,), kwargs)
+
+    assert normalized == {
+        "contents": contents,
+        "request_options": {"timeout": 30.0},
+    }
+    assert normalized is not kwargs
+    assert kwargs == {"request_options": {"timeout": 30.0}}
+
+
+@pytest.mark.unit
+def test_legacy_google_duplicate_contents_raises_without_retaining_content() -> None:
+    with pytest.raises(TypeError, match="multiple values for argument 'contents'"):
+        privacy.normalize_legacy_google_generate_content_args(
+            (object(),),
+            {"contents": object()},
+        )
+
+
+@pytest.mark.unit
+def test_legacy_google_rejects_more_than_one_positional_argument() -> None:
+    with pytest.raises(TypeError, match="takes 1 positional argument but 2 were given"):
+        privacy.normalize_legacy_google_generate_content_args(
+            (object(), object()),
+            {},
+        )
+
+
+@pytest.mark.unit
+def test_google_shape_merge_preserves_caller_precedence_and_inputs() -> None:
+    global_defaults = {"generation_config": {"temperature": 0.05, "top_p": 0.8}}
+    entry_defaults = {"generation_config": {"temperature": 0.1, "candidate_count": 2}}
+    caller = {
+        "contents": "Hello",
+        "config": {
+            "temperature": 0.7,
+            "max_output_tokens": 64,
+            "tools": [
+                {
+                    "function_declarations": [
+                        {
+                            "name": "lookup",
+                            "parameters_json_schema": {"type": "object"},
+                        }
+                    ]
+                }
+            ],
+            "tool_config": {"function_calling_config": {"mode": "ANY"}},
+        },
+    }
+
+    defaults = privacy.merge_google_generate_content_kwargs(
+        global_defaults,
+        entry_defaults,
+        target_shape="google_generativeai",
+    )
+    normalized = privacy.merge_google_generate_content_kwargs(
+        defaults, caller, target_shape="google_generativeai"
+    )
+
+    assert normalized["generation_config"] == {
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "candidate_count": 2,
+        "max_output_tokens": 64,
+    }
+    declaration = normalized["tools"][0]["function_declarations"][0]
+    assert declaration == {
+        "name": "lookup",
+        "parameters": {"type": "object"},
+        "description": "",
+    }
+    assert normalized["tool_config"] == {"function_calling_config": {"mode": "ANY"}}
+    assert global_defaults == {"generation_config": {"temperature": 0.05, "top_p": 0.8}}
+    assert entry_defaults == {"generation_config": {"temperature": 0.1, "candidate_count": 2}}
+    assert caller["config"]["tools"][0]["function_declarations"][0] == {
+        "name": "lookup",
+        "parameters_json_schema": {"type": "object"},
+    }
+    assert caller["config"]["tool_config"] == {"function_calling_config": {"mode": "ANY"}}
+
+
+@pytest.mark.unit
+def test_google_translation_source_normalizes_string_contents_ephemerally() -> None:
+    kwargs = {
+        "contents": "Hello",
+        "generation_config": {"max_output_tokens": 64},
+    }
+
+    normalized = privacy.normalize_google_translation_source_kwargs(kwargs)
+
+    assert normalized == {
+        "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
+        "config": {"max_output_tokens": 64},
+    }
+    assert kwargs == {
+        "contents": "Hello",
+        "generation_config": {"max_output_tokens": 64},
+    }
+
+
+@pytest.mark.unit
+def test_google_translation_source_cleans_content_bearing_turn_get_error() -> None:
+    class FailingTurn(dict[str, object]):
+        def get(self, key: str, default: object = None) -> object:
+            raise ValueError("SECRET-PROMPT")
+
+    with pytest.raises(UntranslatableRequestError) as info:
+        privacy.normalize_google_translation_source_kwargs({"contents": [FailingTurn()]})
+
+    assert info.value.feature == "unsupported_google_contents_shape"
+    assert "SECRET-PROMPT" not in str(info.value)
+    assert info.value.__context__ is None
+
+
+@pytest.mark.unit
+def test_google_translation_source_cleans_content_bearing_list_iteration_error() -> None:
+    class FailingContents(list[object]):
+        def __iter__(self) -> Iterator[object]:
+            raise ValueError("SECRET-PROMPT")
+
+    with pytest.raises(UntranslatableRequestError) as info:
+        privacy.normalize_google_translation_source_kwargs({"contents": FailingContents()})
+
+    assert info.value.feature == "unsupported_google_contents_shape"
+    assert "SECRET-PROMPT" not in str(info.value)
+    assert info.value.__context__ is None
+
+
+@pytest.mark.unit
+def test_google_shape_errors_use_fixed_labels_and_drop_conversion_context() -> None:
+    secret_key = "customer-authored-sensitive-key"
+    with pytest.raises(UntranslatableRequestError) as unknown_info:
+        privacy.normalize_google_generate_content_kwargs(
+            {secret_key: object()},
+            target_shape="google_generativeai",
+        )
+    assert unknown_info.value.feature == "unsupported_google_kwargs"
+    assert secret_key not in str(unknown_info.value)
+    assert unknown_info.value.__context__ is None
+
+    class BrokenConfig:
+        def model_dump(self, **kwargs: object) -> dict[str, object]:
+            raise ValueError("customer-authored-sensitive-value")
+
+    with pytest.raises(UntranslatableRequestError) as conversion_info:
+        privacy.normalize_google_generate_content_kwargs(
+            {"config": BrokenConfig()},
+            target_shape="google_generativeai",
+        )
+    assert conversion_info.value.feature == "unsupported_google_config_shape"
+    assert "customer-authored-sensitive-value" not in str(conversion_info.value)
+    assert conversion_info.value.__context__ is None
+
+
+@pytest.mark.unit
+def test_legacy_google_constructor_defaults_fail_cleanly_on_unsupported_shape() -> None:
+    class Request:
+        @classmethod
+        def to_dict(cls, value: object, **kwargs: object) -> dict[str, object]:
+            return {
+                "contents": [{"role": "user", "parts": [{"text": "Hello"}]}],
+                "generation_config": {"top_k": 7},
+            }
+
+    client = SimpleNamespace(_prepare_request=lambda **kwargs: Request())
+
+    with pytest.raises(UntranslatableRequestError) as info:
+        privacy.prepare_legacy_google_translation_source_kwargs(
+            client,
+            {"contents": "Hello"},
+        )
+
+    assert info.value.feature == "unsupported_google_constructor_generation_config"
+    assert info.value.__context__ is None
+
+
+@pytest.mark.unit
+def test_legacy_google_constructor_defaults_clean_content_bearing_conversion_error() -> None:
+    class Client:
+        def _prepare_request(self, **kwargs: object) -> object:
+            raise ValueError("SECRET-PROMPT")
+
+    with pytest.raises(UntranslatableRequestError) as info:
+        privacy.prepare_legacy_google_translation_source_kwargs(
+            Client(),
+            {"contents": "Hello"},
+        )
+
+    assert info.value.feature == "unsupported_google_constructor_defaults"
+    assert "SECRET-PROMPT" not in str(info.value)
+    assert info.value.__context__ is None
+
+
+@pytest.mark.unit
+def test_estimate_content_length_counts_modern_google_system_and_parts() -> None:
+    kwargs = {
+        "config": {"system_instruction": "S" * 40},
+        "contents": [
+            {"role": "user", "parts": [{"text": "Hello"}, {"inline_data": {}}]},
+            {"role": "model", "parts": [{"text": "world"}]},
+        ],
+    }
+
+    assert privacy.estimate_content_length(kwargs) == 50
+
+
+@pytest.mark.unit
+def test_google_content_estimation_drops_content_bearing_iteration_context() -> None:
+    class BrokenParts(list[object]):
+        def __iter__(self) -> Iterator[object]:
+            raise ValueError("SECRET-PROMPT")
+
+    with pytest.raises(UntranslatableRequestError) as info:
+        privacy.estimate_content_length({"contents": [{"role": "user", "parts": BrokenParts()}]})
+
+    assert info.value.feature == "unsupported_google_estimation_shape"
+    assert "SECRET-PROMPT" not in str(info.value)
+    assert info.value.__context__ is None
 
 
 @pytest.mark.unit

@@ -383,6 +383,14 @@ class TestGoogleAdapterDispatchSeams:
             )
         )
 
+    def _legacy_client(self) -> Any:
+        class LegacyGenerativeModel:
+            def __init__(self) -> None:
+                self.generate_content = lambda **kwargs: kwargs
+
+        LegacyGenerativeModel.__module__ = "google.generativeai.generative_models"
+        return LegacyGenerativeModel()
+
     def test_prepare_call_strips_stream_and_applies_http_bound(self) -> None:
         client = self._client()
         kwargs: dict[str, Any] = {"model": "gemini-3.5-flash", "stream": True}
@@ -422,6 +430,44 @@ class TestGoogleAdapterDispatchSeams:
         assert prepared["config"]["temperature"] == 0.2
         assert prepared["config"]["http_options"]["headers"] == {"x-a": "1"}
         assert prepared["config"]["http_options"]["timeout"] == 10000
+
+    def test_prepare_call_shapes_legacy_request_without_mutating_caller_options(self) -> None:
+        client = self._legacy_client()
+        kwargs: dict[str, Any] = {
+            "model": "gemini-1.5-flash",
+            "contents": "hi",
+            "generation_config": {"temperature": 0.2},
+            "stream": True,
+            "request_options": {
+                "metadata": (("x-test", "1"),),
+                "retry": object(),
+                "timeout": 999.0,
+            },
+        }
+        original = {
+            **kwargs,
+            "request_options": dict(kwargs["request_options"]),
+        }
+
+        method, prepared = GoogleAdapter().prepare_call(
+            client,
+            kwargs,
+            is_streaming=True,
+            timeout=12.5,
+            max_retries=2,
+        )
+
+        assert method is client.generate_content
+        assert "model" not in prepared
+        assert prepared["stream"] is True
+        assert prepared["generation_config"] == {"temperature": 0.2}
+        assert prepared["request_options"] == {
+            "metadata": (("x-test", "1"),),
+            "retry": None,
+            "timeout": 12.5,
+        }
+        assert prepared["request_options"] is not kwargs["request_options"]
+        assert kwargs == original
 
     def test_stream_shape_seams_are_identity(self) -> None:
         adapter = GoogleAdapter()

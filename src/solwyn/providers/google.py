@@ -22,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Literal
 
+from solwyn._privacy import normalize_google_generate_content_kwargs
 from solwyn._token_details import TokenDetails
 from solwyn.exceptions import UnsupportedSurfaceError
 
@@ -160,6 +161,27 @@ def _with_google_http_bound(
     return bounded
 
 
+def _is_legacy_google_client(client: object) -> bool:
+    """Return whether *client* is a deprecated google.generativeai model."""
+    return "google.generativeai" in getattr(type(client), "__module__", "")
+
+
+def _with_legacy_google_request_bound(kwargs: dict[str, Any], *, timeout: float) -> dict[str, Any]:
+    """Apply copied legacy GAPIC timeout/retry bounds.
+
+    ``google.generativeai`` forwards this mapping directly to its GAPIC method.
+    ``retry=None`` disables that method's default retry decorator, preventing
+    retry stacking; unlike google-genai, the legacy package exposes no import-free
+    attempt-count request shape.
+    """
+    bounded = dict(kwargs)
+    request_options = _mapping_from_config(bounded.get("request_options"))
+    request_options["timeout"] = timeout
+    request_options["retry"] = None
+    bounded["request_options"] = request_options
+    return bounded
+
+
 class GoogleAdapter:
     """Extracts normalized TokenDetails from Google Gemini API responses."""
 
@@ -221,12 +243,28 @@ class GoogleAdapter:
         timeout: float,
         max_retries: int,
     ) -> tuple[Callable[..., Any], dict[str, Any]]:
-        """generate_content hop: streaming selects the dedicated method.
+        """Select and shape a Google generation hop for either SDK family.
 
-        google-genai has no ``with_options``, so the mandatory per-hop bound is
-        injected as per-request ``config.http_options`` here. Its methods take
-        no ``stream`` kwarg — strip it; streaming intent picks the method.
+        google-genai uses dedicated streaming/non-streaming methods and carries
+        the mandatory bound in ``config.http_options``. The legacy
+        google.generativeai client uses one root method with ``stream=`` and
+        forwards copied ``request_options`` to GAPIC. In both cases the returned
+        kwargs are defensive copies.
         """
+        if _is_legacy_google_client(client):
+            legacy_kwargs = normalize_google_generate_content_kwargs(
+                kwargs,
+                target_shape="google_generativeai",
+            )
+            legacy_kwargs = _with_legacy_google_request_bound(legacy_kwargs, timeout=timeout)
+            legacy_kwargs.pop("model", None)
+            legacy_kwargs["stream"] = is_streaming
+            return client.generate_content, legacy_kwargs
+
+        kwargs = normalize_google_generate_content_kwargs(
+            kwargs,
+            target_shape="google_genai",
+        )
         kwargs = _with_google_http_bound(kwargs, timeout=timeout, max_retries=max_retries)
         kwargs.pop("stream", None)
         if is_streaming:

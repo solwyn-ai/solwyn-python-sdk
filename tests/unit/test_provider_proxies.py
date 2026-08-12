@@ -14,6 +14,7 @@ from typing import Any
 from unittest.mock import AsyncMock as AsyncMockFn
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 from conftest import (
     ALLOW_BUDGET_RESPONSE,
@@ -23,7 +24,6 @@ from conftest import (
 )
 
 from solwyn._base import _reset_unmetered_spend_warnings
-from solwyn._surfaces import SurfaceSource
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import (
     BudgetExceededError,
@@ -191,6 +191,65 @@ def _mock_openai_videos_client():
     return client
 
 
+def _mock_openai_all_surfaces_client():
+    """Create one OpenAI-shaped client with faithful responses for every proxy."""
+    client = _mock_openai_videos_client()
+    client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[],
+        usage=SimpleNamespace(prompt_tokens=12, completion_tokens=7),
+    )
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.1, 0.2], index=0)],
+        usage=SimpleNamespace(prompt_tokens=8, total_tokens=8),
+    )
+    image_response = SimpleNamespace(
+        data=[SimpleNamespace(b64_json="aGVsbG8=", url=None)],
+        usage=_image_usage(native=True),
+    )
+    client.images.generate.return_value = image_response
+    client.images.edit.return_value = image_response
+    client.audio.transcriptions.create.return_value = SimpleNamespace(
+        text="Hello",
+        usage=SimpleNamespace(type="duration", seconds=2),
+    )
+    client.audio.speech.create.return_value = SimpleNamespace(content=b"audio")
+    return client
+
+
+def _mock_google_all_surfaces_client():
+    """Create one google.genai-shaped client with faithful tracked responses."""
+    client = _mock_google_client()
+    stream_chunk = SimpleNamespace(
+        candidates=[
+            SimpleNamespace(
+                content=SimpleNamespace(parts=[SimpleNamespace(text="Hello")]),
+                finish_reason="STOP",
+            )
+        ],
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=12,
+            candidates_token_count=7,
+            thoughts_token_count=0,
+            cached_content_token_count=0,
+            tool_use_prompt_token_count=0,
+        ),
+    )
+    client.models.generate_content_stream.return_value = iter([stream_chunk])
+    client.models.embed_content.return_value = SimpleNamespace(
+        embeddings=[SimpleNamespace(values=[0.1, 0.2])],
+        usage_metadata=SimpleNamespace(prompt_token_count=8),
+    )
+    client.models.generate_images.return_value = SimpleNamespace(
+        generated_images=[SimpleNamespace(image=SimpleNamespace(image_bytes=b"png"))]
+    )
+    client.models.generate_videos.return_value = SimpleNamespace(
+        name="operations/veo-123",
+        done=False,
+        response=None,
+    )
+    return client
+
+
 class _OpenAIModelsResource:
     def list(self) -> list[str]:
         return ["gpt-5.5"]
@@ -218,49 +277,51 @@ def _make_solwyn(client, **overrides):
 
 def _mock_budget(solwyn, response=None):
     """Patch the budget enforcer to return an allow response."""
-    resp = MagicMock()
+    resp = MagicMock(spec=httpx.Response)
     resp.json.return_value = response or ALLOW_BUDGET_RESPONSE
     resp.raise_for_status = MagicMock()
     return patch.object(solwyn._budget._http, "post", return_value=resp)
 
 
+def _reporting_response() -> MagicMock:
+    """Return one response accepted by confirm and metadata reporter sends."""
+    response = MagicMock(spec=httpx.Response)
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"ingested": 1, "rejected": []}
+    return response
+
+
 @pytest.mark.unit
 def test_sync_openai_explicit_proxy_methods_resolve_exact_wrapper_paths_before_dispatch() -> None:
-    client = _mock_openai_videos_client()
-    solwyn = _make_solwyn(client)
-    order: list[tuple[str, str]] = []
+    client = _mock_openai_all_surfaces_client()
+    solwyn = _make_solwyn(client, on_unmetered="raise")
 
-    def enforce(path: str, *, source: SurfaceSource, **_kwargs: object) -> None:
-        order.append(("policy", f"{source.value}:{path}"))
+    with (
+        _mock_budget(solwyn) as budget_post,
+        patch.object(
+            solwyn._reporter._http,
+            "post",
+            return_value=_reporting_response(),
+        ) as report_post,
+    ):
+        solwyn.chat.completions.create(model="gpt-5.5", messages=[])
+        solwyn.embeddings.create(model="text-embedding-3-small", input="hi")
+        solwyn.images.generate(model="gpt-image-2", prompt="cat")
+        solwyn.images.edit(model="gpt-image-2", prompt="hat", image=b"png")
+        solwyn.audio.transcriptions.create(model="whisper-1", file=b"audio")
+        solwyn.audio.speech.create(model="tts-1", input="hi", voice="alloy")
+        solwyn.videos.create(model="sora-2", prompt="cat", seconds="4")
+        solwyn.close()
 
-    def dispatch(**_kwargs: object) -> object:
-        order.append(("dispatch", "chat"))
-        return object()
-
-    def media(_spec: object, **_kwargs: object) -> object:
-        order.append(("dispatch", "media"))
-        return object()
-
-    solwyn._enforce_explicit_surface = enforce  # type: ignore[attr-defined,method-assign]
-    solwyn._intercepted_call = dispatch  # type: ignore[method-assign]
-    solwyn._media_call = media  # type: ignore[method-assign]
-
-    calls = (
-        ("chat.completions.create", lambda: solwyn.chat.completions.create()),
-        ("embeddings.create", lambda: solwyn.embeddings.create()),
-        ("images.generate", lambda: solwyn.images.generate()),
-        ("images.edit", lambda: solwyn.images.edit()),
-        ("audio.transcriptions.create", lambda: solwyn.audio.transcriptions.create()),
-        ("audio.speech.create", lambda: solwyn.audio.speech.create(model="tts-1")),
-        ("videos.create", lambda: solwyn.videos.create()),
-    )
-    for path, call in calls:
-        order.clear()
-        call()
-        assert order[0] == ("policy", f"wrapper:{path}")
-        assert order[1][0] == "dispatch"
-
-    solwyn.close()
+    budget_post.assert_called()
+    assert report_post.called
+    client.chat.completions.create.assert_called_once()
+    client.embeddings.create.assert_called_once()
+    client.images.generate.assert_called_once()
+    client.images.edit.assert_called_once()
+    client.audio.transcriptions.create.assert_called_once()
+    client.audio.speech.create.assert_called_once()
+    client.videos.create.assert_called_once()
 
 
 @pytest.mark.unit
@@ -292,67 +353,146 @@ def test_sync_openai_proxy_passthroughs_refuse_the_exact_unknown_path(
 
 
 @pytest.mark.unit
-def test_non_openai_media_method_is_unsupported_before_dispatch() -> None:
-    solwyn = _make_solwyn(_mock_anthropic_client())
+@pytest.mark.parametrize(
+    ("surface", "invoke", "provider_boundary"),
+    [
+        (
+            "embeddings.create",
+            lambda wrapper: wrapper.embeddings.create(model="embed", input="private"),
+            lambda client: client.embeddings.create,
+        ),
+        (
+            "images.generate",
+            lambda wrapper: wrapper.images.generate(model="image", prompt="private"),
+            lambda client: client.images.generate,
+        ),
+        (
+            "images.edit",
+            lambda wrapper: wrapper.images.edit(
+                model="image",
+                prompt="private",
+                image=b"png",
+            ),
+            lambda client: client.images.edit,
+        ),
+        (
+            "audio.transcriptions.create",
+            lambda wrapper: wrapper.audio.transcriptions.create(
+                model="whisper",
+                file=b"audio",
+            ),
+            lambda client: client.audio.transcriptions.create,
+        ),
+        (
+            "audio.speech.create",
+            lambda wrapper: wrapper.audio.speech.create(
+                model="tts-1",
+                input="private",
+                voice="alloy",
+            ),
+            lambda client: client.audio.speech.create,
+        ),
+        (
+            "videos.create",
+            lambda wrapper: wrapper.videos.create(model="video", prompt="private"),
+            lambda client: client.videos.create,
+        ),
+    ],
+)
+def test_sync_non_openai_media_methods_are_unsupported_before_provider_io(
+    surface: str,
+    invoke: Any,
+    provider_boundary: Any,
+) -> None:
+    client = _mock_anthropic_client()
+    solwyn = _make_solwyn(client, on_unmetered="raise")
 
-    with (
-        patch.object(solwyn, "_media_call") as dispatch,
-        pytest.raises(UnsupportedSurfaceError) as exc_info,
-    ):
-        solwyn.embeddings.create(model="embed", input="private")
+    with _mock_budget(solwyn) as budget_post, pytest.raises(UnsupportedSurfaceError) as exc_info:
+        invoke(solwyn)
 
-    assert exc_info.value.surface == "embeddings.create"
-    dispatch.assert_not_called()
+    assert exc_info.value.surface == surface
+    budget_post.assert_not_called()
+    provider_boundary(client).assert_not_called()
+    solwyn.close()
+
+
+@pytest.mark.unit
+def test_sync_non_openai_untracked_tts_model_is_unsupported_before_provider_io() -> None:
+    client = _mock_anthropic_client()
+    solwyn = _make_solwyn(client)
+
+    with pytest.raises(UnsupportedSurfaceError) as exc_info:
+        solwyn.audio.speech.create(
+            model="gpt-4o-mini-tts",
+            input="private",
+            voice="alloy",
+        )
+
+    assert exc_info.value.surface == "audio.speech.create"
+    client.audio.speech.create.assert_not_called()
     solwyn.close()
 
 
 @pytest.mark.unit
 def test_sync_provider_native_explicit_methods_resolve_before_dispatch() -> None:
-    anthropic = _make_solwyn(_mock_anthropic_client())
-    anthropic_order: list[tuple[str, str]] = []
-    anthropic._enforce_explicit_surface = (  # type: ignore[method-assign]
-        lambda path, *, source, **_kwargs: anthropic_order.append(
-            ("policy", f"{source.value}:{path}")
+    anthropic_client = _mock_anthropic_client()
+    anthropic = _make_solwyn(anthropic_client, on_unmetered="raise")
+    with (
+        _mock_budget(anthropic) as anthropic_budget_post,
+        patch.object(
+            anthropic._reporter._http,
+            "post",
+            return_value=_reporting_response(),
+        ) as anthropic_report_post,
+    ):
+        anthropic.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=64,
+            messages=[],
         )
-    )
-    anthropic._intercepted_call = (  # type: ignore[method-assign]
-        lambda **_kwargs: anthropic_order.append(("dispatch", "messages"))
-    )
+        anthropic.close()
 
-    anthropic.messages.create()
+    anthropic_budget_post.assert_called_once()
+    assert anthropic_report_post.called
+    anthropic_client.messages.create.assert_called_once()
 
-    assert anthropic_order == [
-        ("policy", "wrapper:messages.create"),
-        ("dispatch", "messages"),
-    ]
-    anthropic.close()
+    google_client = _mock_google_all_surfaces_client()
+    google = _make_solwyn(google_client, on_unmetered="raise")
+    with (
+        _mock_budget(google) as google_budget_post,
+        patch.object(
+            google._reporter._http,
+            "post",
+            return_value=_reporting_response(),
+        ) as google_report_post,
+    ):
+        google.models.generate_content(model="gemini-3.5-flash", contents="hi")
+        list(
+            google.models.generate_content_stream(
+                model="gemini-3.5-flash",
+                contents="hi",
+            )
+        )
+        google.models.embed_content(model="gemini-embedding-001", contents="hi")
+        google.models.generate_images(
+            model="imagen-3.0-generate-002",
+            prompt="cat",
+            config={"number_of_images": 1},
+        )
+        google.models.generate_videos(
+            model="veo-3.0-generate-001",
+            prompt="cat",
+            config={"duration_seconds": 4, "resolution": "720p"},
+        )
+        google.close()
 
-    google = _make_solwyn(_mock_google_client())
-    google_order: list[tuple[str, str]] = []
-    google._enforce_explicit_surface = (  # type: ignore[method-assign]
-        lambda path, *, source, **_kwargs: google_order.append(("policy", f"{source.value}:{path}"))
-    )
-    google._intercepted_call = (  # type: ignore[method-assign]
-        lambda **_kwargs: google_order.append(("dispatch", "chat"))
-    )
-    google._media_call = (  # type: ignore[method-assign]
-        lambda _spec, **_kwargs: google_order.append(("dispatch", "media"))
-    )
-
-    calls = (
-        ("models.generate_content", lambda: google.models.generate_content()),
-        ("models.generate_content_stream", lambda: google.models.generate_content_stream()),
-        ("models.embed_content", lambda: google.models.embed_content()),
-        ("models.generate_images", lambda: google.models.generate_images()),
-        ("models.generate_videos", lambda: google.models.generate_videos()),
-    )
-    for path, call in calls:
-        google_order.clear()
-        call()
-        assert google_order[0] == ("policy", f"wrapper:{path}")
-        assert google_order[1][0] == "dispatch"
-
-    google.close()
+    google_budget_post.assert_called()
+    assert google_report_post.called
+    google_client.models.generate_content.assert_called_once()
+    google_client.models.generate_content_stream.assert_called_once()
+    google_client.models.embed_content.assert_called_once()
+    google_client.models.generate_images.assert_called_once()
+    google_client.models.generate_videos.assert_called_once()
 
 
 @pytest.mark.unit
@@ -1231,7 +1371,7 @@ def _make_async_solwyn(client, **overrides):
 
 
 def _mock_async_budget(solwyn, response=None):
-    resp = MagicMock()
+    resp = MagicMock(spec=httpx.Response)
     resp.json.return_value = response or ALLOW_BUDGET_RESPONSE
     resp.raise_for_status = MagicMock()
     return patch.object(solwyn._budget._http, "post", return_value=resp)
@@ -1240,91 +1380,120 @@ def _mock_async_budget(solwyn, response=None):
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_async_openai_explicit_proxy_methods_resolve_before_dispatch() -> None:
-    solwyn = _make_async_solwyn(_mock_openai_videos_client())
-    order: list[tuple[str, str]] = []
-
-    def enforce(path: str, *, source: SurfaceSource, **_kwargs: object) -> None:
-        order.append(("policy", f"{source.value}:{path}"))
-
-    async def dispatch(**_kwargs: object) -> object:
-        order.append(("dispatch", "chat"))
-        return object()
-
-    async def media(_spec: object, **_kwargs: object) -> object:
-        order.append(("dispatch", "media"))
-        return object()
-
-    solwyn._enforce_explicit_surface = enforce  # type: ignore[method-assign]
-    solwyn._intercepted_call = dispatch  # type: ignore[method-assign]
-    solwyn._media_call = media  # type: ignore[method-assign]
-
-    calls = (
-        ("chat.completions.create", lambda: solwyn.chat.completions.create()),
-        ("embeddings.create", lambda: solwyn.embeddings.create()),
-        ("images.generate", lambda: solwyn.images.generate()),
-        ("images.edit", lambda: solwyn.images.edit()),
-        ("audio.transcriptions.create", lambda: solwyn.audio.transcriptions.create()),
-        ("audio.speech.create", lambda: solwyn.audio.speech.create(model="tts-1")),
-        ("videos.create", lambda: solwyn.videos.create()),
+    client = _mock_openai_all_surfaces_client()
+    client.chat.completions.create = AsyncMockFn(
+        return_value=client.chat.completions.create.return_value
     )
-    for path, call in calls:
-        order.clear()
-        await call()
-        assert order[0] == ("policy", f"wrapper:{path}")
-        assert order[1][0] == "dispatch"
+    client.embeddings.create = AsyncMockFn(return_value=client.embeddings.create.return_value)
+    client.images.generate = AsyncMockFn(return_value=client.images.generate.return_value)
+    client.images.edit = AsyncMockFn(return_value=client.images.edit.return_value)
+    client.audio.transcriptions.create = AsyncMockFn(
+        return_value=client.audio.transcriptions.create.return_value
+    )
+    client.audio.speech.create = AsyncMockFn(return_value=client.audio.speech.create.return_value)
+    client.videos.create = AsyncMockFn(return_value=client.videos.create.return_value)
+    solwyn = _make_async_solwyn(client, on_unmetered="raise")
+    report_post = AsyncMockFn(return_value=_reporting_response())
 
-    await solwyn.close()
+    with (
+        _mock_async_budget(solwyn) as budget_post,
+        patch.object(solwyn._reporter._http, "post", new=report_post),
+    ):
+        await solwyn.chat.completions.create(model="gpt-5.5", messages=[])
+        await solwyn.embeddings.create(model="text-embedding-3-small", input="hi")
+        await solwyn.images.generate(model="gpt-image-2", prompt="cat")
+        await solwyn.images.edit(model="gpt-image-2", prompt="hat", image=b"png")
+        await solwyn.audio.transcriptions.create(model="whisper-1", file=b"audio")
+        await solwyn.audio.speech.create(model="tts-1", input="hi", voice="alloy")
+        await solwyn.videos.create(model="sora-2", prompt="cat", seconds="4")
+        await solwyn.close()
+
+    assert budget_post.await_count > 0
+    assert report_post.await_count > 0
+    client.chat.completions.create.assert_awaited_once()
+    client.embeddings.create.assert_awaited_once()
+    client.images.generate.assert_awaited_once()
+    client.images.edit.assert_awaited_once()
+    client.audio.transcriptions.create.assert_awaited_once()
+    client.audio.speech.create.assert_awaited_once()
+    client.videos.create.assert_awaited_once()
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_async_provider_native_explicit_methods_resolve_before_dispatch() -> None:
-    anthropic = _make_async_solwyn(_mock_anthropic_client())
-    anthropic_order: list[tuple[str, str]] = []
-    anthropic._enforce_explicit_surface = (  # type: ignore[method-assign]
-        lambda path, *, source, **_kwargs: anthropic_order.append(
-            ("policy", f"{source.value}:{path}")
+    anthropic_client = _mock_anthropic_client()
+    anthropic_client.messages.create = AsyncMockFn(
+        return_value=anthropic_client.messages.create.return_value
+    )
+    anthropic = _make_async_solwyn(anthropic_client, on_unmetered="raise")
+    anthropic_report_post = AsyncMockFn(return_value=_reporting_response())
+    with (
+        _mock_async_budget(anthropic) as anthropic_budget_post,
+        patch.object(anthropic._reporter._http, "post", new=anthropic_report_post),
+    ):
+        await anthropic.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=64,
+            messages=[],
         )
+        await anthropic.close()
+
+    anthropic_budget_post.assert_awaited_once()
+    assert anthropic_report_post.await_count > 0
+    anthropic_client.messages.create.assert_awaited_once()
+
+    google_client = _mock_google_all_surfaces_client()
+    google_client.models.generate_content = AsyncMockFn(
+        return_value=google_client.models.generate_content.return_value
     )
+    stream_chunk = next(google_client.models.generate_content_stream.return_value)
 
-    async def anthropic_dispatch(**_kwargs: object) -> None:
-        anthropic_order.append(("dispatch", "messages"))
+    async def stream_chunks() -> Any:
+        yield stream_chunk
 
-    anthropic._intercepted_call = anthropic_dispatch  # type: ignore[method-assign]
-    await anthropic.messages.create()
-    assert anthropic_order == [
-        ("policy", "wrapper:messages.create"),
-        ("dispatch", "messages"),
-    ]
-    await anthropic.close()
-
-    google = _make_async_solwyn(_mock_google_client())
-    google_order: list[tuple[str, str]] = []
-    google._enforce_explicit_surface = (  # type: ignore[method-assign]
-        lambda path, *, source, **_kwargs: google_order.append(("policy", f"{source.value}:{path}"))
+    google_client.models.generate_content_stream = AsyncMockFn(return_value=stream_chunks())
+    google_client.models.embed_content = AsyncMockFn(
+        return_value=google_client.models.embed_content.return_value
     )
-
-    async def google_dispatch(**_kwargs: object) -> None:
-        google_order.append(("dispatch", "chat"))
-
-    async def google_media(_spec: object, **_kwargs: object) -> None:
-        google_order.append(("dispatch", "media"))
-
-    google._intercepted_call = google_dispatch  # type: ignore[method-assign]
-    google._media_call = google_media  # type: ignore[method-assign]
-    calls = (
-        ("models.generate_content", lambda: google.models.generate_content()),
-        ("models.generate_content_stream", lambda: google.models.generate_content_stream()),
-        ("models.embed_content", lambda: google.models.embed_content()),
-        ("models.generate_images", lambda: google.models.generate_images()),
-        ("models.generate_videos", lambda: google.models.generate_videos()),
+    google_client.models.generate_images = AsyncMockFn(
+        return_value=google_client.models.generate_images.return_value
     )
-    for path, call in calls:
-        google_order.clear()
-        await call()
-        assert google_order[0] == ("policy", f"wrapper:{path}")
-        assert google_order[1][0] == "dispatch"
-    await google.close()
+    google_client.models.generate_videos = AsyncMockFn(
+        return_value=google_client.models.generate_videos.return_value
+    )
+    google = _make_async_solwyn(google_client, on_unmetered="raise")
+    google_report_post = AsyncMockFn(return_value=_reporting_response())
+    with (
+        _mock_async_budget(google) as google_budget_post,
+        patch.object(google._reporter._http, "post", new=google_report_post),
+    ):
+        await google.models.generate_content(model="gemini-3.5-flash", contents="hi")
+        stream = await google.models.generate_content_stream(
+            model="gemini-3.5-flash",
+            contents="hi",
+        )
+        _ = [chunk async for chunk in stream]
+        await google.models.embed_content(model="gemini-embedding-001", contents="hi")
+        await google.models.generate_images(
+            model="imagen-3.0-generate-002",
+            prompt="cat",
+            config={"number_of_images": 1},
+        )
+        await google.models.generate_videos(
+            model="veo-3.0-generate-001",
+            prompt="cat",
+            config={"duration_seconds": 4, "resolution": "720p"},
+        )
+        await google.close()
+
+    assert google_budget_post.await_count > 0
+    assert google_report_post.await_count > 0
+    google_client.models.generate_content.assert_awaited_once()
+    google_client.models.generate_content_stream.assert_awaited_once()
+    google_client.models.embed_content.assert_awaited_once()
+    google_client.models.generate_images.assert_awaited_once()
+    google_client.models.generate_videos.assert_awaited_once()
 
 
 @pytest.mark.unit
@@ -1394,17 +1563,111 @@ async def test_async_raw_conditional_root_branches_refuse_unknown_dynamic_resour
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_async_non_openai_media_method_is_unsupported_before_dispatch() -> None:
-    solwyn = _make_async_solwyn(_mock_anthropic_client())
+async def test_async_raw_models_branch_returns_a_cached_guard_in_strict_mode() -> None:
+    client = _OpenAIModelsClient()
+    raw_models = client.models
+    solwyn = _make_async_solwyn(client, on_unmetered="raise")
+
+    guarded = solwyn.models
+
+    assert guarded is solwyn.models
+    assert guarded is not raw_models
+    with pytest.raises(UntrackedSpendSurfaceError) as exc_info:
+        _ = guarded.list
+    assert exc_info.value.surface == "models.list"
+    await solwyn.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "invoke", "provider_path"),
+    [
+        (
+            "embeddings.create",
+            lambda wrapper: wrapper.embeddings.create(model="embed", input="private"),
+            "embeddings.create",
+        ),
+        (
+            "images.generate",
+            lambda wrapper: wrapper.images.generate(model="image", prompt="private"),
+            "images.generate",
+        ),
+        (
+            "images.edit",
+            lambda wrapper: wrapper.images.edit(
+                model="image",
+                prompt="private",
+                image=b"png",
+            ),
+            "images.edit",
+        ),
+        (
+            "audio.transcriptions.create",
+            lambda wrapper: wrapper.audio.transcriptions.create(
+                model="whisper",
+                file=b"audio",
+            ),
+            "audio.transcriptions.create",
+        ),
+        (
+            "audio.speech.create",
+            lambda wrapper: wrapper.audio.speech.create(
+                model="tts-1",
+                input="private",
+                voice="alloy",
+            ),
+            "audio.speech.create",
+        ),
+        (
+            "videos.create",
+            lambda wrapper: wrapper.videos.create(model="video", prompt="private"),
+            "videos.create",
+        ),
+    ],
+)
+async def test_async_non_openai_media_methods_are_unsupported_before_provider_io(
+    surface: str,
+    invoke: Any,
+    provider_path: str,
+) -> None:
+    client = _mock_anthropic_client()
+    resource = client
+    path_parts = provider_path.split(".")
+    for path_part in path_parts[:-1]:
+        resource = getattr(resource, path_part)
+    provider_call = AsyncMockFn(return_value=object())
+    setattr(resource, path_parts[-1], provider_call)
+    solwyn = _make_async_solwyn(client, on_unmetered="raise")
 
     with (
-        patch.object(solwyn, "_media_call", new=AsyncMockFn()) as dispatch,
+        _mock_async_budget(solwyn) as budget_post,
         pytest.raises(UnsupportedSurfaceError) as exc_info,
     ):
-        await solwyn.videos.create(model="video", prompt="private")
+        await invoke(solwyn)
 
-    assert exc_info.value.surface == "videos.create"
-    dispatch.assert_not_awaited()
+    assert exc_info.value.surface == surface
+    budget_post.assert_not_awaited()
+    provider_call.assert_not_awaited()
+    await solwyn.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_non_openai_untracked_tts_model_is_unsupported_before_provider_io() -> None:
+    client = _mock_anthropic_client()
+    client.audio.speech.create = AsyncMockFn(return_value=object())
+    solwyn = _make_async_solwyn(client)
+
+    with pytest.raises(UnsupportedSurfaceError) as exc_info:
+        await solwyn.audio.speech.create(
+            model="gpt-4o-mini-tts",
+            input="private",
+            voice="alloy",
+        )
+
+    assert exc_info.value.surface == "audio.speech.create"
+    client.audio.speech.create.assert_not_awaited()
     await solwyn.close()
 
 

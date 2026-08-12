@@ -18,9 +18,616 @@ If you add a new helper here, add a corresponding enforcement test.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, NoReturn
 
 from solwyn._types import MediaUsage
+from solwyn.exceptions import UntranslatableRequestError
+
+_LEGACY_GOOGLE_GENERATION_CONFIG_KEYS = frozenset(
+    {
+        "candidate_count",
+        "stop_sequences",
+        "max_output_tokens",
+        "temperature",
+        "top_p",
+    }
+)
+_GOOGLE_GENERATE_CONTENT_KEYS = frozenset(
+    {
+        "model",
+        "contents",
+        "stream",
+        "config",
+        "generation_config",
+        "max_output_tokens",
+        "safety_settings",
+        "tools",
+        "tool_config",
+        "system_instruction",
+        "request_options",
+    }
+)
+_GOOGLE_SCHEMA_TYPES = {
+    "STRING": "string",
+    "NUMBER": "number",
+    "INTEGER": "integer",
+    "BOOLEAN": "boolean",
+    "ARRAY": "array",
+    "OBJECT": "object",
+}
+
+
+def _raise_google_shape(feature: str) -> NoReturn:
+    """Raise a structural Google-shape error with no retained input context."""
+    try:
+        raise UntranslatableRequestError(
+            source="google",
+            target="google",
+            feature=feature,
+        ) from None
+    except UntranslatableRequestError as clean:
+        clean.__context__ = None
+        raise
+
+
+def _google_config_mapping(value: object, *, feature: str) -> dict[str, Any]:
+    """Return an ephemeral mapping view of a Google request config."""
+    try:
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return dict(value)
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            dumped = model_dump(exclude_none=True)
+            if isinstance(dumped, dict):
+                return dict(dumped)
+        attrs = getattr(value, "__dict__", None)
+        if isinstance(attrs, dict):
+            return {key: item for key, item in attrs.items() if not key.startswith("_")}
+    except Exception:
+        _raise_google_shape(feature)
+    _raise_google_shape(feature)
+
+
+def _normalize_google_tools(tools: object, *, target_shape: str) -> object:
+    """Translate the documented function-tool subset between Google SDKs.
+
+    Tool descriptions and schemas may contain customer-authored material, so the
+    reshape stays inside this content-privileged module and is purely ephemeral.
+    Built-in/provider-specific tool shapes fail closed instead of being guessed.
+    """
+    if tools is None:
+        return None
+    if not isinstance(tools, (list, tuple)):
+        _raise_google_shape("unsupported_google_tools_shape")
+    normalized_tools: list[dict[str, Any]] = []
+    for tool in tools:
+        tool_mapping = _google_config_mapping(tool, feature="unsupported_google_tool")
+        if set(tool_mapping) != {"function_declarations"}:
+            _raise_google_shape("unsupported_google_tool")
+        declarations = tool_mapping["function_declarations"]
+        if not isinstance(declarations, (list, tuple)):
+            _raise_google_shape("unsupported_google_function_declarations")
+        normalized_declarations: list[dict[str, Any]] = []
+        for declaration in declarations:
+            mapped = _google_config_mapping(
+                declaration,
+                feature="unsupported_google_function_declaration",
+            )
+            allowed = {
+                "name",
+                "description",
+                "parameters",
+                "parameters_json_schema",
+            }
+            if not set(mapped).issubset(allowed):
+                _raise_google_shape("unsupported_google_function_declaration")
+            if target_shape == "google_generativeai":
+                if "parameters" not in mapped and "parameters_json_schema" in mapped:
+                    mapped["parameters"] = mapped["parameters_json_schema"]
+                mapped.pop("parameters_json_schema", None)
+                # Legacy requires the keyword even though modern permits it to
+                # be absent; an empty description preserves that absence.
+                mapped.setdefault("description", "")
+            else:
+                if "parameters_json_schema" not in mapped and "parameters" in mapped:
+                    mapped["parameters_json_schema"] = mapped["parameters"]
+                mapped.pop("parameters", None)
+            normalized_declarations.append(mapped)
+        normalized_tools.append({"function_declarations": normalized_declarations})
+    return normalized_tools
+
+
+def _normalize_google_tool_config(value: object) -> dict[str, Any]:
+    """Copy the common function-calling config subset defensively."""
+    mapped = _google_config_mapping(
+        value,
+        feature="unsupported_google_tool_config_shape",
+    )
+    if set(mapped) != {"function_calling_config"}:
+        _raise_google_shape("unsupported_google_tool_config_shape")
+    calling = _google_config_mapping(
+        mapped["function_calling_config"],
+        feature="unsupported_google_tool_config_shape",
+    )
+    allowed = {"mode", "allowed_function_names"}
+    if not set(calling).issubset(allowed):
+        _raise_google_shape("unsupported_google_tool_config_shape")
+    return {"function_calling_config": calling}
+
+
+def _copy_legacy_google_tool_config(value: object) -> object:
+    """Copy dict layers the legacy SDK mutates while preserving native objects."""
+    if not isinstance(value, dict):
+        return value
+    copied = dict(value)
+    calling = copied.get("function_calling_config")
+    if isinstance(calling, dict):
+        copied["function_calling_config"] = dict(calling)
+    return copied
+
+
+def _legacy_google_schema_dict_to_json(value: object) -> dict[str, Any]:
+    """Clean a proto ``Schema.to_dict`` result into the translation subset."""
+    schema = _google_config_mapping(value, feature="unsupported_google_constructor_tools")
+    type_name = schema.pop("type_", None)
+    if not isinstance(type_name, str) or type_name not in _GOOGLE_SCHEMA_TYPES:
+        _raise_google_shape("unsupported_google_constructor_tools")
+    converted: dict[str, Any] = {"type": _GOOGLE_SCHEMA_TYPES[type_name]}
+    for key in ("description", "enum", "required"):
+        field = schema.pop(key, None)
+        if field:
+            converted[key] = field
+    properties = schema.pop("properties", None)
+    if properties:
+        if not isinstance(properties, dict):
+            _raise_google_shape("unsupported_google_constructor_tools")
+        converted["properties"] = {
+            key: _legacy_google_schema_dict_to_json(item) for key, item in properties.items()
+        }
+    items = schema.pop("items", None)
+    if items:
+        converted["items"] = _legacy_google_schema_dict_to_json(items)
+    if any(field not in (None, "", False, 0, "0", [], {}) for field in schema.values()):
+        _raise_google_shape("unsupported_google_constructor_tools")
+    return converted
+
+
+def _legacy_google_request_tools(value: object) -> list[dict[str, Any]]:
+    """Clean request-proto function tools into modern Google dictionaries."""
+    if not isinstance(value, list):
+        _raise_google_shape("unsupported_google_constructor_tools")
+    tools: list[dict[str, Any]] = []
+    for raw_tool in value:
+        tool = _google_config_mapping(
+            raw_tool,
+            feature="unsupported_google_constructor_tools",
+        )
+        if set(tool) != {"function_declarations"} or not isinstance(
+            tool["function_declarations"], list
+        ):
+            _raise_google_shape("unsupported_google_constructor_tools")
+        declarations: list[dict[str, Any]] = []
+        for raw_declaration in tool["function_declarations"]:
+            declaration = _google_config_mapping(
+                raw_declaration,
+                feature="unsupported_google_constructor_tools",
+            )
+            if not set(declaration).issubset({"name", "description", "parameters"}):
+                _raise_google_shape("unsupported_google_constructor_tools")
+            name = declaration.get("name")
+            description = declaration.get("description")
+            if not isinstance(name, str) or not isinstance(description, str):
+                _raise_google_shape("unsupported_google_constructor_tools")
+            declarations.append(
+                {
+                    "name": name,
+                    "description": description,
+                    "parameters_json_schema": (
+                        _legacy_google_schema_dict_to_json(declaration["parameters"])
+                        if declaration.get("parameters") is not None
+                        else {}
+                    ),
+                }
+            )
+        tools.append({"function_declarations": declarations})
+    return tools
+
+
+def _legacy_google_request_system(value: object) -> str:
+    """Extract the supported single-text-part system instruction."""
+    system = _google_config_mapping(
+        value,
+        feature="unsupported_google_constructor_system_instruction",
+    )
+    parts = system.get("parts")
+    if set(system) - {"parts", "role"} or not isinstance(parts, list) or len(parts) != 1:
+        _raise_google_shape("unsupported_google_constructor_system_instruction")
+    part = _google_config_mapping(
+        parts[0],
+        feature="unsupported_google_constructor_system_instruction",
+    )
+    if set(part) != {"text"} or not isinstance(part["text"], str):
+        _raise_google_shape("unsupported_google_constructor_system_instruction")
+    return part["text"]
+
+
+def _legacy_google_request_payload(
+    client: object,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Build and copy the legacy SDK's effective no-I/O request payload."""
+    prepare_request = getattr(client, "_prepare_request", None)
+    if not callable(prepare_request) or "contents" not in kwargs:
+        _raise_google_shape("unsupported_google_constructor_defaults")
+    request = prepare_request(
+        contents=kwargs["contents"],
+        generation_config=kwargs.get("generation_config"),
+        safety_settings=kwargs.get("safety_settings"),
+        tools=kwargs.get("tools"),
+        tool_config=kwargs.get("tool_config"),
+    )
+    to_dict = getattr(type(request), "to_dict", None)
+    if not callable(to_dict):
+        _raise_google_shape("unsupported_google_constructor_defaults")
+    return _google_config_mapping(
+        to_dict(
+            request,
+            use_integers_for_enums=False,
+            preserving_proto_field_name=True,
+        ),
+        feature="unsupported_google_constructor_defaults",
+    )
+
+
+def _prepare_legacy_google_translation_source_kwargs(
+    client: object, kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """Use legacy ``_prepare_request`` as the constructor/call merge authority."""
+    normalized = normalize_google_generate_content_kwargs(
+        kwargs,
+        target_shape="google_generativeai",
+    )
+    payload = _legacy_google_request_payload(client, normalized)
+    if payload.get("cached_content"):
+        _raise_google_shape("unsupported_google_constructor_cached_content")
+
+    generation = _google_config_mapping(
+        payload.get("generation_config"),
+        feature="unsupported_google_constructor_generation_config",
+    )
+    config = {
+        key: value
+        for key, value in generation.items()
+        if key in _LEGACY_GOOGLE_GENERATION_CONFIG_KEYS
+    }
+    if any(
+        value not in (None, "", False, 0, "0", [], {})
+        for key, value in generation.items()
+        if key not in _LEGACY_GOOGLE_GENERATION_CONFIG_KEYS
+    ):
+        _raise_google_shape("unsupported_google_constructor_generation_config")
+    if payload.get("system_instruction"):
+        config["system_instruction"] = _legacy_google_request_system(payload["system_instruction"])
+    if payload.get("safety_settings"):
+        config["safety_settings"] = payload["safety_settings"]
+    if payload.get("tools"):
+        config["tools"] = _legacy_google_request_tools(payload["tools"])
+    if payload.get("tool_config"):
+        config["tool_config"] = payload["tool_config"]
+
+    contents = payload.get("contents")
+    if not isinstance(contents, list) or not contents:
+        _raise_google_shape("unsupported_google_contents_shape")
+    final_turn = contents[-1]
+    if isinstance(final_turn, dict) and not final_turn.get("role"):
+        final_turn = {**final_turn, "role": "user"}
+        contents = [*contents[:-1], final_turn]
+    result: dict[str, Any] = {"contents": contents, "config": config}
+    if "model" in normalized:
+        result["model"] = normalized["model"]
+    if normalized.get("stream"):
+        result["stream"] = True
+    return result
+
+
+def prepare_legacy_google_translation_source_kwargs(
+    client: object, kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """Prepare one ephemeral legacy request for fallback translation, without I/O."""
+    try:
+        return _prepare_legacy_google_translation_source_kwargs(client, kwargs)
+    except UntranslatableRequestError as structural:
+        structural.__context__ = None
+        raise
+    except Exception:
+        _raise_google_shape("unsupported_google_constructor_defaults")
+
+
+def _merge_legacy_google_metering_layers(
+    layers: tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """Merge legacy request layers without rejecting provider-native options."""
+    merged: dict[str, Any] = {}
+    generation: dict[str, Any] = {}
+    for layer in layers:
+        copied = dict(layer)
+        modern_config = _google_config_mapping(
+            copied.get("config"),
+            feature="unsupported_google_estimation_shape",
+        )
+        native_generation = _google_config_mapping(
+            copied.get("generation_config"),
+            feature="unsupported_google_estimation_shape",
+        )
+        generation.update(
+            {
+                key: value
+                for key, value in modern_config.items()
+                if key in _LEGACY_GOOGLE_GENERATION_CONFIG_KEYS
+            }
+        )
+        generation.update(native_generation)
+        if "max_output_tokens" in copied:
+            generation["max_output_tokens"] = copied["max_output_tokens"]
+        for key in ("model", "contents", "safety_settings", "tools", "tool_config"):
+            if key in copied:
+                value = copied[key]
+            elif key in modern_config:
+                value = modern_config[key]
+            else:
+                continue
+            merged[key] = _copy_legacy_google_tool_config(value) if key == "tool_config" else value
+    if generation:
+        merged["generation_config"] = generation
+    return merged
+
+
+def prepare_legacy_google_metering_kwargs(
+    client: object,
+    *layers: dict[str, Any],
+) -> dict[str, Any]:
+    """Project an effective legacy request onto content and output-cap fields.
+
+    Unlike failover translation, metering must accept every request shape the
+    legacy SDK itself accepts. Unrelated native options remain inside the SDK's
+    no-I/O ``_prepare_request`` merge and are deliberately ignored here.
+    """
+    try:
+        merged = _merge_legacy_google_metering_layers(layers)
+        payload = _legacy_google_request_payload(client, merged)
+        generation = _google_config_mapping(
+            payload.get("generation_config"),
+            feature="unsupported_google_estimation_shape",
+        )
+        config: dict[str, Any] = {}
+        if "max_output_tokens" in generation:
+            config["max_output_tokens"] = generation["max_output_tokens"]
+        if payload.get("system_instruction") is not None:
+            config["system_instruction"] = payload["system_instruction"]
+        projected: dict[str, Any] = {
+            "contents": payload.get("contents"),
+            "config": config,
+        }
+        if "model" in merged:
+            projected["model"] = merged["model"]
+        return projected
+    except UntranslatableRequestError as structural:
+        structural.__context__ = None
+        raise
+    except Exception:
+        _raise_google_shape("unsupported_google_estimation_shape")
+
+
+def _normalize_google_generate_content_kwargs(
+    kwargs: dict[str, Any], *, target_shape: str
+) -> dict[str, Any]:
+    """Normalize one ephemeral Google request layer for the served SDK shape.
+
+    ``google-genai`` accepts ``model``, ``contents``, and a single ``config``;
+    deprecated ``google.generativeai`` accepts ``contents`` plus
+    ``generation_config`` and top-level tool/safety options. This helper maps the
+    documented common generation subset without importing either SDK. It is
+    called independently for global defaults, entry defaults, and per-call
+    values so the ordinary merge order keeps caller precedence across aliases.
+
+    Customer contents and system/tool material are never logged or retained;
+    they move opaquely through defensive, short-lived mappings only.
+    """
+    if target_shape not in {"google_genai", "google_generativeai"}:
+        raise RuntimeError(f"unsupported Google client shape: {target_shape}")
+
+    normalized = dict(kwargs)
+    for key in normalized:
+        if key not in _GOOGLE_GENERATE_CONTENT_KEYS:
+            _raise_google_shape("unsupported_google_kwargs")
+    if target_shape == "google_generativeai":
+        if "system_instruction" in normalized:
+            _raise_google_shape("google.system_instruction_per_call")
+
+        modern_config_value = normalized.pop("config", None)
+        modern_config = _google_config_mapping(
+            modern_config_value,
+            feature="unsupported_google_config_shape",
+        )
+        unsupported_config = set(modern_config) - (
+            _LEGACY_GOOGLE_GENERATION_CONFIG_KEYS
+            | {"system_instruction", "safety_settings", "tools", "tool_config"}
+        )
+        if unsupported_config:
+            _raise_google_shape("unsupported_google_config")
+        if "system_instruction" in modern_config:
+            # Legacy GenerativeModel stores this at construction and exposes no
+            # per-call parameter. Mutating the shared model would be racy.
+            _raise_google_shape("google.system_instruction_per_call")
+
+        mapped_generation = {
+            key: value
+            for key, value in modern_config.items()
+            if key in _LEGACY_GOOGLE_GENERATION_CONFIG_KEYS
+        }
+        if "max_output_tokens" in normalized:
+            mapped_generation["max_output_tokens"] = normalized.pop("max_output_tokens")
+        native_generation_value = normalized.get("generation_config")
+        if native_generation_value is not None and mapped_generation:
+            native_generation = _google_config_mapping(
+                native_generation_value,
+                feature="unsupported_google_generation_config_shape",
+            )
+            unknown = set(native_generation) - _LEGACY_GOOGLE_GENERATION_CONFIG_KEYS
+            if unknown:
+                _raise_google_shape("unsupported_google_generation_config")
+            mapped_generation.update(native_generation)
+            normalized["generation_config"] = mapped_generation
+        elif native_generation_value is None and mapped_generation:
+            normalized["generation_config"] = mapped_generation
+
+        if "safety_settings" not in normalized and "safety_settings" in modern_config:
+            normalized["safety_settings"] = modern_config["safety_settings"]
+        if "tools" not in normalized and "tools" in modern_config:
+            normalized["tools"] = _normalize_google_tools(
+                modern_config["tools"], target_shape=target_shape
+            )
+        if "tool_config" not in normalized and modern_config.get("tool_config") is not None:
+            normalized["tool_config"] = _normalize_google_tool_config(modern_config["tool_config"])
+        # Already-top-level legacy values remain native passthrough. Only values
+        # extracted from modern ``config`` above need cross-shape conversion.
+        # Dict tool configs still get a defensive nested copy because the legacy
+        # SDK's converter mutates them in place during provider dispatch.
+        if "tool_config" in normalized:
+            normalized["tool_config"] = _copy_legacy_google_tool_config(normalized["tool_config"])
+        return normalized
+
+    request_options = normalized.pop("request_options", None)
+    if request_options:
+        _raise_google_shape("google.request_options")
+
+    legacy_generation_value = normalized.pop("generation_config", None)
+    legacy_generation = _google_config_mapping(
+        legacy_generation_value,
+        feature="unsupported_google_generation_config_shape",
+    )
+    unknown_generation = set(legacy_generation) - _LEGACY_GOOGLE_GENERATION_CONFIG_KEYS
+    if unknown_generation:
+        _raise_google_shape("unsupported_google_generation_config")
+    if "max_output_tokens" in normalized:
+        legacy_generation["max_output_tokens"] = normalized.pop("max_output_tokens")
+
+    native_config_value = normalized.pop("config", None)
+    native_config = _google_config_mapping(
+        native_config_value,
+        feature="unsupported_google_config_shape",
+    )
+    mapped_config = dict(legacy_generation)
+    for key in ("safety_settings", "tools", "tool_config", "system_instruction"):
+        if key not in normalized:
+            continue
+        value = normalized.pop(key)
+        if key == "tools":
+            value = _normalize_google_tools(value, target_shape=target_shape)
+        elif key == "tool_config" and value is not None:
+            value = _normalize_google_tool_config(value)
+        mapped_config[key] = value
+    mapped_config.update(native_config)
+    if mapped_config or native_config_value is not None or legacy_generation_value is not None:
+        normalized["config"] = mapped_config
+    return normalized
+
+
+def normalize_google_generate_content_kwargs(
+    kwargs: dict[str, Any], *, target_shape: str
+) -> dict[str, Any]:
+    """Normalize one request layer and suppress content-bearing conversion errors."""
+    try:
+        return _normalize_google_generate_content_kwargs(kwargs, target_shape=target_shape)
+    except UntranslatableRequestError as structural:
+        structural.__context__ = None
+        raise
+    except Exception:
+        _raise_google_shape("malformed_google_request")
+
+
+def merge_google_generate_content_kwargs(
+    *layers: dict[str, Any],
+    target_shape: str,
+) -> dict[str, Any]:
+    """Merge precedence-ordered Google layers with field-level config precedence."""
+    config_key = "generation_config" if target_shape == "google_generativeai" else "config"
+    merged: dict[str, Any] = {}
+    merged_config: dict[str, Any] = {}
+    saw_config = False
+    for layer in layers:
+        normalized = normalize_google_generate_content_kwargs(layer, target_shape=target_shape)
+        config = normalized.pop(config_key, None)
+        if config is not None:
+            saw_config = True
+            merged_config.update(_google_config_mapping(config, feature="malformed_google_request"))
+        merged.update(normalized)
+    if saw_config:
+        merged[config_key] = merged_config
+    return merged
+
+
+def normalize_google_translation_source_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the documented Google source subset for canonical translation.
+
+    The canonical Google translator consumes modern structured turns. Legacy's
+    ordinary string contents are represented as one user text turn. Already
+    structured modern turns pass via defensive container copies; every other
+    legacy content type fails with one constant structural label before provider
+    I/O, rather than leaking a value through a conversion exception.
+    """
+    normalized = normalize_google_generate_content_kwargs(
+        kwargs,
+        target_shape="google_genai",
+    )
+    try:
+        contents = normalized.get("contents")
+        if isinstance(contents, str):
+            normalized["contents"] = [{"role": "user", "parts": [{"text": contents}]}]
+            return normalized
+        if not isinstance(contents, list):
+            _raise_google_shape("unsupported_google_contents_shape")
+        turns: list[dict[str, Any]] = []
+        for turn in contents:
+            if not isinstance(turn, dict):
+                _raise_google_shape("unsupported_google_contents_shape")
+            parts = turn.get("parts")
+            if not isinstance(parts, list) or not all(isinstance(part, dict) for part in parts):
+                _raise_google_shape("unsupported_google_contents_shape")
+            turns.append({**turn, "parts": list(parts)})
+        normalized["contents"] = turns
+        return normalized
+    except UntranslatableRequestError as structural:
+        structural.__context__ = None
+        raise
+    except Exception:
+        _raise_google_shape("unsupported_google_contents_shape")
+
+
+def normalize_legacy_google_generate_content_args(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Normalize legacy ``GenerativeModel.generate_content`` call arguments.
+
+    The deprecated ``google.generativeai`` client accepts exactly one positional
+    argument: customer ``contents``. Keep that content-bearing reshape inside
+    the privacy firewall, return only a short-lived defensive copy, and retain
+    normal Python duplicate-argument behavior.
+    """
+    if len(args) > 1:
+        raise TypeError(
+            f"generate_content() takes 1 positional argument but {len(args)} were given"
+        )
+    normalized = dict(kwargs)
+    if not args:
+        return normalized
+    if "contents" in normalized:
+        raise TypeError("generate_content() got multiple values for argument 'contents'")
+    normalized["contents"] = args[0]
+    return normalized
 
 
 def estimate_content_length(kwargs: dict[str, Any]) -> int:
@@ -67,18 +674,43 @@ def estimate_content_length(kwargs: dict[str, Any]) -> int:
                 if isinstance(text, str):
                     total += len(text)
 
-    contents = kwargs.get("contents")
-    if isinstance(contents, str):
-        total += len(contents)
-    elif isinstance(contents, list):
-        for item in contents:
-            if isinstance(item, str):
-                total += len(item)
-            elif isinstance(item, dict):
-                text = item.get("text", "")
-                if isinstance(text, str):
-                    total += len(text)
+    try:
+        config_value = kwargs.get("config")
+        if config_value is not None:
+            config = _google_config_mapping(
+                config_value,
+                feature="unsupported_google_estimation_shape",
+            )
+            total += _google_prompt_text_length(config.get("system_instruction"))
+        total += _google_prompt_text_length(kwargs.get("contents"))
+    except UntranslatableRequestError as structural:
+        structural.__context__ = None
+        raise
+    except Exception:
+        _raise_google_shape("unsupported_google_estimation_shape")
 
+    return total
+
+
+def _google_prompt_text_length(value: object) -> int:
+    """Count text in Google string/content/part shapes without joining it."""
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, (list, tuple)):
+        return sum(_google_prompt_text_length(item) for item in value)
+    mapped = _google_config_mapping(
+        value,
+        feature="unsupported_google_estimation_shape",
+    )
+    text = mapped.get("text")
+    total = len(text) if isinstance(text, str) else 0
+    parts = mapped.get("parts")
+    if parts is not None:
+        if not isinstance(parts, (list, tuple)):
+            _raise_google_shape("unsupported_google_estimation_shape")
+        total += sum(_google_prompt_text_length(part) for part in parts)
     return total
 
 
