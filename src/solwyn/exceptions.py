@@ -258,9 +258,15 @@ class UntrackedSpendSurfaceError(SolwynError, AttributeError):
         capability_scope: str | None,
     ) -> None:
         scope = f" (scope: {capability_scope})" if capability_scope is not None else ""
+        if kind == "unmetered_spend":
+            guidance = f"acknowledge exact token '{token}'"
+        else:
+            guidance = (
+                "review the provider graph and acknowledge an exact terminal capability token"
+            )
         super().__init__(
             f"Solwyn refused untracked surface '{surface}' for provider "
-            f"{provider}{scope}; acknowledge exact token '{token}' or choose "
+            f"{provider}{scope}; {guidance} or choose "
             "on_unmetered='warn'/'allow'"
         )
         self.surface = surface

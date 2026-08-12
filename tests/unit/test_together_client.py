@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -52,7 +52,10 @@ def _reset_spend_surface_latch() -> None:
     _reset_unmetered_spend_warnings()
 
 
-class _YieldingSet(set[str]):
+_T = TypeVar("_T")
+
+
+class _YieldingSet(set[_T]):
     """Yield after an absent membership check to expose check/insert races."""
 
     def __contains__(self, item: object) -> bool:
@@ -367,7 +370,11 @@ def test_sync_concurrent_unmetered_surface_access_warns_exactly_once(
     # Swap the module-level latch for one that yields on an absent membership
     # check, exposing any check-then-insert race; the surrounding lock must still
     # serialize so exactly one thread warns. monkeypatch restores the original.
-    monkeypatch.setattr(_base, "_warned_spend_surfaces", _YieldingSet())
+    monkeypatch.setattr(
+        _base,
+        "_warned_contextual_surfaces",
+        _YieldingSet[tuple[str, str, str]](),
+    )
     start = threading.Barrier(worker_count)
 
     def access_surface(_: int) -> object:
@@ -382,7 +389,12 @@ def test_sync_concurrent_unmetered_surface_access_warns_exactly_once(
 
     assert all(result is resource for result in results)
     assert len(caplog.records) == 1
-    assert "surface 'rerank'" in caplog.records[0].getMessage()
+    assert caplog.records[0].args == (
+        "together",
+        "native_together",
+        "rerank",
+        None,
+    )
     solwyn.close()
 
 

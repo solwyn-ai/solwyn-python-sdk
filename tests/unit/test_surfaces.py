@@ -43,6 +43,18 @@ OPENAI_ASYNC = SurfaceContext(
     client_shape="openai_sdk",
     mode="async",
 )
+ANTHROPIC_SYNC = SurfaceContext(
+    provider="anthropic",
+    dialect="anthropic",
+    client_shape="anthropic_sdk",
+    mode="sync",
+)
+ANTHROPIC_ASYNC = SurfaceContext(
+    provider="anthropic",
+    dialect="anthropic",
+    client_shape="anthropic_sdk",
+    mode="async",
+)
 GROQ_SYNC = SurfaceContext(
     provider="groq",
     dialect="openai",
@@ -526,6 +538,145 @@ def test_raw_escape_hatches_carry_exact_scopes() -> None:
         assert rule is not None
         assert rule.kind is SurfaceKind.UNMETERED_SPEND
         assert rule.capability_scope is scope
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("context", "path"),
+    [
+        (OPENAI_SYNC, "realtime.calls"),
+        (OPENAI_ASYNC, "realtime.calls"),
+        (ANTHROPIC_SYNC, "beta.environments.work"),
+        (ANTHROPIC_ASYNC, "beta.environments.work"),
+    ],
+)
+def test_supported_operation_containers_are_guarded_namespaces(
+    context: SurfaceContext,
+    path: str,
+) -> None:
+    # Arrange / Act
+    rule = resolve_surface_rule(
+        context=context,
+        path=path,
+        source=SurfaceSource.RAW,
+    )
+
+    # Assert
+    assert rule is not None
+    assert rule.kind is SurfaceKind.NAMESPACE
+    assert rule.acknowledgment_token is None
+    assert rule.capability_scope is None
+    assert rule.expected_shapes == (
+        AttributeShape(descriptor_category="cached_property", return_shape="resource"),
+    )
+
+
+def _assert_unmetered_operation(context: SurfaceContext, path: str) -> None:
+    rule = resolve_surface_rule(
+        context=context,
+        path=path,
+        source=SurfaceSource.RAW,
+    )
+
+    assert rule is not None
+    assert rule.kind is SurfaceKind.UNMETERED_SPEND
+    assert rule.acknowledgment_token == path
+    assert rule.capability_scope is CapabilityScope.OPERATION
+    assert rule.expected_shapes == (
+        AttributeShape(descriptor_category="function", return_shape="callable"),
+    )
+
+
+def _assert_raw_response_family(
+    context: SurfaceContext,
+    prefix: str,
+    operations: set[str],
+) -> None:
+    for response_container in ("with_raw_response", "with_streaming_response"):
+        container_path = f"{prefix}.{response_container}"
+        container = resolve_surface_rule(
+            context=context,
+            path=container_path,
+            source=SurfaceSource.RAW,
+        )
+        assert container is not None
+        assert container.kind is SurfaceKind.UNMETERED_SPEND
+        assert container.acknowledgment_token == container_path
+        assert container.capability_scope is CapabilityScope.RAW_RESPONSE
+        assert container.expected_shapes == (
+            AttributeShape(descriptor_category="cached_property", return_shape="resource"),
+        )
+        for operation in operations:
+            path = f"{container_path}.{operation}"
+            leaf = resolve_surface_rule(
+                context=context,
+                path=path,
+                source=SurfaceSource.RAW,
+            )
+            assert leaf is not None
+            assert leaf.kind is SurfaceKind.UNMETERED_SPEND
+            assert leaf.acknowledgment_token == path
+            assert leaf.capability_scope is CapabilityScope.RAW_RESPONSE
+            assert leaf.expected_shapes == (
+                AttributeShape(descriptor_category="function", return_shape="callable"),
+            )
+
+
+@pytest.mark.unit
+def test_realtime_calls_children_have_exact_operation_and_raw_response_scopes() -> None:
+    # Arrange
+    operations = {"accept", "create", "hangup", "refer", "reject"}
+
+    # Act / Assert
+    for context in (OPENAI_SYNC, OPENAI_ASYNC):
+        for operation in operations:
+            _assert_unmetered_operation(context, f"realtime.calls.{operation}")
+        _assert_raw_response_family(context, "realtime.calls", operations)
+
+
+@pytest.mark.unit
+def test_anthropic_work_children_cover_sync_async_and_raw_response_shapes() -> None:
+    # Arrange
+    operations = {"ack", "heartbeat", "list", "poll", "retrieve", "stats", "stop", "update"}
+
+    # Act / Assert
+    for context in (ANTHROPIC_SYNC, ANTHROPIC_ASYNC):
+        for operation in operations:
+            _assert_unmetered_operation(context, f"beta.environments.work.{operation}")
+        _assert_raw_response_family(context, "beta.environments.work", operations)
+    for operation in ("poller", "worker"):
+        _assert_unmetered_operation(ANTHROPIC_ASYNC, f"beta.environments.work.{operation}")
+        assert (
+            resolve_surface_rule(
+                context=ANTHROPIC_SYNC,
+                path=f"beta.environments.work.{operation}",
+                source=SurfaceSource.RAW,
+            )
+            is None
+        )
+
+
+@pytest.mark.unit
+def test_supported_container_children_preserve_reviewed_selectors_and_modes() -> None:
+    # Arrange
+    parents = {
+        prefix: next(rule for rule in SURFACE_RULES if rule.surface == prefix)
+        for prefix in ("realtime.calls", "beta.environments.work")
+    }
+
+    # Act / Assert
+    for prefix, parent in parents.items():
+        family = [rule for rule in SURFACE_RULES if rule.surface.startswith(f"{prefix}.")]
+        assert family
+        for rule in family:
+            if rule.surface in {
+                "beta.environments.work.poller",
+                "beta.environments.work.worker",
+            }:
+                assert {selector.mode for selector in rule.selectors} == {"async"}
+                assert set(rule.selectors) <= set(parent.selectors)
+            else:
+                assert rule.selectors == parent.selectors
 
 
 @pytest.mark.unit

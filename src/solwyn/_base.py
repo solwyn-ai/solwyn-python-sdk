@@ -38,6 +38,7 @@ from solwyn._surface_graph import (
 from solwyn._surfaces import (
     SURFACE_RULES,
     AttributeShape,
+    CapabilityScope,
     SurfaceContext,
     SurfaceKind,
     SurfaceRule,
@@ -843,6 +844,34 @@ class _SolwynBase:
                     self._invalid_acknowledgment(token, f"namespace {path!r} shape drifted")
                 value = returned
                 continue
+            if rule is not None and rule.kind is SurfaceKind.UNMETERED_SPEND:
+                if not self._shape_matches_before_evaluation(
+                    rule,
+                    descriptor_category,
+                    static_return_shape,
+                ):
+                    self._invalid_acknowledgment(
+                        token,
+                        f"unmetered prefix {path!r} shape drifted",
+                    )
+                returned = getattr(value, name)
+                if not self._shape_is_intentionally_unevaluated(
+                    rule,
+                    descriptor_category,
+                ) and not rule.accepts_shape(
+                    AttributeShape(descriptor_category, _return_shape(returned))
+                ):
+                    self._invalid_acknowledgment(
+                        token,
+                        f"unmetered prefix {path!r} shape drifted",
+                    )
+                if not self._is_guardable_provider_resource(returned):
+                    self._invalid_acknowledgment(
+                        token,
+                        f"unmetered prefix {path!r} is not a guardable provider resource",
+                    )
+                value = returned
+                continue
             if rule is not None:
                 self._invalid_acknowledgment(token, f"prefix {path!r} is not a namespace")
             returned = getattr(value, name)
@@ -910,9 +939,24 @@ class _SolwynBase:
         prefix = f"{path}."
         return any(token.startswith(prefix) for token in self._config.acknowledge_untracked)
 
-    def _apply_untracked_posture(self, path: str, rule: SurfaceRule | None) -> None:
+    def _is_exact_raw_response_escape(self, path: str, rule: SurfaceRule) -> bool:
+        return (
+            rule.capability_scope is CapabilityScope.RAW_RESPONSE
+            and rule.token == path
+            and path in self._config.acknowledge_untracked
+        )
+
+    def _apply_untracked_posture(
+        self,
+        path: str,
+        rule: SurfaceRule | None,
+        *,
+        honor_acknowledgment: bool = True,
+    ) -> None:
         token = rule.token if rule is not None else path
-        if token in self._config.acknowledge_untracked or self._has_acknowledged_descendant(path):
+        if honor_acknowledgment and (
+            token in self._config.acknowledge_untracked or self._has_acknowledged_descendant(path)
+        ):
             return
         scope = (
             rule.capability_scope.value
@@ -1020,16 +1064,26 @@ class _SolwynBase:
                 descriptor_category,
                 static_return_shape,
             ):
-                self._apply_untracked_posture(path, None)
+                self._apply_untracked_posture(
+                    path,
+                    None,
+                    honor_acknowledgment=False,
+                )
                 return self._resolve_unknown_value(getattr(value, name), path)
             self._apply_untracked_posture(path, rule)
             returned = getattr(value, name)
             if self._shape_is_intentionally_unevaluated(rule, descriptor_category):
-                return returned
-            if not rule.accepts_shape(AttributeShape(descriptor_category, _return_shape(returned))):
-                self._apply_untracked_posture(path, None)
                 return self._resolve_unknown_value(returned, path)
-            return returned
+            if not rule.accepts_shape(AttributeShape(descriptor_category, _return_shape(returned))):
+                self._apply_untracked_posture(
+                    path,
+                    None,
+                    honor_acknowledgment=False,
+                )
+                return self._resolve_unknown_value(returned, path)
+            if self._is_exact_raw_response_escape(path, rule):
+                return returned
+            return self._resolve_unknown_value(returned, path)
         if rule.kind in {SurfaceKind.METADATA, SurfaceKind.INFRASTRUCTURE}:
             if not self._shape_matches_before_evaluation(
                 rule,

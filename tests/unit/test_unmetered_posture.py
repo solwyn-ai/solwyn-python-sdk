@@ -45,9 +45,45 @@ class _ContextResource:
         return None
 
 
+class _RawResponsesResource:
+    def create(self) -> str:
+        return "raw-created"
+
+    def delete(self) -> str:
+        return "raw-deleted"
+
+
+class _RawResponseClientResource:
+    @functools.cached_property
+    def responses(self) -> _RawResponsesResource:
+        return _RawResponsesResource()
+
+
+class _CallsResource:
+    def create(self) -> str:
+        return "call-created"
+
+    def reject(self) -> str:
+        return "call-rejected"
+
+
+class _RealtimeResource:
+    def __init__(self, client: _OpenAIClient) -> None:
+        self._client = client
+
+    @functools.cached_property
+    def calls(self) -> _CallsResource:
+        self._client.calls_evaluations += 1
+        return _CallsResource()
+
+
 _ResponsesResource.__module__ = "openai.resources.responses"
 _FutureResource.__module__ = "openai.resources.future"
 _ContextResource.__module__ = "openai.resources.future"
+_RawResponsesResource.__module__ = "openai.resources.responses"
+_RawResponseClientResource.__module__ = "openai.resources.with_raw_response"
+_CallsResource.__module__ = "openai.resources.realtime.calls"
+_RealtimeResource.__module__ = "openai.resources.realtime"
 
 
 class _OpenAIClient:
@@ -56,6 +92,7 @@ class _OpenAIClient:
         self.future_evaluations = 0
         self.base_url_evaluations = 0
         self.custom_auth_evaluations = 0
+        self.calls_evaluations = 0
         self._safe_url = _SafeURL()
 
     @functools.cached_property
@@ -72,6 +109,14 @@ class _OpenAIClient:
     def future_context(self) -> _ContextResource:
         return _ContextResource()
 
+    @functools.cached_property
+    def with_raw_response(self) -> _RawResponseClientResource:
+        return _RawResponseClientResource()
+
+    @functools.cached_property
+    def realtime(self) -> _RealtimeResource:
+        return _RealtimeResource(self)
+
     @property
     def base_url(self) -> _SafeURL:
         self.base_url_evaluations += 1
@@ -84,6 +129,9 @@ class _OpenAIClient:
 
     def post(self) -> str:
         return "posted"
+
+    def experimental_leaf(self) -> str:
+        return "experimental"
 
     def close(self) -> None:
         return None
@@ -143,10 +191,8 @@ for _client_type in (
 
 
 def _make_solwyn(client: object, **kwargs: object) -> Solwyn:
-    with patch("solwyn.reporter.MetadataReporter._flush_loop"):
+    with patch("solwyn.client.MetadataReporter", autospec=True):
         wrapper = Solwyn(client, api_key=VALID_API_KEY, **kwargs)
-    wrapper._reporter._shutdown.set()
-    wrapper._reporter._thread.join(timeout=2.0)
     return wrapper
 
 
@@ -202,6 +248,7 @@ def test_raise_refuses_a_known_untracked_surface_with_its_scope() -> None:
     assert exc_info.value.surface == "post"
     assert exc_info.value.token == "post"
     assert exc_info.value.capability_scope == "arbitrary_endpoint"
+    assert "acknowledge exact token 'post'" in str(exc_info.value)
     _close(wrapper)
 
 
@@ -241,6 +288,200 @@ def test_unknown_acknowledgment_keeps_prefix_guarded_and_future_sibling_refused(
     with pytest.raises(UntrackedSpendSurfaceError):
         _ = future.sibling
     _close(wrapper)
+
+
+@pytest.mark.unit
+def test_unmetered_resource_prefix_allows_only_an_exact_descendant() -> None:
+    # Arrange
+    client = _OpenAIClient()
+    wrapper = _make_solwyn(
+        client,
+        on_unmetered="raise",
+        acknowledge_untracked={"with_raw_response.responses.create"},
+    )
+
+    # Act
+    raw_response = wrapper.with_raw_response
+    responses = raw_response.responses
+
+    # Assert
+    assert raw_response is wrapper.with_raw_response
+    assert raw_response is not client.with_raw_response
+    assert responses is raw_response.responses
+    assert responses is not client.with_raw_response.responses
+    assert responses.create() == "raw-created"
+    with pytest.raises(UntrackedSpendSurfaceError):
+        _ = responses.delete
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_exact_scoped_raw_response_parent_acknowledgment_remains_raw() -> None:
+    # Arrange
+    client = _OpenAIClient()
+    wrapper = _make_solwyn(
+        client,
+        on_unmetered="raise",
+        acknowledge_untracked={"with_raw_response"},
+    )
+
+    # Act
+    raw_response = wrapper.with_raw_response
+
+    # Assert
+    assert raw_response is client.with_raw_response
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_exact_raw_response_acknowledgment_does_not_authorize_shape_drift() -> None:
+    # Arrange
+    client = _OpenAIClient()
+    wrapper = _make_solwyn(
+        client,
+        on_unmetered="raise",
+        acknowledge_untracked={"with_raw_response"},
+    )
+    validated_value = client.with_raw_response
+    client.__dict__["with_raw_response"] = lambda: "drifted"
+
+    # Act
+    with pytest.raises(UntrackedSpendSurfaceError) as exc_info:
+        _ = wrapper.with_raw_response
+
+    # Assert
+    assert isinstance(validated_value, _RawResponseClientResource)
+    assert exc_info.value.kind == "unknown"
+    _close(wrapper)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("posture", ["warn", "allow"])
+def test_permitted_raw_response_parent_without_exact_acknowledgment_is_guarded(
+    posture: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    client = _OpenAIClient()
+    wrapper = _make_solwyn(client, on_unmetered=posture)
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+        raw_response = wrapper.with_raw_response
+        repeated = wrapper.with_raw_response
+
+    # Assert
+    assert raw_response is repeated
+    assert raw_response is not client.with_raw_response
+    records = foreground_records(caplog)
+    if posture == "warn":
+        assert len(records) == 1
+        assert records[0].args == (
+            "openai",
+            "openai_sdk",
+            "with_raw_response",
+            "raw_response",
+        )
+    else:
+        assert records == []
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_exact_raw_response_acknowledgment_does_not_authorize_static_shape_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Arrange
+    client = _OpenAIClient()
+    wrapper = _make_solwyn(
+        client,
+        on_unmetered="raise",
+        acknowledge_untracked={"with_raw_response"},
+    )
+    evaluations = 0
+
+    def drifted_raw_response(_client: _OpenAIClient) -> _RawResponseClientResource:
+        nonlocal evaluations
+        evaluations += 1
+        return _RawResponseClientResource()
+
+    monkeypatch.setattr(
+        _OpenAIClient,
+        "with_raw_response",
+        property(drifted_raw_response),
+    )
+
+    # Act
+    with pytest.raises(UntrackedSpendSurfaceError) as exc_info:
+        _ = wrapper.with_raw_response
+
+    # Assert
+    assert exc_info.value.kind == "unknown"
+    assert evaluations == 0
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_realtime_calls_namespace_returns_a_cached_guard_and_refuses_child() -> None:
+    # Arrange
+    client = _OpenAIClient()
+    wrapper = _make_solwyn(client, on_unmetered="raise")
+
+    # Act
+    calls = wrapper.realtime.calls
+
+    # Assert
+    assert client.calls_evaluations == 1
+    assert calls is wrapper.realtime.calls
+    assert calls is not client.realtime.calls
+    with pytest.raises(UntrackedSpendSurfaceError):
+        _ = calls.create
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_realtime_calls_namespace_parent_acknowledgment_is_rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ConfigurationError, match="classified as namespace"):
+        _make_solwyn(
+            _OpenAIClient(),
+            on_unmetered="raise",
+            acknowledge_untracked={"realtime.calls"},
+        )
+
+
+@pytest.mark.unit
+def test_realtime_calls_exact_descendant_allows_only_that_operation() -> None:
+    # Arrange
+    client = _OpenAIClient()
+    wrapper = _make_solwyn(
+        client,
+        on_unmetered="raise",
+        acknowledge_untracked={"realtime.calls.create"},
+    )
+
+    # Act
+    calls = wrapper.realtime.calls
+    created = calls.create()
+
+    # Assert
+    assert created == "call-created"
+    assert calls is wrapper.realtime.calls
+    assert calls is not client.realtime.calls
+    with pytest.raises(UntrackedSpendSurfaceError):
+        _ = calls.reject
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_non_guardable_unevaluated_prefix_acknowledgment_is_rejected() -> None:
+    # Arrange / Act / Assert
+    with pytest.raises(ConfigurationError, match="not a guardable provider resource"):
+        _make_solwyn(
+            _OpenAIClient(),
+            on_unmetered="raise",
+            acknowledge_untracked={"custom_auth.leaf"},
+        )
 
 
 @pytest.mark.unit
@@ -339,6 +580,52 @@ def test_strict_invisible_dynamic_known_path_refuses_before_dynamic_lookup() -> 
 
     assert client.dynamic_evaluations == 0
     _close(wrapper)
+
+
+@pytest.mark.unit
+def test_unknown_resource_error_does_not_advertise_the_parent_token() -> None:
+    # Arrange
+    wrapper = _make_solwyn(_OpenAIClient(), on_unmetered="raise")
+
+    # Act
+    with pytest.raises(UntrackedSpendSurfaceError) as exc_info:
+        _ = wrapper.future
+    message = str(exc_info.value)
+    _close(wrapper)
+    with pytest.raises(ConfigurationError, match="names a resource container"):
+        _make_solwyn(
+            _OpenAIClient(),
+            on_unmetered="raise",
+            acknowledge_untracked={"future"},
+        )
+
+    # Assert
+    assert "acknowledge exact token 'future'" not in message
+    assert "review the provider graph and acknowledge an exact terminal capability token" in message
+
+
+@pytest.mark.unit
+def test_unknown_callable_error_allows_its_exact_terminal_token() -> None:
+    # Arrange
+    wrapper = _make_solwyn(_OpenAIClient(), on_unmetered="raise")
+    acknowledged = _make_solwyn(
+        _OpenAIClient(),
+        on_unmetered="raise",
+        acknowledge_untracked={"experimental_leaf"},
+    )
+
+    # Act
+    with pytest.raises(UntrackedSpendSurfaceError) as exc_info:
+        _ = wrapper.experimental_leaf
+    acknowledged_result = acknowledged.experimental_leaf()
+
+    # Assert
+    assert "review the provider graph and acknowledge an exact terminal capability token" in str(
+        exc_info.value
+    )
+    assert acknowledged_result == "experimental"
+    _close(wrapper)
+    _close(acknowledged)
 
 
 @pytest.mark.unit
