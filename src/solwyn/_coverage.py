@@ -187,6 +187,7 @@ class CoverageReport(BaseModel):
             differences = _fingerprint_differences(
                 expected,
                 _fingerprint_from_expectation(actual),
+                actual_expectation=actual,
             )
         else:
             raise TypeError("expected must be a literal CoverageExpectation or CoverageFingerprint")
@@ -434,6 +435,8 @@ def _effective_actions(
         return "block", "refuse"
     if kind is SurfaceKind.UNSUPPORTED:
         return "unsupported", "refuse"
+    if kind not in {SurfaceKind.UNMETERED_SPEND, SurfaceKind.UNKNOWN}:
+        raise RuntimeError(f"unsupported coverage kind: {kind}")
 
     acknowledgments = client._config.acknowledge_untracked
     has_acknowledged_descendant = any(
@@ -634,12 +637,22 @@ def _fingerprint_from_expectation(expected: CoverageExpectation) -> CoverageFing
 def _fingerprint_differences(
     expected: CoverageFingerprint,
     actual: CoverageFingerprint,
+    *,
+    actual_expectation: CoverageExpectation | None = None,
 ) -> tuple[str, ...]:
-    return tuple(
-        f"{category}: fingerprint changed"
-        for category in _AUDIT_CATEGORIES
-        if getattr(expected, category) != getattr(actual, category)
-    )
+    differences: list[str] = []
+    for category in _AUDIT_CATEGORIES:
+        if getattr(expected, category) == getattr(actual, category):
+            continue
+        detail = ""
+        if actual_expectation is not None:
+            rows = getattr(actual_expectation, category)
+            detail = (
+                f" (actual now has {len(rows)} entries; pin a CoverageExpectation "
+                "for rule-level diffs)"
+            )
+        differences.append(f"{category}: fingerprint changed{detail}")
+    return tuple(differences)
 
 
 __all__ = [

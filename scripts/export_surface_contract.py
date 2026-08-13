@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from solwyn._surfaces import (
+    SURFACE_RULES,
     AttributeShape,
     SurfaceContext,
     SurfaceSource,
@@ -91,10 +92,49 @@ def compare_report_directory(path: Path) -> tuple[str, ...]:
     if not report_paths:
         return (f"no provider surface reports found in {path}",)
     mismatches: list[str] = []
+    observed_by_context: dict[SurfaceContext, set[str]] = {}
     for report_path in report_paths:
         report = json.loads(report_path.read_text(encoding="utf-8"))
         mismatches.extend(compare_report_contract(report, label=report_path.name))
+        provider = str(report["provider"])
+        context = SurfaceContext(
+            provider=provider,
+            dialect=_DIALECT_BY_PROVIDER[provider],
+            client_shape=str(report["client_shape"]),
+            mode=str(report["mode"]),
+        )
+        observed_by_context.setdefault(context, set()).update(
+            str(observation["path"]) for observation in report["observations"]
+        )
+    _print_dead_rule_advisories(observed_by_context)
     return tuple(mismatches)
+
+
+def _print_dead_rule_advisories(
+    observed_by_context: dict[SurfaceContext, set[str]],
+) -> None:
+    """Advisory only: rules resolvable for a captured context but never observed."""
+
+    dead: list[str] = []
+    for rule in SURFACE_RULES:
+        applicable = [
+            context
+            for context in observed_by_context
+            if resolve_surface_rule(
+                context=context,
+                path=rule.surface,
+                source=SurfaceSource.RAW,
+            )
+            is rule
+        ]
+        if applicable and all(
+            rule.surface not in observed_by_context[context] for context in applicable
+        ):
+            dead.append(rule.rule_id)
+    for rule_id in sorted(dead)[:20]:
+        print(f"advisory: unobserved rule {rule_id}")
+    if len(dead) > 20:
+        print(f"advisory: {len(dead) - 20} more unobserved rules")
 
 
 def generate_and_check(

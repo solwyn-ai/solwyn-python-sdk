@@ -363,6 +363,30 @@ def test_generated_report_directory_check_fails_closed_when_empty(tmp_path: Path
 
 
 @pytest.mark.unit
+def test_report_comparison_emits_dead_rule_advisories(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # Arrange
+    exporter = _export_module()
+    report = {
+        "provider": "anthropic",
+        "client_shape": "anthropic_sdk",
+        "mode": "sync",
+        "observations": [],
+    }
+    (tmp_path / "anthropic_sync--latest.json").write_text(json.dumps(report), encoding="utf-8")
+
+    # Act
+    mismatches = exporter.compare_report_directory(tmp_path)
+
+    # Assert
+    captured = capsys.readouterr().out
+    assert mismatches == ()
+    assert "advisory:" in captured
+    assert "unobserved" in captured
+
+
+@pytest.mark.unit
 def test_provider_matrix_checks_each_generated_report_against_the_contract() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     workflow_data = yaml.safe_load(workflow)

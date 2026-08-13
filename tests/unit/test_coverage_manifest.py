@@ -611,6 +611,43 @@ def test_compact_fingerprint_is_frozen_literal_and_covers_every_category() -> No
 
 
 @pytest.mark.unit
+def test_fingerprint_mismatch_names_the_category_size_for_triage() -> None:
+    # Arrange
+    report = _report_for_expectation(_audit_entry())
+    good = report.fingerprint()
+    tampered = good.model_copy(update={"untracked": "sha256:" + "0" * 64})
+
+    # Act
+    with pytest.raises(CoverageMismatchError) as exc_info:
+        report.expect(tampered)
+
+    # Assert
+    message = str(exc_info.value)
+    assert "untracked: fingerprint changed" in message
+    assert "entries" in message
+    assert "CoverageExpectation" in message
+
+
+@pytest.mark.unit
+def test_effective_actions_rejects_an_unsupported_coverage_kind() -> None:
+    # Arrange
+    import solwyn._coverage as coverage_module
+
+    client = _wrapper(_OpenAIShape())
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="unsupported coverage kind"):
+        coverage_module._effective_actions(
+            kind=object(),
+            token="future.operation",
+            surface="future.operation",
+            return_shape="callable",
+            capability_scope=None,
+            client=client,
+        )
+
+
+@pytest.mark.unit
 def test_real_openai_shape_matches_the_literal_exhaustive_audit_fingerprint() -> None:
     raw = openai.OpenAI(api_key="sk-test")
     try:
