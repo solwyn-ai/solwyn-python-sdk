@@ -310,11 +310,11 @@ audit_client = Solwyn(
 )
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
-    guarded_namespaces="sha256:f8cd6c254dc5fb2076d33aeff6d9e96cd12b3d63cc89850ba86f0d7b5ed62818",
+    guarded_namespaces="sha256:770ba77e018f38c9b64af1d43770dfd6d79f3c1d1c9f5ac5253cfa3000d2b743",
     tracked="sha256:ee52e554ddf531bea4560f69fdbef1ca0ac90e433fb9f93fba6e291d39e2aebc",
-    untracked="sha256:989f425b3fd2f431f691fc83fda676879ef3cda89aafa123d1943af957ce7700",
+    untracked="sha256:8f7d1bc744e022db61ec44c7e2ebfadcf3599ea225a021050ff3022620ecfd3c",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    scoped_escapes="sha256:3d8b7cfcf068bbf907c9e257e5c596844bec9a52b5414898835715f4a7dd406c",
+    scoped_escapes="sha256:6808a0f2ac290c9d4d1504b21b1c0ba98267636ced4234416b53533b29bb4073",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     unsupported="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     conditional="sha256:ce837f71d1fc97849872c5d0f86b0b1f26e1bc4e46a29c3b1b8004bf4b9bcb77",
