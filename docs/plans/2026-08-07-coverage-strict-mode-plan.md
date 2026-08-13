@@ -202,7 +202,7 @@ The initial audit must classify these current cases before the contract is accep
 
 ### Initial Classification Policy and Review Gate
 
-U0 produces the raw, versioned inventories; U1 must convert every observed pre-call row into the committed classification ledger before runtime behavior changes.
+U0 produces full, versioned inventories as downloadable CI artifacts and commits their compact structural fingerprints; U1 must convert every observed pre-call row from those reports into the committed classification ledger before runtime behavior changes.
 The canary discovers paths and shapes but never chooses policy.
 Review applies this precedence to each exact contextual row:
 
@@ -323,17 +323,17 @@ No release step relies on a claim about current customer count.
 - **Goal:** Prove the graph-observation premise against every supported real SDK shape before the rule schema or runtime resolver becomes load-bearing.
 - **Requirements:** R24-R26, R28; KTD9, KTD15.
 - **Dependencies:** None.
-- **Files:** Create `src/solwyn/_surface_graph.py`, `tests/unit/test_surface_observer.py`, `scripts/capture_surface_inventory.py`, and version-labelled fixtures under `tests/fixtures/provider_surface_inventory/`; modify `pyproject.toml`, `uv.lock`, `Makefile`, and `.github/workflows/ci.yml`.
-- **Approach:** Implement the minimal provider-agnostic observer needed to enumerate public roots, inspect descriptor categories statically, and traverse an explicit test-supplied namespace set with cycle and depth protection. Add `google-genai`, `google-generativeai`, boto3, aioboto3, OpenAI, Anthropic, and Together to controlled dev/canary dependency sets without importing them from `src/`. Construct genuine sync and async clients with fake credentials and disable socket access. Run an observer-only solver-compatible matrix at the supported floor, every known public-resource-tree breakpoint, and latest; persist a deterministic raw inventory fixture for every client-shape/interval pair. Boto3 and aiobotocore versions are resolved as compatible sets rather than independently pinned. U0's matrix jobs use read-only repository permissions, no persisted checkout credentials, and no provider/cloud credentials. U1 consumes these fixtures, while U4 reuses the same matrix with classification enforcement enabled.
+- **Files:** Create `src/solwyn/_surface_graph.py`, `tests/unit/test_surface_observer.py`, `scripts/capture_surface_inventory.py`, and `tests/provider_surface_fingerprints.json`; modify `pyproject.toml`, `uv.lock`, `Makefile`, and `.github/workflows/ci.yml`.
+- **Approach:** Implement the minimal provider-agnostic observer needed to enumerate public roots, inspect descriptor categories statically, and traverse an explicit test-supplied namespace set with cycle and depth protection. Add `google-genai`, `google-generativeai`, boto3, aioboto3, OpenAI, Anthropic, and Together to controlled dev/canary dependency sets without importing them from `src/`. Construct genuine sync and async clients with fake credentials and disable socket access. Run an observer-only solver-compatible matrix at the supported floor, every known public-resource-tree breakpoint, and latest. Commit a compact, version-independent structural fingerprint for every client-shape/interval pair; write full deterministic inventories to ignored `build/provider_surface_inventory/` and upload them from CI for seven days, including on check failures. Boto3 and aiobotocore versions are resolved as compatible sets rather than independently pinned. U0's matrix jobs use read-only repository permissions, no persisted checkout credentials, and no provider/cloud credentials. U1 consumes generated or downloaded full reports, while U4 reuses the same matrix with classification enforcement enabled.
 - **Test scenarios:**
   - Native OpenAI/AsyncOpenAI, Azure/AsyncAzureOpenAI, Anthropic/AsyncAnthropic, native Together/AsyncTogether, and generic compatible clients yield deterministic public roots offline.
   - Real `google-genai` sync resources and `aio` are observable, and a real `google.generativeai` client records its distinct root shape.
   - Real boto3 and aioboto3 `bedrock-runtime` clients expose their actual public attributes without making an AWS request.
   - Declared namespace traversal detects cycles, repeated objects, inaccessible descriptors, and depth exhaustion with the exact dotted path.
   - Observation records descriptor category and returned capability shape without inspecting request arguments, prompts, responses, or credentials.
-  - A temporary new child under a declared namespace appears in the raw inventory without being assigned a policy automatically.
-  - Every persisted fixture records distribution name, installed version, structural interval, client shape, mode, exact path, observed descriptor category, and observed return shape in deterministic order.
-- **Verification:** The observer-only structural-interval matrix and committed fixtures pass before U1. Every mandatory client shape is statically observable enough to support the proposed guard, or implementation stops here and revises the architecture.
+  - A temporary new child under a declared namespace appears in the full artifact and changes the committed structural fingerprint without being assigned a policy automatically.
+  - Every full artifact records distribution name, installed version, structural interval, client shape, mode, exact path, observed descriptor category, and observed return shape in deterministic order.
+- **Verification:** The observer-only structural-interval matrix and committed fingerprint manifest pass before U1, and every matrix run retains the full diagnostic report as a short-lived artifact. Every mandatory client shape is statically observable enough to support the proposed guard, or implementation stops here and revises the architecture.
 
 ### U1. Contextual surface contract
 
@@ -341,7 +341,7 @@ No release step relies on a claim about current customer count.
 - **Requirements:** R1-R8, R23, R28; KTD1, KTD3, KTD5-KTD8, KTD10, KTD15.
 - **Dependencies:** U0.
 - **Files:** Create `src/solwyn/_surfaces.py`, `tests/unit/test_surfaces.py`, `scripts/export_surface_contract.py`, and `docs/contracts/surface-classification.json`.
-- **Approach:** Apply the Initial Classification Policy to every persisted U0 inventory row and check in the resulting exhaustive contextual ledger before runtime behavior changes. Define kinds including `namespace`, `metered`, `blocked`, `unsupported`, `unmetered_spend`, `metadata`, `infrastructure`, and `unknown`. Add stable rule ID, contextual applicability, usage basis, source, capability scope, condition enum, acknowledgment token, `expected_descriptor_category`, and `expected_return_shape`. Resolve rules by exact path and deterministic specificity. Keep the module content-free and sans-I/O; the export script owns filesystem creation and deterministic newline-terminated JSON.
+- **Approach:** Apply the Initial Classification Policy to every U0 inventory row from the generated full reports and check in the resulting exhaustive contextual ledger before runtime behavior changes. Define kinds including `namespace`, `metered`, `blocked`, `unsupported`, `unmetered_spend`, `metadata`, `infrastructure`, and `unknown`. Add stable rule ID, contextual applicability, usage basis, source, capability scope, condition enum, acknowledgment token, `expected_descriptor_category`, and `expected_return_shape`. Resolve rules by exact path and deterministic specificity. Keep the module content-free and sans-I/O; the export script owns filesystem creation and deterministic newline-terminated JSON.
 - **Patterns to follow:** Frozen data rows such as `CompatProfile` in `src/solwyn/providers/openai_compatible.py`; provider name versus dialect separation in `src/solwyn/providers/_protocol.py`; Pydantic v2 and runtime-invariant rules from `AGENTS.md`.
 - **Test scenarios:**
   - Native OpenAI and an OpenAI-compatible client select different rules for the same video path.
