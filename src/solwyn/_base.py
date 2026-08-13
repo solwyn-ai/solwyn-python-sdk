@@ -45,6 +45,7 @@ from solwyn._surfaces import (
     SurfaceRule,
     SurfaceSource,
     _validate_surface_path,
+    context_is_declared,
     resolve_surface_rule,
 )
 from solwyn._token_details import TokenDetails
@@ -91,6 +92,19 @@ _FAILOVER_TUNING_FIELDS = (
 )
 
 _GUARDABLE_RETURN_SHAPES = frozenset({"resource", "context_manager", "async_context_manager"})
+
+_CONTEXT_MISMATCH_HINTS = {
+    ("bedrock_boto3", "async"): (
+        " boto3 clients are synchronous — wrap them with Solwyn, or use an "
+        "aioboto3 client with AsyncSolwyn"
+    ),
+    ("bedrock_aioboto3", "sync"): (
+        " aioboto3 clients are asynchronous — wrap them with AsyncSolwyn"
+    ),
+    ("google_generativeai", "async"): (
+        " google-generativeai supports sync only — wrap it with Solwyn"
+    ),
+}
 
 
 class FailoverTuning(NamedTuple):
@@ -605,6 +619,14 @@ class _SolwynBase:
             client_shape=_client_shape(primary.sdk_client, primary.adapter.dialect),
             mode=mode,
         )
+        if not context_is_declared(self._surface_context):
+            context = self._surface_context
+            hint = _CONTEXT_MISMATCH_HINTS.get((context.client_shape, context.mode), "")
+            raise ConfigurationError(
+                "unsupported provider client/mode pairing: "
+                f"{context.provider}/{context.client_shape}/{context.mode}.{hint}",
+                field="client",
+            )
         self._guard_lock = threading.Lock()
         self._guarded_resources: dict[str, _GuardedResource] = {}
         self._validate_acknowledgments(primary.sdk_client)

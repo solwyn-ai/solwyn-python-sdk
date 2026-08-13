@@ -2246,3 +2246,13 @@ _RULES_BY_PATH: dict[str, tuple[SurfaceRule, ...]] = {
     path: tuple(rules) for path, rules in _rules_by_path.items()
 }
 del _rule, _rules_by_path
+
+_DECLARED_SELECTORS: frozenset[SurfaceSelector] = frozenset(
+    selector for rule in SURFACE_RULES for selector in rule.selectors
+)
+
+
+def context_is_declared(context: SurfaceContext) -> bool:
+    """Return whether at least one reviewed selector applies to this context."""
+
+    return any(selector.specificity(context) is not None for selector in _DECLARED_SELECTORS)

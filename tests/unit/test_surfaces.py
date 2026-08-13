@@ -22,6 +22,7 @@ from solwyn._surfaces import (
     SurfaceSelector,
     SurfaceSource,
     UsageBasis,
+    context_is_declared,
     payload_fingerprint,
     resolve_surface_rule,
     surface_contract_data,
@@ -74,6 +75,62 @@ GOOGLE_GENAI_SYNC = SurfaceContext(
     client_shape="google_genai",
     mode="sync",
 )
+
+_DECLARED_CONTEXT_TUPLES = (
+    ("openai", "openai", "openai_sdk", "sync"),
+    ("openai", "openai", "openai_sdk", "async"),
+    ("azure_openai", "openai", "openai_sdk", "sync"),
+    ("azure_openai", "openai", "openai_sdk", "async"),
+    ("openai_compatible", "openai", "openai_sdk", "sync"),
+    ("openai_compatible", "openai", "openai_sdk", "async"),
+    ("together", "openai", "openai_sdk", "sync"),
+    ("together", "openai", "openai_sdk", "async"),
+    ("together", "openai", "native_together", "sync"),
+    ("together", "openai", "native_together", "async"),
+    ("anthropic", "anthropic", "anthropic_sdk", "sync"),
+    ("anthropic", "anthropic", "anthropic_sdk", "async"),
+    ("google", "google", "google_genai", "sync"),
+    ("google", "google", "google_genai", "async"),
+    ("google", "google", "google_generativeai", "sync"),
+    ("bedrock", "bedrock", "bedrock_boto3", "sync"),
+    ("bedrock", "bedrock", "bedrock_aioboto3", "async"),
+)
+
+_UNDECLARED_CONTEXT_TUPLES = (
+    ("bedrock", "bedrock", "bedrock_boto3", "async"),
+    ("bedrock", "bedrock", "bedrock_aioboto3", "sync"),
+    ("google", "google", "google_generativeai", "async"),
+)
+
+
+@pytest.mark.unit
+def test_every_constructible_context_is_declared_or_rejected() -> None:
+    # Arrange / Act / Assert
+    for provider, dialect, client_shape, mode in _DECLARED_CONTEXT_TUPLES:
+        context = SurfaceContext(
+            provider=provider,
+            dialect=dialect,
+            client_shape=client_shape,
+            mode=mode,
+        )
+        assert context_is_declared(context), context
+
+    for provider, dialect, client_shape, mode in _UNDECLARED_CONTEXT_TUPLES:
+        context = SurfaceContext(
+            provider=provider,
+            dialect=dialect,
+            client_shape=client_shape,
+            mode=mode,
+        )
+        assert not context_is_declared(context), context
+
+    named_compat = SurfaceContext(
+        provider="groq",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+    assert context_is_declared(named_compat)
 
 
 def _export_module() -> ModuleType:
