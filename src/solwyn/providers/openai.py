@@ -345,42 +345,6 @@ def _is_untracked_tts_model(model: Any) -> bool:
     return model.startswith(_UNTRACKED_TTS_MODEL_PREFIXES)
 
 
-# Per-process warn-once latch for an untracked token-billed TTS model. Lock-guarded
-# for the multi-threaded sync client; reset in tests via
-# ``_reset_untracked_tts_warning``.
-_untracked_tts_warned = False
-_untracked_tts_warn_lock = threading.Lock()
-
-
-def _warn_untracked_tts_model_once() -> None:
-    """Warn once that a token-billed TTS model's call is passed through untracked.
-
-    Fires when ``audio.speech.create`` is called with a token-billed TTS model
-    whose audio-output tokens no usage block reports: the call cannot be priced,
-    so it passes through UNTRACKED (no budget check, no cost event) rather than
-    settling a silent $0. Content-free: the message names no request or response
-    data.
-    """
-    global _untracked_tts_warned
-    with _untracked_tts_warn_lock:
-        if _untracked_tts_warned:
-            return
-        _untracked_tts_warned = True
-    # Logging handlers may run arbitrary code; keep them outside the lock.
-    logger.warning(
-        "Audio speech model publishes no usage metadata; its audio-output tokens "
-        "are unobservable, so this call is passed through UNTRACKED — no budget "
-        "check and no cost event will be emitted."
-    )
-
-
-def _reset_untracked_tts_warning() -> None:
-    """Clear the per-process untracked-TTS warn latch. Test-support hook only."""
-    global _untracked_tts_warned
-    with _untracked_tts_warn_lock:
-        _untracked_tts_warned = False
-
-
 def _extract_service_tier(response: Any) -> str | None:
     """Return a bounded service_tier value, or None when absent/non-string."""
     tier = getattr(response, "service_tier", None)

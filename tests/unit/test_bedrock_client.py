@@ -19,11 +19,12 @@ from typing import Any
 from unittest.mock import AsyncMock as AsyncMockFn
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
-from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY
+from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, _accepted_response
 
 from solwyn.client import AsyncSolwyn, Solwyn
-from solwyn.exceptions import ConfigurationError
+from solwyn.exceptions import ConfigurationError, UntrackedSpendSurfaceError
 
 BEDROCK_MODEL = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
@@ -73,6 +74,30 @@ def _mock_bedrock_client(region: str = "us-east-1") -> MagicMock:
         "ResponseMetadata": {"HTTPStatusCode": 200},
         "stream": iter(_converse_stream_events()),
     }
+    return client
+
+
+async def _async_bedrock_provider_call(**_kwargs: Any) -> Any:
+    return None
+
+
+def _mock_async_bedrock_client(region: str = "us-east-1") -> MagicMock:
+    """Mock that duck-types as an aiobotocore bedrock-runtime client."""
+    client = _mock_bedrock_client(region)
+    client.__class__.__module__ = "aiobotocore.client"
+    client.__class__.__name__ = "AioBaseClient"
+    del client.with_options
+    client.converse = AsyncMockFn(
+        spec=_async_bedrock_provider_call,
+        return_value=_converse_response(),
+    )
+    client.converse_stream = AsyncMockFn(
+        spec=_async_bedrock_provider_call,
+        return_value={
+            "ResponseMetadata": {"HTTPStatusCode": 200},
+            "stream": _AsyncEventStream(_converse_stream_events()),
+        },
+    )
     return client
 
 
@@ -137,10 +162,15 @@ def _make_solwyn(client: Any, **overrides: Any) -> Solwyn:
 
 
 def _mock_budget(solwyn: Any, response: dict[str, Any] | None = None) -> Any:
-    resp = MagicMock()
+    resp = MagicMock(spec=httpx.Response)
     resp.json.return_value = response or ALLOW_BUDGET_RESPONSE
     resp.raise_for_status = MagicMock()
     return patch.object(solwyn._budget._http, "post", return_value=resp)
+
+
+def _mock_reporting(solwyn: Any) -> Any:
+    resp = _accepted_response({"ingested": 2, "rejected": []})
+    return patch.object(solwyn._reporter._http, "post", return_value=resp)
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +264,81 @@ class TestBedrockConverseInterception:
             solwyn.converse(messages=[{"role": "user", "content": [{"text": "Hi"}]}])
         client.converse.assert_not_called()
         solwyn.close()
+
+    def test_all_explicit_bedrock_methods_resolve_policy_before_dispatch(self) -> None:
+        # Arrange: strict posture makes an inapplicable/missing wrapper rule
+        # fail before orchestration, while HTTP mocks stay at service boundaries.
+        client = _mock_bedrock_client()
+        solwyn = _make_solwyn(client, on_unmetered="raise")
+
+        # Act: blocked methods must refuse before any control-plane or provider
+        # I/O; supported methods then run through the real resolver and walk.
+        with _mock_budget(solwyn) as budget_post, _mock_reporting(solwyn) as reporting_post:
+            blocked = (
+                ("invoke_model", {"modelId": BEDROCK_MODEL, "body": b"{}"}),
+                (
+                    "invoke_model_with_response_stream",
+                    {"modelId": BEDROCK_MODEL, "body": b"{}"},
+                ),
+                ("start_async_invoke", {"modelId": BEDROCK_MODEL, "modelInput": {}}),
+            )
+            for path, kwargs in blocked:
+                with pytest.raises(ConfigurationError):
+                    getattr(solwyn, path)(**kwargs)
+
+            blocked_budget_calls = budget_post.call_count
+            blocked_reporting_calls = reporting_post.call_count
+            converse_result = solwyn.converse(modelId=BEDROCK_MODEL)
+            stream_result = solwyn.converse_stream(modelId=BEDROCK_MODEL)
+            list(stream_result["stream"])
+            solwyn.close()
+
+        # Assert: metered surfaces reached only their matching provider methods,
+        # and every blocked spend surface refused before provider I/O.
+        assert converse_result is client.converse.return_value
+        client.converse.assert_called_once_with(modelId=BEDROCK_MODEL)
+        client.converse_stream.assert_called_once_with(modelId=BEDROCK_MODEL)
+        assert blocked_budget_calls == 0
+        assert blocked_reporting_calls == 0
+        budget_post.assert_called()
+        reporting_urls = [str(call.args[0]) for call in reporting_post.call_args_list]
+        assert any(url.endswith("/api/v1/budgets/confirm") for url in reporting_urls)
+        assert any(url.endswith("/api/v1/metadata/ingest") for url in reporting_urls)
+        client.invoke_model.assert_not_called()
+        client.invoke_model_with_response_stream.assert_not_called()
+        client.start_async_invoke.assert_not_called()
+
+    def test_non_bedrock_explicit_methods_refuse_before_dispatch_in_strict_mode(self) -> None:
+        # Arrange: these Bedrock-shaped paths have no rule for an OpenAI client
+        # shape, so strict posture must reject them at the public wrapper edge.
+        client = _mock_openai_client()
+        calls = (
+            ("converse", {"modelId": BEDROCK_MODEL}),
+            ("converse_stream", {"modelId": BEDROCK_MODEL}),
+            ("invoke_model", {"modelId": BEDROCK_MODEL, "body": b"{}"}),
+            (
+                "invoke_model_with_response_stream",
+                {"modelId": BEDROCK_MODEL, "body": b"{}"},
+            ),
+            ("start_async_invoke", {"modelId": BEDROCK_MODEL, "modelInput": {}}),
+        )
+        for path, _kwargs in calls:
+            setattr(client, path, MagicMock(spec=lambda **_kwargs: None))
+        solwyn = _make_solwyn(client, on_unmetered="raise")
+
+        # Act: exercise every explicit public method with an inapplicable shape.
+        with _mock_budget(solwyn) as budget_post, _mock_reporting(solwyn) as reporting_post:
+            for path, kwargs in calls:
+                with pytest.raises(UntrackedSpendSurfaceError) as exc_info:
+                    getattr(solwyn, path)(**kwargs)
+                assert exc_info.value.surface == path
+
+            # Assert: policy refusal precedes both control-plane and provider I/O.
+            budget_post.assert_not_called()
+            reporting_post.assert_not_called()
+            for path, _kwargs in calls:
+                getattr(client, path).assert_not_called()
+            solwyn.close()
 
     def test_invoke_model_raises_loudly(self) -> None:
         # Silent pass-through would be a budget bypass on Bedrock's primary
@@ -742,6 +847,98 @@ class TestAsyncBedrockConverse:
 
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_all_async_explicit_bedrock_methods_resolve_policy_before_dispatch(
+        self,
+    ) -> None:
+        # Arrange: use async provider boundaries, real policy/orchestration, and
+        # strict posture so an inapplicable explicit rule cannot pass silently.
+        client = _mock_async_bedrock_client()
+        assert not hasattr(client, "with_options")
+        solwyn = _make_async_solwyn(client, on_unmetered="raise")
+
+        # Act: blocked calls must stop before any control-plane or provider I/O;
+        # supported calls then traverse the live async orchestration path.
+        with _mock_budget(solwyn) as budget_post, _mock_reporting(solwyn) as reporting_post:
+            blocked = (
+                ("invoke_model", {"modelId": BEDROCK_MODEL, "body": b"{}"}),
+                (
+                    "invoke_model_with_response_stream",
+                    {"modelId": BEDROCK_MODEL, "body": b"{}"},
+                ),
+                ("start_async_invoke", {"modelId": BEDROCK_MODEL, "modelInput": {}}),
+            )
+            for path, kwargs in blocked:
+                with pytest.raises(ConfigurationError):
+                    await getattr(solwyn, path)(**kwargs)
+
+            blocked_budget_calls = budget_post.call_count
+            blocked_budget_awaits = budget_post.await_count
+            blocked_reporting_calls = reporting_post.call_count
+            blocked_reporting_awaits = reporting_post.await_count
+            converse_result = await solwyn.converse(modelId=BEDROCK_MODEL)
+            stream_result = await solwyn.converse_stream(modelId=BEDROCK_MODEL)
+            _ = [event async for event in stream_result["stream"]]
+            await solwyn.close()
+
+        # Assert: resolver-approved calls reached exactly the corresponding
+        # provider methods, while blocked spend surfaces performed no I/O.
+        assert converse_result is client.converse.return_value
+        client.converse.assert_awaited_once_with(modelId=BEDROCK_MODEL)
+        client.converse_stream.assert_awaited_once_with(modelId=BEDROCK_MODEL)
+        assert blocked_budget_calls == 0
+        assert blocked_budget_awaits == 0
+        assert blocked_reporting_calls == 0
+        assert blocked_reporting_awaits == 0
+        budget_post.assert_awaited()
+        reporting_urls = [str(call.args[0]) for call in reporting_post.call_args_list]
+        assert any(url.endswith("/api/v1/budgets/confirm") for url in reporting_urls)
+        assert any(url.endswith("/api/v1/metadata/ingest") for url in reporting_urls)
+        client.invoke_model.assert_not_called()
+        client.invoke_model_with_response_stream.assert_not_called()
+        client.start_async_invoke.assert_not_called()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_non_bedrock_async_explicit_methods_refuse_before_dispatch_in_strict_mode(
+        self,
+    ) -> None:
+        # Arrange: async OpenAI is an inapplicable shape for every Bedrock path.
+        client = _mock_openai_client()
+        client.__class__.__name__ = "AsyncOpenAI"
+        calls = (
+            ("converse", {"modelId": BEDROCK_MODEL}),
+            ("converse_stream", {"modelId": BEDROCK_MODEL}),
+            ("invoke_model", {"modelId": BEDROCK_MODEL, "body": b"{}"}),
+            (
+                "invoke_model_with_response_stream",
+                {"modelId": BEDROCK_MODEL, "body": b"{}"},
+            ),
+            ("start_async_invoke", {"modelId": BEDROCK_MODEL, "modelInput": {}}),
+        )
+        for path, _kwargs in calls:
+            setattr(client, path, AsyncMockFn(spec=_async_bedrock_provider_call))
+        solwyn = _make_async_solwyn(client, on_unmetered="raise")
+
+        # Act: the public async methods must resolve applicability before await.
+        with _mock_budget(solwyn) as budget_post, _mock_reporting(solwyn) as reporting_post:
+            for path, kwargs in calls:
+                with pytest.raises(UntrackedSpendSurfaceError) as exc_info:
+                    await getattr(solwyn, path)(**kwargs)
+                assert exc_info.value.surface == path
+
+            # Assert: refusal generated no control-plane or provider traffic.
+            budget_post.assert_not_called()
+            budget_post.assert_not_awaited()
+            reporting_post.assert_not_called()
+            reporting_post.assert_not_awaited()
+            for path, _kwargs in calls:
+                provider_method = getattr(client, path)
+                provider_method.assert_not_called()
+                provider_method.assert_not_awaited()
+            await solwyn.close()
 
     @pytest.mark.unit
     @pytest.mark.asyncio

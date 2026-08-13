@@ -792,7 +792,7 @@ class TestUnshippedSpendSurfacePosture:
         assert len(caplog.records) == 1  # once per process, not per access
         message = caplog.records[0].getMessage()
         assert "openai" in message
-        assert "surface 'translations'" in message
+        assert "surface 'audio.translations'" in message
         assert "untracked" in message
         assert "tracking for this surface is coming" in message.lower()
         self._close(solwyn)
@@ -856,7 +856,7 @@ class TestUnshippedSpendSurfacePosture:
             _ = solwyn.audio.translations
 
         record = caplog.records[0]
-        assert record.args == ("openai", "translations")
+        assert record.args == ("openai", "openai_sdk", "audio.translations", None)
         self._close(solwyn)
 
 

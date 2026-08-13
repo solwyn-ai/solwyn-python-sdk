@@ -2,14 +2,14 @@
 
 These thin delegation wrappers let ``Solwyn.chat.completions.create()``
 (and the Anthropic/Google equivalents) route through ``_intercepted_call``
-while passing everything else through to the underlying client.
+while routing every provider pass-through through the shared surface policy.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from solwyn._base import MediaSurfaceSpec, _warn_unmetered_spend_surface_once
+from solwyn._base import MediaSurfaceSpec
 from solwyn._privacy import (
     estimate_content_length,
     estimate_embedding_input_tokens,
@@ -20,6 +20,7 @@ from solwyn._privacy import (
     measure_speech_media,
     measure_video_media,
 )
+from solwyn._surfaces import SurfaceCondition, SurfaceSource
 from solwyn._token_details import TokenDetails
 from solwyn._types import MediaUsage
 from solwyn.providers.openai import (
@@ -29,7 +30,6 @@ from solwyn.providers.openai import (
     _extract_transcription_usage,
     _is_untracked_tts_model,
     _measure_transcription_media,
-    _warn_untracked_tts_model_once,
 )
 
 if TYPE_CHECKING:
@@ -454,11 +454,19 @@ class _SyncChatCompletionsProxy:
 
     def create(self, **kwargs: Any) -> Any:
         """Intercept chat.completions.create() with budget/circuit/reporting."""
+        self._solwyn._enforce_explicit_surface(
+            "chat.completions.create", source=SurfaceSource.WRAPPER
+        )
         return self._solwyn._intercepted_call(**kwargs)
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to OpenAI's chat.completions."""
-        return getattr(self._solwyn._client.chat.completions, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.chat.completions,
+            name=name,
+            path=f"chat.completions.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _SyncChatProxy:
@@ -476,7 +484,12 @@ class _SyncChatProxy:
         ``completions`` (set in __init__) falls through here.
         """
         if self._solwyn._dialect == "openai":
-            return getattr(self._solwyn._client.chat, name)
+            return self._solwyn._resolve_public_attribute(
+                self._solwyn._client.chat,
+                name=name,
+                path=f"chat.{name}",
+                source=SurfaceSource.RAW,
+            )
         raise AttributeError(
             f"'chat.{name}' is not supported. "
             f"The Solwyn chat proxy is OpenAI-dialect-specific; Anthropic uses "
@@ -490,7 +503,7 @@ class _SyncEmbeddingsProxy:
     ``client.embeddings.create()`` (OpenAI's embeddings API, shared by every
     OpenAI-compatible provider) flows through ``_media_call`` instead of the raw
     client, so embeddings spend is budget-checked, confirmed, and reported. Every
-    other ``embeddings`` attribute passes through to the underlying client. The
+    other ``embeddings`` attribute is resolved by the shared surface policy. The
     per-client spec is built once at construction (provider is fixed then).
     """
 
@@ -500,11 +513,17 @@ class _SyncEmbeddingsProxy:
 
     def create(self, **kwargs: Any) -> Any:
         """Intercept embeddings.create() with budget/confirm/reporting."""
+        self._solwyn._enforce_explicit_surface("embeddings.create", source=SurfaceSource.WRAPPER)
         return self._solwyn._media_call(self._spec, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's embeddings."""
-        return getattr(self._solwyn._client.embeddings, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.embeddings,
+            name=name,
+            path=f"embeddings.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _SyncImagesProxy:
@@ -515,11 +534,12 @@ class _SyncImagesProxy:
     so image spend is budget-checked, confirmed, and reported. Both carry a
     billable basis: native gpt-image reports token usage (with image buckets),
     and every dialect carries the request-derived per-image quantity — BOTH are
-    sent when observable, and the server's card unit picks. Every OTHER
-    ``images`` attribute (``create_variation``, …) passes through untracked. On a
-    non-openai client the media seam raises ``UnsupportedSurfaceError`` (that
-    adapter serves no images seam). The per-client spec is built once (the spec
-    is provider-agnostic; the adapter dispatch differs).
+    sent when observable, and the server's card unit picks. Every other
+    ``images`` attribute (``create_variation``, …) is resolved by the shared
+    surface policy. On a non-openai client the media seam raises
+    ``UnsupportedSurfaceError`` (that adapter serves no images seam). The
+    per-client spec is built once (the spec is provider-agnostic; the adapter
+    dispatch differs).
     """
 
     def __init__(self, solwyn: Solwyn) -> None:
@@ -528,6 +548,7 @@ class _SyncImagesProxy:
 
     def generate(self, **kwargs: Any) -> Any:
         """Intercept images.generate() with budget/confirm/reporting."""
+        self._solwyn._enforce_explicit_surface("images.generate", source=SurfaceSource.WRAPPER)
         return self._solwyn._media_call(self._spec, **kwargs)
 
     def edit(self, **kwargs: Any) -> Any:
@@ -537,11 +558,17 @@ class _SyncImagesProxy:
         (stripped in ``prepare_media_call``) routes this hop to
         ``client.images.edit`` rather than ``.generate``.
         """
+        self._solwyn._enforce_explicit_surface("images.edit", source=SurfaceSource.WRAPPER)
         return self._solwyn._media_call(self._spec, **{**kwargs, _IMAGE_OP_KEY: "edit"})
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-generate/edit attributes to the client's images."""
-        return getattr(self._solwyn._client.images, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.images,
+            name=name,
+            path=f"images.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _SyncAudioTranscriptionsProxy:
@@ -553,9 +580,9 @@ class _SyncAudioTranscriptionsProxy:
     reported. The billable basis is per-model: token usage for the
     gpt-4o-transcribe family (``audio_input_tokens``), duration usage for whisper-1
     (``audio_seconds``); a non-JSON response_format yields no usage and is tracked
-    UNPRICED. Every other ``transcriptions`` attribute passes through untracked.
-    The per-client spec is built once (it is provider-agnostic; the adapter
-    dispatch differs).
+    UNPRICED. Every other ``transcriptions`` attribute is resolved by the shared
+    surface policy. The per-client spec is built once (it is provider-agnostic;
+    the adapter dispatch differs).
     """
 
     def __init__(self, solwyn: Solwyn) -> None:
@@ -564,11 +591,19 @@ class _SyncAudioTranscriptionsProxy:
 
     def create(self, **kwargs: Any) -> Any:
         """Intercept audio.transcriptions.create() with budget/confirm/reporting."""
+        self._solwyn._enforce_explicit_surface(
+            "audio.transcriptions.create", source=SurfaceSource.WRAPPER
+        )
         return self._solwyn._media_call(self._spec, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's audio.transcriptions."""
-        return getattr(self._solwyn._client.audio.transcriptions, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.audio.transcriptions,
+            name=name,
+            path=f"audio.transcriptions.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _SyncAudioSpeechProxy:
@@ -581,13 +616,13 @@ class _SyncAudioSpeechProxy:
     count, measured in the firewall (``input_characters``) and priced server-side.
 
     Token-billed TTS models (``gpt-4o-mini-tts`` and its dated snapshots) publish
-    no usage of any kind, so their audio-output tokens are unobservable: those
-    calls are CARVED OUT — one warning per process, then a direct pass-through to
-    the raw client (untracked, a warned pass-through, never a silent $0). Every
-    other ``speech`` attribute passes through untracked. On a non-openai client
-    the media seam raises ``UnsupportedSurfaceError`` (that adapter serves no audio
-    seam). The per-client spec is built once (it is provider-agnostic; the adapter
-    dispatch differs).
+    no usage of any kind, so their audio-output tokens are unobservable. The
+    shared conditional policy decides whether those calls warn, raise, or pass
+    through to the raw client. Every other ``speech`` attribute is resolved by
+    the shared surface policy. On a non-openai client the media seam raises
+    ``UnsupportedSurfaceError`` (that adapter serves no audio seam). The
+    per-client spec is built once (it is provider-agnostic; the adapter dispatch
+    differs).
     """
 
     def __init__(self, solwyn: Solwyn) -> None:
@@ -597,29 +632,39 @@ class _SyncAudioSpeechProxy:
     def create(self, **kwargs: Any) -> Any:
         """Intercept audio.speech.create(); carve out untracked token-billed TTS models.
 
-        A token-billed TTS model has no observable usage, so it cannot be priced:
-        warn once, then pass through to the raw client untracked. Every other model
-        rides the media lifecycle with the ``audio`` op marker selecting speech.
+        A token-billed TTS model has no observable usage, so it cannot be priced;
+        the shared conditional policy runs before its raw dispatch. Every other
+        model rides the media lifecycle with the ``audio`` op marker selecting
+        speech.
         """
+        self._solwyn._enforce_explicit_surface("audio.speech.create", source=SurfaceSource.WRAPPER)
         if _is_untracked_tts_model(kwargs.get("model")):
-            _warn_untracked_tts_model_once()
+            self._solwyn._enforce_explicit_surface(
+                "audio.speech.create",
+                source=SurfaceSource.SYNTHETIC_POLICY,
+                condition=SurfaceCondition.OPENAI_UNTRACKED_TTS_MODEL,
+            )
             return self._solwyn._client.audio.speech.create(**kwargs)
         return self._solwyn._media_call(self._spec, **{**kwargs, _AUDIO_OP_KEY: "speech"})
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's audio.speech."""
-        return getattr(self._solwyn._client.audio.speech, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.audio.speech,
+            name=name,
+            path=f"audio.speech.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _SyncAudioProxy:
-    """Proxy for client.audio: intercepts transcriptions + speech; translations warns once.
+    """Proxy for client.audio with guarded pass-throughs and tracked media seams.
 
     ``transcriptions`` and ``speech`` are the intercepted audio sub-surfaces (their
-    ``create`` routes through the media lifecycle). ``translations`` remains a
-    still-unwired recognized spend surface: it warns-once then passes through
-    untracked. Every other ``audio`` attribute passes through silently. On a
-    non-openai client the media seams raise ``UnsupportedSurfaceError`` (that
-    adapter serves no audio seam).
+    ``create`` routes through the media lifecycle). ``translations`` and every
+    other ``audio`` attribute use the shared surface policy. On a non-openai
+    client the media seams raise ``UnsupportedSurfaceError`` (that adapter serves
+    no audio seam).
     """
 
     def __init__(self, solwyn: Solwyn) -> None:
@@ -629,15 +674,22 @@ class _SyncAudioProxy:
 
     @property
     def translations(self) -> Any:
-        """Warn-once, then pass through to the client's audio.translations (untracked)."""
-        _warn_unmetered_spend_surface_once(
-            adapter=self._solwyn._adapter, dialect=self._solwyn._dialect, surface="translations"
+        """Resolve the client's untracked audio translations resource."""
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.audio,
+            name="translations",
+            path="audio.translations",
+            source=SurfaceSource.RAW,
         )
-        return self._solwyn._client.audio.translations
 
     def __getattr__(self, name: str) -> Any:
         """Pass through other audio attributes (e.g. with_raw_response) to the client."""
-        return getattr(self._solwyn._client.audio, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.audio,
+            name=name,
+            path=f"audio.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _SyncVideosProxy:
@@ -651,11 +703,11 @@ class _SyncVideosProxy:
     label), settled at INITIATION with ``is_estimated=True``. The returned job
     object is passed back untouched: callers poll it themselves; the SDK never
     wraps or polls it. Every other ``videos`` attribute (``retrieve``,
-    ``download_content``, …) passes through untracked. Sora is OpenAI-only, so on
-    a non-openai client (including OpenAI-compatible profiles) ``.create()`` fails
-    loud with ``UnsupportedSurfaceError`` (that adapter serves no video seam). The
-    per-client spec is built once (it is provider-agnostic; the adapter dispatch
-    differs).
+    ``download_content``, …) is resolved by the shared surface policy. Sora is
+    OpenAI-only, so on a non-openai client (including OpenAI-compatible profiles)
+    ``.create()`` fails loud with ``UnsupportedSurfaceError`` (that adapter serves
+    no video seam). The per-client spec is built once (it is provider-agnostic;
+    the adapter dispatch differs).
     """
 
     def __init__(self, solwyn: Solwyn) -> None:
@@ -664,11 +716,17 @@ class _SyncVideosProxy:
 
     def create(self, **kwargs: Any) -> Any:
         """Intercept videos.create() with budget/confirm/reporting."""
+        self._solwyn._enforce_explicit_surface("videos.create", source=SurfaceSource.WRAPPER)
         return self._solwyn._media_call(self._spec, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's videos."""
-        return getattr(self._solwyn._client.videos, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.videos,
+            name=name,
+            path=f"videos.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _SyncMessagesProxy:
@@ -682,10 +740,16 @@ class _SyncMessagesProxy:
         self._solwyn = solwyn
 
     def create(self, **kwargs: Any) -> Any:
+        self._solwyn._enforce_explicit_surface("messages.create", source=SurfaceSource.WRAPPER)
         return self._solwyn._intercepted_call(**kwargs)
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._solwyn._client.messages, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.messages,
+            name=name,
+            path=f"messages.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _SyncModelsProxy:
@@ -707,9 +771,15 @@ class _SyncModelsProxy:
         self._videos_spec = _google_videos_spec()
 
     def generate_content(self, **kwargs: Any) -> Any:
+        self._solwyn._enforce_explicit_surface(
+            "models.generate_content", source=SurfaceSource.WRAPPER
+        )
         return self._solwyn._intercepted_call(**kwargs)
 
     def generate_content_stream(self, **kwargs: Any) -> Any:
+        self._solwyn._enforce_explicit_surface(
+            "models.generate_content_stream", source=SurfaceSource.WRAPPER
+        )
         return self._solwyn._intercepted_call(_force_stream=True, **kwargs)
 
     def embed_content(self, **kwargs: Any) -> Any:
@@ -720,6 +790,7 @@ class _SyncModelsProxy:
         untracked. Because it is defined on the class, it never reaches
         __getattr__.
         """
+        self._solwyn._enforce_explicit_surface("models.embed_content", source=SurfaceSource.WRAPPER)
         return self._solwyn._media_call(self._embeddings_spec, **kwargs)
 
     def generate_images(self, **kwargs: Any) -> Any:
@@ -731,6 +802,9 @@ class _SyncModelsProxy:
         (``config.number_of_images``). Being defined on the class, it never
         reaches __getattr__.
         """
+        self._solwyn._enforce_explicit_surface(
+            "models.generate_images", source=SurfaceSource.WRAPPER
+        )
         return self._solwyn._media_call(self._images_spec, **kwargs)
 
     def generate_videos(self, **kwargs: Any) -> Any:
@@ -745,19 +819,21 @@ class _SyncModelsProxy:
         passed back untouched: callers poll it themselves; the SDK never wraps or
         polls it.
         """
+        self._solwyn._enforce_explicit_surface(
+            "models.generate_videos", source=SurfaceSource.WRAPPER
+        )
         return self._solwyn._media_call(self._videos_spec, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
-        # An unrecognized client.models method arrives here rather than on
-        # Solwyn.__getattr__ — warn-once pass-through per the posture taxonomy for
-        # a recognized-but-untracked spend surface, silent otherwise.
-        # embed_content, generate_images, and generate_videos never reach here:
-        # the explicit methods above intercept them.
-        attribute = getattr(self._solwyn._client.models, name)
-        _warn_unmetered_spend_surface_once(
-            adapter=self._solwyn._adapter, dialect=self._solwyn._dialect, surface=name
+        # Unrecognized client.models methods arrive here rather than on
+        # Solwyn.__getattr__. The shared resolver applies exact-path policy;
+        # explicit tracked methods above never reach this seam.
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.models,
+            name=name,
+            path=f"models.{name}",
+            source=SurfaceSource.RAW,
         )
-        return attribute
 
 
 # ---------------------------------------------------------------------------
@@ -773,11 +849,19 @@ class _AsyncChatCompletionsProxy:
 
     async def create(self, **kwargs: Any) -> Any:
         """Intercept chat.completions.create() with budget/circuit/reporting."""
+        self._solwyn._enforce_explicit_surface(
+            "chat.completions.create", source=SurfaceSource.WRAPPER
+        )
         return await self._solwyn._intercepted_call(**kwargs)
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to OpenAI's chat.completions."""
-        return getattr(self._solwyn._client.chat.completions, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.chat.completions,
+            name=name,
+            path=f"chat.completions.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _AsyncChatProxy:
@@ -789,7 +873,12 @@ class _AsyncChatProxy:
 
     def __getattr__(self, name: str) -> Any:
         if self._solwyn._dialect == "openai":
-            return getattr(self._solwyn._client.chat, name)
+            return self._solwyn._resolve_public_attribute(
+                self._solwyn._client.chat,
+                name=name,
+                path=f"chat.{name}",
+                source=SurfaceSource.RAW,
+            )
         raise AttributeError(
             f"'chat.{name}' is not supported. "
             f"The Solwyn chat proxy is OpenAI-dialect-specific; Anthropic uses "
@@ -801,8 +890,8 @@ class _AsyncEmbeddingsProxy:
     """Async proxy for client.embeddings that routes create() through the media lifecycle.
 
     Mirror of ``_SyncEmbeddingsProxy``: ``client.embeddings.create()`` flows
-    through the async ``_media_call``; every other attribute passes through to
-    the underlying client's embeddings.
+    through the async ``_media_call``; every other attribute uses the shared
+    surface policy.
     """
 
     def __init__(self, solwyn: AsyncSolwyn) -> None:
@@ -811,11 +900,17 @@ class _AsyncEmbeddingsProxy:
 
     async def create(self, **kwargs: Any) -> Any:
         """Intercept embeddings.create() with budget/confirm/reporting."""
+        self._solwyn._enforce_explicit_surface("embeddings.create", source=SurfaceSource.WRAPPER)
         return await self._solwyn._media_call(self._spec, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's embeddings."""
-        return getattr(self._solwyn._client.embeddings, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.embeddings,
+            name=name,
+            path=f"embeddings.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _AsyncImagesProxy:
@@ -823,7 +918,7 @@ class _AsyncImagesProxy:
 
     Mirror of ``_SyncImagesProxy``: ``client.images.generate()`` and
     ``client.images.edit()`` flow through the async ``_media_call``; every other
-    attribute passes through to the underlying client's images.
+    attribute uses the shared surface policy.
     """
 
     def __init__(self, solwyn: AsyncSolwyn) -> None:
@@ -832,15 +927,22 @@ class _AsyncImagesProxy:
 
     async def generate(self, **kwargs: Any) -> Any:
         """Intercept images.generate() with budget/confirm/reporting."""
+        self._solwyn._enforce_explicit_surface("images.generate", source=SurfaceSource.WRAPPER)
         return await self._solwyn._media_call(self._spec, **kwargs)
 
     async def edit(self, **kwargs: Any) -> Any:
         """Intercept images.edit() through the same async lifecycle (op marker routes it)."""
+        self._solwyn._enforce_explicit_surface("images.edit", source=SurfaceSource.WRAPPER)
         return await self._solwyn._media_call(self._spec, **{**kwargs, _IMAGE_OP_KEY: "edit"})
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-generate/edit attributes to the client's images."""
-        return getattr(self._solwyn._client.images, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.images,
+            name=name,
+            path=f"images.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _AsyncAudioTranscriptionsProxy:
@@ -848,7 +950,7 @@ class _AsyncAudioTranscriptionsProxy:
 
     Mirror of ``_SyncAudioTranscriptionsProxy``: ``client.audio.transcriptions
     .create()`` flows through the async ``_media_call``; every other attribute
-    passes through to the underlying client's audio.transcriptions.
+    uses the shared surface policy.
     """
 
     def __init__(self, solwyn: AsyncSolwyn) -> None:
@@ -857,11 +959,19 @@ class _AsyncAudioTranscriptionsProxy:
 
     async def create(self, **kwargs: Any) -> Any:
         """Intercept audio.transcriptions.create() with budget/confirm/reporting."""
+        self._solwyn._enforce_explicit_surface(
+            "audio.transcriptions.create", source=SurfaceSource.WRAPPER
+        )
         return await self._solwyn._media_call(self._spec, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's audio.transcriptions."""
-        return getattr(self._solwyn._client.audio.transcriptions, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.audio.transcriptions,
+            name=name,
+            path=f"audio.transcriptions.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _AsyncAudioSpeechProxy:
@@ -869,9 +979,9 @@ class _AsyncAudioSpeechProxy:
 
     Mirror of ``_SyncAudioSpeechProxy``: ``client.audio.speech.create()`` flows
     through the async ``_media_call`` (billed on the request's ``input`` character
-    count; TTS responses carry no usage). The untracked token-billed carve-out
-    (``gpt-4o-mini-tts``) warns once then awaits a direct pass-through to the raw
-    client; every other attribute passes through to the underlying audio.speech.
+    count; TTS responses carry no usage). The shared conditional policy decides
+    whether the untracked token-billed model (``gpt-4o-mini-tts``) warns, raises,
+    or awaits a direct pass-through; every other attribute uses the same resolver.
     """
 
     def __init__(self, solwyn: AsyncSolwyn) -> None:
@@ -880,23 +990,33 @@ class _AsyncAudioSpeechProxy:
 
     async def create(self, **kwargs: Any) -> Any:
         """Intercept audio.speech.create(); carve out untracked token-billed TTS models."""
+        self._solwyn._enforce_explicit_surface("audio.speech.create", source=SurfaceSource.WRAPPER)
         if _is_untracked_tts_model(kwargs.get("model")):
-            _warn_untracked_tts_model_once()
+            self._solwyn._enforce_explicit_surface(
+                "audio.speech.create",
+                source=SurfaceSource.SYNTHETIC_POLICY,
+                condition=SurfaceCondition.OPENAI_UNTRACKED_TTS_MODEL,
+            )
             return await self._solwyn._client.audio.speech.create(**kwargs)
         return await self._solwyn._media_call(self._spec, **{**kwargs, _AUDIO_OP_KEY: "speech"})
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's audio.speech."""
-        return getattr(self._solwyn._client.audio.speech, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.audio.speech,
+            name=name,
+            path=f"audio.speech.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _AsyncAudioProxy:
-    """Async proxy for client.audio: intercepts transcriptions + speech; translations warns.
+    """Async proxy for client.audio with guarded pass-throughs and tracked media seams.
 
     Mirror of ``_SyncAudioProxy``: attribute access is synchronous, so the
-    ``translations`` warn-once pass-through and the intercepted ``transcriptions``
-    / ``speech`` sub-proxies behave exactly as on the sync proxy; only their
-    ``create`` differs (it awaits the async ``_media_call``).
+    pass-through policy and intercepted ``transcriptions`` / ``speech``
+    sub-proxies behave exactly as on the sync proxy; only their ``create`` differs
+    (it awaits the async ``_media_call``).
     """
 
     def __init__(self, solwyn: AsyncSolwyn) -> None:
@@ -906,15 +1026,22 @@ class _AsyncAudioProxy:
 
     @property
     def translations(self) -> Any:
-        """Warn-once, then pass through to the client's audio.translations (untracked)."""
-        _warn_unmetered_spend_surface_once(
-            adapter=self._solwyn._adapter, dialect=self._solwyn._dialect, surface="translations"
+        """Resolve the client's untracked audio translations resource."""
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.audio,
+            name="translations",
+            path="audio.translations",
+            source=SurfaceSource.RAW,
         )
-        return self._solwyn._client.audio.translations
 
     def __getattr__(self, name: str) -> Any:
         """Pass through other audio attributes to the client."""
-        return getattr(self._solwyn._client.audio, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.audio,
+            name=name,
+            path=f"audio.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _AsyncVideosProxy:
@@ -925,9 +1052,9 @@ class _AsyncVideosProxy:
     request-derived per-second ``MediaUsage`` (top-level ``seconds`` at the
     ``size``-derived resolution label) with ``is_estimated=True`` (the async video
     job carries no usage). The returned job is passed back untouched — callers
-    poll it themselves. Every other ``videos`` attribute passes through to the
-    underlying client's videos; on a non-openai client ``.create()`` fails loud
-    with ``UnsupportedSurfaceError`` (Sora is OpenAI-only).
+    poll it themselves. Every other ``videos`` attribute uses the shared surface
+    policy; on a non-openai client ``.create()`` fails loud with
+    ``UnsupportedSurfaceError`` (Sora is OpenAI-only).
     """
 
     def __init__(self, solwyn: AsyncSolwyn) -> None:
@@ -936,11 +1063,17 @@ class _AsyncVideosProxy:
 
     async def create(self, **kwargs: Any) -> Any:
         """Intercept videos.create() with budget/confirm/reporting."""
+        self._solwyn._enforce_explicit_surface("videos.create", source=SurfaceSource.WRAPPER)
         return await self._solwyn._media_call(self._spec, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's videos."""
-        return getattr(self._solwyn._client.videos, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.videos,
+            name=name,
+            path=f"videos.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _AsyncMessagesProxy:
@@ -950,10 +1083,16 @@ class _AsyncMessagesProxy:
         self._solwyn = solwyn
 
     async def create(self, **kwargs: Any) -> Any:
+        self._solwyn._enforce_explicit_surface("messages.create", source=SurfaceSource.WRAPPER)
         return await self._solwyn._intercepted_call(**kwargs)
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._solwyn._client.messages, name)
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.messages,
+            name=name,
+            path=f"messages.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _AsyncModelsProxy:
@@ -970,9 +1109,15 @@ class _AsyncModelsProxy:
         self._videos_spec = _google_videos_spec()
 
     async def generate_content(self, **kwargs: Any) -> Any:
+        self._solwyn._enforce_explicit_surface(
+            "models.generate_content", source=SurfaceSource.WRAPPER
+        )
         return await self._solwyn._intercepted_call(**kwargs)
 
     async def generate_content_stream(self, **kwargs: Any) -> Any:
+        self._solwyn._enforce_explicit_surface(
+            "models.generate_content_stream", source=SurfaceSource.WRAPPER
+        )
         return await self._solwyn._intercepted_call(_force_stream=True, **kwargs)
 
     async def embed_content(self, **kwargs: Any) -> Any:
@@ -982,6 +1127,7 @@ class _AsyncModelsProxy:
         __getattr__) so embeddings spend is budget-checked, confirmed, and
         reported. Being defined on the class, it never reaches __getattr__.
         """
+        self._solwyn._enforce_explicit_surface("models.embed_content", source=SurfaceSource.WRAPPER)
         return await self._solwyn._media_call(self._embeddings_spec, **kwargs)
 
     async def generate_images(self, **kwargs: Any) -> Any:
@@ -991,6 +1137,9 @@ class _AsyncModelsProxy:
         __getattr__) so image spend is budget-checked, confirmed, and reported on
         the request-derived per-image ``MediaUsage`` basis.
         """
+        self._solwyn._enforce_explicit_surface(
+            "models.generate_images", source=SurfaceSource.WRAPPER
+        )
         return await self._solwyn._media_call(self._images_spec, **kwargs)
 
     async def generate_videos(self, **kwargs: Any) -> Any:
@@ -1002,16 +1151,17 @@ class _AsyncModelsProxy:
         with ``is_estimated=True``. The returned long-running operation is passed
         back untouched — callers poll it themselves.
         """
+        self._solwyn._enforce_explicit_surface(
+            "models.generate_videos", source=SurfaceSource.WRAPPER
+        )
         return await self._solwyn._media_call(self._videos_spec, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
-        # See _SyncModelsProxy.__getattr__: an unrecognized client.models method
-        # is a warn-once pass-through per the posture taxonomy for a
-        # recognized-but-untracked spend surface, silent otherwise. embed_content,
-        # generate_images, and generate_videos never reach here — the explicit
-        # methods above intercept them.
-        attribute = getattr(self._solwyn._client.models, name)
-        _warn_unmetered_spend_surface_once(
-            adapter=self._solwyn._adapter, dialect=self._solwyn._dialect, surface=name
+        # See _SyncModelsProxy.__getattr__: the shared resolver applies exact-path
+        # policy, and explicit tracked methods never reach this seam.
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.models,
+            name=name,
+            path=f"models.{name}",
+            source=SurfaceSource.RAW,
         )
-        return attribute

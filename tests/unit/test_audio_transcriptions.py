@@ -287,7 +287,7 @@ class TestAudioTranscriptionsProxy:
         assert "response_format" in caplog.records[0].getMessage()
         _close_sync(solwyn)
 
-    def test_transcriptions_getattr_passthrough_is_silent(
+    def test_transcriptions_getattr_passthrough_uses_default_warn_posture(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         client = _mock_transcription_client(_token_response())
@@ -295,7 +295,9 @@ class TestAudioTranscriptionsProxy:
         solwyn = _build_sync(client)
         with caplog.at_level(logging.WARNING, logger="solwyn._base"):
             assert solwyn.audio.transcriptions.with_raw_response() == "raw"
-        assert foreground_records(caplog) == []
+        records = foreground_records(caplog)
+        assert len(records) == 1
+        assert records[0].args[2] == "audio.transcriptions.with_raw_response"
         _close_sync(solwyn)
 
     def test_budget_denied_short_circuits(self) -> None:
@@ -327,7 +329,7 @@ class TestAudioTranscriptionsProxy:
         assert first is client.audio.translations
         assert second is client.audio.translations
         assert len(caplog.records) == 1
-        assert "surface 'translations'" in caplog.records[0].getMessage()
+        assert "surface 'audio.translations'" in caplog.records[0].getMessage()
         _close_sync(solwyn)
 
     def test_accessing_audio_attribute_does_not_warn(

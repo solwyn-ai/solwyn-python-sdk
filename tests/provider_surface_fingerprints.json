@@ -153,13 +153,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 621,
-      "observation_count": 2560,
+      "namespace_count": 624,
+      "observation_count": 2577,
       "provider": "azure_openai",
       "service_model_operation_count": 0,
       "shape_key": "azure_openai_async",
       "structural_interval": "openai-admin",
-      "structure_sha256": "2334014d5017aff9a669ce53c846a329eec813b65ad0955b26834dbfe8378e8b",
+      "structure_sha256": "a792aab6b584eb5eedb2bffef88e3ba88152fa6dbf6f304f1c711af31fe7d03b",
       "variant": "azure"
     },
     {
@@ -171,13 +171,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 746,
-      "observation_count": 3140,
+      "namespace_count": 749,
+      "observation_count": 3157,
       "provider": "azure_openai",
       "service_model_operation_count": 0,
       "shape_key": "azure_openai_async",
       "structural_interval": "openai-content-provenance",
-      "structure_sha256": "8851a0e88089af32c75f2934c3f4aac6091f6e4ad772cf23ac2557a012ccb233",
+      "structure_sha256": "6ed2128f0297671c15cb8a140bb0f22038a3f2d0df1549c3e177ffbc806c3e0e",
       "variant": "azure"
     },
     {
@@ -189,13 +189,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 392,
-      "observation_count": 1480,
+      "namespace_count": 395,
+      "observation_count": 1497,
       "provider": "azure_openai",
       "service_model_operation_count": 0,
       "shape_key": "azure_openai_async",
       "structural_interval": "openai-skills",
-      "structure_sha256": "d2ced9a439c90b8f5e6855ebf63dc02ea3e401cd7cc36d77f6f82ee7796921e4",
+      "structure_sha256": "66d910678709364d62ae3ff38e7f6822179ca74092f78175861405732bb31b41",
       "variant": "azure"
     },
     {
@@ -207,13 +207,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 357,
-      "observation_count": 1371,
+      "namespace_count": 360,
+      "observation_count": 1388,
       "provider": "azure_openai",
       "service_model_operation_count": 0,
       "shape_key": "azure_openai_async",
       "structural_interval": "openai-videos",
-      "structure_sha256": "54166093dd66579f011ab1dcd184bf1862a032924984390ac346963ee4eb2d42",
+      "structure_sha256": "5b7ce3294573e9319947a726a1e68657d686cb3a61c418d80a55cd57dcdd4d8c",
       "variant": "azure"
     },
     {
@@ -261,13 +261,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 621,
-      "observation_count": 2560,
+      "namespace_count": 624,
+      "observation_count": 2577,
       "provider": "azure_openai",
       "service_model_operation_count": 0,
       "shape_key": "azure_openai_sync",
       "structural_interval": "openai-admin",
-      "structure_sha256": "cf956d32031556e7d8d63145e949e9a2cb30684835b1ad088e96f7472b11ef93",
+      "structure_sha256": "04bb80c18b024bb4e341d6c9f859d3c22bb44913fd7e19f5986df6f40d2f1ce6",
       "variant": "azure"
     },
     {
@@ -279,13 +279,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 746,
-      "observation_count": 3140,
+      "namespace_count": 749,
+      "observation_count": 3157,
       "provider": "azure_openai",
       "service_model_operation_count": 0,
       "shape_key": "azure_openai_sync",
       "structural_interval": "openai-content-provenance",
-      "structure_sha256": "39db7d70dc38140b91397e9e239e71e30ba2957f1d2cc2068df576a5e79dea0f",
+      "structure_sha256": "42476c60d987a3246a9c1d29da5de2770617a27dbec2390d3418a038de1be20d",
       "variant": "azure"
     },
     {
@@ -297,13 +297,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 392,
-      "observation_count": 1480,
+      "namespace_count": 395,
+      "observation_count": 1497,
       "provider": "azure_openai",
       "service_model_operation_count": 0,
       "shape_key": "azure_openai_sync",
       "structural_interval": "openai-skills",
-      "structure_sha256": "60bfb4b63bf1f00a6afdac43c8e79d98a2c1fc4f95659f320a762e9a21f76a7a",
+      "structure_sha256": "26270f2ad0646b8ad2ff892b33a4a01a7671afa02b596d1ab8a904cac62894f6",
       "variant": "azure"
     },
     {
@@ -315,13 +315,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 357,
-      "observation_count": 1371,
+      "namespace_count": 360,
+      "observation_count": 1388,
       "provider": "azure_openai",
       "service_model_operation_count": 0,
       "shape_key": "azure_openai_sync",
       "structural_interval": "openai-videos",
-      "structure_sha256": "66c67613c8a6984c88947b060b94f049694e4cfb8db3ab3ce8fae79c76457da8",
+      "structure_sha256": "6325aab0f84b2c4ef3d783485e81cf3985129af115c9e4aa8ca1c6e2ff9fa6a6",
       "variant": "azure"
     },
     {
@@ -809,13 +809,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 621,
-      "observation_count": 2560,
+      "namespace_count": 624,
+      "observation_count": 2577,
       "provider": "openai_compatible",
       "service_model_operation_count": 0,
       "shape_key": "openai_compatible_async",
       "structural_interval": "openai-admin",
-      "structure_sha256": "103aeefccf0186ae70791e3680e5a66ce7349dd1855627ee3791e6206dfc86e9",
+      "structure_sha256": "0fa1b51d26231a05c7b503d4d482fa45c36028f95cdbc14481af84855e058a5a",
       "variant": "generic_compatible"
     },
     {
@@ -827,13 +827,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 746,
-      "observation_count": 3140,
+      "namespace_count": 749,
+      "observation_count": 3157,
       "provider": "openai_compatible",
       "service_model_operation_count": 0,
       "shape_key": "openai_compatible_async",
       "structural_interval": "openai-content-provenance",
-      "structure_sha256": "6aecc70ead0b5bcda9fb3410ea63eba0fd7b20f4d3204754de80b483ca0c05e5",
+      "structure_sha256": "2ce04dae948220dbfbdc284464e23368b0035f8af2026b646637f5c2ad745340",
       "variant": "generic_compatible"
     },
     {
@@ -845,13 +845,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 392,
-      "observation_count": 1480,
+      "namespace_count": 395,
+      "observation_count": 1497,
       "provider": "openai_compatible",
       "service_model_operation_count": 0,
       "shape_key": "openai_compatible_async",
       "structural_interval": "openai-skills",
-      "structure_sha256": "bf6a7bcdb12105c1ad94d2938c1eb773d5a62c7e746c3da45943efb58e9d3707",
+      "structure_sha256": "5fc77ccc646d3f4a13513027cd58289206eabaa5cd2de598fcd517863a29b3d0",
       "variant": "generic_compatible"
     },
     {
@@ -863,13 +863,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 357,
-      "observation_count": 1371,
+      "namespace_count": 360,
+      "observation_count": 1388,
       "provider": "openai_compatible",
       "service_model_operation_count": 0,
       "shape_key": "openai_compatible_async",
       "structural_interval": "openai-videos",
-      "structure_sha256": "4028f95167388715f46459d203c4c72bf90dc438e2de7b8b2266bec99226b746",
+      "structure_sha256": "544b9e10d9a2aebeaf96b806134ba0e789a1a0f338c38f1f4e40ba763de8324a",
       "variant": "generic_compatible"
     },
     {
@@ -917,13 +917,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 621,
-      "observation_count": 2560,
+      "namespace_count": 624,
+      "observation_count": 2577,
       "provider": "openai_compatible",
       "service_model_operation_count": 0,
       "shape_key": "openai_compatible_sync",
       "structural_interval": "openai-admin",
-      "structure_sha256": "6a7392db2c35525762d6471cc1325e79a5aca7983f991a8e45c4fab90e1b539d",
+      "structure_sha256": "f73124ac0adccfe1093f5eed8cbfbe91b20a9fb77c6787754240e5b71e4c95ba",
       "variant": "generic_compatible"
     },
     {
@@ -935,13 +935,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 746,
-      "observation_count": 3140,
+      "namespace_count": 749,
+      "observation_count": 3157,
       "provider": "openai_compatible",
       "service_model_operation_count": 0,
       "shape_key": "openai_compatible_sync",
       "structural_interval": "openai-content-provenance",
-      "structure_sha256": "fdf37d4c9c05c9f26dec14e989d1ededd6cecafca76f22fc576a4b8a69d1187e",
+      "structure_sha256": "4e9f3ae9aaa74ba399790ab66d29d799c93feb62e441a216672cd433cdacf45e",
       "variant": "generic_compatible"
     },
     {
@@ -953,13 +953,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 392,
-      "observation_count": 1480,
+      "namespace_count": 395,
+      "observation_count": 1497,
       "provider": "openai_compatible",
       "service_model_operation_count": 0,
       "shape_key": "openai_compatible_sync",
       "structural_interval": "openai-skills",
-      "structure_sha256": "8fc6cffaecbc8a82df23135c985706adfb539f4c05a977edf2e678e8ea54156e",
+      "structure_sha256": "685226d1092dc76416daebc54b7ab27aeacc63ba626e7682ae63fd3adbd33987",
       "variant": "generic_compatible"
     },
     {
@@ -971,13 +971,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 357,
-      "observation_count": 1371,
+      "namespace_count": 360,
+      "observation_count": 1388,
       "provider": "openai_compatible",
       "service_model_operation_count": 0,
       "shape_key": "openai_compatible_sync",
       "structural_interval": "openai-videos",
-      "structure_sha256": "fce7c504ece368fa94b2eddc28f0e1b55a5857bfd1db52512e1b518bccec5d72",
+      "structure_sha256": "d506db79998a00e26e62a8f07a6ca7dd70fb6d2500505bc457e4b0bdf69099ac",
       "variant": "generic_compatible"
     },
     {
@@ -1025,13 +1025,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 621,
-      "observation_count": 2560,
+      "namespace_count": 624,
+      "observation_count": 2577,
       "provider": "openai",
       "service_model_operation_count": 0,
       "shape_key": "openai_native_async",
       "structural_interval": "openai-admin",
-      "structure_sha256": "46e1573a41abbdc5f97df266ca55c6dd9a79d21be1d5ea229e3cacb7d400e7e8",
+      "structure_sha256": "05e0071397eb30a989bd06a68fed356417af1b9b4c89da751b9a4a15bfbd782c",
       "variant": "native"
     },
     {
@@ -1043,13 +1043,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 746,
-      "observation_count": 3140,
+      "namespace_count": 749,
+      "observation_count": 3157,
       "provider": "openai",
       "service_model_operation_count": 0,
       "shape_key": "openai_native_async",
       "structural_interval": "openai-content-provenance",
-      "structure_sha256": "16357b9ef9764deea7158e0e75faa629e8801f3656d1df1a38338af2271967d3",
+      "structure_sha256": "af91899be1b0d0f59294117d437e2c22da17d142b444f3dc9800da91e5ac4849",
       "variant": "native"
     },
     {
@@ -1061,13 +1061,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 392,
-      "observation_count": 1480,
+      "namespace_count": 395,
+      "observation_count": 1497,
       "provider": "openai",
       "service_model_operation_count": 0,
       "shape_key": "openai_native_async",
       "structural_interval": "openai-skills",
-      "structure_sha256": "67fa852e1ca9a50736cff92afbae64efffd5a6b7375786d9fd3b0c7a239b0662",
+      "structure_sha256": "2804f724952a6cd41a0931334c30a918463f230b21f68cf3150da5e094b27a5f",
       "variant": "native"
     },
     {
@@ -1079,13 +1079,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 357,
-      "observation_count": 1371,
+      "namespace_count": 360,
+      "observation_count": 1388,
       "provider": "openai",
       "service_model_operation_count": 0,
       "shape_key": "openai_native_async",
       "structural_interval": "openai-videos",
-      "structure_sha256": "9e76401e7eb0d5bc10ec4530c5a174b3bbd27a236906aba04e3696820e813c93",
+      "structure_sha256": "905c870ea01cf2f2f8c925d0724fb4d9545f5f47be778006f040ecbcb00268c2",
       "variant": "native"
     },
     {
@@ -1133,13 +1133,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 621,
-      "observation_count": 2560,
+      "namespace_count": 624,
+      "observation_count": 2577,
       "provider": "openai",
       "service_model_operation_count": 0,
       "shape_key": "openai_native_sync",
       "structural_interval": "openai-admin",
-      "structure_sha256": "24818552735b7f6a4fc3545b61a5aa60918fd449505ba0a02e82f9fdd6cc3916",
+      "structure_sha256": "11531eb1030ff4d6e8ebdc0b98398b55739b0bd0d52e8db4fa4e44748451ee92",
       "variant": "native"
     },
     {
@@ -1151,13 +1151,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 746,
-      "observation_count": 3140,
+      "namespace_count": 749,
+      "observation_count": 3157,
       "provider": "openai",
       "service_model_operation_count": 0,
       "shape_key": "openai_native_sync",
       "structural_interval": "openai-content-provenance",
-      "structure_sha256": "36fd2226340cb85341d54bae4037b0fb9dfb2e2120281cbf83a07706f90c0548",
+      "structure_sha256": "397c8ba0b538618261721a93ff827d62026382f30cbac91bea14ee2000cb482a",
       "variant": "native"
     },
     {
@@ -1169,13 +1169,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 392,
-      "observation_count": 1480,
+      "namespace_count": 395,
+      "observation_count": 1497,
       "provider": "openai",
       "service_model_operation_count": 0,
       "shape_key": "openai_native_sync",
       "structural_interval": "openai-skills",
-      "structure_sha256": "c35b2112864bc4a6bed5fc3f4d6f5d8087dbd008dd4dcada84e5f8e5b439ccd7",
+      "structure_sha256": "d3d8891c33f66186b2d67006d8303587545929c5cf22d8270b2ac38389976d81",
       "variant": "native"
     },
     {
@@ -1187,13 +1187,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 357,
-      "observation_count": 1371,
+      "namespace_count": 360,
+      "observation_count": 1388,
       "provider": "openai",
       "service_model_operation_count": 0,
       "shape_key": "openai_native_sync",
       "structural_interval": "openai-videos",
-      "structure_sha256": "716ebed8da4bc26d96b8f4c9b16407bcf9c5dee4d56736062c9c3fd90febce93",
+      "structure_sha256": "4dbb76d9bd4678cd435b1575c40eff501e74318d1ff02cba2a5030e7a72636d0",
       "variant": "native"
     },
     {
@@ -1241,13 +1241,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 621,
-      "observation_count": 2560,
+      "namespace_count": 624,
+      "observation_count": 2577,
       "provider": "together",
       "service_model_operation_count": 0,
       "shape_key": "openai_together_async",
       "structural_interval": "openai-admin",
-      "structure_sha256": "f8de7812c3c16533439e1d8238ffbc3465e1167f611404e3df006246ba6df6a3",
+      "structure_sha256": "570ea571c3511091c22fdb001af19914357c17fd76f8a99d1e395f0f0650565d",
       "variant": "openai_compatible"
     },
     {
@@ -1259,13 +1259,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 746,
-      "observation_count": 3140,
+      "namespace_count": 749,
+      "observation_count": 3157,
       "provider": "together",
       "service_model_operation_count": 0,
       "shape_key": "openai_together_async",
       "structural_interval": "openai-content-provenance",
-      "structure_sha256": "cd83e038c236f0865f6e6ff211caf3853b862c82b876c37313cf60fd3572291f",
+      "structure_sha256": "b2337a1e4cdeb96e9d510adc3c5feafb5754dd3e60dd2e9ba131bd22b85b9a39",
       "variant": "openai_compatible"
     },
     {
@@ -1277,13 +1277,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 392,
-      "observation_count": 1480,
+      "namespace_count": 395,
+      "observation_count": 1497,
       "provider": "together",
       "service_model_operation_count": 0,
       "shape_key": "openai_together_async",
       "structural_interval": "openai-skills",
-      "structure_sha256": "d61c7b72b6f687cb27b47db116e14b0c8469c43076feed38139140f2da5fd395",
+      "structure_sha256": "db507c9b7d808eb2a11a3deb7707e394cefa4048c48a38a50599ef37d4fac0f0",
       "variant": "openai_compatible"
     },
     {
@@ -1295,13 +1295,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 357,
-      "observation_count": 1371,
+      "namespace_count": 360,
+      "observation_count": 1388,
       "provider": "together",
       "service_model_operation_count": 0,
       "shape_key": "openai_together_async",
       "structural_interval": "openai-videos",
-      "structure_sha256": "3ddfefc7530b04eb8aaf4c57b80d32022cb8ec757f1ade1f3c06701341bdca57",
+      "structure_sha256": "9a50026c0ae164e6ac830c057dfb32562fdfdbc34a879970d3ee7d166fb09b2c",
       "variant": "openai_compatible"
     },
     {
@@ -1349,13 +1349,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 621,
-      "observation_count": 2560,
+      "namespace_count": 624,
+      "observation_count": 2577,
       "provider": "together",
       "service_model_operation_count": 0,
       "shape_key": "openai_together_sync",
       "structural_interval": "openai-admin",
-      "structure_sha256": "74c04a674369f65d7e4ed875d014442e21eccda11d963b5445f4c51600ddea54",
+      "structure_sha256": "80c26f2c55c6293c1225c383327bc91eb06d601c820ed6008da9c6b728f56f4f",
       "variant": "openai_compatible"
     },
     {
@@ -1367,13 +1367,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 746,
-      "observation_count": 3140,
+      "namespace_count": 749,
+      "observation_count": 3157,
       "provider": "together",
       "service_model_operation_count": 0,
       "shape_key": "openai_together_sync",
       "structural_interval": "openai-content-provenance",
-      "structure_sha256": "d6d03ef3ca255b1edb5e0ef541836d2395101039533a0dec3c16d48422ff98b5",
+      "structure_sha256": "2dbbc499a6581b804148804c9f1bd8405afbb3dd616804edd796aeea2b3b5e8b",
       "variant": "openai_compatible"
     },
     {
@@ -1385,13 +1385,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 392,
-      "observation_count": 1480,
+      "namespace_count": 395,
+      "observation_count": 1497,
       "provider": "together",
       "service_model_operation_count": 0,
       "shape_key": "openai_together_sync",
       "structural_interval": "openai-skills",
-      "structure_sha256": "30df17888dee0c601ba2bd2dd9d2ffd5adae5b75976439ebd192e7383257ac08",
+      "structure_sha256": "508d18c51f57aac09c08393a3bd56ce82eceeb75c075478926c130a2bddedee9",
       "variant": "openai_compatible"
     },
     {
@@ -1403,13 +1403,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 357,
-      "observation_count": 1371,
+      "namespace_count": 360,
+      "observation_count": 1388,
       "provider": "together",
       "service_model_operation_count": 0,
       "shape_key": "openai_together_sync",
       "structural_interval": "openai-videos",
-      "structure_sha256": "9601dc10e6bc8827ba8c895d46fa560acb39ae5ee4b7c758f168a158c14467a5",
+      "structure_sha256": "e924dce145d910a5bde182272f383ed8e89e1b93b34432d49651e952a40d641a",
       "variant": "openai_compatible"
     },
     {

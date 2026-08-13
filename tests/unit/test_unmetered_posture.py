@@ -13,6 +13,7 @@ import pytest
 from conftest import VALID_API_KEY, foreground_records
 
 from solwyn._base import _reset_unmetered_spend_warnings
+from solwyn._surfaces import SurfaceSource
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import ConfigurationError, UntrackedSpendSurfaceError
 
@@ -77,6 +78,26 @@ class _RealtimeResource:
         return _CallsResource()
 
 
+class _RawSpeechResponseResource:
+    def create(self) -> str:
+        return "raw-created"
+
+    def future(self) -> str:
+        return "future"
+
+
+class _SpeechResource:
+    @functools.cached_property
+    def with_raw_response(self) -> _RawSpeechResponseResource:
+        return _RawSpeechResponseResource()
+
+
+class _AudioResource:
+    @functools.cached_property
+    def speech(self) -> _SpeechResource:
+        return _SpeechResource()
+
+
 _ResponsesResource.__module__ = "openai.resources.responses"
 _FutureResource.__module__ = "openai.resources.future"
 _ContextResource.__module__ = "openai.resources.future"
@@ -84,6 +105,9 @@ _RawResponsesResource.__module__ = "openai.resources.responses"
 _RawResponseClientResource.__module__ = "openai.resources.with_raw_response"
 _CallsResource.__module__ = "openai.resources.realtime.calls"
 _RealtimeResource.__module__ = "openai.resources.realtime"
+_RawSpeechResponseResource.__module__ = "openai.resources.audio.speech"
+_SpeechResource.__module__ = "openai.resources.audio.speech"
+_AudioResource.__module__ = "openai.resources.audio.audio"
 
 
 class _OpenAIClient:
@@ -116,6 +140,10 @@ class _OpenAIClient:
     @functools.cached_property
     def realtime(self) -> _RealtimeResource:
         return _RealtimeResource(self)
+
+    @functools.cached_property
+    def audio(self) -> _AudioResource:
+        return _AudioResource()
 
     @property
     def base_url(self) -> _SafeURL:
@@ -253,6 +281,22 @@ def test_raise_refuses_a_known_untracked_surface_with_its_scope() -> None:
 
 
 @pytest.mark.unit
+def test_metered_leaf_reaching_generic_resolver_raises_wiring_invariant() -> None:
+    wrapper = _make_solwyn(_OpenAIClient())
+    raw = _ResponsesResource()
+
+    with pytest.raises(RuntimeError, match="metered surface reached generic resolver"):
+        wrapper._resolve_public_attribute(
+            raw,
+            name="create",
+            path="chat.completions.create",
+            source=SurfaceSource.RAW,
+        )
+
+    _close(wrapper)
+
+
+@pytest.mark.unit
 def test_exact_acknowledgment_allows_only_the_terminal_leaf() -> None:
     client = _OpenAIClient()
     wrapper = _make_solwyn(
@@ -268,6 +312,40 @@ def test_exact_acknowledgment_allows_only_the_terminal_leaf() -> None:
     assert responses.create() == "created"
     with pytest.raises(UntrackedSpendSurfaceError):
         _ = responses.delete
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_raw_response_chain_stays_guarded_until_acknowledged_terminal() -> None:
+    client = _OpenAIClient()
+    wrapper = _make_solwyn(
+        client,
+        on_unmetered="raise",
+        acknowledge_untracked={"audio.speech.with_raw_response.create"},
+    )
+
+    guarded = wrapper.audio.speech.with_raw_response
+
+    assert guarded is wrapper.audio.speech.with_raw_response
+    assert guarded is not client.audio.speech.with_raw_response
+    assert guarded.create() == "raw-created"
+    with pytest.raises(UntrackedSpendSurfaceError):
+        _ = guarded.future
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_exact_scoped_raw_response_container_acknowledgment_returns_raw() -> None:
+    client = _OpenAIClient()
+    wrapper = _make_solwyn(
+        client,
+        on_unmetered="raise",
+        acknowledge_untracked={"audio.speech.with_raw_response"},
+    )
+
+    raw_response = wrapper.audio.speech.with_raw_response
+
+    assert raw_response is client.audio.speech.with_raw_response
     _close(wrapper)
 
 

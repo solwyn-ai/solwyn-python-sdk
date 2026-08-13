@@ -61,6 +61,18 @@ GROQ_SYNC = SurfaceContext(
     client_shape="openai_sdk",
     mode="sync",
 )
+GOOGLE_GENERATIVEAI_SYNC = SurfaceContext(
+    provider="google",
+    dialect="google",
+    client_shape="google_generativeai",
+    mode="sync",
+)
+GOOGLE_GENAI_SYNC = SurfaceContext(
+    provider="google",
+    dialect="google",
+    client_shape="google_genai",
+    mode="sync",
+)
 
 
 def _export_module() -> ModuleType:
@@ -425,6 +437,31 @@ def _assert_audio_translations_source_shapes(context: SurfaceContext) -> None:
 @pytest.mark.unit
 def test_sync_audio_translations_resolves_source_specific_shapes() -> None:
     _assert_audio_translations_source_shapes(OPENAI_SYNC)
+
+
+@pytest.mark.unit
+def test_legacy_google_generation_is_exactly_wrapper_applicable() -> None:
+    raw = resolve_surface_rule(
+        context=GOOGLE_GENERATIVEAI_SYNC,
+        path="generate_content",
+        source=SurfaceSource.RAW,
+    )
+    wrapper = resolve_surface_rule(
+        context=GOOGLE_GENERATIVEAI_SYNC,
+        path="generate_content",
+        source=SurfaceSource.WRAPPER,
+    )
+
+    assert raw is not None and raw.kind is SurfaceKind.METERED
+    assert wrapper is raw
+    assert (
+        resolve_surface_rule(
+            context=GOOGLE_GENAI_SYNC,
+            path="generate_content",
+            source=SurfaceSource.WRAPPER,
+        )
+        is None
+    )
 
 
 @pytest.mark.unit
