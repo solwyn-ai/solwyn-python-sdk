@@ -32,6 +32,6 @@ def test_async_wrapper_rejects_a_sync_boto3_bedrock_client(monkeypatch) -> None:
     assert "aioboto3" in str(exc_info.value)
     assert exc_info.value.field == "client"
 
-    # The matched pairing still constructs.
-    wrapper = Solwyn(_bedrock_client(), api_key=VALID_API_KEY)
-    assert wrapper._surface_context.client_shape == "bedrock_boto3"
+    # The matched pairing still constructs and releases owned resources.
+    with Solwyn(_bedrock_client(), api_key=VALID_API_KEY) as wrapper:
+        assert wrapper._surface_context.client_shape == "bedrock_boto3"

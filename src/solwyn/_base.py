@@ -546,6 +546,19 @@ def _client_shape(client: object, dialect: str) -> str:
     raise RuntimeError(f"unsupported provider dialect for surface context: {dialect}")
 
 
+def _validate_surface_context(context: SurfaceContext) -> None:
+    """Reject a provider client/mode pairing absent from the reviewed rules."""
+
+    if context_is_declared(context):
+        return
+    hint = _CONTEXT_MISMATCH_HINTS.get((context.client_shape, context.mode), "")
+    raise ConfigurationError(
+        "unsupported provider client/mode pairing: "
+        f"{context.provider}/{context.client_shape}/{context.mode}.{hint}",
+        field="client",
+    )
+
+
 def _belongs_to_client_shape(value: object, client_shape: str) -> bool:
     """Whether an opaque resource belongs to the detected provider SDK family."""
 
@@ -610,23 +623,22 @@ class _SolwynBase:
         *,
         mode: Literal["sync", "async"] = "sync",
     ) -> None:
+        runtime_contexts = tuple(
+            SurfaceContext(
+                provider=runtime.adapter.name,
+                dialect=runtime.adapter.dialect,
+                client_shape=_client_shape(runtime.sdk_client, runtime.adapter.dialect),
+                mode=mode,
+            )
+            for runtime in runtimes
+        )
+        for context in runtime_contexts:
+            _validate_surface_context(context)
+
         self._config = config
         self._runtimes = runtimes
         primary = runtimes[0]
-        self._surface_context = SurfaceContext(
-            provider=primary.adapter.name,
-            dialect=primary.adapter.dialect,
-            client_shape=_client_shape(primary.sdk_client, primary.adapter.dialect),
-            mode=mode,
-        )
-        if not context_is_declared(self._surface_context):
-            context = self._surface_context
-            hint = _CONTEXT_MISMATCH_HINTS.get((context.client_shape, context.mode), "")
-            raise ConfigurationError(
-                "unsupported provider client/mode pairing: "
-                f"{context.provider}/{context.client_shape}/{context.mode}.{hint}",
-                field="client",
-            )
+        self._surface_context = runtime_contexts[0]
         self._guard_lock = threading.Lock()
         self._guarded_resources: dict[str, _GuardedResource] = {}
         self._validate_acknowledgments(primary.sdk_client)

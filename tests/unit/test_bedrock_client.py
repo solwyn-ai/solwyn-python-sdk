@@ -822,6 +822,57 @@ def _make_async_solwyn(client: Any, **overrides: Any) -> AsyncSolwyn:
 
 
 @pytest.mark.unit
+def test_sync_wrapper_rejects_an_async_bedrock_fallback() -> None:
+    # Arrange
+    primary = _mock_openai_client()
+    fallback = _mock_async_bedrock_client()
+
+    # Act / Assert
+    with pytest.raises(ConfigurationError) as exc_info:
+        _make_solwyn(
+            primary,
+            model="gpt-5.5",
+            fallback=[(fallback, BEDROCK_MODEL)],
+        )
+    assert exc_info.value.field == "client"
+    assert "AsyncSolwyn" in str(exc_info.value)
+
+
+@pytest.mark.unit
+def test_async_wrapper_rejects_a_sync_bedrock_fallback() -> None:
+    # Arrange
+    primary = _mock_openai_client()
+    fallback = _mock_bedrock_client()
+
+    # Act / Assert
+    with pytest.raises(ConfigurationError) as exc_info:
+        _make_async_solwyn(
+            primary,
+            model="gpt-5.5",
+            fallback=[(fallback, BEDROCK_MODEL)],
+        )
+    assert exc_info.value.field == "client"
+    assert "aioboto3" in str(exc_info.value)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_wrapper_accepts_an_async_bedrock_fallback() -> None:
+    # Arrange
+    primary = _mock_openai_client()
+    fallback = _mock_async_bedrock_client()
+
+    # Act
+    async with _make_async_solwyn(
+        primary,
+        model="gpt-5.5",
+        fallback=[(fallback, BEDROCK_MODEL)],
+    ) as wrapper:
+        # Assert
+        assert wrapper._runtimes[1].sdk_client is fallback
+
+
+@pytest.mark.unit
 class TestAsyncBedrockConverse:
     @pytest.mark.unit
     @pytest.mark.asyncio
