@@ -8,11 +8,16 @@ that context's digest, forcing a reviewed literal update here. Use
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 
-from solwyn._surfaces import SURFACE_RULES, SurfaceContext
+from solwyn._surfaces import DIALECT_BY_PROVIDER, SURFACE_RULES, SurfaceContext
+
+ROOT = Path(__file__).parents[2]
 
 DECLARED_CONTEXT_DIGESTS: dict[tuple[str, str, str, str], str] = {
     ("openai", "openai", "openai_sdk", "sync"): (
@@ -85,6 +90,16 @@ def _digest(rows: list[dict[str, object]]) -> str:
     return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
+def _capture_module() -> ModuleType:
+    path = ROOT / "scripts" / "capture_surface_inventory.py"
+    spec = importlib.util.spec_from_file_location("capture_surface_inventory_context_pins", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load inventory capture script at {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize("context_tuple", sorted(DECLARED_CONTEXT_DIGESTS))
 def test_context_rule_set_matches_the_reviewed_literal_digest(
@@ -128,6 +143,21 @@ def test_every_rule_is_reachable_from_at_least_one_declared_context() -> None:
 
 
 @pytest.mark.unit
-def test_declared_digest_contexts_cover_exactly_the_declared_tuples() -> None:
-    # Act / Assert
-    assert len(DECLARED_CONTEXT_DIGESTS) == 17
+def test_declared_digest_contexts_match_capture_shape_registry() -> None:
+    # Arrange
+    capture = _capture_module()
+    capture_contexts = {
+        (
+            spec.provider,
+            DIALECT_BY_PROVIDER[spec.provider],
+            spec.client_shape,
+            spec.mode,
+        )
+        for spec in capture._SHAPES
+    }
+
+    # Act
+    pinned_contexts = set(DECLARED_CONTEXT_DIGESTS)
+
+    # Assert
+    assert pinned_contexts == capture_contexts

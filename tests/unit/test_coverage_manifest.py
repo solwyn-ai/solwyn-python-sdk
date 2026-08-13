@@ -850,7 +850,7 @@ def test_documented_fingerprint_rejects_alias_and_comment_bypasses(
 
 
 @pytest.mark.unit
-def test_readme_uses_the_tested_literal_openai_fingerprint_without_self_approval() -> None:
+def test_readme_openai_fingerprint_uses_literal_sha256_digests() -> None:
     # Arrange
     readme = (_PROJECT_ROOT / "README.md").read_text()
 
