@@ -1,4 +1,4 @@
-.PHONY: install install-hooks lint fmt fmt-check typecheck test test-unit test-integration check capture-provider-surfaces check-provider-surfaces
+.PHONY: install install-hooks lint fmt fmt-check typecheck test test-unit test-integration check capture-provider-surfaces check-provider-surfaces export-surface-contract check-surface-contract
 
 ##@ Setup
 
@@ -48,3 +48,9 @@ capture-provider-surfaces: ## Refresh latest real-SDK surface fingerprints
 
 check-provider-surfaces: ## Verify latest real-SDK surface fingerprints
 	uv run --extra dev --with 'aioboto3>=13.0' python scripts/capture_surface_inventory.py --check --interval latest --output-dir build/provider_surface_inventory
+
+export-surface-contract: ## Generate the contextual surface contract artifact under build/
+	uv run python scripts/export_surface_contract.py
+
+check-surface-contract: ## Generate and verify the contextual surface contract artifact
+	uv run python scripts/export_surface_contract.py --check

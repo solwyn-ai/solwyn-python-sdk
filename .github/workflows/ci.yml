@@ -63,12 +63,21 @@ jobs:
           --output-dir build/provider_surface_inventory
         env:
           AWS_EC2_METADATA_DISABLED: "true"
+      - name: Verify generated surfaces are classified
+        if: always()
+        run: >-
+          python scripts/export_surface_contract.py
+          --check
+          --output build/surface_contract/surface-classification.json
+          --reports-dir build/provider_surface_inventory
       - name: Upload provider surface inventory
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: provider-surface-${{ matrix.family }}-${{ matrix.interval }}
-          path: build/provider_surface_inventory
+          path: |
+            build/provider_surface_inventory
+            build/surface_contract/surface-classification.json
           if-no-files-found: error
           retention-days: 7
 

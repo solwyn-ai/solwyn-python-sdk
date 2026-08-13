@@ -692,7 +692,10 @@ def test_provider_inventory_ci_is_least_privilege_and_catalog_driven() -> None:
             "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
             "with": {
                 "name": "provider-surface-${{ matrix.family }}-${{ matrix.interval }}",
-                "path": "build/provider_surface_inventory",
+                "path": (
+                    "build/provider_surface_inventory\n"
+                    "build/surface_contract/surface-classification.json\n"
+                ),
                 "if-no-files-found": "error",
                 "retention-days": 7,
             },
