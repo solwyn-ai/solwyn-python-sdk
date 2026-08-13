@@ -36,7 +36,25 @@ def payload_rows(source_text: str) -> dict[str, list[object]]:
         line.strip().strip('"') for line in block.splitlines() if line.strip().startswith('"')
     )
     payload = json.loads(zlib.decompress(base64.b85decode(encoded.encode("ascii"))))
-    return {row[0]: row for row in payload["rules"]}
+    if not isinstance(payload, dict):
+        raise RuntimeError("surface payload root must be an object")
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] != 1:
+        raise RuntimeError("surface payload schema version is unsupported")
+    rules = payload.get("rules")
+    if not isinstance(rules, list):
+        raise RuntimeError("surface payload rules must be a list")
+
+    rows: dict[str, list[object]] = {}
+    for row in rules:
+        if not isinstance(row, list) or not row or not isinstance(row[0], str) or not row[0]:
+            raise RuntimeError(
+                "surface payload rule must be a nonempty list with a nonempty string id"
+            )
+        rule_id = row[0]
+        if rule_id in rows:
+            raise RuntimeError(f"surface payload contains duplicate rule id: {rule_id}")
+        rows[rule_id] = row
+    return rows
 
 
 def classify(
@@ -55,7 +73,7 @@ def _source_at(ref: str) -> str:
     if ref == WORKTREE:
         return (ROOT / SOURCE).read_text(encoding="utf-8")
     return subprocess.run(
-        ["git", "show", f"{ref}:{SOURCE}"],
+        ["git", "show", "--end-of-options", f"{ref}:{SOURCE}"],
         capture_output=True,
         text=True,
         check=True,

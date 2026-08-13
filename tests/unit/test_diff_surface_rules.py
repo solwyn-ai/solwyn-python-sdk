@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import subprocess
 import zlib
 from pathlib import Path
 from types import ModuleType
@@ -64,3 +65,34 @@ def test_payload_rows_reads_the_committed_payload() -> None:
     # Assert
     assert len(rows) > 5000
     assert all(rule_id.startswith("surface.") for rule_id in rows)
+
+
+@pytest.mark.unit
+def test_source_at_rejects_option_shaped_ref_without_writing(tmp_path: Path) -> None:
+    # Arrange
+    diff = _diff_module()
+    output_prefix = tmp_path / "leaked"
+    leaked_target = tmp_path / f"leaked:{diff.SOURCE}"
+    leaked_target.parent.mkdir(parents=True)
+    error = None
+
+    # Act
+    try:
+        diff._source_at(f"--output={output_prefix}")
+    except subprocess.CalledProcessError as exc:
+        error = exc
+
+    # Assert
+    assert error is not None
+    assert not leaked_target.exists()
+
+
+@pytest.mark.unit
+def test_payload_rows_rejects_duplicate_rule_ids() -> None:
+    # Arrange
+    diff = _diff_module()
+    source = _source_with_rows([["rule.a", "first"], ["rule.a", "second"]])
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match=r"duplicate.*rule\.a"):
+        diff.payload_rows(source)
