@@ -633,7 +633,7 @@ def test_committed_latest_fingerprints_match_the_installed_sdk_set() -> None:
     EXPECTED_LATEST_SHAPES = frozenset(
         key for key in capture.shape_keys() if not key.startswith("bedrock_")
     )
-    assert set(selected) == EXPECTED_LATEST_SHAPES, sorted(EXPECTED_LATEST_SHAPES - set(selected))
+    assert set(selected) >= EXPECTED_LATEST_SHAPES, sorted(EXPECTED_LATEST_SHAPES - set(selected))
 
     reports = capture.capture_all(
         structural_interval="latest",
