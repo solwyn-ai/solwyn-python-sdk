@@ -789,7 +789,7 @@ def test_generated_json_is_the_deterministic_python_export(tmp_path: Path) -> No
 
 
 @pytest.mark.unit
-def test_check_writes_contract_before_failing_closed_on_empty_reports(tmp_path: Path) -> None:
+def test_check_bootstraps_then_fails_closed_on_empty_reports(tmp_path: Path) -> None:
     exporter = _export_module()
     output = tmp_path / "nested" / "surface-classification.json"
     reports = tmp_path / "reports"
@@ -799,3 +799,28 @@ def test_check_writes_contract_before_failing_closed_on_empty_reports(tmp_path: 
 
     assert output.read_text(encoding="utf-8") == exporter.render_contract()
     assert mismatches == (f"no provider surface reports found in {reports}",)
+
+
+@pytest.mark.unit
+def test_check_preserves_and_rejects_a_differing_expanded_contract(tmp_path: Path) -> None:
+    exporter = _export_module()
+    output = tmp_path / "surface-classification.json"
+    edited = exporter.render_contract().replace("{", "{\n ", 1)
+    output.write_text(edited, encoding="utf-8")
+
+    mismatches = exporter.generate_and_check(output)
+
+    assert output.read_text(encoding="utf-8") == edited
+    assert len(mismatches) == 1
+    assert "differs from the embedded payload" in mismatches[0]
+
+
+@pytest.mark.unit
+def test_check_bootstraps_a_missing_expanded_contract(tmp_path: Path) -> None:
+    exporter = _export_module()
+    output = tmp_path / "nested" / "surface-classification.json"
+
+    mismatches = exporter.generate_and_check(output)
+
+    assert mismatches == ()
+    assert output.read_text(encoding="utf-8") == exporter.render_contract()

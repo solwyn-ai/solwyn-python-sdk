@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Export the deterministic contextual provider capability contract."""
+"""Export the deterministic contextual provider capability contract.
+
+``--check`` is safe after hand-editing: an existing file that differs from the
+embedded payload FAILS the check and is left untouched; a missing file is
+bootstrapped. The bare (no ``--check``) invocation always overwrites — it is
+the bootstrap step and will destroy local edits.
+"""
 
 from __future__ import annotations
 
@@ -93,9 +99,24 @@ def generate_and_check(
     *,
     reports_dir: Path | None = None,
 ) -> tuple[str, ...]:
-    """Write the deterministic ledger and return provider-report mismatches."""
+    """Verify (or bootstrap) the ledger without destroying local edits.
 
-    write_contract(output)
+    An existing file that differs from the embedded payload is preserved and
+    reported as a mismatch — it is either a hand-edit awaiting
+    ``embed_surface_rules.py`` or a stale export from another payload. A
+    missing file is bootstrapped so fresh CI runners can proceed.
+    """
+
+    rendered = render_contract()
+    if output.exists():
+        if output.read_text(encoding="utf-8") != rendered:
+            return (
+                f"{output} differs from the embedded payload; run "
+                "scripts/embed_surface_rules.py --input <file> to apply edits, "
+                "or delete the file and re-export to regenerate",
+            )
+    else:
+        write_contract(output)
     if reports_dir is None:
         return ()
     return compare_report_directory(reports_dir)
