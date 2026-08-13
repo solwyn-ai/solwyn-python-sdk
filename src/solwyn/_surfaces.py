@@ -8,6 +8,7 @@ guards, coverage reporting, and provider drift canaries.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import zlib
 from collections import defaultdict
@@ -393,6 +394,17 @@ def surface_contract_data(
         },
         "rules": rows,
     }
+
+
+def payload_fingerprint(rules: Iterable[SurfaceRule] | None = None) -> str:
+    """Return a stable digest of the contract for embed provenance checks."""
+
+    canonical = json.dumps(
+        surface_contract_data(rules),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _validate_surface_path(path: str) -> None:

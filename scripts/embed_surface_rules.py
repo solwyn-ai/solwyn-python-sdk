@@ -52,6 +52,7 @@ from solwyn._surfaces import (
     SurfaceSelector,
     SurfaceSource,
     UsageBasis,
+    payload_fingerprint,
 )
 
 ROOT = Path(__file__).parents[1]
@@ -90,7 +91,8 @@ def _canonical_expanded_row(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _validated_rules(contract: Mapping[str, Any]) -> tuple[SurfaceRule, ...]:
-    if set(contract) != {"contract_version", "schema_version", "unknown_policy", "rules"}:
+    required = {"contract_version", "schema_version", "unknown_policy", "rules"}
+    if not required <= set(contract) <= required | {"source_payload_fingerprint"}:
         raise RuntimeError("surface contract root fields are invalid")
     if contract.get("contract_version") != CONTRACT_VERSION:
         raise RuntimeError("surface contract version is unsupported")
@@ -137,6 +139,15 @@ def _validated_rules(contract: Mapping[str, Any]) -> tuple[SurfaceRule, ...]:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("invalid expanded surface contract rule") from exc
+        segments = rule.rule_id.split(".")
+        if (
+            len(segments) not in {4, 5}
+            or segments[0] != "surface"
+            or segments[2] != rule.kind.value
+        ):
+            raise RuntimeError(
+                f"rule id {rule.rule_id!r} does not encode its kind ({rule.kind.value})"
+            )
         if rule.to_data() != _canonical_expanded_row(row):
             raise RuntimeError(f"rule {rule.rule_id!r} does not match validated export")
         rules.append(rule)
@@ -145,6 +156,27 @@ def _validated_rules(contract: Mapping[str, Any]) -> tuple[SurfaceRule, ...]:
     if len({rule.rule_id for rule in ordered}) != len(ordered):
         raise RuntimeError("surface contract contains duplicate rule ids")
     return ordered
+
+
+def rule_delta(
+    new_rules: tuple[SurfaceRule, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Return (removed, added, changed) rule ids vs the installed payload."""
+
+    from solwyn._surfaces import SURFACE_RULES
+
+    current = {rule.rule_id: rule for rule in SURFACE_RULES}
+    incoming = {rule.rule_id: rule for rule in new_rules}
+    removed = tuple(sorted(current.keys() - incoming.keys()))
+    added = tuple(sorted(incoming.keys() - current.keys()))
+    changed = tuple(
+        sorted(
+            rule_id
+            for rule_id in current.keys() & incoming.keys()
+            if current[rule_id].to_data() != incoming[rule_id].to_data()
+        )
+    )
+    return removed, added, changed
 
 
 def _selector_key(selector: SurfaceSelector) -> tuple[str, str, str, str]:
@@ -222,6 +254,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--allow-stale", action="store_true")
+    parser.add_argument("--allow-removals", action="store_true")
     return parser
 
 
@@ -230,6 +264,22 @@ def main() -> int:
     contract = json.loads(args.input.read_text(encoding="utf-8"))
     if not isinstance(contract, dict):
         raise RuntimeError("surface contract root must be an object")
+    stamp = contract.get("source_payload_fingerprint")
+    if stamp != payload_fingerprint() and not args.allow_stale:
+        print(
+            "stale expanded contract: source_payload_fingerprint "
+            f"{stamp!r} does not match the installed payload; re-export on this "
+            "branch or pass --allow-stale to override"
+        )
+        return 1
+    removed, added, changed = rule_delta(_validated_rules(contract))
+    if not args.check:
+        for label, ids in (("removed", removed), ("added", added), ("changed", changed)):
+            for rule_id in ids:
+                print(f"{label}: {rule_id}")
+        if removed and not args.allow_removals:
+            print(f"refusing to remove {len(removed)} rule(s); pass --allow-removals")
+            return 1
     existing = args.source.read_text(encoding="utf-8")
     rewritten = rewrite_source(existing, encode_contract(contract))
     if args.check:

@@ -18,6 +18,7 @@ from solwyn._surfaces import (
     AttributeShape,
     SurfaceContext,
     SurfaceSource,
+    payload_fingerprint,
     resolve_surface_rule,
     surface_contract_data,
 )
@@ -39,7 +40,9 @@ _DIALECT_BY_PROVIDER = {
 def render_contract() -> str:
     """Render the Python-owned contract with stable ordering and a final newline."""
 
-    return json.dumps(surface_contract_data(), indent=2, sort_keys=True) + "\n"
+    contract: dict[str, Any] = surface_contract_data()
+    contract["source_payload_fingerprint"] = payload_fingerprint()
+    return json.dumps(contract, indent=2, sort_keys=True) + "\n"
 
 
 def write_contract(path: Path = DEFAULT_OUTPUT) -> None:

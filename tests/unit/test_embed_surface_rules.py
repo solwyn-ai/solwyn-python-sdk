@@ -30,6 +30,87 @@ def _embed_module() -> ModuleType:
     return module
 
 
+def _stamped(contract: dict[str, Any], fingerprint: str) -> dict[str, Any]:
+    stamped = dict(contract)
+    stamped["source_payload_fingerprint"] = fingerprint
+    return stamped
+
+
+@pytest.mark.unit
+def test_embed_rejects_a_stale_source_fingerprint(tmp_path: Path) -> None:
+    # Arrange
+    from solwyn._surfaces import payload_fingerprint
+
+    contract = _stamped(surface_contract_data(), "sha256:" + "0" * 64)
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    source = tmp_path / "source.py"
+    source.write_text(
+        "x = 1\n# BEGIN GENERATED SURFACE RULE PAYLOAD\nP = ()\n"
+        "# END GENERATED SURFACE RULE PAYLOAD\n",
+        encoding="utf-8",
+    )
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "embed_surface_rules.py"),
+        "--input",
+        str(contract_path),
+        "--source",
+        str(source),
+    ]
+
+    # Act
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+
+    # Assert
+    assert result.returncode != 0
+    assert "stale" in (result.stdout + result.stderr)
+
+    # Arrange
+    good = _stamped(surface_contract_data(), payload_fingerprint())
+    contract_path.write_text(json.dumps(good), encoding="utf-8")
+
+    # Act
+    ok = subprocess.run(command, capture_output=True, text=True, check=False)
+
+    # Assert
+    assert ok.returncode == 0
+
+
+@pytest.mark.unit
+def test_embed_requires_allow_removals_when_rules_disappear() -> None:
+    # Arrange
+    embed = _embed_module()
+    contract: dict[str, Any] = surface_contract_data()
+    reduced = dict(contract)
+    reduced["rules"] = contract["rules"][:-1]
+
+    # Act
+    removed, added, changed = embed.rule_delta(embed._validated_rules(reduced))
+
+    # Assert
+    assert len(removed) == 1
+    assert added == ()
+    assert changed == ()
+
+
+@pytest.mark.unit
+def test_validated_rules_rejects_an_id_that_lies_about_kind() -> None:
+    # Arrange
+    embed = _embed_module()
+    contract: dict[str, Any] = surface_contract_data()
+    row = dict(contract["rules"][0])
+    segments = row["id"].split(".")
+    segments[2] = "blocked" if segments[2] != "blocked" else "metadata"
+    row["id"] = ".".join(segments)
+    tampered = dict(contract)
+    tampered["rules"] = [row] + contract["rules"][1:]
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="does not encode its kind"):
+        embed._validated_rules(tampered)
+
+
 @pytest.mark.unit
 def test_surface_payload_encoder_canonicalizes_equivalent_input_order() -> None:
     # Arrange
@@ -111,9 +192,12 @@ def test_surface_payload_rewriter_changes_only_the_marked_block() -> None:
 @pytest.mark.unit
 def test_surface_payload_cli_generates_then_checks_temporary_source(tmp_path: Path) -> None:
     # Arrange
+    from solwyn._surfaces import payload_fingerprint
+
     input_path = tmp_path / "surface-classification.json"
     source_path = tmp_path / "_surfaces.py"
-    input_path.write_text(json.dumps(surface_contract_data()), encoding="utf-8")
+    contract = _stamped(surface_contract_data(), payload_fingerprint())
+    input_path.write_text(json.dumps(contract), encoding="utf-8")
     stale_source = (
         "before\n"
         "# BEGIN GENERATED SURFACE RULE PAYLOAD\n"

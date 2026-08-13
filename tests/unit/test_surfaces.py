@@ -22,6 +22,7 @@ from solwyn._surfaces import (
     SurfaceSelector,
     SurfaceSource,
     UsageBasis,
+    payload_fingerprint,
     resolve_surface_rule,
     surface_contract_data,
 )
@@ -777,7 +778,9 @@ def test_generated_json_is_the_deterministic_python_export(tmp_path: Path) -> No
     exporter = _export_module()
     output = tmp_path / "surface-classification.json"
     contract = surface_contract_data()
-    expected = json.dumps(contract, indent=2, sort_keys=True) + "\n"
+    expected_contract = dict(contract)
+    expected_contract["source_payload_fingerprint"] = payload_fingerprint()
+    expected = json.dumps(expected_contract, indent=2, sort_keys=True) + "\n"
 
     exporter.write_contract(output)
 
