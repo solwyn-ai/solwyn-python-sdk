@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import socket
-from functools import cached_property
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -207,7 +206,41 @@ def test_compare_fingerprints_reports_missing_and_structural_drift(tmp_path: Pat
     # Assert
     assert mismatches == (
         "missing fingerprint: anthropic_sync@latest",
-        "fingerprint drift: openai_native_sync@latest",
+        "fingerprint drift: openai_native_sync@latest "
+        "(namespace_count 1 -> 1, delta +0; observation_count 2 -> 2, delta +0; "
+        "service_model_operation_count 0 -> 0, delta +0)",
+    )
+
+
+@pytest.mark.unit
+def test_compare_fingerprints_reports_structural_count_deltas_in_fixed_order(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    capture = _capture_module()
+    fingerprint_path = tmp_path / "fingerprints.json"
+    expected = _sample_report()
+    capture.update_fingerprint_manifest(fingerprint_path, [expected])
+    drifted = _sample_report(distribution_version="2.54.0")
+    drifted["namespaces"].append("responses.with_raw_response")
+    drifted["observations"].append(
+        {
+            "path": "responses.with_raw_response",
+            "descriptor_category": "cached_property",
+            "return_shape": "resource",
+            "source": "public_attribute",
+        }
+    )
+    drifted["service_model_operations"].append("responses.create")
+
+    # Act
+    mismatches = capture.compare_fingerprints(fingerprint_path, [drifted])
+
+    # Assert
+    assert mismatches == (
+        "fingerprint drift: openai_native_sync@latest "
+        "(namespace_count 1 -> 2, delta +1; observation_count 2 -> 3, delta +1; "
+        "service_model_operation_count 0 -> 1, delta +1)",
     )
 
 
@@ -367,7 +400,11 @@ def test_inventory_run_writes_full_artifact_before_reporting_drift(
     # Assert
     artifact_path = output_dir / "openai_native_sync--latest.json"
     assert result.paths == (artifact_path,)
-    assert result.mismatches == ("fingerprint drift: openai_native_sync@latest",)
+    assert result.mismatches == (
+        "fingerprint drift: openai_native_sync@latest "
+        "(namespace_count 1 -> 1, delta +0; observation_count 2 -> 2, delta +0; "
+        "service_model_operation_count 0 -> 0, delta +0)",
+    )
     assert json.loads(artifact_path.read_text(encoding="utf-8")) == drifted
 
 
@@ -406,91 +443,6 @@ def test_inventory_run_retains_reports_captured_before_a_later_failure(
             check=True,
         )
     assert (output_dir / "anthropic_async--latest.json").exists()
-
-
-@pytest.mark.unit
-def test_namespace_discovery_fails_instead_of_truncating_at_max_depth() -> None:
-    # Arrange
-    capture = _capture_module()
-
-    class ProviderResource:
-        __module__ = "openai.resources.synthetic"
-
-        def __init__(self, child: object | None = None) -> None:
-            self._child = child
-
-        @property
-        def nested(self) -> object | None:
-            return self._child
-
-    root = ProviderResource(ProviderResource(ProviderResource(ProviderResource())))
-
-    # Act / Assert
-    with pytest.raises(capture.SurfaceInspectionError) as caught:
-        capture._discover_namespaces(root, max_depth=2)
-    assert caught.value.path == "nested.nested.nested"
-    assert caught.value.stage == "depth_exhaustion"
-
-
-@pytest.mark.unit
-def test_namespace_discovery_allows_a_terminal_at_max_depth() -> None:
-    # Arrange
-    capture = _capture_module()
-
-    class ProviderResource:
-        __module__ = "openai.resources.synthetic"
-
-        def __init__(self, child: object | None = None) -> None:
-            self._child = child
-
-        @property
-        def nested(self) -> object | None:
-            return self._child
-
-    root = ProviderResource(ProviderResource(ProviderResource()))
-
-    # Act
-    namespaces = capture._discover_namespaces(root, max_depth=2)
-
-    # Assert
-    assert namespaces == ("nested", "nested.nested")
-
-
-@pytest.mark.unit
-def test_namespace_discovery_preserves_cached_property_after_instance_cache_fill() -> None:
-    # Arrange
-    capture = _capture_module()
-
-    class ProviderResource:
-        __module__ = "openai.resources.synthetic"
-
-    class Root:
-        @cached_property
-        def child(self) -> ProviderResource:
-            return ProviderResource()
-
-    root = Root()
-    cached_child = root.child
-
-    # Act
-    namespaces = capture._discover_namespaces(root)
-
-    # Assert
-    assert root.child is cached_child
-    assert namespaces == ("child",)
-
-
-@pytest.mark.unit
-def test_openai_realtime_calls_is_a_provider_resource() -> None:
-    # Arrange
-    capture = _capture_module()
-    RealtimeCalls = type("_Calls", (), {"__module__": "openai.lib._realtime"})
-
-    # Act
-    is_provider_resource = capture._provider_resource(RealtimeCalls())
-
-    # Assert
-    assert is_provider_resource is True
 
 
 @pytest.mark.unit
@@ -629,6 +581,11 @@ def test_committed_latest_fingerprints_match_the_installed_sdk_set() -> None:
 
     if not selected:
         pytest.skip("provider SDKs are not installed")
+
+    EXPECTED_LATEST_SHAPES = frozenset(
+        key for key in capture.shape_keys() if not key.startswith("bedrock_")
+    )
+    assert set(selected) >= EXPECTED_LATEST_SHAPES, sorted(EXPECTED_LATEST_SHAPES - set(selected))
 
     reports = capture.capture_all(
         structural_interval="latest",

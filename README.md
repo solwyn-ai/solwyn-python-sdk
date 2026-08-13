@@ -289,6 +289,14 @@ Provider applicability is explicit. Native OpenAI video is tracked through
 raises `UnsupportedSurfaceError` before dispatch. An acknowledgment cannot
 turn an unsupported adapter surface into a supported one.
 
+#### Tested SDK version intervals
+
+The surface contract is verified against pinned structural breakpoints per
+provider (see `tests/provider_surface_intervals.json`): floor, named
+breakpoints, and latest. Versions between tested breakpoints may expose
+surfaces we have not classified; those resolve as `unknown` and follow
+`on_unmetered`.
+
 Use `solwyn.coverage(client)` to review the exact effective graph without
 calling a provider operation. Coverage is computed locally and transmits
 nothing. It reads structural client metadata only—never prompts, responses,

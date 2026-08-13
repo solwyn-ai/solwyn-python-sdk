@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import functools
 import inspect
+import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,18 +25,6 @@ from solwyn import (
 )
 from solwyn._base import _SolwynBase
 from solwyn._surfaces import SurfaceContext
-
-OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
-    guarded_namespaces="sha256:770ba77e018f38c9b64af1d43770dfd6d79f3c1d1c9f5ac5253cfa3000d2b743",
-    tracked="sha256:ee52e554ddf531bea4560f69fdbef1ca0ac90e433fb9f93fba6e291d39e2aebc",
-    untracked="sha256:8f7d1bc744e022db61ec44c7e2ebfadcf3599ea225a021050ff3022620ecfd3c",
-    unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    scoped_escapes="sha256:6808a0f2ac290c9d4d1504b21b1c0ba98267636ced4234416b53533b29bb4073",
-    blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    unsupported="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    conditional="sha256:ce837f71d1fc97849872c5d0f86b0b1f26e1bc4e46a29c3b1b8004bf4b9bcb77",
-    safe="sha256:9029368e5fa0a7bf4260cc782560c8ec9a53c948fc280102b1c3633eee5234c5",
-)
 
 _PROJECT_ROOT = Path(__file__).parents[2]
 
@@ -611,11 +600,49 @@ def test_compact_fingerprint_is_frozen_literal_and_covers_every_category() -> No
 
 
 @pytest.mark.unit
+def test_fingerprint_mismatch_names_the_category_size_for_triage() -> None:
+    # Arrange
+    report = _report_for_expectation(_audit_entry())
+    good = report.fingerprint()
+    tampered = good.model_copy(update={"untracked": "sha256:" + "0" * 64})
+
+    # Act
+    with pytest.raises(CoverageMismatchError) as exc_info:
+        report.expect(tampered)
+
+    # Assert
+    message = str(exc_info.value)
+    assert "untracked: fingerprint changed" in message
+    assert "entries" in message
+    assert "CoverageExpectation" in message
+
+
+@pytest.mark.unit
+def test_effective_actions_rejects_an_unsupported_coverage_kind() -> None:
+    # Arrange
+    import solwyn._coverage as coverage_module
+
+    client = _wrapper(_OpenAIShape())
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="unsupported coverage kind"):
+        coverage_module._effective_actions(
+            kind=object(),
+            token="future.operation",
+            surface="future.operation",
+            return_shape="callable",
+            capability_scope=None,
+            client=client,
+        )
+
+
+@pytest.mark.unit
 def test_real_openai_shape_matches_the_literal_exhaustive_audit_fingerprint() -> None:
     raw = openai.OpenAI(api_key="sk-test")
     try:
         report = solwyn.coverage(_wrapper(raw))
-        report.expect(OPENAI_STRICT_FINGERPRINT)
+        readme = (_PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        report.expect(_documented_openai_fingerprint(readme))
     finally:
         raw.close()
 
@@ -726,6 +753,34 @@ def _documented_openai_fingerprint(readme: str) -> CoverageFingerprint:
     return CoverageFingerprint(**values)
 
 
+def _latest_openai_version_from_fingerprint_manifest() -> str:
+    manifest = json.loads(
+        (_PROJECT_ROOT / "tests" / "provider_surface_fingerprints.json").read_text(encoding="utf-8")
+    )
+    latest_rows = tuple(
+        row
+        for row in manifest["fingerprints"]
+        if row["provider"] == "openai"
+        and row["variant"] == "native"
+        and row["structural_interval"] == "latest"
+    )
+    assert len(latest_rows) == 2
+    assert {row["mode"] for row in latest_rows} == {"sync", "async"}
+    versions: list[str] = []
+    for row in latest_rows:
+        openai_distributions = tuple(
+            distribution
+            for distribution in row["distributions"]
+            if distribution["name"] == "openai"
+        )
+        assert len(openai_distributions) == 1
+        version = openai_distributions[0]["version"]
+        assert isinstance(version, str) and version
+        versions.append(version)
+    assert len(set(versions)) == 1, "latest OpenAI sync/async fingerprints disagree on version"
+    return versions[0]
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize(
     ("executable_lines", "before_literal", "expected_message"),
@@ -774,8 +829,10 @@ def test_documented_fingerprint_rejects_alias_and_comment_bypasses(
     expected_message: str,
 ) -> None:
     # Arrange
+    readme = (_PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    reviewed_fingerprint = _documented_openai_fingerprint(readme)
     fields = "\n".join(
-        f"    {name}={value!r}," for name, value in OPENAI_STRICT_FINGERPRINT.model_dump().items()
+        f"    {name}={value!r}," for name, value in reviewed_fingerprint.model_dump().items()
     )
     literal_lines = f"OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(\n{fields}\n)"
     fence_lines = (
@@ -793,7 +850,7 @@ def test_documented_fingerprint_rejects_alias_and_comment_bypasses(
 
 
 @pytest.mark.unit
-def test_readme_uses_the_tested_literal_openai_fingerprint_without_self_approval() -> None:
+def test_readme_openai_fingerprint_uses_literal_sha256_digests() -> None:
     # Arrange
     readme = (_PROJECT_ROOT / "README.md").read_text()
 
@@ -801,7 +858,38 @@ def test_readme_uses_the_tested_literal_openai_fingerprint_without_self_approval
     documented_fingerprint = _documented_openai_fingerprint(readme)
 
     # Assert
-    assert documented_fingerprint == OPENAI_STRICT_FINGERPRINT
+    assert all(
+        re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+        for digest in documented_fingerprint.model_dump().values()
+    )
+
+
+@pytest.mark.unit
+def test_readme_is_the_only_authored_openai_fingerprint_literal() -> None:
+    # Arrange
+    module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+
+    # Act
+    assignments = tuple(
+        statement
+        for statement in module.body
+        if _assigns_name(statement, "OPENAI_STRICT_FINGERPRINT")
+    )
+
+    # Assert
+    assert assignments == ()
+
+
+@pytest.mark.unit
+def test_readme_openai_provenance_matches_the_latest_fingerprint_manifest() -> None:
+    # Arrange
+    readme = (_PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+    # Act
+    version = _latest_openai_version_from_fingerprint_manifest()
+
+    # Assert
+    assert f"openai=={version}" in readme
 
 
 @pytest.mark.unit
@@ -825,6 +913,8 @@ def test_readme_states_the_strict_coverage_and_trust_boundary_contract() -> None
         "response, page, stream, job, or operation object",
         "Native OpenAI video is tracked",
         "video on an OpenAI-compatible provider is unsupported",
+        "Tested SDK version intervals",
+        "unknown` and follow `on_unmetered`",
     )
 
     # Act

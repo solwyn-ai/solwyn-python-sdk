@@ -7,7 +7,9 @@ from this and add their own HTTP layer.
 
 from __future__ import annotations
 
+import inspect
 import logging
+import os
 import statistics
 import threading
 import time
@@ -45,6 +47,7 @@ from solwyn._surfaces import (
     SurfaceRule,
     SurfaceSource,
     _validate_surface_path,
+    context_is_declared,
     resolve_surface_rule,
 )
 from solwyn._token_details import TokenDetails
@@ -91,6 +94,19 @@ _FAILOVER_TUNING_FIELDS = (
 )
 
 _GUARDABLE_RETURN_SHAPES = frozenset({"resource", "context_manager", "async_context_manager"})
+
+_CONTEXT_MISMATCH_HINTS = {
+    ("bedrock_boto3", "async"): (
+        " boto3 clients are synchronous — wrap them with Solwyn, or use an "
+        "aioboto3 client with AsyncSolwyn"
+    ),
+    ("bedrock_aioboto3", "sync"): (
+        " aioboto3 clients are asynchronous — wrap them with AsyncSolwyn"
+    ),
+    ("google_generativeai", "async"): (
+        " google-generativeai supports sync only — wrap it with Solwyn"
+    ),
+}
 
 
 class FailoverTuning(NamedTuple):
@@ -152,16 +168,30 @@ def _warn_cost_policy_inactive_once() -> None:
     logger.warning("CostPolicy selected but no price hints available; using health-based order")
 
 
-# Per-process warn-once state is keyed by the complete contextual rule identity,
-# so equal terminal names in different provider graphs cannot suppress each other.
-_warned_contextual_surfaces: set[tuple[str, str, str]] = set()
+# Per-process warn-once state is keyed by the complete contextual rule identity
+# and drift state, so matching and drift warnings cannot suppress each other.
+_WARNED_SURFACE_LIMIT = 512
+_warned_contextual_surfaces: set[tuple[str, str, str, str, bool]] = set()
+_warn_limit_reached = False
 _spend_surface_warn_lock = threading.Lock()
+
+
+def _reset_warn_locks_after_fork_in_child() -> None:
+    global _spend_surface_warn_lock, _cost_policy_warn_lock
+    _spend_surface_warn_lock = threading.Lock()
+    _cost_policy_warn_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_warn_locks_after_fork_in_child)
 
 
 def _reset_unmetered_spend_warnings() -> None:
     """Clear the per-process warn-once latch. Test-support hook only."""
+    global _warn_limit_reached
     with _spend_surface_warn_lock:
         _warned_contextual_surfaces.clear()
+        _warn_limit_reached = False
 
 
 def _warn_contextual_surface_once(
@@ -170,14 +200,50 @@ def _warn_contextual_surface_once(
     rule_id: str,
     surface: str,
     capability_scope: str | None,
+    drifted_from_rule_id: str | None = None,
 ) -> None:
-    """Warn once per provider/client-shape/rule identity without content data."""
+    """Warn once per provider/client-shape/mode/rule/drift identity, bounded in size."""
 
-    warning_key = (context.provider, context.client_shape, rule_id)
+    global _warn_limit_reached
+    warning_key = (
+        context.provider,
+        context.client_shape,
+        context.mode,
+        rule_id,
+        drifted_from_rule_id is not None,
+    )
+    warn_limit_reached_now = False
     with _spend_surface_warn_lock:
         if warning_key in _warned_contextual_surfaces:
             return
-        _warned_contextual_surfaces.add(warning_key)
+        if len(_warned_contextual_surfaces) >= _WARNED_SURFACE_LIMIT:
+            if _warn_limit_reached:
+                return
+            _warn_limit_reached = True
+            warn_limit_reached_now = True
+        else:
+            _warned_contextual_surfaces.add(warning_key)
+    if warn_limit_reached_now:
+        logger.warning(
+            "Untracked-surface warning limit (%d) reached; further distinct "
+            "surfaces will not be individually reported this process.",
+            _WARNED_SURFACE_LIMIT,
+        )
+        return
+    if drifted_from_rule_id is not None:
+        drift_message = "Reviewed rule %s no longer matches its shape.".replace(
+            "%s", drifted_from_rule_id
+        )
+        logger.warning(
+            "Provider '%s' client shape '%s' exposes untracked surface '%s' "
+            "(scope: %s); no budget check and no cost event will be emitted. "
+            f"Tracking for this surface is coming. {drift_message}",
+            context.provider,
+            context.client_shape,
+            surface,
+            capability_scope,
+        )
+        return
     logger.warning(
         "Provider '%s' client shape '%s' exposes untracked surface '%s' "
         "(scope: %s); no budget check and no cost event will be emitted. "
@@ -532,8 +598,25 @@ def _client_shape(client: object, dialect: str) -> str:
     raise RuntimeError(f"unsupported provider dialect for surface context: {dialect}")
 
 
+def _validate_surface_context(context: SurfaceContext) -> None:
+    """Reject a provider client/mode pairing absent from the reviewed rules."""
+
+    if context_is_declared(context):
+        return
+    hint = _CONTEXT_MISMATCH_HINTS.get((context.client_shape, context.mode), "")
+    raise ConfigurationError(
+        "unsupported provider client/mode pairing: "
+        f"{context.provider}/{context.client_shape}/{context.mode}.{hint}",
+        field="client",
+    )
+
+
 def _belongs_to_client_shape(value: object, client_shape: str) -> bool:
-    """Whether an opaque resource belongs to the detected provider SDK family."""
+    """Whether an opaque resource belongs to the detected provider SDK family.
+
+    Context validation prevents undeclared shapes from constructing; the final
+    error remains defense-in-depth against future vocabulary drift.
+    """
 
     module = getattr(type(value), "__module__", "")
     if client_shape == "openai_sdk":
@@ -550,7 +633,7 @@ def _belongs_to_client_shape(value: object, client_shape: str) -> bool:
         return "botocore" in module and "aiobotocore" not in module
     if client_shape == "bedrock_aioboto3":
         return "aiobotocore" in module
-    return False
+    raise RuntimeError(f"unrecognized client shape: {client_shape}")
 
 
 class _GuardedResource:
@@ -596,15 +679,22 @@ class _SolwynBase:
         *,
         mode: Literal["sync", "async"] = "sync",
     ) -> None:
+        runtime_contexts = tuple(
+            SurfaceContext(
+                provider=runtime.adapter.name,
+                dialect=runtime.adapter.dialect,
+                client_shape=_client_shape(runtime.sdk_client, runtime.adapter.dialect),
+                mode=mode,
+            )
+            for runtime in runtimes
+        )
+        for context in runtime_contexts:
+            _validate_surface_context(context)
+
         self._config = config
         self._runtimes = runtimes
         primary = runtimes[0]
-        self._surface_context = SurfaceContext(
-            provider=primary.adapter.name,
-            dialect=primary.adapter.dialect,
-            client_shape=_client_shape(primary.sdk_client, primary.adapter.dialect),
-            mode=mode,
-        )
+        self._surface_context = runtime_contexts[0]
         self._guard_lock = threading.Lock()
         self._guarded_resources: dict[str, _GuardedResource] = {}
         self._validate_acknowledgments(primary.sdk_client)
@@ -856,7 +946,13 @@ class _SolwynBase:
         return bool(matching_shapes) and set(matching_shapes) == {"unevaluated_descriptor"}
 
     def _has_dynamic_attribute_hook(self, value: object) -> bool:
-        return self._inspect_static_attribute(type(value), "__getattr__") is not None
+        value_type = type(value)
+        if self._inspect_static_attribute(value_type, "__getattr__") is not None:
+            return True
+        return (
+            inspect.getattr_static(value_type, "__getattribute__", object.__getattribute__)
+            is not object.__getattribute__
+        )
 
     def _is_guardable_provider_resource(self, value: object) -> bool:
         return _return_shape(value) in _GUARDABLE_RETURN_SHAPES and _belongs_to_client_shape(
@@ -889,6 +985,7 @@ class _SolwynBase:
         rule: SurfaceRule | None,
         *,
         honor_acknowledgment: bool = True,
+        drifted_from: SurfaceRule | None = None,
     ) -> None:
         token = rule.token if rule is not None else path
         if honor_acknowledgment and (
@@ -901,14 +998,15 @@ class _SolwynBase:
             else None
         )
         kind = rule.kind.value if rule is not None else SurfaceKind.UNKNOWN.value
-        rule_id = (
-            rule.rule_id
-            if rule is not None
-            else (
+        if rule is not None:
+            rule_id = rule.rule_id
+        elif drifted_from is not None:
+            rule_id = drifted_from.rule_id
+        else:
+            rule_id = (
                 f"unknown:{self._surface_context.client_shape}:{self._surface_context.mode}:"
                 f"{self._surface_context.provider}:{path}"
             )
-        )
         if self._config.on_unmetered == "allow":
             return
         if self._config.on_unmetered == "warn":
@@ -917,6 +1015,7 @@ class _SolwynBase:
                 rule_id=rule_id,
                 surface=path,
                 capability_scope=scope,
+                drifted_from_rule_id=(drifted_from.rule_id if drifted_from is not None else None),
             )
             return
         raise UntrackedSpendSurfaceError(
@@ -926,6 +1025,7 @@ class _SolwynBase:
             client_shape=self._surface_context.client_shape,
             kind=kind,
             capability_scope=scope,
+            drifted_from_rule_id=(drifted_from.rule_id if drifted_from is not None else None),
         )
 
     def _resolve_unknown_value(self, value: object, path: str) -> Any:
@@ -996,7 +1096,7 @@ class _SolwynBase:
                 visible = name in dir(value)
             except Exception:
                 visible = False
-            if rule is not None and not visible and not self._has_dynamic_attribute_hook(value):
+            if not visible and not self._has_dynamic_attribute_hook(value):
                 return getattr(value, name)
             if rule is not None and rule.kind is SurfaceKind.BLOCKED:
                 raise ConfigurationError(rule.reason or "blocked surface", field=path)
@@ -1038,6 +1138,7 @@ class _SolwynBase:
                     path,
                     None,
                     honor_acknowledgment=False,
+                    drifted_from=rule,
                 )
                 return self._resolve_unknown_value(getattr(value, name), path)
             self._apply_untracked_posture(path, rule)
@@ -1049,6 +1150,7 @@ class _SolwynBase:
                     path,
                     None,
                     honor_acknowledgment=False,
+                    drifted_from=rule,
                 )
                 return self._resolve_unknown_value(returned, path)
             if self._is_exact_raw_response_escape(path, rule):
@@ -1060,11 +1162,21 @@ class _SolwynBase:
                 descriptor_category,
                 static_return_shape,
             ):
-                self._apply_untracked_posture(path, None)
+                self._apply_untracked_posture(
+                    path,
+                    None,
+                    honor_acknowledgment=False,
+                    drifted_from=rule,
+                )
                 return self._resolve_unknown_value(getattr(value, name), path)
             returned = getattr(value, name)
             if not rule.accepts_shape(AttributeShape(descriptor_category, _return_shape(returned))):
-                self._apply_untracked_posture(path, None)
+                self._apply_untracked_posture(
+                    path,
+                    None,
+                    honor_acknowledgment=False,
+                    drifted_from=rule,
+                )
                 return self._resolve_unknown_value(returned, path)
             return returned
         if rule.kind is SurfaceKind.NAMESPACE:
@@ -1073,11 +1185,21 @@ class _SolwynBase:
                 descriptor_category,
                 static_return_shape,
             ):
-                self._apply_untracked_posture(path, None)
+                self._apply_untracked_posture(
+                    path,
+                    None,
+                    honor_acknowledgment=False,
+                    drifted_from=rule,
+                )
                 return self._resolve_unknown_value(getattr(value, name), path)
             returned = getattr(value, name)
             if not rule.accepts_shape(AttributeShape(descriptor_category, _return_shape(returned))):
-                self._apply_untracked_posture(path, None)
+                self._apply_untracked_posture(
+                    path,
+                    None,
+                    honor_acknowledgment=False,
+                    drifted_from=rule,
+                )
                 return self._resolve_unknown_value(returned, path)
             return self._guard_resource(returned, path)
         raise RuntimeError(f"unsupported surface kind in runtime resolver: {rule.kind.value}")

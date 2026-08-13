@@ -27,13 +27,13 @@
         }
       ],
       "mode": "async",
-      "namespace_count": 0,
-      "observation_count": 31,
+      "namespace_count": 52,
+      "observation_count": 214,
       "provider": "anthropic",
       "service_model_operation_count": 0,
       "shape_key": "anthropic_async",
       "structural_interval": "floor",
-      "structure_sha256": "7ca9664d0bd5afad1417a7f39a89563a111dd34d35f1ed13cdb70f001fd567a9",
+      "structure_sha256": "0015077c96272ebafbd4ccdd01f4394b81ebb3a96a3e58d059e66b981f420c84",
       "variant": "native"
     },
     {
@@ -81,13 +81,13 @@
         }
       ],
       "mode": "sync",
-      "namespace_count": 0,
-      "observation_count": 31,
+      "namespace_count": 52,
+      "observation_count": 214,
       "provider": "anthropic",
       "service_model_operation_count": 0,
       "shape_key": "anthropic_sync",
       "structural_interval": "floor",
-      "structure_sha256": "b1e45066ec223826920c48a716769b65b596d68f90abc4cd96ba08dc05574ddb",
+      "structure_sha256": "a0af4dbc93fc404221a606a35b7ccd26180bf50ac7162a9d400db075bea64610",
       "variant": "native"
     },
     {

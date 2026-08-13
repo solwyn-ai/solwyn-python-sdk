@@ -183,6 +183,7 @@ class TestBedrockConverseInterception:
     def test_converse_is_intercepted_and_returns_raw_response(self) -> None:
         client = _mock_bedrock_client()
         solwyn = _make_solwyn(client)
+        assert solwyn._surface_context.client_shape == "bedrock_boto3"
         reported: list = []
         solwyn._reporter.report = lambda e: reported.append(e)
         # Settlement rides report_settlement; forward its SUCCESS event into the
@@ -821,13 +822,65 @@ def _make_async_solwyn(client: Any, **overrides: Any) -> AsyncSolwyn:
 
 
 @pytest.mark.unit
+def test_sync_wrapper_rejects_an_async_bedrock_fallback() -> None:
+    # Arrange
+    primary = _mock_openai_client()
+    fallback = _mock_async_bedrock_client()
+
+    # Act / Assert
+    with pytest.raises(ConfigurationError) as exc_info:
+        _make_solwyn(
+            primary,
+            model="gpt-5.5",
+            fallback=[(fallback, BEDROCK_MODEL)],
+        )
+    assert exc_info.value.field == "client"
+    assert "AsyncSolwyn" in str(exc_info.value)
+
+
+@pytest.mark.unit
+def test_async_wrapper_rejects_a_sync_bedrock_fallback() -> None:
+    # Arrange
+    primary = _mock_openai_client()
+    fallback = _mock_bedrock_client()
+
+    # Act / Assert
+    with pytest.raises(ConfigurationError) as exc_info:
+        _make_async_solwyn(
+            primary,
+            model="gpt-5.5",
+            fallback=[(fallback, BEDROCK_MODEL)],
+        )
+    assert exc_info.value.field == "client"
+    assert "aioboto3" in str(exc_info.value)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_wrapper_accepts_an_async_bedrock_fallback() -> None:
+    # Arrange
+    primary = _mock_openai_client()
+    fallback = _mock_async_bedrock_client()
+
+    # Act
+    async with _make_async_solwyn(
+        primary,
+        model="gpt-5.5",
+        fallback=[(fallback, BEDROCK_MODEL)],
+    ) as wrapper:
+        # Assert
+        assert wrapper._runtimes[1].sdk_client is fallback
+
+
+@pytest.mark.unit
 class TestAsyncBedrockConverse:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_async_converse_is_intercepted(self) -> None:
-        client = _mock_bedrock_client()
+        client = _mock_async_bedrock_client()
         client.converse = AsyncMockFn(return_value=_converse_response())
         solwyn = _make_async_solwyn(client)
+        assert solwyn._surface_context.client_shape == "bedrock_aioboto3"
         reported: list = []
         solwyn._reporter.report = lambda e: reported.append(e)
         solwyn._reporter.report_settlement = lambda _c, e: reported.append(e)
@@ -943,7 +996,7 @@ class TestAsyncBedrockConverse:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_async_converse_stream_wraps_inner_event_stream(self) -> None:
-        client = _mock_bedrock_client()
+        client = _mock_async_bedrock_client()
         client.converse_stream = AsyncMockFn(
             return_value={
                 "ResponseMetadata": {"HTTPStatusCode": 200},
@@ -979,7 +1032,7 @@ class TestAsyncBedrockConverse:
         # settle the reservation via `await result["stream"].close()` — exactly
         # once (the _settled guard), idempotent on repeat calls, at the zero
         # usage observed before the terminal metadata event.
-        client = _mock_bedrock_client()
+        client = _mock_async_bedrock_client()
         client.converse_stream = AsyncMockFn(
             return_value={
                 "ResponseMetadata": {"HTTPStatusCode": 200},
@@ -1024,7 +1077,7 @@ class TestAsyncBedrockConverse:
     async def test_async_invoke_model_raises_loudly(self) -> None:
         # Mirror of the sync fail-loud test: a regression that let async
         # invoke_model pass through silently would be a budget bypass.
-        client = _mock_bedrock_client()
+        client = _mock_async_bedrock_client()
         solwyn = _make_async_solwyn(client)
 
         with pytest.raises(ConfigurationError, match="converse"):
@@ -1037,7 +1090,7 @@ class TestAsyncBedrockConverse:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_async_invoke_model_with_response_stream_raises_loudly(self) -> None:
-        client = _mock_bedrock_client()
+        client = _mock_async_bedrock_client()
         solwyn = _make_async_solwyn(client)
 
         with pytest.raises(ConfigurationError, match="converse"):
@@ -1052,7 +1105,7 @@ class TestAsyncBedrockConverse:
     async def test_async_start_async_invoke_raises_loudly(self) -> None:
         # Mirror of the sync fail-loud test: async start_async_invoke passing
         # through silently would be a video-scale budget bypass.
-        client = _mock_bedrock_client()
+        client = _mock_async_bedrock_client()
         solwyn = _make_async_solwyn(client)
 
         with pytest.raises(ConfigurationError, match="start_async_invoke"):
@@ -1065,7 +1118,7 @@ class TestAsyncBedrockConverse:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_async_dispatch_error_event_carries_provider_region(self) -> None:
-        client = _mock_bedrock_client(region="ap-southeast-2")
+        client = _mock_async_bedrock_client(region="ap-southeast-2")
         client.converse = AsyncMockFn(side_effect=_Status(500))  # POST_SEND_AMBIGUOUS
         solwyn = _make_async_solwyn(client)
         reported: list = []
@@ -1096,7 +1149,7 @@ class TestAsyncBedrockConverse:
 
                 return _gen()
 
-        client = _mock_bedrock_client(region="eu-west-1")
+        client = _mock_async_bedrock_client(region="eu-west-1")
         client.converse_stream = AsyncMockFn(
             return_value={
                 "ResponseMetadata": {"HTTPStatusCode": 200},

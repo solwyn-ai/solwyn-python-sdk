@@ -13,7 +13,7 @@ import pytest
 from conftest import VALID_API_KEY, foreground_records
 
 from solwyn._base import _reset_unmetered_spend_warnings
-from solwyn._surfaces import SurfaceSource
+from solwyn._surfaces import SurfaceSource, resolve_surface_rule
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import ConfigurationError, UntrackedSpendSurfaceError
 
@@ -187,6 +187,19 @@ class _DynamicOpenAIClient(_MissingResponsesClient):
         return lambda: name
 
 
+class _DynamicGetattributeOpenAIClient(_MissingResponsesClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.dynamic_evaluations = 0
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "future_operation":
+            evaluations = object.__getattribute__(self, "dynamic_evaluations")
+            object.__setattr__(self, "dynamic_evaluations", evaluations + 1)
+            return lambda: name
+        return super().__getattribute__(name)
+
+
 class _DriftedBaseURLClient(_OpenAIClient):
     @property
     def base_url(self) -> Any:
@@ -211,6 +224,7 @@ for _client_type in (
     _OpenAIClient,
     _MissingResponsesClient,
     _DynamicOpenAIClient,
+    _DynamicGetattributeOpenAIClient,
     _DriftedBaseURLClient,
     _DriftedPostClient,
     _OpaqueClient,
@@ -254,6 +268,185 @@ def test_default_warn_logs_once_and_returns_the_terminal_capability(
 
 
 @pytest.mark.unit
+def test_reviewed_shape_drift_warns_after_the_matching_surface_already_warned(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    client = _OpenAIClient()
+    wrapper = _make_solwyn(client, on_unmetered="warn")
+    reviewed_rule = resolve_surface_rule(
+        context=wrapper._surface_context,
+        path="post",
+        source=SurfaceSource.RAW,
+    )
+    assert reviewed_rule is not None
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+        first = wrapper.post
+        monkeypatch.setattr(_OpenAIClient, "post", property(lambda _client: "drifted"))
+        second = wrapper.post
+
+    # Assert
+    assert first() == "posted"
+    assert second == "drifted"
+    records = foreground_records(caplog)
+    assert len(records) == 2
+    assert records[0].args == ("openai", "openai_sdk", "post", "arbitrary_endpoint")
+    assert (
+        f"Reviewed rule {reviewed_rule.rule_id} no longer matches its shape."
+        in records[1].getMessage()
+    )
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_warn_latch_keys_include_mode_and_are_bounded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from solwyn import _base
+
+    # Arrange
+    _base._reset_unmetered_spend_warnings()
+    sync_context = _base.SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+    async_context = _base.SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="async",
+    )
+
+    try:
+        # Act
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+            for context in (sync_context, async_context):
+                _base._warn_contextual_surface_once(
+                    context=context,
+                    rule_id="rule-x",
+                    surface="post",
+                    capability_scope=None,
+                )
+
+        # Assert
+        assert len(_base._warned_contextual_surfaces) == 2
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+            for index in range(_base._WARNED_SURFACE_LIMIT + 50):
+                _base._warn_contextual_surface_once(
+                    context=sync_context,
+                    rule_id=f"rule-{index}",
+                    surface=f"surface-{index}",
+                    capability_scope=None,
+                )
+
+        # Assert
+        assert len(_base._warned_contextual_surfaces) <= _base._WARNED_SURFACE_LIMIT
+        overflow_records = [
+            record
+            for record in caplog.records
+            if "Untracked-surface warning limit" in record.getMessage()
+        ]
+        assert len(overflow_records) == 1
+    finally:
+        _base._reset_unmetered_spend_warnings()
+
+
+@pytest.mark.unit
+def test_warn_latch_overflow_logging_is_reentrant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from solwyn import _base
+
+    class _SameThreadReentryGuard:
+        entered = False
+
+        def __enter__(self) -> None:
+            if self.entered:
+                raise RuntimeError("warning lock reentered")
+            self.entered = True
+
+        def __exit__(self, *args: object) -> None:
+            self.entered = False
+
+    # Arrange
+    context = _base.SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+    lock = _SameThreadReentryGuard()
+    _base._warned_contextual_surfaces.update(
+        ("openai", "openai_sdk", "sync", f"rule-{index}", False)
+        for index in range(_base._WARNED_SURFACE_LIMIT)
+    )
+    monkeypatch.setattr(_base, "_spend_surface_warn_lock", lock)
+    warning_calls = 0
+
+    def reenter_once(*args: object) -> None:
+        nonlocal warning_calls
+        warning_calls += 1
+        if warning_calls == 1:
+            _base._warn_contextual_surface_once(
+                context=context,
+                rule_id="recursive-rule",
+                surface="recursive-surface",
+                capability_scope=None,
+            )
+
+    monkeypatch.setattr(_base.logger, "warning", reenter_once)
+
+    try:
+        # Act
+        _base._warn_contextual_surface_once(
+            context=context,
+            rule_id="overflow-rule",
+            surface="overflow-surface",
+            capability_scope=None,
+        )
+
+        # Assert
+        assert warning_calls == 1
+    finally:
+        _base._reset_unmetered_spend_warnings()
+
+
+@pytest.mark.unit
+def test_fork_reset_replaces_module_warning_locks_with_unlocked_locks() -> None:
+    from solwyn import _base
+
+    # Arrange
+    old_spend_lock = _base._spend_surface_warn_lock
+    old_cost_lock = _base._cost_policy_warn_lock
+    spend_sentinel = object()
+    cost_sentinel = object()
+    _base._spend_surface_warn_lock = spend_sentinel  # type: ignore[assignment]
+    _base._cost_policy_warn_lock = cost_sentinel  # type: ignore[assignment]
+
+    try:
+        # Act
+        _base._reset_warn_locks_after_fork_in_child()
+
+        # Assert
+        assert _base._spend_surface_warn_lock is not spend_sentinel
+        assert _base._cost_policy_warn_lock is not cost_sentinel
+        assert _base._spend_surface_warn_lock.acquire(blocking=False)
+        _base._spend_surface_warn_lock.release()
+        assert _base._cost_policy_warn_lock.acquire(blocking=False)
+        _base._cost_policy_warn_lock.release()
+    finally:
+        _base._spend_surface_warn_lock = old_spend_lock
+        _base._cost_policy_warn_lock = old_cost_lock
+
+
+@pytest.mark.unit
 def test_allow_is_silent_and_returns_the_terminal_capability(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -268,15 +461,22 @@ def test_allow_is_silent_and_returns_the_terminal_capability(
 
 @pytest.mark.unit
 def test_raise_refuses_a_known_untracked_surface_with_its_scope() -> None:
+    # Arrange
     wrapper = _make_solwyn(_OpenAIClient(), on_unmetered="raise")
 
+    # Act
     with pytest.raises(UntrackedSpendSurfaceError) as exc_info:
         _ = wrapper.post
 
+    # Assert
     assert exc_info.value.surface == "post"
     assert exc_info.value.token == "post"
     assert exc_info.value.capability_scope == "arbitrary_endpoint"
+    assert exc_info.value.drifted_from_rule_id is None
     assert "acknowledge exact token 'post'" in str(exc_info.value)
+    assert repr(exc_info.value) == (
+        "UntrackedSpendSurfaceError(surface='post', provider='openai', kind='unmetered_spend')"
+    )
     _close(wrapper)
 
 
@@ -661,6 +861,22 @@ def test_strict_invisible_dynamic_known_path_refuses_before_dynamic_lookup() -> 
 
 
 @pytest.mark.unit
+def test_strict_custom_getattribute_refuses_before_dynamic_lookup() -> None:
+    # Arrange
+    client = _DynamicGetattributeOpenAIClient()
+    wrapper = _make_solwyn(client, on_unmetered="raise")
+    client.dynamic_evaluations = 0
+
+    # Act
+    with pytest.raises(UntrackedSpendSurfaceError):
+        _ = wrapper.future_operation
+
+    # Assert
+    assert client.dynamic_evaluations == 0
+    _close(wrapper)
+
+
+@pytest.mark.unit
 def test_unknown_resource_error_does_not_advertise_the_parent_token() -> None:
     # Arrange
     wrapper = _make_solwyn(_OpenAIClient(), on_unmetered="raise")
@@ -759,6 +975,37 @@ def test_known_missing_path_preserves_provider_attribute_error() -> None:
 
 
 @pytest.mark.unit
+def test_probing_a_nonexistent_unruled_name_is_a_plain_attribute_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    wrapper = _make_solwyn(_MissingResponsesClient(), on_unmetered="warn")
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+        exists = hasattr(wrapper, "nonexistent_unruled")
+
+    # Assert
+    assert exists is False
+    assert all("untracked surface" not in record.getMessage() for record in caplog.records)
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_probing_a_nonexistent_unruled_name_under_raise_is_a_plain_attribute_error() -> None:
+    # Arrange
+    wrapper = _make_solwyn(_MissingResponsesClient(), on_unmetered="raise")
+
+    # Act
+    with pytest.raises(AttributeError) as exc_info:
+        _ = wrapper.nonexistent_unruled
+
+    # Assert
+    assert type(exc_info.value) is AttributeError
+    _close(wrapper)
+
+
+@pytest.mark.unit
 def test_feature_probe_helpers_treat_strict_refusal_as_absent() -> None:
     wrapper = _make_solwyn(_OpenAIClient(), on_unmetered="raise")
     sentinel = object()
@@ -791,15 +1038,57 @@ def test_safe_metadata_preserves_identity_when_both_shapes_match() -> None:
 
 @pytest.mark.unit
 def test_safe_metadata_return_shape_drift_reenters_strict_unknown_posture() -> None:
+    # Arrange
     client = _DriftedBaseURLClient()
     wrapper = _make_solwyn(client, on_unmetered="raise")
     client.base_url_evaluations = 0
+    reviewed_rule = resolve_surface_rule(
+        context=wrapper._surface_context,
+        path="base_url",
+        source=SurfaceSource.RAW,
+    )
+    assert reviewed_rule is not None
 
+    # Act
     with pytest.raises(UntrackedSpendSurfaceError) as exc_info:
         _ = wrapper.base_url
 
+    # Assert
     assert exc_info.value.kind == "unknown"
+    assert exc_info.value.drifted_from_rule_id == reviewed_rule.rule_id
+    assert f"reviewed rule {reviewed_rule.rule_id} no longer matches its shape" in str(
+        exc_info.value
+    )
+    assert f"drifted_from_rule_id={reviewed_rule.rule_id!r}" in repr(exc_info.value)
     assert client.base_url_evaluations == 1
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_safe_metadata_return_shape_drift_warning_names_the_reviewed_rule(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    client = _DriftedBaseURLClient()
+    wrapper = _make_solwyn(client, on_unmetered="warn")
+    reviewed_rule = resolve_surface_rule(
+        context=wrapper._surface_context,
+        path="base_url",
+        source=SurfaceSource.RAW,
+    )
+    assert reviewed_rule is not None
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+        _ = wrapper.base_url
+
+    # Assert
+    records = foreground_records(caplog)
+    assert len(records) == 1
+    assert (
+        f"Reviewed rule {reviewed_rule.rule_id} no longer matches its shape."
+        in records[0].getMessage()
+    )
     _close(wrapper)
 
 

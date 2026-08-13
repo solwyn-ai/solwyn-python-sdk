@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Export the deterministic contextual provider capability contract."""
+"""Export the deterministic contextual provider capability contract.
+
+``--check`` is safe after hand-editing: an existing file that differs from the
+embedded payload FAILS the check and is left untouched; a missing file is
+bootstrapped. The bare (no ``--check``) invocation always overwrites — it is
+the bootstrap step and will destroy local edits.
+"""
 
 from __future__ import annotations
 
@@ -9,31 +15,26 @@ from pathlib import Path
 from typing import Any
 
 from solwyn._surfaces import (
+    DIALECT_BY_PROVIDER,
+    SURFACE_RULES,
     AttributeShape,
     SurfaceContext,
     SurfaceSource,
+    payload_fingerprint,
     resolve_surface_rule,
     surface_contract_data,
 )
 
-DEFAULT_OUTPUT = (
-    Path(__file__).parents[1] / "build" / "surface_contract" / "surface-classification.json"
-)
-_DIALECT_BY_PROVIDER = {
-    "anthropic": "anthropic",
-    "azure_openai": "openai",
-    "bedrock": "bedrock",
-    "google": "google",
-    "openai": "openai",
-    "openai_compatible": "openai",
-    "together": "openai",
-}
+ROOT = Path(__file__).parents[1]
+DEFAULT_OUTPUT = ROOT / "build" / "surface_contract" / "surface-classification.json"
 
 
 def render_contract() -> str:
     """Render the Python-owned contract with stable ordering and a final newline."""
 
-    return json.dumps(surface_contract_data(), indent=2, sort_keys=True) + "\n"
+    contract: dict[str, Any] = surface_contract_data()
+    contract["source_payload_fingerprint"] = payload_fingerprint()
+    return json.dumps(contract, indent=2, sort_keys=True) + "\n"
 
 
 def write_contract(path: Path = DEFAULT_OUTPUT) -> None:
@@ -49,7 +50,7 @@ def compare_report_contract(report: dict[str, Any], *, label: str) -> tuple[str,
     provider = str(report["provider"])
     context = SurfaceContext(
         provider=provider,
-        dialect=_DIALECT_BY_PROVIDER[provider],
+        dialect=DIALECT_BY_PROVIDER[provider],
         client_shape=str(report["client_shape"]),
         mode=str(report["mode"]),
     )
@@ -82,10 +83,49 @@ def compare_report_directory(path: Path) -> tuple[str, ...]:
     if not report_paths:
         return (f"no provider surface reports found in {path}",)
     mismatches: list[str] = []
+    observed_by_context: dict[SurfaceContext, set[str]] = {}
     for report_path in report_paths:
         report = json.loads(report_path.read_text(encoding="utf-8"))
         mismatches.extend(compare_report_contract(report, label=report_path.name))
+        provider = str(report["provider"])
+        context = SurfaceContext(
+            provider=provider,
+            dialect=DIALECT_BY_PROVIDER[provider],
+            client_shape=str(report["client_shape"]),
+            mode=str(report["mode"]),
+        )
+        observed_by_context.setdefault(context, set()).update(
+            str(observation["path"]) for observation in report["observations"]
+        )
+    _print_dead_rule_advisories(observed_by_context)
     return tuple(mismatches)
+
+
+def _print_dead_rule_advisories(
+    observed_by_context: dict[SurfaceContext, set[str]],
+) -> None:
+    """Advisory only: rules resolvable for a captured context but never observed."""
+
+    dead: list[str] = []
+    for rule in SURFACE_RULES:
+        applicable = [
+            context
+            for context in observed_by_context
+            if resolve_surface_rule(
+                context=context,
+                path=rule.surface,
+                source=SurfaceSource.RAW,
+            )
+            is rule
+        ]
+        if applicable and all(
+            rule.surface not in observed_by_context[context] for context in applicable
+        ):
+            dead.append(rule.rule_id)
+    for rule_id in sorted(dead)[:20]:
+        print(f"advisory: unobserved rule {rule_id}")
+    if len(dead) > 20:
+        print(f"advisory: {len(dead) - 20} more unobserved rules")
 
 
 def generate_and_check(
@@ -93,9 +133,24 @@ def generate_and_check(
     *,
     reports_dir: Path | None = None,
 ) -> tuple[str, ...]:
-    """Write the deterministic ledger and return provider-report mismatches."""
+    """Verify (or bootstrap) the ledger without destroying local edits.
 
-    write_contract(output)
+    An existing file that differs from the embedded payload is preserved and
+    reported as a mismatch — it is either a hand-edit awaiting
+    ``embed_surface_rules.py`` or a stale export from another payload. A
+    missing file is bootstrapped so fresh CI runners can proceed.
+    """
+
+    rendered = render_contract()
+    if output.exists():
+        if output.read_text(encoding="utf-8") != rendered:
+            return (
+                f"{output} differs from the embedded payload; run "
+                "scripts/embed_surface_rules.py --input <file> to apply edits, "
+                "or delete the file and re-export to regenerate",
+            )
+    else:
+        write_contract(output)
     if reports_dir is None:
         return ()
     return compare_report_directory(reports_dir)
@@ -114,6 +169,13 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    import solwyn
+
+    installed = Path(solwyn.__file__).resolve()
+    expected = (ROOT / "src" / "solwyn" / "__init__.py").resolve()
+    if installed != expected:
+        print(f"solwyn resolves to {installed}, not this checkout ({expected}); run via uv run")
+        return 1
     args = _parser().parse_args()
     if args.check:
         report_mismatches = generate_and_check(

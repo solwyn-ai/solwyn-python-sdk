@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import shlex
+import zlib
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 import yaml
 
+from solwyn._surface_graph import declared_namespace_paths
 from solwyn._surfaces import (
     SURFACE_RULES,
     AttributeShape,
@@ -22,6 +25,8 @@ from solwyn._surfaces import (
     SurfaceSelector,
     SurfaceSource,
     UsageBasis,
+    context_is_declared,
+    payload_fingerprint,
     resolve_surface_rule,
     surface_contract_data,
 )
@@ -74,15 +79,146 @@ GOOGLE_GENAI_SYNC = SurfaceContext(
     mode="sync",
 )
 
+_DECLARED_CONTEXT_TUPLES = (
+    ("openai", "openai", "openai_sdk", "sync"),
+    ("openai", "openai", "openai_sdk", "async"),
+    ("azure_openai", "openai", "openai_sdk", "sync"),
+    ("azure_openai", "openai", "openai_sdk", "async"),
+    ("openai_compatible", "openai", "openai_sdk", "sync"),
+    ("openai_compatible", "openai", "openai_sdk", "async"),
+    ("together", "openai", "openai_sdk", "sync"),
+    ("together", "openai", "openai_sdk", "async"),
+    ("together", "openai", "native_together", "sync"),
+    ("together", "openai", "native_together", "async"),
+    ("anthropic", "anthropic", "anthropic_sdk", "sync"),
+    ("anthropic", "anthropic", "anthropic_sdk", "async"),
+    ("google", "google", "google_genai", "sync"),
+    ("google", "google", "google_genai", "async"),
+    ("google", "google", "google_generativeai", "sync"),
+    ("bedrock", "bedrock", "bedrock_boto3", "sync"),
+    ("bedrock", "bedrock", "bedrock_aioboto3", "async"),
+)
 
-def _export_module() -> ModuleType:
-    path = ROOT / "scripts" / "export_surface_contract.py"
-    spec = importlib.util.spec_from_file_location("export_surface_contract", path)
+_UNDECLARED_CONTEXT_TUPLES = (
+    ("bedrock", "bedrock", "bedrock_boto3", "async"),
+    ("bedrock", "bedrock", "bedrock_aioboto3", "sync"),
+    ("google", "google", "google_generativeai", "async"),
+)
+
+
+@pytest.mark.unit
+def test_declared_namespace_paths_matches_the_contract_frontier() -> None:
+    # Arrange
+    context = SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+
+    # Act
+    paths = declared_namespace_paths(context)
+
+    # Assert
+    assert paths
+    assert all(
+        resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW) for path in paths
+    )
+
+
+@pytest.mark.unit
+def test_every_constructible_context_is_declared_or_rejected() -> None:
+    # Arrange / Act / Assert
+    for provider, dialect, client_shape, mode in _DECLARED_CONTEXT_TUPLES:
+        context = SurfaceContext(
+            provider=provider,
+            dialect=dialect,
+            client_shape=client_shape,
+            mode=mode,
+        )
+        assert context_is_declared(context), context
+
+    for provider, dialect, client_shape, mode in _UNDECLARED_CONTEXT_TUPLES:
+        context = SurfaceContext(
+            provider=provider,
+            dialect=dialect,
+            client_shape=client_shape,
+            mode=mode,
+        )
+        assert not context_is_declared(context), context
+
+    named_compat = SurfaceContext(
+        provider="groq",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+    assert context_is_declared(named_compat)
+
+
+@pytest.mark.unit
+def test_embedded_surface_rule_rows_have_exactly_eleven_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from solwyn import _surfaces
+
+    # Arrange
+    malformed = {
+        "rules": [["too", "short"]],
+        "schema_version": _surfaces.CONTRACT_VERSION,
+    }
+    encoded = base64.b85encode(zlib.compress(json.dumps(malformed).encode("utf-8"))).decode("ascii")
+    monkeypatch.setattr(_surfaces, "_GENERATED_SURFACE_RULE_PAYLOAD", encoded)
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="invalid embedded surface rule row"):
+        _surfaces._build_surface_rules()
+
+
+def _script_module(name: str) -> ModuleType:
+    path = ROOT / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load surface contract exporter at {path}")
+        raise RuntimeError(f"could not load surface contract script at {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _export_module() -> ModuleType:
+    return _script_module("export_surface_contract")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("script_name", ["export_surface_contract", "embed_surface_rules"])
+def test_surface_contract_generators_refuse_another_installed_checkout_before_work(
+    script_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import solwyn
+
+    # Arrange
+    module = _script_module(script_name)
+    installed = tmp_path / "site-packages" / "solwyn" / "__init__.py"
+    monkeypatch.setattr(solwyn, "__file__", str(installed))
+
+    def fail_if_work_starts() -> None:
+        raise AssertionError("argument parsing started before checkout identity validation")
+
+    monkeypatch.setattr(module, "_parser", fail_if_work_starts)
+
+    # Act
+    result = module.main()
+
+    # Assert
+    expected = (ROOT / "src" / "solwyn" / "__init__.py").resolve()
+    assert result == 1
+    assert (
+        f"solwyn resolves to {installed.resolve()}, not this checkout ({expected}); run via uv run"
+        in capsys.readouterr().out
+    )
 
 
 def _rule(
@@ -302,6 +438,30 @@ def test_generated_report_directory_check_fails_closed_when_empty(tmp_path: Path
     assert exporter.compare_report_directory(tmp_path) == (
         f"no provider surface reports found in {tmp_path}",
     )
+
+
+@pytest.mark.unit
+def test_report_comparison_emits_dead_rule_advisories(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # Arrange
+    exporter = _export_module()
+    report = {
+        "provider": "anthropic",
+        "client_shape": "anthropic_sdk",
+        "mode": "sync",
+        "observations": [],
+    }
+    (tmp_path / "anthropic_sync--latest.json").write_text(json.dumps(report), encoding="utf-8")
+
+    # Act
+    mismatches = exporter.compare_report_directory(tmp_path)
+
+    # Assert
+    captured = capsys.readouterr().out
+    assert mismatches == ()
+    assert "advisory:" in captured
+    assert "unobserved" in captured
 
 
 @pytest.mark.unit
@@ -777,7 +937,9 @@ def test_generated_json_is_the_deterministic_python_export(tmp_path: Path) -> No
     exporter = _export_module()
     output = tmp_path / "surface-classification.json"
     contract = surface_contract_data()
-    expected = json.dumps(contract, indent=2, sort_keys=True) + "\n"
+    expected_contract = dict(contract)
+    expected_contract["source_payload_fingerprint"] = payload_fingerprint()
+    expected = json.dumps(expected_contract, indent=2, sort_keys=True) + "\n"
 
     exporter.write_contract(output)
 
@@ -789,7 +951,7 @@ def test_generated_json_is_the_deterministic_python_export(tmp_path: Path) -> No
 
 
 @pytest.mark.unit
-def test_check_writes_contract_before_failing_closed_on_empty_reports(tmp_path: Path) -> None:
+def test_check_bootstraps_then_fails_closed_on_empty_reports(tmp_path: Path) -> None:
     exporter = _export_module()
     output = tmp_path / "nested" / "surface-classification.json"
     reports = tmp_path / "reports"
@@ -799,3 +961,34 @@ def test_check_writes_contract_before_failing_closed_on_empty_reports(tmp_path: 
 
     assert output.read_text(encoding="utf-8") == exporter.render_contract()
     assert mismatches == (f"no provider surface reports found in {reports}",)
+
+
+@pytest.mark.unit
+def test_check_preserves_and_rejects_a_differing_expanded_contract(tmp_path: Path) -> None:
+    # Arrange
+    exporter = _export_module()
+    output = tmp_path / "surface-classification.json"
+    edited = exporter.render_contract().replace("{", "{\n ", 1)
+    output.write_text(edited, encoding="utf-8")
+
+    # Act
+    mismatches = exporter.generate_and_check(output)
+
+    # Assert
+    assert output.read_text(encoding="utf-8") == edited
+    assert len(mismatches) == 1
+    assert "differs from the embedded payload" in mismatches[0]
+
+
+@pytest.mark.unit
+def test_check_bootstraps_a_missing_expanded_contract(tmp_path: Path) -> None:
+    # Arrange
+    exporter = _export_module()
+    output = tmp_path / "nested" / "surface-classification.json"
+
+    # Act
+    mismatches = exporter.generate_and_check(output)
+
+    # Assert
+    assert mismatches == ()
+    assert output.read_text(encoding="utf-8") == exporter.render_contract()

@@ -8,6 +8,7 @@ guards, coverage reporting, and provider drift canaries.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import zlib
 from collections import defaultdict
@@ -16,7 +17,26 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+# Payload and reader ship together in this file: bumping this constant
+# requires regenerating the payload IN THE SAME COMMIT (a mismatched payload
+# fails at import, which also disables the export/embed tooling until fixed).
 CONTRACT_VERSION = 1
+
+DIALECT_BY_PROVIDER: dict[str, str] = {
+    "anthropic": "anthropic",
+    "azure_openai": "openai",
+    "bedrock": "bedrock",
+    "google": "google",
+    "openai": "openai",
+    "openai_compatible": "openai",
+    "together": "openai",
+}
+"""Capture-provider identity -> wire dialect, for inventory/export/canary tooling.
+
+The runtime derives dialect from the adapter; this map is for tools that start
+from a provider name. Extend it when adding a provider or framework family —
+``test_provider_touchpoint_registries_agree`` fails if any registry is missed.
+"""
 
 
 class SurfaceKind(StrEnum):
@@ -395,6 +415,17 @@ def surface_contract_data(
     }
 
 
+def payload_fingerprint(rules: Iterable[SurfaceRule] | None = None) -> str:
+    """Return a stable digest of the contract for embed provenance checks."""
+
+    canonical = json.dumps(
+        surface_contract_data(rules),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _validate_surface_path(path: str) -> None:
     parts = path.split(".")
     invalid_part = any(
@@ -412,6 +443,9 @@ def _build_surface_rules() -> tuple[SurfaceRule, ...]:
         raise RuntimeError("invalid embedded surface rule payload") from exc
     if payload.get("schema_version") != CONTRACT_VERSION:
         raise RuntimeError("unsupported embedded surface rule schema")
+    for row in payload["rules"]:
+        if not isinstance(row, list) or len(row) != 11:
+            raise RuntimeError("invalid embedded surface rule row")
 
     rules = tuple(
         SurfaceRule(
@@ -2234,3 +2268,13 @@ _RULES_BY_PATH: dict[str, tuple[SurfaceRule, ...]] = {
     path: tuple(rules) for path, rules in _rules_by_path.items()
 }
 del _rule, _rules_by_path
+
+_DECLARED_SELECTORS: frozenset[SurfaceSelector] = frozenset(
+    selector for rule in SURFACE_RULES for selector in rule.selectors
+)
+
+
+def context_is_declared(context: SurfaceContext) -> bool:
+    """Return whether at least one reviewed selector applies to this context."""
+
+    return any(selector.specificity(context) is not None for selector in _DECLARED_SELECTORS)

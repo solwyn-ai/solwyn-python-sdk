@@ -38,7 +38,9 @@ tracked. The token-billed TTS condition is a distinct synthetic rule with token
 `audio.speech.create:gpt-4o-mini-tts`.
 
 `on_unmetered="warn"` is the compatibility default; `raise` is strict mode and
-`allow` is the explicit pass posture. Strict mode guards cooperative public
+`allow` is the explicit pass posture. Guarded provider resources forward
+attributes only — protocol dunders (with/async-with) are not forwarded in ANY
+posture, including allow. Strict mode guards cooperative public
 pre-call access only. It is not a sandbox for callers that retain the raw
 client, reach private wrapper state, acknowledge a scoped raw escape, or invoke
 native behavior on provider-returned response/page/stream/job/operation
@@ -48,6 +50,38 @@ Coverage fingerprints must be independently reviewed literals. Never derive a
 value from the report under test and immediately pass it to `expect(...)`.
 Changes to audit fields are bidirectional drift and require reviewing the full
 entries before updating the literal.
+
+### Changing a surface rule
+
+Never hand-edit the payload block in `_surfaces.py`. The loop:
+
+1. `uv run python scripts/export_surface_contract.py` — bootstrap the editable
+   JSON (OVERWRITES any existing local edits — export first, edit second).
+2. Edit exact rows in `build/surface_contract/surface-classification.json`.
+   Compat-vs-native splits use wildcard-plus-override selectors: a
+   `provider: null` rule for every openai-dialect provider, plus a
+   higher-specificity `provider: "openai"` rule that wins for native (see the
+   `videos.create` pair). Keep rule ids stable; the id's third segment must
+   equal the rule's kind.
+3. `uv run python scripts/embed_surface_rules.py --input build/surface_contract/surface-classification.json`
+   — validates, prints the rule delta, refuses stale exports (`--allow-stale`)
+   and silent removals (`--allow-removals`).
+4. `uv run python scripts/export_surface_contract.py` — refresh the expanded
+   artifact and its `source_payload_fingerprint` from the newly embedded
+   canonical payload before running any `--check` command.
+5. Update the per-context digests in
+   `tests/unit/test_surface_context_pins.py` (and
+   the README's `OPENAI_STRICT_FINGERPRINT` if the OpenAI graph moved),
+   then run
+   `make check && make test-unit && make check-surface-contract && make check-provider-surfaces`.
+   Continue to the PR output only after this passes.
+
+Put `uv run python scripts/diff_surface_rules.py <PR-base-ref>` output in the
+PR. Use the branch or ref the PR targets; use `origin/main` only when the PR
+actually targets main.
+Red canary? See `docs/surface-canary-runbook.md`.
+Release forensics: any installed wheel reproduces its full ledger via
+`python -c "from solwyn._surfaces import surface_contract_data; import json; print(json.dumps(surface_contract_data()))"`.
 
 ## Provider Adapter Notes
 

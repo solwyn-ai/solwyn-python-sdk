@@ -20,13 +20,22 @@ expanded JSON source of truth:
        uv run python scripts/embed_surface_rules.py \
            --input build/surface_contract/surface-classification.json
 
-4. Re-export from the new canonical payload and prove payload identity plus
-   provider/report compatibility::
+4. Refresh the expanded artifact and its ``source_payload_fingerprint`` from
+   the new canonical payload::
+
+       uv run python scripts/export_surface_contract.py
+
+5. Prove payload identity plus provider/report compatibility::
 
        make check-surface-contract
        make check-provider-surfaces
        uv run python scripts/export_surface_contract.py --check \
            --reports-dir build/provider_surface_inventory
+
+Step 3 prints the rule-level delta against the installed payload and refuses
+stale exports (``--allow-stale`` to override) and rule removals
+(``--allow-removals``). ``make check-surface-contract`` is now edit-preserving:
+a differing expanded contract FAILS the check and is left on disk untouched.
 
 ``--check`` is verification-only: it exits nonzero when the supplied expanded
 contract would change the Python payload, and never writes or applies edits.
@@ -35,6 +44,7 @@ contract would change the Python payload, and never writes or applies edits.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import json
 import zlib
@@ -52,6 +62,7 @@ from solwyn._surfaces import (
     SurfaceSelector,
     SurfaceSource,
     UsageBasis,
+    payload_fingerprint,
 )
 
 ROOT = Path(__file__).parents[1]
@@ -90,7 +101,8 @@ def _canonical_expanded_row(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _validated_rules(contract: Mapping[str, Any]) -> tuple[SurfaceRule, ...]:
-    if set(contract) != {"contract_version", "schema_version", "unknown_policy", "rules"}:
+    required = {"contract_version", "schema_version", "unknown_policy", "rules"}
+    if not required <= set(contract) <= required | {"source_payload_fingerprint"}:
         raise RuntimeError("surface contract root fields are invalid")
     if contract.get("contract_version") != CONTRACT_VERSION:
         raise RuntimeError("surface contract version is unsupported")
@@ -137,6 +149,15 @@ def _validated_rules(contract: Mapping[str, Any]) -> tuple[SurfaceRule, ...]:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("invalid expanded surface contract rule") from exc
+        segments = rule.rule_id.split(".")
+        if (
+            len(segments) not in {4, 5}
+            or segments[0] != "surface"
+            or segments[2] != rule.kind.value
+        ):
+            raise RuntimeError(
+                f"rule id {rule.rule_id!r} does not encode its kind ({rule.kind.value})"
+            )
         if rule.to_data() != _canonical_expanded_row(row):
             raise RuntimeError(f"rule {rule.rule_id!r} does not match validated export")
         rules.append(rule)
@@ -145,6 +166,27 @@ def _validated_rules(contract: Mapping[str, Any]) -> tuple[SurfaceRule, ...]:
     if len({rule.rule_id for rule in ordered}) != len(ordered):
         raise RuntimeError("surface contract contains duplicate rule ids")
     return ordered
+
+
+def rule_delta(
+    new_rules: tuple[SurfaceRule, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Return (removed, added, changed) rule ids vs the installed payload."""
+
+    from solwyn._surfaces import SURFACE_RULES
+
+    current = {rule.rule_id: rule for rule in SURFACE_RULES}
+    incoming = {rule.rule_id: rule for rule in new_rules}
+    removed = tuple(sorted(current.keys() - incoming.keys()))
+    added = tuple(sorted(incoming.keys() - current.keys()))
+    changed = tuple(
+        sorted(
+            rule_id
+            for rule_id in current.keys() & incoming.keys()
+            if current[rule_id].to_data() != incoming[rule_id].to_data()
+        )
+    )
+    return removed, added, changed
 
 
 def _selector_key(selector: SurfaceSelector) -> tuple[str, str, str, str]:
@@ -217,23 +259,79 @@ def rewrite_source(source: str, encoded: str) -> str:
     return f"{before}{_render_payload(encoded)}{after}"
 
 
+def decode_source_payload(source: str) -> dict[str, Any]:
+    """Decode the compact JSON payload from a marked surface source file."""
+
+    if source.count(BEGIN_MARKER) != 1 or source.count(END_MARKER) != 1:
+        raise RuntimeError("surface source must contain one generated payload block")
+    _before, marked = source.split(BEGIN_MARKER, 1)
+    payload_block, _after = marked.split(END_MARKER, 1)
+    try:
+        parsed = ast.parse(payload_block.strip())
+        statement = parsed.body[0]
+        if (
+            len(parsed.body) != 1
+            or not isinstance(statement, ast.Assign)
+            or len(statement.targets) != 1
+            or not isinstance(statement.targets[0], ast.Name)
+            or statement.targets[0].id != "_GENERATED_SURFACE_RULE_PAYLOAD"
+        ):
+            raise RuntimeError("invalid generated surface payload assignment")
+        encoded = ast.literal_eval(statement.value)
+        if not isinstance(encoded, str):
+            raise RuntimeError("generated surface payload must be a string")
+        decoded = json.loads(zlib.decompress(base64.b85decode(encoded.encode("ascii"))))
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("invalid generated surface payload") from exc
+    if not isinstance(decoded, dict):
+        raise RuntimeError("generated surface payload must decode to an object")
+    return decoded
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--check", action="store_true")
+    parser.add_argument("--allow-stale", action="store_true")
+    parser.add_argument("--allow-removals", action="store_true")
     return parser
 
 
 def main() -> int:
+    import solwyn
+
+    installed = Path(solwyn.__file__).resolve()
+    expected = (ROOT / "src" / "solwyn" / "__init__.py").resolve()
+    if installed != expected:
+        print(f"solwyn resolves to {installed}, not this checkout ({expected}); run via uv run")
+        return 1
     args = _parser().parse_args()
     contract = json.loads(args.input.read_text(encoding="utf-8"))
     if not isinstance(contract, dict):
         raise RuntimeError("surface contract root must be an object")
+    stamp = contract.get("source_payload_fingerprint")
+    if stamp != payload_fingerprint() and not args.allow_stale:
+        print(
+            "stale expanded contract: source_payload_fingerprint "
+            f"{stamp!r} does not match the installed payload; re-export on this "
+            "branch or pass --allow-stale to override"
+        )
+        return 1
+    removed, added, changed = rule_delta(_validated_rules(contract))
+    if not args.check:
+        for label, ids in (("removed", removed), ("added", added), ("changed", changed)):
+            for rule_id in ids:
+                print(f"{label}: {rule_id}")
+        if removed and not args.allow_removals:
+            print(f"refusing to remove {len(removed)} rule(s); pass --allow-removals")
+            return 1
     existing = args.source.read_text(encoding="utf-8")
-    rewritten = rewrite_source(existing, encode_contract(contract))
     if args.check:
-        return 0 if rewritten == existing else 1
+        return 0 if decode_source_payload(existing) == compact_contract(contract) else 1
+    rewritten = rewrite_source(existing, encode_contract(contract))
     args.source.write_text(rewritten, encoding="utf-8")
     print(args.source)
     return 0

@@ -5,9 +5,12 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import os
+import shutil
 import subprocess
 import sys
 import zlib
+from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -19,6 +22,38 @@ from solwyn._surfaces import surface_contract_data
 ROOT = Path(__file__).parents[2]
 
 
+@pytest.mark.unit
+def test_repo_tool_environment_resolves_checkout_without_mutating_pytest_process(
+    repo_tool_env: Callable[[Path], dict[str, str]],
+) -> None:
+    # Arrange
+    import solwyn
+
+    original_pythonpath = os.environ.get("PYTHONPATH")
+    pytest_solwyn = Path(solwyn.__file__).resolve()
+    publish_workflow = (ROOT / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8")
+
+    # Act
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import solwyn; print(Path(solwyn.__file__).resolve())",
+        ],
+        env=repo_tool_env(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # Assert
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str((ROOT / "src" / "solwyn" / "__init__.py").resolve())
+    assert os.environ.get("PYTHONPATH") == original_pythonpath
+    assert Path(solwyn.__file__).resolve() == pytest_solwyn
+    assert "PYTHONPATH" not in publish_workflow
+
+
 def _embed_module() -> ModuleType:
     path = ROOT / "scripts" / "embed_surface_rules.py"
     assert path.exists(), f"missing deterministic payload encoder: {path}"
@@ -28,6 +63,187 @@ def _embed_module() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _stamped(contract: dict[str, Any], fingerprint: str) -> dict[str, Any]:
+    stamped = dict(contract)
+    stamped["source_payload_fingerprint"] = fingerprint
+    return stamped
+
+
+def _run_repo_tool(
+    checkout: Path,
+    repo_tool_env: Callable[[Path], dict[str, str]],
+    script: str,
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(checkout / "scripts" / script), *arguments],
+        cwd=checkout,
+        env=repo_tool_env(checkout),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@pytest.mark.unit
+def test_embed_rejects_a_stale_source_fingerprint(
+    tmp_path: Path,
+    repo_tool_env: Callable[[Path], dict[str, str]],
+) -> None:
+    # Arrange
+    from solwyn._surfaces import payload_fingerprint
+
+    contract = _stamped(surface_contract_data(), "sha256:" + "0" * 64)
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    source = tmp_path / "source.py"
+    source.write_text(
+        "x = 1\n# BEGIN GENERATED SURFACE RULE PAYLOAD\nP = ()\n"
+        "# END GENERATED SURFACE RULE PAYLOAD\n",
+        encoding="utf-8",
+    )
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "embed_surface_rules.py"),
+        "--input",
+        str(contract_path),
+        "--source",
+        str(source),
+    ]
+
+    # Act
+    result = subprocess.run(
+        command,
+        env=repo_tool_env(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # Assert
+    assert result.returncode != 0
+    assert "stale" in (result.stdout + result.stderr)
+
+    # Arrange
+    good = _stamped(surface_contract_data(), payload_fingerprint())
+    contract_path.write_text(json.dumps(good), encoding="utf-8")
+
+    # Act
+    ok = subprocess.run(
+        command,
+        env=repo_tool_env(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # Assert
+    assert ok.returncode == 0
+
+
+@pytest.mark.unit
+def test_embed_requires_allow_removals_when_rules_disappear() -> None:
+    # Arrange
+    embed = _embed_module()
+    contract: dict[str, Any] = surface_contract_data()
+    reduced = dict(contract)
+    reduced["rules"] = contract["rules"][:-1]
+
+    # Act
+    removed, added, changed = embed.rule_delta(embed._validated_rules(reduced))
+
+    # Assert
+    assert len(removed) == 1
+    assert added == ()
+    assert changed == ()
+
+
+@pytest.mark.unit
+def test_embed_cli_requires_allow_removals_before_rewriting(
+    tmp_path: Path,
+    repo_tool_env: Callable[[Path], dict[str, str]],
+) -> None:
+    # Arrange
+    from solwyn._surfaces import payload_fingerprint
+
+    contract: dict[str, Any] = surface_contract_data()
+    removed_ids = sorted(row["id"] for row in contract["rules"][-2:])
+    reduced = dict(contract)
+    reduced["rules"] = contract["rules"][:-2]
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(
+        json.dumps(_stamped(reduced, payload_fingerprint())),
+        encoding="utf-8",
+    )
+    source_path = tmp_path / "_surfaces.py"
+    original_source = (
+        "before\n"
+        "# BEGIN GENERATED SURFACE RULE PAYLOAD\n"
+        "_GENERATED_SURFACE_RULE_PAYLOAD = (\n"
+        '    "old"\n'
+        ")\n"
+        "# END GENERATED SURFACE RULE PAYLOAD\n"
+        "after\n"
+    )
+    source_path.write_text(original_source, encoding="utf-8")
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "embed_surface_rules.py"),
+        "--input",
+        str(contract_path),
+        "--source",
+        str(source_path),
+    ]
+    expected_removed_lines = [f"removed: {rule_id}" for rule_id in removed_ids]
+
+    # Act
+    refused = subprocess.run(
+        command,
+        env=repo_tool_env(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    source_after_refusal = source_path.read_text(encoding="utf-8")
+    allowed = subprocess.run(
+        [*command, "--allow-removals"],
+        env=repo_tool_env(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # Assert
+    assert refused.returncode != 0
+    assert [
+        line for line in refused.stdout.splitlines() if line.startswith("removed: ")
+    ] == expected_removed_lines
+    assert "pass --allow-removals" in refused.stdout
+    assert source_after_refusal == original_source
+    assert allowed.returncode == 0, allowed.stderr
+    assert [
+        line for line in allowed.stdout.splitlines() if line.startswith("removed: ")
+    ] == expected_removed_lines
+    assert source_path.read_text(encoding="utf-8") != original_source
+
+
+@pytest.mark.unit
+def test_validated_rules_rejects_an_id_that_lies_about_kind() -> None:
+    # Arrange
+    embed = _embed_module()
+    contract: dict[str, Any] = surface_contract_data()
+    row = dict(contract["rules"][0])
+    segments = row["id"].split(".")
+    segments[2] = "blocked" if segments[2] != "blocked" else "metadata"
+    row["id"] = ".".join(segments)
+    tampered = dict(contract)
+    tampered["rules"] = [row] + contract["rules"][1:]
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="does not encode its kind"):
+        embed._validated_rules(tampered)
 
 
 @pytest.mark.unit
@@ -109,11 +325,17 @@ def test_surface_payload_rewriter_changes_only_the_marked_block() -> None:
 
 
 @pytest.mark.unit
-def test_surface_payload_cli_generates_then_checks_temporary_source(tmp_path: Path) -> None:
+def test_surface_payload_cli_generates_then_checks_temporary_source(
+    tmp_path: Path,
+    repo_tool_env: Callable[[Path], dict[str, str]],
+) -> None:
     # Arrange
+    from solwyn._surfaces import payload_fingerprint
+
     input_path = tmp_path / "surface-classification.json"
     source_path = tmp_path / "_surfaces.py"
-    input_path.write_text(json.dumps(surface_contract_data()), encoding="utf-8")
+    contract = _stamped(surface_contract_data(), payload_fingerprint())
+    input_path.write_text(json.dumps(contract), encoding="utf-8")
     stale_source = (
         "before\n"
         "# BEGIN GENERATED SURFACE RULE PAYLOAD\n"
@@ -135,15 +357,24 @@ def test_surface_payload_cli_generates_then_checks_temporary_source(tmp_path: Pa
     stale_check = subprocess.run(
         [*command, "--check"],
         cwd=ROOT,
+        env=repo_tool_env(ROOT),
         capture_output=True,
         text=True,
         check=False,
     )
     source_after_stale_check = source_path.read_text(encoding="utf-8")
-    generated = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
+    generated = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=repo_tool_env(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     synchronized_check = subprocess.run(
         [*command, "--check"],
         cwd=ROOT,
+        env=repo_tool_env(ROOT),
         capture_output=True,
         text=True,
         check=False,
@@ -158,20 +389,167 @@ def test_surface_payload_cli_generates_then_checks_temporary_source(tmp_path: Pa
 
 
 @pytest.mark.unit
-def test_committed_surface_payload_is_the_canonical_contract_rewrite() -> None:
+def test_surface_rule_authoring_loop_refreshes_the_source_fingerprint_before_checks(
+    tmp_path: Path,
+    repo_tool_env: Callable[[Path], dict[str, str]],
+) -> None:
+    # Arrange
+    checkout = tmp_path / "checkout"
+    shutil.copytree(ROOT / "src" / "solwyn", checkout / "src" / "solwyn")
+    (checkout / "scripts").mkdir(parents=True)
+    for script in ("export_surface_contract.py", "embed_surface_rules.py"):
+        shutil.copy2(ROOT / "scripts" / script, checkout / "scripts" / script)
+    contract_path = checkout / "build" / "surface_contract" / "surface-classification.json"
+    source_path = checkout / "src" / "solwyn" / "_surfaces.py"
+
+    # Act
+    exported = _run_repo_tool(
+        checkout,
+        repo_tool_env,
+        "export_surface_contract.py",
+        "--output",
+        str(contract_path),
+    )
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    edited_row = next(row for row in contract["rules"] if row["reason"] is not None)
+    edited_row["reason"] = "reviewed test-only reason"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    embedded = _run_repo_tool(
+        checkout,
+        repo_tool_env,
+        "embed_surface_rules.py",
+        "--input",
+        str(contract_path),
+        "--source",
+        str(source_path),
+    )
+    stale_check = _run_repo_tool(
+        checkout,
+        repo_tool_env,
+        "export_surface_contract.py",
+        "--output",
+        str(contract_path),
+        "--check",
+    )
+    refreshed = _run_repo_tool(
+        checkout,
+        repo_tool_env,
+        "export_surface_contract.py",
+        "--output",
+        str(contract_path),
+    )
+    export_check = _run_repo_tool(
+        checkout,
+        repo_tool_env,
+        "export_surface_contract.py",
+        "--output",
+        str(contract_path),
+        "--check",
+    )
+    embed_check = _run_repo_tool(
+        checkout,
+        repo_tool_env,
+        "embed_surface_rules.py",
+        "--input",
+        str(contract_path),
+        "--source",
+        str(source_path),
+        "--check",
+    )
+
+    # Assert
+    assert exported.returncode == 0, exported.stderr
+    assert embedded.returncode == 0, embedded.stderr
+    assert stale_check.returncode == 1, stale_check.stderr
+    assert "differs from the embedded payload" in stale_check.stdout
+    assert refreshed.returncode == 0, refreshed.stderr
+    assert export_check.returncode == 0, export_check.stderr
+    assert embed_check.returncode == 0, embed_check.stderr
+
+
+@pytest.mark.unit
+def test_embed_workflow_documents_a_bare_export_between_embed_and_checks() -> None:
+    # Arrange
+    workflow = _embed_module().__doc__ or ""
+    maintainer_docs = (ROOT / "src" / "solwyn" / "CLAUDE.md").read_text(encoding="utf-8")
+    runbook = (ROOT / "docs" / "surface-canary-runbook.md").read_text(encoding="utf-8")
+
+    # Act
+    bare_exports = workflow.count("uv run python scripts/export_surface_contract.py\n")
+
+    # Assert
+    assert bare_exports == 2
+    maintainer_instruction = (
+        "refresh the expanded\n   artifact and its `source_payload_fingerprint`"
+    )
+    assert maintainer_instruction in maintainer_docs
+    assert "refreshes the expanded\n   artifact's `source_payload_fingerprint`" in runbook
+
+
+@pytest.mark.unit
+def test_surface_payload_check_accepts_equivalent_json_from_alternate_zlib(
+    tmp_path: Path,
+    repo_tool_env: Callable[[Path], dict[str, str]],
+) -> None:
+    # Arrange
+    from solwyn._surfaces import payload_fingerprint
+
+    embed = _embed_module()
+    contract = _stamped(surface_contract_data(), payload_fingerprint())
+    canonical_json = json.dumps(
+        embed.compact_contract(contract),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    alternate_encoded = base64.b85encode(zlib.compress(canonical_json, level=1)).decode("ascii")
+    assert alternate_encoded != embed.encode_contract(contract)
+
+    input_path = tmp_path / "surface-classification.json"
+    input_path.write_text(json.dumps(contract), encoding="utf-8")
+    source_path = tmp_path / "_surfaces.py"
+    source = embed.rewrite_source(
+        "before\n# BEGIN GENERATED SURFACE RULE PAYLOAD\nold\n"
+        "# END GENERATED SURFACE RULE PAYLOAD\nafter\n",
+        alternate_encoded,
+    )
+    source_path.write_text(source, encoding="utf-8")
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "embed_surface_rules.py"),
+        "--input",
+        str(input_path),
+        "--source",
+        str(source_path),
+        "--check",
+    ]
+
+    # Act
+    result = subprocess.run(
+        command,
+        cwd=ROOT,
+        env=repo_tool_env(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # Assert
+    assert result.returncode == 0, result.stderr
+    assert source_path.read_text(encoding="utf-8") == source
+
+
+@pytest.mark.unit
+def test_committed_surface_payload_decodes_to_the_canonical_compact_contract() -> None:
     # Arrange
     embed = _embed_module()
     source_path = ROOT / "src" / "solwyn" / "_surfaces.py"
     committed_source = source_path.read_text(encoding="utf-8")
 
     # Act
-    canonical_source = embed.rewrite_source(
-        committed_source,
-        embed.encode_contract(surface_contract_data()),
-    )
+    decoded_payload = embed.decode_source_payload(committed_source)
 
     # Assert
-    assert canonical_source == committed_source
+    assert decoded_payload == embed.compact_contract(surface_contract_data())
 
 
 @pytest.mark.unit
