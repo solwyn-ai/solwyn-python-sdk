@@ -842,6 +842,20 @@ def test_readme_uses_the_tested_literal_openai_fingerprint_without_self_approval
 
 
 @pytest.mark.unit
+def test_readme_openai_provenance_matches_the_installed_sdk() -> None:
+    import importlib.metadata
+
+    # Arrange
+    readme = (_PROJECT_ROOT / "README.md").read_text()
+
+    # Act
+    version = importlib.metadata.version("openai")
+
+    # Assert
+    assert f"openai=={version}" in readme
+
+
+@pytest.mark.unit
 def test_readme_states_the_strict_coverage_and_trust_boundary_contract() -> None:
     # Arrange
     readme = (_PROJECT_ROOT / "README.md").read_text()
@@ -862,6 +876,8 @@ def test_readme_states_the_strict_coverage_and_trust_boundary_contract() -> None
         "response, page, stream, job, or operation object",
         "Native OpenAI video is tracked",
         "video on an OpenAI-compatible provider is unsupported",
+        "Tested SDK version intervals",
+        "unknown` and follow `on_unmetered`",
     )
 
     # Act

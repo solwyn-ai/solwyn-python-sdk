@@ -13,7 +13,7 @@ import pytest
 from conftest import VALID_API_KEY, foreground_records
 
 from solwyn._base import _reset_unmetered_spend_warnings
-from solwyn._surfaces import SurfaceSource
+from solwyn._surfaces import SurfaceSource, resolve_surface_rule
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import ConfigurationError, UntrackedSpendSurfaceError
 
@@ -385,6 +385,34 @@ def test_warn_latch_overflow_logging_is_reentrant(
 
 
 @pytest.mark.unit
+def test_fork_reset_replaces_module_warning_locks_with_unlocked_locks() -> None:
+    from solwyn import _base
+
+    # Arrange
+    old_spend_lock = _base._spend_surface_warn_lock
+    old_cost_lock = _base._cost_policy_warn_lock
+    spend_sentinel = object()
+    cost_sentinel = object()
+    _base._spend_surface_warn_lock = spend_sentinel  # type: ignore[assignment]
+    _base._cost_policy_warn_lock = cost_sentinel  # type: ignore[assignment]
+
+    try:
+        # Act
+        _base._reset_warn_locks_after_fork_in_child()
+
+        # Assert
+        assert _base._spend_surface_warn_lock is not spend_sentinel
+        assert _base._cost_policy_warn_lock is not cost_sentinel
+        assert _base._spend_surface_warn_lock.acquire(blocking=False)
+        _base._spend_surface_warn_lock.release()
+        assert _base._cost_policy_warn_lock.acquire(blocking=False)
+        _base._cost_policy_warn_lock.release()
+    finally:
+        _base._spend_surface_warn_lock = old_spend_lock
+        _base._cost_policy_warn_lock = old_cost_lock
+
+
+@pytest.mark.unit
 def test_allow_is_silent_and_returns_the_terminal_capability(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -399,15 +427,22 @@ def test_allow_is_silent_and_returns_the_terminal_capability(
 
 @pytest.mark.unit
 def test_raise_refuses_a_known_untracked_surface_with_its_scope() -> None:
+    # Arrange
     wrapper = _make_solwyn(_OpenAIClient(), on_unmetered="raise")
 
+    # Act
     with pytest.raises(UntrackedSpendSurfaceError) as exc_info:
         _ = wrapper.post
 
+    # Assert
     assert exc_info.value.surface == "post"
     assert exc_info.value.token == "post"
     assert exc_info.value.capability_scope == "arbitrary_endpoint"
+    assert exc_info.value.drifted_from_rule_id is None
     assert "acknowledge exact token 'post'" in str(exc_info.value)
+    assert repr(exc_info.value) == (
+        "UntrackedSpendSurfaceError(surface='post', provider='openai', kind='unmetered_spend')"
+    )
     _close(wrapper)
 
 
@@ -969,15 +1004,57 @@ def test_safe_metadata_preserves_identity_when_both_shapes_match() -> None:
 
 @pytest.mark.unit
 def test_safe_metadata_return_shape_drift_reenters_strict_unknown_posture() -> None:
+    # Arrange
     client = _DriftedBaseURLClient()
     wrapper = _make_solwyn(client, on_unmetered="raise")
     client.base_url_evaluations = 0
+    reviewed_rule = resolve_surface_rule(
+        context=wrapper._surface_context,
+        path="base_url",
+        source=SurfaceSource.RAW,
+    )
+    assert reviewed_rule is not None
 
+    # Act
     with pytest.raises(UntrackedSpendSurfaceError) as exc_info:
         _ = wrapper.base_url
 
+    # Assert
     assert exc_info.value.kind == "unknown"
+    assert exc_info.value.drifted_from_rule_id == reviewed_rule.rule_id
+    assert f"reviewed rule {reviewed_rule.rule_id} no longer matches its shape" in str(
+        exc_info.value
+    )
+    assert f"drifted_from_rule_id={reviewed_rule.rule_id!r}" in repr(exc_info.value)
     assert client.base_url_evaluations == 1
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_safe_metadata_return_shape_drift_warning_names_the_reviewed_rule(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    client = _DriftedBaseURLClient()
+    wrapper = _make_solwyn(client, on_unmetered="warn")
+    reviewed_rule = resolve_surface_rule(
+        context=wrapper._surface_context,
+        path="base_url",
+        source=SurfaceSource.RAW,
+    )
+    assert reviewed_rule is not None
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+        _ = wrapper.base_url
+
+    # Assert
+    records = foreground_records(caplog)
+    assert len(records) == 1
+    assert (
+        f"Reviewed rule {reviewed_rule.rule_id} no longer matches its shape."
+        in records[0].getMessage()
+    )
     _close(wrapper)
 
 

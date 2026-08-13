@@ -17,6 +17,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+# Payload and reader ship together in this file: bumping this constant
+# requires regenerating the payload IN THE SAME COMMIT (a mismatched payload
+# fails at import, which also disables the export/embed tooling until fixed).
 CONTRACT_VERSION = 1
 
 DIALECT_BY_PROVIDER: dict[str, str] = {
@@ -440,6 +443,9 @@ def _build_surface_rules() -> tuple[SurfaceRule, ...]:
         raise RuntimeError("invalid embedded surface rule payload") from exc
     if payload.get("schema_version") != CONTRACT_VERSION:
         raise RuntimeError("unsupported embedded surface rule schema")
+    for row in payload["rules"]:
+        if not isinstance(row, list) or len(row) != 11:
+            raise RuntimeError("invalid embedded surface rule row")
 
     rules = tuple(
         SurfaceRule(

@@ -267,6 +267,7 @@ class UntrackedSpendSurfaceError(SolwynError, AttributeError):
         client_shape: str,
         kind: str,
         capability_scope: str | None,
+        drifted_from_rule_id: str | None = None,
     ) -> None:
         scope = f" (scope: {capability_scope})" if capability_scope is not None else ""
         if kind == "unmetered_spend":
@@ -275,10 +276,15 @@ class UntrackedSpendSurfaceError(SolwynError, AttributeError):
             guidance = (
                 "review the provider graph and acknowledge an exact terminal capability token"
             )
+        drift = (
+            f" (reviewed rule {drifted_from_rule_id} no longer matches its shape)"
+            if drifted_from_rule_id is not None
+            else ""
+        )
         super().__init__(
             f"Solwyn refused untracked surface '{surface}' for provider "
             f"{provider}{scope}; {guidance} or choose "
-            "on_unmetered='warn'/'allow'"
+            f"on_unmetered='warn'/'allow'{drift}"
         )
         self.surface = surface
         self.token = token
@@ -286,12 +292,18 @@ class UntrackedSpendSurfaceError(SolwynError, AttributeError):
         self.client_shape = client_shape
         self.kind = kind
         self.capability_scope = capability_scope
+        self.drifted_from_rule_id = drifted_from_rule_id
 
     def __repr__(self) -> str:
+        drift = (
+            f", drifted_from_rule_id={self.drifted_from_rule_id!r}"
+            if self.drifted_from_rule_id is not None
+            else ""
+        )
         return (
             "UntrackedSpendSurfaceError("
             f"surface={self.surface!r}, provider={self.provider!r}, "
-            f"kind={self.kind!r})"
+            f"kind={self.kind!r}{drift})"
         )
 
 

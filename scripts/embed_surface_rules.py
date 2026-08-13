@@ -265,6 +265,13 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    import solwyn
+
+    installed = Path(solwyn.__file__).resolve()
+    expected = (ROOT / "src" / "solwyn" / "__init__.py").resolve()
+    if installed != expected:
+        print(f"solwyn resolves to {installed}, not this checkout ({expected}); run via uv run")
+        return 1
     args = _parser().parse_args()
     contract = json.loads(args.input.read_text(encoding="utf-8"))
     if not isinstance(contract, dict):

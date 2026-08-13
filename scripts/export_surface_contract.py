@@ -25,9 +25,8 @@ from solwyn._surfaces import (
     surface_contract_data,
 )
 
-DEFAULT_OUTPUT = (
-    Path(__file__).parents[1] / "build" / "surface_contract" / "surface-classification.json"
-)
+ROOT = Path(__file__).parents[1]
+DEFAULT_OUTPUT = ROOT / "build" / "surface_contract" / "surface-classification.json"
 
 
 def render_contract() -> str:
@@ -170,6 +169,13 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    import solwyn
+
+    installed = Path(solwyn.__file__).resolve()
+    expected = (ROOT / "src" / "solwyn" / "__init__.py").resolve()
+    if installed != expected:
+        print(f"solwyn resolves to {installed}, not this checkout ({expected}); run via uv run")
+        return 1
     args = _parser().parse_args()
     if args.check:
         report_mismatches = generate_and_check(

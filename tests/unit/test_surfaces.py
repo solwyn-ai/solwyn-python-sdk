@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import shlex
+import zlib
 from pathlib import Path
 from types import ModuleType
 
@@ -154,14 +156,69 @@ def test_every_constructible_context_is_declared_or_rejected() -> None:
     assert context_is_declared(named_compat)
 
 
-def _export_module() -> ModuleType:
-    path = ROOT / "scripts" / "export_surface_contract.py"
-    spec = importlib.util.spec_from_file_location("export_surface_contract", path)
+@pytest.mark.unit
+def test_embedded_surface_rule_rows_have_exactly_eleven_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from solwyn import _surfaces
+
+    # Arrange
+    malformed = {
+        "rules": [["too", "short"]],
+        "schema_version": _surfaces.CONTRACT_VERSION,
+    }
+    encoded = base64.b85encode(zlib.compress(json.dumps(malformed).encode("utf-8"))).decode("ascii")
+    monkeypatch.setattr(_surfaces, "_GENERATED_SURFACE_RULE_PAYLOAD", encoded)
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="invalid embedded surface rule row"):
+        _surfaces._build_surface_rules()
+
+
+def _script_module(name: str) -> ModuleType:
+    path = ROOT / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"could not load surface contract exporter at {path}")
+        raise RuntimeError(f"could not load surface contract script at {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _export_module() -> ModuleType:
+    return _script_module("export_surface_contract")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("script_name", ["export_surface_contract", "embed_surface_rules"])
+def test_surface_contract_generators_refuse_another_installed_checkout_before_work(
+    script_name: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import solwyn
+
+    # Arrange
+    module = _script_module(script_name)
+    installed = tmp_path / "site-packages" / "solwyn" / "__init__.py"
+    monkeypatch.setattr(solwyn, "__file__", str(installed))
+
+    def fail_if_work_starts() -> None:
+        raise AssertionError("argument parsing started before checkout identity validation")
+
+    monkeypatch.setattr(module, "_parser", fail_if_work_starts)
+
+    # Act
+    result = module.main()
+
+    # Assert
+    expected = (ROOT / "src" / "solwyn" / "__init__.py").resolve()
+    assert result == 1
+    assert (
+        f"solwyn resolves to {installed.resolve()}, not this checkout ({expected}); run via uv run"
+        in capsys.readouterr().out
+    )
 
 
 def _rule(

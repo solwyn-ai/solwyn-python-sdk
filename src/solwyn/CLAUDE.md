@@ -38,7 +38,9 @@ tracked. The token-billed TTS condition is a distinct synthetic rule with token
 `audio.speech.create:gpt-4o-mini-tts`.
 
 `on_unmetered="warn"` is the compatibility default; `raise` is strict mode and
-`allow` is the explicit pass posture. Strict mode guards cooperative public
+`allow` is the explicit pass posture. Guarded provider resources forward
+attributes only — protocol dunders (with/async-with) are not forwarded in ANY
+posture, including allow. Strict mode guards cooperative public
 pre-call access only. It is not a sandbox for callers that retain the raw
 client, reach private wrapper state, acknowledge a scoped raw escape, or invoke
 native behavior on provider-returned response/page/stream/job/operation

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 import statistics
 import threading
 import time
@@ -175,6 +176,16 @@ _warn_limit_reached = False
 _spend_surface_warn_lock = threading.Lock()
 
 
+def _reset_warn_locks_after_fork_in_child() -> None:
+    global _spend_surface_warn_lock, _cost_policy_warn_lock
+    _spend_surface_warn_lock = threading.Lock()
+    _cost_policy_warn_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_warn_locks_after_fork_in_child)
+
+
 def _reset_unmetered_spend_warnings() -> None:
     """Clear the per-process warn-once latch. Test-support hook only."""
     global _warn_limit_reached
@@ -189,6 +200,7 @@ def _warn_contextual_surface_once(
     rule_id: str,
     surface: str,
     capability_scope: str | None,
+    drifted_from_rule_id: str | None = None,
 ) -> None:
     """Warn once per provider/client-shape/mode/rule identity, bounded in size."""
 
@@ -210,6 +222,20 @@ def _warn_contextual_surface_once(
             "Untracked-surface warning limit (%d) reached; further distinct "
             "surfaces will not be individually reported this process.",
             _WARNED_SURFACE_LIMIT,
+        )
+        return
+    if drifted_from_rule_id is not None:
+        drift_message = "Reviewed rule %s no longer matches its shape.".replace(
+            "%s", drifted_from_rule_id
+        )
+        logger.warning(
+            "Provider '%s' client shape '%s' exposes untracked surface '%s' "
+            "(scope: %s); no budget check and no cost event will be emitted. "
+            f"Tracking for this surface is coming. {drift_message}",
+            context.provider,
+            context.client_shape,
+            surface,
+            capability_scope,
         )
         return
     logger.warning(
@@ -953,6 +979,7 @@ class _SolwynBase:
         rule: SurfaceRule | None,
         *,
         honor_acknowledgment: bool = True,
+        drifted_from: SurfaceRule | None = None,
     ) -> None:
         token = rule.token if rule is not None else path
         if honor_acknowledgment and (
@@ -965,14 +992,15 @@ class _SolwynBase:
             else None
         )
         kind = rule.kind.value if rule is not None else SurfaceKind.UNKNOWN.value
-        rule_id = (
-            rule.rule_id
-            if rule is not None
-            else (
+        if rule is not None:
+            rule_id = rule.rule_id
+        elif drifted_from is not None:
+            rule_id = drifted_from.rule_id
+        else:
+            rule_id = (
                 f"unknown:{self._surface_context.client_shape}:{self._surface_context.mode}:"
                 f"{self._surface_context.provider}:{path}"
             )
-        )
         if self._config.on_unmetered == "allow":
             return
         if self._config.on_unmetered == "warn":
@@ -981,6 +1009,7 @@ class _SolwynBase:
                 rule_id=rule_id,
                 surface=path,
                 capability_scope=scope,
+                drifted_from_rule_id=(drifted_from.rule_id if drifted_from is not None else None),
             )
             return
         raise UntrackedSpendSurfaceError(
@@ -990,6 +1019,7 @@ class _SolwynBase:
             client_shape=self._surface_context.client_shape,
             kind=kind,
             capability_scope=scope,
+            drifted_from_rule_id=(drifted_from.rule_id if drifted_from is not None else None),
         )
 
     def _resolve_unknown_value(self, value: object, path: str) -> Any:
@@ -1102,6 +1132,7 @@ class _SolwynBase:
                     path,
                     None,
                     honor_acknowledgment=False,
+                    drifted_from=rule,
                 )
                 return self._resolve_unknown_value(getattr(value, name), path)
             self._apply_untracked_posture(path, rule)
@@ -1113,6 +1144,7 @@ class _SolwynBase:
                     path,
                     None,
                     honor_acknowledgment=False,
+                    drifted_from=rule,
                 )
                 return self._resolve_unknown_value(returned, path)
             if self._is_exact_raw_response_escape(path, rule):
@@ -1124,11 +1156,21 @@ class _SolwynBase:
                 descriptor_category,
                 static_return_shape,
             ):
-                self._apply_untracked_posture(path, None)
+                self._apply_untracked_posture(
+                    path,
+                    None,
+                    honor_acknowledgment=False,
+                    drifted_from=rule,
+                )
                 return self._resolve_unknown_value(getattr(value, name), path)
             returned = getattr(value, name)
             if not rule.accepts_shape(AttributeShape(descriptor_category, _return_shape(returned))):
-                self._apply_untracked_posture(path, None)
+                self._apply_untracked_posture(
+                    path,
+                    None,
+                    honor_acknowledgment=False,
+                    drifted_from=rule,
+                )
                 return self._resolve_unknown_value(returned, path)
             return returned
         if rule.kind is SurfaceKind.NAMESPACE:
@@ -1137,11 +1179,21 @@ class _SolwynBase:
                 descriptor_category,
                 static_return_shape,
             ):
-                self._apply_untracked_posture(path, None)
+                self._apply_untracked_posture(
+                    path,
+                    None,
+                    honor_acknowledgment=False,
+                    drifted_from=rule,
+                )
                 return self._resolve_unknown_value(getattr(value, name), path)
             returned = getattr(value, name)
             if not rule.accepts_shape(AttributeShape(descriptor_category, _return_shape(returned))):
-                self._apply_untracked_posture(path, None)
+                self._apply_untracked_posture(
+                    path,
+                    None,
+                    honor_acknowledgment=False,
+                    drifted_from=rule,
+                )
                 return self._resolve_unknown_value(returned, path)
             return self._guard_resource(returned, path)
         raise RuntimeError(f"unsupported surface kind in runtime resolver: {rule.kind.value}")
