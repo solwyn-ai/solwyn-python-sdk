@@ -95,6 +95,65 @@ def test_embed_requires_allow_removals_when_rules_disappear() -> None:
 
 
 @pytest.mark.unit
+def test_embed_cli_requires_allow_removals_before_rewriting(tmp_path: Path) -> None:
+    # Arrange
+    from solwyn._surfaces import payload_fingerprint
+
+    contract: dict[str, Any] = surface_contract_data()
+    removed_ids = sorted(row["id"] for row in contract["rules"][-2:])
+    reduced = dict(contract)
+    reduced["rules"] = contract["rules"][:-2]
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(
+        json.dumps(_stamped(reduced, payload_fingerprint())),
+        encoding="utf-8",
+    )
+    source_path = tmp_path / "_surfaces.py"
+    original_source = (
+        "before\n"
+        "# BEGIN GENERATED SURFACE RULE PAYLOAD\n"
+        "_GENERATED_SURFACE_RULE_PAYLOAD = (\n"
+        '    "old"\n'
+        ")\n"
+        "# END GENERATED SURFACE RULE PAYLOAD\n"
+        "after\n"
+    )
+    source_path.write_text(original_source, encoding="utf-8")
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "embed_surface_rules.py"),
+        "--input",
+        str(contract_path),
+        "--source",
+        str(source_path),
+    ]
+    expected_removed_lines = [f"removed: {rule_id}" for rule_id in removed_ids]
+
+    # Act
+    refused = subprocess.run(command, capture_output=True, text=True, check=False)
+    source_after_refusal = source_path.read_text(encoding="utf-8")
+    allowed = subprocess.run(
+        [*command, "--allow-removals"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    # Assert
+    assert refused.returncode != 0
+    assert [
+        line for line in refused.stdout.splitlines() if line.startswith("removed: ")
+    ] == expected_removed_lines
+    assert "pass --allow-removals" in refused.stdout
+    assert source_after_refusal == original_source
+    assert allowed.returncode == 0, allowed.stderr
+    assert [
+        line for line in allowed.stdout.splitlines() if line.startswith("removed: ")
+    ] == expected_removed_lines
+    assert source_path.read_text(encoding="utf-8") != original_source
+
+
+@pytest.mark.unit
 def test_validated_rules_rejects_an_id_that_lies_about_kind() -> None:
     # Arrange
     embed = _embed_module()
