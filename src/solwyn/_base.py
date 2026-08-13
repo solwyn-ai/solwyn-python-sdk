@@ -168,10 +168,10 @@ def _warn_cost_policy_inactive_once() -> None:
     logger.warning("CostPolicy selected but no price hints available; using health-based order")
 
 
-# Per-process warn-once state is keyed by the complete contextual rule identity,
-# so equal terminal names in different provider graphs cannot suppress each other.
+# Per-process warn-once state is keyed by the complete contextual rule identity
+# and drift state, so matching and drift warnings cannot suppress each other.
 _WARNED_SURFACE_LIMIT = 512
-_warned_contextual_surfaces: set[tuple[str, str, str, str]] = set()
+_warned_contextual_surfaces: set[tuple[str, str, str, str, bool]] = set()
 _warn_limit_reached = False
 _spend_surface_warn_lock = threading.Lock()
 
@@ -202,10 +202,16 @@ def _warn_contextual_surface_once(
     capability_scope: str | None,
     drifted_from_rule_id: str | None = None,
 ) -> None:
-    """Warn once per provider/client-shape/mode/rule identity, bounded in size."""
+    """Warn once per provider/client-shape/mode/rule/drift identity, bounded in size."""
 
     global _warn_limit_reached
-    warning_key = (context.provider, context.client_shape, context.mode, rule_id)
+    warning_key = (
+        context.provider,
+        context.client_shape,
+        context.mode,
+        rule_id,
+        drifted_from_rule_id is not None,
+    )
     warn_limit_reached_now = False
     with _spend_surface_warn_lock:
         if warning_key in _warned_contextual_surfaces:

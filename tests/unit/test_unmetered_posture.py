@@ -268,6 +268,40 @@ def test_default_warn_logs_once_and_returns_the_terminal_capability(
 
 
 @pytest.mark.unit
+def test_reviewed_shape_drift_warns_after_the_matching_surface_already_warned(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    client = _OpenAIClient()
+    wrapper = _make_solwyn(client, on_unmetered="warn")
+    reviewed_rule = resolve_surface_rule(
+        context=wrapper._surface_context,
+        path="post",
+        source=SurfaceSource.RAW,
+    )
+    assert reviewed_rule is not None
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+        first = wrapper.post
+        monkeypatch.setattr(_OpenAIClient, "post", property(lambda _client: "drifted"))
+        second = wrapper.post
+
+    # Assert
+    assert first() == "posted"
+    assert second == "drifted"
+    records = foreground_records(caplog)
+    assert len(records) == 2
+    assert records[0].args == ("openai", "openai_sdk", "post", "arbitrary_endpoint")
+    assert (
+        f"Reviewed rule {reviewed_rule.rule_id} no longer matches its shape."
+        in records[1].getMessage()
+    )
+    _close(wrapper)
+
+
+@pytest.mark.unit
 def test_warn_latch_keys_include_mode_and_are_bounded(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -350,7 +384,7 @@ def test_warn_latch_overflow_logging_is_reentrant(
     )
     lock = _SameThreadReentryGuard()
     _base._warned_contextual_surfaces.update(
-        ("openai", "openai_sdk", "sync", f"rule-{index}")
+        ("openai", "openai_sdk", "sync", f"rule-{index}", False)
         for index in range(_base._WARNED_SURFACE_LIMIT)
     )
     monkeypatch.setattr(_base, "_spend_surface_warn_lock", lock)

@@ -40,6 +40,7 @@ contract would change the Python payload, and never writes or applies edits.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import json
 import zlib
@@ -254,6 +255,37 @@ def rewrite_source(source: str, encoded: str) -> str:
     return f"{before}{_render_payload(encoded)}{after}"
 
 
+def decode_source_payload(source: str) -> dict[str, Any]:
+    """Decode the compact JSON payload from a marked surface source file."""
+
+    if source.count(BEGIN_MARKER) != 1 or source.count(END_MARKER) != 1:
+        raise RuntimeError("surface source must contain one generated payload block")
+    _before, marked = source.split(BEGIN_MARKER, 1)
+    payload_block, _after = marked.split(END_MARKER, 1)
+    try:
+        parsed = ast.parse(payload_block.strip())
+        statement = parsed.body[0]
+        if (
+            len(parsed.body) != 1
+            or not isinstance(statement, ast.Assign)
+            or len(statement.targets) != 1
+            or not isinstance(statement.targets[0], ast.Name)
+            or statement.targets[0].id != "_GENERATED_SURFACE_RULE_PAYLOAD"
+        ):
+            raise RuntimeError("invalid generated surface payload assignment")
+        encoded = ast.literal_eval(statement.value)
+        if not isinstance(encoded, str):
+            raise RuntimeError("generated surface payload must be a string")
+        decoded = json.loads(zlib.decompress(base64.b85decode(encoded.encode("ascii"))))
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError("invalid generated surface payload") from exc
+    if not isinstance(decoded, dict):
+        raise RuntimeError("generated surface payload must decode to an object")
+    return decoded
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
@@ -293,9 +325,9 @@ def main() -> int:
             print(f"refusing to remove {len(removed)} rule(s); pass --allow-removals")
             return 1
     existing = args.source.read_text(encoding="utf-8")
-    rewritten = rewrite_source(existing, encode_contract(contract))
     if args.check:
-        return 0 if rewritten == existing else 1
+        return 0 if decode_source_payload(existing) == compact_contract(contract) else 1
+    rewritten = rewrite_source(existing, encode_contract(contract))
     args.source.write_text(rewritten, encoding="utf-8")
     print(args.source)
     return 0

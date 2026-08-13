@@ -301,20 +301,61 @@ def test_surface_payload_cli_generates_then_checks_temporary_source(tmp_path: Pa
 
 
 @pytest.mark.unit
-def test_committed_surface_payload_is_the_canonical_contract_rewrite() -> None:
+def test_surface_payload_check_accepts_equivalent_json_from_alternate_zlib(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    from solwyn._surfaces import payload_fingerprint
+
+    embed = _embed_module()
+    contract = _stamped(surface_contract_data(), payload_fingerprint())
+    canonical_json = json.dumps(
+        embed.compact_contract(contract),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    alternate_encoded = base64.b85encode(zlib.compress(canonical_json, level=1)).decode("ascii")
+    assert alternate_encoded != embed.encode_contract(contract)
+
+    input_path = tmp_path / "surface-classification.json"
+    input_path.write_text(json.dumps(contract), encoding="utf-8")
+    source_path = tmp_path / "_surfaces.py"
+    source = embed.rewrite_source(
+        "before\n# BEGIN GENERATED SURFACE RULE PAYLOAD\nold\n"
+        "# END GENERATED SURFACE RULE PAYLOAD\nafter\n",
+        alternate_encoded,
+    )
+    source_path.write_text(source, encoding="utf-8")
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "embed_surface_rules.py"),
+        "--input",
+        str(input_path),
+        "--source",
+        str(source_path),
+        "--check",
+    ]
+
+    # Act
+    result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, check=False)
+
+    # Assert
+    assert result.returncode == 0, result.stderr
+    assert source_path.read_text(encoding="utf-8") == source
+
+
+@pytest.mark.unit
+def test_committed_surface_payload_decodes_to_the_canonical_compact_contract() -> None:
     # Arrange
     embed = _embed_module()
     source_path = ROOT / "src" / "solwyn" / "_surfaces.py"
     committed_source = source_path.read_text(encoding="utf-8")
 
     # Act
-    canonical_source = embed.rewrite_source(
-        committed_source,
-        embed.encode_contract(surface_contract_data()),
-    )
+    decoded_payload = embed.decode_source_payload(committed_source)
 
     # Assert
-    assert canonical_source == committed_source
+    assert decoded_payload == embed.compact_contract(surface_contract_data())
 
 
 @pytest.mark.unit
