@@ -49,6 +49,30 @@ value from the report under test and immediately pass it to `expect(...)`.
 Changes to audit fields are bidirectional drift and require reviewing the full
 entries before updating the literal.
 
+### Changing a surface rule
+
+Never hand-edit the payload block in `_surfaces.py`. The loop:
+
+1. `uv run python scripts/export_surface_contract.py` — bootstrap the editable
+   JSON (OVERWRITES any existing local edits — export first, edit second).
+2. Edit exact rows in `build/surface_contract/surface-classification.json`.
+   Compat-vs-native splits use wildcard-plus-override selectors: a
+   `provider: null` rule for every openai-dialect provider, plus a
+   higher-specificity `provider: "openai"` rule that wins for native (see the
+   `videos.create` pair). Keep rule ids stable; the id's third segment must
+   equal the rule's kind.
+3. `uv run python scripts/embed_surface_rules.py --input build/surface_contract/surface-classification.json`
+   — validates, prints the rule delta, refuses stale exports (`--allow-stale`)
+   and silent removals (`--allow-removals`).
+4. `make check-surface-contract && make check-provider-surfaces`, then update
+   the per-context digests in `tests/unit/test_surface_context_pins.py` (and
+   `OPENAI_STRICT_FINGERPRINT` + the README fence if the OpenAI graph moved).
+
+Put `uv run python scripts/diff_surface_rules.py origin/main` output in the PR.
+Red canary? See `docs/surface-canary-runbook.md`.
+Release forensics: any installed wheel reproduces its full ledger via
+`python -c "from solwyn._surfaces import surface_contract_data; import json; print(json.dumps(surface_contract_data()))"`.
+
 ## Provider Adapter Notes
 
 - **Anthropic**: `input_tokens` = base + `cache_read_input_tokens` + `cache_creation.ephemeral_5m_input_tokens` + `cache_creation.ephemeral_1h_input_tokens` (additive, base does NOT include cache); aggregate-only `cache_creation_input_tokens` falls back to the 5m bucket

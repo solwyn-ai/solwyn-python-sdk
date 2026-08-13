@@ -28,6 +28,11 @@ expanded JSON source of truth:
        uv run python scripts/export_surface_contract.py --check \
            --reports-dir build/provider_surface_inventory
 
+Step 3 prints the rule-level delta against the installed payload and refuses
+stale exports (``--allow-stale`` to override) and rule removals
+(``--allow-removals``). ``make check-surface-contract`` is now edit-preserving:
+a differing expanded contract FAILS the check and is left on disk untouched.
+
 ``--check`` is verification-only: it exits nonzero when the supplied expanded
 contract would change the Python payload, and never writes or applies edits.
 """

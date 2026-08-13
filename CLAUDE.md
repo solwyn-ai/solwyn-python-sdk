@@ -6,7 +6,8 @@ Drop-in wrapper for `openai`, `anthropic`, `google.generativeai`, and boto3 `bed
 
 ```bash
 make check                                # full quality gate (lint + format + typecheck)
-make test                                 # unit tests (~1.5s)
+make test                                 # unit tests + real-SDK surface canary (needs all provider SDKs + aioboto3)
+make test-unit                            # unit tests only (~2s)
 make test-integration                     # integration tests (needs API at localhost:8080)
 make install                              # install in dev mode
 make install-hooks                        # install pre-commit hook
