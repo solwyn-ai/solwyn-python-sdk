@@ -8,6 +8,7 @@ UntranslatableRequestError -- raised when a cross-provider hop cannot translate 
 UntranslatableModelError -- raised when a model id is not configured for a target provider.
 UnsupportedSurfaceError -- raised when an adapter does not serve a requested media surface.
 UntrackedSpendSurfaceError -- raised when strict posture refuses an untracked capability.
+CoverageMismatchError -- raised when a literal coverage audit pin drifts.
 SolwynTagsClampedWarning -- emitted when merged tags exceed the event cap.
 """
 
@@ -29,6 +30,16 @@ class SolwynError(Exception):
 
 class SolwynTagsClampedWarning(UserWarning):
     """Warns that lower-priority tags were dropped from an event snapshot."""
+
+
+class CoverageMismatchError(SolwynError):
+    """Raised when an attached client's coverage differs from a literal pin."""
+
+    def __init__(self, *, differences: tuple[str, ...]) -> None:
+        if not differences:
+            raise RuntimeError("coverage mismatch requires at least one difference")
+        super().__init__("coverage expectation mismatch: " + "; ".join(differences))
+        self.differences = differences
 
 
 class BudgetExceededError(SolwynError):

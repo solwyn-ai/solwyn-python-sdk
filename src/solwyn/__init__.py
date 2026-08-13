@@ -16,6 +16,15 @@ except PackageNotFoundError:
     __version__ = "0.0.0-dev"
 
 from solwyn._constants import TAG_KEY_MAX_LENGTH, TAG_VALUE_MAX_LENGTH, TAGS_MAX_KEYS
+from solwyn._coverage import (
+    CoverageAuditEntry,
+    CoverageEntry,
+    CoverageExpectation,
+    CoverageFingerprint,
+    CoverageReport,
+    CoverageRuntime,
+    coverage,
+)
 from solwyn._routing import (
     CostPolicy,
     HealthBasedPolicy,
@@ -25,6 +34,7 @@ from solwyn._routing import (
     SelectionPolicy,
 )
 from solwyn._run import RunContext, current_run, current_run_context, run, run_in_executor
+from solwyn._surface_graph import SurfaceInspectionError
 from solwyn._types import CircuitState, FailoverReason, ProviderEntry, ProviderName
 from solwyn.circuit_breaker import CircuitBreakerState
 from solwyn.client import AsyncSolwyn, Solwyn
@@ -32,6 +42,7 @@ from solwyn.config import SolwynConfig
 from solwyn.exceptions import (
     BudgetExceededError,
     ConfigurationError,
+    CoverageMismatchError,
     ProviderUnavailableError,
     RunStoppedError,
     SolwynError,
@@ -47,12 +58,21 @@ __all__ = [
     "Solwyn",
     "AsyncSolwyn",
     "SolwynConfig",
+    "coverage",
+    "CoverageRuntime",
+    "CoverageEntry",
+    "CoverageAuditEntry",
+    "CoverageExpectation",
+    "CoverageFingerprint",
+    "CoverageReport",
+    "SurfaceInspectionError",
     "SolwynError",
     "SolwynTagsClampedWarning",
     "BudgetExceededError",
     "RunStoppedError",
     "ProviderUnavailableError",
     "ConfigurationError",
+    "CoverageMismatchError",
     "UntranslatableRequestError",
     "UntranslatableModelError",
     "UnsupportedSurfaceError",
