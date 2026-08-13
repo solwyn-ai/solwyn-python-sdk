@@ -34,6 +34,8 @@ doing its job.
 - Update the per-context digests in `tests/unit/test_surface_context_pins.py`
   and, if the OpenAI graph moved, `OPENAI_STRICT_FINGERPRINT` +
   the README fence (review the delta first — never paste blind).
+- Run `make check && make check-surface-contract && make check-provider-surfaces`.
+  Continue to the PR checklist only after it passes.
 
 ## 5. PR checklist
 

@@ -12,6 +12,7 @@ permissions:
 
 jobs:
   test:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -39,7 +40,11 @@ jobs:
           persist-credentials: false
       - id: catalog
         run: |
-          matrix=$(jq -c '{include: .include}' tests/provider_surface_intervals.json)
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            matrix=$(jq -c '{include: [.include[] | select(.interval == "latest")]}' tests/provider_surface_intervals.json)
+          else
+            matrix=$(jq -c '{include: .include}' tests/provider_surface_intervals.json)
+          fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   provider-surface-inventory:
