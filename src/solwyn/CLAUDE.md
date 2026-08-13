@@ -64,11 +64,16 @@ Never hand-edit the payload block in `_surfaces.py`. The loop:
 3. `uv run python scripts/embed_surface_rules.py --input build/surface_contract/surface-classification.json`
    — validates, prints the rule delta, refuses stale exports (`--allow-stale`)
    and silent removals (`--allow-removals`).
-4. `make check-surface-contract && make check-provider-surfaces`, then update
-   the per-context digests in `tests/unit/test_surface_context_pins.py` (and
-   `OPENAI_STRICT_FINGERPRINT` + the README fence if the OpenAI graph moved).
+4. Update the per-context digests in
+   `tests/unit/test_surface_context_pins.py` (and
+   `OPENAI_STRICT_FINGERPRINT` + the README fence if the OpenAI graph moved),
+   then run
+   `make check && make test-unit && make check-surface-contract && make check-provider-surfaces`.
+   Continue to the PR output only after this passes.
 
-Put `uv run python scripts/diff_surface_rules.py origin/main` output in the PR.
+Put `uv run python scripts/diff_surface_rules.py <PR-base-ref>` output in the
+PR. Use the branch or ref the PR targets; use `origin/main` only when the PR
+actually targets main.
 Red canary? See `docs/surface-canary-runbook.md`.
 Release forensics: any installed wheel reproduces its full ledger via
 `python -c "from solwyn._surfaces import surface_contract_data; import json; print(json.dumps(surface_contract_data()))"`.

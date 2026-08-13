@@ -39,7 +39,9 @@ doing its job.
 
 ## 5. PR checklist
 
-- Paste `uv run python scripts/diff_surface_rules.py origin/main` output in the PR.
+- Paste `uv run python scripts/diff_surface_rules.py <PR-base-ref>` output in
+  the PR. Use the branch or ref the PR targets; use `origin/main` only when the
+  PR actually targets main.
 - One sentence per new rule saying why its kind is right.
 - Never disable, skip, or `--ignore` the canary to unblock a release; the
   publish workflow already excludes it.
