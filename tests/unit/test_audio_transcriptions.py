@@ -283,8 +283,9 @@ class TestAudioTranscriptionsProxy:
         assert event.token_details is None
         assert event.media_usage is None
         assert event.input_tokens == 0
-        assert len(caplog.records) == 1
-        assert "response_format" in caplog.records[0].getMessage()
+        records = foreground_records(caplog)
+        assert len(records) == 1
+        assert "response_format" in records[0].getMessage()
         _close_sync(solwyn)
 
     def test_transcriptions_getattr_passthrough_uses_default_warn_posture(

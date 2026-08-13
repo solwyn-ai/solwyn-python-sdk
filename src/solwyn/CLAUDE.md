@@ -3,7 +3,10 @@
 ## Module Map
 
 - `client.py` — `Solwyn` (sync) + `AsyncSolwyn` (async) wrappers
-- `_base.py` — shared sans-I/O logic (budget request construction, metadata formatting)
+- `_base.py` — shared sans-I/O logic (budget request construction, metadata formatting, guarded surface resolution and posture enforcement)
+- `_surface_graph.py` — offline, operation-free observer for provider client capability graphs; raises `SurfaceInspectionError` on inaccessible declared namespaces or cycles
+- `_surfaces.py` — sole sans-I/O owner of contextual surface classifications, applicability, shapes, usage basis, and JSON-ready contract data
+- `_coverage.py` — frozen deterministic coverage reports and bidirectional literal expectations; structural metadata only, with no provider operations or network I/O
 - `budget.py` — `BudgetEnforcer` / `AsyncBudgetEnforcer` with cloud API check + local fallback. Settlement lives in the reporter, NOT here: `build_confirm_request` (sans-I/O, keyword-only) constructs the confirm; there is no `confirm_cost`. The `/budgets/check` POST rides the injected control-plane breaker. Run-scoped, token-billed calls meet the LEASE branch first (`_check_lease`): a sticky hard deny keeps the run on the per-call path, otherwise `_lease.admit()` decides and the enforcer performs only the I/O it prescribes — a blocking `POST /budgets/lease` grant on the caller's `budget_check_timeout` when there is no usable lease (one in-flight grant per run; losers take the legacy path rather than storm or wait), an ALWAYS-async renewal (daemon thread / task) at 75% depletion or the refresh deadline, and a best-effort surrender on `close()` and at interpreter exit. Every lease call rides `_control_plane_breaker` exactly like the check, and a REFUSAL (409 cap, 503 lease_unavailable, malformed body) credits the breaker and routes the run to the legacy path — only transport failures are an outage. An authoritative grant/renew denial feeds the UNCHANGED sticky-deny machinery; `BudgetCheckResult.lease_id` is the settlement key that later trues the reservation up — except for a call whose usage was never measurable (`build_confirm_request(usage_unmeasured=True)`, the client's fail-soft synthetic tier), which settles AT its reserved bound so a paid response's spent output allowance is never re-lent past the run's cap. The enforcer also owns the two things the sans-I/O ledger cannot: the §8 uncounted-mode telemetry (`_note_uncounted_admission` — one WARNING on ENTRY to a fail-open uncounted episode, then at most 1/30s while it persists; an installed grant ends the episode, both the cold-start and the expiry-ladder admissions feed it) and the fork identity — `_reset_after_fork_in_child` mints a FRESH `holder_id`, because the client's `_sdk_instance_id` survives a fork and the server releases a same-(project, run, holder) active lease as stale, so a child re-granting under the parent's id would kill the parent's live lease and start a churn
 - `_lease.py` — sans-I/O lease ledger (PJ-2): the §4 outage ladder, atomic reservation math, generation fencing, renewal/backoff bookkeeping. Takes NO locks and does NO I/O — the caller serializes it (the sync enforcer's `_state_lock`, the async enforcer's event loop) and supplies a monotonic `now`
 - `circuit_breaker.py` — local-only circuit breaker state machine. `name` distinguishes health domains in logs (provider breakers vs the shared `"control-plane"` breaker)
@@ -16,6 +19,35 @@
 - `_types.py` — Pydantic models for API request/response contracts
 - `_validation.py` — API key + project ID format validation
 - `providers/` — extraction adapters (OpenAI, OpenAI-compatible, Anthropic, Google, Bedrock); `_translation/` is content-privileged for request/response translation only
+
+## Coverage Contract Ownership
+
+`src/solwyn/_surfaces.py` is the source of truth consumed by runtime guards,
+coverage manifests, drift canaries, and the generated
+`build/surface_contract/surface-classification.json`. That JSON is a short-lived
+CI artifact for diagnosing every rule and applicability decision. It is not
+committed; the Python rules remain authoritative, and cross-SDK consumption
+remains deferred.
+
+Keep namespaces and terminal leaves separate. Acknowledgments are exact,
+applicable terminal tokens only and must never authorize a namespace or use a
+wildcard. Wrapper ownership precedes raw paths, deliberate block precedes
+unsupported, and unsupported precedes untracked posture. OpenAI-compatible
+adapters keep video explicitly unsupported while native OpenAI video remains
+tracked. The token-billed TTS condition is a distinct synthetic rule with token
+`audio.speech.create:gpt-4o-mini-tts`.
+
+`on_unmetered="warn"` is the compatibility default; `raise` is strict mode and
+`allow` is the explicit pass posture. Strict mode guards cooperative public
+pre-call access only. It is not a sandbox for callers that retain the raw
+client, reach private wrapper state, acknowledge a scoped raw escape, or invoke
+native behavior on provider-returned response/page/stream/job/operation
+objects.
+
+Coverage fingerprints must be independently reviewed literals. Never derive a
+value from the report under test and immediately pass it to `expect(...)`.
+Changes to audit fields are bidirectional drift and require reviewing the full
+entries before updating the literal.
 
 ## Provider Adapter Notes
 

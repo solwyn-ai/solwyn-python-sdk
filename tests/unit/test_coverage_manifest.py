@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import functools
 import inspect
+import re
+from pathlib import Path
 from types import SimpleNamespace
 
 import openai
@@ -33,6 +36,8 @@ OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
     conditional="sha256:ce837f71d1fc97849872c5d0f86b0b1f26e1bc4e46a29c3b1b8004bf4b9bcb77",
     safe="sha256:9029368e5fa0a7bf4260cc782560c8ec9a53c948fc280102b1c3633eee5234c5",
 )
+
+_PROJECT_ROOT = Path(__file__).parents[2]
 
 
 class _Completions:
@@ -631,3 +636,235 @@ def test_public_coverage_models_are_frozen() -> None:
 
     with pytest.raises(Exception, match="frozen"):
         report.provider = "changed"
+
+
+def _python_fences(markdown: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"```python\n(.*?)```", markdown, flags=re.DOTALL))
+
+
+def _assigns_name(statement: ast.stmt, name: str) -> bool:
+    if isinstance(statement, ast.Assign):
+        targets = statement.targets
+    elif isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+        targets = [statement.target]
+    else:
+        return False
+    return any(
+        isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == name
+        for target in targets
+        for node in ast.walk(target)
+    )
+
+
+def _expression_method_call(
+    statement: ast.stmt,
+    *,
+    owner: str,
+    method: str,
+) -> ast.Call | None:
+    if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+        return None
+    call = statement.value
+    if (
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == owner
+        and call.func.attr == method
+    ):
+        return call
+    return None
+
+
+def _documented_openai_fingerprint(readme: str) -> CoverageFingerprint:
+    snippet = next(
+        fence
+        for fence in _python_fences(readme)
+        if "OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(" in fence
+    )
+    module = ast.parse(snippet)
+    assert not any(
+        isinstance(node, ast.Attribute) and node.attr == "fingerprint" for node in ast.walk(module)
+    ), "documented strict coverage must not call .fingerprint(); must not access .fingerprint"
+    assignments = tuple(
+        (index, statement)
+        for index, statement in enumerate(module.body)
+        if _assigns_name(statement, "OPENAI_STRICT_FINGERPRINT")
+    )
+    assert len(assignments) == 1, (
+        "documented strict coverage requires exactly one top-level assignment "
+        "to OPENAI_STRICT_FINGERPRINT"
+    )
+    assignment_index, assignment = assignments[0]
+    assert isinstance(assignment, ast.Assign)
+    expect_calls = tuple(
+        (index, call)
+        for index, statement in enumerate(module.body)
+        if (call := _expression_method_call(statement, owner="report", method="expect")) is not None
+    )
+    assert len(expect_calls) == 1, (
+        "documented strict coverage report.expect must be a top-level expression called once"
+    )
+    expectation_index, expectation = expect_calls[0]
+    assert assignment_index < expectation_index, (
+        "documented literal assignment must precede report.expect"
+    )
+    assert (
+        len(expectation.args) == 1
+        and not expectation.keywords
+        and isinstance(expectation.args[0], ast.Name)
+        and expectation.args[0].id == "OPENAI_STRICT_FINGERPRINT"
+    ), "report.expect must pass OPENAI_STRICT_FINGERPRINT directly"
+    assert isinstance(assignment.value, ast.Call)
+    assert isinstance(assignment.value.func, ast.Name)
+    assert assignment.value.func.id == "CoverageFingerprint"
+    assert not assignment.value.args
+    values = {
+        keyword.arg: ast.literal_eval(keyword.value)
+        for keyword in assignment.value.keywords
+        if keyword.arg is not None
+    }
+    return CoverageFingerprint(**values)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("executable_lines", "before_literal", "expected_message"),
+    [
+        (
+            "actual = report.fingerprint()\n"
+            "# report.expect(OPENAI_STRICT_FINGERPRINT)\n"
+            "report.expect(actual)",
+            False,
+            "must not call .fingerprint()",
+        ),
+        (
+            "actual = OPENAI_STRICT_FINGERPRINT\n"
+            "# report.expect(OPENAI_STRICT_FINGERPRINT)\n"
+            "report.expect(actual)",
+            False,
+            "must pass OPENAI_STRICT_FINGERPRINT",
+        ),
+        (
+            "make_fp = report.fingerprint\n"
+            "OPENAI_STRICT_FINGERPRINT = make_fp()\n"
+            "report.expect(OPENAI_STRICT_FINGERPRINT)",
+            False,
+            "must not access .fingerprint",
+        ),
+        (
+            "if False:\n    report.expect(OPENAI_STRICT_FINGERPRINT)",
+            False,
+            "must be a top-level expression",
+        ),
+        (
+            "OPENAI_STRICT_FINGERPRINT = replacement\nreport.expect(OPENAI_STRICT_FINGERPRINT)",
+            False,
+            "exactly one top-level assignment",
+        ),
+        (
+            "report.expect(OPENAI_STRICT_FINGERPRINT)",
+            True,
+            "literal assignment must precede report.expect",
+        ),
+    ],
+)
+def test_documented_fingerprint_rejects_alias_and_comment_bypasses(
+    executable_lines: str,
+    before_literal: bool,
+    expected_message: str,
+) -> None:
+    # Arrange
+    fields = "\n".join(
+        f"    {name}={value!r}," for name, value in OPENAI_STRICT_FINGERPRINT.model_dump().items()
+    )
+    literal_lines = f"OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(\n{fields}\n)"
+    fence_lines = (
+        (executable_lines, literal_lines) if before_literal else (literal_lines, executable_lines)
+    )
+    fence = "\n".join(fence_lines)
+    markdown = f"```python\n{fence}\n```"
+
+    # Act
+    with pytest.raises(AssertionError) as caught:
+        _documented_openai_fingerprint(markdown)
+
+    # Assert
+    assert expected_message in str(caught.value)
+
+
+@pytest.mark.unit
+def test_readme_uses_the_tested_literal_openai_fingerprint_without_self_approval() -> None:
+    # Arrange
+    readme = (_PROJECT_ROOT / "README.md").read_text()
+
+    # Act
+    documented_fingerprint = _documented_openai_fingerprint(readme)
+
+    # Assert
+    assert documented_fingerprint == OPENAI_STRICT_FINGERPRINT
+
+
+@pytest.mark.unit
+def test_readme_states_the_strict_coverage_and_trust_boundary_contract() -> None:
+    # Arrange
+    readme = (_PROJECT_ROOT / "README.md").read_text()
+    required_claims = (
+        '`on_unmetered="warn"` logs once and permits the call',
+        '`on_unmetered="raise"` refuses the call before provider I/O',
+        '`on_unmetered="allow"` permits the call without warning',
+        "`SOLWYN_ON_UNMETERED=raise`",
+        'acknowledge_untracked={"responses.create"}',
+        '`SOLWYN_ACKNOWLEDGE_UNTRACKED="responses.create,audio.speech.create:gpt-4o-mini-tts"`',
+        "Namespace tokens such as `responses` are invalid",
+        "`audio.speech.create:gpt-4o-mini-tts`",
+        "Coverage is computed locally and transmits nothing.",
+        "Strict mode is not a sandbox.",
+        "retaining the raw provider client",
+        "accessing private wrapper state",
+        "acknowledging a scoped raw escape",
+        "response, page, stream, job, or operation object",
+        "Native OpenAI video is tracked",
+        "video on an OpenAI-compatible provider is unsupported",
+    )
+
+    # Act
+    normalized_readme = " ".join(readme.split())
+
+    # Assert
+    for claim in required_claims:
+        assert claim in normalized_readme
+
+
+@pytest.mark.unit
+def test_maintainer_docs_define_python_contract_and_ci_artifact() -> None:
+    # Arrange
+    maintainer_docs = (_PROJECT_ROOT / "src" / "solwyn" / "CLAUDE.md").read_text()
+
+    # Act
+    normalized_docs = " ".join(maintainer_docs.split())
+
+    # Assert
+    assert "build/surface_contract/surface-classification.json" in normalized_docs
+    assert "short-lived CI artifact" in normalized_docs
+    assert "not committed" in normalized_docs
+    assert "cross-SDK consumption remains deferred" in normalized_docs
+
+
+@pytest.mark.unit
+def test_unreleased_changelog_keeps_posture_and_escape_controls_together() -> None:
+    # Arrange
+    changelog = (_PROJECT_ROOT / "CHANGELOG.md").read_text()
+
+    # Act
+    unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+
+    # Assert
+    for contract_name in (
+        "on_unmetered",
+        "SOLWYN_ON_UNMETERED",
+        "acknowledge_untracked",
+        "SOLWYN_ACKNOWLEDGE_UNTRACKED",
+        "UntrackedSpendSurfaceError",
+        "coverage(client)",
+    ):
+        assert contract_name in unreleased
