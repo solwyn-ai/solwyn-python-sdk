@@ -19,6 +19,22 @@ from typing import Any
 
 CONTRACT_VERSION = 1
 
+DIALECT_BY_PROVIDER: dict[str, str] = {
+    "anthropic": "anthropic",
+    "azure_openai": "openai",
+    "bedrock": "bedrock",
+    "google": "google",
+    "openai": "openai",
+    "openai_compatible": "openai",
+    "together": "openai",
+}
+"""Capture-provider identity -> wire dialect, for inventory/export/canary tooling.
+
+The runtime derives dialect from the adapter; this map is for tools that start
+from a provider name. Extend it when adding a provider or framework family —
+``test_provider_touchpoint_registries_agree`` fails if any registry is missed.
+"""
+
 
 class SurfaceKind(StrEnum):
     """The closed set of capability classifications."""

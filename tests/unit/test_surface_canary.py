@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import os
 import warnings
 from dataclasses import replace
@@ -15,8 +16,10 @@ from typing import Any
 import pytest
 import yaml
 
+from solwyn._base import _belongs_to_client_shape, _client_shape
 from solwyn._surface_graph import SurfaceCanaryError, audit_public_surface
 from solwyn._surfaces import (
+    DIALECT_BY_PROVIDER,
     AttributeShape,
     CapabilityScope,
     SurfaceContext,
@@ -44,6 +47,30 @@ TEST_CONTEXT = SurfaceContext(
     client_shape="test_sdk",
     mode="sync",
 )
+
+
+@pytest.mark.unit
+def test_provider_touchpoint_registries_agree() -> None:
+    # Arrange
+    capture = _capture_module()
+    catalog = json.loads(
+        (ROOT / "tests" / "provider_surface_intervals.json").read_text(encoding="utf-8")
+    )
+
+    # Act / Assert
+    assert set(capture._FAMILY_SHAPES) == SUPPORTED_FAMILIES
+    assert {row["family"] for row in catalog["include"]} == set(capture._FAMILY_SHAPES)
+    assert set(DIALECT_BY_PROVIDER) == {spec.provider for spec in capture._SHAPES}
+
+
+@pytest.mark.unit
+def test_unknown_client_shape_fails_loud() -> None:
+    # Arrange
+    client_shape = "new_provider_sdk"
+
+    # Act / Assert
+    with pytest.raises(RuntimeError, match="unrecognized client shape: new_provider_sdk"):
+        _belongs_to_client_shape(object(), client_shape)
 
 
 def _capture_module() -> ModuleType:
@@ -524,15 +551,7 @@ def _require_provider_sdk(shape_key: str) -> object:
 def _context_for_spec(spec: Any) -> SurfaceContext:
     return SurfaceContext(
         provider=spec.provider,
-        dialect={
-            "anthropic": "anthropic",
-            "azure_openai": "openai",
-            "bedrock": "bedrock",
-            "google": "google",
-            "openai": "openai",
-            "openai_compatible": "openai",
-            "together": "openai",
-        }[spec.provider],
+        dialect=DIALECT_BY_PROVIDER[spec.provider],
         client_shape=spec.client_shape,
         mode=spec.mode,
     )
@@ -543,6 +562,8 @@ async def _audit_real_shape(shape_key: str) -> tuple[object, ...]:
     spec = capture._SHAPES_BY_KEY[shape_key]
     with capture._deny_socket_access() as socket_counter:
         async with capture._client_for(spec) as client:
+            context = _context_for_spec(spec)
+            assert _client_shape(client, context.dialect) == spec.client_shape
             service_operations = (
                 capture._bedrock_service_model_operations(client)
                 if spec.client_shape.startswith("bedrock_")
@@ -550,7 +571,7 @@ async def _audit_real_shape(shape_key: str) -> tuple[object, ...]:
             )
             rows = audit_public_surface(
                 client,
-                context=_context_for_spec(spec),
+                context=context,
                 client_family=shape_key,
                 installed_version=version(spec.distribution),
                 service_model_operations=service_operations,

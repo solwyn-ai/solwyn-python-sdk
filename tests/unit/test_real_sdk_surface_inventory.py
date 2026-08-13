@@ -630,6 +630,11 @@ def test_committed_latest_fingerprints_match_the_installed_sdk_set() -> None:
     if not selected:
         pytest.skip("provider SDKs are not installed")
 
+    EXPECTED_LATEST_SHAPES = frozenset(
+        key for key in capture.shape_keys() if not key.startswith("bedrock_")
+    )
+    assert set(selected) == EXPECTED_LATEST_SHAPES, sorted(EXPECTED_LATEST_SHAPES - set(selected))
+
     reports = capture.capture_all(
         structural_interval="latest",
         selected=selected,

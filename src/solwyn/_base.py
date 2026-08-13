@@ -580,7 +580,11 @@ def _validate_surface_context(context: SurfaceContext) -> None:
 
 
 def _belongs_to_client_shape(value: object, client_shape: str) -> bool:
-    """Whether an opaque resource belongs to the detected provider SDK family."""
+    """Whether an opaque resource belongs to the detected provider SDK family.
+
+    Context validation prevents undeclared shapes from constructing; the final
+    error remains defense-in-depth against future vocabulary drift.
+    """
 
     module = getattr(type(value), "__module__", "")
     if client_shape == "openai_sdk":
@@ -597,7 +601,7 @@ def _belongs_to_client_shape(value: object, client_shape: str) -> bool:
         return "botocore" in module and "aiobotocore" not in module
     if client_shape == "bedrock_aioboto3":
         return "aiobotocore" in module
-    return False
+    raise RuntimeError(f"unrecognized client shape: {client_shape}")
 
 
 class _GuardedResource:

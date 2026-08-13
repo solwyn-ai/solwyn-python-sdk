@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from solwyn._surfaces import (
+    DIALECT_BY_PROVIDER,
     SURFACE_RULES,
     AttributeShape,
     SurfaceContext,
@@ -27,15 +28,6 @@ from solwyn._surfaces import (
 DEFAULT_OUTPUT = (
     Path(__file__).parents[1] / "build" / "surface_contract" / "surface-classification.json"
 )
-_DIALECT_BY_PROVIDER = {
-    "anthropic": "anthropic",
-    "azure_openai": "openai",
-    "bedrock": "bedrock",
-    "google": "google",
-    "openai": "openai",
-    "openai_compatible": "openai",
-    "together": "openai",
-}
 
 
 def render_contract() -> str:
@@ -59,7 +51,7 @@ def compare_report_contract(report: dict[str, Any], *, label: str) -> tuple[str,
     provider = str(report["provider"])
     context = SurfaceContext(
         provider=provider,
-        dialect=_DIALECT_BY_PROVIDER[provider],
+        dialect=DIALECT_BY_PROVIDER[provider],
         client_shape=str(report["client_shape"]),
         mode=str(report["mode"]),
     )
@@ -99,7 +91,7 @@ def compare_report_directory(path: Path) -> tuple[str, ...]:
         provider = str(report["provider"])
         context = SurfaceContext(
             provider=provider,
-            dialect=_DIALECT_BY_PROVIDER[provider],
+            dialect=DIALECT_BY_PROVIDER[provider],
             client_shape=str(report["client_shape"]),
             mode=str(report["mode"]),
         )
