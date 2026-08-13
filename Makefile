@@ -54,3 +54,4 @@ export-surface-contract: ## Generate the contextual surface contract artifact un
 
 check-surface-contract: ## Generate and verify the contextual surface contract artifact
 	uv run python scripts/export_surface_contract.py --check
+	uv run python scripts/embed_surface_rules.py --input build/surface_contract/surface-classification.json --check

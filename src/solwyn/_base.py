@@ -16,7 +16,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -29,6 +29,23 @@ from solwyn._routing import (
     SelectionPolicy,
 )
 from solwyn._run import _capture_run_context, _RunContextSnapshot
+from solwyn._surface_graph import (
+    _descriptor_category,
+    _return_shape,
+    _static_attribute,
+    _static_return_shape,
+)
+from solwyn._surfaces import (
+    SURFACE_RULES,
+    AttributeShape,
+    CapabilityScope,
+    SurfaceContext,
+    SurfaceKind,
+    SurfaceRule,
+    SurfaceSource,
+    _validate_surface_path,
+    resolve_surface_rule,
+)
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
     CallStatus,
@@ -40,6 +57,11 @@ from solwyn._types import (
 )
 from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
 from solwyn.config import SolwynConfig
+from solwyn.exceptions import (
+    ConfigurationError,
+    UnsupportedSurfaceError,
+    UntrackedSpendSurfaceError,
+)
 
 if TYPE_CHECKING:
     from solwyn._registry import ProviderRuntime
@@ -66,6 +88,8 @@ _FAILOVER_TUNING_FIELDS = (
     "circuit_breaker_recovery_timeout",
     "circuit_breaker_success_threshold",
 )
+
+_GUARDABLE_RETURN_SHAPES = frozenset({"resource", "context_manager", "async_context_manager"})
 
 
 class FailoverTuning(NamedTuple):
@@ -151,6 +175,7 @@ _UNSHIPPED_SPEND_SURFACES: dict[str, frozenset[str]] = {
 # multi-threaded sync client. Keyed by surface name to honor "one warning per
 # surface per process". Tests reset it via ``_reset_unmetered_spend_warnings``.
 _warned_spend_surfaces: set[str] = set()
+_warned_contextual_surfaces: set[tuple[str, str, str]] = set()
 _spend_surface_warn_lock = threading.Lock()
 
 
@@ -199,6 +224,32 @@ def _reset_unmetered_spend_warnings() -> None:
     """Clear the per-process warn-once latch. Test-support hook only."""
     with _spend_surface_warn_lock:
         _warned_spend_surfaces.clear()
+        _warned_contextual_surfaces.clear()
+
+
+def _warn_contextual_surface_once(
+    *,
+    context: SurfaceContext,
+    rule_id: str,
+    surface: str,
+    capability_scope: str | None,
+) -> None:
+    """Warn once per provider/client-shape/rule identity without content data."""
+
+    warning_key = (context.provider, context.client_shape, rule_id)
+    with _spend_surface_warn_lock:
+        if warning_key in _warned_contextual_surfaces:
+            return
+        _warned_contextual_surfaces.add(warning_key)
+    logger.warning(
+        "Provider '%s' client shape '%s' exposes untracked surface '%s' "
+        "(scope: %s); no budget check and no cost event will be emitted. "
+        "Tracking for this surface is coming.",
+        context.provider,
+        context.client_shape,
+        surface,
+        capability_scope,
+    )
 
 
 def _openai_uses_max_completion_tokens(model: str) -> bool:
@@ -521,6 +572,76 @@ class _AttemptContext(BaseModel):
         return (time.monotonic() - self.start_time) * 1000
 
 
+def _client_shape(client: object, dialect: str) -> str:
+    """Return the provider-independent structural client-shape identity."""
+
+    module = getattr(type(client), "__module__", "")
+    class_name = getattr(type(client), "__name__", "")
+    if dialect == "openai":
+        if (module == "together" or module.startswith("together.")) and class_name in {
+            "Together",
+            "AsyncTogether",
+        }:
+            return "native_together"
+        return "openai_sdk"
+    if dialect == "anthropic":
+        return "anthropic_sdk"
+    if dialect == "google":
+        if "google.generativeai" in module:
+            return "google_generativeai"
+        return "google_genai"
+    if dialect == "bedrock":
+        return "bedrock_aioboto3" if "aiobotocore" in module else "bedrock_boto3"
+    raise RuntimeError(f"unsupported provider dialect for surface context: {dialect}")
+
+
+def _belongs_to_client_shape(value: object, client_shape: str) -> bool:
+    """Whether an opaque resource belongs to the detected provider SDK family."""
+
+    module = getattr(type(value), "__module__", "")
+    if client_shape == "openai_sdk":
+        return "openai" in module
+    if client_shape == "native_together":
+        return module == "together" or module.startswith("together.")
+    if client_shape == "anthropic_sdk":
+        return "anthropic" in module
+    if client_shape == "google_genai":
+        return "google.genai" in module
+    if client_shape == "google_generativeai":
+        return "google.generativeai" in module
+    if client_shape == "bedrock_boto3":
+        return "botocore" in module and "aiobotocore" not in module
+    if client_shape == "bedrock_aioboto3":
+        return "aiobotocore" in module
+    return False
+
+
+class _GuardedResource:
+    """Path-qualified provider namespace that re-enters its owner's resolver."""
+
+    def __init__(self, owner: _SolwynBase, raw: object, path: str) -> None:
+        self._solwyn_owner = owner
+        self._solwyn_raw = raw
+        self._solwyn_path = path
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            return getattr(self._solwyn_raw, name)
+        path = f"{self._solwyn_path}.{name}"
+        return self._solwyn_owner._resolve_public_attribute(
+            self._solwyn_raw,
+            name=name,
+            path=path,
+            source=SurfaceSource.RAW,
+        )
+
+    def __dir__(self) -> list[str]:
+        return sorted(set(dir(self._solwyn_raw)))
+
+    def __repr__(self) -> str:
+        return f"<guarded provider resource {self._solwyn_path!r}>"
+
+
 class _SolwynBase:
     """Shared sans-I/O base class for Solwyn sync and async clients.
 
@@ -535,9 +656,21 @@ class _SolwynBase:
         config: SolwynConfig,
         runtimes: list[ProviderRuntime],
         selection_policy: SelectionPolicy | None = None,
+        *,
+        mode: Literal["sync", "async"] = "sync",
     ) -> None:
         self._config = config
         self._runtimes = runtimes
+        primary = runtimes[0]
+        self._surface_context = SurfaceContext(
+            provider=primary.adapter.name,
+            dialect=primary.adapter.dialect,
+            client_shape=_client_shape(primary.sdk_client, primary.adapter.dialect),
+            mode=mode,
+        )
+        self._guard_lock = threading.Lock()
+        self._guarded_resources: dict[str, _GuardedResource] = {}
+        self._validate_acknowledgments(primary.sdk_client)
         self._requested_failover_tuning = {
             name: getattr(config, name) for name in _FAILOVER_TUNING_FIELDS
         }
@@ -597,6 +730,388 @@ class _SolwynBase:
         # time; the child would inherit them held by a thread it doesn't have.
         register_fork_reset(self)
 
+    def _validate_acknowledgments(self, raw_client: object) -> None:
+        for token in sorted(self._config.acknowledge_untracked):
+            applicable = self._applicable_rules_for_token(token)
+            eligible = [rule for rule in applicable if rule.kind is SurfaceKind.UNMETERED_SPEND]
+            if applicable and not eligible:
+                kinds = ", ".join(sorted({rule.kind.value for rule in applicable}))
+                self._invalid_acknowledgment(token, f"classified as {kinds}")
+            if eligible:
+                if any(rule.source is SurfaceSource.SYNTHETIC_POLICY for rule in eligible):
+                    continue
+                raw_rules = [
+                    rule
+                    for rule in eligible
+                    if rule.source in {SurfaceSource.RAW, SurfaceSource.BOTH}
+                ]
+                if not raw_rules:
+                    continue
+                self._validate_live_acknowledgment(raw_client, token, raw_rules[0])
+                continue
+            if ":" in token:
+                self._invalid_acknowledgment(token, "no applicable conditional rule")
+            self._validate_live_acknowledgment(raw_client, token, None)
+
+    def _applicable_rules_for_token(self, token: str) -> tuple[SurfaceRule, ...]:
+        applicable: list[SurfaceRule] = []
+        for rule in SURFACE_RULES:
+            if rule.token != token:
+                continue
+            sources = (
+                (SurfaceSource.RAW, SurfaceSource.WRAPPER)
+                if rule.source is SurfaceSource.BOTH
+                else (rule.source,)
+            )
+            if any(
+                resolve_surface_rule(
+                    context=self._surface_context,
+                    path=rule.surface,
+                    source=source,
+                    condition=rule.condition,
+                )
+                is rule
+                for source in sources
+            ):
+                applicable.append(rule)
+        return tuple(applicable)
+
+    def _validate_live_acknowledgment(
+        self,
+        raw_client: object,
+        token: str,
+        expected_rule: SurfaceRule | None,
+    ) -> None:
+        try:
+            _validate_surface_path(token)
+        except RuntimeError:
+            self._invalid_acknowledgment(token, "not an exact public dotted path")
+
+        value = raw_client
+        parts = token.split(".")
+        for index, name in enumerate(parts):
+            path = ".".join(parts[: index + 1])
+            static = self._inspect_static_attribute(value, name)
+            if static is None:
+                self._invalid_acknowledgment(token, f"path {path!r} is not statically visible")
+            descriptor_category, static_return_shape = static
+            rule = resolve_surface_rule(
+                context=self._surface_context,
+                path=path,
+                source=SurfaceSource.RAW,
+            )
+            terminal = index == len(parts) - 1
+            if terminal:
+                if expected_rule is not None:
+                    if rule is not expected_rule:
+                        self._invalid_acknowledgment(token, "does not resolve to its exact rule")
+                    if not self._shape_matches_before_evaluation(
+                        expected_rule,
+                        descriptor_category,
+                        static_return_shape,
+                    ):
+                        self._invalid_acknowledgment(token, "does not match its reviewed shape")
+                    if self._shape_is_intentionally_unevaluated(
+                        expected_rule,
+                        descriptor_category,
+                    ):
+                        return
+                    returned = getattr(value, name)
+                    if not expected_rule.accepts_shape(
+                        AttributeShape(descriptor_category, _return_shape(returned))
+                    ):
+                        self._invalid_acknowledgment(
+                            token,
+                            "evaluated attribute does not match its reviewed shape",
+                        )
+                    return
+                returned = getattr(value, name)
+                if self._is_guardable_provider_resource(returned):
+                    self._invalid_acknowledgment(token, "names a resource container")
+                return
+
+            if rule is not None and rule.kind is SurfaceKind.NAMESPACE:
+                if not self._shape_matches_before_evaluation(
+                    rule,
+                    descriptor_category,
+                    static_return_shape,
+                ):
+                    self._invalid_acknowledgment(token, f"namespace {path!r} shape drifted")
+                returned = getattr(value, name)
+                if not rule.accepts_shape(
+                    AttributeShape(descriptor_category, _return_shape(returned))
+                ):
+                    self._invalid_acknowledgment(token, f"namespace {path!r} shape drifted")
+                value = returned
+                continue
+            if rule is not None and rule.kind is SurfaceKind.UNMETERED_SPEND:
+                if not self._shape_matches_before_evaluation(
+                    rule,
+                    descriptor_category,
+                    static_return_shape,
+                ):
+                    self._invalid_acknowledgment(
+                        token,
+                        f"unmetered prefix {path!r} shape drifted",
+                    )
+                returned = getattr(value, name)
+                if not self._shape_is_intentionally_unevaluated(
+                    rule,
+                    descriptor_category,
+                ) and not rule.accepts_shape(
+                    AttributeShape(descriptor_category, _return_shape(returned))
+                ):
+                    self._invalid_acknowledgment(
+                        token,
+                        f"unmetered prefix {path!r} shape drifted",
+                    )
+                if not self._is_guardable_provider_resource(returned):
+                    self._invalid_acknowledgment(
+                        token,
+                        f"unmetered prefix {path!r} is not a guardable provider resource",
+                    )
+                value = returned
+                continue
+            if rule is not None:
+                self._invalid_acknowledgment(token, f"prefix {path!r} is not a namespace")
+            returned = getattr(value, name)
+            if not self._is_guardable_provider_resource(returned):
+                self._invalid_acknowledgment(token, f"unknown prefix {path!r} is not guardable")
+            value = returned
+
+    def _invalid_acknowledgment(self, token: str, reason: str) -> NoReturn:
+        raise ConfigurationError(
+            f"invalid acknowledgment token {token!r}: {reason}",
+            field="acknowledge_untracked",
+        )
+
+    def _inspect_static_attribute(self, value: object, name: str) -> tuple[str, str] | None:
+        try:
+            static_value = _static_attribute(value, name)
+        except AttributeError:
+            return None
+        descriptor_category = _descriptor_category(static_value)
+        return descriptor_category, _static_return_shape(static_value, descriptor_category)
+
+    def _shape_matches_before_evaluation(
+        self,
+        rule: SurfaceRule,
+        descriptor_category: str,
+        static_return_shape: str,
+    ) -> bool:
+        static_shape = AttributeShape(descriptor_category, static_return_shape)
+        if rule.accepts_shape(static_shape):
+            return True
+        return static_return_shape == "unevaluated_descriptor" and any(
+            shape.descriptor_category == descriptor_category for shape in rule.expected_shapes
+        )
+
+    def _shape_is_intentionally_unevaluated(
+        self,
+        rule: SurfaceRule,
+        descriptor_category: str,
+    ) -> bool:
+        matching_shapes = tuple(
+            shape.return_shape
+            for shape in rule.expected_shapes
+            if shape.descriptor_category == descriptor_category
+        )
+        return bool(matching_shapes) and set(matching_shapes) == {"unevaluated_descriptor"}
+
+    def _has_dynamic_attribute_hook(self, value: object) -> bool:
+        return self._inspect_static_attribute(type(value), "__getattr__") is not None
+
+    def _is_guardable_provider_resource(self, value: object) -> bool:
+        return _return_shape(value) in _GUARDABLE_RETURN_SHAPES and _belongs_to_client_shape(
+            value, self._surface_context.client_shape
+        )
+
+    def _guard_resource(self, value: object, path: str) -> _GuardedResource:
+        with self._guard_lock:
+            cached = self._guarded_resources.get(path)
+            if cached is not None:
+                return cached
+            guarded = _GuardedResource(self, value, path)
+            self._guarded_resources[path] = guarded
+            return guarded
+
+    def _has_acknowledged_descendant(self, path: str) -> bool:
+        prefix = f"{path}."
+        return any(token.startswith(prefix) for token in self._config.acknowledge_untracked)
+
+    def _is_exact_raw_response_escape(self, path: str, rule: SurfaceRule) -> bool:
+        return (
+            rule.capability_scope is CapabilityScope.RAW_RESPONSE
+            and rule.token == path
+            and path in self._config.acknowledge_untracked
+        )
+
+    def _apply_untracked_posture(
+        self,
+        path: str,
+        rule: SurfaceRule | None,
+        *,
+        honor_acknowledgment: bool = True,
+    ) -> None:
+        token = rule.token if rule is not None else path
+        if honor_acknowledgment and (
+            token in self._config.acknowledge_untracked or self._has_acknowledged_descendant(path)
+        ):
+            return
+        scope = (
+            rule.capability_scope.value
+            if rule is not None and rule.capability_scope is not None
+            else None
+        )
+        kind = rule.kind.value if rule is not None else SurfaceKind.UNKNOWN.value
+        rule_id = (
+            rule.rule_id
+            if rule is not None
+            else (
+                f"unknown:{self._surface_context.client_shape}:{self._surface_context.mode}:"
+                f"{self._surface_context.provider}:{path}"
+            )
+        )
+        if self._config.on_unmetered == "allow":
+            return
+        if self._config.on_unmetered == "warn":
+            _warn_contextual_surface_once(
+                context=self._surface_context,
+                rule_id=rule_id,
+                surface=path,
+                capability_scope=scope,
+            )
+            return
+        raise UntrackedSpendSurfaceError(
+            surface=path,
+            token=token,
+            provider=self._surface_context.provider,
+            client_shape=self._surface_context.client_shape,
+            kind=kind,
+            capability_scope=scope,
+        )
+
+    def _resolve_unknown_value(self, value: object, path: str) -> Any:
+        if self._is_guardable_provider_resource(value):
+            return self._guard_resource(value, path)
+        if self._has_acknowledged_descendant(path):
+            raise RuntimeError(f"acknowledged descendant has unguardable prefix: {path}")
+        return value
+
+    def _resolve_public_attribute(
+        self,
+        value: object,
+        *,
+        name: str,
+        path: str,
+        source: SurfaceSource,
+    ) -> Any:
+        """Resolve one public provider attribute before evaluating its descriptor."""
+
+        if name.startswith("_"):
+            return getattr(value, name)
+        with self._guard_lock:
+            cached = self._guarded_resources.get(path)
+        if cached is not None:
+            return cached
+
+        rule = resolve_surface_rule(
+            context=self._surface_context,
+            path=path,
+            source=source,
+        )
+        static = self._inspect_static_attribute(value, name)
+        if static is None:
+            try:
+                visible = name in dir(value)
+            except Exception:
+                visible = False
+            if rule is not None and not visible and not self._has_dynamic_attribute_hook(value):
+                return getattr(value, name)
+            if rule is not None and rule.kind is SurfaceKind.BLOCKED:
+                raise ConfigurationError(rule.reason or "blocked surface", field=path)
+            if rule is not None and rule.kind is SurfaceKind.UNSUPPORTED:
+                raise UnsupportedSurfaceError(
+                    surface=path,
+                    provider=self._surface_context.provider,
+                )
+            if rule is not None and rule.kind is SurfaceKind.METERED:
+                raise RuntimeError(f"metered surface reached generic resolver: {path}")
+            effective_rule = (
+                rule if rule is not None and rule.kind is SurfaceKind.UNMETERED_SPEND else None
+            )
+            if self._has_dynamic_attribute_hook(value):
+                effective_rule = None
+            self._apply_untracked_posture(path, effective_rule)
+            return self._resolve_unknown_value(getattr(value, name), path)
+
+        descriptor_category, static_return_shape = static
+        if rule is None:
+            self._apply_untracked_posture(path, None)
+            return self._resolve_unknown_value(getattr(value, name), path)
+        if rule.kind is SurfaceKind.BLOCKED:
+            raise ConfigurationError(rule.reason or "blocked surface", field=path)
+        if rule.kind is SurfaceKind.UNSUPPORTED:
+            raise UnsupportedSurfaceError(
+                surface=path,
+                provider=self._surface_context.provider,
+            )
+        if rule.kind is SurfaceKind.METERED:
+            raise RuntimeError(f"metered surface reached generic resolver: {path}")
+        if rule.kind is SurfaceKind.UNMETERED_SPEND:
+            if not self._shape_matches_before_evaluation(
+                rule,
+                descriptor_category,
+                static_return_shape,
+            ):
+                self._apply_untracked_posture(
+                    path,
+                    None,
+                    honor_acknowledgment=False,
+                )
+                return self._resolve_unknown_value(getattr(value, name), path)
+            self._apply_untracked_posture(path, rule)
+            returned = getattr(value, name)
+            if self._shape_is_intentionally_unevaluated(rule, descriptor_category):
+                return self._resolve_unknown_value(returned, path)
+            if not rule.accepts_shape(AttributeShape(descriptor_category, _return_shape(returned))):
+                self._apply_untracked_posture(
+                    path,
+                    None,
+                    honor_acknowledgment=False,
+                )
+                return self._resolve_unknown_value(returned, path)
+            if self._is_exact_raw_response_escape(path, rule):
+                return returned
+            return self._resolve_unknown_value(returned, path)
+        if rule.kind in {SurfaceKind.METADATA, SurfaceKind.INFRASTRUCTURE}:
+            if not self._shape_matches_before_evaluation(
+                rule,
+                descriptor_category,
+                static_return_shape,
+            ):
+                self._apply_untracked_posture(path, None)
+                return self._resolve_unknown_value(getattr(value, name), path)
+            returned = getattr(value, name)
+            if not rule.accepts_shape(AttributeShape(descriptor_category, _return_shape(returned))):
+                self._apply_untracked_posture(path, None)
+                return self._resolve_unknown_value(returned, path)
+            return returned
+        if rule.kind is SurfaceKind.NAMESPACE:
+            if not self._shape_matches_before_evaluation(
+                rule,
+                descriptor_category,
+                static_return_shape,
+            ):
+                self._apply_untracked_posture(path, None)
+                return self._resolve_unknown_value(getattr(value, name), path)
+            returned = getattr(value, name)
+            if not rule.accepts_shape(AttributeShape(descriptor_category, _return_shape(returned))):
+                self._apply_untracked_posture(path, None)
+                return self._resolve_unknown_value(returned, path)
+            return self._guard_resource(returned, path)
+        raise RuntimeError(f"unsupported surface kind in runtime resolver: {rule.kind.value}")
+
     def _reset_after_fork_in_child(self) -> None:
         """Replace this client's locks in a forked child.
 
@@ -607,6 +1122,7 @@ class _SolwynBase:
         """
         self._signal_lock = threading.Lock()
         self._breaker_lock = threading.Lock()
+        self._guard_lock = threading.Lock()
 
     def _new_circuit_breaker(self) -> CircuitBreaker:
         """Create a circuit breaker from the configured tuning + jitter."""

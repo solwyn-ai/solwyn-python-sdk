@@ -36,6 +36,14 @@ def test_unsupported_surface_error_is_publicly_exported() -> None:
 
 
 @pytest.mark.unit
+def test_untracked_spend_surface_error_is_publicly_exported() -> None:
+    assert "UntrackedSpendSurfaceError" in solwyn.__all__
+    assert solwyn.UntrackedSpendSurfaceError is exceptions.UntrackedSpendSurfaceError
+    assert issubclass(solwyn.UntrackedSpendSurfaceError, solwyn.SolwynError)
+    assert issubclass(solwyn.UntrackedSpendSurfaceError, AttributeError)
+
+
+@pytest.mark.unit
 def test_run_stopped_error_is_publicly_exported() -> None:
     assert "RunStoppedError" in solwyn.__all__
     assert solwyn.RunStoppedError is exceptions.RunStoppedError

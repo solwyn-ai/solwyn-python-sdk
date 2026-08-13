@@ -313,6 +313,8 @@ def _provider_resource(value: object) -> bool:
     class_name = type(value).__name__
     if module.startswith("google.genai."):
         return True
+    if module == "openai.lib._realtime":
+        return class_name in {"_Calls", "_AsyncCalls"}
     if module.startswith(("openai.", "anthropic.", "together.")):
         return (
             ".resources." in module
@@ -348,6 +350,14 @@ def _discover_namespaces(
                 raise SurfaceInspectionError(
                     path, "namespace_discovery", type(exc).__name__
                 ) from None
+            if (
+                not isinstance(static_value, property)
+                and type(static_value).__name__ != "cached_property"
+            ):
+                try:
+                    static_value = inspect.getattr_static(type(value), name)
+                except AttributeError:
+                    continue
             if (
                 not isinstance(static_value, (property,))
                 and type(static_value).__name__ != "cached_property"

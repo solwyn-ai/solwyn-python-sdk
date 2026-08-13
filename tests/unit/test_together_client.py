@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -52,7 +52,10 @@ def _reset_spend_surface_latch() -> None:
     _reset_unmetered_spend_warnings()
 
 
-class _YieldingSet(set[str]):
+_T = TypeVar("_T")
+
+
+class _YieldingSet(set[_T]):
     """Yield after an absent membership check to expose check/insert races."""
 
     def __contains__(self, item: object) -> bool:
@@ -252,13 +255,11 @@ def test_sync_unmetered_surface_warns_and_passes_through(caplog: pytest.LogCaptu
 
 
 @pytest.mark.unit
-def test_sync_curated_silent_surfaces_pass_through_without_warning(
+def test_sync_curated_shape_drift_warns_under_the_compatibility_posture(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # batches and fine_tuning (truly-unrelated resources) were dropped from
-    # Together's warn set: they pass through SILENTLY. embeddings, images, and
-    # audio are intercepted -> they return the media proxy, not the raw
-    # attribute, and are silent too.
+    # The bare object() stand-ins do not match the real SDK's reviewed
+    # cached-property/resource shape, so they re-enter the default warn posture.
     client = FakeTogetherClient(_completion_response())
     for surface in SILENT_SURFACES:
         setattr(client, surface, object())
@@ -279,7 +280,7 @@ def test_sync_curated_silent_surfaces_pass_through_without_warning(
         assert solwyn.audio is not client.audio
         assert solwyn.videos is not client.videos
 
-    assert foreground_records(caplog) == []
+    assert {record.args[2] for record in foreground_records(caplog)} == SILENT_SURFACES
     solwyn.close()
 
 
@@ -369,7 +370,11 @@ def test_sync_concurrent_unmetered_surface_access_warns_exactly_once(
     # Swap the module-level latch for one that yields on an absent membership
     # check, exposing any check-then-insert race; the surrounding lock must still
     # serialize so exactly one thread warns. monkeypatch restores the original.
-    monkeypatch.setattr(_base, "_warned_spend_surfaces", _YieldingSet())
+    monkeypatch.setattr(
+        _base,
+        "_warned_contextual_surfaces",
+        _YieldingSet[tuple[str, str, str]](),
+    )
     start = threading.Barrier(worker_count)
 
     def access_surface(_: int) -> object:
@@ -384,7 +389,12 @@ def test_sync_concurrent_unmetered_surface_access_warns_exactly_once(
 
     assert all(result is resource for result in results)
     assert len(caplog.records) == 1
-    assert "surface 'rerank'" in caplog.records[0].getMessage()
+    assert caplog.records[0].args == (
+        "together",
+        "native_together",
+        "rerank",
+        None,
+    )
     solwyn.close()
 
 
@@ -433,11 +443,10 @@ def test_unmetered_surface_warning_latch_is_per_process(
 
 
 @pytest.mark.unit
-def test_unrelated_surface_passes_through_silently(
+def test_unrelated_surface_uses_the_default_warn_posture(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # A surface that is neither in the central openai map nor any adapter's
-    # declared set (moderations) passes through with no warning.
+    # Compatibility mode keeps the pass-through but makes the bypass visible.
     OpenAI = type("OpenAI", (), {"__module__": "openai._client"})
     client = OpenAI()
     resource = object()
@@ -447,7 +456,9 @@ def test_unrelated_surface_passes_through_silently(
     with caplog.at_level(logging.WARNING, logger="solwyn._base"):
         assert solwyn.moderations is resource
 
-    assert foreground_records(caplog) == []
+    records = foreground_records(caplog)
+    assert len(records) == 1
+    assert records[0].args[2] == "moderations"
     solwyn.close()
 
 

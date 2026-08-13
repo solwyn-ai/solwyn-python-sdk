@@ -813,12 +813,13 @@ class TestUnshippedSpendSurfacePosture:
         self._close(first)
         self._close(second)
 
-    def test_intercepted_and_unrelated_surfaces_are_silent(
+    def test_intercepted_surfaces_are_silent_and_drifted_fake_resources_warn(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
         # embeddings, images, audio, and videos are intercepted -> they return the
         # media proxy, NOT the raw client attribute; moderations/files are
-        # truly-unrelated resources that pass through. None of them warn.
+        # provider resources. This test's bare object() stand-ins deliberately
+        # fail their reviewed cached-property/resource shape and therefore warn.
         client, _ = _mock_openai_client()
         for surface in ("embeddings", "images", "audio", "videos", "moderations", "files"):
             setattr(client, surface, object())
@@ -832,11 +833,14 @@ class TestUnshippedSpendSurfacePosture:
             assert solwyn.images is not client.images
             assert solwyn.audio is not client.audio
             assert solwyn.videos is not client.videos
-            # unrelated resources still pass through untouched.
+            # Shape-drifted stand-ins pass through under the default warn posture.
             for surface in ("moderations", "files"):
                 assert getattr(solwyn, surface) is getattr(client, surface)
 
-        assert foreground_records(caplog) == []
+        assert {record.args[2] for record in foreground_records(caplog)} == {
+            "moderations",
+            "files",
+        }
         self._close(solwyn)
 
     def test_warning_message_carries_no_request_content(

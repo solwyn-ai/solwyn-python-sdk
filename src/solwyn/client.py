@@ -25,8 +25,8 @@ import functools
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
-from typing import Any, NamedTuple, cast
+from collections.abc import AsyncIterator, Callable, Collection, Iterator, Mapping
+from typing import Any, Literal, NamedTuple, cast
 
 import httpx
 from pydantic import ValidationError
@@ -37,7 +37,6 @@ from solwyn._base import (
     _effective_output_bound,
     _normalized_openai_output_cap_layer,
     _SolwynBase,
-    _warn_unmetered_spend_surface_once,
 )
 from solwyn._privacy import estimate_content_length, estimate_tokens_from_length
 from solwyn._proxies import (
@@ -60,6 +59,7 @@ from solwyn._proxies import (
 from solwyn._registry import ProviderRuntime, build_runtimes
 from solwyn._routing import RoutingRequest, SelectionPolicy
 from solwyn._run import _capture_run_context, _RunContextSnapshot
+from solwyn._surfaces import SurfaceSource
 from solwyn._token_details import TokenDetails
 from solwyn._types import CallStatus, FailoverReason, ProviderName
 from solwyn.budget import (
@@ -762,6 +762,8 @@ class Solwyn(_SolwynBase):
         fallback: object = None,
         default_params: dict[str, Any] | None = None,
         tags: Mapping[str, str] | None = None,
+        on_unmetered: Literal["warn", "raise", "allow"] | None = None,
+        acknowledge_untracked: Collection[str] | None = None,
         selection_policy: SelectionPolicy | None = None,
         **config_kwargs: object,
     ) -> None:
@@ -798,6 +800,10 @@ class Solwyn(_SolwynBase):
         }
         if api_key is not None:
             cfg_kwargs["api_key"] = api_key
+        if on_unmetered is not None:
+            cfg_kwargs["on_unmetered"] = on_unmetered
+        if acknowledge_untracked is not None:
+            cfg_kwargs["acknowledge_untracked"] = acknowledge_untracked
         try:
             config = SolwynConfig(**cfg_kwargs)
         except ValidationError as exc:
@@ -806,7 +812,7 @@ class Solwyn(_SolwynBase):
                 first["msg"] if first else str(exc),
                 field=str(first["loc"][-1]) if first else None,
             ) from exc
-        super().__init__(config, runtimes, selection_policy=selection_policy)
+        super().__init__(config, runtimes, selection_policy=selection_policy, mode="sync")
 
         # Budget enforcer
         self._budget = BudgetEnforcer(
@@ -1833,12 +1839,13 @@ class Solwyn(_SolwynBase):
         self.close()
 
     def __getattr__(self, name: str) -> Any:
-        """Pass through non-intercepted attributes to the underlying client."""
-        attribute = getattr(self._client, name)
-        _warn_unmetered_spend_surface_once(
-            adapter=self._adapter, dialect=self._dialect, surface=name
+        """Resolve public pass-throughs through the contextual capability guard."""
+        return self._resolve_public_attribute(
+            self._client,
+            name=name,
+            path=name,
+            source=SurfaceSource.RAW,
         )
-        return attribute
 
 
 # ---------------------------------------------------------------------------
@@ -1876,6 +1883,8 @@ class AsyncSolwyn(_SolwynBase):
         fallback: object = None,
         default_params: dict[str, Any] | None = None,
         tags: Mapping[str, str] | None = None,
+        on_unmetered: Literal["warn", "raise", "allow"] | None = None,
+        acknowledge_untracked: Collection[str] | None = None,
         selection_policy: SelectionPolicy | None = None,
         **config_kwargs: object,
     ) -> None:
@@ -1906,6 +1915,10 @@ class AsyncSolwyn(_SolwynBase):
         }
         if api_key is not None:
             cfg_kwargs["api_key"] = api_key
+        if on_unmetered is not None:
+            cfg_kwargs["on_unmetered"] = on_unmetered
+        if acknowledge_untracked is not None:
+            cfg_kwargs["acknowledge_untracked"] = acknowledge_untracked
         try:
             config = SolwynConfig(**cfg_kwargs)
         except ValidationError as exc:
@@ -1914,7 +1927,7 @@ class AsyncSolwyn(_SolwynBase):
                 first["msg"] if first else str(exc),
                 field=str(first["loc"][-1]) if first else None,
             ) from exc
-        super().__init__(config, runtimes, selection_policy=selection_policy)
+        super().__init__(config, runtimes, selection_policy=selection_policy, mode="async")
 
         self._budget = AsyncBudgetEnforcer(
             api_url=config.api_url,
@@ -2876,9 +2889,10 @@ class AsyncSolwyn(_SolwynBase):
         await self.close()
 
     def __getattr__(self, name: str) -> Any:
-        """Pass through non-intercepted attributes to the underlying client."""
-        attribute = getattr(self._client, name)
-        _warn_unmetered_spend_surface_once(
-            adapter=self._adapter, dialect=self._dialect, surface=name
+        """Resolve public pass-throughs through the contextual capability guard."""
+        return self._resolve_public_attribute(
+            self._client,
+            name=name,
+            path=name,
+            source=SurfaceSource.RAW,
         )
-        return attribute

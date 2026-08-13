@@ -37,6 +37,7 @@ from solwyn.exceptions import (
     SolwynError,
     SolwynTagsClampedWarning,
     UnsupportedSurfaceError,
+    UntrackedSpendSurfaceError,
     UntranslatableModelError,
     UntranslatableRequestError,
 )
@@ -55,6 +56,7 @@ __all__ = [
     "UntranslatableRequestError",
     "UntranslatableModelError",
     "UnsupportedSurfaceError",
+    "UntrackedSpendSurfaceError",
     "ProviderEntry",
     "ProviderName",
     "FailoverReason",

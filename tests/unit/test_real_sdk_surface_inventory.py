@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import socket
+from functools import cached_property
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -456,6 +457,43 @@ def test_namespace_discovery_allows_a_terminal_at_max_depth() -> None:
 
 
 @pytest.mark.unit
+def test_namespace_discovery_preserves_cached_property_after_instance_cache_fill() -> None:
+    # Arrange
+    capture = _capture_module()
+
+    class ProviderResource:
+        __module__ = "openai.resources.synthetic"
+
+    class Root:
+        @cached_property
+        def child(self) -> ProviderResource:
+            return ProviderResource()
+
+    root = Root()
+    cached_child = root.child
+
+    # Act
+    namespaces = capture._discover_namespaces(root)
+
+    # Assert
+    assert root.child is cached_child
+    assert namespaces == ("child",)
+
+
+@pytest.mark.unit
+def test_openai_realtime_calls_is_a_provider_resource() -> None:
+    # Arrange
+    capture = _capture_module()
+    RealtimeCalls = type("_Calls", (), {"__module__": "openai.lib._realtime"})
+
+    # Act
+    is_provider_resource = capture._provider_resource(RealtimeCalls())
+
+    # Assert
+    assert is_provider_resource is True
+
+
+@pytest.mark.unit
 def test_offline_guard_denies_an_attempted_socket_connection() -> None:
     capture = _capture_module()
 
@@ -514,11 +552,21 @@ def test_real_sdk_inventory_is_offline_deterministic_and_content_free(
                 "videos.create_and_poll",
                 "post",
                 "with_options",
+                "realtime.calls.create",
+                "realtime.calls.with_raw_response.reject",
+                "realtime.calls.with_streaming_response.accept",
             },
         ),
         (
             "anthropic_sync",
-            {"messages.stream", "messages.parse", "messages.batches.create"},
+            {
+                "messages.stream",
+                "messages.parse",
+                "messages.batches.create",
+                "beta.environments.work.ack",
+                "beta.environments.work.with_raw_response.update",
+                "beta.environments.work.with_streaming_response.poll",
+            },
         ),
         (
             "together_native_sync",

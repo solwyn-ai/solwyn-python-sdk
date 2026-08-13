@@ -7,6 +7,7 @@ Configuration via constructor kwargs or environment variables with the
 from __future__ import annotations
 
 import os
+from collections.abc import Collection
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -23,6 +24,10 @@ _ENV_PREFIX = "SOLWYN_"
 
 class _EnvTags(str):
     """Tag string originating from ``SOLWYN_TAGS``."""
+
+
+class _EnvAcknowledgments(str):
+    """Exact-token string originating from ``SOLWYN_ACKNOWLEDGE_UNTRACKED``."""
 
 
 class SolwynConfig(BaseModel):
@@ -46,6 +51,13 @@ class SolwynConfig(BaseModel):
     # Global fill-absent defaults (per-entry default_params wins).
     default_params: dict[str, Any] = Field(default_factory=dict)
     tags: dict[str, str] | None = None
+
+    # Compatibility-default handling for provider capabilities that bypass
+    # Solwyn interception. Acknowledgments are exact terminal tokens only;
+    # graph-aware applicability validation happens in _SolwynBase once the
+    # caller's concrete provider client is available.
+    on_unmetered: Literal["warn", "raise", "allow"] = "warn"
+    acknowledge_untracked: frozenset[str] = Field(default_factory=frozenset)
 
     # Failover knobs
     failover_total_timeout: float = 30.0
@@ -136,6 +148,8 @@ class SolwynConfig(BaseModel):
             "api_key": "API_KEY",
             "api_url": "API_URL",
             "tags": "TAGS",
+            "on_unmetered": "ON_UNMETERED",
+            "acknowledge_untracked": "ACKNOWLEDGE_UNTRACKED",
             "fail_open": "FAIL_OPEN",
             "budget_mode": "BUDGET_MODE",
             "circuit_breaker_failure_threshold": "CIRCUIT_BREAKER_FAILURE_THRESHOLD",
@@ -166,6 +180,8 @@ class SolwynConfig(BaseModel):
                     # Coerce boolean-looking strings
                     if field == "tags":
                         values[field] = _EnvTags(env_val)
+                    elif field == "acknowledge_untracked":
+                        values[field] = _EnvAcknowledgments(env_val)
                     elif field in {"fail_open", "breaker_reporting_enabled", "lease_enabled"}:
                         values[field] = env_val.lower() in ("true", "1", "yes")
                     else:
@@ -185,6 +201,27 @@ class SolwynConfig(BaseModel):
             return _copy_tags(value, parameter="tags")
         except TypeError as exc:
             raise ValueError(str(exc)) from exc
+
+    @field_validator("acknowledge_untracked", mode="before")
+    @classmethod
+    def _validate_acknowledgment_tokens(cls, value: object) -> frozenset[str]:
+        if isinstance(value, _EnvAcknowledgments):
+            if not value.strip():
+                return frozenset()
+            env_tokens = tuple(part.strip() for part in value.split(","))
+            if any(not token for token in env_tokens):
+                raise ValueError("SOLWYN_ACKNOWLEDGE_UNTRACKED must not contain empty elements")
+            return frozenset(env_tokens)
+        if isinstance(value, (str, bytes)):
+            raise ValueError("acknowledge_untracked must be a collection of exact tokens")
+        if not isinstance(value, Collection):
+            raise ValueError("acknowledge_untracked must be a collection of exact tokens") from None
+        tokens: set[str] = set()
+        for token in value:
+            if not isinstance(token, str) or not token:
+                raise ValueError("acknowledge_untracked tokens must be non-empty strings")
+            tokens.add(token)
+        return frozenset(tokens)
 
     @model_validator(mode="after")
     def _validate_credentials(self) -> SolwynConfig:
