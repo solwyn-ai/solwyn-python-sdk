@@ -803,13 +803,16 @@ def test_check_bootstraps_then_fails_closed_on_empty_reports(tmp_path: Path) -> 
 
 @pytest.mark.unit
 def test_check_preserves_and_rejects_a_differing_expanded_contract(tmp_path: Path) -> None:
+    # Arrange
     exporter = _export_module()
     output = tmp_path / "surface-classification.json"
     edited = exporter.render_contract().replace("{", "{\n ", 1)
     output.write_text(edited, encoding="utf-8")
 
+    # Act
     mismatches = exporter.generate_and_check(output)
 
+    # Assert
     assert output.read_text(encoding="utf-8") == edited
     assert len(mismatches) == 1
     assert "differs from the embedded payload" in mismatches[0]
@@ -817,10 +820,13 @@ def test_check_preserves_and_rejects_a_differing_expanded_contract(tmp_path: Pat
 
 @pytest.mark.unit
 def test_check_bootstraps_a_missing_expanded_contract(tmp_path: Path) -> None:
+    # Arrange
     exporter = _export_module()
     output = tmp_path / "nested" / "surface-classification.json"
 
+    # Act
     mismatches = exporter.generate_and_check(output)
 
+    # Assert
     assert mismatches == ()
     assert output.read_text(encoding="utf-8") == exporter.render_contract()
