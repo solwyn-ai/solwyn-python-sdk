@@ -11,9 +11,9 @@ import hashlib
 import json
 import re
 from collections.abc import Collection
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from solwyn._base import _client_shape, _SolwynBase
 from solwyn._surface_graph import (
@@ -25,6 +25,7 @@ from solwyn._surface_graph import (
 from solwyn._surfaces import (
     SURFACE_RULES,
     AttributeShape,
+    CapabilityScope,
     SurfaceCondition,
     SurfaceContext,
     SurfaceKind,
@@ -121,6 +122,25 @@ class CoverageExpectation(BaseModel):
     unsupported: tuple[CoverageAuditEntry, ...] = Field(...)
     conditional: tuple[CoverageAuditEntry, ...] = Field(...)
     safe: tuple[CoverageAuditEntry, ...] = Field(...)
+
+    @model_validator(mode="after")
+    def _validate_unique_rule_ids(self) -> Self:
+        categories_by_rule_id: dict[str, str] = {}
+        for category in _AUDIT_CATEGORIES:
+            category_rule_ids: set[str] = set()
+            for row in getattr(self, category):
+                if row.rule_id in category_rule_ids:
+                    raise ValueError(f"duplicate rule_id {row.rule_id!r} in {category}")
+                category_rule_ids.add(row.rule_id)
+
+                previous_category = categories_by_rule_id.get(row.rule_id)
+                if previous_category is not None:
+                    raise ValueError(
+                        f"rule_id {row.rule_id!r} appears in multiple categories: "
+                        f"{previous_category}, {category}"
+                    )
+                categories_by_rule_id[row.rule_id] = category
+        return self
 
 
 class CoverageFingerprint(BaseModel):
@@ -305,11 +325,7 @@ def _entry_for_observation(
         client=client,
         expected_shape=expected_shape,
         observed_shape=observed_shape,
-        capability_scope=(
-            rule.capability_scope.value
-            if rule is not None and rule.capability_scope is not None
-            else None
-        ),
+        capability_scope=(rule.capability_scope if rule is not None else None),
     )
 
 
@@ -335,6 +351,7 @@ def _coverage_entry(
         token=rule.token,
         surface=rule.surface,
         return_shape=observed_shape.return_shape,
+        capability_scope=rule.capability_scope,
         client=client,
     )
     return CoverageEntry(
@@ -366,7 +383,7 @@ def _unknown_entry(
     client: _SolwynBase,
     expected_shape: AttributeShape | None,
     observed_shape: AttributeShape,
-    capability_scope: str | None,
+    capability_scope: CapabilityScope | None,
 ) -> CoverageEntry:
     context = client._surface_context
     policy_action, dispatch_action = _effective_actions(
@@ -374,6 +391,7 @@ def _unknown_entry(
         token=surface,
         surface=surface,
         return_shape=observed_shape.return_shape,
+        capability_scope=capability_scope,
         client=client,
     )
     return CoverageEntry(
@@ -385,7 +403,7 @@ def _unknown_entry(
         dispatch_action=dispatch_action,
         usage_basis=None,
         source=SurfaceSource.RAW.value,
-        capability_scope=capability_scope,
+        capability_scope=(capability_scope.value if capability_scope is not None else None),
         condition=None,
         reason=None,
         expected_descriptor_category=(
@@ -403,6 +421,7 @@ def _effective_actions(
     token: str,
     surface: str,
     return_shape: str,
+    capability_scope: CapabilityScope | None,
     client: _SolwynBase,
 ) -> tuple[str, str]:
     if kind is SurfaceKind.METERED:
@@ -426,6 +445,13 @@ def _effective_actions(
         policy_action = client._config.on_unmetered
     if policy_action == "raise":
         return policy_action, "refuse"
+    if (
+        kind is SurfaceKind.UNMETERED_SPEND
+        and capability_scope is CapabilityScope.RAW_RESPONSE
+        and token == surface
+        and surface in acknowledgments
+    ):
+        return policy_action, "return"
     if return_shape in _GUARDABLE_RETURN_SHAPES:
         return policy_action, "guard"
     return policy_action, "return"

@@ -23,11 +23,11 @@ from solwyn._base import _SolwynBase
 from solwyn._surfaces import SurfaceContext
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
-    guarded_namespaces="sha256:f8cd6c254dc5fb2076d33aeff6d9e96cd12b3d63cc89850ba86f0d7b5ed62818",
+    guarded_namespaces="sha256:770ba77e018f38c9b64af1d43770dfd6d79f3c1d1c9f5ac5253cfa3000d2b743",
     tracked="sha256:ee52e554ddf531bea4560f69fdbef1ca0ac90e433fb9f93fba6e291d39e2aebc",
-    untracked="sha256:989f425b3fd2f431f691fc83fda676879ef3cda89aafa123d1943af957ce7700",
+    untracked="sha256:8f7d1bc744e022db61ec44c7e2ebfadcf3599ea225a021050ff3022620ecfd3c",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    scoped_escapes="sha256:3d8b7cfcf068bbf907c9e257e5c596844bec9a52b5414898835715f4a7dd406c",
+    scoped_escapes="sha256:6808a0f2ac290c9d4d1504b21b1c0ba98267636ced4234416b53533b29bb4073",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     unsupported="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     conditional="sha256:ce837f71d1fc97849872c5d0f86b0b1f26e1bc4e46a29c3b1b8004bf4b9bcb77",
@@ -194,6 +194,43 @@ def test_allowed_unknown_shapes_return_or_guard_and_acknowledgments_are_sorted()
     assert entries[("novel_resource", None)].dispatch_action == "guard"
     assert entries[("post", None)].policy_action == "acknowledged"
     assert entries[("post", None)].dispatch_action == "return"
+
+
+@pytest.mark.unit
+def test_raw_response_acknowledgment_reports_exact_escape_but_guards_descendant() -> None:
+    class RawResponseResource:
+        pass
+
+    class RawResponseClient:
+        @functools.cached_property
+        def with_raw_response(self) -> RawResponseResource:
+            return RawResponseResource()
+
+    RawResponseClient.__module__ = "openai._client"
+
+    exact = _by_identity(
+        solwyn.coverage(
+            _wrapper(
+                RawResponseClient(),
+                acknowledgments=frozenset({"with_raw_response"}),
+            )
+        )
+    )[("with_raw_response", None)]
+    descendant = _by_identity(
+        solwyn.coverage(
+            _wrapper(
+                RawResponseClient(),
+                acknowledgments=frozenset({"with_raw_response.responses.create"}),
+            )
+        )
+    )[("with_raw_response", None)]
+
+    assert exact.capability_scope == "raw_response"
+    assert (exact.policy_action, exact.dispatch_action) == ("acknowledged", "return")
+    assert (descendant.policy_action, descendant.dispatch_action) == (
+        "acknowledged",
+        "guard",
+    )
 
 
 @pytest.mark.unit
@@ -449,6 +486,48 @@ def _report_for_expectation(entry: CoverageAuditEntry) -> CoverageReport:
         acknowledgments=(),
         entries=(CoverageEntry(**entry.model_dump()),),
     )
+
+
+@pytest.mark.unit
+def test_coverage_expectation_rejects_duplicate_rule_ids_within_category() -> None:
+    entry = _audit_entry()
+
+    with pytest.raises(
+        ValueError,
+        match="duplicate rule_id 'rule.operation' in untracked",
+    ):
+        CoverageExpectation(
+            guarded_namespaces=(),
+            tracked=(),
+            untracked=(entry, entry),
+            unknown=(),
+            scoped_escapes=(),
+            blocked=(),
+            unsupported=(),
+            conditional=(),
+            safe=(),
+        )
+
+
+@pytest.mark.unit
+def test_coverage_expectation_rejects_duplicate_rule_ids_across_categories() -> None:
+    entry = _audit_entry()
+
+    with pytest.raises(
+        ValueError,
+        match="rule_id 'rule.operation' appears in multiple categories: tracked, untracked",
+    ):
+        CoverageExpectation(
+            guarded_namespaces=(),
+            tracked=(entry,),
+            untracked=(entry,),
+            unknown=(),
+            scoped_escapes=(),
+            blocked=(),
+            unsupported=(),
+            conditional=(),
+            safe=(),
+        )
 
 
 @pytest.mark.unit
