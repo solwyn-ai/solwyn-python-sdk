@@ -254,6 +254,63 @@ def test_default_warn_logs_once_and_returns_the_terminal_capability(
 
 
 @pytest.mark.unit
+def test_warn_latch_keys_include_mode_and_are_bounded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from solwyn import _base
+
+    # Arrange
+    _base._reset_unmetered_spend_warnings()
+    sync_context = _base.SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+    async_context = _base.SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="async",
+    )
+
+    try:
+        # Act
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+            for context in (sync_context, async_context):
+                _base._warn_contextual_surface_once(
+                    context=context,
+                    rule_id="rule-x",
+                    surface="post",
+                    capability_scope=None,
+                )
+
+        # Assert
+        assert len(_base._warned_contextual_surfaces) == 2
+
+        # Act
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+            for index in range(_base._WARNED_SURFACE_LIMIT + 50):
+                _base._warn_contextual_surface_once(
+                    context=sync_context,
+                    rule_id=f"rule-{index}",
+                    surface=f"surface-{index}",
+                    capability_scope=None,
+                )
+
+        # Assert
+        assert len(_base._warned_contextual_surfaces) <= _base._WARNED_SURFACE_LIMIT
+        overflow_records = [
+            record
+            for record in caplog.records
+            if "Untracked-surface warning limit" in record.getMessage()
+        ]
+        assert len(overflow_records) == 1
+    finally:
+        _base._reset_unmetered_spend_warnings()
+
+
+@pytest.mark.unit
 def test_allow_is_silent_and_returns_the_terminal_capability(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -754,6 +811,37 @@ def test_known_missing_path_preserves_provider_attribute_error() -> None:
     with pytest.raises(AttributeError) as exc_info:
         _ = wrapper.responses
 
+    assert type(exc_info.value) is AttributeError
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_probing_a_nonexistent_unruled_name_is_a_plain_attribute_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Arrange
+    wrapper = _make_solwyn(_MissingResponsesClient(), on_unmetered="warn")
+
+    # Act
+    with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+        exists = hasattr(wrapper, "nonexistent_unruled")
+
+    # Assert
+    assert exists is False
+    assert all("untracked surface" not in record.getMessage() for record in caplog.records)
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_probing_a_nonexistent_unruled_name_under_raise_is_a_plain_attribute_error() -> None:
+    # Arrange
+    wrapper = _make_solwyn(_MissingResponsesClient(), on_unmetered="raise")
+
+    # Act
+    with pytest.raises(AttributeError) as exc_info:
+        _ = wrapper.nonexistent_unruled
+
+    # Assert
     assert type(exc_info.value) is AttributeError
     _close(wrapper)
 

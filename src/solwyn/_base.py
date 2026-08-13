@@ -168,14 +168,18 @@ def _warn_cost_policy_inactive_once() -> None:
 
 # Per-process warn-once state is keyed by the complete contextual rule identity,
 # so equal terminal names in different provider graphs cannot suppress each other.
-_warned_contextual_surfaces: set[tuple[str, str, str]] = set()
+_WARNED_SURFACE_LIMIT = 512
+_warned_contextual_surfaces: set[tuple[str, str, str, str]] = set()
+_warn_limit_reached = False
 _spend_surface_warn_lock = threading.Lock()
 
 
 def _reset_unmetered_spend_warnings() -> None:
     """Clear the per-process warn-once latch. Test-support hook only."""
+    global _warn_limit_reached
     with _spend_surface_warn_lock:
         _warned_contextual_surfaces.clear()
+        _warn_limit_reached = False
 
 
 def _warn_contextual_surface_once(
@@ -185,11 +189,22 @@ def _warn_contextual_surface_once(
     surface: str,
     capability_scope: str | None,
 ) -> None:
-    """Warn once per provider/client-shape/rule identity without content data."""
+    """Warn once per provider/client-shape/mode/rule identity, bounded in size."""
 
-    warning_key = (context.provider, context.client_shape, rule_id)
+    global _warn_limit_reached
+    warning_key = (context.provider, context.client_shape, context.mode, rule_id)
     with _spend_surface_warn_lock:
         if warning_key in _warned_contextual_surfaces:
+            return
+        if len(_warned_contextual_surfaces) >= _WARNED_SURFACE_LIMIT:
+            if _warn_limit_reached:
+                return
+            _warn_limit_reached = True
+            logger.warning(
+                "Untracked-surface warning limit (%d) reached; further distinct "
+                "surfaces will not be individually reported this process.",
+                _WARNED_SURFACE_LIMIT,
+            )
             return
         _warned_contextual_surfaces.add(warning_key)
     logger.warning(
@@ -1030,7 +1045,7 @@ class _SolwynBase:
                 visible = name in dir(value)
             except Exception:
                 visible = False
-            if rule is not None and not visible and not self._has_dynamic_attribute_hook(value):
+            if not visible and not self._has_dynamic_attribute_hook(value):
                 return getattr(value, name)
             if rule is not None and rule.kind is SurfaceKind.BLOCKED:
                 raise ConfigurationError(rule.reason or "blocked surface", field=path)
