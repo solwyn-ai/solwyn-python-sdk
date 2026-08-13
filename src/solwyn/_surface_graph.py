@@ -186,6 +186,15 @@ def observe_public_surface(
     return tuple(sorted(observations))
 
 
+def declared_namespace_paths(context: SurfaceContext) -> frozenset[str]:
+    """Return the contract-declared traversal frontier for one context."""
+
+    def resolve(path: str) -> SurfaceRule | None:
+        return resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW)
+
+    return _applicable_namespace_paths(SURFACE_RULES, resolve)
+
+
 def audit_public_surface(
     root: object,
     *,

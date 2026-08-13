@@ -11,6 +11,7 @@ from types import ModuleType
 import pytest
 import yaml
 
+from solwyn._surface_graph import declared_namespace_paths
 from solwyn._surfaces import (
     SURFACE_RULES,
     AttributeShape,
@@ -101,6 +102,26 @@ _UNDECLARED_CONTEXT_TUPLES = (
     ("bedrock", "bedrock", "bedrock_aioboto3", "sync"),
     ("google", "google", "google_generativeai", "async"),
 )
+
+
+@pytest.mark.unit
+def test_declared_namespace_paths_matches_the_contract_frontier() -> None:
+    # Arrange
+    context = SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+
+    # Act
+    paths = declared_namespace_paths(context)
+
+    # Assert
+    assert paths
+    assert all(
+        resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW) for path in paths
+    )
 
 
 @pytest.mark.unit

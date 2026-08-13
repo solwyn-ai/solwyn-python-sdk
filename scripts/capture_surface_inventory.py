@@ -24,7 +24,12 @@ from pathlib import Path
 from typing import Any, NamedTuple
 from unittest.mock import patch
 
-from solwyn._surface_graph import SurfaceInspectionError, observe_public_surface
+from solwyn._surface_graph import (
+    SurfaceInspectionError,
+    declared_namespace_paths,
+    observe_public_surface,
+)
+from solwyn._surfaces import DIALECT_BY_PROVIDER, SurfaceContext
 
 SCHEMA_VERSION = 1
 FINGERPRINT_SCHEMA_VERSION = 1
@@ -308,83 +313,6 @@ async def _client_for(spec: ShapeSpec) -> AsyncIterator[object]:
                 await result
 
 
-def _provider_resource(value: object) -> bool:
-    module = type(value).__module__
-    class_name = type(value).__name__
-    if module.startswith("google.genai."):
-        return True
-    if module == "openai.lib._realtime":
-        return class_name in {"_Calls", "_AsyncCalls"}
-    if module.startswith(("openai.", "anthropic.", "together.")):
-        return (
-            ".resources." in module
-            or module.endswith("._client")
-            or "WithRawResponse" in class_name
-            or "WithStreamedResponse" in class_name
-            or "WithStreamingResponse" in class_name
-        )
-    return False
-
-
-def _discover_namespaces(
-    root: object,
-    *,
-    max_depth: int = 8,
-) -> tuple[str, ...]:
-    namespaces: list[str] = []
-
-    def visit(value: object, prefix: str, depth: int, ancestor_ids: frozenset[int]) -> None:
-        try:
-            names = sorted({name for name in dir(value) if not name.startswith("_")})
-        except Exception as exc:
-            raise SurfaceInspectionError(
-                prefix or "<root>", "namespace_discovery", type(exc).__name__
-            ) from None
-        for name in names:
-            path = f"{prefix}.{name}" if prefix else name
-            try:
-                static_value = inspect.getattr_static(value, name)
-            except Exception as exc:
-                if inspect.getattr_static(type(value), "__getattr__", None) is not None:
-                    continue
-                raise SurfaceInspectionError(
-                    path, "namespace_discovery", type(exc).__name__
-                ) from None
-            if (
-                not isinstance(static_value, property)
-                and type(static_value).__name__ != "cached_property"
-            ):
-                try:
-                    static_value = inspect.getattr_static(type(value), name)
-                except AttributeError:
-                    continue
-            if (
-                not isinstance(static_value, (property,))
-                and type(static_value).__name__ != "cached_property"
-            ):
-                continue
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    returned = getattr(value, name)
-            except Exception as exc:
-                raise SurfaceInspectionError(
-                    path, "namespace_discovery", type(exc).__name__
-                ) from None
-            if not _provider_resource(returned):
-                continue
-            if depth >= max_depth:
-                raise SurfaceInspectionError(path, "depth_exhaustion")
-            returned_id = id(returned)
-            if returned_id in ancestor_ids:
-                raise SurfaceInspectionError(path, "cycle")
-            namespaces.append(path)
-            visit(returned, path, depth + 1, ancestor_ids | {returned_id})
-
-    visit(root, "", 0, frozenset({id(root)}))
-    return tuple(sorted(set(namespaces)))
-
-
 def _distribution_rows(spec: ShapeSpec) -> list[dict[str, str]]:
     names = [spec.distribution]
     if spec.key == "bedrock_boto3_sync":
@@ -408,8 +336,20 @@ def _bedrock_service_model_operations(client: object) -> tuple[str, ...]:
 async def _capture_shape(spec: ShapeSpec, structural_interval: str) -> dict[str, Any]:
     with _deny_socket_access() as socket_counter:
         async with _client_for(spec) as client:
-            namespaces = _discover_namespaces(client)
-            observed = observe_public_surface(client, namespaces=namespaces)
+            context = SurfaceContext(
+                provider=spec.provider,
+                dialect=DIALECT_BY_PROVIDER[spec.provider],
+                client_shape=spec.client_shape,
+                mode=spec.mode,
+            )
+            declared = declared_namespace_paths(context)
+            observed = observe_public_surface(
+                client,
+                namespaces=declared,
+                require_all_namespaces=False,
+            )
+            observed_paths = {item.path for item in observed}
+            namespaces = tuple(sorted(declared & observed_paths))
             rows: dict[str, dict[str, str]] = {
                 item.path: {
                     "path": item.path,

@@ -5,7 +5,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import socket
-from functools import cached_property
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -406,91 +405,6 @@ def test_inventory_run_retains_reports_captured_before_a_later_failure(
             check=True,
         )
     assert (output_dir / "anthropic_async--latest.json").exists()
-
-
-@pytest.mark.unit
-def test_namespace_discovery_fails_instead_of_truncating_at_max_depth() -> None:
-    # Arrange
-    capture = _capture_module()
-
-    class ProviderResource:
-        __module__ = "openai.resources.synthetic"
-
-        def __init__(self, child: object | None = None) -> None:
-            self._child = child
-
-        @property
-        def nested(self) -> object | None:
-            return self._child
-
-    root = ProviderResource(ProviderResource(ProviderResource(ProviderResource())))
-
-    # Act / Assert
-    with pytest.raises(capture.SurfaceInspectionError) as caught:
-        capture._discover_namespaces(root, max_depth=2)
-    assert caught.value.path == "nested.nested.nested"
-    assert caught.value.stage == "depth_exhaustion"
-
-
-@pytest.mark.unit
-def test_namespace_discovery_allows_a_terminal_at_max_depth() -> None:
-    # Arrange
-    capture = _capture_module()
-
-    class ProviderResource:
-        __module__ = "openai.resources.synthetic"
-
-        def __init__(self, child: object | None = None) -> None:
-            self._child = child
-
-        @property
-        def nested(self) -> object | None:
-            return self._child
-
-    root = ProviderResource(ProviderResource(ProviderResource()))
-
-    # Act
-    namespaces = capture._discover_namespaces(root, max_depth=2)
-
-    # Assert
-    assert namespaces == ("nested", "nested.nested")
-
-
-@pytest.mark.unit
-def test_namespace_discovery_preserves_cached_property_after_instance_cache_fill() -> None:
-    # Arrange
-    capture = _capture_module()
-
-    class ProviderResource:
-        __module__ = "openai.resources.synthetic"
-
-    class Root:
-        @cached_property
-        def child(self) -> ProviderResource:
-            return ProviderResource()
-
-    root = Root()
-    cached_child = root.child
-
-    # Act
-    namespaces = capture._discover_namespaces(root)
-
-    # Assert
-    assert root.child is cached_child
-    assert namespaces == ("child",)
-
-
-@pytest.mark.unit
-def test_openai_realtime_calls_is_a_provider_resource() -> None:
-    # Arrange
-    capture = _capture_module()
-    RealtimeCalls = type("_Calls", (), {"__module__": "openai.lib._realtime"})
-
-    # Act
-    is_provider_resource = capture._provider_resource(RealtimeCalls())
-
-    # Assert
-    assert is_provider_resource is True
 
 
 @pytest.mark.unit
