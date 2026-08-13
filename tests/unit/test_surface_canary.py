@@ -595,6 +595,10 @@ def test_canary_is_required_by_local_and_structural_interval_gates() -> None:
     ]
     standard_test_steps = str(workflow["jobs"]["test"]["steps"])
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    publish_workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "publish.yml").read_text(encoding="utf-8")
+    )
+    publish_test_steps = str(publish_workflow["jobs"]["test"]["steps"])
     source = Path(__file__).read_text(encoding="utf-8")
 
     # Assert
@@ -606,6 +610,8 @@ def test_canary_is_required_by_local_and_structural_interval_gates() -> None:
     assert workflow["permissions"] == {"contents": "read"}
     assert "aioboto3" not in standard_test_steps
     assert "--ignore=tests/unit/test_surface_canary.py" in standard_test_steps
+    assert "--ignore=tests/unit/test_surface_canary.py" in publish_test_steps
+    assert "aioboto3" not in publish_test_steps
 
     assert "test: test-unit check-surface-canary" in makefile
     assert "check-surface-canary:" in makefile
