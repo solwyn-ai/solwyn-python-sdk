@@ -7,6 +7,7 @@ from this and add their own HTTP layer.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import statistics
 import threading
@@ -193,6 +194,7 @@ def _warn_contextual_surface_once(
 
     global _warn_limit_reached
     warning_key = (context.provider, context.client_shape, context.mode, rule_id)
+    warn_limit_reached_now = False
     with _spend_surface_warn_lock:
         if warning_key in _warned_contextual_surfaces:
             return
@@ -200,13 +202,16 @@ def _warn_contextual_surface_once(
             if _warn_limit_reached:
                 return
             _warn_limit_reached = True
-            logger.warning(
-                "Untracked-surface warning limit (%d) reached; further distinct "
-                "surfaces will not be individually reported this process.",
-                _WARNED_SURFACE_LIMIT,
-            )
-            return
-        _warned_contextual_surfaces.add(warning_key)
+            warn_limit_reached_now = True
+        else:
+            _warned_contextual_surfaces.add(warning_key)
+    if warn_limit_reached_now:
+        logger.warning(
+            "Untracked-surface warning limit (%d) reached; further distinct "
+            "surfaces will not be individually reported this process.",
+            _WARNED_SURFACE_LIMIT,
+        )
+        return
     logger.warning(
         "Provider '%s' client shape '%s' exposes untracked surface '%s' "
         "(scope: %s); no budget check and no cost event will be emitted. "
@@ -905,7 +910,13 @@ class _SolwynBase:
         return bool(matching_shapes) and set(matching_shapes) == {"unevaluated_descriptor"}
 
     def _has_dynamic_attribute_hook(self, value: object) -> bool:
-        return self._inspect_static_attribute(type(value), "__getattr__") is not None
+        value_type = type(value)
+        if self._inspect_static_attribute(value_type, "__getattr__") is not None:
+            return True
+        return (
+            inspect.getattr_static(value_type, "__getattribute__", object.__getattribute__)
+            is not object.__getattribute__
+        )
 
     def _is_guardable_provider_resource(self, value: object) -> bool:
         return _return_shape(value) in _GUARDABLE_RETURN_SHAPES and _belongs_to_client_shape(

@@ -187,6 +187,19 @@ class _DynamicOpenAIClient(_MissingResponsesClient):
         return lambda: name
 
 
+class _DynamicGetattributeOpenAIClient(_MissingResponsesClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.dynamic_evaluations = 0
+
+    def __getattribute__(self, name: str) -> Any:
+        if name == "future_operation":
+            evaluations = object.__getattribute__(self, "dynamic_evaluations")
+            object.__setattr__(self, "dynamic_evaluations", evaluations + 1)
+            return lambda: name
+        return super().__getattribute__(name)
+
+
 class _DriftedBaseURLClient(_OpenAIClient):
     @property
     def base_url(self) -> Any:
@@ -211,6 +224,7 @@ for _client_type in (
     _OpenAIClient,
     _MissingResponsesClient,
     _DynamicOpenAIClient,
+    _DynamicGetattributeOpenAIClient,
     _DriftedBaseURLClient,
     _DriftedPostClient,
     _OpaqueClient,
@@ -306,6 +320,66 @@ def test_warn_latch_keys_include_mode_and_are_bounded(
             if "Untracked-surface warning limit" in record.getMessage()
         ]
         assert len(overflow_records) == 1
+    finally:
+        _base._reset_unmetered_spend_warnings()
+
+
+@pytest.mark.unit
+def test_warn_latch_overflow_logging_is_reentrant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from solwyn import _base
+
+    class _SameThreadReentryGuard:
+        entered = False
+
+        def __enter__(self) -> None:
+            if self.entered:
+                raise RuntimeError("warning lock reentered")
+            self.entered = True
+
+        def __exit__(self, *args: object) -> None:
+            self.entered = False
+
+    # Arrange
+    context = _base.SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+    lock = _SameThreadReentryGuard()
+    _base._warned_contextual_surfaces.update(
+        ("openai", "openai_sdk", "sync", f"rule-{index}")
+        for index in range(_base._WARNED_SURFACE_LIMIT)
+    )
+    monkeypatch.setattr(_base, "_spend_surface_warn_lock", lock)
+    warning_calls = 0
+
+    def reenter_once(*args: object) -> None:
+        nonlocal warning_calls
+        warning_calls += 1
+        if warning_calls == 1:
+            _base._warn_contextual_surface_once(
+                context=context,
+                rule_id="recursive-rule",
+                surface="recursive-surface",
+                capability_scope=None,
+            )
+
+    monkeypatch.setattr(_base.logger, "warning", reenter_once)
+
+    try:
+        # Act
+        _base._warn_contextual_surface_once(
+            context=context,
+            rule_id="overflow-rule",
+            surface="overflow-surface",
+            capability_scope=None,
+        )
+
+        # Assert
+        assert warning_calls == 1
     finally:
         _base._reset_unmetered_spend_warnings()
 
@@ -713,6 +787,22 @@ def test_strict_invisible_dynamic_known_path_refuses_before_dynamic_lookup() -> 
     with pytest.raises(UntrackedSpendSurfaceError):
         _ = wrapper.responses
 
+    assert client.dynamic_evaluations == 0
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_strict_custom_getattribute_refuses_before_dynamic_lookup() -> None:
+    # Arrange
+    client = _DynamicGetattributeOpenAIClient()
+    wrapper = _make_solwyn(client, on_unmetered="raise")
+    client.dynamic_evaluations = 0
+
+    # Act
+    with pytest.raises(UntrackedSpendSurfaceError):
+        _ = wrapper.future_operation
+
+    # Assert
     assert client.dynamic_evaluations == 0
     _close(wrapper)
 
