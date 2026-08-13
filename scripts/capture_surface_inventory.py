@@ -537,6 +537,24 @@ def _comparison_row(row: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in row.items() if key != "distributions"}
 
 
+def _fingerprint_drift_message(
+    key: tuple[str, str],
+    expected: Mapping[str, Any],
+    actual: Mapping[str, Any],
+) -> str:
+    counts = (
+        "namespace_count",
+        "observation_count",
+        "service_model_operation_count",
+    )
+    rendered = "; ".join(
+        f"{name} {expected[name]} -> {actual[name]}, "
+        f"delta {int(actual[name]) - int(expected[name]):+d}"
+        for name in counts
+    )
+    return f"fingerprint drift: {_display_key(key)} ({rendered})"
+
+
 def compare_fingerprints(
     path: Path,
     reports: Collection[Mapping[str, Any]],
@@ -560,7 +578,7 @@ def compare_fingerprints(
             continue
         actual = fingerprint_report(report)
         if _comparison_row(expected) != _comparison_row(actual):
-            mismatches.append(f"fingerprint drift: {_display_key(key)}")
+            mismatches.append(_fingerprint_drift_message(key, expected, actual))
     return tuple(mismatches)
 
 

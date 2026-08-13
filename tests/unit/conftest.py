@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import uuid
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -25,6 +28,18 @@ DEFAULT_PROVIDER_CHAIN = [ProviderEntry(provider=ProviderName.OPENAI, model="gpt
 # Namespace for call_uuid below. Arbitrary but FIXED: the ids it derives are
 # stable across runs, so a queue-order assertion can name them.
 _CALL_ID_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+
+
+@pytest.fixture
+def repo_tool_env() -> Callable[[Path], dict[str, str]]:
+    """Build an isolated subprocess environment for checkout-owned tools."""
+
+    def build(checkout: Path) -> dict[str, str]:
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str((checkout / "src").resolve())
+        return environment
+
+    return build
 
 
 def call_uuid(label: str) -> str:

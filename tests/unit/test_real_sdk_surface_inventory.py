@@ -206,7 +206,41 @@ def test_compare_fingerprints_reports_missing_and_structural_drift(tmp_path: Pat
     # Assert
     assert mismatches == (
         "missing fingerprint: anthropic_sync@latest",
-        "fingerprint drift: openai_native_sync@latest",
+        "fingerprint drift: openai_native_sync@latest "
+        "(namespace_count 1 -> 1, delta +0; observation_count 2 -> 2, delta +0; "
+        "service_model_operation_count 0 -> 0, delta +0)",
+    )
+
+
+@pytest.mark.unit
+def test_compare_fingerprints_reports_structural_count_deltas_in_fixed_order(
+    tmp_path: Path,
+) -> None:
+    # Arrange
+    capture = _capture_module()
+    fingerprint_path = tmp_path / "fingerprints.json"
+    expected = _sample_report()
+    capture.update_fingerprint_manifest(fingerprint_path, [expected])
+    drifted = _sample_report(distribution_version="2.54.0")
+    drifted["namespaces"].append("responses.with_raw_response")
+    drifted["observations"].append(
+        {
+            "path": "responses.with_raw_response",
+            "descriptor_category": "cached_property",
+            "return_shape": "resource",
+            "source": "public_attribute",
+        }
+    )
+    drifted["service_model_operations"].append("responses.create")
+
+    # Act
+    mismatches = capture.compare_fingerprints(fingerprint_path, [drifted])
+
+    # Assert
+    assert mismatches == (
+        "fingerprint drift: openai_native_sync@latest "
+        "(namespace_count 1 -> 2, delta +1; observation_count 2 -> 3, delta +1; "
+        "service_model_operation_count 0 -> 1, delta +1)",
     )
 
 
@@ -366,7 +400,11 @@ def test_inventory_run_writes_full_artifact_before_reporting_drift(
     # Assert
     artifact_path = output_dir / "openai_native_sync--latest.json"
     assert result.paths == (artifact_path,)
-    assert result.mismatches == ("fingerprint drift: openai_native_sync@latest",)
+    assert result.mismatches == (
+        "fingerprint drift: openai_native_sync@latest "
+        "(namespace_count 1 -> 1, delta +0; observation_count 2 -> 2, delta +0; "
+        "service_model_operation_count 0 -> 0, delta +0)",
+    )
     assert json.loads(artifact_path.read_text(encoding="utf-8")) == drifted
 
 

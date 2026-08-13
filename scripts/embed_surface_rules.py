@@ -20,8 +20,12 @@ expanded JSON source of truth:
        uv run python scripts/embed_surface_rules.py \
            --input build/surface_contract/surface-classification.json
 
-4. Re-export from the new canonical payload and prove payload identity plus
-   provider/report compatibility::
+4. Refresh the expanded artifact and its ``source_payload_fingerprint`` from
+   the new canonical payload::
+
+       uv run python scripts/export_surface_contract.py
+
+5. Prove payload identity plus provider/report compatibility::
 
        make check-surface-contract
        make check-provider-surfaces

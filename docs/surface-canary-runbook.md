@@ -20,20 +20,22 @@ doing its job.
   unmetered_spend > metadata/infrastructure; when unsure, `unmetered_spend`
   with an exact acknowledgment token).
 
-## 3. Apply (the four-step loop)
+## 3. Apply (the five-step loop)
 
 1. `uv run python scripts/export_surface_contract.py`
 2. Edit exact rows in `build/surface_contract/surface-classification.json`.
 3. `uv run python scripts/embed_surface_rules.py --input build/surface_contract/surface-classification.json`
    (prints the rule delta; requires `--allow-removals` for deletions).
-4. `make check-surface-contract && make check-provider-surfaces`
+4. `uv run python scripts/export_surface_contract.py` (refreshes the expanded
+   artifact's `source_payload_fingerprint` from the new embedded payload).
+5. `make check-surface-contract && make check-provider-surfaces`
 
 ## 4. Refresh evidence + pins
 
 - `make capture-provider-surfaces` (refreshes latest fingerprints only).
 - Update the per-context digests in `tests/unit/test_surface_context_pins.py`
-  and, if the OpenAI graph moved, `OPENAI_STRICT_FINGERPRINT` +
-  the README fence (review the delta first — never paste blind).
+  and, if the OpenAI graph moved, the README's `OPENAI_STRICT_FINGERPRINT`
+  (review the delta first — never paste blind).
 - Run `make check && make test-unit && make check-surface-contract && make check-provider-surfaces`.
   Continue to the PR checklist only after it passes.
 

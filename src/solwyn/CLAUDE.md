@@ -66,9 +66,12 @@ Never hand-edit the payload block in `_surfaces.py`. The loop:
 3. `uv run python scripts/embed_surface_rules.py --input build/surface_contract/surface-classification.json`
    — validates, prints the rule delta, refuses stale exports (`--allow-stale`)
    and silent removals (`--allow-removals`).
-4. Update the per-context digests in
+4. `uv run python scripts/export_surface_contract.py` — refresh the expanded
+   artifact and its `source_payload_fingerprint` from the newly embedded
+   canonical payload before running any `--check` command.
+5. Update the per-context digests in
    `tests/unit/test_surface_context_pins.py` (and
-   `OPENAI_STRICT_FINGERPRINT` + the README fence if the OpenAI graph moved),
+   the README's `OPENAI_STRICT_FINGERPRINT` if the OpenAI graph moved),
    then run
    `make check && make test-unit && make check-surface-contract && make check-provider-surfaces`.
    Continue to the PR output only after this passes.
