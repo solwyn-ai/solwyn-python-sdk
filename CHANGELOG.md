@@ -23,6 +23,24 @@ derived from git tags (hatch-vcs).
   only. Namespaces, wildcards, inapplicable tokens, tracked leaves, blocked
   leaves, and unsupported leaves are rejected; the conditional token-billed
   TTS exception uses `audio.speech.create:gpt-4o-mini-tts`.
+- **Privacy-safe advisory reporting identifies untracked provider-client
+  surfaces.** It is ON by default. Provider-call paths schedule fire-and-forget
+  delivery through the reporter's background thread/task, never on the budget
+  hot path; shutdown may make a deadline-bounded best-effort final attempt, and
+  send failures remain silent. External payloads contain only a structural
+  dotted surface path; bounded provider/client-shape, sync/async, rule, scope,
+  and posture fields; approximate occurrence counts and first/last timestamps;
+  and random SDK-instance/report identifiers. They never contain model names,
+  request arguments, prompts, or responses. Only unacknowledged `warn`/`allow`
+  observations are reported; `raise` refusals and acknowledged escapes are
+  not. Reporting adds neither a budget check nor a cost event, so it does not
+  meter or budget-enforce these calls; counts are bounded-overcount signals,
+  not billing truth, and dashboard absence is not comprehensive usage evidence.
+  Core derives the project from authentication on its project-implicit route.
+  Set `report_untracked_surfaces=False` or
+  `SOLWYN_REPORT_UNTRACKED_SURFACES=false` to disable optional external
+  advisory egress without changing local `on_unmetered`
+  `warn`/`allow`/`raise` behavior.
 - **Dashboard-stopped runs raise `RunStoppedError`.** The public exception is
   a `BudgetExceededError` subclass, so existing hard-deny handlers remain
   compatible. It identifies the stopped run, preserves the budget snapshot
