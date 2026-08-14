@@ -441,6 +441,219 @@ def test_sync_reporters_only_drain_their_originating_observations(second_api_key
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("captured_before_fork", [False, True], ids=["unsent", "captured"])
+def test_sync_fork_reset_discards_only_inherited_advisory_observations(
+    captured_before_fork: bool,
+) -> None:
+    parent = _quiet_sync_reporter()
+    child = _quiet_sync_reporter()
+    parent_http = parent._http
+    inherited_child_http = child._http
+    _observe(parent, n=2)
+    _observe(child, n=2)
+    child_state = child._untracked_state
+    assert child_state is not None
+    inherited_reports = child._build_untracked_reports() if captured_before_fork else []
+    old_lock = child_state.lock
+    if captured_before_fork:
+        child._mark_untracked_reports_attempted(inherited_reports)
+
+    child._reset_after_fork_in_child()
+
+    try:
+        assert child._untracked_state is child_state
+        assert child_state.lock is not old_lock
+        assert child_state.sdk_instance_id == SDK_INSTANCE_ID
+        assert [built.report.occurrences for built in parent._build_untracked_reports()] == [2]
+        assert child._build_untracked_reports() == []
+
+        _observe(child)
+        if captured_before_fork:
+            # A pre-fork worker cannot continue after a real fork. These calls
+            # deterministically model a stale captured completion and must be inert.
+            child._mark_untracked_reports_attempted(inherited_reports)
+            child._mark_untracked_reports_sent(inherited_reports)
+        post_fork_reports = child._build_untracked_reports()
+
+        assert [built.report.occurrences for built in post_fork_reports] == [1]
+        if captured_before_fork:
+            assert post_fork_reports[0].report.report_id != inherited_reports[0].report.report_id
+        child._mark_untracked_reports_sent(post_fork_reports)
+        assert child._build_untracked_reports() == []
+    finally:
+        parent._shutdown.set()
+        child._shutdown.set()
+        parent_http.close()
+        inherited_child_http.close()
+        child._http.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("captured_before_fork", [False, True], ids=["unsent", "captured"])
+@pytest.mark.asyncio
+async def test_async_fork_reset_discards_only_inherited_advisory_observations(
+    captured_before_fork: bool,
+) -> None:
+    parent = _async_reporter()
+    child = _async_reporter()
+    parent_http = parent._http
+    inherited_child_http = child._http
+    _observe(parent, mode="async", n=2)
+    _observe(child, mode="async", n=2)
+    child_state = child._untracked_state
+    assert child_state is not None
+    inherited_reports = child._build_untracked_reports() if captured_before_fork else []
+    old_lock = child_state.lock
+    if captured_before_fork:
+        child._mark_untracked_reports_attempted(inherited_reports)
+
+    child._reset_after_fork_in_child()
+
+    try:
+        assert child._untracked_state is child_state
+        assert child_state.lock is not old_lock
+        assert child_state.sdk_instance_id == SDK_INSTANCE_ID
+        assert [built.report.occurrences for built in parent._build_untracked_reports()] == [2]
+        assert child._build_untracked_reports() == []
+
+        _observe(child, mode="async")
+        if captured_before_fork:
+            child._mark_untracked_reports_attempted(inherited_reports)
+            child._mark_untracked_reports_sent(inherited_reports)
+        post_fork_reports = child._build_untracked_reports()
+
+        assert [built.report.occurrences for built in post_fork_reports] == [1]
+        if captured_before_fork:
+            assert post_fork_reports[0].report.report_id != inherited_reports[0].report.report_id
+        child._mark_untracked_reports_sent(post_fork_reports)
+        assert child._build_untracked_reports() == []
+    finally:
+        await parent_http.aclose()
+        await inherited_child_http.aclose()
+        await child._http.aclose()
+
+
+@pytest.mark.unit
+def test_global_registry_saturation_does_not_suppress_origin_reporter_delivery() -> None:
+    reporter = _quiet_sync_reporter()
+    context = SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+    for index in range(_base._UNTRACKED_SURFACE_LIMIT):
+        _base._record_untracked_surface_observation(
+            context=context,
+            surface=f"disabled_{index}",
+            rule_kind="unknown",
+            capability_scope=None,
+            posture="allow",
+            notifier=None,
+        )
+
+    try:
+        with patch.object(reporter, "_notify_untracked_observation") as wake:
+            for _ in range(2):
+                _base._record_untracked_surface_observation(
+                    context=context,
+                    surface="responses.create",
+                    rule_kind="unmetered_spend",
+                    capability_scope="operation",
+                    posture="allow",
+                    notifier=reporter.observe_untracked_surface,
+                )
+
+        assert len(_base._untracked_surface_observations) == _base._UNTRACKED_SURFACE_LIMIT
+        assert ("openai", "openai_sdk", "sync", "responses.create") not in (
+            _base._untracked_surface_observations
+        )
+        assert wake.call_count == 2
+        with patch.object(reporter._http, "post", return_value=_ok_response()) as post:
+            reporter._flush_untracked_reports()
+        post.assert_called_once()
+        assert post.call_args.kwargs["json"][0]["occurrences"] == 2
+    finally:
+        reporter._http.close()
+
+
+@pytest.mark.unit
+def test_origin_reporter_ledger_keeps_its_own_cardinality_bound() -> None:
+    reporter = _quiet_sync_reporter()
+    state = reporter._untracked_state
+    assert state is not None
+    context = SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+    seen_at = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+    for index in range(_base._UNTRACKED_SURFACE_LIMIT):
+        state.observe(
+            context=context,
+            surface=f"surface_{index}",
+            rule_kind="unknown",
+            capability_scope=None,
+            posture="allow",
+            seen_at=seen_at,
+        )
+    state.observe(
+        context=context,
+        surface="overflow",
+        rule_kind="unknown",
+        capability_scope=None,
+        posture="allow",
+        seen_at=seen_at,
+    )
+    state.observe(
+        context=context,
+        surface="surface_0",
+        rule_kind="unknown",
+        capability_scope=None,
+        posture="allow",
+        seen_at=seen_at,
+    )
+
+    try:
+        assert len(state.observations) == _base._UNTRACKED_SURFACE_LIMIT
+        assert ("openai", "openai_sdk", "sync", "overflow") not in state.observations
+        assert state.observations[("openai", "openai_sdk", "sync", "surface_0")]["occurrences"] == 2
+    finally:
+        reporter._http.close()
+
+
+@pytest.mark.unit
+def test_advisory_notifier_failure_never_escapes_the_provider_call_path() -> None:
+    context = SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+
+    def fail_notifier(**_kwargs: object) -> None:
+        raise RuntimeError("advisory notifier failed")
+
+    status = _base._record_untracked_surface_observation(
+        context=context,
+        surface="responses.create",
+        rule_kind="unmetered_spend",
+        capability_scope="operation",
+        posture="allow",
+        notifier=fail_notifier,
+    )
+
+    assert status == "silent"
+    assert (
+        _base._untracked_surface_observations[("openai", "openai_sdk", "sync", "responses.create")][
+            "occurrences"
+        ]
+        == 1
+    )
+
+
+@pytest.mark.unit
 def test_sync_untracked_only_call_wakes_reporter_without_budget_bootstrap() -> None:
     client = Solwyn(
         _UntrackedOpenAIClient(),

@@ -72,6 +72,7 @@ _MAX_PENDING_CONTROL = 1000
 _UNTRACKED_REPORT_INTERVAL = 15 * 60.0
 _UNTRACKED_REPORT_BATCH_SIZE = 100
 _UNTRACKED_OCCURRENCES_MAX = 1_000_000_000
+_UNTRACKED_REPORT_KEY_LIMIT = 512
 
 _T = TypeVar("_T")
 
@@ -134,6 +135,7 @@ _UntrackedSurfaceKey = tuple[str, str, str, str]
 class _BuiltUntrackedReport:
     """One wire report plus the cumulative count it consumes on a 2xx."""
 
+    generation: int
     key: _UntrackedSurfaceKey
     sent_through_occurrences: int
     report: UntrackedSurfaceReport
@@ -150,12 +152,18 @@ class _UntrackedReportState:
     def __init__(self, sdk_instance_id: str | None) -> None:
         self.sdk_instance_id = sdk_instance_id
         self.lock = threading.Lock()
+        self.generation = 0
         self.observations: dict[_UntrackedSurfaceKey, _base._UntrackedSurfaceObservation] = {}
         self.last_sent_occurrences: dict[_UntrackedSurfaceKey, int] = {}
         self.last_attempted_at: dict[_UntrackedSurfaceKey, float] = {}
 
-    def reset_lock_after_fork(self) -> None:
+    def reset_after_fork_in_child(self) -> None:
+        """Discard inherited eligibility and invalidate captured report batches."""
         self.lock = threading.Lock()
+        self.generation += 1
+        self.observations = {}
+        self.last_sent_occurrences = {}
+        self.last_attempted_at = {}
 
     def observe(
         self,
@@ -171,6 +179,8 @@ class _UntrackedReportState:
         with self.lock:
             observation = self.observations.get(key)
             if observation is None:
+                if len(self.observations) >= _UNTRACKED_REPORT_KEY_LIMIT:
+                    return
                 self.observations[key] = {
                     "occurrences": 1,
                     "first_seen_at": seen_at,
@@ -198,6 +208,7 @@ class _UntrackedReportState:
             ]
             last_occurrences = dict(self.last_sent_occurrences)
             last_attempted_at = dict(self.last_attempted_at)
+            generation = self.generation
 
         reports: list[_BuiltUntrackedReport] = []
         for key, observation in sorted(observations, key=lambda item: item[0]):
@@ -236,6 +247,7 @@ class _UntrackedReportState:
                 continue
             reports.append(
                 _BuiltUntrackedReport(
+                    generation=generation,
                     key=key,
                     sent_through_occurrences=baseline + delta,
                     report=report,
@@ -258,11 +270,15 @@ class _UntrackedReportState:
     def mark_attempted(self, reports: list[_BuiltUntrackedReport], attempted_at: float) -> None:
         with self.lock:
             for built in reports:
+                if built.generation != self.generation:
+                    continue
                 self.last_attempted_at[built.key] = attempted_at
 
     def mark_sent(self, reports: list[_BuiltUntrackedReport]) -> None:
         with self.lock:
             for built in reports:
+                if built.generation != self.generation:
+                    continue
                 current = self.last_sent_occurrences.get(built.key, 0)
                 self.last_sent_occurrences[built.key] = max(current, built.sent_through_occurrences)
 
@@ -956,14 +972,15 @@ class MetadataReporter(_ReporterBase):
         relaunched lazily by ``_ensure_thread`` on the next enqueue. Locks
         possibly held by a now-absent thread are replaced, and the inherited
         client is abandoned (never closed — the parent owns those sockets).
-        Queued items duplicated into the child by fork are deliberately KEPT: the
-        server dedups. A closed reporter stays closed (fresh shutdown Event kept
-        set — see below).
+        Queued spend items duplicated into the child by fork are deliberately
+        KEPT: the server dedups them. Inherited advisory observations are
+        discarded because parent and child mint different report IDs. A closed
+        reporter stays closed (fresh shutdown Event kept set — see below).
         """
         self._breaker_project_lock = threading.Lock()
         self._breaker_report_lock = threading.Lock()
         if self._untracked_state is not None:
-            self._untracked_state.reset_lock_after_fork()
+            self._untracked_state.reset_after_fork_in_child()
         self._drop_lock = threading.Lock()
         self._in_flight_lock = threading.Lock()
         self._breaker_worker_lock = threading.Lock()
@@ -1714,13 +1731,15 @@ class AsyncMetadataReporter(_ReporterBase):
         The parent's event loop, flush task, and breaker task do not exist in the
         child; clear them so ``_ensure_started`` relaunches the flush loop in the
         child's own loop on the next enqueue. The inherited client is abandoned
-        (never closed — the parent owns those sockets). Queued items duplicated
-        into the child by fork are deliberately KEPT: the server dedups.
+        (never closed — the parent owns those sockets). Queued spend items
+        duplicated into the child by fork are deliberately KEPT: the server
+        dedups them. Inherited advisory observations are discarded because
+        parent and child mint different report IDs.
         """
         self._breaker_project_lock = threading.Lock()
         self._breaker_report_lock = threading.Lock()
         if self._untracked_state is not None:
-            self._untracked_state.reset_lock_after_fork()
+            self._untracked_state.reset_after_fork_in_child()
         self._drop_lock = threading.Lock()
         self._ownership_lock = threading.Lock()
         self._in_flight = 0

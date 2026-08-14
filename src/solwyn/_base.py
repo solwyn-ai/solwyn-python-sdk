@@ -7,6 +7,7 @@ from this and add their own HTTP layer.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import logging
 import os
@@ -259,15 +260,19 @@ def _record_untracked_surface_observation(
     # Never invoke reporter code under the process-global warning lock. The
     # notifier performs only origin-owned in-memory bookkeeping + wakeup; its
     # reporter thread/task owns every network operation.
-    if registry_status != "full" and notifier is not None:
-        notifier(
-            context=context,
-            surface=surface,
-            rule_kind=rule_kind,
-            capability_scope=capability_scope,
-            posture=posture,
-            seen_at=seen_at,
-        )
+    if notifier is not None:
+        # Advisory bookkeeping must never affect the provider call. The origin
+        # reporter has its own bounded ledger, so global warning-registry
+        # saturation is not a reason to suppress this callback.
+        with contextlib.suppress(Exception):
+            notifier(
+                context=context,
+                surface=surface,
+                rule_kind=rule_kind,
+                capability_scope=capability_scope,
+                posture=posture,
+                seen_at=seen_at,
+            )
     return registry_status
 
 
