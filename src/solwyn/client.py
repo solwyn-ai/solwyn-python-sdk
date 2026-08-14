@@ -991,6 +991,7 @@ class Solwyn(_SolwynBase):
             retry_backoff_cap=config.reporter_retry_backoff_cap,
             shutdown_deadline=config.reporter_shutdown_deadline,
         )
+        self._untracked_observation_notifier = self._reporter.observe_untracked_surface
 
     @functools.cached_property
     def chat(self) -> _SyncChatProxy:
@@ -2189,6 +2190,7 @@ class AsyncSolwyn(_SolwynBase):
             retry_backoff_cap=config.reporter_retry_backoff_cap,
             shutdown_deadline=config.reporter_shutdown_deadline,
         )
+        self._untracked_observation_notifier = self._reporter.observe_untracked_surface
 
     @functools.cached_property
     def chat(self) -> _AsyncChatProxy:

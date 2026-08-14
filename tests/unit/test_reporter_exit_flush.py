@@ -25,12 +25,29 @@ import pytest
 from conftest import VALID_API_KEY, call_uuid
 
 from solwyn._lifecycle import _drain_queues_blocking, blocking_exit_flush
+from solwyn._surfaces import SurfaceContext
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
 from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.reporter import AsyncMetadataReporter
 
 _URL = "https://api.test.solwyn.ai"
+
+
+def _observe_untracked(reporter: AsyncMetadataReporter) -> None:
+    reporter.observe_untracked_surface(
+        context=SurfaceContext(
+            provider="openai",
+            dialect="openai",
+            client_shape="openai_sdk",
+            mode="async",
+        ),
+        surface="responses.create",
+        rule_kind="unmetered_spend",
+        capability_scope="operation",
+        posture="warn",
+        seen_at=datetime.now(UTC),
+    )
 
 
 def _make_confirm_request(**overrides) -> BudgetConfirmRequest:
@@ -248,6 +265,39 @@ def test_async_finalizer_flushes_queued_confirm_on_gc(monkeypatch: pytest.Monkey
     assert any("budgets/confirm" in u for u in sink), (
         f"GC finalizer did not flush the queued confirm; got {sink}"
     )
+
+
+@pytest.mark.unit
+def test_async_finalizer_flushes_due_untracked_observation_on_gc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink: list[str] = []
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
+
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, sdk_instance_id="gc-instance")
+    _observe_untracked(reporter)
+
+    del reporter
+    gc.collect()
+
+    assert f"{_URL}/api/v1/untracked-surfaces" in sink
+
+
+@pytest.mark.unit
+def test_blocking_exit_flush_initiates_due_untracked_cycle_without_spend_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink: list[str] = []
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, sdk_instance_id="exit-instance")
+    _observe_untracked(reporter)
+
+    blocking_exit_flush(reporter)
+
+    assert f"{_URL}/api/v1/untracked-surfaces" in sink
+    assert reporter.dropped_counts == {}
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
 
 
 @pytest.mark.unit

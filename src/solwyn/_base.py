@@ -182,8 +182,11 @@ class _UntrackedSurfaceObservation(TypedDict):
     warning_emitted: bool
 
 
+_UntrackedSurfaceKey = tuple[str, str, str, str]
+_UntrackedObservationNotifier = Callable[..., None]
+
 _UNTRACKED_SURFACE_LIMIT = 512
-_untracked_surface_observations: dict[tuple[str, str, str, str], _UntrackedSurfaceObservation] = {}
+_untracked_surface_observations: dict[_UntrackedSurfaceKey, _UntrackedSurfaceObservation] = {}
 _warn_limit_reached = False
 _spend_surface_warn_lock = threading.Lock()
 
@@ -213,6 +216,7 @@ def _record_untracked_surface_observation(
     rule_kind: Literal["unmetered_spend", "unknown"],
     capability_scope: str | None,
     posture: Literal["warn", "allow"],
+    notifier: _UntrackedObservationNotifier | None = None,
 ) -> Literal["warn", "silent", "full"]:
     """Record one content-free observation and return its registry status."""
 
@@ -236,20 +240,35 @@ def _record_untracked_surface_observation(
             observation["posture"] = posture
             if should_warn:
                 observation["warning_emitted"] = True
-                return "warn"
-            return "silent"
-        if len(_untracked_surface_observations) >= _UNTRACKED_SURFACE_LIMIT:
-            return "full"
-        _untracked_surface_observations[observation_key] = {
-            "occurrences": 1,
-            "first_seen_at": seen_at,
-            "last_seen_at": seen_at,
-            "rule_kind": rule_kind,
-            "capability_scope": capability_scope,
-            "posture": posture,
-            "warning_emitted": posture == "warn",
-        }
-        return "warn" if posture == "warn" else "silent"
+                registry_status: Literal["warn", "silent", "full"] = "warn"
+            else:
+                registry_status = "silent"
+        elif len(_untracked_surface_observations) >= _UNTRACKED_SURFACE_LIMIT:
+            registry_status = "full"
+        else:
+            _untracked_surface_observations[observation_key] = {
+                "occurrences": 1,
+                "first_seen_at": seen_at,
+                "last_seen_at": seen_at,
+                "rule_kind": rule_kind,
+                "capability_scope": capability_scope,
+                "posture": posture,
+                "warning_emitted": posture == "warn",
+            }
+            registry_status = "warn" if posture == "warn" else "silent"
+    # Never invoke reporter code under the process-global warning lock. The
+    # notifier performs only origin-owned in-memory bookkeeping + wakeup; its
+    # reporter thread/task owns every network operation.
+    if registry_status != "full" and notifier is not None:
+        notifier(
+            context=context,
+            surface=surface,
+            rule_kind=rule_kind,
+            capability_scope=capability_scope,
+            posture=posture,
+            seen_at=seen_at,
+        )
+    return registry_status
 
 
 def _warn_contextual_surface_once(
@@ -259,6 +278,7 @@ def _warn_contextual_surface_once(
     rule_kind: Literal["unmetered_spend", "unknown"],
     capability_scope: str | None,
     drifted_from_rule_id: str | None = None,
+    notifier: _UntrackedObservationNotifier | None = None,
 ) -> None:
     """Record every hit and warn once per provider/client-shape/mode/surface."""
 
@@ -269,6 +289,7 @@ def _warn_contextual_surface_once(
         rule_kind=rule_kind,
         capability_scope=capability_scope,
         posture="warn",
+        notifier=notifier,
     )
     if registry_status == "silent":
         return
@@ -753,6 +774,7 @@ class _SolwynBase:
         self._surface_context = runtime_contexts[0]
         self._guard_lock = threading.Lock()
         self._guarded_resources: dict[str, _GuardedResource] = {}
+        self._untracked_observation_notifier: _UntrackedObservationNotifier | None = None
         self._validate_acknowledgments(primary.sdk_client)
         self._requested_failover_tuning = {
             name: getattr(config, name) for name in _FAILOVER_TUNING_FIELDS
@@ -1062,6 +1084,7 @@ class _SolwynBase:
                 rule_kind=cast(Literal["unmetered_spend", "unknown"], kind),
                 capability_scope=scope,
                 posture="allow",
+                notifier=self._untracked_observation_notifier,
             )
             return
         if posture == "warn":
@@ -1071,6 +1094,7 @@ class _SolwynBase:
                 rule_kind=cast(Literal["unmetered_spend", "unknown"], kind),
                 capability_scope=scope,
                 drifted_from_rule_id=(drifted_from.rule_id if drifted_from is not None else None),
+                notifier=self._untracked_observation_notifier,
             )
             return
         raise UntrackedSpendSurfaceError(

@@ -38,6 +38,7 @@ if TYPE_CHECKING:
         _PendingConfirm,
         _PendingEvent,
         _PendingSettlement,
+        _UntrackedReportState,
     )
 
 logger = logging.getLogger(__name__)
@@ -171,9 +172,10 @@ def register_async_reporter(reporter: AsyncMetadataReporter) -> None:
 
     The finalizer covers the reporter-GC'd-before-exit case (constructed, events
     queued, never started — so no flush task holds it alive). It captures the
-    QUEUES + config (never ``reporter``, which would defeat the weak reference),
-    so a collected reporter still drains over a temporary sync client, with its
-    losses accounted the only way left — loudly, via ``_gc_drop_counter``. A
+    QUEUES + reporter-owned advisory state + config (never ``reporter``, which
+    would defeat the weak reference), so a collected reporter still drains over
+    a temporary sync client. Spend losses are accounted the only way left —
+    loudly, via ``_gc_drop_counter`` — while advisory failures remain silent. A
     running reporter cannot be GC'd (its flush task holds a strong ref). A
     COMPLETED ``close()`` detaches the finalizer; a cancelled close leaves it
     armed as the last-chance delivery path.
@@ -198,6 +200,7 @@ def register_async_reporter(reporter: AsyncMetadataReporter) -> None:
         reporter._control_plane_breaker,
         reporter.shutdown_deadline,
         _gc_drop_counter,
+        reporter._untracked_state,
     )
     # Documented writable property; typeshed models finalize with __slots__
     # only, so mypy rejects the assignment it cannot see.
@@ -291,8 +294,8 @@ def blocking_exit_flush(base: AsyncMetadataReporter) -> None:
     """Drain a (loop-less) async reporter's queues over a temporary sync client.
 
     Called from the atexit hook: no event loop exists at interpreter exit, so a
-    synchronous ``httpx.Client`` posts the same sans-I/O payloads the async path
-    would, using the reporter's own URL and auth.
+    synchronous ``httpx.Client`` posts the same sans-I/O spend and due advisory
+    payloads the async path would, using the reporter's own URL and auth.
     """
     _drain_queues_blocking(
         base._confirm_queue,
@@ -303,6 +306,7 @@ def blocking_exit_flush(base: AsyncMetadataReporter) -> None:
         base._control_plane_breaker,
         base.shutdown_deadline,
         base._count_drop,
+        base._untracked_state,
     )
 
 
@@ -433,6 +437,7 @@ def _drain_queues_blocking(
     breaker: CircuitBreaker | None,
     budget: float,
     drop_counter: Callable[[str, str, int], None],
+    untracked_state: _UntrackedReportState | None = None,
 ) -> None:
     """Best-effort, single-attempt, deadline-bounded exit flush of the queues.
 
@@ -455,9 +460,16 @@ def _drain_queues_blocking(
     ``exit_breaker_open``) after at most one recovery probe — but metadata
     ingest is deliberately NOT breaker-gated (it is the durable spend truth),
     so events, including the events of breaker-held settlements, still get
-    their deadline-bounded attempt. Never raises out of the exit hook.
+    their deadline-bounded attempt. Due untracked-surface reports use the same
+    deadline but remain fire-and-forget: their failures never enter spend-drop
+    accounting. Never raises out of the exit hook.
     """
-    if not (confirm_q or settlement_q or event_q):
+    if not (
+        confirm_q
+        or settlement_q
+        or event_q
+        or (untracked_state is not None and untracked_state.reports_due(_monotonic()))
+    ):
         return
 
     deadline = _monotonic() + budget
@@ -468,6 +480,7 @@ def _drain_queues_blocking(
     base_url = api_url.rstrip("/")
     confirm_url = f"{base_url}/api/v1/budgets/confirm"
     ingest_url = f"{base_url}/api/v1/metadata/ingest"
+    untracked_url = f"{base_url}/api/v1/untracked-surfaces"
     own = _ExitOwnership()
     client = httpx.Client(timeout=5.0)
 
@@ -591,6 +604,26 @@ def _drain_queues_blocking(
                     )
                 else:
                     own.resolve("event", len(batch))
+            if untracked_state is not None:
+                advisory_reports = untracked_state.build_reports(_monotonic())
+                for offset in range(0, len(advisory_reports), 100):
+                    if _monotonic() >= deadline:
+                        break
+                    advisory_batch = advisory_reports[offset : offset + 100]
+                    if not advisory_batch:
+                        continue
+                    untracked_state.mark_attempted(advisory_batch, _monotonic())
+                    try:
+                        response = client.post(
+                            untracked_url,
+                            json=[built.report.model_dump(mode="json") for built in advisory_batch],
+                            headers=headers,
+                            timeout=max(0.001, deadline - _monotonic()),
+                        )
+                        response.raise_for_status()
+                    except Exception:
+                        continue
+                    untracked_state.mark_sent(advisory_batch)
         except Exception as exc:
             logger.warning("lifecycle.exit_flush_failed: exc_type=%s", type(exc).__name__)
         if held_drops:

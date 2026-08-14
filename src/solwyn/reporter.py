@@ -24,13 +24,15 @@ import logging
 import re
 import threading
 import time
+import uuid
 import weakref
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 import httpx
 
+from solwyn import _base
 from solwyn._lifecycle import (
     _drain_count,
     _is_retryable_exc,
@@ -39,12 +41,14 @@ from solwyn._lifecycle import (
     register_sync_reporter,
 )
 from solwyn._read_only_key import handle_read_only_key_error
+from solwyn._surfaces import SurfaceContext
 from solwyn._types import (
     BreakerStateReport,
     BudgetConfirmRequest,
     CircuitState,
     MetadataEvent,
     ProviderName,
+    UntrackedSurfaceReport,
 )
 from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
 
@@ -62,6 +66,12 @@ _DROP_LOG_INTERVAL = 60.0
 # (larger) event queue bound so a control-plane outage cannot let pending
 # settlements grow without limit.
 _MAX_PENDING_CONTROL = 1000
+
+# Untracked-surface reports are advisory deltas, not spend events. A key is
+# eligible on its first observation and then no more than once per 15 minutes.
+_UNTRACKED_REPORT_INTERVAL = 15 * 60.0
+_UNTRACKED_REPORT_BATCH_SIZE = 100
+_UNTRACKED_OCCURRENCES_MAX = 1_000_000_000
 
 _T = TypeVar("_T")
 
@@ -115,6 +125,146 @@ class _PendingSettlement:
 
     confirm: _PendingConfirm
     event: MetadataEvent
+
+
+_UntrackedSurfaceKey = tuple[str, str, str, str]
+
+
+@dataclasses.dataclass(frozen=True)
+class _BuiltUntrackedReport:
+    """One wire report plus the cumulative count it consumes on a 2xx."""
+
+    key: _UntrackedSurfaceKey
+    sent_through_occurrences: int
+    report: UntrackedSurfaceReport
+
+
+class _UntrackedReportState:
+    """Reporter-owned advisory state safe to capture in lifecycle finalizers.
+
+    The holder has no reporter or transport reference, so the async GC
+    finalizer can retain it without keeping the reporter alive. Its lock is
+    replaceable after fork while the holder identity stays stable.
+    """
+
+    def __init__(self, sdk_instance_id: str | None) -> None:
+        self.sdk_instance_id = sdk_instance_id
+        self.lock = threading.Lock()
+        self.observations: dict[_UntrackedSurfaceKey, _base._UntrackedSurfaceObservation] = {}
+        self.last_sent_occurrences: dict[_UntrackedSurfaceKey, int] = {}
+        self.last_attempted_at: dict[_UntrackedSurfaceKey, float] = {}
+
+    def reset_lock_after_fork(self) -> None:
+        self.lock = threading.Lock()
+
+    def observe(
+        self,
+        *,
+        context: SurfaceContext,
+        surface: str,
+        rule_kind: Literal["unmetered_spend", "unknown"],
+        capability_scope: str | None,
+        posture: Literal["warn", "allow"],
+        seen_at: datetime,
+    ) -> None:
+        key = (context.provider, context.client_shape, context.mode, surface)
+        with self.lock:
+            observation = self.observations.get(key)
+            if observation is None:
+                self.observations[key] = {
+                    "occurrences": 1,
+                    "first_seen_at": seen_at,
+                    "last_seen_at": seen_at,
+                    "rule_kind": rule_kind,
+                    "capability_scope": capability_scope,
+                    "posture": posture,
+                    "warning_emitted": False,
+                }
+                return
+            observation["occurrences"] += 1
+            observation["first_seen_at"] = min(observation["first_seen_at"], seen_at)
+            observation["last_seen_at"] = max(observation["last_seen_at"], seen_at)
+            observation["rule_kind"] = rule_kind
+            observation["capability_scope"] = capability_scope
+            observation["posture"] = posture
+
+    def build_reports(self, now: float) -> list[_BuiltUntrackedReport]:
+        """Build due deltas without advancing successful-send state."""
+        if self.sdk_instance_id is None:
+            return []
+        with self.lock:
+            observations = [
+                (key, observation.copy()) for key, observation in self.observations.items()
+            ]
+            last_occurrences = dict(self.last_sent_occurrences)
+            last_attempted_at = dict(self.last_attempted_at)
+
+        reports: list[_BuiltUntrackedReport] = []
+        for key, observation in sorted(observations, key=lambda item: item[0]):
+            provider, client_shape, mode, surface = key
+            baseline = last_occurrences.get(key, 0)
+            total = observation["occurrences"]
+            if total <= baseline:
+                continue
+            previous_attempt_at = last_attempted_at.get(key)
+            if (
+                previous_attempt_at is not None
+                and now - previous_attempt_at < _UNTRACKED_REPORT_INTERVAL
+            ):
+                continue
+            delta = min(total - baseline, _UNTRACKED_OCCURRENCES_MAX)
+            try:
+                report = UntrackedSurfaceReport.model_validate(
+                    {
+                        "provider": provider,
+                        "client_shape": client_shape,
+                        "mode": mode,
+                        "surface": surface,
+                        "rule_kind": observation["rule_kind"],
+                        "capability_scope": observation["capability_scope"],
+                        "posture": observation["posture"],
+                        "occurrences": delta,
+                        "first_seen_at": observation["first_seen_at"],
+                        "last_seen_at": observation["last_seen_at"],
+                        "sdk_instance_id": self.sdk_instance_id,
+                        "report_id": str(uuid.uuid4()),
+                    }
+                )
+            except Exception:
+                # S1 validates each structural field before observation. A
+                # corrupted private-test entry remains advisory and silent.
+                continue
+            reports.append(
+                _BuiltUntrackedReport(
+                    key=key,
+                    sent_through_occurrences=baseline + delta,
+                    report=report,
+                )
+            )
+        return reports
+
+    def reports_due(self, now: float) -> bool:
+        if self.sdk_instance_id is None:
+            return False
+        with self.lock:
+            for key, observation in self.observations.items():
+                if observation["occurrences"] <= self.last_sent_occurrences.get(key, 0):
+                    continue
+                attempted_at = self.last_attempted_at.get(key)
+                if attempted_at is None or now - attempted_at >= _UNTRACKED_REPORT_INTERVAL:
+                    return True
+        return False
+
+    def mark_attempted(self, reports: list[_BuiltUntrackedReport], attempted_at: float) -> None:
+        with self.lock:
+            for built in reports:
+                self.last_attempted_at[built.key] = attempted_at
+
+    def mark_sent(self, reports: list[_BuiltUntrackedReport]) -> None:
+        with self.lock:
+            for built in reports:
+                current = self.last_sent_occurrences.get(built.key, 0)
+                self.last_sent_occurrences[built.key] = max(current, built.sent_through_occurrences)
 
 
 class _ReporterBase:
@@ -179,6 +329,7 @@ class _ReporterBase:
         # keeps differing from its snapshot and self-retries next cycle.
         self._breaker_last_sent: dict[str, tuple[CircuitState, int, int]] = {}
         self._breaker_heartbeat_at = 0.0
+        self._untracked_state = _UntrackedReportState(sdk_instance_id)
 
         # Plain deques (NO maxlen): bounds are enforced by _enqueue_owned so an
         # overflow is COUNTED, not silently dropped by the deque itself. The
@@ -297,6 +448,46 @@ class _ReporterBase:
             != (snapshot.state, snapshot.failure_count, snapshot.success_count)
             for provider, snapshot in snapshots
         )
+
+    def observe_untracked_surface(
+        self,
+        *,
+        context: SurfaceContext,
+        surface: str,
+        rule_kind: Literal["unmetered_spend", "unknown"],
+        capability_scope: str | None,
+        posture: Literal["warn", "allow"],
+        seen_at: datetime,
+    ) -> None:
+        """Record one content-free observation owned by this reporter instance."""
+        self._untracked_state.observe(
+            context=context,
+            surface=surface,
+            rule_kind=rule_kind,
+            capability_scope=capability_scope,
+            posture=posture,
+            seen_at=seen_at,
+        )
+        self._notify_untracked_observation()
+
+    def _notify_untracked_observation(self) -> None:
+        """Let the concrete reporter schedule advisory work off the caller thread."""
+
+    def _build_untracked_reports(self) -> list[_BuiltUntrackedReport]:
+        """Build eligible per-key deltas without advancing successful-send state."""
+        return self._untracked_state.build_reports(_monotonic())
+
+    def _untracked_reports_due(self) -> bool:
+        """Cheap cadence/delta pre-check for the reporter flush loop."""
+        return self._untracked_state.reports_due(_monotonic())
+
+    def _mark_untracked_reports_attempted(self, reports: list[_BuiltUntrackedReport]) -> None:
+        """Advance cadence for every network attempt, successful or otherwise."""
+        self._untracked_state.mark_attempted(reports, _monotonic())
+
+    def _mark_untracked_reports_sent(self, reports: list[_BuiltUntrackedReport]) -> None:
+        """Advance delta baselines only after a successful POST."""
+        self._untracked_state.mark_sent(reports)
 
     # ------------------------------------------------------------------
     # Queueing + bounds
@@ -698,12 +889,14 @@ class MetadataReporter(_ReporterBase):
         self._shutdown = threading.Event()
         self._in_flight_lock = threading.Lock()
         self._breaker_worker_lock = threading.Lock()
+        self._untracked_worker_lock = threading.Lock()
         self._thread_lock = threading.Lock()
         # Set by the fork handler so the next enqueue relaunches the (fork-killed)
         # flush thread. False otherwise, so a never-forked reporter never spawns
         # an unexpected thread from report().
         self._needs_thread_restart = False
         self._breaker_worker: threading.Thread | None = None
+        self._untracked_worker: threading.Thread | None = None
         self._thread = self._launch_thread()
         # Exit flush: if the process exits without close(), the atexit hook runs
         # close() so queued spend is still delivered. The live flush thread keeps
@@ -755,9 +948,11 @@ class MetadataReporter(_ReporterBase):
         """
         self._breaker_project_lock = threading.Lock()
         self._breaker_report_lock = threading.Lock()
+        self._untracked_state.reset_lock_after_fork()
         self._drop_lock = threading.Lock()
         self._in_flight_lock = threading.Lock()
         self._breaker_worker_lock = threading.Lock()
+        self._untracked_worker_lock = threading.Lock()
         self._thread_lock = threading.Lock()
         self._ownership_lock = threading.Lock()
         # In-hand items live on the parent's (now-absent) flush thread stack;
@@ -765,12 +960,23 @@ class MetadataReporter(_ReporterBase):
         self._in_hand = {}
         self._in_flight = 0
         self._breaker_worker = None
+        self._untracked_worker = None
         self._http = httpx.Client(timeout=10.0)
         if not self._shutdown.is_set():
             # Replace the inherited Event and arm the lazy relaunch; a closed
             # reporter keeps its set Event and never relaunches.
             self._shutdown = threading.Event()
             self._needs_thread_restart = True
+
+    def _notify_untracked_observation(self) -> None:
+        """Wake the origin reporter without doing network I/O on the caller thread."""
+        try:
+            self._ensure_thread()
+            if self._untracked_reports_due():
+                self._start_untracked_cycle()
+        except Exception:
+            # Advisory activation must never affect the provider call.
+            return
 
     def report(self, event: MetadataEvent) -> None:
         """Enqueue a metadata event for async reporting.  Non-blocking."""
@@ -810,6 +1016,20 @@ class MetadataReporter(_ReporterBase):
         self._thread.join(timeout=max(0.0, deadline - _monotonic()))
         self._final_flush_bounded(deadline)
         self._seal_delivery()
+
+        with self._untracked_worker_lock:
+            active_untracked_worker = self._untracked_worker
+            if active_untracked_worker is not None and not active_untracked_worker.is_alive():
+                active_untracked_worker = None
+        if active_untracked_worker is not None:
+            active_untracked_worker.join(timeout=max(0.0, deadline - _monotonic()))
+        if not self._deadline_expired(deadline) and self._untracked_reports_due():
+            final_untracked_worker = self._start_untracked_cycle(
+                during_shutdown=True,
+                deadline=deadline,
+            )
+            if final_untracked_worker is not None:
+                final_untracked_worker.join(timeout=max(0.0, deadline - _monotonic()))
 
         if active_breaker_worker is not None:
             active_breaker_worker.join(timeout=max(0.0, deadline - _monotonic()))
@@ -873,6 +1093,8 @@ class MetadataReporter(_ReporterBase):
                 logger.warning("reporter.flush_cycle_failed: exc_type=%s", type(exc).__name__)
             if self._breaker_reports_due():
                 self._start_breaker_cycle()
+            if self._untracked_reports_due():
+                self._start_untracked_cycle()
 
     def _flush_remaining(self, *, deadline: float | None = None, final: bool = False) -> None:
         """Flush queued confirms, settlements, then metadata events in batches.
@@ -1207,6 +1429,66 @@ class MetadataReporter(_ReporterBase):
                     type(exc).__name__,
                 )
 
+    def _start_untracked_cycle(
+        self,
+        *,
+        during_shutdown: bool = False,
+        deadline: float | None = None,
+    ) -> threading.Thread | None:
+        """Start one advisory report cycle, coalescing concurrent flush ticks."""
+        with self._untracked_worker_lock:
+            if (self._shutdown.is_set() and not during_shutdown) or self._deadline_expired(
+                deadline
+            ):
+                return None
+            worker = self._untracked_worker
+            if worker is not None and worker.is_alive():
+                return worker
+
+            def _run() -> None:
+                try:
+                    self._flush_untracked_reports(deadline=deadline)
+                finally:
+                    with self._untracked_worker_lock:
+                        if self._untracked_worker is threading.current_thread():
+                            self._untracked_worker = None
+                    # A new key can arrive after this cycle took its snapshot.
+                    # Schedule its cycle once this worker no longer occupies
+                    # the coalescing slot.
+                    if not self._shutdown.is_set() and self._untracked_reports_due():
+                        self._start_untracked_cycle()
+
+            worker = threading.Thread(
+                target=_run,
+                daemon=True,
+                name="solwyn-untracked-surface-reporter",
+            )
+            self._untracked_worker = worker
+            worker.start()
+            return worker
+
+    def _flush_untracked_reports(self, *, deadline: float | None = None) -> None:
+        """POST eligible deltas in advisory batches and silently drop failures."""
+        built_reports = self._build_untracked_reports()
+        for offset in range(0, len(built_reports), _UNTRACKED_REPORT_BATCH_SIZE):
+            if self._deadline_expired(deadline):
+                return
+            batch = built_reports[offset : offset + _UNTRACKED_REPORT_BATCH_SIZE]
+            if not batch:
+                continue
+            self._mark_untracked_reports_attempted(batch)
+            try:
+                response = self._http.post(
+                    f"{self.api_url}/api/v1/untracked-surfaces",
+                    json=[built.report.model_dump(mode="json") for built in batch],
+                    headers=self._auth_headers(),
+                    timeout=10.0 if deadline is None else self._send_timeout(deadline),
+                )
+                response.raise_for_status()
+            except Exception:
+                continue
+            self._mark_untracked_reports_sent(batch)
+
     def _send_confirm(
         self, confirm_request: BudgetConfirmRequest, *, timeout: float = 5.0
     ) -> _SendOutcome:
@@ -1384,6 +1666,7 @@ class AsyncMetadataReporter(_ReporterBase):
         self._shutdown_event: asyncio.Event | None = None
         self._flush_task: asyncio.Task[None] | None = None
         self._breaker_task: asyncio.Task[None] | None = None
+        self._untracked_task: asyncio.Task[None] | None = None
         # Set by close(); once closed, enqueues are dropped and start() fails
         # loud. Distinct from _shutdown_event, which only exists once a flush
         # loop has run — a never-started reporter has no shutdown event but can
@@ -1415,11 +1698,13 @@ class AsyncMetadataReporter(_ReporterBase):
         """
         self._breaker_project_lock = threading.Lock()
         self._breaker_report_lock = threading.Lock()
+        self._untracked_state.reset_lock_after_fork()
         self._drop_lock = threading.Lock()
         self._ownership_lock = threading.Lock()
         self._in_flight = 0
         self._flush_task = None
         self._breaker_task = None
+        self._untracked_task = None
         self._shutdown_event = None
         self._http = httpx.AsyncClient(timeout=10.0)
 
@@ -1438,6 +1723,18 @@ class AsyncMetadataReporter(_ReporterBase):
             return
         self._shutdown_event = asyncio.Event()
         self._flush_task = asyncio.create_task(self._flush_loop())
+
+    def _notify_untracked_observation(self) -> None:
+        """Start/wake advisory delivery without awaiting or doing network I/O."""
+        try:
+            self._ensure_started()
+            if self._flush_task is None or self._flush_task.done():
+                return
+            if self._untracked_reports_due():
+                self._start_untracked_cycle()
+        except Exception:
+            # Advisory activation must never affect the provider call.
+            return
 
     def _ensure_started(self) -> None:
         """Auto-start the flush loop on first enqueue, when a loop is running.
@@ -1531,6 +1828,9 @@ class AsyncMetadataReporter(_ReporterBase):
         active_breaker_task = self._breaker_task
         if active_breaker_task is not None and active_breaker_task.done():
             active_breaker_task = None
+        active_untracked_task = self._untracked_task
+        if active_untracked_task is not None and active_untracked_task.done():
+            active_untracked_task = None
         if self._shutdown_event is not None:
             self._shutdown_event.set()
         if self._flush_task is not None:
@@ -1550,6 +1850,15 @@ class AsyncMetadataReporter(_ReporterBase):
         # cancelled close leaves delivery open for the lifecycle rescue paths.
         self._seal_delivery()
 
+        if active_untracked_task is not None:
+            await self._await_within(active_untracked_task, deadline)
+        if not self._deadline_expired(deadline) and self._untracked_reports_due():
+            final_untracked_task = self._start_untracked_cycle(
+                during_shutdown=True,
+                deadline=deadline,
+            )
+            if final_untracked_task is not None:
+                await self._await_within(final_untracked_task, deadline)
         if active_breaker_task is not None:
             await self._await_within(active_breaker_task, deadline)
         if active_breaker_task is None or not self._deadline_expired(deadline):
@@ -1632,6 +1941,8 @@ class AsyncMetadataReporter(_ReporterBase):
                     logger.warning("reporter.flush_cycle_failed: exc_type=%s", type(exc).__name__)
                 if self._breaker_reports_due():
                     self._start_breaker_cycle()
+                if self._untracked_reports_due():
+                    self._start_untracked_cycle()
             else:
                 break
 
@@ -1863,6 +2174,62 @@ class AsyncMetadataReporter(_ReporterBase):
                     report.provider.value,
                     type(exc).__name__,
                 )
+
+    def _start_untracked_cycle(
+        self,
+        *,
+        during_shutdown: bool = False,
+        deadline: float | None = None,
+    ) -> asyncio.Task[None] | None:
+        """Start one advisory report task, coalescing concurrent flush ticks."""
+        if (
+            self._shutdown_event is not None
+            and self._shutdown_event.is_set()
+            and not during_shutdown
+        ) or self._deadline_expired(deadline):
+            return None
+        task = self._untracked_task
+        if task is not None and not task.done():
+            return task
+        task = asyncio.create_task(
+            self._flush_untracked_reports(deadline=deadline),
+            name="solwyn-untracked-surface-reporter",
+        )
+
+        def _continue_if_due(_completed: asyncio.Task[None]) -> None:
+            if self._untracked_task is _completed:
+                self._untracked_task = None
+            if (
+                not (self._shutdown_event is not None and self._shutdown_event.is_set())
+                and self._untracked_reports_due()
+            ):
+                self._start_untracked_cycle()
+
+        task.add_done_callback(_continue_if_due)
+        self._untracked_task = task
+        return task
+
+    async def _flush_untracked_reports(self, *, deadline: float | None = None) -> None:
+        """POST eligible deltas in advisory batches and silently drop failures."""
+        built_reports = self._build_untracked_reports()
+        for offset in range(0, len(built_reports), _UNTRACKED_REPORT_BATCH_SIZE):
+            if self._deadline_expired(deadline):
+                return
+            batch = built_reports[offset : offset + _UNTRACKED_REPORT_BATCH_SIZE]
+            if not batch:
+                continue
+            self._mark_untracked_reports_attempted(batch)
+            try:
+                response = await self._http.post(
+                    f"{self.api_url}/api/v1/untracked-surfaces",
+                    json=[built.report.model_dump(mode="json") for built in batch],
+                    headers=self._auth_headers(),
+                    timeout=10.0 if deadline is None else self._send_timeout(deadline),
+                )
+                response.raise_for_status()
+            except Exception:
+                continue
+            self._mark_untracked_reports_sent(batch)
 
     async def _send_confirm(
         self, confirm_request: BudgetConfirmRequest, *, timeout: float = 5.0
