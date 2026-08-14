@@ -829,11 +829,20 @@ async def test_async_observation_coalesced_behind_active_cycle_is_woken_after_co
     reporter._shutdown_event = asyncio.Event()
     started = asyncio.Event()
     release = asyncio.Event()
+    continuation_started = asyncio.Event()
+    continuation_release = asyncio.Event()
+    send_count = 0
     _observe(reporter, mode="async")
 
     async def send(_url: str, **_kwargs: object) -> MagicMock:
-        started.set()
-        await release.wait()
+        nonlocal send_count
+        send_count += 1
+        if send_count == 1:
+            started.set()
+            await release.wait()
+        else:
+            continuation_started.set()
+            await continuation_release.wait()
         return _ok_response()
 
     try:
@@ -851,14 +860,17 @@ async def test_async_observation_coalesced_behind_active_cycle_is_woken_after_co
             assert reporter._start_untracked_cycle() is task
             release.set()
             await asyncio.wait_for(task, timeout=1.0)
-            await asyncio.sleep(0)
+            await asyncio.wait_for(continuation_started.wait(), timeout=1.0)
             continuation = reporter._untracked_task
             assert continuation is not None
+            continuation_release.set()
             await asyncio.wait_for(continuation, timeout=1.0)
 
+        assert send_count == 2
         assert reporter._untracked_reports_due() is False
     finally:
         release.set()
+        continuation_release.set()
         await reporter._http.aclose()
 
 
