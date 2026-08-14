@@ -8,6 +8,7 @@ from this and add their own HTTP layer.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import inspect
 import logging
 import os
@@ -47,6 +48,7 @@ from solwyn._surfaces import (
     SurfaceKind,
     SurfaceRule,
     SurfaceSource,
+    _surface_path_is_wire_eligible,
     _validate_surface_path,
     context_is_declared,
     resolve_surface_rule,
@@ -188,6 +190,7 @@ _UntrackedObservationNotifier = Callable[..., None]
 
 _UNTRACKED_SURFACE_LIMIT = 512
 _untracked_surface_observations: dict[_UntrackedSurfaceKey, _UntrackedSurfaceObservation] = {}
+_unreportable_surface_warning_keys: set[_UntrackedSurfaceKey] = set()
 _warn_limit_reached = False
 _spend_surface_warn_lock = threading.Lock()
 
@@ -207,6 +210,7 @@ def _reset_unmetered_spend_warnings() -> None:
     global _warn_limit_reached
     with _spend_surface_warn_lock:
         _untracked_surface_observations.clear()
+        _unreportable_surface_warning_keys.clear()
         _warn_limit_reached = False
 
 
@@ -218,10 +222,11 @@ def _record_untracked_surface_observation(
     capability_scope: str | None,
     posture: Literal["warn", "allow"],
     notifier: _UntrackedObservationNotifier | None = None,
-) -> Literal["warn", "silent", "full"]:
+) -> Literal["warn", "silent", "full", "unreportable"]:
     """Record one content-free observation and return its registry status."""
 
-    _validate_surface_path(surface)
+    if not _surface_path_is_wire_eligible(surface):
+        return "unreportable"
     observation_key = (
         context.provider,
         context.client_shape,
@@ -276,6 +281,26 @@ def _record_untracked_surface_observation(
     return registry_status
 
 
+def _latch_unreportable_surface_warning(
+    *, context: SurfaceContext, surface: str
+) -> Literal["warn", "silent", "full"]:
+    """Bound warn-once state without retaining an over-limit surface path."""
+
+    warning_key = (
+        context.provider,
+        context.client_shape,
+        context.mode,
+        hashlib.sha256(surface.encode("ascii")).hexdigest(),
+    )
+    with _spend_surface_warn_lock:
+        if warning_key in _unreportable_surface_warning_keys:
+            return "silent"
+        if len(_unreportable_surface_warning_keys) >= _UNTRACKED_SURFACE_LIMIT:
+            return "full"
+        _unreportable_surface_warning_keys.add(warning_key)
+    return "warn"
+
+
 def _warn_contextual_surface_once(
     *,
     context: SurfaceContext,
@@ -296,6 +321,12 @@ def _warn_contextual_surface_once(
         posture="warn",
         notifier=notifier,
     )
+    wire_ineligible = registry_status == "unreportable"
+    if wire_ineligible:
+        registry_status = _latch_unreportable_surface_warning(
+            context=context,
+            surface=surface,
+        )
     if registry_status == "silent":
         return
     warn_limit_reached_now = False
@@ -310,6 +341,15 @@ def _warn_contextual_surface_once(
             "Untracked-surface warning limit (%d) reached; further distinct "
             "surfaces will not be individually reported this process.",
             _UNTRACKED_SURFACE_LIMIT,
+        )
+        return
+    if wire_ineligible:
+        logger.warning(
+            "Provider '%s' client shape '%s' exposes an untracked public surface "
+            "outside advisory reporting limits; no budget check and no cost event "
+            "will be emitted, and no advisory report will be sent.",
+            context.provider,
+            context.client_shape,
         )
         return
     if drifted_from_rule_id is not None:

@@ -11,11 +11,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, foreground_records
 from pydantic import ValidationError
 
 from solwyn import _base, _types
-from solwyn._surfaces import SurfaceContext
+from solwyn._surfaces import CapabilityScope, SurfaceContext
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 
@@ -184,6 +184,28 @@ def test_untracked_surface_wire_model_matches_deployed_core_contract() -> None:
 
 
 @pytest.mark.unit
+def test_runtime_structural_vocabularies_fit_untracked_wire_literals() -> None:
+    def client_type(name: str, module: str) -> object:
+        return type(name, (), {"__module__": module})()
+
+    client_shapes = {
+        _base._client_shape(client_type("OpenAI", "openai._client"), "openai"),
+        _base._client_shape(client_type("Together", "together"), "openai"),
+        _base._client_shape(client_type("Anthropic", "anthropic._client"), "anthropic"),
+        _base._client_shape(
+            client_type("GenerativeModel", "google.generativeai.generative_models"),
+            "google",
+        ),
+        _base._client_shape(client_type("Client", "google.genai.client"), "google"),
+        _base._client_shape(client_type("Bedrock", "botocore.client"), "bedrock"),
+        _base._client_shape(client_type("Bedrock", "aiobotocore.client"), "bedrock"),
+    }
+
+    assert {scope.value for scope in CapabilityScope} <= set(get_args(_types.UntrackedScope))
+    assert client_shapes <= set(get_args(_types.UntrackedClientShape))
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -274,6 +296,11 @@ def test_sync_first_observation_is_due_immediately_then_waits_fifteen_minutes() 
             reporter._flush_untracked_reports()
             assert post.call_count == 1
 
+            with patch("solwyn.reporter._monotonic", return_value=now + 899.999):
+                assert reporter._untracked_reports_due() is False
+                reporter._flush_untracked_reports()
+            assert post.call_count == 1
+
             with patch("solwyn.reporter._monotonic", return_value=now + 900.0):
                 assert reporter._untracked_reports_due() is True
                 reporter._flush_untracked_reports()
@@ -314,6 +341,41 @@ def test_sync_failed_send_keeps_delta_and_refreshes_report_id_until_2xx() -> Non
             assert first_payload[0]["report_id"] != second_payload[0]["report_id"]
             assert reporter._untracked_reports_due() is False
             assert reporter.dropped_counts == {}
+    finally:
+        reporter._http.close()
+
+
+@pytest.mark.unit
+def test_validation_failed_advisory_key_is_throttled_after_one_cycle() -> None:
+    reporter = _quiet_sync_reporter()
+    state = reporter._untracked_state
+    assert state is not None
+    key = ("openai", "openai_sdk", "sync", "responses.create")
+    state.observe(
+        context=SurfaceContext(
+            provider="openai",
+            dialect="openai",
+            client_shape="openai_sdk",
+            mode="sync",
+        ),
+        surface="responses.create",
+        rule_kind="unmetered_spend",
+        capability_scope="future_scope",
+        posture="warn",
+        seen_at=datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
+    )
+
+    try:
+        with (
+            patch("solwyn.reporter._monotonic", return_value=100.0),
+            patch.object(reporter._http, "post", return_value=_ok_response()) as post,
+        ):
+            reporter._flush_untracked_reports()
+
+        post.assert_not_called()
+        assert state.last_attempted_at[key] == 100.0
+        assert state.reports_due(999.999) is False
+        assert state.reports_due(1_000.0) is True
     finally:
         reporter._http.close()
 
@@ -408,36 +470,56 @@ def test_sync_mixed_batch_outcome_advances_only_successful_batch() -> None:
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "second_api_key",
-    [API_KEY, "sk_test_second_project_abcdefghijklmnopqrstuvwxyz"],
+    [VALID_API_KEY, "sk_proj_" + "b" * 64],
     ids=["same-project-key", "different-project-key"],
 )
 def test_sync_reporters_only_drain_their_originating_observations(second_api_key: str) -> None:
-    first = _quiet_sync_reporter()
-    with patch("solwyn.reporter.MetadataReporter._flush_loop"):
-        second = MetadataReporter(API_URL, second_api_key, sdk_instance_id="sdk-instance-second")
-    second._thread.join(timeout=2.0)
-    _observe(first, n=2)
+    first = Solwyn(
+        _UntrackedOpenAIClient(),
+        api_key=VALID_API_KEY,
+        on_unmetered="allow",
+        reporter_flush_interval=3_600.0,
+    )
+    second = Solwyn(
+        _UntrackedOpenAIClient(),
+        api_key=second_api_key,
+        on_unmetered="allow",
+        reporter_flush_interval=3_600.0,
+    )
 
     try:
         with (
-            patch.object(first._http, "post", return_value=_ok_response()) as first_post,
-            patch.object(second._http, "post", return_value=_ok_response()) as second_post,
+            patch.object(first._reporter, "_start_untracked_cycle") as first_start,
+            patch.object(second._reporter, "_start_untracked_cycle") as second_start,
         ):
-            first._flush_untracked_reports()
-            second._flush_untracked_reports()
+            assert first.post() == "posted"
+            assert first.post() == "posted"
+
+        assert first_start.call_count == 2
+        second_start.assert_not_called()
+        with (
+            patch.object(first._reporter._http, "post", return_value=_ok_response()) as first_post,
+            patch.object(
+                second._reporter._http,
+                "post",
+                return_value=_ok_response(),
+            ) as second_post,
+        ):
+            first._reporter._flush_untracked_reports()
+            second._reporter._flush_untracked_reports()
 
         first_post.assert_called_once()
         assert first_post.call_args.kwargs["json"][0]["occurrences"] == 2
         second_post.assert_not_called()
         assert (
-            _base._untracked_surface_observations[
-                ("openai", "openai_sdk", "sync", "responses.create")
-            ]["occurrences"]
+            _base._untracked_surface_observations[("openai", "openai_sdk", "sync", "post")][
+                "occurrences"
+            ]
             == 2
         )
     finally:
-        first._http.close()
-        second._http.close()
+        first.close()
+        second.close()
 
 
 @pytest.mark.unit
@@ -654,30 +736,49 @@ def test_advisory_notifier_failure_never_escapes_the_provider_call_path() -> Non
 
 
 @pytest.mark.unit
-def test_sync_untracked_only_call_wakes_reporter_without_budget_bootstrap() -> None:
+def test_sync_shipping_defaults_post_exact_advisory_wire_without_budget_bootstrap(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     client = Solwyn(
         _UntrackedOpenAIClient(),
         api_key=VALID_API_KEY,
-        on_unmetered="allow",
         reporter_flush_interval=3_600.0,
     )
     sent = threading.Event()
     caller_thread = threading.current_thread()
+    wire_calls: list[tuple[str, dict[str, object], threading.Thread]] = []
 
-    def send(url: str, **_kwargs: object) -> MagicMock:
-        assert url == f"{client._config.api_url}/api/v1/untracked-surfaces"
-        assert threading.current_thread() is not caller_thread
+    def send(url: str, **kwargs: object) -> MagicMock:
+        wire_calls.append((url, kwargs, threading.current_thread()))
         sent.set()
         return _ok_response()
 
     try:
+        assert client._config.on_unmetered == "warn"
+        assert client._config.report_untracked_surfaces is True
         with (
             patch.object(client._reporter._http, "post", side_effect=send),
             patch.object(client._budget._http, "post") as budget_post,
         ):
-            assert client.post() == "posted"
+            with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+                assert client.post() == "posted"
             assert sent.wait(timeout=1.0), "origin reporter was not woken by observation"
             budget_post.assert_not_called()
+        assert len(wire_calls) == 1
+        url, kwargs, worker_thread = wire_calls[0]
+        assert url == f"{client._config.api_url}/api/v1/untracked-surfaces"
+        assert worker_thread is not caller_thread
+        assert kwargs["headers"] == {
+            "Authorization": f"Bearer {VALID_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        body = kwargs["json"]
+        assert isinstance(body, list)
+        assert len(body) == 1
+        assert set(body[0]) == EXPECTED_UNTRACKED_SURFACE_REPORT_FIELDS
+        assert body[0]["surface"] == "post"
+        assert body[0]["posture"] == "warn"
+        assert len(foreground_records(caplog)) == 1
     finally:
         client.close()
 
@@ -951,6 +1052,68 @@ def test_sync_close_initiates_final_due_untracked_cycle_before_transport_close()
 
 
 @pytest.mark.unit
+def test_sync_close_waits_for_an_active_untracked_worker() -> None:
+    reporter = _quiet_sync_reporter()
+    _observe(reporter)
+    started = threading.Event()
+    release = threading.Event()
+    close_completed = threading.Event()
+    close_reached_advisory_join = threading.Event()
+
+    def send(_url: str, **_kwargs: object) -> MagicMock:
+        started.set()
+        release.wait(timeout=2.0)
+        return _ok_response()
+
+    def close_reporter() -> None:
+        reporter.close(timeout=1.0)
+        close_completed.set()
+
+    original_seal = reporter._seal_delivery
+
+    def seal_delivery() -> None:
+        original_seal()
+        close_reached_advisory_join.set()
+
+    closer = threading.Thread(target=close_reporter, daemon=True)
+    try:
+        with (
+            patch.object(reporter._http, "post", side_effect=send) as post,
+            patch.object(reporter, "_seal_delivery", side_effect=seal_delivery),
+        ):
+            worker = reporter._start_untracked_cycle()
+            assert worker is not None
+            assert started.wait(timeout=1.0)
+
+            closer.start()
+            assert close_reached_advisory_join.wait(timeout=1.0)
+            assert close_completed.is_set() is False
+            release.set()
+            assert close_completed.wait(timeout=1.0)
+            closer.join(timeout=1.0)
+
+        post.assert_called_once()
+        assert not closer.is_alive()
+    finally:
+        release.set()
+        if closer.is_alive():
+            closer.join(timeout=1.0)
+        reporter._shutdown.set()
+        reporter._http.close()
+
+
+@pytest.mark.unit
+def test_sync_close_does_not_start_untracked_work_after_deadline() -> None:
+    reporter = _quiet_sync_reporter()
+    _observe(reporter)
+
+    with patch.object(reporter, "_start_untracked_cycle") as start_cycle:
+        reporter.close(timeout=0.0)
+
+    start_cycle.assert_not_called()
+
+
+@pytest.mark.unit
 @pytest.mark.asyncio
 async def test_async_close_initiates_final_due_untracked_cycle_before_transport_close() -> None:
     reporter = _async_reporter()
@@ -967,6 +1130,55 @@ async def test_async_close_initiates_final_due_untracked_cycle_before_transport_
     post.assert_awaited_once()
     assert post.call_args.args[0] == f"{API_URL}/api/v1/untracked-surfaces"
     assert reporter.dropped_counts == {}
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_close_waits_for_an_active_untracked_task() -> None:
+    reporter = _async_reporter()
+    _observe(reporter, mode="async")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    close_reached_advisory_join = asyncio.Event()
+
+    async def send(_url: str, **_kwargs: object) -> MagicMock:
+        started.set()
+        await release.wait()
+        return _ok_response()
+
+    original_seal = reporter._seal_delivery
+
+    def seal_delivery() -> None:
+        original_seal()
+        close_reached_advisory_join.set()
+
+    with (
+        patch.object(reporter._http, "post", new=AsyncMock(side_effect=send)) as post,
+        patch.object(reporter, "_seal_delivery", side_effect=seal_delivery),
+    ):
+        task = reporter._start_untracked_cycle()
+        assert task is not None
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
+        close_task = asyncio.create_task(reporter.close(timeout=1.0))
+        await asyncio.wait_for(close_reached_advisory_join.wait(), timeout=1.0)
+        assert close_task.done() is False
+        release.set()
+        await asyncio.wait_for(close_task, timeout=1.0)
+
+    post.assert_awaited_once()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_close_does_not_start_untracked_work_after_deadline() -> None:
+    reporter = _async_reporter()
+    _observe(reporter, mode="async")
+
+    with patch.object(reporter, "_start_untracked_cycle") as start_cycle:
+        await reporter.close(timeout=0.0)
+
+    start_cycle.assert_not_called()
 
 
 @pytest.mark.unit

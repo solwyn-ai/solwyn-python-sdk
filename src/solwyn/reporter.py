@@ -243,7 +243,14 @@ class _UntrackedReportState:
                 )
             except Exception:
                 # S1 validates each structural field before observation. A
-                # corrupted private-test entry remains advisory and silent.
+                # corrupted private-test entry remains advisory and silent,
+                # but it must still advance cadence: leaving the key due would
+                # make both worker completion hooks respawn without a delay.
+                with self.lock:
+                    if generation == self.generation:
+                        attempted_at = self.last_attempted_at.get(key)
+                        if attempted_at is None or now > attempted_at:
+                            self.last_attempted_at[key] = now
                 continue
             reports.append(
                 _BuiltUntrackedReport(
@@ -1768,6 +1775,12 @@ class AsyncMetadataReporter(_ReporterBase):
     def _notify_untracked_observation(self) -> None:
         """Start/wake advisory delivery without awaiting or doing network I/O."""
         if self._untracked_state is None:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Advisory state is retained for close()/GC/atexit. Unlike spend
+            # events, it does not need to consume the no-loop warning latch.
             return
         try:
             self._ensure_started()

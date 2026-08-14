@@ -58,6 +58,10 @@ derived from git tags (hatch-vcs).
   retained raw clients, private wrapper state, explicitly acknowledged scoped
   raw escapes, and native behavior on returned provider objects remain outside
   its enforcement boundary.
+- **Identifier-clean provider paths that exceed advisory wire limits keep the
+  configured local posture.** `warn` logs once and forwards, while `allow`
+  forwards silently; neither posture sends the over-length or over-depth path
+  externally. Malformed and non-ASCII public paths still fail closed.
 - **`run_stopped` denials now stay sticky only for their run.** Per-call and
   lease denials use the same run-scoped classification as `agent_run`, so a
   control-plane outage cannot replay a dashboard stop against unrelated run

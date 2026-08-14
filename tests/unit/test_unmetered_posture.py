@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import VALID_API_KEY, foreground_records
@@ -221,6 +221,22 @@ class _OpaqueClient(_OpenAIClient):
         self.opaque = object()
 
 
+class _DeepDynamicResource:
+    def __getattr__(self, name: str) -> Any:
+        if name == "call":
+            return lambda: "called"
+        return self
+
+
+class _DeepOpenAIClient(_OpenAIClient):
+    @functools.cached_property
+    def deep(self) -> _DeepDynamicResource:
+        return _DeepDynamicResource()
+
+
+_DeepDynamicResource.__module__ = "openai.resources.deep"
+
+
 for _client_type in (
     _OpenAIClient,
     _MissingResponsesClient,
@@ -229,6 +245,7 @@ for _client_type in (
     _DriftedBaseURLClient,
     _DriftedPostClient,
     _OpaqueClient,
+    _DeepOpenAIClient,
 ):
     _client_type.__module__ = "openai._client"
 
@@ -1057,12 +1074,12 @@ def test_strict_invisible_dynamic_unknown_refuses_before_descriptor_evaluation()
     "surface",
     [
         "café",
-        "a" * 129,
-        "a.a.a.a.a.a.a.a.a",
+        "not public",
+        "a..b",
     ],
-    ids=["unicode", "overlong", "overdeep"],
+    ids=["unicode", "space", "empty-segment"],
 )
-def test_dynamic_access_cannot_create_an_invalid_wire_surface_observation(
+def test_dynamic_access_rejects_a_non_structural_public_surface(
     surface: str,
 ) -> None:
     from solwyn import _base
@@ -1073,6 +1090,68 @@ def test_dynamic_access_cannot_create_an_invalid_wire_surface_observation(
         getattr(wrapper, surface)
 
     assert _base._untracked_surface_observations == {}
+    _close(wrapper)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("posture", ["warn", "allow"])
+def test_overlong_identifier_forwards_without_an_advisory_observation(
+    posture: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from solwyn import _base
+
+    surface = "a" * 129
+    wrapper = _make_solwyn(_DynamicOpenAIClient(), on_unmetered=posture)
+    notifier = wrapper._untracked_observation_notifier
+    assert isinstance(notifier, MagicMock)
+    notifier.reset_mock()
+
+    with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+        first = getattr(wrapper, surface)
+        second = getattr(wrapper, surface)
+
+    assert first() == surface
+    assert second() == surface
+    assert ("openai", "openai_sdk", "sync", surface) not in _base._untracked_surface_observations
+    notifier.assert_not_called()
+    records = foreground_records(caplog)
+    assert len(records) == (1 if posture == "warn" else 0)
+    _close(wrapper)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("posture", ["warn", "allow"])
+def test_nine_segment_identifier_chain_forwards_without_an_advisory_observation(
+    posture: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from solwyn import _base
+
+    wrapper = _make_solwyn(_DeepOpenAIClient(), on_unmetered=posture)
+    resource = wrapper.deep
+    for segment in ("one", "two", "three", "four", "five", "six", "seven"):
+        resource = getattr(resource, segment)
+    terminal_path = "deep.one.two.three.four.five.six.seven.call"
+    notifier = wrapper._untracked_observation_notifier
+    assert isinstance(notifier, MagicMock)
+    notifier.reset_mock()
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+        assert hasattr(resource, "call") is True
+        terminal = resource.call
+
+    assert terminal() == "called"
+    assert (
+        "openai",
+        "openai_sdk",
+        "sync",
+        terminal_path,
+    ) not in _base._untracked_surface_observations
+    notifier.assert_not_called()
+    records = foreground_records(caplog)
+    assert len(records) == (1 if posture == "warn" else 0)
     _close(wrapper)
 
 
