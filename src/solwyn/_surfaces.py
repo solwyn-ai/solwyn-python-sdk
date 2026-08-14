@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import zlib
 from collections import defaultdict
 from collections.abc import Iterable
@@ -21,6 +22,8 @@ from typing import Any
 # requires regenerating the payload IN THE SAME COMMIT (a mismatched payload
 # fails at import, which also disables the export/embed tooling until fixed).
 CONTRACT_VERSION = 1
+_SURFACE_PATH_MAX_LENGTH = 128
+_SURFACE_PATH_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*){0,7}")
 
 DIALECT_BY_PROVIDER: dict[str, str] = {
     "anthropic": "anthropic",
@@ -428,11 +431,13 @@ def payload_fingerprint(rules: Iterable[SurfaceRule] | None = None) -> str:
 
 def _validate_surface_path(path: str) -> None:
     parts = path.split(".")
-    invalid_part = any(
-        not part or not part.isidentifier() or part.startswith("_") for part in parts
-    )
-    if not path or invalid_part:
-        raise RuntimeError(f"invalid public surface path: {path!r}")
+    private_part = any(part.startswith("_") for part in parts)
+    if (
+        len(path) > _SURFACE_PATH_MAX_LENGTH
+        or _SURFACE_PATH_PATTERN.fullmatch(path) is None
+        or private_part
+    ):
+        raise RuntimeError("invalid public surface path")
 
 
 def _build_surface_rules() -> tuple[SurfaceRule, ...]:

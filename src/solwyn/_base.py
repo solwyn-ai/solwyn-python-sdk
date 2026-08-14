@@ -18,7 +18,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn, TypedDict, cast
 
 from pydantic import BaseModel, ConfigDict
 
@@ -168,10 +168,22 @@ def _warn_cost_policy_inactive_once() -> None:
     logger.warning("CostPolicy selected but no price hints available; using health-based order")
 
 
-# Per-process warn-once state is keyed by the complete contextual rule identity
-# and drift state, so matching and drift warnings cannot suppress each other.
-_WARNED_SURFACE_LIMIT = 512
-_warned_contextual_surfaces: set[tuple[str, str, str, str, bool]] = set()
+# Per-process observations contain only structural capability data. The registry
+# doubles as the warning latch: every hit increments its counter, while only a
+# newly inserted warn-posture key emits the contextual warning.
+class _UntrackedSurfaceObservation(TypedDict):
+    occurrences: int
+    first_seen_at: datetime
+    last_seen_at: datetime
+    rule_kind: Literal["unmetered_spend", "unknown"]
+    capability_scope: str | None
+    posture: Literal["warn", "allow"]
+    # Local-only latch state; reporters serialize only the wire fields above.
+    warning_emitted: bool
+
+
+_UNTRACKED_SURFACE_LIMIT = 512
+_untracked_surface_observations: dict[tuple[str, str, str, str], _UntrackedSurfaceObservation] = {}
 _warn_limit_reached = False
 _spend_surface_warn_lock = threading.Lock()
 
@@ -187,47 +199,91 @@ if hasattr(os, "register_at_fork"):
 
 
 def _reset_unmetered_spend_warnings() -> None:
-    """Clear the per-process warn-once latch. Test-support hook only."""
+    """Clear per-process untracked observations and warning state for tests."""
     global _warn_limit_reached
     with _spend_surface_warn_lock:
-        _warned_contextual_surfaces.clear()
+        _untracked_surface_observations.clear()
         _warn_limit_reached = False
+
+
+def _record_untracked_surface_observation(
+    *,
+    context: SurfaceContext,
+    surface: str,
+    rule_kind: Literal["unmetered_spend", "unknown"],
+    capability_scope: str | None,
+    posture: Literal["warn", "allow"],
+) -> Literal["warn", "silent", "full"]:
+    """Record one content-free observation and return its registry status."""
+
+    _validate_surface_path(surface)
+    observation_key = (
+        context.provider,
+        context.client_shape,
+        context.mode,
+        surface,
+    )
+    with _spend_surface_warn_lock:
+        seen_at = datetime.now(UTC)
+        observation = _untracked_surface_observations.get(observation_key)
+        if observation is not None:
+            should_warn = posture == "warn" and not observation["warning_emitted"]
+            observation["occurrences"] += 1
+            observation["first_seen_at"] = min(observation["first_seen_at"], seen_at)
+            observation["last_seen_at"] = max(observation["last_seen_at"], seen_at)
+            observation["rule_kind"] = rule_kind
+            observation["capability_scope"] = capability_scope
+            observation["posture"] = posture
+            if should_warn:
+                observation["warning_emitted"] = True
+                return "warn"
+            return "silent"
+        if len(_untracked_surface_observations) >= _UNTRACKED_SURFACE_LIMIT:
+            return "full"
+        _untracked_surface_observations[observation_key] = {
+            "occurrences": 1,
+            "first_seen_at": seen_at,
+            "last_seen_at": seen_at,
+            "rule_kind": rule_kind,
+            "capability_scope": capability_scope,
+            "posture": posture,
+            "warning_emitted": posture == "warn",
+        }
+        return "warn" if posture == "warn" else "silent"
 
 
 def _warn_contextual_surface_once(
     *,
     context: SurfaceContext,
-    rule_id: str,
     surface: str,
+    rule_kind: Literal["unmetered_spend", "unknown"],
     capability_scope: str | None,
     drifted_from_rule_id: str | None = None,
 ) -> None:
-    """Warn once per provider/client-shape/mode/rule/drift identity, bounded in size."""
+    """Record every hit and warn once per provider/client-shape/mode/surface."""
 
     global _warn_limit_reached
-    warning_key = (
-        context.provider,
-        context.client_shape,
-        context.mode,
-        rule_id,
-        drifted_from_rule_id is not None,
+    registry_status = _record_untracked_surface_observation(
+        context=context,
+        surface=surface,
+        rule_kind=rule_kind,
+        capability_scope=capability_scope,
+        posture="warn",
     )
+    if registry_status == "silent":
+        return
     warn_limit_reached_now = False
-    with _spend_surface_warn_lock:
-        if warning_key in _warned_contextual_surfaces:
-            return
-        if len(_warned_contextual_surfaces) >= _WARNED_SURFACE_LIMIT:
+    if registry_status == "full":
+        with _spend_surface_warn_lock:
             if _warn_limit_reached:
                 return
             _warn_limit_reached = True
             warn_limit_reached_now = True
-        else:
-            _warned_contextual_surfaces.add(warning_key)
     if warn_limit_reached_now:
         logger.warning(
             "Untracked-surface warning limit (%d) reached; further distinct "
             "surfaces will not be individually reported this process.",
-            _WARNED_SURFACE_LIMIT,
+            _UNTRACKED_SURFACE_LIMIT,
         )
         return
     if drifted_from_rule_id is not None:
@@ -998,22 +1054,21 @@ class _SolwynBase:
             else None
         )
         kind = rule.kind.value if rule is not None else SurfaceKind.UNKNOWN.value
-        if rule is not None:
-            rule_id = rule.rule_id
-        elif drifted_from is not None:
-            rule_id = drifted_from.rule_id
-        else:
-            rule_id = (
-                f"unknown:{self._surface_context.client_shape}:{self._surface_context.mode}:"
-                f"{self._surface_context.provider}:{path}"
+        posture = self._config.on_unmetered
+        if posture == "allow":
+            _record_untracked_surface_observation(
+                context=self._surface_context,
+                surface=path,
+                rule_kind=cast(Literal["unmetered_spend", "unknown"], kind),
+                capability_scope=scope,
+                posture="allow",
             )
-        if self._config.on_unmetered == "allow":
             return
-        if self._config.on_unmetered == "warn":
+        if posture == "warn":
             _warn_contextual_surface_once(
                 context=self._surface_context,
-                rule_id=rule_id,
                 surface=path,
+                rule_kind=cast(Literal["unmetered_spend", "unknown"], kind),
                 capability_scope=scope,
                 drifted_from_rule_id=(drifted_from.rule_id if drifted_from is not None else None),
             )
