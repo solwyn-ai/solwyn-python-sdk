@@ -284,6 +284,28 @@ def test_async_finalizer_flushes_due_untracked_observation_on_gc(
 
 
 @pytest.mark.unit
+def test_async_finalizer_has_no_untracked_delivery_state_when_reporting_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink: list[str] = []
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
+
+    reporter = AsyncMetadataReporter(
+        _URL,
+        VALID_API_KEY,
+        sdk_instance_id="gc-disabled-instance",
+        report_untracked_surfaces=False,
+    )
+    _observe_untracked(reporter)
+
+    assert reporter._untracked_state is None
+    del reporter
+    gc.collect()
+
+    assert f"{_URL}/api/v1/untracked-surfaces" not in sink
+
+
+@pytest.mark.unit
 def test_blocking_exit_flush_initiates_due_untracked_cycle_without_spend_drops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -295,6 +317,28 @@ def test_blocking_exit_flush_initiates_due_untracked_cycle_without_spend_drops(
     blocking_exit_flush(reporter)
 
     assert f"{_URL}/api/v1/untracked-surfaces" in sink
+    assert reporter.dropped_counts == {}
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+
+
+@pytest.mark.unit
+def test_blocking_exit_flush_skips_untracked_delivery_when_reporting_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink: list[str] = []
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
+    reporter = AsyncMetadataReporter(
+        _URL,
+        VALID_API_KEY,
+        sdk_instance_id="exit-disabled-instance",
+        report_untracked_surfaces=False,
+    )
+    _observe_untracked(reporter)
+
+    blocking_exit_flush(reporter)
+
+    assert f"{_URL}/api/v1/untracked-surfaces" not in sink
     assert reporter.dropped_counts == {}
     if reporter._finalizer is not None:
         reporter._finalizer.detach()

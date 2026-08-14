@@ -287,6 +287,7 @@ class _ReporterBase:
         | None = None,
         sdk_instance_id: str | None = None,
         breaker_reporting_enabled: bool = True,
+        report_untracked_surfaces: bool = True,
         breaker_report_heartbeat: float = 60.0,
         control_plane_breaker: CircuitBreaker | None = None,
         max_send_attempts: int = 5,
@@ -329,7 +330,9 @@ class _ReporterBase:
         # keeps differing from its snapshot and self-retries next cycle.
         self._breaker_last_sent: dict[str, tuple[CircuitState, int, int]] = {}
         self._breaker_heartbeat_at = 0.0
-        self._untracked_state = _UntrackedReportState(sdk_instance_id)
+        self._untracked_state = (
+            _UntrackedReportState(sdk_instance_id) if report_untracked_surfaces else None
+        )
 
         # Plain deques (NO maxlen): bounds are enforced by _enqueue_owned so an
         # overflow is COUNTED, not silently dropped by the deque itself. The
@@ -460,7 +463,10 @@ class _ReporterBase:
         seen_at: datetime,
     ) -> None:
         """Record one content-free observation owned by this reporter instance."""
-        self._untracked_state.observe(
+        state = self._untracked_state
+        if state is None:
+            return
+        state.observe(
             context=context,
             surface=surface,
             rule_kind=rule_kind,
@@ -475,19 +481,25 @@ class _ReporterBase:
 
     def _build_untracked_reports(self) -> list[_BuiltUntrackedReport]:
         """Build eligible per-key deltas without advancing successful-send state."""
-        return self._untracked_state.build_reports(_monotonic())
+        state = self._untracked_state
+        return [] if state is None else state.build_reports(_monotonic())
 
     def _untracked_reports_due(self) -> bool:
         """Cheap cadence/delta pre-check for the reporter flush loop."""
-        return self._untracked_state.reports_due(_monotonic())
+        state = self._untracked_state
+        return state is not None and state.reports_due(_monotonic())
 
     def _mark_untracked_reports_attempted(self, reports: list[_BuiltUntrackedReport]) -> None:
         """Advance cadence for every network attempt, successful or otherwise."""
-        self._untracked_state.mark_attempted(reports, _monotonic())
+        state = self._untracked_state
+        if state is not None:
+            state.mark_attempted(reports, _monotonic())
 
     def _mark_untracked_reports_sent(self, reports: list[_BuiltUntrackedReport]) -> None:
         """Advance delta baselines only after a successful POST."""
-        self._untracked_state.mark_sent(reports)
+        state = self._untracked_state
+        if state is not None:
+            state.mark_sent(reports)
 
     # ------------------------------------------------------------------
     # Queueing + bounds
@@ -861,6 +873,7 @@ class MetadataReporter(_ReporterBase):
         | None = None,
         sdk_instance_id: str | None = None,
         breaker_reporting_enabled: bool = True,
+        report_untracked_surfaces: bool = True,
         breaker_report_heartbeat: float = 60.0,
         control_plane_breaker: CircuitBreaker | None = None,
         max_send_attempts: int = 5,
@@ -878,6 +891,7 @@ class MetadataReporter(_ReporterBase):
             breaker_snapshots=breaker_snapshots,
             sdk_instance_id=sdk_instance_id,
             breaker_reporting_enabled=breaker_reporting_enabled,
+            report_untracked_surfaces=report_untracked_surfaces,
             breaker_report_heartbeat=breaker_report_heartbeat,
             control_plane_breaker=control_plane_breaker,
             max_send_attempts=max_send_attempts,
@@ -948,7 +962,8 @@ class MetadataReporter(_ReporterBase):
         """
         self._breaker_project_lock = threading.Lock()
         self._breaker_report_lock = threading.Lock()
-        self._untracked_state.reset_lock_after_fork()
+        if self._untracked_state is not None:
+            self._untracked_state.reset_lock_after_fork()
         self._drop_lock = threading.Lock()
         self._in_flight_lock = threading.Lock()
         self._breaker_worker_lock = threading.Lock()
@@ -970,6 +985,8 @@ class MetadataReporter(_ReporterBase):
 
     def _notify_untracked_observation(self) -> None:
         """Wake the origin reporter without doing network I/O on the caller thread."""
+        if self._untracked_state is None:
+            return
         try:
             self._ensure_thread()
             if self._untracked_reports_due():
@@ -1436,6 +1453,8 @@ class MetadataReporter(_ReporterBase):
         deadline: float | None = None,
     ) -> threading.Thread | None:
         """Start one advisory report cycle, coalescing concurrent flush ticks."""
+        if self._untracked_state is None:
+            return None
         with self._untracked_worker_lock:
             if (self._shutdown.is_set() and not during_shutdown) or self._deadline_expired(
                 deadline
@@ -1638,6 +1657,7 @@ class AsyncMetadataReporter(_ReporterBase):
         | None = None,
         sdk_instance_id: str | None = None,
         breaker_reporting_enabled: bool = True,
+        report_untracked_surfaces: bool = True,
         breaker_report_heartbeat: float = 60.0,
         control_plane_breaker: CircuitBreaker | None = None,
         max_send_attempts: int = 5,
@@ -1655,6 +1675,7 @@ class AsyncMetadataReporter(_ReporterBase):
             breaker_snapshots=breaker_snapshots,
             sdk_instance_id=sdk_instance_id,
             breaker_reporting_enabled=breaker_reporting_enabled,
+            report_untracked_surfaces=report_untracked_surfaces,
             breaker_report_heartbeat=breaker_report_heartbeat,
             control_plane_breaker=control_plane_breaker,
             max_send_attempts=max_send_attempts,
@@ -1698,7 +1719,8 @@ class AsyncMetadataReporter(_ReporterBase):
         """
         self._breaker_project_lock = threading.Lock()
         self._breaker_report_lock = threading.Lock()
-        self._untracked_state.reset_lock_after_fork()
+        if self._untracked_state is not None:
+            self._untracked_state.reset_lock_after_fork()
         self._drop_lock = threading.Lock()
         self._ownership_lock = threading.Lock()
         self._in_flight = 0
@@ -1726,6 +1748,8 @@ class AsyncMetadataReporter(_ReporterBase):
 
     def _notify_untracked_observation(self) -> None:
         """Start/wake advisory delivery without awaiting or doing network I/O."""
+        if self._untracked_state is None:
+            return
         try:
             self._ensure_started()
             if self._flush_task is None or self._flush_task.done():
@@ -2182,6 +2206,8 @@ class AsyncMetadataReporter(_ReporterBase):
         deadline: float | None = None,
     ) -> asyncio.Task[None] | None:
         """Start one advisory report task, coalescing concurrent flush ticks."""
+        if self._untracked_state is None:
+            return None
         if (
             self._shutdown_event is not None
             and self._shutdown_event.is_set()

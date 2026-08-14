@@ -277,6 +277,32 @@ class TestEnvVarConstruction:
 
         solwyn.close()
 
+    @pytest.mark.parametrize(
+        ("env_val", "expected"),
+        [
+            ("true", True),
+            ("1", True),
+            ("yes", True),
+            ("false", False),
+            ("0", False),
+            ("no", False),
+        ],
+    )
+    def test_untracked_surface_reporting_boolean_coercion(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env_val: str,
+        expected: bool,
+    ) -> None:
+        monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.setenv("SOLWYN_REPORT_UNTRACKED_SURFACES", env_val)
+
+        solwyn = _make_solwyn(_mock_openai_client())
+
+        assert solwyn._config.report_untracked_surfaces is expected
+
+        solwyn.close()
+
 
 @pytest.mark.unit
 class TestControlPlaneConfig:
@@ -780,6 +806,12 @@ class TestUnmeteredPostureConfig:
 
         assert config.on_unmetered == "warn"
         assert config.acknowledge_untracked == frozenset()
+        assert config.report_untracked_surfaces is True
+
+    def test_untracked_surface_reporting_can_be_disabled_by_constructor(self) -> None:
+        config = self._config(report_untracked_surfaces=False)
+
+        assert config.report_untracked_surfaces is False
 
     @pytest.mark.parametrize("posture", ["warn", "raise", "allow"])
     def test_posture_accepts_the_three_contract_literals(self, posture: str) -> None:

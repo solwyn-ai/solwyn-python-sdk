@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from datetime import UTC, datetime
 from typing import get_args
@@ -469,6 +470,34 @@ def test_sync_untracked_only_call_wakes_reporter_without_budget_bootstrap() -> N
 
 
 @pytest.mark.unit
+def test_sync_disabled_reporting_stays_local_through_periodic_flush_and_close(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = Solwyn(
+        _UntrackedOpenAIClient(),
+        api_key=VALID_API_KEY,
+        on_unmetered="warn",
+        report_untracked_surfaces=False,
+        reporter_flush_interval=0.01,
+    )
+
+    with patch.object(client._reporter._http, "post", return_value=_ok_response()) as post:
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+            assert client.post() == "posted"
+            assert client.post() == "posted"
+        threading.Event().wait(0.03)
+        client.close()
+
+    key = ("openai", "openai_sdk", "sync", "post")
+    assert _base._untracked_surface_observations[key]["occurrences"] == 2
+    assert len([record for record in caplog.records if record.name == "solwyn._base"]) == 1
+    assert client._untracked_observation_notifier is None
+    assert client._reporter._untracked_state is None
+    assert client._reporter._untracked_worker is None
+    post.assert_not_called()
+
+
+@pytest.mark.unit
 def test_sync_untracked_observation_restarts_and_wakes_reporter_after_fork() -> None:
     reporter = _quiet_sync_reporter()
     parent_http = reporter._http
@@ -647,6 +676,40 @@ async def test_async_untracked_only_call_auto_starts_and_wakes_reporter() -> Non
             budget_post.assert_not_awaited()
     finally:
         await client.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_disabled_reporting_stays_local_through_periodic_flush_and_close(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client = AsyncSolwyn(
+        _UntrackedAsyncOpenAIClient(),
+        api_key=VALID_API_KEY,
+        on_unmetered="warn",
+        report_untracked_surfaces=False,
+        reporter_flush_interval=0.01,
+    )
+    client._reporter.start()
+
+    with patch.object(
+        client._reporter._http,
+        "post",
+        new=AsyncMock(return_value=_ok_response()),
+    ) as post:
+        with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+            assert await client.post() == "posted"
+            assert await client.post() == "posted"
+        await asyncio.sleep(0.03)
+        await client.close()
+
+    key = ("openai", "openai_sdk", "async", "post")
+    assert _base._untracked_surface_observations[key]["occurrences"] == 2
+    assert len([record for record in caplog.records if record.name == "solwyn._base"]) == 1
+    assert client._untracked_observation_notifier is None
+    assert client._reporter._untracked_state is None
+    assert client._reporter._untracked_task is None
+    post.assert_not_awaited()
 
 
 @pytest.mark.unit
