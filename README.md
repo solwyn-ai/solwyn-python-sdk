@@ -248,11 +248,17 @@ Billable quantities are read from the response's usage block where it exists (gp
 
 ## Strict coverage controls
 
-- **OpenAI Responses:** Native OpenAI `responses.create(...)` and
-  `responses.parse(...)` are budget-metered for sync and async clients.
-  `create(stream=True)` is supported; parse is non-streaming and refuses any
-  effective streaming request. The `responses.stream()` context-manager helper
-  and every other Responses leaf remain guarded by `on_unmetered`.
+- **OpenAI Responses:** Native OpenAI `responses.create(...)`,
+  `responses.parse(...)`, and the `responses.stream(...)` context-manager helper
+  are budget-metered for sync and async clients. `create(stream=True)` is
+  supported; parse is non-streaming and refuses any effective streaming
+  request. The stream helper's new-response overload preserves the SDK's
+  context-manager and `get_final_response()` behavior while settling terminal
+  usage or a conservative estimate on early exit. Its existing-response
+  retrieval overload (`response_id` / `starting_after`) creates no new spend,
+  so it is a reviewed raw pass-through: no defaults, budget check, or duplicate
+  settlement are applied. Every other Responses leaf remains guarded by
+  `on_unmetered`.
   `background=True` create calls are refused because queued responses expose no
   create-time usage. Azure/OpenAI-compatible Responses coverage is not claimed.
 
@@ -343,8 +349,8 @@ audit_client = Solwyn(
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
     guarded_namespaces="sha256:38de7d9d718f03bc61f4a24e24f131c1a018434fcb38eb5cb7371290fc72e074",
-    tracked="sha256:81958f506743fd953eae6cfa18451c14fcfcc7f991fd973a2ff876abce878ca9",
-    untracked="sha256:bc2e32616dc36f6ad2db71877951293fbd35eb8625af6aaa232c4262bd7a2aef",
+    tracked="sha256:586f19c33f350871240a3498fbfa255c9759bec35e1285a8fccfeb937ec68148",
+    untracked="sha256:1a3192143f409c0e38edcee32232d411c40706fcddd7a7d729403d67690ffb2c",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     scoped_escapes="sha256:6808a0f2ac290c9d4d1504b21b1c0ba98267636ced4234416b53533b29bb4073",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",

@@ -33,6 +33,7 @@ from solwyn.providers.openai import (
     _is_untracked_tts_model,
     _measure_transcription_media,
 )
+from solwyn.stream import _DeferredAsyncResponsesStreamManagerWrapper
 
 if TYPE_CHECKING:
     from solwyn.client import AsyncSolwyn, Solwyn
@@ -466,10 +467,26 @@ def _reject_responses_background(kwargs: Mapping[str, object]) -> None:
         raise ConfigurationError(_RESPONSES_BACKGROUND_GUIDANCE, field="background")
 
 
-class _SyncResponsesProxy:
-    """Native OpenAI Responses proxy with metered ``create`` and ``parse`` seams.
+def _is_existing_responses_stream(kwargs: Mapping[str, object]) -> bool:
+    """Recognize the SDK's no-new-spend existing-response stream overload."""
+    for name in ("response_id", "starting_after"):
+        if name not in kwargs:
+            continue
+        value_type = type(kwargs[name])
+        module = getattr(value_type, "__module__", "")
+        class_name = getattr(value_type, "__name__", "")
+        if not (
+            (module == "openai" or module.startswith("openai."))
+            and class_name in {"NotGiven", "Omit"}
+        ):
+            return True
+    return False
 
-    Both leaves ride the existing Responses interception pipeline: they are
+
+class _SyncResponsesProxy:
+    """Native OpenAI Responses proxy with metered spend-producing seams.
+
+    These leaves ride the existing Responses interception pipeline: they are
     primary-only, apply only Responses-compatible effective defaults, and
     settle provider-reported usage. Queued background responses are refused
     because create-time usage is unavailable, and parse refuses streaming
@@ -492,6 +509,18 @@ class _SyncResponsesProxy:
         return self._solwyn._intercepted_call(
             _surface="responses",
             _responses_leaf="parse",
+            **kwargs,
+        )
+
+    def stream(self, **kwargs: Any) -> Any:
+        """Return a metered wrapper around OpenAI's stream-manager helper."""
+        self._solwyn._enforce_explicit_surface("responses.stream", source=SurfaceSource.WRAPPER)
+        if _is_existing_responses_stream(kwargs):
+            return self._solwyn._client.responses.stream(**kwargs)
+        _reject_responses_background(kwargs)
+        return self._solwyn._intercepted_call(
+            _surface="responses",
+            _responses_leaf="stream",
             **kwargs,
         )
 
@@ -901,13 +930,13 @@ class _SyncModelsProxy:
 
 
 class _AsyncResponsesProxy:
-    """Async native OpenAI Responses proxy with metered create and parse seams.
+    """Async native OpenAI Responses proxy with metered spend-producing seams.
 
-    This mirrors ``_SyncResponsesProxy``: foreground ``create`` and
-    non-streaming ``parse`` calls use the primary-only Responses pipeline and
-    its filtered effective defaults, while background calls are refused because
-    usage is unavailable at creation. Every other leaf remains a shared-policy
-    raw provider operation.
+    This mirrors ``_SyncResponsesProxy``: foreground ``create``, non-streaming
+    ``parse``, and the ``stream`` manager helper use the primary-only Responses
+    pipeline and its filtered effective defaults, while background calls are
+    refused because usage is unavailable at creation. Every other leaf remains
+    a shared-policy raw provider operation.
     """
 
     def __init__(self, solwyn: AsyncSolwyn) -> None:
@@ -926,6 +955,18 @@ class _AsyncResponsesProxy:
             _surface="responses",
             _responses_leaf="parse",
             **kwargs,
+        )
+
+    def stream(self, **kwargs: Any) -> Any:
+        """Return OpenAI's async-manager shape while deferring Solwyn I/O."""
+        self._solwyn._enforce_explicit_surface("responses.stream", source=SurfaceSource.WRAPPER)
+        if _is_existing_responses_stream(kwargs):
+            return self._solwyn._client.responses.stream(**kwargs)
+        _reject_responses_background(kwargs)
+        return _DeferredAsyncResponsesStreamManagerWrapper(
+            lambda: self._solwyn._intercepted_call(
+                _surface="responses", _responses_leaf="stream", **kwargs
+            )
         )
 
     def __getattr__(self, name: str) -> Any:

@@ -8,6 +8,7 @@ adjacent regression also protects the default chat routing.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 from collections.abc import AsyncIterator, Iterator
@@ -17,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from conftest import VALID_API_KEY, VALID_PROJECT_ID
+from openai import NOT_GIVEN, omit
 
 from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn.client import AsyncSolwyn, Solwyn
@@ -85,6 +87,7 @@ class _SyncResponsesResource:
         self.response = response
         self.create_calls: list[dict[str, object]] = []
         self.parse_calls: list[dict[str, object]] = []
+        self.stream_calls: list[dict[str, object]] = []
         self.retrieve_calls: list[str] = []
 
     def create(self, **kwargs: object) -> object:
@@ -93,6 +96,13 @@ class _SyncResponsesResource:
 
     def parse(self, **kwargs: object) -> object:
         self.parse_calls.append(kwargs)
+        return self.response
+
+    def stream(self, **kwargs: object) -> object:
+        self.stream_calls.append(kwargs)
+        order = getattr(self.response, "order", None)
+        if order is not None:
+            order.append("manager.create")
         return self.response
 
     def retrieve(self, response_id: str) -> object:
@@ -109,6 +119,7 @@ class _AsyncResponsesResource:
         self.response = response
         self.create_calls: list[dict[str, object]] = []
         self.parse_calls: list[dict[str, object]] = []
+        self.stream_calls: list[dict[str, object]] = []
         self.retrieve_calls: list[str] = []
 
     async def create(self, **kwargs: object) -> object:
@@ -117,6 +128,14 @@ class _AsyncResponsesResource:
 
     async def parse(self, **kwargs: object) -> object:
         self.parse_calls.append(kwargs)
+        return self.response
+
+    def stream(self, **kwargs: object) -> object:
+        """Match OpenAI: async ``responses.stream`` returns a manager directly."""
+        self.stream_calls.append(kwargs)
+        order = getattr(self.response, "order", None)
+        if order is not None:
+            order.append("manager.create")
         return self.response
 
     async def retrieve(self, response_id: str) -> object:
@@ -234,6 +253,7 @@ def _mock_openai_client() -> tuple[MagicMock, SimpleNamespace]:
     client.responses = SimpleNamespace(
         create=MagicMock(spec=_sync_call, return_value=response),
         parse=MagicMock(spec=_sync_call, return_value=response),
+        stream=MagicMock(spec=_sync_call),
     )
     client.with_options.return_value = client
     return client, response
@@ -248,6 +268,7 @@ def _mock_async_openai_client() -> tuple[MagicMock, SimpleNamespace]:
     client.responses = SimpleNamespace(
         create=AsyncMock(spec=_async_call, return_value=response),
         parse=AsyncMock(spec=_async_call, return_value=response),
+        stream=MagicMock(spec=_sync_call),
     )
     client.with_options.return_value = client
     return client, response
@@ -360,6 +381,126 @@ class _FakeAsyncStream:
 
     async def aclose(self) -> None:
         self.aclose_calls += 1
+
+
+class _FakeSyncResponseStream(_FakeSyncStream):
+    """SDK inner stream shape, including helpers that consume it directly."""
+
+    def __init__(self, events: list[object], final_response: object) -> None:
+        super().__init__(events)
+        self._iterator = iter(events)
+        self.final_response = final_response
+        self.get_final_response_calls = 0
+
+    def __iter__(self) -> Iterator[object]:
+        return self
+
+    def __next__(self) -> object:
+        return next(self._iterator)
+
+    def get_final_response(self) -> object:
+        self.get_final_response_calls += 1
+        list(self)
+        return self.final_response
+
+
+class _FakeAsyncResponseStream(_FakeAsyncStream):
+    """Async SDK inner stream shape with its coroutine helper."""
+
+    def __init__(self, events: list[object], final_response: object) -> None:
+        super().__init__(events)
+        self._iterator = self._iterate(events)
+        self.final_response = final_response
+        self.get_final_response_calls = 0
+
+    @staticmethod
+    async def _iterate(events: list[object]) -> AsyncIterator[object]:
+        for event in events:
+            yield event
+
+    def __aiter__(self) -> AsyncIterator[object]:
+        return self
+
+    async def __anext__(self) -> object:
+        return await anext(self._iterator)
+
+    async def get_final_response(self) -> object:
+        self.get_final_response_calls += 1
+        async for _event in self:
+            pass
+        return self.final_response
+
+
+class _FakeSyncResponseStreamManager:
+    """OpenAI ResponseStreamManager lifecycle without importing the SDK."""
+
+    def __init__(
+        self,
+        stream: _FakeSyncResponseStream,
+        *,
+        order: list[str] | None = None,
+        enter_error: Exception | None = None,
+        exit_error: Exception | None = None,
+    ) -> None:
+        self.stream = stream
+        self.order = order
+        self.enter_error = enter_error
+        self.exit_error = exit_error
+        self.enter_calls = 0
+        self.exit_calls: list[tuple[object, ...]] = []
+        self._entered = False
+
+    def __enter__(self) -> _FakeSyncResponseStream:
+        self.enter_calls += 1
+        if self.order is not None:
+            self.order.append("manager.open")
+        if self.enter_error is not None:
+            raise self.enter_error
+        self._entered = True
+        return self.stream
+
+    def __exit__(self, *args: object) -> None:
+        self.exit_calls.append(args)
+        if self._entered:
+            self.stream.close()
+        if self.exit_error is not None:
+            raise self.exit_error
+
+
+class _FakeAsyncResponseStreamManager:
+    """OpenAI AsyncResponseStreamManager lifecycle without importing the SDK."""
+
+    def __init__(
+        self,
+        stream: _FakeAsyncResponseStream,
+        *,
+        order: list[str] | None = None,
+        enter_error: Exception | None = None,
+        exit_error: Exception | None = None,
+    ) -> None:
+        self.stream = stream
+        self.order = order
+        self.enter_error = enter_error
+        self.exit_error = exit_error
+        self.enter_calls = 0
+        self.exit_calls: list[tuple[object, ...]] = []
+        self._entered = False
+
+    async def __aenter__(self) -> _FakeAsyncResponseStream:
+        self.enter_calls += 1
+        if self.order is not None:
+            self.order.append("manager.open")
+        if self.enter_error is not None:
+            raise self.enter_error
+        self._entered = True
+        return self.stream
+
+    async def __aexit__(self, *args: object) -> None:
+        self.exit_calls.append(args)
+        if self._entered:
+            await self.stream.aclose()
+        if self.exit_error is not None:
+            raise self.exit_error
 
 
 def _terminal_event(*, service_tier: str = "flex") -> SimpleNamespace:
@@ -508,6 +649,306 @@ class TestResponsesPublicProxySync:
                     "extra_body": {"stream": False},
                 }
             ]
+
+    def test_native_stream_helper_opens_after_one_budget_check_and_settles_terminal_usage(
+        self,
+    ) -> None:
+        order: list[str] = []
+        delta = SimpleNamespace(type="response.output_text.delta", delta="hello")
+        terminal = _terminal_event()
+        inner = _FakeSyncResponseStream([delta, terminal], terminal.response)
+        provider_manager = _FakeSyncResponseStreamManager(inner, order=order)
+        client = _NativeOpenAIClient(provider_manager)
+
+        with _sync_solwyn(
+            client,
+            default_params={"instructions": "12345678", "max_output_tokens": 321},
+        ) as solwyn:
+            check = MagicMock(
+                spec=solwyn._budget.check_budget,
+                side_effect=lambda **_kwargs: (order.append("budget.check"), _allow_budget())[1],
+            )
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                manager = solwyn.responses.stream(
+                    model="gpt-5.5",
+                    input="abcd",
+                    temperature=0.4,
+                )
+                assert order == ["budget.check", "manager.create"]
+                solwyn._reporter.report_settlement.assert_not_called()
+
+                with manager as events:
+                    assert list(events) == [delta, terminal]
+
+            assert order == ["budget.check", "manager.create", "manager.open"]
+            check.assert_called_once()
+            assert client._responses.stream_calls == [
+                {
+                    "model": "gpt-5.5",
+                    "input": "abcd",
+                    "temperature": 0.4,
+                    "instructions": "12345678",
+                    "max_output_tokens": 321,
+                }
+            ]
+            assert provider_manager.enter_calls == 1
+            assert len(provider_manager.exit_calls) == 1
+            assert inner.close_calls == 1
+            solwyn._reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            assert event.input_tokens == 30
+            assert event.output_tokens == 12
+            assert event.service_tier == "flex"
+            assert confirm.token_details == event.token_details
+            assert confirm.service_tier == "flex"
+
+    def test_native_existing_response_stream_is_reviewed_raw_retrieval(self) -> None:
+        inner = _FakeSyncResponseStream([], object())
+        provider_manager = _FakeSyncResponseStreamManager(inner)
+        client = _NativeOpenAIClient(provider_manager)
+
+        with _sync_solwyn(
+            client,
+            default_params={"instructions": "must-not-leak", "max_output_tokens": 321},
+            on_unmetered="raise",
+        ) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                manager = solwyn.responses.stream(
+                    response_id="resp_123",
+                    starting_after=7,
+                    text_format=dict,
+                )
+
+            assert manager is provider_manager
+            assert client._responses.stream_calls == [
+                {
+                    "response_id": "resp_123",
+                    "starting_after": 7,
+                    "text_format": dict,
+                }
+            ]
+            check.assert_not_called()
+            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._reporter.report.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "selector_kwargs",
+        [
+            {"response_id": None},
+            {"response_id": ""},
+            {"response_id": "resp_123", "starting_after": 0},
+        ],
+    )
+    def test_given_falsey_existing_response_selector_remains_raw(
+        self, selector_kwargs: dict[str, object]
+    ) -> None:
+        provider_manager = object()
+        client = _NativeOpenAIClient(provider_manager)
+
+        with _sync_solwyn(client, on_unmetered="raise") as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                manager = solwyn.responses.stream(**selector_kwargs)
+
+            assert manager is provider_manager
+            assert client._responses.stream_calls == [selector_kwargs]
+            check.assert_not_called()
+            solwyn._reporter.report_settlement.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("sentinel_key", "sentinel"),
+        [
+            ("response_id", omit),
+            ("response_id", NOT_GIVEN),
+            ("starting_after", omit),
+            ("starting_after", NOT_GIVEN),
+        ],
+    )
+    def test_omitted_existing_response_selector_still_meters_new_response_stream(
+        self,
+        sentinel_key: str,
+        sentinel: object,
+    ) -> None:
+        terminal = _terminal_event()
+        inner = _FakeSyncResponseStream([terminal], terminal.response)
+        provider_manager = _FakeSyncResponseStreamManager(inner)
+        client = _NativeOpenAIClient(provider_manager)
+
+        with _sync_solwyn(client) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                manager = solwyn.responses.stream(
+                    model="gpt-5.5",
+                    input="1234",
+                    **{sentinel_key: sentinel},
+                )
+                assert manager is not provider_manager
+                with manager as events:
+                    assert list(events) == [terminal]
+
+            check.assert_called_once()
+            assert client._responses.stream_calls == [
+                {
+                    "model": "gpt-5.5",
+                    "input": "1234",
+                    sentinel_key: sentinel,
+                }
+            ]
+            solwyn._reporter.report_settlement.assert_called_once()
+
+    def test_native_stream_helper_abandonment_estimates_and_holds_lease_floor(self) -> None:
+        delta = SimpleNamespace(type="response.output_text.delta", delta="partial")
+        inner = _FakeSyncResponseStream([delta], object())
+        provider_manager = _FakeSyncResponseStreamManager(inner)
+        client = _NativeOpenAIClient(provider_manager)
+
+        with _sync_solwyn(client) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+                solwyn.responses.stream(
+                    model="gpt-5.5",
+                    input="12345678",
+                    max_output_tokens=50,
+                ) as events,
+            ):
+                assert next(events) is delta
+
+            call_id = check.call_args.kwargs["call_id"]
+            true_up.assert_called_once_with(
+                call_id,
+                2,
+                claim_token=7,
+                floor_at_reservation=True,
+            )
+            solwyn._reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            assert event.input_tokens == 2
+            assert event.output_tokens == 0
+            assert event.token_details.is_estimated is True
+            assert confirm.token_details == event.token_details
+
+    def test_native_stream_helper_forwards_get_final_response_without_double_settlement(
+        self,
+    ) -> None:
+        terminal = _terminal_event()
+        inner = _FakeSyncResponseStream([terminal], terminal.response)
+        client = _NativeOpenAIClient(_FakeSyncResponseStreamManager(inner))
+
+        with _sync_solwyn(client) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                solwyn.responses.stream(model="gpt-5.5", input="1234") as events,
+            ):
+                result = events.get_final_response()
+
+            assert result is terminal.response
+            assert hasattr(events, "until_done")
+            assert hasattr(events, "get_final_response")
+            assert inner.get_final_response_calls == 1
+            solwyn._reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            assert event.input_tokens == 30
+            assert event.output_tokens == 12
+            assert event.service_tier == "flex"
+            assert confirm.token_details == event.token_details
+
+    def test_native_stream_helper_close_before_enter_settles_and_closes_manager(self) -> None:
+        inner = _FakeSyncResponseStream([], object())
+        provider_manager = _FakeSyncResponseStreamManager(inner)
+        client = _NativeOpenAIClient(provider_manager)
+
+        with _sync_solwyn(client) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
+                manager.close()
+                manager.close()
+
+            assert provider_manager.enter_calls == 0
+            assert len(provider_manager.exit_calls) == 1
+            solwyn._reporter.report_settlement.assert_called_once()
+            _, event = solwyn._reporter.report_settlement.call_args.args
+            assert event.input_tokens == 1
+            assert event.token_details.is_estimated is True
+
+    def test_native_stream_helper_enter_failure_releases_reservation(self) -> None:
+        error = _Status(503, "stream open failed")
+        inner = _FakeSyncResponseStream([], object())
+        provider_manager = _FakeSyncResponseStreamManager(inner, enter_error=error)
+        client = _NativeOpenAIClient(provider_manager)
+
+        with _sync_solwyn(client) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._budget.release_reservation)
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget, "release_reservation", new=release),
+                pytest.raises(_Status) as exc_info,
+                solwyn.responses.stream(model="gpt-5.5", input="1234"),
+            ):
+                pass
+
+            assert exc_info.value is error
+            release.assert_called_once()
+            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._reporter.report.assert_called_once()
+
+    def test_native_stream_helper_close_failure_does_not_mask_body_exception(self) -> None:
+        inner = _FakeSyncResponseStream([], object())
+        provider_manager = _FakeSyncResponseStreamManager(
+            inner,
+            exit_error=RuntimeError("close failed"),
+        )
+        client = _NativeOpenAIClient(provider_manager)
+
+        with _sync_solwyn(client) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                pytest.raises(ValueError, match="application failed"),
+                solwyn.responses.stream(model="gpt-5.5", input="1234"),
+            ):
+                raise ValueError("application failed")
+
+            solwyn._reporter.report_settlement.assert_called_once()
+
+    def test_native_stream_helper_wrap_failure_releases_and_closes_once(self) -> None:
+        original = ValueError("wrapping failed")
+        inner = _FakeSyncResponseStream([], object())
+        provider_manager = _FakeSyncResponseStreamManager(inner)
+        client = _NativeOpenAIClient(provider_manager)
+
+        with _sync_solwyn(client) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._budget.release_reservation)
+            breaker_failure = MagicMock()
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn, "_wrap_stream", side_effect=original),
+                patch.object(
+                    solwyn._get_circuit_breaker("openai"),
+                    "record_failure",
+                    new=breaker_failure,
+                ),
+            ):
+                manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
+                with pytest.raises(ValueError, match="wrapping failed") as exc_info:
+                    manager.__enter__()
+                manager.close()
+
+            assert exc_info.value is original
+            release.assert_called_once()
+            breaker_failure.assert_called_once_with()
+            solwyn._reporter.report.assert_called_once()
+            solwyn._reporter.report_settlement.assert_not_called()
+            assert len(provider_manager.exit_calls) == 1
+            assert inner.close_calls == 1
 
     def test_native_create_emits_no_unmetered_warning(
         self, caplog: pytest.LogCaptureFixture
@@ -695,6 +1136,68 @@ class TestResponsesPublicProxySync:
                 for record in caplog.records
             )
 
+    def test_compat_stream_helper_remains_warned_raw_manager_passthrough(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        inner = _FakeSyncResponseStream([], object())
+        provider_manager = _FakeSyncResponseStreamManager(inner)
+        client = _GroqClient(provider_manager)
+
+        with _sync_solwyn(
+            client,
+            model="llama-3.3-70b-versatile",
+            report_untracked_surfaces=False,
+        ) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                caplog.at_level(logging.WARNING, logger="solwyn._base"),
+            ):
+                result = solwyn.responses.stream(
+                    model="llama-3.3-70b-versatile",
+                    input="hello",
+                )
+
+            assert result is provider_manager
+            assert client._responses.stream_calls == [
+                {"model": "llama-3.3-70b-versatile", "input": "hello"}
+            ]
+            check.assert_not_called()
+            assert any(
+                "untracked surface 'responses.stream'" in record.getMessage()
+                for record in caplog.records
+            )
+
+    def test_compat_existing_response_stream_remains_warned_raw_passthrough(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        provider_manager = object()
+        client = _GroqClient(provider_manager)
+
+        with _sync_solwyn(
+            client,
+            model="llama-3.3-70b-versatile",
+            default_params={"instructions": "must-not-leak"},
+            report_untracked_surfaces=False,
+        ) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                caplog.at_level(logging.WARNING, logger="solwyn._base"),
+            ):
+                result = solwyn.responses.stream(response_id="resp_123", starting_after=7)
+
+            assert result is provider_manager
+            assert client._responses.stream_calls == [
+                {"response_id": "resp_123", "starting_after": 7}
+            ]
+            check.assert_not_called()
+            solwyn._reporter.report_settlement.assert_not_called()
+            assert any(
+                "untracked surface 'responses.stream'" in record.getMessage()
+                for record in caplog.records
+            )
+
     def test_strict_acknowledgment_rejects_create_but_allows_retrieve(self) -> None:
         create_client = _NativeOpenAIClient(object())
 
@@ -729,6 +1232,17 @@ class TestResponsesPublicProxySync:
             )
 
         # Assert.
+        assert exc_info.value.field == "acknowledge_untracked"
+
+    def test_strict_acknowledgment_rejects_native_stream(self) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            Solwyn(
+                _NativeOpenAIClient(object()),
+                api_key=VALID_API_KEY,
+                on_unmetered="raise",
+                acknowledge_untracked={"responses.stream"},
+            )
+
         assert exc_info.value.field == "acknowledge_untracked"
 
     def test_namespace_is_cached_for_native_and_compat(self) -> None:
@@ -882,6 +1396,562 @@ class TestResponsesPublicProxyAsync:
                     "extra_body": {"stream": False},
                 }
             ]
+
+    @pytest.mark.asyncio
+    async def test_native_stream_helper_opens_after_one_budget_check_and_settles_terminal_usage(
+        self,
+    ) -> None:
+        order: list[str] = []
+        delta = SimpleNamespace(type="response.output_text.delta", delta="hello")
+        terminal = _terminal_event()
+        inner = _FakeAsyncResponseStream([delta, terminal], terminal.response)
+        provider_manager = _FakeAsyncResponseStreamManager(inner, order=order)
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(
+            client,
+            default_params={"instructions": "12345678", "max_output_tokens": 321},
+        ) as solwyn:
+
+            async def budget_check(**_kwargs: object) -> object:
+                order.append("budget.check")
+                return _allow_budget()
+
+            check = AsyncMock(spec=solwyn._budget.check_budget, side_effect=budget_check)
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                manager = solwyn.responses.stream(
+                    model="gpt-5.5",
+                    input="abcd",
+                    temperature=0.4,
+                )
+                assert order == []
+                solwyn._reporter.report_settlement.assert_not_called()
+
+                async with manager as events:
+                    assert [event async for event in events] == [delta, terminal]
+
+            assert order == ["budget.check", "manager.create", "manager.open"]
+            check.assert_awaited_once()
+            assert client._responses.stream_calls == [
+                {
+                    "model": "gpt-5.5",
+                    "input": "abcd",
+                    "temperature": 0.4,
+                    "instructions": "12345678",
+                    "max_output_tokens": 321,
+                }
+            ]
+            assert provider_manager.enter_calls == 1
+            assert len(provider_manager.exit_calls) == 1
+            assert inner.aclose_calls == 1
+            solwyn._reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            assert event.input_tokens == 30
+            assert event.output_tokens == 12
+            assert event.service_tier == "flex"
+            assert confirm.token_details == event.token_details
+            assert confirm.service_tier == "flex"
+
+    @pytest.mark.asyncio
+    async def test_native_existing_response_stream_is_reviewed_raw_retrieval(self) -> None:
+        inner = _FakeAsyncResponseStream([], object())
+        provider_manager = _FakeAsyncResponseStreamManager(inner)
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(
+            client,
+            default_params={"instructions": "must-not-leak", "max_output_tokens": 321},
+            on_unmetered="raise",
+        ) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                manager = solwyn.responses.stream(
+                    response_id="resp_123",
+                    starting_after=7,
+                    text_format=dict,
+                )
+
+            assert manager is provider_manager
+            assert client._responses.stream_calls == [
+                {
+                    "response_id": "resp_123",
+                    "starting_after": 7,
+                    "text_format": dict,
+                }
+            ]
+            check.assert_not_awaited()
+            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._reporter.report.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "selector_kwargs",
+        [
+            {"response_id": None},
+            {"response_id": ""},
+            {"response_id": "resp_123", "starting_after": 0},
+        ],
+    )
+    async def test_given_falsey_existing_response_selector_remains_raw(
+        self, selector_kwargs: dict[str, object]
+    ) -> None:
+        provider_manager = object()
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(client, on_unmetered="raise") as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                manager = solwyn.responses.stream(**selector_kwargs)
+
+            assert manager is provider_manager
+            assert client._responses.stream_calls == [selector_kwargs]
+            check.assert_not_awaited()
+            solwyn._reporter.report_settlement.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("sentinel_key", "sentinel"),
+        [
+            ("response_id", omit),
+            ("response_id", NOT_GIVEN),
+            ("starting_after", omit),
+            ("starting_after", NOT_GIVEN),
+        ],
+    )
+    async def test_omitted_existing_response_selector_still_meters_new_response_stream(
+        self,
+        sentinel_key: str,
+        sentinel: object,
+    ) -> None:
+        terminal = _terminal_event()
+        inner = _FakeAsyncResponseStream([terminal], terminal.response)
+        provider_manager = _FakeAsyncResponseStreamManager(inner)
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                manager = solwyn.responses.stream(
+                    model="gpt-5.5",
+                    input="1234",
+                    **{sentinel_key: sentinel},
+                )
+                assert manager is not provider_manager
+                async with manager as events:
+                    assert [event async for event in events] == [terminal]
+
+            check.assert_awaited_once()
+            assert client._responses.stream_calls == [
+                {
+                    "model": "gpt-5.5",
+                    "input": "1234",
+                    sentinel_key: sentinel,
+                }
+            ]
+            solwyn._reporter.report_settlement.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_native_stream_helper_defers_pipeline_creation_until_context_entry(
+        self,
+    ) -> None:
+        terminal = _terminal_event()
+        inner = _FakeAsyncResponseStream([terminal], terminal.response)
+        client = _AsyncNativeOpenAIClient(_FakeAsyncResponseStreamManager(inner))
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            intercepted = MagicMock(side_effect=solwyn._intercepted_call)
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn, "_intercepted_call", new=intercepted),
+            ):
+                manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
+                intercepted.assert_not_called()
+
+                async with manager as events:
+                    assert [event async for event in events] == [terminal]
+
+            intercepted.assert_called_once()
+            check.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_native_stream_helper_abandonment_estimates_and_holds_lease_floor(
+        self,
+    ) -> None:
+        delta = SimpleNamespace(type="response.output_text.delta", delta="partial")
+        inner = _FakeAsyncResponseStream([delta], object())
+        provider_manager = _FakeAsyncResponseStreamManager(inner)
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+            ):
+                async with solwyn.responses.stream(
+                    model="gpt-5.5",
+                    input="12345678",
+                    max_output_tokens=50,
+                ) as events:
+                    assert await anext(events) is delta
+
+            call_id = check.call_args.kwargs["call_id"]
+            true_up.assert_called_once_with(
+                call_id,
+                2,
+                claim_token=7,
+                floor_at_reservation=True,
+            )
+            solwyn._reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            assert event.input_tokens == 2
+            assert event.output_tokens == 0
+            assert event.token_details.is_estimated is True
+            assert confirm.token_details == event.token_details
+
+    @pytest.mark.asyncio
+    async def test_native_stream_helper_forwards_get_final_response_without_double_settlement(
+        self,
+    ) -> None:
+        terminal = _terminal_event()
+        inner = _FakeAsyncResponseStream([terminal], terminal.response)
+        client = _AsyncNativeOpenAIClient(_FakeAsyncResponseStreamManager(inner))
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                async with solwyn.responses.stream(model="gpt-5.5", input="1234") as events:
+                    result = await events.get_final_response()
+
+            assert result is terminal.response
+            assert hasattr(events, "until_done")
+            assert hasattr(events, "get_final_response")
+            assert inner.get_final_response_calls == 1
+            solwyn._reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            assert event.input_tokens == 30
+            assert event.output_tokens == 12
+            assert event.service_tier == "flex"
+            assert confirm.token_details == event.token_details
+
+    @pytest.mark.asyncio
+    async def test_native_stream_helper_close_before_enter_is_inert(
+        self,
+    ) -> None:
+        inner = _FakeAsyncResponseStream([], object())
+        provider_manager = _FakeAsyncResponseStreamManager(inner)
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
+                await manager.close()
+                await manager.close()
+
+            assert provider_manager.enter_calls == 0
+            assert provider_manager.exit_calls == []
+            assert client._responses.stream_calls == []
+            check.assert_not_awaited()
+            solwyn._reporter.report_settlement.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_native_stream_helper_enter_failure_releases_reservation(self) -> None:
+        error = _Status(503, "stream open failed")
+        inner = _FakeAsyncResponseStream([], object())
+        provider_manager = _FakeAsyncResponseStreamManager(inner, enter_error=error)
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._budget.release_reservation)
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget, "release_reservation", new=release),
+                pytest.raises(_Status) as exc_info,
+            ):
+                async with solwyn.responses.stream(model="gpt-5.5", input="1234"):
+                    pass
+
+            assert exc_info.value is error
+            release.assert_called_once()
+            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._reporter.report.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_native_stream_helper_close_failure_does_not_mask_body_exception(self) -> None:
+        inner = _FakeAsyncResponseStream([], object())
+        provider_manager = _FakeAsyncResponseStreamManager(
+            inner,
+            exit_error=RuntimeError("close failed"),
+        )
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                pytest.raises(ValueError, match="application failed"),
+            ):
+                async with solwyn.responses.stream(model="gpt-5.5", input="1234"):
+                    raise ValueError("application failed")
+
+            solwyn._reporter.report_settlement.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("opened_before_wait", [False, True])
+    async def test_native_stream_helper_entry_cancellation_reconciles_and_closes_once(
+        self,
+        opened_before_wait: bool,
+    ) -> None:
+        inner = _FakeAsyncResponseStream([], object())
+        enter_started = asyncio.Event()
+        wait_forever = asyncio.Event()
+
+        class CancellableManager:
+            def __init__(self) -> None:
+                self.enter_calls = 0
+                self.exit_calls: list[tuple[object, ...]] = []
+                self.opened = False
+
+            async def __aenter__(self):
+                self.enter_calls += 1
+                self.opened = opened_before_wait
+                enter_started.set()
+                await wait_forever.wait()
+                self.opened = True
+                return inner
+
+            async def __aexit__(self, *args: object) -> None:
+                self.exit_calls.append(args)
+                if self.opened:
+                    await inner.aclose()
+
+        provider_manager = CancellableManager()
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._budget.release_reservation)
+            breaker_failure = MagicMock()
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(
+                    solwyn._get_circuit_breaker("openai"),
+                    "record_failure",
+                    new=breaker_failure,
+                ),
+            ):
+                manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
+                enter_task = asyncio.create_task(manager.__aenter__())
+                await enter_started.wait()
+                enter_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await enter_task
+                await manager.close()
+                await manager.close()
+
+            check.assert_awaited_once()
+            release.assert_called_once()
+            breaker_failure.assert_called_once_with()
+            solwyn._reporter.report.assert_called_once()
+            solwyn._reporter.report_settlement.assert_not_called()
+            assert provider_manager.enter_calls == 1
+            assert len(provider_manager.exit_calls) == 1
+            exit_args = provider_manager.exit_calls[0]
+            assert exit_args[0] is asyncio.CancelledError
+            assert isinstance(exit_args[1], asyncio.CancelledError)
+            assert inner.aclose_calls == int(opened_before_wait)
+
+    @pytest.mark.asyncio
+    async def test_native_stream_helper_nested_reentry_keeps_first_entry_closable(self) -> None:
+        inner = _FakeAsyncResponseStream([], object())
+        provider_manager = _FakeAsyncResponseStreamManager(inner)
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._budget.release_reservation)
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget, "release_reservation", new=release),
+            ):
+                manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
+                first = await manager.__aenter__()
+                with pytest.raises(RuntimeError, match="already entered"):
+                    await manager.__aenter__()
+                await manager.close()
+                await manager.close()
+
+            assert first is not None
+            assert provider_manager.enter_calls == 1
+            assert len(provider_manager.exit_calls) == 1
+            assert inner.aclose_calls == 1
+            release.assert_not_called()
+            solwyn._reporter.report.assert_not_called()
+            solwyn._reporter.report_settlement.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_native_stream_helper_concurrent_reentry_keeps_first_entry_closable(
+        self,
+    ) -> None:
+        inner = _FakeAsyncResponseStream([], object())
+        enter_started = asyncio.Event()
+        allow_enter = asyncio.Event()
+
+        class BlockingOneShotManager:
+            def __init__(self) -> None:
+                self.enter_calls = 0
+                self.exit_calls: list[tuple[object, ...]] = []
+
+            async def __aenter__(self):
+                self.enter_calls += 1
+                if self.enter_calls > 1:
+                    raise RuntimeError("one-shot manager reused")
+                enter_started.set()
+                await allow_enter.wait()
+                return inner
+
+            async def __aexit__(self, *args: object) -> None:
+                self.exit_calls.append(args)
+                await inner.aclose()
+
+        provider_manager = BlockingOneShotManager()
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._budget.release_reservation)
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget, "release_reservation", new=release),
+            ):
+                manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
+                first_task = asyncio.create_task(manager.__aenter__())
+                await enter_started.wait()
+                second_task = asyncio.create_task(manager.__aenter__())
+                await asyncio.sleep(0)
+                assert provider_manager.enter_calls == 1
+                allow_enter.set()
+
+                first = await first_task
+                with pytest.raises(RuntimeError, match="already entered"):
+                    await second_task
+                await manager.close()
+
+            assert first is not None
+            assert provider_manager.enter_calls == 1
+            assert len(provider_manager.exit_calls) == 1
+            assert inner.aclose_calls == 1
+            release.assert_not_called()
+            solwyn._reporter.report.assert_not_called()
+            solwyn._reporter.report_settlement.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_native_stream_helper_cancelled_close_is_publicly_retryable(self) -> None:
+        inner = _FakeAsyncResponseStream([], object())
+        first_exit_started = asyncio.Event()
+        second_exit_started = asyncio.Event()
+        allow_exit = asyncio.Event()
+
+        class RetryableExitManager:
+            def __init__(self) -> None:
+                self.exit_attempts = 0
+                self.completed_exits = 0
+                self.active_exits = 0
+                self.max_active_exits = 0
+
+            async def __aenter__(self):
+                return inner
+
+            async def __aexit__(self, *_args: object) -> None:
+                self.exit_attempts += 1
+                self.active_exits += 1
+                self.max_active_exits = max(self.max_active_exits, self.active_exits)
+                if self.exit_attempts == 1:
+                    first_exit_started.set()
+                else:
+                    second_exit_started.set()
+                try:
+                    await allow_exit.wait()
+                    await inner.aclose()
+                    self.completed_exits += 1
+                finally:
+                    self.active_exits -= 1
+
+        provider_manager = RetryableExitManager()
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._budget.release_reservation)
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget, "release_reservation", new=release),
+            ):
+                manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
+                await manager.__aenter__()
+                first_close = asyncio.create_task(manager.close())
+                await first_exit_started.wait()
+                second_close = asyncio.create_task(manager.close())
+                await asyncio.sleep(0)
+                assert provider_manager.exit_attempts == 1
+
+                first_close.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await first_close
+                try:
+                    await asyncio.wait_for(second_exit_started.wait(), timeout=1)
+                finally:
+                    allow_exit.set()
+                await second_close
+                await manager.close()
+
+            check.assert_awaited_once()
+            assert provider_manager.exit_attempts == 2
+            assert provider_manager.completed_exits == 1
+            assert provider_manager.max_active_exits == 1
+            assert inner.aclose_calls == 1
+            release.assert_not_called()
+            solwyn._reporter.report.assert_not_called()
+            solwyn._reporter.report_settlement.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_native_stream_helper_wrap_failure_releases_and_closes_once(self) -> None:
+        original = ValueError("wrapping failed")
+        inner = _FakeAsyncResponseStream([], object())
+        provider_manager = _FakeAsyncResponseStreamManager(inner)
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._budget.release_reservation)
+            breaker_failure = MagicMock()
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn, "_wrap_stream_async", side_effect=original),
+                patch.object(
+                    solwyn._get_circuit_breaker("openai"),
+                    "record_failure",
+                    new=breaker_failure,
+                ),
+            ):
+                manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
+                with pytest.raises(ValueError, match="wrapping failed") as exc_info:
+                    await manager.__aenter__()
+                await manager.close()
+
+            assert exc_info.value is original
+            release.assert_called_once()
+            breaker_failure.assert_called_once_with()
+            solwyn._reporter.report.assert_called_once()
+            solwyn._reporter.report_settlement.assert_not_called()
+            assert len(provider_manager.exit_calls) == 1
+            assert inner.aclose_calls == 1
 
     @pytest.mark.asyncio
     async def test_native_create_emits_no_unmetered_warning(
@@ -1080,6 +2150,70 @@ class TestResponsesPublicProxyAsync:
             )
 
     @pytest.mark.asyncio
+    async def test_compat_stream_helper_remains_warned_raw_manager_passthrough(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        inner = _FakeAsyncResponseStream([], object())
+        provider_manager = _FakeAsyncResponseStreamManager(inner)
+        client = _AsyncGroqClient(provider_manager)
+
+        async with _async_solwyn(
+            client,
+            model="llama-3.3-70b-versatile",
+            report_untracked_surfaces=False,
+        ) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                caplog.at_level(logging.WARNING, logger="solwyn._base"),
+            ):
+                result = solwyn.responses.stream(
+                    model="llama-3.3-70b-versatile",
+                    input="hello",
+                )
+
+            assert result is provider_manager
+            assert client._responses.stream_calls == [
+                {"model": "llama-3.3-70b-versatile", "input": "hello"}
+            ]
+            check.assert_not_awaited()
+            assert any(
+                "untracked surface 'responses.stream'" in record.getMessage()
+                for record in caplog.records
+            )
+
+    @pytest.mark.asyncio
+    async def test_compat_existing_response_stream_remains_warned_raw_passthrough(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        provider_manager = object()
+        client = _AsyncGroqClient(provider_manager)
+
+        async with _async_solwyn(
+            client,
+            model="llama-3.3-70b-versatile",
+            default_params={"instructions": "must-not-leak"},
+            report_untracked_surfaces=False,
+        ) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                caplog.at_level(logging.WARNING, logger="solwyn._base"),
+            ):
+                result = solwyn.responses.stream(response_id="resp_123", starting_after=7)
+
+            assert result is provider_manager
+            assert client._responses.stream_calls == [
+                {"response_id": "resp_123", "starting_after": 7}
+            ]
+            check.assert_not_awaited()
+            solwyn._reporter.report_settlement.assert_not_called()
+            assert any(
+                "untracked surface 'responses.stream'" in record.getMessage()
+                for record in caplog.records
+            )
+
+    @pytest.mark.asyncio
     async def test_strict_acknowledgment_rejects_create_but_allows_retrieve(self) -> None:
         create_client = _AsyncNativeOpenAIClient(object())
 
@@ -1114,6 +2248,17 @@ class TestResponsesPublicProxyAsync:
             )
 
         # Assert.
+        assert exc_info.value.field == "acknowledge_untracked"
+
+    def test_strict_acknowledgment_rejects_native_stream(self) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            AsyncSolwyn(
+                _AsyncNativeOpenAIClient(object()),
+                api_key=VALID_API_KEY,
+                on_unmetered="raise",
+                acknowledge_untracked={"responses.stream"},
+            )
+
         assert exc_info.value.field == "acknowledge_untracked"
 
     @pytest.mark.asyncio
@@ -1164,6 +2309,27 @@ class TestResponsesInterceptedCallSync:
             assert event.service_tier == "default"
             assert confirm.token_details == event.token_details
             assert confirm.service_tier == event.service_tier
+
+    def test_chat_stream_does_not_gain_responses_manager_helpers(self) -> None:
+        client, _ = _mock_openai_client()
+        client.chat.completions.create.return_value = _FakeSyncStream([])
+
+        with _sync_solwyn(client) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                stream = solwyn._intercepted_call(
+                    model="gpt-5.5",
+                    messages=[],
+                    stream=True,
+                )
+
+            assert not hasattr(stream, "until_done")
+            assert not hasattr(stream, "get_final_response")
+            with pytest.raises(AttributeError):
+                _ = stream.until_done
+            with pytest.raises(AttributeError):
+                _ = stream.get_final_response
+            stream.close()
 
     def test_sync_dispatch_defaults_to_chat(self) -> None:
         client, _ = _mock_openai_client()
@@ -1407,6 +2573,12 @@ class TestResponsesInterceptedCallSync:
             events = list(stream)
 
             assert events == [delta, terminal]
+            assert not hasattr(stream, "until_done")
+            assert not hasattr(stream, "get_final_response")
+            with pytest.raises(AttributeError):
+                _ = stream.until_done
+            with pytest.raises(AttributeError):
+                _ = stream.get_final_response
             sent = client.responses.create.call_args.kwargs
             assert sent["stream"] is True
             assert "stream_options" not in sent
@@ -1604,6 +2776,28 @@ class TestResponsesInterceptedCallAsync:
             assert event.service_tier == "default"
             assert confirm.token_details == event.token_details
             assert confirm.service_tier == event.service_tier
+
+    @pytest.mark.asyncio
+    async def test_chat_stream_does_not_gain_responses_manager_helpers(self) -> None:
+        client, _ = _mock_async_openai_client()
+        client.chat.completions.create.return_value = _FakeAsyncStream([])
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                stream = await solwyn._intercepted_call(
+                    model="gpt-5.5",
+                    messages=[],
+                    stream=True,
+                )
+
+            assert not hasattr(stream, "until_done")
+            assert not hasattr(stream, "get_final_response")
+            with pytest.raises(AttributeError):
+                _ = stream.until_done
+            with pytest.raises(AttributeError):
+                _ = stream.get_final_response
+            await stream.close()
 
     @pytest.mark.asyncio
     async def test_async_dispatch_defaults_to_chat(self) -> None:
@@ -1862,6 +3056,12 @@ class TestResponsesInterceptedCallAsync:
             events = [event async for event in stream]
 
             assert events == [delta, terminal]
+            assert not hasattr(stream, "until_done")
+            assert not hasattr(stream, "get_final_response")
+            with pytest.raises(AttributeError):
+                _ = stream.until_done
+            with pytest.raises(AttributeError):
+                _ = stream.get_final_response
             sent = client.responses.create.call_args.kwargs
             assert sent["stream"] is True
             assert "stream_options" not in sent

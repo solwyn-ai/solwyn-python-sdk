@@ -629,6 +629,24 @@ class TestOpenAIAdapterResponsesDispatch:
         assert shaped == kwargs
         assert shaped is not kwargs
 
+    def test_stream_leaf_selects_manager_helper_without_injecting_stream(self) -> None:
+        def stream(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(responses=SimpleNamespace(stream=stream))
+        kwargs: dict[str, Any] = {"model": "gpt-5.5", "input": "hello"}
+
+        method, shaped = OpenAIAdapter().prepare_responses_call(
+            client,
+            kwargs,
+            is_streaming=True,
+            leaf="stream",
+        )
+
+        assert method is stream
+        assert shaped == kwargs
+        assert shaped is not kwargs
+
     def test_unsupported_internal_leaf_fails_loud(self) -> None:
         # Arrange.
         client = SimpleNamespace(responses=SimpleNamespace(create=lambda **kwargs: kwargs))

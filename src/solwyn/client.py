@@ -25,7 +25,7 @@ import functools
 import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Collection, Iterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator, Mapping
 from typing import Any, Literal, NamedTuple, cast
 
 import httpx
@@ -95,7 +95,12 @@ from solwyn.exceptions import (
 from solwyn.providers import _translation
 from solwyn.providers._errors import Disposition, classify_exception, retry_after_seconds
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
-from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
+from solwyn.stream import (
+    AsyncStreamWrapper,
+    SyncStreamWrapper,
+    _AsyncResponsesStreamManagerWrapper,
+    _SyncResponsesStreamManagerWrapper,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -242,8 +247,11 @@ def _responses_is_streaming(
 
     OpenAI merges ``extra_body`` into the request body after named parameters,
     so an explicit structural ``stream`` entry there has final precedence for
-    parse. Create deliberately retains its established top-level semantics.
+    parse. Create deliberately retains its established top-level semantics;
+    the dedicated stream-manager leaf is always streaming.
     """
+    if leaf == "stream":
+        return True
     if leaf != "parse":
         return bool(kwargs.get("stream", False)) or force_stream
 
@@ -301,6 +309,79 @@ def _safe_extract_region(runtime: ProviderRuntime) -> str | None:
     except Exception as exc:
         logger.warning("settlement.extract_region_failed_fail_soft: %s", type(exc).__name__)
         return None
+
+
+def _make_stream_error_handler(
+    owner: Any,
+    runtime: ProviderRuntime,
+    ctx: _AttemptContext,
+    budget: Any,
+    primary: ProviderRuntime,
+    *,
+    requested_model: str,
+    is_model_fallback: bool,
+    call_id: str,
+    agent_run: _RunContextSnapshot,
+) -> Callable[[BaseException], None]:
+    """Build the established stream-error reconciliation callback once."""
+    provider = runtime.adapter.name
+    is_provider_fallback = ctx.is_provider_fallback
+    provider_region = _safe_extract_region(runtime)
+
+    def on_error(_exc: BaseException) -> None:
+        owner._get_circuit_breaker(provider).record_failure()
+        owner._budget.release_reservation(
+            call_id,
+            lease_claim_token=_lease_claim_token(budget),
+        )
+        owner._reporter.report(
+            owner._build_error_event(
+                model=ctx.model,
+                provider=provider,
+                latency_ms=ctx.elapsed_ms(),
+                is_model_fallback=is_model_fallback,
+                is_provider_fallback=is_provider_fallback,
+                requested_provider=primary.entry.provider if is_provider_fallback else None,
+                requested_model=requested_model if is_provider_fallback else None,
+                attempt_index=ctx.attempt_index,
+                call_id=call_id,
+                possibly_succeeded=True,
+                agent_run=agent_run,
+                provider_region=provider_region,
+            )
+        )
+
+    return on_error
+
+
+def _make_async_stream_error_handler(
+    owner: Any,
+    runtime: ProviderRuntime,
+    ctx: _AttemptContext,
+    budget: Any,
+    primary: ProviderRuntime,
+    *,
+    requested_model: str,
+    is_model_fallback: bool,
+    call_id: str,
+    agent_run: _RunContextSnapshot,
+) -> Callable[[BaseException], Awaitable[None]]:
+    sync_handler = _make_stream_error_handler(
+        owner,
+        runtime,
+        ctx,
+        budget,
+        primary,
+        requested_model=requested_model,
+        is_model_fallback=is_model_fallback,
+        call_id=call_id,
+        agent_run=agent_run,
+    )
+
+    async def on_error(exc: BaseException) -> None:
+        sync_handler(exc)
+
+    return on_error
 
 
 def _safe_extract_service_tier(runtime: ProviderRuntime, response: Any) -> str | None:
@@ -1999,6 +2080,37 @@ class Solwyn(_SolwynBase):
             # spurious success before its on_error failure. So record_success()
             # runs ONLY on the non-streaming path, AFTER the streaming early return.
             if is_streaming:
+                if _surface == "responses" and _responses_leaf == "stream":
+                    on_error = _make_stream_error_handler(
+                        self,
+                        rt,
+                        ctx,
+                        budget,
+                        primary,
+                        requested_model=requested_model,
+                        is_model_fallback=is_model_fallback,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                    )
+                    return _SyncResponsesStreamManagerWrapper(
+                        response,
+                        functools.partial(
+                            self._wrap_stream,
+                            rt,
+                            ctx=ctx,
+                            budget=budget,
+                            primary=primary,
+                            requested_model=requested_model,
+                            is_model_fallback=is_model_fallback,
+                            primary_errored=primary_errored,
+                            call_id=call_id,
+                            agent_run=agent_run,
+                            estimated_input_tokens=est_in,
+                            estimate_empty_usage=True,
+                            on_error=on_error,
+                        ),
+                        on_error=on_error,
+                    )
                 return self._wrap_stream(
                     rt,
                     response,
@@ -2122,6 +2234,7 @@ class Solwyn(_SolwynBase):
         agent_run: _RunContextSnapshot,
         estimated_input_tokens: int = 0,
         estimate_empty_usage: bool = False,
+        on_error: Callable[[BaseException], None] | None = None,
     ) -> Any:
         """Wrap a streaming response, settling against the SERVED runtime.
 
@@ -2208,30 +2321,17 @@ class Solwyn(_SolwynBase):
             else:
                 self._reporter.report(event)
 
-        def on_error(_exc: Exception) -> None:
-            self._get_circuit_breaker(provider).record_failure()
-            # A stream that dies mid-flight never reaches on_complete, so its
-            # lease reservation is handed back here (the _settled guard makes
-            # on_complete / on_error mutually exclusive).
-            self._budget.release_reservation(
-                call_id,
-                lease_claim_token=_lease_claim_token(budget),
-            )
-            self._reporter.report(
-                self._build_error_event(
-                    model=served_model,
-                    provider=provider,
-                    latency_ms=ctx.elapsed_ms(),
-                    is_model_fallback=is_model_fallback,
-                    is_provider_fallback=is_provider_fallback,
-                    requested_provider=primary.entry.provider if is_provider_fallback else None,
-                    requested_model=requested_model if is_provider_fallback else None,
-                    attempt_index=ctx.attempt_index,
-                    call_id=call_id,
-                    possibly_succeeded=True,
-                    agent_run=agent_run,
-                    provider_region=provider_region,
-                )
+        if on_error is None:
+            on_error = _make_stream_error_handler(
+                self,
+                runtime,
+                ctx,
+                budget,
+                primary,
+                requested_model=requested_model,
+                is_model_fallback=is_model_fallback,
+                call_id=call_id,
+                agent_run=agent_run,
             )
 
         # Cross-DIALECT hop: reshape each served chunk back to the caller's
@@ -2593,6 +2693,8 @@ class AsyncSolwyn(_SolwynBase):
                 is_streaming=is_streaming,
                 leaf=responses_leaf,
             )
+            if responses_leaf == "stream":
+                return method(**call_kwargs)
             return await method(**call_kwargs)
         method, call_kwargs = runtime.adapter.prepare_call(
             client,
@@ -3216,6 +3318,37 @@ class AsyncSolwyn(_SolwynBase):
             # log a spurious success before its on_error failure. So record_success()
             # runs ONLY on the non-streaming path, AFTER the streaming early return.
             if is_streaming:
+                if _surface == "responses" and _responses_leaf == "stream":
+                    on_error = _make_async_stream_error_handler(
+                        self,
+                        rt,
+                        ctx,
+                        budget,
+                        primary,
+                        requested_model=requested_model,
+                        is_model_fallback=is_model_fallback,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                    )
+                    return _AsyncResponsesStreamManagerWrapper(
+                        response,
+                        functools.partial(
+                            self._wrap_stream_async,
+                            rt,
+                            ctx=ctx,
+                            budget=budget,
+                            primary=primary,
+                            requested_model=requested_model,
+                            is_model_fallback=is_model_fallback,
+                            primary_errored=primary_errored,
+                            call_id=call_id,
+                            agent_run=agent_run,
+                            estimated_input_tokens=est_in,
+                            estimate_empty_usage=True,
+                            on_error=on_error,
+                        ),
+                        on_error=on_error,
+                    )
                 return self._wrap_stream_async(
                     rt,
                     response,
@@ -3338,6 +3471,7 @@ class AsyncSolwyn(_SolwynBase):
         agent_run: _RunContextSnapshot,
         estimated_input_tokens: int = 0,
         estimate_empty_usage: bool = False,
+        on_error: Callable[[BaseException], Awaitable[None]] | None = None,
     ) -> Any:
         """Wrap an async streaming response, settling against the SERVED runtime.
 
@@ -3422,30 +3556,17 @@ class AsyncSolwyn(_SolwynBase):
             else:
                 self._reporter.report(event)
 
-        async def on_error(_exc: Exception) -> None:
-            self._get_circuit_breaker(provider).record_failure()
-            # A stream that dies mid-flight never reaches on_complete, so its
-            # lease reservation is handed back here (the _settled guard makes
-            # on_complete / on_error mutually exclusive).
-            self._budget.release_reservation(
-                call_id,
-                lease_claim_token=_lease_claim_token(budget),
-            )
-            self._reporter.report(
-                self._build_error_event(
-                    model=served_model,
-                    provider=provider,
-                    latency_ms=ctx.elapsed_ms(),
-                    is_model_fallback=is_model_fallback,
-                    is_provider_fallback=is_provider_fallback,
-                    requested_provider=primary.entry.provider if is_provider_fallback else None,
-                    requested_model=requested_model if is_provider_fallback else None,
-                    attempt_index=ctx.attempt_index,
-                    call_id=call_id,
-                    possibly_succeeded=True,
-                    agent_run=agent_run,
-                    provider_region=provider_region,
-                )
+        if on_error is None:
+            on_error = _make_async_stream_error_handler(
+                self,
+                runtime,
+                ctx,
+                budget,
+                primary,
+                requested_model=requested_model,
+                is_model_fallback=is_model_fallback,
+                call_id=call_id,
+                agent_run=agent_run,
             )
 
         # Cross-DIALECT hop: reshape each served chunk back to the caller's

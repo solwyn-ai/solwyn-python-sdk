@@ -455,12 +455,13 @@ class OpenAIAdapter:
         ``stream`` but deliberately omits ``stream_options`` because Responses
         rejects it; usage instead arrives on the terminal
         ``response.completed`` event. ``parse`` is dispatched only after the
-        client pipeline has refused streaming intent.
+        client pipeline has refused streaming intent, while ``stream`` selects
+        the SDK's context-manager helper without adding a provider kwarg.
         """
         kwargs = dict(kwargs)
-        if is_streaming:
+        if is_streaming and leaf == "create":
             kwargs["stream"] = True
-        if leaf not in {"create", "parse"}:
+        if leaf not in {"create", "parse", "stream"}:
             raise RuntimeError(f"unsupported OpenAI Responses leaf: {leaf}")
         return getattr(client.responses, leaf), kwargs
 
