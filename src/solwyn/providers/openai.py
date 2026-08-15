@@ -441,6 +441,24 @@ class OpenAIAdapter:
             kwargs["stream"] = True
         return client.chat.completions.create, kwargs
 
+    def prepare_responses_call(
+        self,
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        is_streaming: bool,
+    ) -> tuple[Callable[..., Any], dict[str, Any]]:
+        """Duck-typed Responses dispatch seam, like the media surface seams.
+
+        This foundation targets native OpenAI only. Streaming sets ``stream``
+        but deliberately omits ``stream_options`` because Responses rejects it;
+        usage instead arrives on the terminal ``response.completed`` event.
+        """
+        kwargs = dict(kwargs)
+        if is_streaming:
+            kwargs["stream"] = True
+        return client.responses.create, kwargs
+
     def prepare_media_call(
         self,
         surface: str,
@@ -485,9 +503,10 @@ class OpenAIAdapter:
 class OpenAIStreamAccumulator:
     """Accumulates usage from OpenAI streaming chunks.
 
-    OpenAI includes usage only in the final chunk when the caller sets
-    stream_options={"include_usage": True}. We save that chunk and
-    delegate to the same extraction logic as non-streaming responses.
+    Chat Completions includes usage in a final chunk when the caller sets
+    stream_options={"include_usage": True}; Responses embeds its usage-bearing
+    response on the terminal ``response.completed`` event. We save either object
+    and delegate to the same extraction logic as non-streaming responses.
     """
 
     def __init__(self) -> None:
@@ -497,6 +516,11 @@ class OpenAIStreamAccumulator:
         usage = getattr(chunk, "usage", None)
         if usage is not None:
             self._usage_chunk = chunk
+            return
+
+        response = getattr(chunk, "response", None)
+        if response is not None and getattr(response, "usage", None) is not None:
+            self._usage_chunk = response
 
     def finalize(self) -> TokenDetails:
         if self._usage_chunk is None:
