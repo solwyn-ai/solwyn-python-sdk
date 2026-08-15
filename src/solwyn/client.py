@@ -57,14 +57,17 @@ from solwyn._proxies import (
     _AsyncImagesProxy,
     _AsyncMessagesProxy,
     _AsyncModelsProxy,
+    _AsyncResponsesProxy,
     _AsyncVideosProxy,
     _bedrock_internal_kwargs,
+    _reject_responses_background,
     _SyncAudioProxy,
     _SyncChatProxy,
     _SyncEmbeddingsProxy,
     _SyncImagesProxy,
     _SyncMessagesProxy,
     _SyncModelsProxy,
+    _SyncResponsesProxy,
     _SyncVideosProxy,
 )
 from solwyn._registry import ProviderRuntime, build_runtimes
@@ -1028,6 +1031,28 @@ class Solwyn(_SolwynBase):
         return _SyncChatProxy(self)
 
     @functools.cached_property
+    def responses(self) -> Any:
+        """Expose metered Responses create only for native OpenAI clients.
+
+        Native ``responses.create`` uses the primary-only Responses pipeline;
+        other Responses leaves stay guarded raw operations. OpenAI-compatible
+        providers, including Azure, retain their existing raw namespace and
+        unmetered posture. Cached because provider identity is construction-time
+        state.
+        """
+        if (
+            self._adapter.name == "openai"
+            and self._inspect_static_attribute(self._client, "responses") is not None
+        ):
+            return _SyncResponsesProxy(self)
+        return self._resolve_public_attribute(
+            self._client,
+            name="responses",
+            path="responses",
+            source=SurfaceSource.RAW,
+        )
+
+    @functools.cached_property
     def embeddings(self) -> _SyncEmbeddingsProxy:
         """Return a proxy that routes embeddings.create() through the media lifecycle.
 
@@ -1544,6 +1569,7 @@ class Solwyn(_SolwynBase):
                 primary_defaults=primary.entry.default_params,
                 kwargs=kwargs,
             )
+            _reject_responses_background(request_semantics)
         is_streaming = bool(request_semantics.get("stream", False)) or _force_stream
 
         # Legacy GenerativeModel constructor defaults are applied by its
@@ -2329,6 +2355,27 @@ class AsyncSolwyn(_SolwynBase):
         return _AsyncChatProxy(self)
 
     @functools.cached_property
+    def responses(self) -> Any:
+        """Expose metered Responses create only for native OpenAI clients.
+
+        The async proxy mirrors the sync contract: native foreground create is
+        intercepted through the primary Responses pipeline; all other leaves
+        and every OpenAI-compatible provider remain guarded raw operations.
+        Cached because provider identity is construction-time state.
+        """
+        if (
+            self._adapter.name == "openai"
+            and self._inspect_static_attribute(self._client, "responses") is not None
+        ):
+            return _AsyncResponsesProxy(self)
+        return self._resolve_public_attribute(
+            self._client,
+            name="responses",
+            path="responses",
+            source=SurfaceSource.RAW,
+        )
+
+    @functools.cached_property
     def embeddings(self) -> _AsyncEmbeddingsProxy:
         """Return an async proxy that routes embeddings.create() through the media lifecycle.
 
@@ -2771,6 +2818,7 @@ class AsyncSolwyn(_SolwynBase):
                 primary_defaults=primary.entry.default_params,
                 kwargs=kwargs,
             )
+            _reject_responses_background(request_semantics)
         is_streaming = bool(request_semantics.get("stream", False)) or _force_stream
 
         char_count = (

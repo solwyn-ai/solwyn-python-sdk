@@ -1,13 +1,15 @@
-"""Internal Responses API interception pipeline tests.
+"""Public Responses proxies and their shared interception pipeline tests.
 
-Public ``responses`` proxies land separately.  These tests drive the private
-``_surface="responses"`` branch directly so dispatch, budgeting, routing, and
-settlement can be verified before the public surface contract changes.  A
-focused adjacent regression also protects the default chat routing.
+The public sync/async suites prove native-only proxy routing and guarded raw
+leaves. The lower suites drive ``_surface="responses"`` directly for detailed
+dispatch, budgeting, routing, streaming, and settlement coverage. A focused
+adjacent regression also protects the default chat routing.
 """
 
 from __future__ import annotations
 
+import functools
+import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
@@ -16,8 +18,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
+from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn.client import AsyncSolwyn, Solwyn
-from solwyn.exceptions import ProviderUnavailableError, UnsupportedSurfaceError
+from solwyn.exceptions import ConfigurationError, ProviderUnavailableError, UnsupportedSurfaceError
+
+
+@pytest.fixture(autouse=True)
+def _reset_unmetered_warning_state() -> Iterator[None]:
+    _reset_unmetered_spend_warnings()
+    yield
+    _reset_unmetered_spend_warnings()
 
 
 class OpenAI:
@@ -64,6 +74,90 @@ def _sync_create(**kwargs: object) -> object:
 
 async def _async_create(**kwargs: object) -> object:
     raise NotImplementedError
+
+
+class _SyncResponsesResource:
+    """Realistic OpenAI Responses resource with observable provider calls."""
+
+    __module__ = "openai.resources.responses.responses"
+
+    def __init__(self, response: object) -> None:
+        self.response = response
+        self.create_calls: list[dict[str, object]] = []
+        self.retrieve_calls: list[str] = []
+
+    def create(self, **kwargs: object) -> object:
+        self.create_calls.append(kwargs)
+        return self.response
+
+    def retrieve(self, response_id: str) -> object:
+        self.retrieve_calls.append(response_id)
+        return self.response
+
+
+class _AsyncResponsesResource:
+    """Async counterpart of ``_SyncResponsesResource``."""
+
+    __module__ = "openai.resources.responses.responses"
+
+    def __init__(self, response: object) -> None:
+        self.response = response
+        self.create_calls: list[dict[str, object]] = []
+        self.retrieve_calls: list[str] = []
+
+    async def create(self, **kwargs: object) -> object:
+        self.create_calls.append(kwargs)
+        return self.response
+
+    async def retrieve(self, response_id: str) -> object:
+        self.retrieve_calls.append(response_id)
+        return self.response
+
+
+class _NativeOpenAIClient:
+    """Minimal native OpenAI shell whose namespace shape matches the SDK."""
+
+    __module__ = "openai._client"
+
+    def __init__(self, response: object) -> None:
+        self._responses = _SyncResponsesResource(response)
+
+    @functools.cached_property
+    def responses(self) -> _SyncResponsesResource:
+        return self._responses
+
+    def with_options(self, **_kwargs: object) -> _NativeOpenAIClient:
+        return self
+
+
+class _AsyncNativeOpenAIClient:
+    """Minimal native async OpenAI shell whose namespace shape matches the SDK."""
+
+    __module__ = "openai._client"
+
+    def __init__(self, response: object) -> None:
+        self._responses = _AsyncResponsesResource(response)
+
+    @functools.cached_property
+    def responses(self) -> _AsyncResponsesResource:
+        return self._responses
+
+    def with_options(self, **_kwargs: object) -> _AsyncNativeOpenAIClient:
+        return self
+
+
+class _GroqClient(_NativeOpenAIClient):
+    """OpenAI SDK shape targeting Groq through ``base_url`` detection."""
+
+    __module__ = "openai._client"
+    base_url = "https://api.groq.com/openai/v1"
+
+
+class _AsyncGroqClient(_AsyncNativeOpenAIClient):
+    """Async OpenAI SDK shape targeting Groq through ``base_url`` detection."""
+
+    __module__ = "openai._client"
+    base_url = "https://api.groq.com/openai/v1"
 
 
 def _responses_usage(
@@ -270,6 +364,430 @@ def _terminal_event(*, service_tier: str = "flex") -> SimpleNamespace:
             service_tier=service_tier,
         ),
     )
+
+
+@pytest.mark.unit
+class TestResponsesPublicProxySync:
+    def test_native_create_intercepts_once_dispatches_and_settles(self) -> None:
+        response = _responses_response()
+        client = _NativeOpenAIClient(response)
+
+        with _sync_solwyn(client) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                result = solwyn.responses.create(model="gpt-5.5", input="hello")
+
+            assert result is response
+            check.assert_called_once()
+            assert client._responses.create_calls == [{"model": "gpt-5.5", "input": "hello"}]
+            solwyn._reporter.report_settlement.assert_called_once()
+
+    def test_native_create_emits_no_unmetered_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = _NativeOpenAIClient(_responses_response())
+
+        with _sync_solwyn(client, report_untracked_surfaces=False) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                caplog.at_level(logging.WARNING, logger="solwyn._base"),
+            ):
+                solwyn.responses.create(model="gpt-5.5", input="hello")
+
+        assert all("untracked surface" not in record.getMessage() for record in caplog.records)
+
+    def test_background_create_is_refused_before_budget_or_provider_dispatch(self) -> None:
+        client = _NativeOpenAIClient(_responses_response())
+
+        with _sync_solwyn(client) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                pytest.raises(ConfigurationError) as exc_info,
+            ):
+                solwyn.responses.create(model="gpt-5.5", input="hello", background=True)
+
+            assert exc_info.value.field == "background"
+            assert "create-time usage" in str(exc_info.value)
+            check.assert_not_called()
+            assert client._responses.create_calls == []
+
+    def test_extra_body_background_overrides_false_and_is_refused_before_dispatch(
+        self,
+    ) -> None:
+        client = _NativeOpenAIClient(_responses_response())
+
+        with _sync_solwyn(client) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                pytest.raises(ConfigurationError) as exc_info,
+            ):
+                solwyn.responses.create(
+                    model="gpt-5.5",
+                    input="hello",
+                    background=False,
+                    extra_body={"background": True},
+                )
+
+            assert exc_info.value.field == "background"
+            check.assert_not_called()
+            assert client._responses.create_calls == []
+
+    def test_default_background_create_is_refused_before_budget_or_provider_dispatch(
+        self,
+    ) -> None:
+        client = _NativeOpenAIClient(_responses_response())
+
+        with _sync_solwyn(client, default_params={"background": True}) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                pytest.raises(ConfigurationError) as exc_info,
+            ):
+                solwyn.responses.create(model="gpt-5.5", input="hello")
+
+            assert exc_info.value.field == "background"
+            assert "create-time usage" in str(exc_info.value)
+            check.assert_not_called()
+            assert client._responses.create_calls == []
+
+    def test_extra_body_background_false_overrides_true_default_and_is_intercepted(
+        self,
+    ) -> None:
+        response = _responses_response()
+        client = _NativeOpenAIClient(response)
+
+        with _sync_solwyn(client, default_params={"background": True}) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                result = solwyn.responses.create(
+                    model="gpt-5.5",
+                    input="hello",
+                    extra_body={"background": False},
+                )
+
+            assert result is response
+            check.assert_called_once()
+            assert client._responses.create_calls == [
+                {
+                    "model": "gpt-5.5",
+                    "input": "hello",
+                    "background": True,
+                    "extra_body": {"background": False},
+                }
+            ]
+
+    def test_retrieve_remains_warned_raw_passthrough(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        response = object()
+        client = _NativeOpenAIClient(response)
+
+        with _sync_solwyn(client, report_untracked_surfaces=False) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                caplog.at_level(logging.WARNING, logger="solwyn._base"),
+            ):
+                result = solwyn.responses.retrieve("resp_1")
+
+            assert result is response
+            assert client._responses.retrieve_calls == ["resp_1"]
+            check.assert_not_called()
+            assert any(
+                "untracked surface 'responses.retrieve'" in record.getMessage()
+                for record in caplog.records
+            )
+
+    def test_compat_create_remains_warned_raw_passthrough(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        response = object()
+        client = _GroqClient(response)
+
+        with _sync_solwyn(
+            client,
+            model="llama-3.3-70b-versatile",
+            report_untracked_surfaces=False,
+        ) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                caplog.at_level(logging.WARNING, logger="solwyn._base"),
+            ):
+                result = solwyn.responses.create(model="llama-3.3-70b-versatile", input="hello")
+
+            assert result is response
+            assert client._responses.create_calls == [
+                {"model": "llama-3.3-70b-versatile", "input": "hello"}
+            ]
+            check.assert_not_called()
+            assert any(
+                "untracked surface 'responses.create'" in record.getMessage()
+                for record in caplog.records
+            )
+
+    def test_strict_acknowledgment_rejects_create_but_allows_retrieve(self) -> None:
+        create_client = _NativeOpenAIClient(object())
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            Solwyn(
+                create_client,
+                api_key=VALID_API_KEY,
+                on_unmetered="raise",
+                acknowledge_untracked={"responses.create"},
+            )
+
+        assert exc_info.value.field == "acknowledge_untracked"
+
+        response = object()
+        retrieve_client = _NativeOpenAIClient(response)
+        with _sync_solwyn(
+            retrieve_client,
+            on_unmetered="raise",
+            acknowledge_untracked={"responses.retrieve"},
+        ) as solwyn:
+            assert solwyn.responses.retrieve("resp_1") is response
+            assert retrieve_client._responses.retrieve_calls == ["resp_1"]
+
+    def test_namespace_is_cached_for_native_and_compat(self) -> None:
+        native = _NativeOpenAIClient(_responses_response())
+        compat = _GroqClient(object())
+
+        with (
+            _sync_solwyn(native) as native_solwyn,
+            _sync_solwyn(compat, model="llama-3.3-70b-versatile") as compat_solwyn,
+        ):
+            native_responses = native_solwyn.responses
+            compat_responses = compat_solwyn.responses
+
+            assert native_responses is native_solwyn.responses
+            assert compat_responses is compat_solwyn.responses
+
+    def test_native_client_without_responses_preserves_attribute_error(self) -> None:
+        with _sync_solwyn(OpenAI()) as solwyn, pytest.raises(AttributeError):
+            _ = solwyn.responses
+
+
+@pytest.mark.unit
+class TestResponsesPublicProxyAsync:
+    @pytest.mark.asyncio
+    async def test_native_create_intercepts_once_dispatches_and_settles(self) -> None:
+        response = _responses_response()
+        client = _AsyncNativeOpenAIClient(response)
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                result = await solwyn.responses.create(model="gpt-5.5", input="hello")
+
+            assert result is response
+            check.assert_awaited_once()
+            assert client._responses.create_calls == [{"model": "gpt-5.5", "input": "hello"}]
+            solwyn._reporter.report_settlement.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_native_create_emits_no_unmetered_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client = _AsyncNativeOpenAIClient(_responses_response())
+
+        async with _async_solwyn(client, report_untracked_surfaces=False) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                caplog.at_level(logging.WARNING, logger="solwyn._base"),
+            ):
+                await solwyn.responses.create(model="gpt-5.5", input="hello")
+
+        assert all("untracked surface" not in record.getMessage() for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_background_create_is_refused_before_budget_or_provider_dispatch(self) -> None:
+        client = _AsyncNativeOpenAIClient(_responses_response())
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                pytest.raises(ConfigurationError) as exc_info,
+            ):
+                await solwyn.responses.create(model="gpt-5.5", input="hello", background=True)
+
+            assert exc_info.value.field == "background"
+            assert "create-time usage" in str(exc_info.value)
+            check.assert_not_awaited()
+            assert client._responses.create_calls == []
+
+    @pytest.mark.asyncio
+    async def test_extra_body_background_overrides_false_and_is_refused_before_dispatch(
+        self,
+    ) -> None:
+        client = _AsyncNativeOpenAIClient(_responses_response())
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                pytest.raises(ConfigurationError) as exc_info,
+            ):
+                await solwyn.responses.create(
+                    model="gpt-5.5",
+                    input="hello",
+                    background=False,
+                    extra_body={"background": True},
+                )
+
+            assert exc_info.value.field == "background"
+            check.assert_not_awaited()
+            assert client._responses.create_calls == []
+
+    @pytest.mark.asyncio
+    async def test_default_background_create_is_refused_before_budget_or_provider_dispatch(
+        self,
+    ) -> None:
+        client = _AsyncNativeOpenAIClient(_responses_response())
+
+        async with _async_solwyn(client, default_params={"background": True}) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                pytest.raises(ConfigurationError) as exc_info,
+            ):
+                await solwyn.responses.create(model="gpt-5.5", input="hello")
+
+            assert exc_info.value.field == "background"
+            assert "create-time usage" in str(exc_info.value)
+            check.assert_not_awaited()
+            assert client._responses.create_calls == []
+
+    @pytest.mark.asyncio
+    async def test_extra_body_background_false_overrides_true_default_and_is_intercepted(
+        self,
+    ) -> None:
+        response = _responses_response()
+        client = _AsyncNativeOpenAIClient(response)
+
+        async with _async_solwyn(client, default_params={"background": True}) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                result = await solwyn.responses.create(
+                    model="gpt-5.5",
+                    input="hello",
+                    extra_body={"background": False},
+                )
+
+            assert result is response
+            check.assert_awaited_once()
+            assert client._responses.create_calls == [
+                {
+                    "model": "gpt-5.5",
+                    "input": "hello",
+                    "background": True,
+                    "extra_body": {"background": False},
+                }
+            ]
+
+    @pytest.mark.asyncio
+    async def test_retrieve_remains_warned_raw_passthrough(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        response = object()
+        client = _AsyncNativeOpenAIClient(response)
+
+        async with _async_solwyn(client, report_untracked_surfaces=False) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                caplog.at_level(logging.WARNING, logger="solwyn._base"),
+            ):
+                result = await solwyn.responses.retrieve("resp_1")
+
+            assert result is response
+            assert client._responses.retrieve_calls == ["resp_1"]
+            check.assert_not_awaited()
+            assert any(
+                "untracked surface 'responses.retrieve'" in record.getMessage()
+                for record in caplog.records
+            )
+
+    @pytest.mark.asyncio
+    async def test_compat_create_remains_warned_raw_passthrough(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        response = object()
+        client = _AsyncGroqClient(response)
+
+        async with _async_solwyn(
+            client,
+            model="llama-3.3-70b-versatile",
+            report_untracked_surfaces=False,
+        ) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                caplog.at_level(logging.WARNING, logger="solwyn._base"),
+            ):
+                result = await solwyn.responses.create(
+                    model="llama-3.3-70b-versatile", input="hello"
+                )
+
+            assert result is response
+            assert client._responses.create_calls == [
+                {"model": "llama-3.3-70b-versatile", "input": "hello"}
+            ]
+            check.assert_not_awaited()
+            assert any(
+                "untracked surface 'responses.create'" in record.getMessage()
+                for record in caplog.records
+            )
+
+    @pytest.mark.asyncio
+    async def test_strict_acknowledgment_rejects_create_but_allows_retrieve(self) -> None:
+        create_client = _AsyncNativeOpenAIClient(object())
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            AsyncSolwyn(
+                create_client,
+                api_key=VALID_API_KEY,
+                on_unmetered="raise",
+                acknowledge_untracked={"responses.create"},
+            )
+
+        assert exc_info.value.field == "acknowledge_untracked"
+
+        response = object()
+        retrieve_client = _AsyncNativeOpenAIClient(response)
+        async with _async_solwyn(
+            retrieve_client,
+            on_unmetered="raise",
+            acknowledge_untracked={"responses.retrieve"},
+        ) as solwyn:
+            assert await solwyn.responses.retrieve("resp_1") is response
+            assert retrieve_client._responses.retrieve_calls == ["resp_1"]
+
+    @pytest.mark.asyncio
+    async def test_namespace_is_cached_for_native_and_compat(self) -> None:
+        native = _AsyncNativeOpenAIClient(_responses_response())
+        compat = _AsyncGroqClient(object())
+
+        async with (
+            _async_solwyn(native) as native_solwyn,
+            _async_solwyn(compat, model="llama-3.3-70b-versatile") as compat_solwyn,
+        ):
+            native_responses = native_solwyn.responses
+            compat_responses = compat_solwyn.responses
+
+            assert native_responses is native_solwyn.responses
+            assert compat_responses is compat_solwyn.responses
+
+    @pytest.mark.asyncio
+    async def test_native_client_without_responses_preserves_attribute_error(self) -> None:
+        async with _async_solwyn(AsyncOpenAI()) as solwyn:
+            with pytest.raises(AttributeError):
+                _ = solwyn.responses
 
 
 @pytest.mark.unit

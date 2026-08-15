@@ -555,8 +555,9 @@ def test_namespace_leaf_and_exact_infrastructure_depth_remain_distinct() -> None
 
     assert responses is not None and responses.kind is SurfaceKind.NAMESPACE
     assert responses.acknowledgment_token is None
-    assert create is not None and create.kind is SurfaceKind.UNMETERED_SPEND
-    assert create.acknowledgment_token == "responses.create"
+    assert create is not None and create.kind is SurfaceKind.METERED
+    assert create.usage_basis is UsageBasis.PROVIDER
+    assert create.acknowledgment_token is None
     assert close is not None and close.kind is SurfaceKind.INFRASTRUCTURE
     assert (
         resolve_surface_rule(

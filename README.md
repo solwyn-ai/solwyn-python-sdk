@@ -284,7 +284,7 @@ client = Solwyn(
     OpenAI(),
     api_key="sk_proj_...",
     on_unmetered="raise",
-    acknowledge_untracked={"responses.create"},
+    acknowledge_untracked={"responses.retrieve"},
 )
 ```
 
@@ -292,10 +292,10 @@ Acknowledgments are narrow, deliberate exceptions to the posture. Each token
 must name an applicable, observed terminal capability; it grants only that
 leaf. Namespace tokens such as `responses` are invalid, as are wildcards,
 typos, tracked leaves, blocked leaves, and unsupported leaves. Namespace
-objects remain guarded after an acknowledgment, so `responses.create` does not
+objects remain guarded after an acknowledgment, so `responses.retrieve` does not
 authorize a future sibling. The equivalent comma-delimited environment
 encoding is
-`SOLWYN_ACKNOWLEDGE_UNTRACKED="responses.create,audio.speech.create:gpt-4o-mini-tts"`.
+`SOLWYN_ACKNOWLEDGE_UNTRACKED="responses.retrieve,audio.speech.create:gpt-4o-mini-tts"`.
 The conditional token for token-billed TTS is exactly
 `audio.speech.create:gpt-4o-mini-tts`; acknowledging ordinary
 `audio.speech.create` does not cover that model-specific exception.
@@ -334,9 +334,9 @@ audit_client = Solwyn(
 )
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
-    guarded_namespaces="sha256:770ba77e018f38c9b64af1d43770dfd6d79f3c1d1c9f5ac5253cfa3000d2b743",
-    tracked="sha256:ee52e554ddf531bea4560f69fdbef1ca0ac90e433fb9f93fba6e291d39e2aebc",
-    untracked="sha256:8f7d1bc744e022db61ec44c7e2ebfadcf3599ea225a021050ff3022620ecfd3c",
+    guarded_namespaces="sha256:38de7d9d718f03bc61f4a24e24f131c1a018434fcb38eb5cb7371290fc72e074",
+    tracked="sha256:c23b04e7892944f972cd0296f7442eaff351776ea0e35516321a9470567cc874",
+    untracked="sha256:2969df31fc9b474959d35bd2ef386e2b64c573d5c7ca541abe5992ca48787d89",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     scoped_escapes="sha256:6808a0f2ac290c9d4d1504b21b1c0ba98267636ced4234416b53533b29bb4073",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",

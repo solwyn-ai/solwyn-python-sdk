@@ -27,6 +27,9 @@ class _ResponsesResource:
     def create(self) -> str:
         return "created"
 
+    def retrieve(self) -> str:
+        return "retrieved"
+
     def delete(self) -> str:
         return "deleted"
 
@@ -724,14 +727,14 @@ def test_exact_acknowledgment_allows_only_the_terminal_leaf() -> None:
     wrapper = _make_solwyn(
         client,
         on_unmetered="raise",
-        acknowledge_untracked={"responses.create"},
+        acknowledge_untracked={"responses.retrieve"},
     )
 
     responses = wrapper.responses
 
     assert responses is wrapper.responses
     assert responses is not client.responses
-    assert responses.create() == "created"
+    assert responses.retrieve() == "retrieved"
     with pytest.raises(UntrackedSpendSurfaceError):
         _ = responses.delete
     _close(wrapper)
