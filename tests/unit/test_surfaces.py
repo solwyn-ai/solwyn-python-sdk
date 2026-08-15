@@ -48,6 +48,18 @@ OPENAI_ASYNC = SurfaceContext(
     client_shape="openai_sdk",
     mode="async",
 )
+AZURE_OPENAI_SYNC = SurfaceContext(
+    provider="azure_openai",
+    dialect="openai",
+    client_shape="openai_sdk",
+    mode="sync",
+)
+AZURE_OPENAI_ASYNC = SurfaceContext(
+    provider="azure_openai",
+    dialect="openai",
+    client_shape="openai_sdk",
+    mode="async",
+)
 ANTHROPIC_SYNC = SurfaceContext(
     provider="anthropic",
     dialect="anthropic",
@@ -594,16 +606,37 @@ def test_native_openai_responses_parse_is_metered_on_raw_and_wrapper(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("context", [AZURE_OPENAI_SYNC, AZURE_OPENAI_ASYNC])
+def test_azure_responses_namespace_and_spend_leaves_are_available_from_both_sources(
+    context: SurfaceContext,
+) -> None:
+    for source in (SurfaceSource.RAW, SurfaceSource.WRAPPER):
+        namespace = resolve_surface_rule(
+            context=context,
+            path="responses",
+            source=source,
+        )
+        assert namespace is not None
+        assert namespace.kind is SurfaceKind.NAMESPACE
+        assert namespace.source is SurfaceSource.BOTH
+        assert namespace.acknowledgment_token is None
+
+        for path in ("responses.create", "responses.parse", "responses.stream"):
+            rule = resolve_surface_rule(context=context, path=path, source=source)
+            assert rule is not None
+            assert rule.kind is SurfaceKind.METERED
+            assert rule.source is SurfaceSource.BOTH
+            assert rule.usage_basis is UsageBasis.PROVIDER
+            assert rule.acknowledgment_token is None
+            assert rule.policy_action == "track"
+            assert rule.dispatch_action == "intercept"
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "context",
     [
         GROQ_SYNC,
-        SurfaceContext(
-            provider="azure_openai",
-            dialect="openai",
-            client_shape="openai_sdk",
-            mode="sync",
-        ),
         SurfaceContext(
             provider="openai_compatible",
             dialect="openai",

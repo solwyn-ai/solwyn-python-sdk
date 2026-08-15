@@ -237,6 +237,7 @@ Beyond chat, Solwyn tracks the non-text surfaces that spend money. Each rides th
 | Audio — transcription | `client.audio.transcriptions.create` (incl. Groq whisper) | — |
 | Audio — speech (TTS) | `client.audio.speech.create` | — |
 | Video | `client.videos.create` (Sora) | `client.models.generate_videos` (Veo) |
+| Responses | Native OpenAI + Azure OpenAI: `client.responses.create` / `.parse` / `.stream` | — |
 
 Billable quantities are read from the response's usage block where it exists (gpt-image token buckets, whisper duration) and derived from the request where a provider reports none — image counts from `n=`, TTS character counts from `input=`, video seconds from the request. Whatever the SDK can't observe stays `None`, and the call is tracked **unpriced** rather than settled at a silent $0. Only lengths, counts, durations, and variant selectors are ever measured — never the media itself.
 
@@ -248,19 +249,21 @@ Billable quantities are read from the response's usage block where it exists (gp
 
 ## Strict coverage controls
 
-- **OpenAI Responses:** Native OpenAI `responses.create(...)`,
-  `responses.parse(...)`, and the `responses.stream(...)` context-manager helper
-  are budget-metered for sync and async clients. `create(stream=True)` is
+- **OpenAI Responses:** Native OpenAI and Azure OpenAI
+  `responses.create(...)`, `responses.parse(...)`, and the
+  `responses.stream(...)` context-manager helper are budget-metered for sync
+  and async clients. `create(stream=True)` is
   supported; parse is non-streaming and refuses any effective streaming
   request. The stream helper's new-response overload preserves the SDK's
   context-manager and `get_final_response()` behavior while settling terminal
   usage or a conservative estimate on early exit. Its existing-response
   retrieval overload (`response_id` / `starting_after`) creates no new spend,
   so it is a reviewed raw pass-through: no defaults, budget check, or duplicate
-  settlement are applied. Every other Responses leaf remains guarded by
-  `on_unmetered`.
+  settlement are applied. Every other Responses leaf, including beta and raw
+  response helpers, remains guarded by `on_unmetered`.
   `background=True` create calls are refused because queued responses expose no
-  create-time usage. Azure/OpenAI-compatible Responses coverage is not claimed.
+  create-time usage. Other OpenAI-compatible providers retain their raw
+  Responses managers and follow the guarded unmetered posture.
 
 Solwyn classifies the public pre-call capability graph of every supported
 wrapped client. Tracked leaves are intercepted as usual. Resource namespaces
@@ -362,6 +365,10 @@ OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
 report = coverage(audit_client)
 report.expect(OPENAI_STRICT_FINGERPRINT)
 ```
+
+Azure OpenAI exposes the same metered Responses trio, but its surrounding
+capability graph is distinct. Audit and pin an Azure client independently; do
+not reuse the native OpenAI fingerprint for Azure.
 
 When a provider SDK changes, inspect `report.entries`, decide whether each
 change is acceptable, and then paste a newly reviewed literal. Never approve a

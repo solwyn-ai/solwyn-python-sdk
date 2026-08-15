@@ -1,9 +1,10 @@
 """Public Responses proxies and their shared interception pipeline tests.
 
-The public sync/async suites prove native-only proxy routing and guarded raw
-leaves. The lower suites drive ``_surface="responses"`` directly for detailed
-dispatch, budgeting, routing, streaming, and settlement coverage. A focused
-adjacent regression also protects the default chat routing.
+The public sync/async suites prove native and capability-gated compatible proxy
+routing plus guarded raw leaves. The lower suites drive
+``_surface="responses"`` directly for detailed dispatch, budgeting, routing,
+streaming, and settlement coverage. A focused adjacent regression also
+protects the default chat routing.
 """
 
 from __future__ import annotations
@@ -21,8 +22,10 @@ from conftest import VALID_API_KEY, VALID_PROJECT_ID
 from openai import NOT_GIVEN, omit
 
 from solwyn._base import _reset_unmetered_spend_warnings
+from solwyn._proxies import _AsyncResponsesProxy, _SyncResponsesProxy
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import ConfigurationError, ProviderUnavailableError, UnsupportedSurfaceError
+from solwyn.providers.openai_compatible import COMPAT_PROFILES
 
 
 @pytest.fixture(autouse=True)
@@ -175,6 +178,20 @@ class _AsyncNativeOpenAIClient:
         return self
 
 
+class AzureOpenAI(_NativeOpenAIClient):
+    """Azure SDK-shaped sync client detected by class name and endpoint."""
+
+    __module__ = "openai._client"
+    base_url = "https://solwyn-test.openai.azure.com/openai"
+
+
+class AsyncAzureOpenAI(_AsyncNativeOpenAIClient):
+    """Azure SDK-shaped async client detected by class name and endpoint."""
+
+    __module__ = "openai._client"
+    base_url = "https://solwyn-test.cognitiveservices.azure.com/openai"
+
+
 class _GroqClient(_NativeOpenAIClient):
     """OpenAI SDK shape targeting Groq through ``base_url`` detection."""
 
@@ -187,6 +204,42 @@ class _AsyncGroqClient(_AsyncNativeOpenAIClient):
 
     __module__ = "openai._client"
     base_url = "https://api.groq.com/openai/v1"
+
+
+_COMPAT_PROFILE_URLS = {
+    "xai": "https://api.x.ai/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "mistral": "https://api.mistral.ai/v1",
+    "qwen": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "zai": "https://api.z.ai/api/paas/v4",
+    "groq": "https://api.groq.com/openai/v1",
+    "together": "https://api.together.xyz/v1",
+    "fireworks": "https://api.fireworks.ai/inference/v1",
+    "perplexity": "https://api.perplexity.ai",
+    "azure_openai": "https://solwyn-test.openai.azure.com/openai",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "ollama": "http://localhost:11434/v1",
+    "vllm": "http://localhost:8000/v1",
+    "lmstudio": "http://localhost:1234/v1",
+    "openai_compatible": "https://api.future-provider.example/v1",
+}
+
+
+def _profile_client(profile_name: str, response: object, *, async_mode: bool = False) -> object:
+    base = _AsyncNativeOpenAIClient if async_mode else _NativeOpenAIClient
+    if profile_name == "azure_openai":
+        class_name = "AsyncAzureOpenAI" if async_mode else "AzureOpenAI"
+    else:
+        class_name = "AsyncOpenAI" if async_mode else "OpenAI"
+    client_type = type(
+        class_name,
+        (base,),
+        {
+            "__module__": "openai._client",
+            "base_url": _COMPAT_PROFILE_URLS[profile_name],
+        },
+    )
+    return client_type(response)
 
 
 def _responses_usage(
@@ -525,6 +578,191 @@ def _terminal_event(*, service_tier: str = "flex") -> SimpleNamespace:
 
 @pytest.mark.unit
 class TestResponsesPublicProxySync:
+    def test_azure_create_uses_responses_defaults_and_azure_attribution(self) -> None:
+        response = _responses_response(service_tier="priority")
+        client = AzureOpenAI(response)
+
+        with _sync_solwyn(
+            client,
+            model="deployment",
+            default_params={
+                "instructions": "default instruction",
+                "temperature": 0.2,
+                "max_output_tokens": 321,
+                "max_tokens": 999,
+            },
+        ) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                result = solwyn.responses.create(
+                    model="deployment",
+                    input="hello",
+                    temperature=0.7,
+                )
+
+            assert result is response
+            check.assert_called_once()
+            assert check.call_args.kwargs["provider"] == "azure_openai"
+            assert check.call_args.kwargs["fallback_providers"] == []
+            assert check.call_args.kwargs["estimated_output_bound"] == 321
+            assert client._responses.create_calls == [
+                {
+                    "model": "deployment",
+                    "input": "hello",
+                    "instructions": "default instruction",
+                    "temperature": 0.7,
+                    "max_output_tokens": 321,
+                }
+            ]
+            solwyn._reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            assert event.provider.value == "azure_openai"
+            assert event.input_tokens == 120
+            assert event.output_tokens == 45
+            assert event.service_tier == "priority"
+            assert confirm.token_details == event.token_details
+
+    def test_azure_parse_dispatches_to_parse_and_settles_once(self) -> None:
+        response = _responses_response()
+        client = AzureOpenAI(response)
+
+        with _sync_solwyn(client, model="deployment") as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                result = solwyn.responses.parse(
+                    model="deployment",
+                    input="hello",
+                    text_format=dict,
+                )
+
+            assert result is response
+            check.assert_called_once()
+            assert check.call_args.kwargs["provider"] == "azure_openai"
+            assert client._responses.create_calls == []
+            assert client._responses.parse_calls == [
+                {"model": "deployment", "input": "hello", "text_format": dict}
+            ]
+            solwyn._reporter.report_settlement.assert_called_once()
+
+    def test_azure_create_stream_settles_terminal_provider_usage(self) -> None:
+        terminal = _terminal_event(service_tier="priority")
+        provider_stream = _FakeSyncStream(
+            [SimpleNamespace(type="response.output_text.delta", delta="hello"), terminal]
+        )
+        client = AzureOpenAI(provider_stream)
+
+        with _sync_solwyn(client, model="deployment") as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                stream = solwyn.responses.create(
+                    model="deployment",
+                    input="hello",
+                    stream=True,
+                )
+                assert list(stream)[-1] is terminal
+
+            check.assert_called_once()
+            assert client._responses.create_calls == [
+                {"model": "deployment", "input": "hello", "stream": True}
+            ]
+            solwyn._reporter.report_settlement.assert_called_once()
+            _, event = solwyn._reporter.report_settlement.call_args.args
+            assert event.provider.value == "azure_openai"
+            assert event.input_tokens == 30
+            assert event.output_tokens == 12
+            assert event.service_tier == "priority"
+            assert event.token_details.is_estimated is False
+
+    def test_azure_stream_helper_settles_terminal_usage_once(self) -> None:
+        terminal = _terminal_event(service_tier="flex")
+        inner = _FakeSyncResponseStream([terminal], terminal.response)
+        provider_manager = _FakeSyncResponseStreamManager(inner)
+        client = AzureOpenAI(provider_manager)
+
+        with _sync_solwyn(client, model="deployment") as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                solwyn.responses.stream(model="deployment", input="hello") as events,
+            ):
+                assert list(events) == [terminal]
+                assert events.get_final_response() is terminal.response
+
+            check.assert_called_once()
+            assert client._responses.stream_calls == [{"model": "deployment", "input": "hello"}]
+            solwyn._reporter.report_settlement.assert_called_once()
+            _, event = solwyn._reporter.report_settlement.call_args.args
+            assert event.provider.value == "azure_openai"
+            assert event.input_tokens == 30
+            assert event.output_tokens == 12
+            assert event.service_tier == "flex"
+
+    def test_azure_existing_response_stream_keeps_raw_manager_identity(self) -> None:
+        provider_manager = object()
+        client = AzureOpenAI(provider_manager)
+
+        with _sync_solwyn(
+            client,
+            model="deployment",
+            default_params={"instructions": "must-not-leak"},
+        ) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                result = solwyn.responses.stream(response_id="resp_123", starting_after=7)
+
+            assert result is provider_manager
+            assert client._responses.stream_calls == [
+                {"response_id": "resp_123", "starting_after": 7}
+            ]
+            check.assert_not_called()
+            solwyn._reporter.report_settlement.assert_not_called()
+
+    def test_azure_background_refusal_happens_before_budget_or_provider(self) -> None:
+        client = AzureOpenAI(_responses_response())
+
+        with _sync_solwyn(client, model="deployment") as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                pytest.raises(ConfigurationError) as exc_info,
+            ):
+                solwyn.responses.create(
+                    model="deployment",
+                    input="hello",
+                    background=True,
+                )
+
+            assert exc_info.value.field == "background"
+            check.assert_not_called()
+            assert client._responses.create_calls == []
+
+    def test_azure_provider_error_releases_reservation_without_fallback(self) -> None:
+        client = AzureOpenAI(_responses_response())
+        error = _Status(429)
+        client._responses.create = MagicMock(side_effect=error)  # type: ignore[method-assign]
+
+        with _sync_solwyn(client, model="deployment") as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._budget.release_reservation)
+            breaker_failure = MagicMock()
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(
+                    solwyn._get_circuit_breaker("azure_openai"),
+                    "record_failure",
+                    new=breaker_failure,
+                ),
+                pytest.raises(_Status) as exc_info,
+            ):
+                solwyn.responses.create(model="deployment", input="hello")
+
+            assert exc_info.value is error
+            check.assert_called_once()
+            client._responses.create.assert_called_once()
+            release.assert_called_once()
+            breaker_failure.assert_called_once_with()
+
     def test_native_create_intercepts_once_dispatches_and_settles(self) -> None:
         response = _responses_response()
         client = _NativeOpenAIClient(response)
@@ -1198,6 +1436,62 @@ class TestResponsesPublicProxySync:
                 for record in caplog.records
             )
 
+    @pytest.mark.parametrize(("profile_name", "base_url"), _COMPAT_PROFILE_URLS.items())
+    def test_every_compat_profile_agrees_on_proxy_precheck_and_dispatch_capability(
+        self,
+        profile_name: str,
+        base_url: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from solwyn.client import _responses_preparer
+
+        assert [profile.name for profile in COMPAT_PROFILES] == list(_COMPAT_PROFILE_URLS)
+        response = _responses_response()
+        client = _profile_client(profile_name, response)
+        assert vars(type(client))["base_url"] == base_url
+        expects_metering = profile_name == "azure_openai"
+
+        with _sync_solwyn(
+            client,
+            model="deployment",
+            report_untracked_surfaces=False,
+        ) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                caplog.at_level(logging.WARNING, logger="solwyn._base"),
+            ):
+                preparer = _responses_preparer(solwyn._adapter)
+                namespace = solwyn.responses
+
+                assert (preparer is not None) is expects_metering
+                assert isinstance(namespace, _SyncResponsesProxy) is expects_metering
+
+                result = namespace.create(model="deployment", input="hello")
+                assert result is response
+
+                if expects_metering:
+                    check.assert_called_once()
+                    assert check.call_args.kwargs["provider"] == "azure_openai"
+                    assert all(
+                        "untracked surface 'responses.create'" not in record.getMessage()
+                        for record in caplog.records
+                    )
+                else:
+                    check.assert_not_called()
+                    assert any(
+                        "untracked surface 'responses.create'" in record.getMessage()
+                        for record in caplog.records
+                    )
+                    with pytest.raises(UnsupportedSurfaceError) as exc_info:
+                        solwyn._intercepted_call(
+                            _surface="responses",
+                            model="deployment",
+                            input="hello",
+                        )
+                    assert exc_info.value.provider == profile_name
+                    check.assert_not_called()
+
     def test_strict_acknowledgment_rejects_create_but_allows_retrieve(self) -> None:
         create_client = _NativeOpenAIClient(object())
 
@@ -1266,6 +1560,166 @@ class TestResponsesPublicProxySync:
 
 @pytest.mark.unit
 class TestResponsesPublicProxyAsync:
+    @pytest.mark.asyncio
+    async def test_azure_create_budget_dispatch_and_settlement_use_azure_attribution(
+        self,
+    ) -> None:
+        response = _responses_response()
+        client = AsyncAzureOpenAI(response)
+
+        async with _async_solwyn(
+            client,
+            model="deployment",
+            default_params={"instructions": "default", "max_output_tokens": 222},
+        ) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                result = await solwyn.responses.create(
+                    model="deployment",
+                    input="hello",
+                    max_output_tokens=333,
+                )
+
+            assert result is response
+            check.assert_awaited_once()
+            assert check.call_args.kwargs["provider"] == "azure_openai"
+            assert check.call_args.kwargs["estimated_output_bound"] == 333
+            assert client._responses.create_calls == [
+                {
+                    "model": "deployment",
+                    "input": "hello",
+                    "instructions": "default",
+                    "max_output_tokens": 333,
+                }
+            ]
+            solwyn._reporter.report_settlement.assert_called_once()
+            _, event = solwyn._reporter.report_settlement.call_args.args
+            assert event.provider.value == "azure_openai"
+            assert event.input_tokens == 120
+            assert event.output_tokens == 45
+
+    @pytest.mark.asyncio
+    async def test_azure_parse_dispatches_to_async_parse_and_settles_once(self) -> None:
+        response = _responses_response()
+        client = AsyncAzureOpenAI(response)
+
+        async with _async_solwyn(client, model="deployment") as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                result = await solwyn.responses.parse(
+                    model="deployment",
+                    input="hello",
+                    text_format=dict,
+                )
+
+            assert result is response
+            check.assert_awaited_once()
+            assert check.call_args.kwargs["provider"] == "azure_openai"
+            assert client._responses.create_calls == []
+            assert client._responses.parse_calls == [
+                {"model": "deployment", "input": "hello", "text_format": dict}
+            ]
+            solwyn._reporter.report_settlement.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_azure_stream_helper_abandonment_estimates_and_settles_once(self) -> None:
+        delta = SimpleNamespace(type="response.output_text.delta", delta="partial")
+        inner = _FakeAsyncResponseStream([delta], object())
+        provider_manager = _FakeAsyncResponseStreamManager(inner)
+        client = AsyncAzureOpenAI(provider_manager)
+
+        async with _async_solwyn(client, model="deployment") as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                manager = solwyn.responses.stream(
+                    model="deployment",
+                    input="12345678",
+                )
+                async with manager as events:
+                    assert await anext(events) is delta
+
+            check.assert_awaited_once()
+            assert client._responses.stream_calls == [{"model": "deployment", "input": "12345678"}]
+            solwyn._reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            assert event.provider.value == "azure_openai"
+            assert event.input_tokens == 2
+            assert event.output_tokens == 0
+            assert event.token_details.is_estimated is True
+            assert confirm.token_details == event.token_details
+
+    @pytest.mark.asyncio
+    async def test_azure_existing_response_stream_keeps_raw_async_manager_identity(
+        self,
+    ) -> None:
+        provider_manager = object()
+        client = AsyncAzureOpenAI(provider_manager)
+
+        async with _async_solwyn(
+            client,
+            model="deployment",
+            default_params={"instructions": "must-not-leak"},
+        ) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._budget, "check_budget", new=check):
+                result = solwyn.responses.stream(response_id="resp_123", starting_after=7)
+
+            assert result is provider_manager
+            assert client._responses.stream_calls == [
+                {"response_id": "resp_123", "starting_after": 7}
+            ]
+            check.assert_not_awaited()
+            solwyn._reporter.report_settlement.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_azure_parse_streaming_refusal_precedes_budget_and_provider(self) -> None:
+        client = AsyncAzureOpenAI(_responses_response())
+
+        async with _async_solwyn(client, model="deployment") as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                pytest.raises(ConfigurationError) as exc_info,
+            ):
+                await solwyn.responses.parse(
+                    model="deployment",
+                    input="hello",
+                    text_format=dict,
+                    stream=True,
+                )
+
+            assert exc_info.value.field == "stream"
+            check.assert_not_awaited()
+            assert client._responses.parse_calls == []
+
+    @pytest.mark.asyncio
+    async def test_azure_provider_error_releases_reservation_without_fallback(self) -> None:
+        client = AsyncAzureOpenAI(_responses_response())
+        error = _Status(429)
+        client._responses.create = AsyncMock(side_effect=error)  # type: ignore[method-assign]
+
+        async with _async_solwyn(client, model="deployment") as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._budget.release_reservation)
+            breaker_failure = MagicMock()
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(
+                    solwyn._get_circuit_breaker("azure_openai"),
+                    "record_failure",
+                    new=breaker_failure,
+                ),
+                pytest.raises(_Status) as exc_info,
+            ):
+                await solwyn.responses.create(model="deployment", input="hello")
+
+            assert exc_info.value is error
+            check.assert_awaited_once()
+            client._responses.create.assert_awaited_once()
+            release.assert_called_once()
+            breaker_failure.assert_called_once_with()
+
     @pytest.mark.asyncio
     async def test_native_create_intercepts_once_dispatches_and_settles(self) -> None:
         response = _responses_response()
@@ -2212,6 +2666,62 @@ class TestResponsesPublicProxyAsync:
                 "untracked surface 'responses.stream'" in record.getMessage()
                 for record in caplog.records
             )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("profile_name", "base_url"), _COMPAT_PROFILE_URLS.items())
+    async def test_every_compat_profile_async_proxy_and_precheck_use_same_capability(
+        self,
+        profile_name: str,
+        base_url: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from solwyn.client import _responses_preparer
+
+        response = _responses_response()
+        client = _profile_client(profile_name, response, async_mode=True)
+        assert vars(type(client))["base_url"] == base_url
+        expects_metering = profile_name == "azure_openai"
+
+        async with _async_solwyn(
+            client,
+            model="deployment",
+            report_untracked_surfaces=False,
+        ) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                caplog.at_level(logging.WARNING, logger="solwyn._base"),
+            ):
+                preparer = _responses_preparer(solwyn._adapter)
+                namespace = solwyn.responses
+
+                assert (preparer is not None) is expects_metering
+                assert isinstance(namespace, _AsyncResponsesProxy) is expects_metering
+
+                result = await namespace.create(model="deployment", input="hello")
+                assert result is response
+
+                if expects_metering:
+                    check.assert_awaited_once()
+                    assert check.call_args.kwargs["provider"] == "azure_openai"
+                    assert all(
+                        "untracked surface 'responses.create'" not in record.getMessage()
+                        for record in caplog.records
+                    )
+                else:
+                    check.assert_not_awaited()
+                    assert any(
+                        "untracked surface 'responses.create'" in record.getMessage()
+                        for record in caplog.records
+                    )
+                    with pytest.raises(UnsupportedSurfaceError) as exc_info:
+                        await solwyn._intercepted_call(
+                            _surface="responses",
+                            model="deployment",
+                            input="hello",
+                        )
+                    assert exc_info.value.provider == profile_name
+                    check.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_strict_acknowledgment_rejects_create_but_allows_retrieve(self) -> None:

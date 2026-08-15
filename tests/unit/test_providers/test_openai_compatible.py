@@ -20,6 +20,7 @@ from solwyn.providers._protocol import ProviderAdapter
 from solwyn.providers.openai import _AUDIO_OP_KEY, _IMAGE_OP_KEY, OpenAIAdapter
 from solwyn.providers.openai_compatible import (
     COMPAT_PROFILES,
+    CompatProfile,
     CompatStreamAccumulator,
     OpenAICompatibleAdapter,
     build_compat_adapters,
@@ -231,6 +232,95 @@ class TestProfileTable:
             else type(adapter) is OpenAICompatibleAdapter
             for adapter in adapters
         )
+
+
+@pytest.mark.unit
+class TestResponsesCapability:
+    def test_only_azure_profile_enables_responses(self) -> None:
+        assert [profile.name for profile in COMPAT_PROFILES if profile.supports_responses] == [
+            "azure_openai"
+        ]
+        assert CompatProfile(name="future_provider").supports_responses is False
+
+    def test_adapter_exposes_its_profile_capability(self) -> None:
+        for profile, adapter in zip(COMPAT_PROFILES, build_compat_adapters(), strict=True):
+            assert adapter.supports_responses is profile.supports_responses, adapter.name
+
+    @pytest.mark.parametrize("leaf", ["create", "parse", "stream"])
+    def test_azure_selects_each_responses_leaf_with_defensive_copy(self, leaf: str) -> None:
+        def create(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        def parse(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        def stream(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(
+            responses=SimpleNamespace(create=create, parse=parse, stream=stream)
+        )
+        kwargs: dict[str, Any] = {"model": "deployment", "input": "hello"}
+
+        method, prepared = _adapter("azure_openai").prepare_responses_call(
+            client,
+            kwargs,
+            is_streaming=leaf in {"create", "stream"},
+            leaf=leaf,
+        )
+
+        assert method is getattr(client.responses, leaf)
+        expected = dict(kwargs)
+        if leaf == "create":
+            expected["stream"] = True
+        assert prepared == expected
+        assert prepared is not kwargs
+        assert "stream_options" not in prepared
+
+    def test_disabled_profile_fails_before_touching_provider_client(self) -> None:
+        adapter = OpenAICompatibleAdapter(CompatProfile(name="groq"))
+
+        with pytest.raises(UnsupportedSurfaceError) as exc_info:
+            adapter.prepare_responses_call(
+                SimpleNamespace(),
+                {"model": "llama"},
+                is_streaming=False,
+            )
+
+        assert exc_info.value.surface == "responses.create"
+        assert exc_info.value.provider == "groq"
+
+    def test_unknown_azure_leaf_fails_before_attribute_lookup(self) -> None:
+        with pytest.raises(RuntimeError, match="unsupported Azure OpenAI Responses leaf"):
+            _adapter("azure_openai").prepare_responses_call(
+                SimpleNamespace(responses=SimpleNamespace()),
+                {"model": "deployment"},
+                is_streaming=False,
+                leaf="retrieve",
+            )
+
+    def test_azure_responses_terminal_event_supplies_usage_and_service_tier(self) -> None:
+        accumulator = _adapter("azure_openai").create_stream_accumulator(estimated_input_tokens=99)
+        accumulator.observe(
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(
+                    usage=SimpleNamespace(
+                        input_tokens=18,
+                        output_tokens=7,
+                        input_tokens_details=None,
+                        output_tokens_details=None,
+                    ),
+                    service_tier="priority",
+                ),
+            )
+        )
+
+        details = accumulator.finalize()
+        assert details.input_tokens == 18
+        assert details.output_tokens == 7
+        assert details.is_estimated is False
+        assert accumulator.get_service_tier() == "priority"
 
 
 # ---------------------------------------------------------------------------

@@ -237,6 +237,23 @@ _RESPONSES_PARSE_STREAM_GUIDANCE = (
 )
 
 
+_ResponsesPreparer = Callable[..., tuple[Callable[..., Any], dict[str, Any]]]
+
+
+def _responses_preparer(adapter: object) -> _ResponsesPreparer | None:
+    """Return the adapter's enabled Responses seam, if it has one.
+
+    Native OpenAI predates an explicit capability attribute and remains enabled
+    through the ``True`` default. Compatible adapters expose the profile flag,
+    so a method shared by the adapter class cannot accidentally enable every
+    compatible provider.
+    """
+    prepare = getattr(adapter, "prepare_responses_call", None)
+    if not callable(prepare) or not getattr(adapter, "supports_responses", True):
+        return None
+    return cast("_ResponsesPreparer", prepare)
+
+
 def _responses_is_streaming(
     kwargs: Mapping[str, object],
     *,
@@ -1145,16 +1162,15 @@ class Solwyn(_SolwynBase):
 
     @functools.cached_property
     def responses(self) -> Any:
-        """Expose metered Responses create and parse for native OpenAI clients.
+        """Expose metered Responses leaves for capable OpenAI-dialect clients.
 
-        Both native leaves use the primary-only Responses pipeline; other
-        Responses leaves stay guarded raw operations. OpenAI-compatible
-        providers, including Azure, retain their existing raw namespace and
-        unmetered posture. Cached because provider identity is construction-time
-        state.
+        Native OpenAI and Azure OpenAI use the primary-only Responses pipeline;
+        other Responses leaves and incapable compatible providers retain the
+        guarded raw posture. Cached because provider identity is
+        construction-time state.
         """
         if (
-            self._adapter.name == "openai"
+            _responses_preparer(self._adapter) is not None
             and self._inspect_static_attribute(self._client, "responses") is not None
         ):
             return _SyncResponsesProxy(self)
@@ -1362,7 +1378,7 @@ class Solwyn(_SolwynBase):
                 max_retries=max_retries,
             )
         if surface == "responses":
-            prepare = getattr(runtime.adapter, "prepare_responses_call", None)
+            prepare = _responses_preparer(runtime.adapter)
             if prepare is None:
                 raise UnsupportedSurfaceError(
                     surface=f"responses.{responses_leaf}", provider=runtime.adapter.name
@@ -1663,10 +1679,7 @@ class Solwyn(_SolwynBase):
         # can join them (and dedup cache-hit / abandoned-stream spend).
         call_id = str(uuid.uuid4())
         primary = self._runtimes[0]
-        if (
-            _surface == "responses"
-            and getattr(primary.adapter, "prepare_responses_call", None) is None
-        ):
+        if _surface == "responses" and _responses_preparer(primary.adapter) is None:
             raise UnsupportedSurfaceError(
                 surface=f"responses.{_responses_leaf}", provider=primary.adapter.name
             )
@@ -1854,9 +1867,11 @@ class Solwyn(_SolwynBase):
         if not allow_cross_provider:
             candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
         if _surface == "responses":
-            # v1 is native-primary only. Compat Responses support is not uniform,
-            # and no cross-dialect translation subset exists for this request shape.
-            candidates = [c for c in candidates if c is primary]
+            # v1 is capability-gated and primary-only. Compat Responses support
+            # is not uniform, and no cross-dialect translation subset exists.
+            candidates = [
+                c for c in candidates if c is primary and _responses_preparer(c.adapter) is not None
+            ]
         if not candidates:
             self._budget.release_reservation(
                 call_id,
@@ -2502,16 +2517,15 @@ class AsyncSolwyn(_SolwynBase):
 
     @functools.cached_property
     def responses(self) -> Any:
-        """Expose metered Responses create and parse for native OpenAI clients.
+        """Expose metered Responses leaves for capable OpenAI-dialect clients.
 
-        The async proxy mirrors the sync contract: native foreground create and
-        non-streaming parse are intercepted through the primary Responses
-        pipeline; all other leaves and every OpenAI-compatible provider remain
-        guarded raw operations. Cached because provider identity is
-        construction-time state.
+        The async proxy mirrors the sync contract: native OpenAI and Azure
+        OpenAI are intercepted through the primary Responses pipeline; all
+        other leaves and incapable compatible providers remain guarded raw
+        operations. Cached because provider identity is construction-time state.
         """
         if (
-            self._adapter.name == "openai"
+            _responses_preparer(self._adapter) is not None
             and self._inspect_static_attribute(self._client, "responses") is not None
         ):
             return _AsyncResponsesProxy(self)
@@ -2682,7 +2696,7 @@ class AsyncSolwyn(_SolwynBase):
                 max_retries=max_retries,
             )
         if surface == "responses":
-            prepare = getattr(runtime.adapter, "prepare_responses_call", None)
+            prepare = _responses_preparer(runtime.adapter)
             if prepare is None:
                 raise UnsupportedSurfaceError(
                     surface=f"responses.{responses_leaf}", provider=runtime.adapter.name
@@ -2950,10 +2964,7 @@ class AsyncSolwyn(_SolwynBase):
         # _intercepted_call for the join/dedup contract.
         call_id = str(uuid.uuid4())
         primary = self._runtimes[0]
-        if (
-            _surface == "responses"
-            and getattr(primary.adapter, "prepare_responses_call", None) is None
-        ):
+        if _surface == "responses" and _responses_preparer(primary.adapter) is None:
             raise UnsupportedSurfaceError(
                 surface=f"responses.{_responses_leaf}", provider=primary.adapter.name
             )
@@ -3104,8 +3115,10 @@ class AsyncSolwyn(_SolwynBase):
         if not allow_cross_provider:
             candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
         if _surface == "responses":
-            # v1 is native-primary only; see the synchronous candidate walk.
-            candidates = [c for c in candidates if c is primary]
+            # v1 is capability-gated and primary-only; see the sync walk.
+            candidates = [
+                c for c in candidates if c is primary and _responses_preparer(c.adapter) is not None
+            ]
         if not candidates:
             self._budget.release_reservation(
                 call_id,
