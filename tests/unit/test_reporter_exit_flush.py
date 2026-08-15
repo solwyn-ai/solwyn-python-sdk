@@ -25,12 +25,42 @@ import pytest
 from conftest import VALID_API_KEY, call_uuid
 
 from solwyn._lifecycle import _drain_queues_blocking, blocking_exit_flush
+from solwyn._surfaces import SurfaceContext
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
 from solwyn.circuit_breaker import CircuitBreaker
+from solwyn.client import AsyncSolwyn
 from solwyn.reporter import AsyncMetadataReporter
 
 _URL = "https://api.test.solwyn.ai"
+
+
+class _UntrackedAsyncOpenAIClient:
+    async def post(self) -> str:
+        return "posted"
+
+    async def close(self) -> None:
+        return None
+
+
+_UntrackedAsyncOpenAIClient.__module__ = "openai._client"
+_UntrackedAsyncOpenAIClient.__name__ = "AsyncOpenAI"
+
+
+def _observe_untracked(reporter: AsyncMetadataReporter) -> None:
+    reporter.observe_untracked_surface(
+        context=SurfaceContext(
+            provider="openai",
+            dialect="openai",
+            client_shape="openai_sdk",
+            mode="async",
+        ),
+        surface="responses.create",
+        rule_kind="unmetered_spend",
+        capability_scope="operation",
+        posture="warn",
+        seen_at=datetime.now(UTC),
+    )
 
 
 def _make_confirm_request(**overrides) -> BudgetConfirmRequest:
@@ -248,6 +278,150 @@ def test_async_finalizer_flushes_queued_confirm_on_gc(monkeypatch: pytest.Monkey
     assert any("budgets/confirm" in u for u in sink), (
         f"GC finalizer did not flush the queued confirm; got {sink}"
     )
+
+
+@pytest.mark.unit
+def test_async_finalizer_flushes_due_untracked_observation_on_gc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink: list[str] = []
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
+
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, sdk_instance_id="gc-instance")
+    _observe_untracked(reporter)
+
+    del reporter
+    gc.collect()
+
+    assert f"{_URL}/api/v1/untracked-surfaces" in sink
+
+
+@pytest.mark.unit
+def test_async_finalizer_has_no_untracked_delivery_state_when_reporting_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink: list[str] = []
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
+
+    reporter = AsyncMetadataReporter(
+        _URL,
+        VALID_API_KEY,
+        sdk_instance_id="gc-disabled-instance",
+        report_untracked_surfaces=False,
+    )
+    _observe_untracked(reporter)
+
+    assert reporter._untracked_state is None
+    del reporter
+    gc.collect()
+
+    assert f"{_URL}/api/v1/untracked-surfaces" not in sink
+
+
+@pytest.mark.unit
+def test_blocking_exit_flush_initiates_due_untracked_cycle_without_spend_drops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink: list[str] = []
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, sdk_instance_id="exit-instance")
+    _observe_untracked(reporter)
+
+    blocking_exit_flush(reporter)
+
+    assert f"{_URL}/api/v1/untracked-surfaces" in sink
+    assert reporter.dropped_counts == {}
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+
+
+@pytest.mark.unit
+def test_no_loop_advisory_access_is_silent_and_still_exit_flushes(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sink: list[str] = []
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
+    client = AsyncSolwyn(
+        _UntrackedAsyncOpenAIClient(),
+        api_key=VALID_API_KEY,
+        api_url=_URL,
+        on_unmetered="allow",
+    )
+
+    try:
+        with caplog.at_level("WARNING"):
+            operation = client.post
+
+        assert callable(operation)
+        assert client._reporter._warned_no_loop is False
+        assert not any(
+            record.name in {"solwyn._base", "solwyn.reporter"} for record in caplog.records
+        )
+        state = client._reporter._untracked_state
+        assert state is not None
+        assert ("openai", "openai_sdk", "async", "post") in state.observations
+
+        blocking_exit_flush(client._reporter)
+
+        assert f"{_URL}/api/v1/untracked-surfaces" in sink
+    finally:
+        asyncio.run(client.close())
+
+
+@pytest.mark.unit
+def test_failing_exit_advisory_post_is_silent_and_cadence_throttled(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sink: list[str] = []
+
+    def down(_url: str) -> object:
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink, down))
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, sdk_instance_id="exit-failure")
+    _observe_untracked(reporter)
+    state = reporter._untracked_state
+    assert state is not None
+    key = ("openai", "openai_sdk", "async", "responses.create")
+
+    with caplog.at_level("WARNING"):
+        blocking_exit_flush(reporter)
+
+    assert f"{_URL}/api/v1/untracked-surfaces" in sink
+    assert key not in state.last_sent_occurrences
+    attempted_at = state.last_attempted_at[key]
+    assert state.reports_due(attempted_at + 899.999) is False
+    assert state.reports_due(attempted_at + 900.0) is True
+    assert reporter.dropped_counts == {}
+    assert "lifecycle.exit_flush_failed" not in caplog.text
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+    reporter._close_completed = True
+    asyncio.run(reporter._http.aclose())
+
+
+@pytest.mark.unit
+def test_blocking_exit_flush_skips_untracked_delivery_when_reporting_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sink: list[str] = []
+    monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
+    reporter = AsyncMetadataReporter(
+        _URL,
+        VALID_API_KEY,
+        sdk_instance_id="exit-disabled-instance",
+        report_untracked_surfaces=False,
+    )
+    _observe_untracked(reporter)
+
+    blocking_exit_flush(reporter)
+
+    assert f"{_URL}/api/v1/untracked-surfaces" not in sink
+    assert reporter.dropped_counts == {}
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
 
 
 @pytest.mark.unit

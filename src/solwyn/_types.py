@@ -7,7 +7,7 @@ NotificationEventType, Environment, BudgetPeriod.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal, cast
 
@@ -18,6 +18,7 @@ from pydantic import (
     SerializationInfo,
     SerializerFunctionWrapHandler,
     StringConstraints,
+    field_validator,
     model_serializer,
     model_validator,
 )
@@ -126,6 +127,26 @@ ServiceTier = Literal["auto", "default", "flex", "scale", "priority", "standard"
 # cards land. Vendored lock-step with core shared/models.py's Modality.
 Modality = Literal["text", "image", "audio", "video", "embedding"]
 
+UntrackedClientShape = Literal[
+    "openai_sdk",
+    "native_together",
+    "anthropic_sdk",
+    "google_generativeai",
+    "google_genai",
+    "bedrock_boto3",
+    "bedrock_aioboto3",
+]
+UntrackedRuleKind = Literal["unmetered_spend", "unknown"]
+UntrackedPosture = Literal["warn", "allow"]
+UntrackedScope = Literal[
+    "operation",
+    "client",
+    "resource",
+    "raw_response",
+    "arbitrary_endpoint",
+]
+SURFACE_PATH_PATTERN = r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*){0,7}$"
+
 TagKey = Annotated[
     str,
     StringConstraints(min_length=1, max_length=TAG_KEY_MAX_LENGTH, strict=True),
@@ -178,6 +199,38 @@ class BreakerStateReport(BaseModel):
         max_length=100,
         description="Bounded SDK instance identifier used to isolate Redis snapshots",
     )
+
+
+class UntrackedSurfaceReport(BaseModel):
+    """Content-free structural observation for a surface the SDK does not meter."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: ProviderName
+    client_shape: UntrackedClientShape
+    mode: Literal["sync", "async"]
+    surface: str = Field(..., max_length=128, pattern=SURFACE_PATH_PATTERN)
+    rule_kind: UntrackedRuleKind
+    capability_scope: UntrackedScope | None = None
+    posture: UntrackedPosture
+    occurrences: int = Field(..., ge=1, le=1_000_000_000)
+    first_seen_at: datetime
+    last_seen_at: datetime
+    sdk_instance_id: str = Field(..., max_length=100)
+    report_id: str = Field(..., max_length=36, pattern=CALL_ID_PATTERN)
+
+    @field_validator("first_seen_at", "last_seen_at")
+    @classmethod
+    def normalize_seen_at(cls, value: datetime) -> datetime:
+        if value.utcoffset() is None:
+            return value.replace(tzinfo=UTC)
+        return value
+
+    @model_validator(mode="after")
+    def _check_seen_order(self) -> UntrackedSurfaceReport:
+        if self.last_seen_at < self.first_seen_at:
+            raise ValueError("last_seen_at must be greater than or equal to first_seen_at")
+        return self
 
 
 class MediaUsage(BaseModel):

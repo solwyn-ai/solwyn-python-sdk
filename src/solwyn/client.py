@@ -984,12 +984,16 @@ class Solwyn(_SolwynBase):
             breaker_snapshots=self._get_breaker_snapshots,
             sdk_instance_id=self._sdk_instance_id,
             breaker_reporting_enabled=config.breaker_reporting_enabled,
+            report_untracked_surfaces=config.report_untracked_surfaces,
             breaker_report_heartbeat=config.breaker_report_heartbeat,
             control_plane_breaker=self._control_plane_breaker,
             max_send_attempts=config.reporter_max_send_attempts,
             retry_backoff_base=config.reporter_retry_backoff_base,
             retry_backoff_cap=config.reporter_retry_backoff_cap,
             shutdown_deadline=config.reporter_shutdown_deadline,
+        )
+        self._untracked_observation_notifier = (
+            self._reporter.observe_untracked_surface if config.report_untracked_surfaces else None
         )
 
     @functools.cached_property
@@ -2182,12 +2186,16 @@ class AsyncSolwyn(_SolwynBase):
             breaker_snapshots=self._get_breaker_snapshots,
             sdk_instance_id=self._sdk_instance_id,
             breaker_reporting_enabled=config.breaker_reporting_enabled,
+            report_untracked_surfaces=config.report_untracked_surfaces,
             breaker_report_heartbeat=config.breaker_report_heartbeat,
             control_plane_breaker=self._control_plane_breaker,
             max_send_attempts=config.reporter_max_send_attempts,
             retry_backoff_base=config.reporter_retry_backoff_base,
             retry_backoff_cap=config.reporter_retry_backoff_cap,
             shutdown_deadline=config.reporter_shutdown_deadline,
+        )
+        self._untracked_observation_notifier = (
+            self._reporter.observe_untracked_surface if config.report_untracked_surfaces else None
         )
 
     @functools.cached_property

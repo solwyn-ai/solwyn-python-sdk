@@ -258,6 +258,22 @@ Known untracked leaves and newly observed leaves follow `on_unmetered`:
   `UntrackedSpendSurfaceError`. This is strict mode.
 - `on_unmetered="allow"` permits the call without warning.
 
+By default, unacknowledged `warn` and `allow` observations schedule structural
+advisory POSTs to the project-implicit `/api/v1/untracked-surfaces` route. A
+background reporter thread/task sends them immediately on first observation
+and then at a 15-minute cadence; shutdown may make a deadline-bounded
+best-effort final attempt. Send failures are silent. Payloads contain only the
+dotted surface path, bounded provider/client-shape, sync/async, rule, scope,
+and posture fields, approximate occurrence counts and first/last timestamps,
+and random SDK-instance/report identifiers. Model names, request arguments,
+prompts, and responses are never included. This is an approximate signal, not
+billing truth, and it does not add a budget check or cost event.
+
+Set `report_untracked_surfaces=False` or
+`SOLWYN_REPORT_UNTRACKED_SURFACES=false` to opt out of advisory egress. This
+does not change the local `on_unmetered` posture; warnings, allowed calls, and
+strict refusals continue unchanged.
+
 Set the posture in the constructor or with `SOLWYN_ON_UNMETERED=raise`:
 
 ```python
@@ -516,6 +532,7 @@ except BudgetExceededError as e:
 | `lease_enabled` | `SOLWYN_LEASE_ENABLED` | `True` | Use in-memory token leases for eligible run-scoped calls |
 | `lease_output_bound_default` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token allowance when no configured provider hop has an explicit cap |
 | `on_unmetered` | `SOLWYN_ON_UNMETERED` | `warn` | Handle untracked or unknown pre-call capabilities with `warn`, `raise`, or `allow` |
+| `report_untracked_surfaces` | `SOLWYN_REPORT_UNTRACKED_SURFACES` | `True` | Send optional structural advisory reports for unacknowledged `warn`/`allow` observations; set false to keep them local |
 | `acknowledge_untracked` | `SOLWYN_ACKNOWLEDGE_UNTRACKED` | empty | Exact terminal capability tokens; env format is comma-delimited |
 | `control_plane_failure_threshold` | `SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD` | `3` | Consecutive Solwyn API failures before local outage posture applies |
 | `control_plane_recovery_timeout` | `SOLWYN_CONTROL_PLANE_RECOVERY_TIMEOUT` | `30.0` | Seconds before probing the Solwyn API after its breaker opens |

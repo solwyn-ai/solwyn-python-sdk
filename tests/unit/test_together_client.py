@@ -37,21 +37,22 @@ SILENT_SURFACES = frozenset({"batches", "fine_tuning"})
 
 @pytest.fixture(autouse=True)
 def _reset_spend_surface_latch() -> None:
-    """Reset the per-process warn-once latch so warn tests stay order-independent."""
+    """Reset per-process observations so untracked tests stay order-independent."""
     _reset_unmetered_spend_warnings()
 
 
-_T = TypeVar("_T")
+_K = TypeVar("_K")
+_V = TypeVar("_V")
 
 
-class _YieldingSet(set[_T]):
-    """Yield after an absent membership check to expose check/insert races."""
+class _YieldingDict(dict[_K, _V]):
+    """Yield after an absent lookup to expose check/insert races."""
 
-    def __contains__(self, item: object) -> bool:
-        present = super().__contains__(item)
-        if not present:
+    def get(self, key: _K, default: _V | None = None) -> _V | None:
+        value = super().get(key, default)
+        if value is default:
             time.sleep(0.05)
-        return present
+        return value
 
 
 def _completion_response() -> SimpleNamespace:
@@ -380,13 +381,13 @@ def test_sync_concurrent_unmetered_surface_access_warns_exactly_once(
     resource = object()
     client.rerank = resource
     solwyn = _make_solwyn(client)
-    # Swap the module-level latch for one that yields on an absent membership
-    # check, exposing any check-then-insert race; the surrounding lock must still
+    # Swap the module-level registry for one that yields on an absent lookup,
+    # exposing any check-then-insert race; the surrounding lock must still
     # serialize so exactly one thread warns. monkeypatch restores the original.
     monkeypatch.setattr(
         _base,
-        "_warned_contextual_surfaces",
-        _YieldingSet[tuple[str, str, str]](),
+        "_untracked_surface_observations",
+        _YieldingDict[tuple[str, str, str, str], _base._UntrackedSurfaceObservation](),
     )
     start = threading.Barrier(worker_count)
 
@@ -408,6 +409,10 @@ def test_sync_concurrent_unmetered_surface_access_warns_exactly_once(
         "rerank",
         None,
     )
+    observation = _base._untracked_surface_observations[
+        ("together", "native_together", "sync", "rerank")
+    ]
+    assert observation["occurrences"] == worker_count
     solwyn.close()
 
 

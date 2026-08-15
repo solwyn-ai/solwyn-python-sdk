@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import zlib
 from collections import defaultdict
 from collections.abc import Iterable
@@ -21,6 +22,8 @@ from typing import Any
 # requires regenerating the payload IN THE SAME COMMIT (a mismatched payload
 # fails at import, which also disables the export/embed tooling until fixed).
 CONTRACT_VERSION = 1
+_SURFACE_PATH_MAX_LENGTH = 128
+_SURFACE_PATH_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*){0,7}")
 
 DIALECT_BY_PROVIDER: dict[str, str] = {
     "anthropic": "anthropic",
@@ -208,6 +211,8 @@ class SurfaceRule:
         if not self.rule_id:
             raise RuntimeError("surface rule id must not be empty")
         _validate_surface_path(self.surface)
+        if not _surface_path_is_reportable(self.surface):
+            raise RuntimeError(f"surface rule {self.rule_id} exceeds the advisory wire path bounds")
         if not self.selectors:
             raise RuntimeError(f"surface rule {self.rule_id} has no selectors")
         if len(set(self.selectors)) != len(self.selectors):
@@ -358,6 +363,10 @@ def resolve_surface_rule(
     """Resolve an exact path or fail if equally specific rules overlap."""
 
     _validate_surface_path(path)
+    if not _surface_path_is_reportable(path):
+        # Every embedded rule fits the wire boundary, so an over-limit path can
+        # only be unknown — resolve it without scanning.
+        return None
     selected_rules = _RULES_BY_PATH.get(path, ()) if rules is None else rules
     candidates: list[tuple[tuple[int, int, int], SurfaceRule]] = []
     for rule in selected_rules:
@@ -426,13 +435,28 @@ def payload_fingerprint(rules: Iterable[SurfaceRule] | None = None) -> str:
     return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _surface_path_is_reportable(path: str) -> bool:
+    """Return whether a structural path fits the advisory wire boundary.
+
+    Structural validity is deliberately broader: Python admits public
+    identifiers this bounded ASCII/depth/length pattern rejects, and a provider
+    call must keep forwarding them instead of failing on a reporting limit.
+    """
+
+    return (
+        len(path) <= _SURFACE_PATH_MAX_LENGTH and _SURFACE_PATH_PATTERN.fullmatch(path) is not None
+    )
+
+
 def _validate_surface_path(path: str) -> None:
+    """Reject a non-structural public path without echoing its content."""
+
     parts = path.split(".")
     invalid_part = any(
         not part or not part.isidentifier() or part.startswith("_") for part in parts
     )
     if not path or invalid_part:
-        raise RuntimeError(f"invalid public surface path: {path!r}")
+        raise RuntimeError("invalid public surface path")
 
 
 def _build_surface_rules() -> tuple[SurfaceRule, ...]:

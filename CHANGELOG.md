@@ -23,6 +23,24 @@ derived from git tags (hatch-vcs).
   only. Namespaces, wildcards, inapplicable tokens, tracked leaves, blocked
   leaves, and unsupported leaves are rejected; the conditional token-billed
   TTS exception uses `audio.speech.create:gpt-4o-mini-tts`.
+- **Privacy-safe advisory reporting identifies untracked provider-client
+  surfaces.** It is ON by default. Provider-call paths schedule fire-and-forget
+  delivery through the reporter's background thread/task, never on the budget
+  hot path; shutdown may make a deadline-bounded best-effort final attempt, and
+  send failures remain silent. External payloads contain only a structural
+  dotted surface path; bounded provider/client-shape, sync/async, rule, scope,
+  and posture fields; approximate occurrence counts and first/last timestamps;
+  and random SDK-instance/report identifiers. They never contain model names,
+  request arguments, prompts, or responses. Only unacknowledged `warn`/`allow`
+  observations are reported; `raise` refusals and acknowledged escapes are
+  not. Reporting adds neither a budget check nor a cost event, so it does not
+  meter or budget-enforce these calls; counts are bounded-overcount signals,
+  not billing truth, and dashboard absence is not comprehensive usage evidence.
+  Core derives the project from authentication on its project-implicit route.
+  Set `report_untracked_surfaces=False` or
+  `SOLWYN_REPORT_UNTRACKED_SURFACES=false` to disable optional external
+  advisory egress without changing local `on_unmetered`
+  `warn`/`allow`/`raise` behavior.
 - **Dashboard-stopped runs raise `RunStoppedError`.** The public exception is
   a `BudgetExceededError` subclass, so existing hard-deny handlers remain
   compatible. It identifies the stopped run, preserves the budget snapshot
@@ -40,6 +58,11 @@ derived from git tags (hatch-vcs).
   retained raw clients, private wrapper state, explicitly acknowledged scoped
   raw escapes, and native behavior on returned provider objects remain outside
   its enforcement boundary.
+- **Identifier-clean provider paths that exceed advisory wire limits keep the
+  configured local posture.** `warn` logs once and forwards, while `allow`
+  forwards silently; an over-length, over-depth, or non-ASCII path is counted
+  locally and never sent externally. Malformed public paths (empty, private, or
+  non-identifier segments) still fail closed.
 - **`run_stopped` denials now stay sticky only for their run.** Per-call and
   lease denials use the same run-scoped classification as `agent_run`, so a
   control-plane outage cannot replay a dashboard stop against unrelated run

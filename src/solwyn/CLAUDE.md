@@ -46,6 +46,33 @@ client, reach private wrapper state, acknowledge a scoped raw escape, or invoke
 native behavior on provider-returned response/page/stream/job/operation
 objects.
 
+Advisory reporting for untracked provider-client surfaces is ON by default.
+From provider-call paths, the SDK only schedules fire-and-forget delivery
+through the reporter's background thread/task, never on the budget hot path.
+Shutdown may wait within the shared deadline for active advisory work and a
+best-effort final attempt; send failures remain silent. Each external payload
+contains a structural dotted surface path; bounded execution-context and
+classification fields (provider, client shape, sync/async mode, rule kind,
+optional capability scope, and posture); approximate occurrence counts and
+first/last timestamps; and random SDK-instance/report identifiers. Model names,
+request arguments, prompts, and responses are never included. A public path that
+is identifier-clean but structurally unreportable (deeper or longer than the
+wire pattern allows, or non-ASCII) stays LOCAL-ONLY: it is warned and counted in
+the process registry exactly like any other untracked surface, and never reaches
+a reporter. Only a malformed path — an empty, private, or non-identifier
+segment — fails closed with a content-free `RuntimeError`.
+
+Only unacknowledged `warn`/`allow` observations enter advisory reporting;
+`raise` refusals and acknowledged escapes do not. Reporting adds neither a
+budget check nor a cost event, so it does not meter or budget-enforce these
+calls. Counts are approximate, bounded-overcount signals rather than billing
+truth, and absence from the dashboard is not comprehensive usage evidence.
+Core derives the project from authentication on its project-implicit route.
+Set `report_untracked_surfaces=False` or
+`SOLWYN_REPORT_UNTRACKED_SURFACES=false` to disable this optional external
+advisory egress without changing local `on_unmetered`
+`warn`/`allow`/`raise` behavior.
+
 Coverage fingerprints must be independently reviewed literals. Never derive a
 value from the report under test and immediately pass it to `expect(...)`.
 Changes to audit fields are bidirectional drift and require reviewing the full

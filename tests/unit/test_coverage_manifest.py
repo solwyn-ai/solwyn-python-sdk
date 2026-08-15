@@ -926,6 +926,30 @@ def test_readme_states_the_strict_coverage_and_trust_boundary_contract() -> None
 
 
 @pytest.mark.unit
+def test_readme_discloses_default_untracked_advisory_egress_and_opt_outs() -> None:
+    readme = (_PROJECT_ROOT / "README.md").read_text()
+    normalized_readme = " ".join(readme.split())
+
+    required_claims = (
+        "unacknowledged `warn` and `allow` observations schedule structural advisory POSTs",
+        "project-implicit `/api/v1/untracked-surfaces` route",
+        "background reporter thread/task",
+        "15-minute cadence",
+        "deadline-bounded best-effort final attempt",
+        "Model names, request arguments, prompts, and responses are never included",
+        "approximate signal, not billing truth",
+        "does not add a budget check or cost event",
+        "Send failures are silent",
+        "`report_untracked_surfaces=False`",
+        "`SOLWYN_REPORT_UNTRACKED_SURFACES=false`",
+        "does not change the local `on_unmetered` posture",
+        "| `report_untracked_surfaces` | `SOLWYN_REPORT_UNTRACKED_SURFACES` | `True` |",
+    )
+    for claim in required_claims:
+        assert claim in normalized_readme
+
+
+@pytest.mark.unit
 def test_maintainer_docs_define_python_contract_and_ci_artifact() -> None:
     # Arrange
     maintainer_docs = (_PROJECT_ROOT / "src" / "solwyn" / "CLAUDE.md").read_text()

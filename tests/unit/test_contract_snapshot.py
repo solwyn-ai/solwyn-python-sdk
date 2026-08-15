@@ -54,6 +54,7 @@ from solwyn._types import (
     MediaUsage,
     MetadataEvent,
     ProviderName,
+    UntrackedSurfaceReport,
 )
 from solwyn.client import AsyncSolwyn, Solwyn
 
@@ -197,6 +198,21 @@ EXPECTED_BREAKER_STATE_REPORT_FIELDS = {
     "sdk_instance_id",
 }
 
+EXPECTED_UNTRACKED_SURFACE_REPORT_FIELDS = {
+    "provider",
+    "client_shape",
+    "mode",
+    "surface",
+    "rule_kind",
+    "capability_scope",
+    "posture",
+    "occurrences",
+    "first_seen_at",
+    "last_seen_at",
+    "sdk_instance_id",
+    "report_id",
+}
+
 EXPECTED_METADATA_FIELDS = {
     "model",
     "provider",
@@ -321,6 +337,9 @@ class TestWireModelFieldSets:
     def test_breaker_state_report_field_set(self) -> None:
         assert set(BreakerStateReport.model_fields) == EXPECTED_BREAKER_STATE_REPORT_FIELDS
 
+    def test_untracked_surface_report_field_set(self) -> None:
+        assert set(UntrackedSurfaceReport.model_fields) == EXPECTED_UNTRACKED_SURFACE_REPORT_FIELDS
+
 
 def _confirm(**overrides: Any) -> BudgetConfirmRequest:
     base: dict[str, Any] = {
@@ -395,6 +414,37 @@ class TestWireModelDumpSnapshots:
             "success_count": 0,
             "reported_at": "2026-07-14T12:00:00Z",
             "sdk_instance_id": "sdk-instance-1",
+        }
+
+    def test_untracked_surface_report_dump_keys(self) -> None:
+        report = UntrackedSurfaceReport(
+            provider="openai",
+            client_shape="openai_sdk",
+            mode="sync",
+            surface="responses.create",
+            rule_kind="unmetered_spend",
+            capability_scope="operation",
+            posture="warn",
+            occurrences=3,
+            first_seen_at="2026-08-13T12:00:00Z",
+            last_seen_at="2026-08-13T12:01:00Z",
+            sdk_instance_id="sdk-instance-1",
+            report_id="3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b",
+        )
+
+        assert report.model_dump(mode="json") == {
+            "provider": "openai",
+            "client_shape": "openai_sdk",
+            "mode": "sync",
+            "surface": "responses.create",
+            "rule_kind": "unmetered_spend",
+            "capability_scope": "operation",
+            "posture": "warn",
+            "occurrences": 3,
+            "first_seen_at": "2026-08-13T12:00:00Z",
+            "last_seen_at": "2026-08-13T12:01:00Z",
+            "sdk_instance_id": "sdk-instance-1",
+            "report_id": "3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b",
         }
 
     def test_budget_check_request_scoped_dump_carries_agent_run_id(self) -> None:

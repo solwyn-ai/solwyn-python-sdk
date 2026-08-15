@@ -34,7 +34,12 @@ from solwyn._privacy import (
     measure_speech_media,
     measure_video_media,
 )
-from solwyn._types import BudgetCheckRequest, BudgetConfirmRequest, MetadataEvent
+from solwyn._types import (
+    BudgetCheckRequest,
+    BudgetConfirmRequest,
+    MetadataEvent,
+    UntrackedSurfaceReport,
+)
 from solwyn.client import Solwyn
 from solwyn.exceptions import UntranslatableRequestError
 
@@ -518,7 +523,12 @@ def test_privacy_banner_set_equals_allowlist() -> None:
 def test_wire_models_stay_content_free() -> None:
     """SDK<->API wire models must never carry a content-bearing field name.
     Failover adds only STRUCTURAL fields (provider identifiers, error class)."""
-    for model in (MetadataEvent, BudgetCheckRequest, BudgetConfirmRequest):
+    for model in (
+        MetadataEvent,
+        BudgetCheckRequest,
+        BudgetConfirmRequest,
+        UntrackedSurfaceReport,
+    ):
         leaked = set(model.model_fields) & FORBIDDEN_FIELDS
         assert not leaked, f"{model.__name__} leaks content-bearing fields: {leaked}"
 

@@ -5,9 +5,10 @@ from __future__ import annotations
 import functools
 import logging
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import VALID_API_KEY, foreground_records
@@ -220,6 +221,22 @@ class _OpaqueClient(_OpenAIClient):
         self.opaque = object()
 
 
+class _DeepDynamicResource:
+    def __getattr__(self, name: str) -> Any:
+        if name == "call":
+            return lambda: "called"
+        return self
+
+
+class _DeepOpenAIClient(_OpenAIClient):
+    @functools.cached_property
+    def deep(self) -> _DeepDynamicResource:
+        return _DeepDynamicResource()
+
+
+_DeepDynamicResource.__module__ = "openai.resources.deep"
+
+
 for _client_type in (
     _OpenAIClient,
     _MissingResponsesClient,
@@ -228,6 +245,7 @@ for _client_type in (
     _DriftedBaseURLClient,
     _DriftedPostClient,
     _OpaqueClient,
+    _DeepOpenAIClient,
 ):
     _client_type.__module__ = "openai._client"
 
@@ -268,7 +286,7 @@ def test_default_warn_logs_once_and_returns_the_terminal_capability(
 
 
 @pytest.mark.unit
-def test_reviewed_shape_drift_warns_after_the_matching_surface_already_warned(
+def test_reviewed_shape_drift_counts_after_the_matching_surface_already_warned(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -292,17 +310,19 @@ def test_reviewed_shape_drift_warns_after_the_matching_surface_already_warned(
     assert first() == "posted"
     assert second == "drifted"
     records = foreground_records(caplog)
-    assert len(records) == 2
+    assert len(records) == 1
     assert records[0].args == ("openai", "openai_sdk", "post", "arbitrary_endpoint")
-    assert (
-        f"Reviewed rule {reviewed_rule.rule_id} no longer matches its shape."
-        in records[1].getMessage()
-    )
+    from solwyn import _base
+
+    observation = _base._untracked_surface_observations[("openai", "openai_sdk", "sync", "post")]
+    assert observation["occurrences"] == 2
+    assert observation["rule_kind"] == "unknown"
+    assert observation["capability_scope"] is None
     _close(wrapper)
 
 
 @pytest.mark.unit
-def test_warn_latch_keys_include_mode_and_are_bounded(
+def test_untracked_observation_keys_include_mode_and_are_bounded(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     from solwyn import _base
@@ -328,26 +348,26 @@ def test_warn_latch_keys_include_mode_and_are_bounded(
             for context in (sync_context, async_context):
                 _base._warn_contextual_surface_once(
                     context=context,
-                    rule_id="rule-x",
                     surface="post",
+                    rule_kind="unknown",
                     capability_scope=None,
                 )
 
         # Assert
-        assert len(_base._warned_contextual_surfaces) == 2
+        assert len(_base._untracked_surface_observations) == 2
 
         # Act
         with caplog.at_level(logging.WARNING, logger="solwyn._base"):
-            for index in range(_base._WARNED_SURFACE_LIMIT + 50):
+            for index in range(_base._UNTRACKED_SURFACE_LIMIT + 50):
                 _base._warn_contextual_surface_once(
                     context=sync_context,
-                    rule_id=f"rule-{index}",
-                    surface=f"surface-{index}",
+                    surface=f"surface_{index}",
+                    rule_kind="unknown",
                     capability_scope=None,
                 )
 
         # Assert
-        assert len(_base._warned_contextual_surfaces) <= _base._WARNED_SURFACE_LIMIT
+        assert len(_base._untracked_surface_observations) <= _base._UNTRACKED_SURFACE_LIMIT
         overflow_records = [
             record
             for record in caplog.records
@@ -383,10 +403,14 @@ def test_warn_latch_overflow_logging_is_reentrant(
         mode="sync",
     )
     lock = _SameThreadReentryGuard()
-    _base._warned_contextual_surfaces.update(
-        ("openai", "openai_sdk", "sync", f"rule-{index}", False)
-        for index in range(_base._WARNED_SURFACE_LIMIT)
-    )
+    for index in range(_base._UNTRACKED_SURFACE_LIMIT):
+        _base._record_untracked_surface_observation(
+            context=context,
+            surface=f"surface_{index}",
+            rule_kind="unknown",
+            capability_scope=None,
+            posture="warn",
+        )
     monkeypatch.setattr(_base, "_spend_surface_warn_lock", lock)
     warning_calls = 0
 
@@ -396,8 +420,8 @@ def test_warn_latch_overflow_logging_is_reentrant(
         if warning_calls == 1:
             _base._warn_contextual_surface_once(
                 context=context,
-                rule_id="recursive-rule",
-                surface="recursive-surface",
+                surface="recursive_surface",
+                rule_kind="unknown",
                 capability_scope=None,
             )
 
@@ -407,8 +431,8 @@ def test_warn_latch_overflow_logging_is_reentrant(
         # Act
         _base._warn_contextual_surface_once(
             context=context,
-            rule_id="overflow-rule",
-            surface="overflow-surface",
+            surface="overflow_surface",
+            rule_kind="unknown",
             capability_scope=None,
         )
 
@@ -416,6 +440,106 @@ def test_warn_latch_overflow_logging_is_reentrant(
         assert warning_calls == 1
     finally:
         _base._reset_unmetered_spend_warnings()
+
+
+@pytest.mark.unit
+def test_observation_timestamps_cannot_regress_when_lock_acquisition_is_reordered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from solwyn import _base
+
+    older = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+    newer = datetime(2026, 8, 13, 12, 1, tzinfo=UTC)
+    sampled_times = iter((older, newer))
+    context = _base.SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+
+    class _InterleavingClock:
+        @classmethod
+        def now(cls, timezone: object) -> datetime:
+            assert timezone is UTC
+            return next(sampled_times)
+
+    class _LaterObservationEntersFirst:
+        interleaved = False
+
+        def __enter__(self) -> None:
+            if self.interleaved:
+                return
+            self.interleaved = True
+            _base._record_untracked_surface_observation(
+                context=context,
+                surface="post",
+                rule_kind="unmetered_spend",
+                capability_scope="arbitrary_endpoint",
+                posture="warn",
+            )
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    monkeypatch.setattr(_base, "datetime", _InterleavingClock)
+    monkeypatch.setattr(_base, "_spend_surface_warn_lock", _LaterObservationEntersFirst())
+
+    _base._record_untracked_surface_observation(
+        context=context,
+        surface="post",
+        rule_kind="unmetered_spend",
+        capability_scope="arbitrary_endpoint",
+        posture="allow",
+    )
+
+    observation = _base._untracked_surface_observations[("openai", "openai_sdk", "sync", "post")]
+    assert observation["occurrences"] == 2
+    assert observation["first_seen_at"] == older
+    assert observation["last_seen_at"] == newer
+    assert observation["posture"] == "allow"
+    assert observation["warning_emitted"] is True
+
+
+@pytest.mark.unit
+def test_observation_interval_widens_monotonically_when_wall_clock_moves_backward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from solwyn import _base
+
+    first = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
+    backward = datetime(2026, 8, 13, 11, 59, tzinfo=UTC)
+    sampled_times = iter((first, backward))
+    context = _base.SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+
+    class _BackwardClock:
+        @classmethod
+        def now(cls, timezone: object) -> datetime:
+            assert timezone is UTC
+            return next(sampled_times)
+
+    monkeypatch.setattr(_base, "datetime", _BackwardClock)
+
+    for posture in ("allow", "warn"):
+        _base._record_untracked_surface_observation(
+            context=context,
+            surface="post",
+            rule_kind="unmetered_spend",
+            capability_scope="arbitrary_endpoint",
+            posture=posture,
+        )
+
+    observation = _base._untracked_surface_observations[("openai", "openai_sdk", "sync", "post")]
+    assert observation["occurrences"] == 2
+    assert observation["first_seen_at"] == backward
+    assert observation["last_seen_at"] == first
+    assert observation["posture"] == "warn"
+    assert observation["warning_emitted"] is True
 
 
 @pytest.mark.unit
@@ -450,12 +574,110 @@ def test_fork_reset_replaces_module_warning_locks_with_unlocked_locks() -> None:
 def test_allow_is_silent_and_returns_the_terminal_capability(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    from solwyn import _base
+
     wrapper = _make_solwyn(_OpenAIClient(), on_unmetered="allow")
 
     with caplog.at_level(logging.WARNING, logger="solwyn._base"):
         assert wrapper.post() == "posted"
 
     assert foreground_records(caplog) == []
+    key = ("openai", "openai_sdk", "sync", "post")
+    observation = _base._untracked_surface_observations[key]
+    assert observation["occurrences"] == 1
+    assert observation["rule_kind"] == "unmetered_spend"
+    assert observation["capability_scope"] == "arbitrary_endpoint"
+    assert observation["posture"] == "allow"
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_allow_then_warn_counts_both_and_warns_on_the_first_warn_hit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from solwyn import _base
+
+    client = _OpenAIClient()
+    allow_wrapper = _make_solwyn(client, on_unmetered="allow")
+    warn_wrapper = _make_solwyn(client, on_unmetered="warn")
+
+    with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+        assert allow_wrapper.post() == "posted"
+        assert warn_wrapper.post() == "posted"
+
+    records = foreground_records(caplog)
+    assert len(records) == 1
+    assert records[0].args == ("openai", "openai_sdk", "post", "arbitrary_endpoint")
+    observation = _base._untracked_surface_observations[("openai", "openai_sdk", "sync", "post")]
+    assert observation["occurrences"] == 2
+    assert observation["posture"] == "warn"
+    _close(allow_wrapper)
+    _close(warn_wrapper)
+
+
+@pytest.mark.unit
+def test_warn_logs_once_and_counts_every_observation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from solwyn import _base
+
+    wrapper = _make_solwyn(_OpenAIClient(), on_unmetered="warn")
+
+    with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+        calls = [wrapper.post for _ in range(3)]
+
+    assert [call() for call in calls] == ["posted", "posted", "posted"]
+    assert len(foreground_records(caplog)) == 1
+    key = ("openai", "openai_sdk", "sync", "post")
+    observation = _base._untracked_surface_observations[key]
+    assert observation["occurrences"] == 3
+    assert observation["first_seen_at"] <= observation["last_seen_at"]
+    assert observation["rule_kind"] == "unmetered_spend"
+    assert observation["capability_scope"] == "arbitrary_endpoint"
+    assert observation["posture"] == "warn"
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_raise_records_no_untracked_surface_observation() -> None:
+    from solwyn import _base
+
+    wrapper = _make_solwyn(_OpenAIClient(), on_unmetered="raise")
+
+    with pytest.raises(UntrackedSpendSurfaceError):
+        _ = wrapper.post
+
+    assert _base._untracked_surface_observations == {}
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_untracked_surface_registry_contains_only_structural_data() -> None:
+    from solwyn import _base
+
+    class _PromptBearingOpenAIClient(_OpenAIClient):
+        def post(self, prompt: str) -> str:
+            return prompt
+
+    _PromptBearingOpenAIClient.__module__ = "openai._client"
+    prompt = "prompt-derived-secret"
+    wrapper = _make_solwyn(_PromptBearingOpenAIClient(), on_unmetered="allow")
+
+    assert wrapper.post(prompt) == prompt
+
+    key = ("openai", "openai_sdk", "sync", "post")
+    observation = _base._untracked_surface_observations[key]
+    assert set(observation) == {
+        "occurrences",
+        "first_seen_at",
+        "last_seen_at",
+        "rule_kind",
+        "capability_scope",
+        "posture",
+        "warning_emitted",
+    }
+    assert observation["warning_emitted"] is False
+    assert prompt not in repr(_base._untracked_surface_observations)
     _close(wrapper)
 
 
@@ -845,6 +1067,119 @@ def test_strict_invisible_dynamic_unknown_refuses_before_descriptor_evaluation()
 
     assert client.dynamic_evaluations == 0
     _close(wrapper)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "surface",
+    [
+        "not public",
+        "foo-bar",
+        "a..b",
+    ],
+    ids=["space", "hyphen", "empty-segment"],
+)
+def test_dynamic_access_rejects_a_non_structural_public_surface(
+    surface: str,
+) -> None:
+    from solwyn import _base
+
+    wrapper = _make_solwyn(_DynamicOpenAIClient(), on_unmetered="allow")
+
+    with pytest.raises(RuntimeError, match="invalid public surface path"):
+        getattr(wrapper, surface)
+
+    assert _base._untracked_surface_observations == {}
+    _close(wrapper)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("posture", ["warn", "allow"])
+@pytest.mark.parametrize(
+    "surface",
+    ["a" * 129, "café"],
+    ids=["overlong", "non-ascii"],
+)
+def test_wire_ineligible_identifier_forwards_and_stays_local(
+    surface: str,
+    posture: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from solwyn import _base
+
+    wrapper = _make_solwyn(_DynamicOpenAIClient(), on_unmetered=posture)
+    notifier = wrapper._untracked_observation_notifier
+    assert isinstance(notifier, MagicMock)
+    notifier.reset_mock()
+
+    with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+        first = getattr(wrapper, surface)
+        second = getattr(wrapper, surface)
+
+    assert first() == surface
+    assert second() == surface
+    observation = _base._untracked_surface_observations[("openai", "openai_sdk", "sync", surface)]
+    assert observation["occurrences"] == 2
+    notifier.assert_not_called()
+    records = foreground_records(caplog)
+    assert len(records) == (1 if posture == "warn" else 0)
+    _close(wrapper)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("posture", ["warn", "allow"])
+def test_nine_segment_identifier_chain_forwards_without_an_advisory_report(
+    posture: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from solwyn import _base
+
+    wrapper = _make_solwyn(_DeepOpenAIClient(), on_unmetered=posture)
+    resource = wrapper.deep
+    for segment in ("one", "two", "three", "four", "five", "six", "seven"):
+        resource = getattr(resource, segment)
+    terminal_path = "deep.one.two.three.four.five.six.seven.call"
+    notifier = wrapper._untracked_observation_notifier
+    assert isinstance(notifier, MagicMock)
+    notifier.reset_mock()
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="solwyn._base"):
+        assert hasattr(resource, "call") is True
+        terminal = resource.call
+
+    assert terminal() == "called"
+    observation = _base._untracked_surface_observations[
+        ("openai", "openai_sdk", "sync", terminal_path)
+    ]
+    assert observation["occurrences"] >= 1
+    notifier.assert_not_called()
+    records = foreground_records(caplog)
+    assert len(records) == (1 if posture == "warn" else 0)
+    _close(wrapper)
+
+
+@pytest.mark.unit
+def test_registry_boundary_rejects_an_invalid_wire_surface() -> None:
+    from solwyn import _base
+
+    context = _base.SurfaceContext(
+        provider="openai",
+        dialect="openai",
+        client_shape="openai_sdk",
+        mode="sync",
+    )
+
+    with pytest.raises(RuntimeError, match="invalid public surface path"):
+        _base._record_untracked_surface_observation(
+            context=context,
+            surface="prompt derived value",
+            rule_kind="unknown",
+            capability_scope=None,
+            posture="allow",
+        )
+
+    assert _base._untracked_surface_observations == {}
 
 
 @pytest.mark.unit
