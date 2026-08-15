@@ -9,6 +9,17 @@ derived from git tags (hatch-vcs).
 
 ### Added
 
+- **Native OpenAI Responses create calls are now budget-metered.** Sync and
+  async `responses.create(...)` calls, including `stream=True`, use one
+  primary-only path with Responses-compatible effective defaults: chat-only
+  defaults are stripped, caller arguments win, and budget preflight and provider
+  dispatch see the same mapping. Non-stream responses and completed Responses
+  streams settle provider-reported usage through the normal off-thread path;
+  completed streams take that usage from the terminal event. Streams abandoned
+  before terminal usage settle a length-based estimate, with lease-backed
+  abandoned calls floored at the reserved authority. Effective `background=True`
+  requests (including OpenAI's `extra_body` override precedence) fail loud
+  because queued responses expose no create-time usage.
 - **Strict pre-call coverage controls and local coverage manifests.** Clients
   now classify and guard the reachable public provider-client graph. Set
   `on_unmetered="raise"` / `SOLWYN_ON_UNMETERED=raise` to refuse untracked or
@@ -52,6 +63,11 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **Breaking (pre-launch): native `responses.create` is no longer an
+  acknowledgeable unmetered capability.** Remove `responses.create` from
+  `acknowledge_untracked`; it is now a tracked leaf and is rejected as an
+  acknowledgment token. Acknowledgment examples now use the still-unmetered
+  `responses.retrieve` leaf.
 - **Untracked capabilities now warn once by default instead of passing
   silently.** Guarded namespaces keep descendants inside the same posture
   decision. Strict mode is a cooperative pre-call guard, not a sandbox:

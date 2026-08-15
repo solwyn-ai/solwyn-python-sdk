@@ -248,6 +248,13 @@ Billable quantities are read from the response's usage block where it exists (gp
 
 ## Strict coverage controls
 
+- **OpenAI Responses:** Native OpenAI `responses.create(...)` is budget-metered
+  for sync and async clients, including `stream=True`. `responses.parse` and the
+  `responses.stream()` context-manager helper remain guarded unmetered leaves at
+  this milestone. `background=True` is refused because queued responses expose
+  no create-time usage, and Azure/OpenAI-compatible Responses coverage is not
+  yet claimed.
+
 Solwyn classifies the public pre-call capability graph of every supported
 wrapped client. Tracked leaves are intercepted as usual. Resource namespaces
 stay guarded so access to a parent never grants present or future descendants.
