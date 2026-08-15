@@ -1304,7 +1304,13 @@ class TestSyncResponsesStreamManagerLifecycle:
                 self.stream.close()
 
         manager = BlockingManager()
-        wrapper = _SyncResponsesStreamManagerWrapper(manager, self._wrap, on_error=MagicMock())
+        wrapper = _SyncResponsesStreamManagerWrapper(
+            manager,
+            self._wrap,
+            on_error=MagicMock(),
+            on_entry_error=MagicMock(),
+            on_abandoned_before_entry=MagicMock(),
+        )
         entered: list[object] = []
         errors: list[BaseException] = []
 
@@ -1347,7 +1353,13 @@ class TestSyncResponsesStreamManagerLifecycle:
         manager = MagicMock()
         manager.__enter__.return_value = inner
         manager.__exit__.return_value = None
-        wrapper = _SyncResponsesStreamManagerWrapper(manager, self._wrap, on_error=MagicMock())
+        wrapper = _SyncResponsesStreamManagerWrapper(
+            manager,
+            self._wrap,
+            on_error=MagicMock(),
+            on_entry_error=MagicMock(),
+            on_abandoned_before_entry=MagicMock(),
+        )
 
         wrapper.__enter__()
         with pytest.raises(RuntimeError, match="already entered"):
@@ -1363,14 +1375,27 @@ class TestSyncResponsesStreamManagerLifecycle:
 
         manager = MagicMock()
         manager.__exit__.return_value = None
-        wrapper = _SyncResponsesStreamManagerWrapper(manager, self._wrap, on_error=MagicMock())
+        wrap = MagicMock()
+        abandoned = MagicMock()
+        wrapper = _SyncResponsesStreamManagerWrapper(
+            manager,
+            wrap,
+            on_error=MagicMock(),
+            on_entry_error=MagicMock(),
+            on_abandoned_before_entry=abandoned,
+        )
 
+        wrapper.close()
         wrapper.close()
         with pytest.raises(RuntimeError, match="closed"):
             wrapper.__enter__()
 
         manager.__enter__.assert_not_called()
         manager.__exit__.assert_called_once_with(None, None, None)
+        # Nothing was dispatched: the reservation goes back and no stream is
+        # ever wrapped or settled.
+        abandoned.assert_called_once_with()
+        wrap.assert_not_called()
 
     def test_wrap_failure_closes_opened_manager_without_masking_original(self) -> None:
         from solwyn.stream import _SyncResponsesStreamManagerWrapper
@@ -1381,10 +1406,13 @@ class TestSyncResponsesStreamManagerLifecycle:
         manager.__enter__.return_value = inner
         manager.__exit__.side_effect = RuntimeError("cleanup failed")
         on_error = MagicMock()
+        on_entry_error = MagicMock()
         wrapper = _SyncResponsesStreamManagerWrapper(
             manager,
             MagicMock(side_effect=original),
             on_error=on_error,
+            on_entry_error=on_entry_error,
+            on_abandoned_before_entry=MagicMock(),
         )
 
         with pytest.raises(ValueError, match="wrapping failed") as exc_info:
@@ -1392,11 +1420,41 @@ class TestSyncResponsesStreamManagerLifecycle:
         wrapper.close()
 
         assert exc_info.value is original
+        # The provider stream was already open: this is an established-stream
+        # failure, not an entry failure.
         on_error.assert_called_once_with(original)
+        on_entry_error.assert_not_called()
         manager.__exit__.assert_called_once()
         exit_args = manager.__exit__.call_args.args
         assert exit_args[0] is ValueError
         assert exit_args[1] is original
+
+    def test_provider_entry_failure_uses_the_entry_error_path(self) -> None:
+        from solwyn.stream import _SyncResponsesStreamManagerWrapper
+
+        original = RuntimeError("entry failed")
+        manager = MagicMock()
+        manager.__enter__.side_effect = original
+        manager.__exit__.return_value = None
+        wrap = MagicMock()
+        on_error = MagicMock()
+        on_entry_error = MagicMock()
+        wrapper = _SyncResponsesStreamManagerWrapper(
+            manager,
+            wrap,
+            on_error=on_error,
+            on_entry_error=on_entry_error,
+            on_abandoned_before_entry=MagicMock(),
+        )
+
+        with pytest.raises(RuntimeError, match="entry failed"):
+            wrapper.__enter__()
+        wrapper.close()
+
+        on_entry_error.assert_called_once_with(original)
+        on_error.assert_not_called()
+        wrap.assert_not_called()
+        manager.__exit__.assert_called_once()
 
 
 @pytest.mark.unit
@@ -1427,6 +1485,8 @@ class TestAsyncResponsesStreamManagerLifecycle:
             manager,
             lambda source: self._wrap(source, on_complete, on_error),
             on_error=on_error,
+            on_entry_error=AsyncMock(),
+            on_abandoned_before_entry=AsyncMock(),
         )
 
         first = await wrapper.__aenter__()
@@ -1473,6 +1533,8 @@ class TestAsyncResponsesStreamManagerLifecycle:
             manager,
             lambda source: self._wrap(source, on_complete, on_error),
             on_error=on_error,
+            on_entry_error=AsyncMock(),
+            on_abandoned_before_entry=AsyncMock(),
         )
 
         first_task = asyncio.create_task(wrapper.__aenter__())
@@ -1502,10 +1564,13 @@ class TestAsyncResponsesStreamManagerLifecycle:
         manager.__aexit__ = AsyncMock(return_value=None)
         on_complete = AsyncMock()
         on_error = AsyncMock()
+        abandoned = AsyncMock()
         wrapper = _AsyncResponsesStreamManagerWrapper(
             manager,
             lambda source: self._wrap(source, on_complete, on_error),
             on_error=on_error,
+            on_entry_error=AsyncMock(),
+            on_abandoned_before_entry=abandoned,
         )
 
         await wrapper.close()
@@ -1515,7 +1580,9 @@ class TestAsyncResponsesStreamManagerLifecycle:
 
         manager.__aenter__.assert_not_awaited()
         manager.__aexit__.assert_awaited_once_with(None, None, None)
-        on_complete.assert_awaited_once()
+        # Nothing was dispatched: the reservation goes back instead of settling.
+        abandoned.assert_awaited_once_with()
+        on_complete.assert_not_awaited()
         on_error.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1561,6 +1628,8 @@ class TestAsyncResponsesStreamManagerLifecycle:
             manager,
             lambda source: self._wrap(source, on_complete, on_error),
             on_error=on_error,
+            on_entry_error=AsyncMock(),
+            on_abandoned_before_entry=AsyncMock(),
         )
         await wrapper.__aenter__()
 
@@ -1612,6 +1681,8 @@ class TestAsyncResponsesStreamManagerLifecycle:
             manager,
             lambda source: self._wrap(source, on_complete, on_error),
             on_error=on_error,
+            on_entry_error=AsyncMock(),
+            on_abandoned_before_entry=AsyncMock(),
         )
         await wrapper.__aenter__()
 
@@ -1637,10 +1708,13 @@ class TestAsyncResponsesStreamManagerLifecycle:
         manager.__aenter__ = AsyncMock(return_value=_CloseableAsyncStream([]))
         manager.__aexit__ = AsyncMock(side_effect=RuntimeError("cleanup failed"))
         on_error = AsyncMock()
+        on_entry_error = AsyncMock()
         wrapper = _AsyncResponsesStreamManagerWrapper(
             manager,
             MagicMock(side_effect=original),
             on_error=on_error,
+            on_entry_error=on_entry_error,
+            on_abandoned_before_entry=AsyncMock(),
         )
 
         with pytest.raises(ValueError, match="wrapping failed") as exc_info:
@@ -1648,11 +1722,42 @@ class TestAsyncResponsesStreamManagerLifecycle:
         await wrapper.close()
 
         assert exc_info.value is original
+        # The provider stream was already open: this is an established-stream
+        # failure, not an entry failure.
         on_error.assert_awaited_once_with(original)
+        on_entry_error.assert_not_awaited()
         manager.__aexit__.assert_awaited_once()
         exit_args = manager.__aexit__.await_args.args
         assert exit_args[0] is ValueError
         assert exit_args[1] is original
+
+    @pytest.mark.asyncio
+    async def test_provider_entry_failure_uses_the_entry_error_path(self) -> None:
+        from solwyn.stream import _AsyncResponsesStreamManagerWrapper
+
+        original = RuntimeError("entry failed")
+        manager = MagicMock()
+        manager.__aenter__ = AsyncMock(side_effect=original)
+        manager.__aexit__ = AsyncMock(return_value=None)
+        wrap = MagicMock()
+        on_error = AsyncMock()
+        on_entry_error = AsyncMock()
+        wrapper = _AsyncResponsesStreamManagerWrapper(
+            manager,
+            wrap,
+            on_error=on_error,
+            on_entry_error=on_entry_error,
+            on_abandoned_before_entry=AsyncMock(),
+        )
+
+        with pytest.raises(RuntimeError, match="entry failed"):
+            await wrapper.__aenter__()
+        await wrapper.close()
+
+        on_entry_error.assert_awaited_once_with(original)
+        on_error.assert_not_awaited()
+        wrap.assert_not_called()
+        manager.__aexit__.assert_awaited_once()
 
 
 @pytest.mark.unit

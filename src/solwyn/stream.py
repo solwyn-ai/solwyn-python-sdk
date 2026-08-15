@@ -379,9 +379,11 @@ class _SyncResponsesStreamManagerWrapper:
     The SDK manager opens the provider stream only in ``__enter__``. Solwyn
     therefore wraps the returned inner stream at that point, allowing the
     ordinary ``SyncStreamWrapper`` accumulator and settlement callbacks to
-    observe terminal Responses events. Closing before entry still settles the
-    existing reservation with the request estimate, while an entry failure
-    takes the stream error path and releases it.
+    observe terminal Responses events. Closing before entry dispatched no
+    provider request at all, so it releases the reservation without settling
+    or reporting; a provider entry failure takes the classified entry-error
+    path, and any failure after the provider stream opens takes the
+    established stream-error path.
     """
 
     def __init__(
@@ -390,12 +392,17 @@ class _SyncResponsesStreamManagerWrapper:
         wrap_stream: Callable[[Any], SyncStreamWrapper],
         *,
         on_error: Callable[[BaseException], None],
+        on_entry_error: Callable[[BaseException], None],
+        on_abandoned_before_entry: Callable[[], None],
     ) -> None:
         self._manager = manager
         self._wrap_stream = wrap_stream
         self._on_error = on_error
+        self._on_entry_error = on_entry_error
+        self._on_abandoned_before_entry = on_abandoned_before_entry
         self._stream: SyncStreamWrapper | None = None
-        self._error_settled = False
+        self._pre_entry_settled = False
+        self._dispatched = False
         self._state = "new"
         self._lock = threading.RLock()
 
@@ -404,20 +411,40 @@ class _SyncResponsesStreamManagerWrapper:
             self._stream = self._wrap_stream(source)
         return self._stream
 
-    def _settle_entry_error(self, exc: BaseException) -> None:
+    def _settle_before_stream(
+        self,
+        exc: BaseException,
+        handler: Callable[[BaseException], None],
+    ) -> None:
+        """Run at most ONE pre-entry reconciliation for this manager."""
         if self._stream is not None:
             self._stream._settle_error(exc)
             return
-        if self._error_settled:
+        if self._pre_entry_settled:
             return
-        self._error_settled = True
+        self._pre_entry_settled = True
         try:
-            self._on_error(exc)
+            handler(exc)
         except BaseException as settlement_exc:
             logger.warning(
                 "Responses entry settlement raised; suppressing (%s)",
                 type(settlement_exc).__name__,
             )
+
+    def _settle_entry_error(self, exc: BaseException) -> None:
+        """The provider request failed in ``__enter__``: classify it."""
+        self._settle_before_stream(exc, self._on_entry_error)
+
+    def _settle_wrap_error(self, exc: BaseException) -> None:
+        """The provider stream opened; wrapping failed after establishment."""
+        self._settle_before_stream(exc, self._on_error)
+
+    def _release_before_entry(self) -> None:
+        """Give the reservation back for a manager that never dispatched."""
+        if self._pre_entry_settled:
+            return
+        self._pre_entry_settled = True
+        self._on_abandoned_before_entry()
 
     def _close_failed_entry(self, exc: BaseException) -> None:
         try:
@@ -444,13 +471,14 @@ class _SyncResponsesStreamManagerWrapper:
                 self._settle_entry_error(exc)
                 self._close_failed_entry(exc)
                 raise
+            self._dispatched = True
 
             try:
                 stream = self._wrapped_stream(source)
                 entered_stream = _SyncResponsesEnteredStreamWrapper(stream)
             except BaseException as exc:
                 self._state = "closed"
-                self._settle_entry_error(exc)
+                self._settle_wrap_error(exc)
                 self._close_failed_entry(exc)
                 raise
 
@@ -466,7 +494,10 @@ class _SyncResponsesStreamManagerWrapper:
 
             settlement_error: BaseException | None = None
             try:
-                self._wrapped_stream()._settle()
+                if self._dispatched:
+                    self._wrapped_stream()._settle()
+                else:
+                    self._release_before_entry()
             except BaseException as exc:
                 settlement_error = exc
 
@@ -493,7 +524,7 @@ class _SyncResponsesStreamManagerWrapper:
             return result
 
     def close(self) -> None:
-        """Settle once and ask the SDK manager to close its inner stream."""
+        """Reconcile once (settle, or release if never entered) and close."""
         self._finish((None, None, None))
 
     def __exit__(self, *args: object) -> bool | None:
@@ -512,12 +543,17 @@ class _AsyncResponsesStreamManagerWrapper:
         wrap_stream: Callable[[Any], AsyncStreamWrapper],
         *,
         on_error: Callable[[BaseException], Awaitable[None]],
+        on_entry_error: Callable[[BaseException], Awaitable[None]],
+        on_abandoned_before_entry: Callable[[], Awaitable[None]],
     ) -> None:
         self._manager = manager
         self._wrap_stream = wrap_stream
         self._on_error = on_error
+        self._on_entry_error = on_entry_error
+        self._on_abandoned_before_entry = on_abandoned_before_entry
         self._stream: AsyncStreamWrapper | None = None
-        self._error_settled = False
+        self._pre_entry_settled = False
+        self._dispatched = False
         self._state = "new"
         self._lock = asyncio.Lock()
 
@@ -530,20 +566,40 @@ class _AsyncResponsesStreamManagerWrapper:
     def _cleanup_complete(self) -> bool:
         return self._state == "closed"
 
-    async def _settle_entry_error(self, exc: BaseException) -> None:
+    async def _settle_before_stream(
+        self,
+        exc: BaseException,
+        handler: Callable[[BaseException], Awaitable[None]],
+    ) -> None:
+        """Run at most ONE pre-entry reconciliation for this manager."""
         if self._stream is not None:
             await self._stream._settle_error(exc)
             return
-        if self._error_settled:
+        if self._pre_entry_settled:
             return
-        self._error_settled = True
+        self._pre_entry_settled = True
         try:
-            await self._on_error(exc)
+            await handler(exc)
         except BaseException as settlement_exc:
             logger.warning(
                 "Responses entry settlement raised; suppressing (%s)",
                 type(settlement_exc).__name__,
             )
+
+    async def _settle_entry_error(self, exc: BaseException) -> None:
+        """The provider request failed in ``__aenter__``: classify it."""
+        await self._settle_before_stream(exc, self._on_entry_error)
+
+    async def _settle_wrap_error(self, exc: BaseException) -> None:
+        """The provider stream opened; wrapping failed after establishment."""
+        await self._settle_before_stream(exc, self._on_error)
+
+    async def _release_before_entry(self) -> None:
+        """Give the reservation back for a manager that never dispatched."""
+        if self._pre_entry_settled:
+            return
+        self._pre_entry_settled = True
+        await self._on_abandoned_before_entry()
 
     async def _close_failed_entry(self, exc: BaseException) -> None:
         try:
@@ -568,13 +624,14 @@ class _AsyncResponsesStreamManagerWrapper:
                 await self._settle_entry_error(exc)
                 await self._close_failed_entry(exc)
                 raise
+            self._dispatched = True
 
             try:
                 stream = self._wrapped_stream(source)
                 entered_stream = _AsyncResponsesEnteredStreamWrapper(stream)
             except BaseException as exc:
                 self._state = "closed"
-                await self._settle_entry_error(exc)
+                await self._settle_wrap_error(exc)
                 await self._close_failed_entry(exc)
                 raise
 
@@ -592,7 +649,10 @@ class _AsyncResponsesStreamManagerWrapper:
 
             settlement_error: BaseException | None = None
             try:
-                await self._wrapped_stream()._settle()
+                if self._dispatched:
+                    await self._wrapped_stream()._settle()
+                else:
+                    await self._release_before_entry()
             except BaseException as exc:
                 settlement_error = exc
 
@@ -621,7 +681,7 @@ class _AsyncResponsesStreamManagerWrapper:
             return result
 
     async def close(self) -> None:
-        """Settle once and ask the SDK manager to close its inner stream."""
+        """Reconcile once (settle, or release if never entered) and close."""
         await self._finish((None, None, None))
 
     async def __aexit__(self, *args: object) -> bool | None:

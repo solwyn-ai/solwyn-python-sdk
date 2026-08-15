@@ -284,10 +284,12 @@ Billable quantities are read from the response's usage block where it exists (gp
   `responses.create(...)`, `responses.parse(...)`, and the
   `responses.stream(...)` context-manager helper are budget-metered for sync
   and async clients. `create(stream=True)` is
-  supported; parse is non-streaming and refuses any effective streaming
-  request. The stream helper's new-response overload preserves the SDK's
-  context-manager and `get_final_response()` behavior while settling terminal
-  usage or a conservative estimate on early exit. Foreground non-streaming
+  supported; streaming `parse` is not metered, so any effective streaming parse
+  request is refused. The stream helper's new-response overload preserves the
+  SDK's context-manager and `get_final_response()` behavior while settling
+  terminal usage or a conservative estimate on early exit; a helper closed
+  before it is ever entered sent no provider request, so it releases its
+  reservation instead of settling. Foreground non-streaming
   calls likewise settle a conservative marked
   estimate when Responses usage is missing or zeroed; lease-backed calls hold
   the reserved bound because output usage is unobservable. Its existing-response
@@ -298,7 +300,7 @@ Billable quantities are read from the response's usage block where it exists (gp
   `background=True` create calls are refused because queued responses expose no
   create-time usage. Because the OpenAI SDK serializes `extra_body` after named
   arguments, metering-critical overrides for `model`, `input`, `instructions`,
-  or `max_output_tokens` are refused with
+  `max_output_tokens`, or `stream` are refused with
   `ConfigurationError(field="extra_body")`; pass those values as top-level
   Responses arguments instead. Other vendor-specific `extra_body` extensions
   pass through unchanged. Other OpenAI-compatible providers retain their raw

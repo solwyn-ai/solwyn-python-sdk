@@ -232,12 +232,16 @@ def _effective_responses_kwargs(
 
 
 _RESPONSES_PARSE_STREAM_GUIDANCE = (
-    "OpenAI responses.parse is non-streaming and cannot meter a streaming response. "
-    "Use responses.create(stream=True) for metered streaming calls."
+    "Solwyn does not meter streaming responses.parse. "
+    "Use responses.create(stream=True) for metered streaming calls, "
+    "or the raw provider client for streaming parse."
 )
 
+# ``stream`` belongs here for the same reason as the others: extra_body wins on
+# the wire, so an entry there would desync Solwyn's streaming mode from the
+# dispatched request and lose the metered spend of whichever mode actually ran.
 _RESPONSES_METERING_CRITICAL_EXTRA_BODY_KEYS = frozenset(
-    {"model", "input", "instructions", "max_output_tokens"}
+    {"model", "input", "instructions", "max_output_tokens", "stream"}
 )
 
 
@@ -355,6 +359,49 @@ def _safe_extract_region(runtime: ProviderRuntime) -> str | None:
         return None
 
 
+def _settle_stream_failure(
+    owner: Any,
+    ctx: _AttemptContext,
+    budget: Any,
+    primary: ProviderRuntime,
+    *,
+    provider: str,
+    provider_region: str | None,
+    requested_model: str,
+    is_model_fallback: bool,
+    call_id: str,
+    agent_run: _RunContextSnapshot,
+    record_breaker_failure: bool,
+    possibly_succeeded: bool | None,
+    failover_error_class: str | None = None,
+) -> None:
+    """Reconcile one unsettleable stream: breaker verdict, release, error event."""
+    is_provider_fallback = ctx.is_provider_fallback
+    if record_breaker_failure:
+        owner._get_circuit_breaker(provider).record_failure()
+    owner._budget.release_reservation(
+        call_id,
+        lease_claim_token=_lease_claim_token(budget),
+    )
+    owner._reporter.report(
+        owner._build_error_event(
+            model=ctx.model,
+            provider=provider,
+            latency_ms=ctx.elapsed_ms(),
+            is_model_fallback=is_model_fallback,
+            is_provider_fallback=is_provider_fallback,
+            requested_provider=primary.entry.provider if is_provider_fallback else None,
+            requested_model=requested_model if is_provider_fallback else None,
+            failover_error_class=failover_error_class,
+            attempt_index=ctx.attempt_index,
+            call_id=call_id,
+            possibly_succeeded=possibly_succeeded,
+            agent_run=agent_run,
+            provider_region=provider_region,
+        )
+    )
+
+
 def _make_stream_error_handler(
     owner: Any,
     runtime: ProviderRuntime,
@@ -367,35 +414,104 @@ def _make_stream_error_handler(
     call_id: str,
     agent_run: _RunContextSnapshot,
 ) -> Callable[[BaseException], None]:
-    """Build the established stream-error reconciliation callback once."""
+    """Build the established stream-error reconciliation callback once.
+
+    The stream was already open, so the request provably reached the provider:
+    the abort is a provider-health failure and a possibly-succeeded charge.
+    """
     provider = runtime.adapter.name
-    is_provider_fallback = ctx.is_provider_fallback
     provider_region = _safe_extract_region(runtime)
 
     def on_error(_exc: BaseException) -> None:
-        owner._get_circuit_breaker(provider).record_failure()
+        _settle_stream_failure(
+            owner,
+            ctx,
+            budget,
+            primary,
+            provider=provider,
+            provider_region=provider_region,
+            requested_model=requested_model,
+            is_model_fallback=is_model_fallback,
+            call_id=call_id,
+            agent_run=agent_run,
+            record_breaker_failure=True,
+            possibly_succeeded=True,
+        )
+
+    return on_error
+
+
+def _make_stream_entry_error_handler(
+    owner: Any,
+    runtime: ProviderRuntime,
+    ctx: _AttemptContext,
+    budget: Any,
+    primary: ProviderRuntime,
+    *,
+    requested_model: str,
+    is_model_fallback: bool,
+    call_id: str,
+    agent_run: _RunContextSnapshot,
+) -> Callable[[BaseException], None]:
+    """Build the reconciliation callback for a stream that never established.
+
+    An SDK stream-manager helper sends its request in ``__enter__``, so this
+    failure is the candidate walk's dispatch error arriving one call later and
+    carries the SAME dispositions: FAIL_FAST is request-shaped and must record
+    no provider-health failure (an identical 400 on ``create(stream=True)``
+    records none), FAILOVER and POST_SEND_AMBIGUOUS are health signals, and only
+    a post-send-ambiguous abort is possibly_succeeded.
+    """
+    provider = runtime.adapter.name
+    provider_region = _safe_extract_region(runtime)
+
+    def on_entry_error(exc: BaseException) -> None:
+        # A non-``Exception`` teardown (cancellation, interrupt) is not a
+        # classifiable provider error: the request was in flight when the caller
+        # tore it down, so it keeps the ambiguous reconciliation.
+        disp = (
+            classify_exception(exc)
+            if isinstance(exc, Exception)
+            else Disposition.POST_SEND_AMBIGUOUS
+        )
+        _settle_stream_failure(
+            owner,
+            ctx,
+            budget,
+            primary,
+            provider=provider,
+            provider_region=provider_region,
+            requested_model=requested_model,
+            is_model_fallback=is_model_fallback,
+            call_id=call_id,
+            agent_run=agent_run,
+            record_breaker_failure=disp is not Disposition.FAIL_FAST,
+            possibly_succeeded=True if disp is Disposition.POST_SEND_AMBIGUOUS else None,
+            failover_error_class=type(exc).__name__,
+        )
+
+    return on_entry_error
+
+
+def _make_reservation_release_handler(
+    owner: Any,
+    budget: Any,
+    *,
+    call_id: str,
+) -> Callable[[], None]:
+    """Build the release used when a manager is abandoned before it dispatches.
+
+    No provider request was sent: there is no usage to confirm, no provider
+    health verdict to record, and no error to report — only the reservation.
+    """
+
+    def release() -> None:
         owner._budget.release_reservation(
             call_id,
             lease_claim_token=_lease_claim_token(budget),
         )
-        owner._reporter.report(
-            owner._build_error_event(
-                model=ctx.model,
-                provider=provider,
-                latency_ms=ctx.elapsed_ms(),
-                is_model_fallback=is_model_fallback,
-                is_provider_fallback=is_provider_fallback,
-                requested_provider=primary.entry.provider if is_provider_fallback else None,
-                requested_model=requested_model if is_provider_fallback else None,
-                attempt_index=ctx.attempt_index,
-                call_id=call_id,
-                possibly_succeeded=True,
-                agent_run=agent_run,
-                provider_region=provider_region,
-            )
-        )
 
-    return on_error
+    return release
 
 
 def _make_async_stream_error_handler(
@@ -426,6 +542,50 @@ def _make_async_stream_error_handler(
         sync_handler(exc)
 
     return on_error
+
+
+def _make_async_stream_entry_error_handler(
+    owner: Any,
+    runtime: ProviderRuntime,
+    ctx: _AttemptContext,
+    budget: Any,
+    primary: ProviderRuntime,
+    *,
+    requested_model: str,
+    is_model_fallback: bool,
+    call_id: str,
+    agent_run: _RunContextSnapshot,
+) -> Callable[[BaseException], Awaitable[None]]:
+    sync_handler = _make_stream_entry_error_handler(
+        owner,
+        runtime,
+        ctx,
+        budget,
+        primary,
+        requested_model=requested_model,
+        is_model_fallback=is_model_fallback,
+        call_id=call_id,
+        agent_run=agent_run,
+    )
+
+    async def on_entry_error(exc: BaseException) -> None:
+        sync_handler(exc)
+
+    return on_entry_error
+
+
+def _make_async_reservation_release_handler(
+    owner: Any,
+    budget: Any,
+    *,
+    call_id: str,
+) -> Callable[[], Awaitable[None]]:
+    sync_handler = _make_reservation_release_handler(owner, budget, call_id=call_id)
+
+    async def release() -> None:
+        sync_handler()
+
+    return release
 
 
 def _safe_extract_service_tier(runtime: ProviderRuntime, response: Any) -> str | None:
@@ -2151,6 +2311,20 @@ class Solwyn(_SolwynBase):
                         call_id=call_id,
                         agent_run=agent_run,
                     )
+                    # The manager sends its request in __enter__, AFTER this
+                    # candidate walk: its failure needs the walk's classification,
+                    # not the established stream's unconditional verdict.
+                    on_entry_error = _make_stream_entry_error_handler(
+                        self,
+                        rt,
+                        ctx,
+                        budget,
+                        primary,
+                        requested_model=requested_model,
+                        is_model_fallback=is_model_fallback,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                    )
                     return _SyncResponsesStreamManagerWrapper(
                         response,
                         functools.partial(
@@ -2169,6 +2343,10 @@ class Solwyn(_SolwynBase):
                             on_error=on_error,
                         ),
                         on_error=on_error,
+                        on_entry_error=on_entry_error,
+                        on_abandoned_before_entry=_make_reservation_release_handler(
+                            self, budget, call_id=call_id
+                        ),
                     )
                 return self._wrap_stream(
                     rt,
@@ -2322,16 +2500,19 @@ class Solwyn(_SolwynBase):
 
         def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             usage_unmeasured = False
-            if (
-                estimate_empty_usage
-                and token_details.input_tokens == 0
-                and token_details.output_tokens == 0
-            ):
-                token_details = TokenDetails(
-                    input_tokens=estimated_input_tokens,
-                    is_estimated=True,
-                )
-                usage_unmeasured = True
+            if estimate_empty_usage:
+                if token_details.input_tokens == 0 and token_details.output_tokens == 0:
+                    token_details = TokenDetails(
+                        input_tokens=estimated_input_tokens,
+                        is_estimated=True,
+                    )
+                    usage_unmeasured = True
+                elif token_details.is_estimated:
+                    # A compat accumulator's length estimate is better telemetry
+                    # than a synthetic tier, but it still cannot account for the
+                    # response's output: the lease must hold its reserved bound
+                    # rather than re-lend spent output allowance.
+                    usage_unmeasured = True
             self._get_circuit_breaker(provider).record_success()
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
@@ -3392,6 +3573,20 @@ class AsyncSolwyn(_SolwynBase):
                         call_id=call_id,
                         agent_run=agent_run,
                     )
+                    # The manager sends its request in __aenter__, AFTER this
+                    # candidate walk: its failure needs the walk's classification,
+                    # not the established stream's unconditional verdict.
+                    on_entry_error = _make_async_stream_entry_error_handler(
+                        self,
+                        rt,
+                        ctx,
+                        budget,
+                        primary,
+                        requested_model=requested_model,
+                        is_model_fallback=is_model_fallback,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                    )
                     return _AsyncResponsesStreamManagerWrapper(
                         response,
                         functools.partial(
@@ -3410,6 +3605,10 @@ class AsyncSolwyn(_SolwynBase):
                             on_error=on_error,
                         ),
                         on_error=on_error,
+                        on_entry_error=on_entry_error,
+                        on_abandoned_before_entry=_make_async_reservation_release_handler(
+                            self, budget, call_id=call_id
+                        ),
                     )
                 return self._wrap_stream_async(
                     rt,
@@ -3560,16 +3759,19 @@ class AsyncSolwyn(_SolwynBase):
 
         async def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
             usage_unmeasured = False
-            if (
-                estimate_empty_usage
-                and token_details.input_tokens == 0
-                and token_details.output_tokens == 0
-            ):
-                token_details = TokenDetails(
-                    input_tokens=estimated_input_tokens,
-                    is_estimated=True,
-                )
-                usage_unmeasured = True
+            if estimate_empty_usage:
+                if token_details.input_tokens == 0 and token_details.output_tokens == 0:
+                    token_details = TokenDetails(
+                        input_tokens=estimated_input_tokens,
+                        is_estimated=True,
+                    )
+                    usage_unmeasured = True
+                elif token_details.is_estimated:
+                    # A compat accumulator's length estimate is better telemetry
+                    # than a synthetic tier, but it still cannot account for the
+                    # response's output: the lease must hold its reserved bound
+                    # rather than re-lend spent output allowance.
+                    usage_unmeasured = True
             self._get_circuit_breaker(provider).record_success()
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.

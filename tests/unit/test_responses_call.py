@@ -229,6 +229,7 @@ _RESPONSES_CRITICAL_EXTRA_BODY_KEYS = (
     "input",
     "instructions",
     "max_output_tokens",
+    "stream",
 )
 _RESPONSES_SPEND_OPERATIONS = ("create", "parse", "create_stream", "stream_helper")
 
@@ -635,8 +636,13 @@ class TestResponsesPublicProxySync:
                 else:
                     solwyn.responses.create(**call_kwargs)
 
-            assert exc_info.value.field == "extra_body"
-            assert override_key in str(exc_info.value)
+            if operation == "parse" and override_key == "stream":
+                # Parse resolves effective streaming (extra_body included) and
+                # refuses it before the override check ever runs.
+                assert exc_info.value.field == "stream"
+            else:
+                assert exc_info.value.field == "extra_body"
+                assert override_key in str(exc_info.value)
             check.assert_not_called()
             assert client._responses.create_calls == []
             assert client._responses.parse_calls == []
@@ -900,6 +906,41 @@ class TestResponsesPublicProxySync:
             assert event.service_tier == "priority"
             assert event.token_details.is_estimated is False
 
+    def test_azure_stream_without_usage_estimates_and_holds_lease_floor(self) -> None:
+        delta = SimpleNamespace(type="response.output_text.delta", delta="hello")
+        provider_stream = _FakeSyncStream([delta])
+        client = AzureOpenAI(provider_stream)
+
+        with _sync_solwyn(client, model="deployment") as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+            ):
+                stream = solwyn.responses.create(
+                    model="deployment",
+                    input="12345678",
+                    stream=True,
+                    max_output_tokens=50,
+                )
+                assert list(stream) == [delta]
+
+            call_id = check.call_args.kwargs["call_id"]
+            solwyn._reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            # The accumulator's own length estimate is kept as telemetry, but it
+            # cannot account for all output, so the lease holds its bound.
+            assert event.token_details.is_estimated is True
+            assert event.input_tokens == 2
+            assert confirm.token_details == event.token_details
+            true_up.assert_called_once_with(
+                call_id,
+                event.token_details.total_tokens,
+                claim_token=7,
+                floor_at_reservation=True,
+            )
+
     def test_azure_stream_helper_settles_terminal_usage_once(self) -> None:
         terminal = _terminal_event(service_tier="flex")
         inner = _FakeSyncResponseStream([terminal], terminal.response)
@@ -1086,7 +1127,7 @@ class TestResponsesPublicProxySync:
             assert client._responses.create_calls == []
             assert client._responses.parse_calls == []
 
-    def test_extra_body_stream_false_overrides_streaming_default_for_parse(self) -> None:
+    def test_extra_body_stream_false_is_still_refused_for_parse(self) -> None:
         # Arrange.
         response = _responses_response()
         client = _NativeOpenAIClient(response)
@@ -1094,8 +1135,11 @@ class TestResponsesPublicProxySync:
         # Act.
         with _sync_solwyn(client, default_params={"stream": True}) as solwyn:
             check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
-                result = solwyn.responses.parse(
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                pytest.raises(ConfigurationError) as exc_info,
+            ):
+                solwyn.responses.parse(
                     model="gpt-5.5",
                     input="hello",
                     text_format=dict,
@@ -1103,17 +1147,10 @@ class TestResponsesPublicProxySync:
                 )
 
             # Assert.
-            assert result is response
-            check.assert_called_once()
-            assert client._responses.parse_calls == [
-                {
-                    "model": "gpt-5.5",
-                    "input": "hello",
-                    "text_format": dict,
-                    "stream": True,
-                    "extra_body": {"stream": False},
-                }
-            ]
+            assert exc_info.value.field == "extra_body"
+            assert "stream" in str(exc_info.value)
+            check.assert_not_called()
+            assert client._responses.parse_calls == []
 
     def test_native_stream_helper_opens_after_one_budget_check_and_settles_terminal_usage(
         self,
@@ -1322,24 +1359,36 @@ class TestResponsesPublicProxySync:
             assert event.service_tier == "flex"
             assert confirm.token_details == event.token_details
 
-    def test_native_stream_helper_close_before_enter_settles_and_closes_manager(self) -> None:
+    def test_native_stream_helper_close_before_enter_releases_and_closes_manager(self) -> None:
         inner = _FakeSyncResponseStream([], object())
         provider_manager = _FakeSyncResponseStreamManager(inner)
         client = _NativeOpenAIClient(provider_manager)
 
         with _sync_solwyn(client) as solwyn:
             check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            release = MagicMock(spec=solwyn._budget.release_reservation)
+            breaker_success = MagicMock()
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(
+                    solwyn._get_circuit_breaker("openai"),
+                    "record_success",
+                    new=breaker_success,
+                ),
+            ):
                 manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
                 manager.close()
                 manager.close()
 
+            # The manager never dispatched: no spend to confirm, no provider
+            # verdict to record — only the reservation goes back.
             assert provider_manager.enter_calls == 0
             assert len(provider_manager.exit_calls) == 1
-            solwyn._reporter.report_settlement.assert_called_once()
-            _, event = solwyn._reporter.report_settlement.call_args.args
-            assert event.input_tokens == 1
-            assert event.token_details.is_estimated is True
+            release.assert_called_once()
+            breaker_success.assert_not_called()
+            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._reporter.report.assert_not_called()
 
     def test_native_stream_helper_enter_failure_releases_reservation(self) -> None:
         error = _Status(503, "stream open failed")
@@ -1350,9 +1399,15 @@ class TestResponsesPublicProxySync:
         with _sync_solwyn(client) as solwyn:
             check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
             release = MagicMock(spec=solwyn._budget.release_reservation)
+            breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._budget, "check_budget", new=check),
                 patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(
+                    solwyn._get_circuit_breaker("openai"),
+                    "record_failure",
+                    new=breaker_failure,
+                ),
                 pytest.raises(_Status) as exc_info,
                 solwyn.responses.stream(model="gpt-5.5", input="1234"),
             ):
@@ -1360,8 +1415,48 @@ class TestResponsesPublicProxySync:
 
             assert exc_info.value is error
             release.assert_called_once()
+            # 5xx is post-send ambiguous: a health failure whose charge the
+            # server must reconcile.
+            breaker_failure.assert_called_once_with()
             solwyn._reporter.report_settlement.assert_not_called()
             solwyn._reporter.report.assert_called_once()
+            event = solwyn._reporter.report.call_args.args[0]
+            assert event.possibly_succeeded is True
+            assert event.failover_error_class == "_Status"
+
+    def test_native_stream_helper_fail_fast_enter_failure_spares_the_breaker(self) -> None:
+        error = _Status(400, "invalid request")
+        inner = _FakeSyncResponseStream([], object())
+        provider_manager = _FakeSyncResponseStreamManager(inner, enter_error=error)
+        client = _NativeOpenAIClient(provider_manager)
+
+        with _sync_solwyn(client) as solwyn:
+            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._budget.release_reservation)
+            breaker_failure = MagicMock()
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(
+                    solwyn._get_circuit_breaker("openai"),
+                    "record_failure",
+                    new=breaker_failure,
+                ),
+                pytest.raises(_Status) as exc_info,
+                solwyn.responses.stream(model="gpt-5.5", input="1234"),
+            ):
+                pass
+
+            assert exc_info.value is error
+            # A request-shaped 4xx is not a provider-health signal — the same
+            # status on create(stream=True) records nothing either.
+            breaker_failure.assert_not_called()
+            release.assert_called_once()
+            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._reporter.report.assert_called_once()
+            event = solwyn._reporter.report.call_args.args[0]
+            assert event.possibly_succeeded is None
+            assert event.failover_error_class == "_Status"
 
     def test_native_stream_helper_close_failure_does_not_mask_body_exception(self) -> None:
         inner = _FakeSyncResponseStream([], object())
@@ -1825,8 +1920,13 @@ class TestResponsesPublicProxyAsync:
                 else:
                     await solwyn.responses.create(**call_kwargs)
 
-            assert exc_info.value.field == "extra_body"
-            assert override_key in str(exc_info.value)
+            if operation == "parse" and override_key == "stream":
+                # Parse resolves effective streaming (extra_body included) and
+                # refuses it before the override check ever runs.
+                assert exc_info.value.field == "stream"
+            else:
+                assert exc_info.value.field == "extra_body"
+                assert override_key in str(exc_info.value)
             check.assert_not_awaited()
             assert client._responses.create_calls == []
             assert client._responses.parse_calls == []
@@ -2087,6 +2187,42 @@ class TestResponsesPublicProxyAsync:
             assert confirm.token_details == event.token_details
 
     @pytest.mark.asyncio
+    async def test_azure_stream_helper_without_usage_holds_lease_floor(self) -> None:
+        delta = SimpleNamespace(type="response.output_text.delta", delta="partial")
+        inner = _FakeAsyncResponseStream([delta], object())
+        provider_manager = _FakeAsyncResponseStreamManager(inner)
+        client = AsyncAzureOpenAI(provider_manager)
+
+        async with _async_solwyn(client, model="deployment") as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+            ):
+                async with solwyn.responses.stream(
+                    model="deployment",
+                    input="12345678",
+                    max_output_tokens=50,
+                ) as events:
+                    assert [event async for event in events] == [delta]
+
+            call_id = check.call_args.kwargs["call_id"]
+            solwyn._reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            # The accumulator's own length estimate is kept as telemetry, but it
+            # cannot account for all output, so the lease holds its bound.
+            assert event.token_details.is_estimated is True
+            assert event.input_tokens == 2
+            assert confirm.token_details == event.token_details
+            true_up.assert_called_once_with(
+                call_id,
+                event.token_details.total_tokens,
+                claim_token=7,
+                floor_at_reservation=True,
+            )
+
+    @pytest.mark.asyncio
     async def test_azure_existing_response_stream_keeps_raw_async_manager_identity(
         self,
     ) -> None:
@@ -2260,7 +2396,7 @@ class TestResponsesPublicProxyAsync:
             assert client._responses.parse_calls == []
 
     @pytest.mark.asyncio
-    async def test_extra_body_stream_false_overrides_streaming_default_for_parse(self) -> None:
+    async def test_extra_body_stream_false_is_still_refused_for_parse(self) -> None:
         # Arrange.
         response = _responses_response()
         client = _AsyncNativeOpenAIClient(response)
@@ -2268,8 +2404,11 @@ class TestResponsesPublicProxyAsync:
         # Act.
         async with _async_solwyn(client, default_params={"stream": True}) as solwyn:
             check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
-                result = await solwyn.responses.parse(
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                pytest.raises(ConfigurationError) as exc_info,
+            ):
+                await solwyn.responses.parse(
                     model="gpt-5.5",
                     input="hello",
                     text_format=dict,
@@ -2277,17 +2416,10 @@ class TestResponsesPublicProxyAsync:
                 )
 
             # Assert.
-            assert result is response
-            check.assert_awaited_once()
-            assert client._responses.parse_calls == [
-                {
-                    "model": "gpt-5.5",
-                    "input": "hello",
-                    "text_format": dict,
-                    "stream": True,
-                    "extra_body": {"stream": False},
-                }
-            ]
+            assert exc_info.value.field == "extra_body"
+            assert "stream" in str(exc_info.value)
+            check.assert_not_awaited()
+            assert client._responses.parse_calls == []
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_opens_after_one_budget_check_and_settles_terminal_usage(
@@ -2559,9 +2691,15 @@ class TestResponsesPublicProxyAsync:
         async with _async_solwyn(client) as solwyn:
             check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
             release = MagicMock(spec=solwyn._budget.release_reservation)
+            breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._budget, "check_budget", new=check),
                 patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(
+                    solwyn._get_circuit_breaker("openai"),
+                    "record_failure",
+                    new=breaker_failure,
+                ),
                 pytest.raises(_Status) as exc_info,
             ):
                 async with solwyn.responses.stream(model="gpt-5.5", input="1234"):
@@ -2569,8 +2707,49 @@ class TestResponsesPublicProxyAsync:
 
             assert exc_info.value is error
             release.assert_called_once()
+            # 5xx is post-send ambiguous: a health failure whose charge the
+            # server must reconcile.
+            breaker_failure.assert_called_once_with()
             solwyn._reporter.report_settlement.assert_not_called()
             solwyn._reporter.report.assert_called_once()
+            event = solwyn._reporter.report.call_args.args[0]
+            assert event.possibly_succeeded is True
+            assert event.failover_error_class == "_Status"
+
+    @pytest.mark.asyncio
+    async def test_native_stream_helper_fail_fast_enter_failure_spares_the_breaker(self) -> None:
+        error = _Status(400, "invalid request")
+        inner = _FakeAsyncResponseStream([], object())
+        provider_manager = _FakeAsyncResponseStreamManager(inner, enter_error=error)
+        client = _AsyncNativeOpenAIClient(provider_manager)
+
+        async with _async_solwyn(client) as solwyn:
+            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._budget.release_reservation)
+            breaker_failure = MagicMock()
+            with (
+                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(
+                    solwyn._get_circuit_breaker("openai"),
+                    "record_failure",
+                    new=breaker_failure,
+                ),
+                pytest.raises(_Status) as exc_info,
+            ):
+                async with solwyn.responses.stream(model="gpt-5.5", input="1234"):
+                    pass
+
+            assert exc_info.value is error
+            # A request-shaped 4xx is not a provider-health signal — the same
+            # status on create(stream=True) records nothing either.
+            breaker_failure.assert_not_called()
+            release.assert_called_once()
+            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._reporter.report.assert_called_once()
+            event = solwyn._reporter.report.call_args.args[0]
+            assert event.possibly_succeeded is None
+            assert event.failover_error_class == "_Status"
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_close_failure_does_not_mask_body_exception(self) -> None:
