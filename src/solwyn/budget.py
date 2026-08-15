@@ -1178,14 +1178,15 @@ class _BudgetEnforcerBase:
         ``media_usage`` carries a non-text surface's settled non-token quantities
         so the API settles the enforcement counter on the per-unit basis; None
         for chat/token confirms.
-        ``usage_unmeasured`` marks the fail-soft SYNTHETIC tier — every usage
-        read for this call raised, so ``token_details`` carries the pre-flight
-        input estimate and NO output at all. The wire confirm is unchanged
-        (the cloud sees the honest ``is_estimated`` value it already prices
-        distinctly), but the LOCAL lease reservation settles at its reserved
-        bound instead of being trued up to that under-measure: crediting the
-        unspent-looking output back would re-lend authority a paid response
-        already consumed, weakening the run's hard token cap.
+        ``usage_unmeasured`` marks the fail-soft tier where the provider did
+        not report usable usage (absent/zero usage, or an unreadable usage
+        shape). ``token_details`` may carry a retained adapter estimate or the
+        synthetic pre-flight input estimate; either is explicitly marked
+        ``is_estimated``. The wire confirm is unchanged, but the LOCAL lease
+        reservation settles at its reserved bound instead of being trued up to
+        that under-measure: crediting the unspent-looking output back would
+        re-lend authority a paid response already consumed, weakening the
+        run's hard token cap.
         """
         if not call_id:
             raise RuntimeError("call_id is required for budget confirm reconciliation")

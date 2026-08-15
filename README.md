@@ -202,7 +202,7 @@ Auto-detected providers:
 | LM Studio | `localhost:1234` | `include_usage` injected (pre-0.3.18 omits usage → estimate) |
 | Anything else | any non-OpenAI `base_url` | generic `openai_compatible`; `stream_options` never sent |
 
-For endpoints auto-detection can't name (e.g. vLLM on a non-default port), pass the provider explicitly — on the constructor for the primary, or as the 4th element of a fallback spec:
+For endpoints auto-detection can't name, pin the provider explicitly — on the constructor for the primary, or as the 4th element of a fallback spec:
 
 ```python
 client = Solwyn(
@@ -214,7 +214,38 @@ client = Solwyn(
 )
 ```
 
-**Token accounting.** Budgets and attribution depend on accurate per-call usage, and "OpenAI-compatible" endpoints differ most in exactly that. Solwyn requests streaming usage only from providers where that's documented-safe, reads it from the final chunk where it arrives automatically, and — when a provider reports no usage at all (or reports an unparseable/zeroed block alongside real content) — falls back to a length-based estimate that is **explicitly marked** (`token_details.is_estimated = true` on the wire, plus a one-time SDK warning). Degraded accounting is loud and flagged, never silently zero.
+`provider=` is an identity assertion, not a label applied after detection. It
+bypasses `base_url` detection entirely and selects the named adapter. The pin
+does not translate dialects, rewrite the endpoint, or synthesize a different
+SDK client; construction still validates the actual client family and
+sync/async mode, and raises `ConfigurationError(field="client")` for a mismatch.
+Unknown provider names raise `ConfigurationError(field="provider")`. Fallback
+provider pins follow the same rules.
+
+This is useful for native OpenAI behind a corporate gateway or local proxy,
+where an arbitrary `base_url` would otherwise look like a generic compatible
+provider. Pinning `openai` preserves the native Responses surface and OpenAI
+budget attribution:
+
+```python
+gateway = OpenAI(base_url="http://localhost:9999/v1", api_key="...")
+client = Solwyn(gateway, api_key="sk_proj_...", provider="openai")
+
+response = client.responses.create(
+    model="gpt-5.5",
+    input="Summarize the release notes.",
+)
+```
+
+If that gateway omits or zeroes foreground Responses usage, `create` and
+`parse` settle the request-length input estimate with
+`token_details.is_estimated = true` instead of reporting exact `0/0`. The
+unknown output remains zero in the estimate, and a lease-backed call keeps its
+full reserved bound so that unseen output spend is not re-lent. Streaming and
+the stream helper apply the same conservative policy when terminal usage is
+missing.
+
+**Token accounting.** Budgets and attribution depend on accurate per-call usage, and "OpenAI-compatible" endpoints differ most in exactly that. Solwyn requests streaming usage only from providers where that's documented-safe, reads it from the final chunk where it arrives automatically, and — when a provider reports no usage at all (or reports an unparseable/zeroed block alongside real content) — falls back to a length-based estimate that is **explicitly marked** (`token_details.is_estimated = true` on the wire; compatible-provider degradation also emits the existing one-time SDK warning where applicable). Degraded accounting is flagged, never silently zero.
 
 The "never sent" entries above describe Solwyn's own injection policy. A `stream_options` you pass explicitly always reaches your configured provider untouched (drop-in contract); it is only stripped when a *failover hop* lands on a provider known to reject it.
 
@@ -256,13 +287,21 @@ Billable quantities are read from the response's usage block where it exists (gp
   supported; parse is non-streaming and refuses any effective streaming
   request. The stream helper's new-response overload preserves the SDK's
   context-manager and `get_final_response()` behavior while settling terminal
-  usage or a conservative estimate on early exit. Its existing-response
+  usage or a conservative estimate on early exit. Foreground non-streaming
+  calls likewise settle a conservative marked
+  estimate when Responses usage is missing or zeroed; lease-backed calls hold
+  the reserved bound because output usage is unobservable. Its existing-response
   retrieval overload (`response_id` / `starting_after`) creates no new spend,
   so it is a reviewed raw pass-through: no defaults, budget check, or duplicate
   settlement are applied. Every other Responses leaf, including beta and raw
   response helpers, remains guarded by `on_unmetered`.
   `background=True` create calls are refused because queued responses expose no
-  create-time usage. Other OpenAI-compatible providers retain their raw
+  create-time usage. Because the OpenAI SDK serializes `extra_body` after named
+  arguments, metering-critical overrides for `model`, `input`, `instructions`,
+  or `max_output_tokens` are refused with
+  `ConfigurationError(field="extra_body")`; pass those values as top-level
+  Responses arguments instead. Other vendor-specific `extra_body` extensions
+  pass through unchanged. Other OpenAI-compatible providers retain their raw
   Responses managers and follow the guarded unmetered posture.
 
 Solwyn classifies the public pre-call capability graph of every supported
@@ -604,7 +643,7 @@ All SDK errors inherit from `SolwynError`:
 | `BudgetExceededError` | Cloud denies a budget check in `hard_deny` mode, or local enforcement denies while Cloud is unreachable and `fail_open=False` |
 | `RunStoppedError` | A dashboard stop is learned for an agent run — on the next budget check for per-call traffic, or after lease renewal or re-grant for leased traffic |
 | `ProviderUnavailableError` | Circuit breaker is open, or the failover chain is exhausted |
-| `ConfigurationError` | Invalid API key format, invalid `provider=` override, or an untracked call surface (e.g. Bedrock `invoke_model`) |
+| `ConfigurationError` | Invalid API key format, invalid `provider=` pin/client pairing, or an untracked call surface (e.g. Bedrock `invoke_model`) |
 | `UntrackedSpendSurfaceError` | Strict coverage posture refuses an unacknowledged untracked or unknown capability before provider I/O |
 | `UnsupportedSurfaceError` | The selected provider adapter does not support an explicit Solwyn wrapper surface |
 | `UntranslatableRequestError` | A cross-provider failover hop cannot represent the request (structural labels only — never content) |

@@ -6,11 +6,11 @@ and the ``ProviderEntry`` that describes its model/default params.
 ``build_runtimes`` turns the primary client plus an ordered list of fallback
 specs into the ``[primary, *fallbacks]`` chain the router walks.
 
-Provider identity may be OVERRIDDEN explicitly (``provider="groq"`` on the
+Provider identity may be PINNED explicitly (``provider="openai"`` on the
 client constructor, or a 4th element in a fallback spec tuple) for endpoints
-auto-detection cannot name — e.g. a vLLM server on a non-default port. An
-override may only relabel within the same API dialect; a mismatch is a
-loud ConfigurationError.
+auto-detection cannot name correctly — e.g. native OpenAI behind a corporate
+gateway. A pin bypasses detection entirely; construction later validates the
+named provider against the caller's actual SDK client shape and sync/async mode.
 
 No business logic, no network, no credentials: ``ProviderEntry`` deliberately
 carries no api_key/base_url. Provider credentials live only on the
@@ -35,42 +35,23 @@ class ProviderRuntime:
     entry: ProviderEntry
     sdk_client: Any
     adapter: ProviderAdapter
+    provider_pinned: bool = False
 
 
 def _resolve_adapter(client: Any, provider_override: str | None) -> ProviderAdapter:
-    """Detect *client*'s adapter, honoring an explicit provider override.
+    """Detect *client*'s adapter unless its provider identity is pinned.
 
-    Without an override this is pure detection. With one, the named adapter is
-    used — but only after verifying it speaks the SAME dialect the client was
-    detected as (an override relabels attribution; it cannot make an Anthropic
-    client speak the OpenAI wire shape). Fail loud on any mismatch.
+    A pin is a caller assertion that bypasses type/base-url detection. It does
+    not translate wire dialects or synthesize a different SDK client; the base
+    constructor validates the selected adapter against the actual client shape.
     """
     if provider_override is None:
         return get_adapter_for_client(client)
 
     try:
-        adapter = get_adapter_by_name(provider_override)
+        return get_adapter_by_name(provider_override)
     except ValueError as exc:
         raise ConfigurationError(str(exc), field="provider") from exc
-
-    try:
-        detected = get_adapter_for_client(client)
-    except ValueError as exc:
-        raise ConfigurationError(
-            f"provider override '{provider_override}' was given, but the client "
-            f"type '{type(client).__name__}' is not a recognized provider SDK "
-            "client (openai / anthropic / google-genai / bedrock / together)",
-            field="provider",
-        ) from exc
-    if detected.dialect != adapter.dialect:
-        raise ConfigurationError(
-            f"provider override '{provider_override}' speaks the "
-            f"'{adapter.dialect}' dialect but the client speaks "
-            f"'{detected.dialect}' — the override can only relabel a client "
-            "within its own dialect",
-            field="provider",
-        )
-    return adapter
 
 
 def _runtime_for(
@@ -86,7 +67,12 @@ def _runtime_for(
         model=model,
         default_params=default_params,
     )
-    return ProviderRuntime(entry=entry, sdk_client=client, adapter=adapter)
+    return ProviderRuntime(
+        entry=entry,
+        sdk_client=client,
+        adapter=adapter,
+        provider_pinned=provider_override is not None,
+    )
 
 
 def _parse_fallback_spec(spec: object) -> tuple[Any, str, dict[str, Any], str | None]:
@@ -148,8 +134,9 @@ def build_runtimes(
         fallback_specs: Ordered list of ``(client, model)``,
             ``(client, model, default_params)``, or
             ``(client, model, default_params, provider)`` tuples.
-        primary_provider: Optional explicit provider name for the primary
-            client (e.g. ``"vllm"`` for a server auto-detection cannot name).
+        primary_provider: Optional provider identity assertion for the primary
+            client. A pin bypasses auto-detection and is validated against the
+            actual SDK client shape during wrapper construction.
 
     Returns:
         Runtimes in order ``[primary, *fallbacks]``. The primary entry's
@@ -157,7 +144,7 @@ def build_runtimes(
 
     Raises:
         ConfigurationError: If a fallback spec tuple is malformed, or a
-            provider override is unknown / dialect-mismatched.
+            provider pin is unknown or incompatible with the SDK client.
     """
     runtimes = [_runtime_for(primary_client, primary_model or "", {}, primary_provider)]
 

@@ -679,31 +679,123 @@ class _AttemptContext(BaseModel):
         return (time.monotonic() - self.start_time) * 1000
 
 
-def _client_shape(client: object, dialect: str) -> str:
-    """Return the provider-independent structural client-shape identity."""
+def _client_shape(client: object, _dialect: str) -> str:
+    """Return the provider-independent structural client-shape identity.
+
+    Shape comes from the SDK object's module/class, never the selected adapter.
+    This distinction is load-bearing for explicit provider pins: an Anthropic
+    client pinned as OpenAI must form an undeclared OpenAI/Anthropic context
+    instead of being mislabeled ``openai_sdk`` from the adapter dialect.
+    """
 
     module = getattr(type(client), "__module__", "")
     class_name = getattr(type(client), "__name__", "")
-    if dialect == "openai":
-        if (module == "together" or module.startswith("together.")) and class_name in {
-            "Together",
-            "AsyncTogether",
-        }:
-            return "native_together"
+    if (module == "together" or module.startswith("together.")) and class_name in {
+        "Together",
+        "AsyncTogether",
+    }:
+        return "native_together"
+    if module == "openai" or module.startswith("openai."):
         return "openai_sdk"
-    if dialect == "anthropic":
+    if module == "anthropic" or module.startswith("anthropic."):
         return "anthropic_sdk"
-    if dialect == "google":
-        if "google.generativeai" in module:
-            return "google_generativeai"
+    if "google.generativeai" in module:
+        return "google_generativeai"
+    if module == "google.genai" or module.startswith("google.genai."):
         return "google_genai"
-    if dialect == "bedrock":
-        return "bedrock_aioboto3" if "aiobotocore" in module else "bedrock_boto3"
-    raise RuntimeError(f"unsupported provider dialect for surface context: {dialect}")
+    if "aiobotocore" in module:
+        return "bedrock_aioboto3"
+    if "botocore" in module:
+        return "bedrock_boto3"
+    return "undeclared_sdk"
 
 
-def _validate_surface_context(context: SurfaceContext) -> None:
+def _client_mode(client: object, client_shape: str) -> Literal["sync", "async"] | None:
+    """Return a known SDK client's inherent mode, or ``None`` for duck types."""
+
+    class_name = getattr(type(client), "__name__", "")
+    if client_shape == "openai_sdk":
+        api_mode = _api_client_base_mode(client, sdk_module="openai")
+        if api_mode is not None:
+            return api_mode
+        if class_name in {"AsyncOpenAI", "AsyncAzureOpenAI"}:
+            return "async"
+        if class_name in {"OpenAI", "AzureOpenAI"}:
+            return "sync"
+    if client_shape == "native_together":
+        return "async" if class_name == "AsyncTogether" else "sync"
+    if client_shape == "anthropic_sdk":
+        api_mode = _api_client_base_mode(client, sdk_module="anthropic")
+        if api_mode is not None:
+            return api_mode
+        if class_name == "AsyncAnthropic":
+            return "async"
+        if class_name == "Anthropic":
+            return "sync"
+    if client_shape == "google_generativeai":
+        return "sync"
+    if client_shape == "google_genai":
+        if class_name == "AsyncClient":
+            return "async"
+        if class_name == "Client":
+            return "sync"
+    if client_shape == "bedrock_aioboto3":
+        return "async"
+    if client_shape == "bedrock_boto3":
+        return "sync"
+    return None
+
+
+def _api_client_base_mode(
+    client: object,
+    *,
+    sdk_module: str,
+) -> Literal["sync", "async"] | None:
+    """Classify an official Stainless client from its SDK-owned base class."""
+
+    base_module = f"{sdk_module}._base_client"
+    for base in getattr(type(client), "__mro__", ()):
+        if getattr(base, "__module__", "") != base_module:
+            continue
+        if getattr(base, "__name__", "") == "AsyncAPIClient":
+            return "async"
+        if getattr(base, "__name__", "") == "SyncAPIClient":
+            return "sync"
+    return None
+
+
+def _is_bedrock_runtime_client(client: object) -> bool:
+    """Return whether a botocore-shaped client targets Bedrock Runtime."""
+
+    meta = getattr(client, "meta", None)
+    service_model = getattr(meta, "service_model", None)
+    return getattr(service_model, "service_name", None) == "bedrock-runtime"
+
+
+def _validate_surface_context(
+    context: SurfaceContext,
+    *,
+    pinned_client: object | None = None,
+) -> None:
     """Reject a provider client/mode pairing absent from the reviewed rules."""
+
+    if pinned_client is not None:
+        if context.provider == "bedrock" and not _is_bedrock_runtime_client(pinned_client):
+            raise ConfigurationError(
+                "unsupported provider client pairing: provider 'bedrock' requires "
+                "a botocore/aiobotocore bedrock-runtime client",
+                field="client",
+            )
+        client_mode = _client_mode(pinned_client, context.client_shape)
+        if client_mode is not None and client_mode != context.mode:
+            mode_label = "asynchronous" if client_mode == "async" else "synchronous"
+            wrapper = "AsyncSolwyn" if client_mode == "async" else "Solwyn"
+            raise ConfigurationError(
+                "unsupported provider client/mode pairing: "
+                f"{context.provider}/{context.client_shape}/{context.mode}. "
+                f"The pinned client is {mode_label}; use {wrapper}.",
+                field="client",
+            )
 
     if context_is_declared(context):
         return
@@ -792,8 +884,11 @@ class _SolwynBase:
             )
             for runtime in runtimes
         )
-        for context in runtime_contexts:
-            _validate_surface_context(context)
+        for runtime, context in zip(runtimes, runtime_contexts, strict=True):
+            _validate_surface_context(
+                context,
+                pinned_client=runtime.sdk_client if runtime.provider_pinned else None,
+            )
 
         self._config = config
         self._runtimes = runtimes

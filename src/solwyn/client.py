@@ -236,6 +236,10 @@ _RESPONSES_PARSE_STREAM_GUIDANCE = (
     "Use responses.create(stream=True) for metered streaming calls."
 )
 
+_RESPONSES_METERING_CRITICAL_EXTRA_BODY_KEYS = frozenset(
+    {"model", "input", "instructions", "max_output_tokens"}
+)
+
 
 _ResponsesPreparer = Callable[..., tuple[Callable[..., Any], dict[str, Any]]]
 
@@ -281,6 +285,29 @@ def _responses_is_streaming(
     if bool(stream) or force_stream:
         raise ConfigurationError(_RESPONSES_PARSE_STREAM_GUIDANCE, field="stream")
     return False
+
+
+def _reject_responses_metering_overrides(kwargs: Mapping[str, object]) -> None:
+    """Reject ``extra_body`` keys that can change metered Responses semantics.
+
+    OpenAI merges ``extra_body`` after named arguments when serializing the
+    request. Inspect key names only: accepting one of these overrides would let
+    provider dispatch diverge from Solwyn's attribution, input estimate, or
+    lease output bound.
+    """
+    extra_body = kwargs.get("extra_body")
+    if not isinstance(extra_body, Mapping):
+        return
+    overridden = _RESPONSES_METERING_CRITICAL_EXTRA_BODY_KEYS.intersection(extra_body)
+    if not overridden:
+        return
+    names = ", ".join(sorted(overridden))
+    raise ConfigurationError(
+        "Solwyn cannot meter Responses requests that override "
+        f"{names} through extra_body. Pass these as top-level Responses "
+        "arguments so budget preflight and provider dispatch use the same values.",
+        field="extra_body",
+    )
 
 
 def _source_compatible_defaults(dialect: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -411,13 +438,12 @@ def _safe_extract_service_tier(runtime: ProviderRuntime, response: Any) -> str |
 
 
 class _FailSoftUsage(NamedTuple):
-    """Settlement usage plus whether ANY of it was actually measured.
+    """Settlement usage plus whether the provider reported any measured usage.
 
-    ``unmeasured`` is the synthetic bottom of the ladder: no adapter read
-    succeeded, so ``token_details`` is a pre-flight input estimate with no
-    output term. It is deliberately NOT a field on ``TokenDetails`` — that is
-    a wire model, and this distinction is local bookkeeping about the read,
-    not a new fact for the API to parse.
+    ``unmeasured`` marks an adapter or synthetic estimate used because the
+    provider supplied no non-empty usage. It is deliberately NOT a field on
+    ``TokenDetails`` — that is a wire model, and this distinction is local
+    bookkeeping about the read, not a new fact for the API to parse.
     """
 
     token_details: TokenDetails
@@ -425,7 +451,11 @@ class _FailSoftUsage(NamedTuple):
 
 
 def _extract_usage_fail_soft(
-    runtime: ProviderRuntime, response: Any, *, estimated_input_tokens: int
+    runtime: ProviderRuntime,
+    response: Any,
+    *,
+    estimated_input_tokens: int,
+    estimate_empty_usage: bool = False,
 ) -> _FailSoftUsage:
     """Usage for settlement, degrading to estimates instead of raising (R5).
 
@@ -435,15 +465,20 @@ def _extract_usage_fail_soft(
     estimated spend telemetry (is_estimated=True), which the API already
     prices distinctly.
 
-    The synthetic tier is flagged ``unmeasured``: it carries no output term at
-    all, so a lease-funded call must settle its local reservation at the
-    reserved bound rather than true it up to this under-measure.
+    ``estimate_empty_usage`` opts a surface into treating absent or extracted
+    zero input/output usage as unmeasured. Responses calls use this because a
+    paid response with omitted usage must not settle as exact zero; chat
+    retains its existing zero-usage semantics. An adapter estimate may still
+    improve the telemetry, but the unmeasured flag keeps a lease-funded call's
+    local reservation at the reserved bound rather than trueing it up to an
+    estimate that cannot account for all output.
     """
     token_details: TokenDetails | None = None
     try:
         token_details = runtime.adapter.extract_usage(response)
     except Exception as exc:
         logger.warning("settlement.extract_usage_failed_fail_soft: %s", type(exc).__name__)
+    provider_usage_empty = token_details is None or token_details.total_tokens == 0
     # Explicit-degradation fallback (pre-existing semantics): a non-None
     # estimate REPLACES the extracted details.
     estimated: TokenDetails | None = None
@@ -455,6 +490,13 @@ def _extract_usage_fail_soft(
         logger.warning("settlement.estimate_usage_failed_fail_soft: %s", type(exc).__name__)
     if estimated is not None:
         token_details = estimated
+    if estimate_empty_usage and provider_usage_empty:
+        if token_details is not None and token_details.is_estimated:
+            return _FailSoftUsage(token_details, unmeasured=True)
+        return _FailSoftUsage(
+            TokenDetails(input_tokens=estimated_input_tokens, output_tokens=0, is_estimated=True),
+            unmeasured=True,
+        )
     if token_details is None:
         return _FailSoftUsage(
             TokenDetails(input_tokens=estimated_input_tokens, output_tokens=0, is_estimated=True),
@@ -1078,12 +1120,12 @@ class Solwyn(_SolwynBase):
 
         # Build the [primary, *fallbacks] runtime chain. All chain clients are
         # constructed up front so the first failover is pure dispatch.
-        # ``provider`` optionally overrides auto-detection for the primary
-        # (e.g. provider="vllm" for a server on a non-default port).
+        # ``provider`` pins the primary identity and bypasses auto-detection
+        # (e.g. native OpenAI behind a corporate gateway base_url).
         fallback_specs = _normalize_fallback(fallback)
         runtimes = build_runtimes(client, model, fallback_specs, primary_provider=provider)
 
-        # The primary runtime's adapter is the detected (or overridden)
+        # The primary runtime's adapter is the detected (or explicitly pinned)
         # provider identity for usage extraction and proxy selection.
         self._adapter = runtimes[0].adapter
         self._dialect = runtimes[0].adapter.dialect
@@ -1710,6 +1752,8 @@ class Solwyn(_SolwynBase):
             if _surface == "responses"
             else bool(request_semantics.get("stream", False)) or _force_stream
         )
+        if _surface == "responses":
+            _reject_responses_metering_overrides(request_semantics)
 
         # Legacy GenerativeModel constructor defaults are applied by its
         # no-I/O _prepare_request seam, not exposed in the raw call kwargs.
@@ -2151,7 +2195,10 @@ class Solwyn(_SolwynBase):
             # destroyed by extraction — usage degrades to estimates
             # (is_estimated=True), region/tier degrade to None.
             token_details, usage_unmeasured = _extract_usage_fail_soft(
-                rt, response, estimated_input_tokens=est_in
+                rt,
+                response,
+                estimated_input_tokens=est_in,
+                estimate_empty_usage=_surface == "responses",
             )
             # Per-region pricing attribution: the SERVED runtime's endpoint region.
             provider_region = _safe_extract_region(rt)
@@ -2438,11 +2485,11 @@ class AsyncSolwyn(_SolwynBase):
             raise TypeError("unexpected keyword argument 'project_id'")
 
         # Build the [primary, *fallbacks] runtime chain (constructed up front).
-        # ``provider`` optionally overrides auto-detection for the primary.
+        # ``provider`` pins the primary identity and bypasses auto-detection.
         fallback_specs = _normalize_fallback(fallback)
         runtimes = build_runtimes(client, model, fallback_specs, primary_provider=provider)
 
-        # The primary runtime's adapter is the detected (or overridden)
+        # The primary runtime's adapter is the detected (or explicitly pinned)
         # provider identity for usage extraction and proxy selection.
         self._adapter = runtimes[0].adapter
         self._dialect = runtimes[0].adapter.dialect
@@ -2993,6 +3040,8 @@ class AsyncSolwyn(_SolwynBase):
             if _surface == "responses"
             else bool(request_semantics.get("stream", False)) or _force_stream
         )
+        if _surface == "responses":
+            _reject_responses_metering_overrides(request_semantics)
 
         char_count = (
             estimate_responses_content_length(cast("dict[str, Any]", request_semantics))
@@ -3387,7 +3436,10 @@ class AsyncSolwyn(_SolwynBase):
             # destroyed by extraction — usage degrades to estimates
             # (is_estimated=True), region/tier degrade to None.
             token_details, usage_unmeasured = _extract_usage_fail_soft(
-                rt, response, estimated_input_tokens=est_in
+                rt,
+                response,
+                estimated_input_tokens=est_in,
+                estimate_empty_usage=_surface == "responses",
             )
             # Per-region pricing attribution: the SERVED runtime's endpoint region.
             provider_region = _safe_extract_region(rt)

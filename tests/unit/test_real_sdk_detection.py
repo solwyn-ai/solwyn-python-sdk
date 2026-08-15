@@ -199,6 +199,29 @@ class TestAnthropicRealClient:
         assert adapter.name == "anthropic"
         assert adapter.dialect == "anthropic"
 
+    @pytest.mark.parametrize(
+        "client_name",
+        [
+            "AnthropicAWS",
+            "AnthropicBedrock",
+            "AnthropicBedrockMantle",
+            "AnthropicFoundry",
+            "AnthropicGoogleCloud",
+            "AnthropicVertex",
+            "AsyncAnthropicAWS",
+            "AsyncAnthropicBedrock",
+            "AsyncAnthropicBedrockMantle",
+            "AsyncAnthropicFoundry",
+            "AsyncAnthropicGoogleCloud",
+            "AsyncAnthropicVertex",
+        ],
+    )
+    def test_anthropic_platform_variant(self, anthropic_mod: Any, client_name: str) -> None:
+        client = object.__new__(getattr(anthropic_mod, client_name))
+        adapter = get_adapter_for_client(client)
+        assert adapter.name == "anthropic"
+        assert adapter.dialect == "anthropic"
+
 
 # ---------------------------------------------------------------------------
 # together (native clients admitted into the together compat slot)

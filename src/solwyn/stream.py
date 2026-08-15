@@ -172,8 +172,8 @@ class AsyncStreamWrapper:
 
     Call close() or use ``async with stream:`` to settle on early abort.
 
-    No lock needed: async wrappers run in a single-threaded event loop,
-    so concurrent settlement is not possible.
+    Settlement marks itself complete before awaiting its callback. Provider
+    cleanup is serialized separately so cancellation leaves it retryable.
 
     Cross-provider stream normalization: see ``SyncStreamWrapper`` — the
     optional ``chunk_translator`` reshapes raw served chunks into caller-dialect
@@ -197,7 +197,8 @@ class AsyncStreamWrapper:
         self._chunk_translator = chunk_translator
         self._start_time = time.monotonic()
         self._settled = False
-        self._closed = False
+        self._cleanup_complete = False
+        self._close_lock = asyncio.Lock()
 
     async def _settle(self) -> None:
         """Fire on_complete exactly once with accumulated data."""
@@ -262,16 +263,17 @@ class AsyncStreamWrapper:
         Forwarding to the inner stream is also safe if called multiple times;
         well-behaved stream implementations are idempotent.
         """
-        if self._closed:
-            return
-        self._closed = True
-        await self._settle()
-        if hasattr(self._stream, "aclose"):
-            await self._stream.aclose()
-        elif hasattr(self._stream, "close"):
-            close_result = self._stream.close()
-            if inspect.isawaitable(close_result):
-                await close_result
+        async with self._close_lock:
+            if self._cleanup_complete:
+                return
+            await self._settle()
+            if hasattr(self._stream, "aclose"):
+                await self._stream.aclose()
+            elif hasattr(self._stream, "close"):
+                close_result = self._stream.close()
+                if inspect.isawaitable(close_result):
+                    await close_result
+            self._cleanup_complete = True
 
     async def aclose(self) -> None:
         """Support the async-iterator cleanup protocol."""

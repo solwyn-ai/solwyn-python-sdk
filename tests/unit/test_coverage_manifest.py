@@ -407,6 +407,7 @@ def test_bedrock_service_model_operation_is_visible_only_through_wrapper_reachab
             service_model=SimpleNamespace(operation_names=("Converse", "FutureOperation"))
         )
 
+    ServiceOnlyBedrock.__module__ = "botocore.client"
     report = solwyn.coverage(
         _wrapper(
             ServiceOnlyBedrock(),

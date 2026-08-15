@@ -17,13 +17,28 @@ derived from git tags (hatch-vcs).
   mapping. `create(stream=True)` and completed helper streams settle
   provider-reported usage from the terminal event; streams abandoned before
   terminal usage settle a length-based estimate, with lease-backed abandoned
-  calls floored at the reserved authority. Effective `background=True` requests
-  fail loud because queued responses expose no create-time usage, and parse
-  refuses effective streaming before budget or provider I/O. The helper's
+  calls floored at the reserved authority. Non-streaming create/parse calls
+  with omitted or zeroed Responses usage now use that same explicitly marked
+  request-length estimate, and lease-backed calls likewise retain their full
+  reservation rather than settling as exact zero. Effective `background=True`
+  requests fail loud because queued responses expose no create-time usage, and
+  parse refuses effective streaming before budget or provider I/O. To keep
+  preflight and the serialized wire request identical, metering-critical
+  `extra_body` overrides (`model`, `input`, `instructions`, and
+  `max_output_tokens`) are rejected; vendor-specific extensions still pass
+  through unchanged. The helper's
   existing-response retrieval overload remains raw because it creates no new
   spend. Azure admission is explicit through an Azure-only
   `CompatProfile.supports_responses` capability flag; all other compatible
   profiles retain their guarded raw Responses managers.
+- **Explicit provider identity pins bypass auto-detection.** Passing
+  `provider="openai"` (or a provider in a fallback 4-tuple) selects that named
+  adapter without inspecting `base_url`, enabling native OpenAI Responses
+  metering behind corporate gateways and local proxies. Pins do not translate
+  dialects or replace SDK clients: wrapper construction validates the actual
+  provider-client family and sync/async mode, rejects mismatches with
+  `ConfigurationError(field="client")`, and reports unknown names against the
+  `provider` field.
 - **Strict pre-call coverage controls and local coverage manifests.** Clients
   now classify and guard the reachable public provider-client graph. Set
   `on_unmetered="raise"` / `SOLWYN_ON_UNMETERED=raise` to refuse untracked or

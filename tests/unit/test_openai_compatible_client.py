@@ -259,22 +259,21 @@ class TestProviderOverride:
         with pytest.raises(ConfigurationError, match="Unknown provider"):
             _make_solwyn(client, provider="not-a-provider")
 
-    def test_cross_dialect_override_raises_configuration_error(self) -> None:
+    def test_pin_rejects_anthropic_client_through_surface_context_validation(self) -> None:
         client = make_mock_client(module="anthropic._client", name="Anthropic")
-        with pytest.raises(ConfigurationError, match="dialect"):
+        client.messages.create = MagicMock()
+        with pytest.raises(ConfigurationError) as exc_info:
             _make_solwyn(client, provider="groq")
+        assert exc_info.value.field == "client"
+        assert "groq/anthropic_sdk/sync" in str(exc_info.value)
+        client.messages.create.assert_not_called()
 
-    def test_unrecognized_client_with_override_raises_configuration_error(self) -> None:
-        """An override relabels a DETECTED client — it cannot adopt an object
-        from an unknown SDK (distinct from the dialect-mismatch branch)."""
+    def test_pin_rejects_an_unrecognized_client_shape(self) -> None:
         UnknownClient = type("UnknownClient", (), {"__module__": "totally_unknown_sdk._client"})
-        expected = (
-            "not a recognized provider SDK client "
-            "(openai / anthropic / google-genai / bedrock / together)"
-        )
         with pytest.raises(ConfigurationError) as exc_info:
             _make_solwyn(UnknownClient(), provider="groq")
-        assert expected in str(exc_info.value)
+        assert exc_info.value.field == "client"
+        assert "undeclared_sdk" in str(exc_info.value)
 
     def test_fallback_spec_provider_override(self) -> None:
         primary = _compat_client("https://api.groq.com/openai/v1")
@@ -282,6 +281,16 @@ class TestProviderOverride:
         solwyn = _make_solwyn(primary, fallback=[(fallback, "my-model", {}, "vllm")])
 
         assert solwyn._runtimes[1].entry.provider == ProviderName.VLLM
+
+    def test_fallback_provider_pin_rejects_wrong_client_shape(self) -> None:
+        primary = _compat_client("https://api.groq.com/openai/v1")
+        fallback = make_mock_client(module="anthropic._client", name="Anthropic")
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_solwyn(primary, fallback=[(fallback, "my-model", {}, "vllm")])
+
+        assert exc_info.value.field == "client"
+        assert "vllm/anthropic_sdk/sync" in str(exc_info.value)
 
     def test_fallback_spec_non_string_provider_raises(self) -> None:
         primary = _compat_client("https://api.groq.com/openai/v1")
@@ -903,7 +912,7 @@ class TestAsyncCompat:
     @pytest.mark.unit
     @pytest.mark.asyncio
     async def test_async_provider_override(self) -> None:
-        client = make_mock_client()
+        client = make_mock_client(name="AsyncOpenAI")
         client.base_url = "http://localhost:9999/v1"
         client.chat.completions.create = AsyncMock(return_value=_response())
         solwyn = _make_async_solwyn(client, provider="vllm")

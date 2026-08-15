@@ -59,6 +59,55 @@ class _CloseableAsyncStream:
         self.aclose_calls += 1
 
 
+class _BlockingAsyncCleanup:
+    def __init__(self) -> None:
+        self.first_started = asyncio.Event()
+        self.second_started = asyncio.Event()
+        self.allow = asyncio.Event()
+        self.attempts = 0
+        self.completed = 0
+        self.active = 0
+        self.max_active = 0
+
+    async def run(self) -> None:
+        self.attempts += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        if self.attempts == 1:
+            self.first_started.set()
+        else:
+            self.second_started.set()
+        try:
+            await self.allow.wait()
+            self.completed += 1
+        finally:
+            self.active -= 1
+
+
+class _BlockingAcloseStream:
+    def __init__(self, cleanup: _BlockingAsyncCleanup) -> None:
+        self._cleanup = cleanup
+
+    async def __aiter__(self):
+        return
+        yield
+
+    async def aclose(self) -> None:
+        await self._cleanup.run()
+
+
+class _BlockingAsyncCloseStream:
+    def __init__(self, cleanup: _BlockingAsyncCleanup) -> None:
+        self._cleanup = cleanup
+
+    async def __aiter__(self):
+        return
+        yield
+
+    async def close(self) -> None:
+        await self._cleanup.run()
+
+
 def test_fake_accumulator_satisfies_stream_usage_accumulator_protocol() -> None:
     assert isinstance(FakeAccumulator(), StreamUsageAccumulator)
 
@@ -1101,6 +1150,121 @@ class TestAsyncStreamWrapperInnerClose:
 
         assert inner.close_called == 1
         assert completion_count == 1
+
+    @pytest.mark.parametrize(
+        "stream_type",
+        [_BlockingAcloseStream, _BlockingAsyncCloseStream],
+        ids=["aclose", "async-close"],
+    )
+    @pytest.mark.asyncio
+    async def test_cancelled_provider_cleanup_is_retryable_and_serialized(
+        self,
+        stream_type: type[_BlockingAcloseStream] | type[_BlockingAsyncCloseStream],
+    ) -> None:
+        from solwyn.stream import AsyncStreamWrapper
+
+        cleanup = _BlockingAsyncCleanup()
+        on_complete = AsyncMock()
+        on_error = AsyncMock()
+        wrapper = AsyncStreamWrapper(
+            stream=stream_type(cleanup),
+            accumulator=FakeAccumulator(),
+            on_complete=on_complete,
+            on_error=on_error,
+        )
+
+        first_close = asyncio.create_task(wrapper.close())
+        await cleanup.first_started.wait()
+        second_close = asyncio.create_task(wrapper.close())
+        await asyncio.sleep(0)
+        assert cleanup.attempts == 1
+
+        first_close.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_close
+        try:
+            await asyncio.wait_for(cleanup.second_started.wait(), timeout=1)
+        finally:
+            cleanup.allow.set()
+        await second_close
+        await wrapper.close()
+
+        assert cleanup.attempts == 2
+        assert cleanup.completed == 1
+        assert cleanup.max_active == 1
+        on_complete.assert_awaited_once()
+        on_error.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_settlement_cancellation_leaves_provider_cleanup_retryable(self) -> None:
+        from solwyn.stream import AsyncStreamWrapper
+
+        inner = _CloseableAsyncStream([])
+        settlement_started = asyncio.Event()
+        never_finish_settlement = asyncio.Event()
+        completion_calls = 0
+
+        async def on_complete(_details: TokenDetails, _elapsed_ms: float) -> None:
+            nonlocal completion_calls
+            completion_calls += 1
+            settlement_started.set()
+            await never_finish_settlement.wait()
+
+        on_error = AsyncMock()
+        wrapper = AsyncStreamWrapper(
+            stream=inner,
+            accumulator=FakeAccumulator(),
+            on_complete=on_complete,
+            on_error=on_error,
+        )
+
+        first_close = asyncio.create_task(wrapper.close())
+        await settlement_started.wait()
+        first_close.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_close
+        await wrapper.close()
+        await wrapper.close()
+
+        assert completion_calls == 1
+        assert inner.aclose_calls == 1
+        on_error.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_provider_cleanup_error_is_retryable_without_double_settlement(self) -> None:
+        from solwyn.stream import AsyncStreamWrapper
+
+        class FailsOnceStream:
+            def __init__(self) -> None:
+                self.aclose_calls = 0
+
+            async def __aiter__(self):
+                return
+                yield
+
+            async def aclose(self) -> None:
+                self.aclose_calls += 1
+                if self.aclose_calls == 1:
+                    raise RuntimeError("cleanup failed")
+
+        inner = FailsOnceStream()
+        on_complete = AsyncMock()
+        on_error = AsyncMock()
+        wrapper = AsyncStreamWrapper(
+            stream=inner,
+            accumulator=FakeAccumulator(),
+            on_complete=on_complete,
+            on_error=on_error,
+        )
+
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            await wrapper.close()
+        await wrapper.close()
+        await wrapper.close()
+
+        assert inner.aclose_calls == 2
+        on_complete.assert_awaited_once()
+        on_error.assert_not_awaited()
 
 
 @pytest.mark.unit

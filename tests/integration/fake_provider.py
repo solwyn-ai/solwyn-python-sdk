@@ -1,9 +1,10 @@
-"""A minimal local OpenAI-compatible chat-completions server for E2E tests.
+"""A minimal local OpenAI-compatible provider server for E2E tests.
 
 Test infrastructure ONLY — never imported by src/. Serves POST
-``/v1/chat/completions`` in both JSON and SSE-streaming form, always returning
-a valid usage block (configurable token counts), and records every request so
-tests can assert the provider was (or was NOT) called and with which payload.
+``/v1/chat/completions`` and ``/v1/responses`` in both JSON and SSE-streaming
+form, always returning a valid usage block (configurable token counts), and
+records every request so tests can assert the provider was (or was NOT) called
+and with which payload.
 
 Why this doubles as detection coverage: Solwyn detects OpenAI-compatible
 providers from the client's base_url — conventional local ports (1234/11434/
@@ -37,6 +38,7 @@ from typing import Any
 PORT_PROFILES: dict[int, str] = {1234: "lmstudio", 11434: "ollama", 8000: "vllm"}
 
 RESPONSE_CONTENT = "This is a fake response."
+STRUCTURED_RESPONSE_CONTENT = {"answer": "structured fake response", "score": 7}
 
 
 @dataclass
@@ -108,23 +110,30 @@ class _BaseHandler(BaseHTTPRequestHandler):
 
 
 class _Handler(_BaseHandler):
-    """OpenAI chat-completions dialect."""
+    """OpenAI chat-completions and Responses dialect."""
 
     # do_POST is the BaseHTTPRequestHandler dispatch contract (name is fixed).
     def do_POST(self) -> None:
         body = self._read_and_record()
 
-        if not self.path.endswith("/chat/completions"):
-            self._send_json(404, {"error": {"message": f"no route: {self.path}"}})
+        if self.path.endswith("/responses"):
+            if self._maybe_send_queued_failure():
+                return
+            if body.get("stream"):
+                self._send_responses_stream(body)
+            else:
+                self._send_json(200, self._response(body))
             return
-        # Queued failures apply only to the completions route — a request to an
-        # unrelated path must not silently consume a fail_next() entry.
-        if self._maybe_send_queued_failure():
+        if self.path.endswith("/chat/completions"):
+            if self._maybe_send_queued_failure():
+                return
+            if body.get("stream"):
+                self._send_stream(body)
+            else:
+                self._send_json(200, self._completion(body))
             return
-        if body.get("stream"):
-            self._send_stream(body)
-        else:
-            self._send_json(200, self._completion(body))
+        # Unrelated routes must not silently consume a fail_next() entry.
+        self._send_json(404, {"error": {"message": f"no route: {self.path}"}})
 
     def _usage(self) -> dict[str, int]:
         return {
@@ -152,6 +161,146 @@ class _Handler(_BaseHandler):
             del payload["usage"]
         return payload
 
+    def _responses_usage(self) -> dict[str, object]:
+        return {
+            "input_tokens": self.state.prompt_tokens,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": self.state.completion_tokens,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": self.state.prompt_tokens + self.state.completion_tokens,
+        }
+
+    def _response_output_text(self, body: dict[str, Any]) -> str:
+        text = body.get("text")
+        response_format = text.get("format") if isinstance(text, dict) else None
+        if isinstance(response_format, dict) and response_format.get("type") == "json_schema":
+            return json.dumps(STRUCTURED_RESPONSE_CONTENT, separators=(",", ":"))
+        return RESPONSE_CONTENT
+
+    def _response(
+        self,
+        body: dict[str, Any],
+        *,
+        completed: bool = True,
+        output_text: str | None = None,
+    ) -> dict[str, Any]:
+        if completed and output_text is None:
+            output_text = self._response_output_text(body)
+        response: dict[str, Any] = {
+            "id": "resp_fake_0001",
+            "object": "response",
+            "created_at": 1700000000.0,
+            "status": "completed" if completed else "in_progress",
+            "model": body.get("model", "fake-model"),
+            "output": (
+                [
+                    {
+                        "id": "msg_fake_0001",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": output_text,
+                                "annotations": [],
+                                "logprobs": [],
+                            }
+                        ],
+                    }
+                ]
+                if completed
+                else []
+            ),
+            "parallel_tool_calls": True,
+            "tool_choice": "auto",
+            "tools": [],
+            "service_tier": body.get("service_tier", "default"),
+            "usage": self._responses_usage() if completed else None,
+        }
+        if completed and self.state.omit_usage:
+            del response["usage"]
+        return response
+
+    def _send_responses_stream(self, body: dict[str, Any]) -> None:
+        """SSE stream ending in a full ``response.completed`` usage event."""
+        with self.state.lock:
+            drop_after = self.state.drop_stream_after
+            self.state.drop_stream_after = None
+        output_text = self._response_output_text(body)
+        message_item = {
+            "id": "msg_fake_0001",
+            "type": "message",
+            "status": "in_progress",
+            "role": "assistant",
+            "content": [],
+        }
+        empty_text_part = {
+            "type": "output_text",
+            "text": "",
+            "annotations": [],
+            "logprobs": [],
+        }
+
+        events = [
+            {
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": self._response(body, completed=False),
+            },
+            {
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": message_item,
+            },
+            {
+                "type": "response.content_part.added",
+                "sequence_number": 2,
+                "item_id": "msg_fake_0001",
+                "output_index": 0,
+                "content_index": 0,
+                "part": empty_text_part,
+            },
+            {
+                "type": "response.output_text.delta",
+                "sequence_number": 3,
+                "item_id": "msg_fake_0001",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": output_text,
+                "logprobs": [],
+            },
+            {
+                "type": "response.completed",
+                "sequence_number": 4,
+                "response": self._response(body, output_text=output_text),
+            },
+        ]
+        self._send_sse(events, drop_after=drop_after)
+
+    def _send_sse(self, events: list[dict[str, Any]], *, drop_after: int | None) -> None:
+        """Send events with explicit chunked framing so truncation is detectable."""
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+        def write_chunk(data: bytes) -> None:
+            self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
+
+        for sent, event in enumerate(events):
+            if drop_after is not None and sent >= drop_after:
+                # Close without the chunked terminator: the client's HTTP layer
+                # sees an incomplete body and raises RemoteProtocolError.
+                self.close_connection = True
+                return
+            write_chunk(f"data: {json.dumps(event)}\n\n".encode())
+        write_chunk(b"data: [DONE]\n\n")
+        self.wfile.write(b"0\r\n\r\n")
+
     def _send_stream(self, body: dict[str, Any]) -> None:
         """SSE stream: two content chunks, a stop chunk, a usage-only final chunk.
 
@@ -162,14 +311,8 @@ class _Handler(_BaseHandler):
         (tier 1), never the estimation fallback. ``set_omit_usage(True)`` drops
         that final chunk entirely, forcing the length-based estimation fallback.
 
-        Framed as HTTP/1.1 chunked transfer encoding (rather than HTTP/1.0
-        close-terminated) so a ``drop_next_stream()`` truncation is DETECTABLE:
-        under HTTP/1.0 the connection close that ends a normal response and the
-        connection close that abandons a truncated one look identical to the
-        client, so a dropped stream would read as clean EOF. Chunked framing
-        gives the body an explicit ``0\\r\\n\\r\\n`` terminator — omitting it on a
-        drop makes the body demonstrably incomplete, and httpx's HTTP/1.1 layer
-        raises ``httpx.RemoteProtocolError`` instead of silently truncating.
+        Shared chunked framing makes a ``drop_next_stream()`` truncation
+        distinguishable from normal end-of-stream.
         """
         model = body.get("model", "fake-model")
         with self.state.lock:
@@ -196,25 +339,7 @@ class _Handler(_BaseHandler):
         ]
         if not omit_usage:
             events.append(chunk(None, None, self._usage()))
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Transfer-Encoding", "chunked")
-        self.end_headers()
-
-        def write_chunk(data: bytes) -> None:
-            self.wfile.write(f"{len(data):X}\r\n".encode() + data + b"\r\n")
-
-        for sent, event in enumerate(events):
-            if drop_after is not None and sent >= drop_after:
-                # Close WITHOUT the chunked terminator: the client's HTTP layer
-                # sees an incomplete body and raises (RemoteProtocolError).
-                self.close_connection = True
-                return
-            write_chunk(f"data: {json.dumps(event)}\n\n".encode())
-        write_chunk(b"data: [DONE]\n\n")
-        self.wfile.write(b"0\r\n\r\n")
+        self._send_sse(events, drop_after=drop_after)
 
 
 class _AnthropicHandler(_BaseHandler):
@@ -304,8 +429,7 @@ class FakeProviderServer:
             self._state.fail_statuses.extend([(status, retry_after)] * count)
 
     def set_omit_usage(self, omit: bool = True) -> None:
-        """While set, JSON completions have no ``usage`` key and SSE streams have
-        no terminal usage chunk — forces the length-based estimation fallback."""
+        """Omit usage from JSON and SSE terminal payloads on both API routes."""
         with self._state.lock:
             self._state.omit_usage = omit
 

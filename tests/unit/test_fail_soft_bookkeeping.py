@@ -78,6 +78,52 @@ class TestExtractUsageFailSoft:
         # trues up against it normally.
         assert result.unmeasured is False
 
+    def test_zero_usage_passes_through_without_empty_usage_policy(self) -> None:
+        adapter = _adapter()
+        empty = TokenDetails()
+        adapter.extract_usage.return_value = empty
+        adapter.estimate_missing_usage.return_value = None
+
+        result = _extract_usage_fail_soft(_runtime(adapter), object(), estimated_input_tokens=99)
+
+        assert result.token_details is empty
+        assert result.unmeasured is False
+
+    def test_empty_usage_policy_degrades_zero_usage_to_synthetic_estimate(self) -> None:
+        adapter = _adapter()
+        adapter.extract_usage.return_value = TokenDetails()
+        adapter.estimate_missing_usage.return_value = None
+
+        result = _extract_usage_fail_soft(
+            _runtime(adapter),
+            object(),
+            estimated_input_tokens=99,
+            estimate_empty_usage=True,
+        )
+
+        assert result.token_details == TokenDetails(
+            input_tokens=99,
+            output_tokens=0,
+            is_estimated=True,
+        )
+        assert result.unmeasured is True
+
+    def test_empty_usage_policy_keeps_adapter_estimate_unmeasured(self) -> None:
+        adapter = _adapter()
+        adapter.extract_usage.return_value = TokenDetails()
+        estimated = TokenDetails(input_tokens=99, output_tokens=7, is_estimated=True)
+        adapter.estimate_missing_usage.return_value = estimated
+
+        result = _extract_usage_fail_soft(
+            _runtime(adapter),
+            object(),
+            estimated_input_tokens=99,
+            estimate_empty_usage=True,
+        )
+
+        assert result.token_details is estimated
+        assert result.unmeasured is True
+
     def test_extract_usage_raise_degrades_to_adapter_estimate(self) -> None:
         adapter = _adapter()
         adapter.extract_usage.side_effect = RuntimeError("unexpected shape")
