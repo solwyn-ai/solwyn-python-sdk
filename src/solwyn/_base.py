@@ -443,6 +443,15 @@ def _nested_output_cap(value: object, key: str) -> int | None:
     return _positive_output_cap(nested)
 
 
+def _responses_output_bound(kwargs: dict[str, object], default_bound: int) -> int:
+    """Return the Responses output bound used for conservative lease sizing.
+
+    Responses uses ``max_output_tokens``, not the chat token aliases. Calls
+    without a usable cap use the configured conservative fallback.
+    """
+    return _positive_output_cap(kwargs.get("max_output_tokens")) or default_bound
+
+
 def _dialect_output_cap(dialect: str, kwargs: dict[str, object]) -> int | None:
     """Return the effective native cap in one dialect-shaped kwargs mapping."""
     if dialect == ProviderName.GOOGLE.value:
