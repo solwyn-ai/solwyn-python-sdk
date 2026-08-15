@@ -604,6 +604,44 @@ class TestOpenAIAdapterResponsesDispatch:
         assert shaped == kwargs
         assert shaped is not kwargs
 
+    def test_parse_leaf_selects_responses_parse_with_defensive_copy(self) -> None:
+        # Arrange.
+        def parse(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(responses=SimpleNamespace(parse=parse))
+        kwargs: dict[str, Any] = {
+            "model": "gpt-5.5",
+            "input": "hello",
+            "text_format": dict,
+        }
+
+        # Act.
+        method, shaped = OpenAIAdapter().prepare_responses_call(
+            client,
+            kwargs,
+            is_streaming=False,
+            leaf="parse",
+        )
+
+        # Assert.
+        assert method is parse
+        assert shaped == kwargs
+        assert shaped is not kwargs
+
+    def test_unsupported_internal_leaf_fails_loud(self) -> None:
+        # Arrange.
+        client = SimpleNamespace(responses=SimpleNamespace(create=lambda **kwargs: kwargs))
+
+        # Act and assert.
+        with pytest.raises(RuntimeError, match="unsupported OpenAI Responses leaf"):
+            OpenAIAdapter().prepare_responses_call(
+                client,
+                {"model": "gpt-5.5"},
+                is_streaming=False,
+                leaf="retrieve",
+            )
+
     def test_streaming_adds_stream_true_without_mutating_input(self) -> None:
         client = SimpleNamespace(responses=SimpleNamespace(create=lambda **kwargs: kwargs))
         kwargs: dict[str, Any] = {"model": "gpt-5.5"}

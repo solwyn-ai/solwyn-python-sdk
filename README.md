@@ -248,12 +248,13 @@ Billable quantities are read from the response's usage block where it exists (gp
 
 ## Strict coverage controls
 
-- **OpenAI Responses:** Native OpenAI `responses.create(...)` is budget-metered
-  for sync and async clients, including `stream=True`. `responses.parse` and the
-  `responses.stream()` context-manager helper remain guarded unmetered leaves at
-  this milestone. `background=True` is refused because queued responses expose
-  no create-time usage, and Azure/OpenAI-compatible Responses coverage is not
-  yet claimed.
+- **OpenAI Responses:** Native OpenAI `responses.create(...)` and
+  `responses.parse(...)` are budget-metered for sync and async clients.
+  `create(stream=True)` is supported; parse is non-streaming and refuses any
+  effective streaming request. The `responses.stream()` context-manager helper
+  and every other Responses leaf remain guarded by `on_unmetered`.
+  `background=True` create calls are refused because queued responses expose no
+  create-time usage. Azure/OpenAI-compatible Responses coverage is not claimed.
 
 Solwyn classifies the public pre-call capability graph of every supported
 wrapped client. Tracked leaves are intercepted as usual. Resource namespaces
@@ -342,8 +343,8 @@ audit_client = Solwyn(
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
     guarded_namespaces="sha256:38de7d9d718f03bc61f4a24e24f131c1a018434fcb38eb5cb7371290fc72e074",
-    tracked="sha256:c23b04e7892944f972cd0296f7442eaff351776ea0e35516321a9470567cc874",
-    untracked="sha256:2969df31fc9b474959d35bd2ef386e2b64c573d5c7ca541abe5992ca48787d89",
+    tracked="sha256:81958f506743fd953eae6cfa18451c14fcfcc7f991fd973a2ff876abce878ca9",
+    untracked="sha256:bc2e32616dc36f6ad2db71877951293fbd35eb8625af6aaa232c4262bd7a2aef",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     scoped_escapes="sha256:6808a0f2ac290c9d4d1504b21b1c0ba98267636ced4234416b53533b29bb4073",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",

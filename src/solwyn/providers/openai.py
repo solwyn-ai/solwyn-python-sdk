@@ -447,17 +447,22 @@ class OpenAIAdapter:
         kwargs: dict[str, Any],
         *,
         is_streaming: bool,
+        leaf: str = "create",
     ) -> tuple[Callable[..., Any], dict[str, Any]]:
         """Duck-typed Responses dispatch seam, like the media surface seams.
 
-        This foundation targets native OpenAI only. Streaming sets ``stream``
-        but deliberately omits ``stream_options`` because Responses rejects it;
-        usage instead arrives on the terminal ``response.completed`` event.
+        This foundation targets native OpenAI only. ``create`` streaming sets
+        ``stream`` but deliberately omits ``stream_options`` because Responses
+        rejects it; usage instead arrives on the terminal
+        ``response.completed`` event. ``parse`` is dispatched only after the
+        client pipeline has refused streaming intent.
         """
         kwargs = dict(kwargs)
         if is_streaming:
             kwargs["stream"] = True
-        return client.responses.create, kwargs
+        if leaf not in {"create", "parse"}:
+            raise RuntimeError(f"unsupported OpenAI Responses leaf: {leaf}")
+        return getattr(client.responses, leaf), kwargs
 
     def prepare_media_call(
         self,

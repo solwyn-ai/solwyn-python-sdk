@@ -226,6 +226,38 @@ def _effective_responses_kwargs(
     return defaults | dict(kwargs)
 
 
+_RESPONSES_PARSE_STREAM_GUIDANCE = (
+    "OpenAI responses.parse is non-streaming and cannot meter a streaming response. "
+    "Use responses.create(stream=True) for metered streaming calls."
+)
+
+
+def _responses_is_streaming(
+    kwargs: Mapping[str, object],
+    *,
+    leaf: str,
+    force_stream: bool = False,
+) -> bool:
+    """Resolve Responses streaming mode and refuse it for the parse leaf.
+
+    OpenAI merges ``extra_body`` into the request body after named parameters,
+    so an explicit structural ``stream`` entry there has final precedence for
+    parse. Create deliberately retains its established top-level semantics.
+    """
+    if leaf != "parse":
+        return bool(kwargs.get("stream", False)) or force_stream
+
+    extra_body = kwargs.get("extra_body")
+    stream = (
+        extra_body["stream"]
+        if isinstance(extra_body, Mapping) and "stream" in extra_body
+        else kwargs.get("stream", False)
+    )
+    if bool(stream) or force_stream:
+        raise ConfigurationError(_RESPONSES_PARSE_STREAM_GUIDANCE, field="stream")
+    return False
+
+
 def _source_compatible_defaults(dialect: str, params: dict[str, Any]) -> dict[str, Any]:
     """Return target defaults that are also legal in the source DIALECT.
 
@@ -1032,10 +1064,10 @@ class Solwyn(_SolwynBase):
 
     @functools.cached_property
     def responses(self) -> Any:
-        """Expose metered Responses create only for native OpenAI clients.
+        """Expose metered Responses create and parse for native OpenAI clients.
 
-        Native ``responses.create`` uses the primary-only Responses pipeline;
-        other Responses leaves stay guarded raw operations. OpenAI-compatible
+        Both native leaves use the primary-only Responses pipeline; other
+        Responses leaves stay guarded raw operations. OpenAI-compatible
         providers, including Azure, retain their existing raw namespace and
         unmetered posture. Cached because provider identity is construction-time
         state.
@@ -1230,6 +1262,7 @@ class Solwyn(_SolwynBase):
         read_timeout: float,
         max_retries: int,
         surface: str = "chat",
+        responses_leaf: str = "create",
     ) -> Any:
         """Dispatch one hop to the runtime's SDK client. Pure I/O - no metrics.
 
@@ -1251,12 +1284,13 @@ class Solwyn(_SolwynBase):
             prepare = getattr(runtime.adapter, "prepare_responses_call", None)
             if prepare is None:
                 raise UnsupportedSurfaceError(
-                    surface="responses.create", provider=runtime.adapter.name
+                    surface=f"responses.{responses_leaf}", provider=runtime.adapter.name
                 )
             method, call_kwargs = prepare(
                 client,
                 cast("dict[str, Any]", kwargs),
                 is_streaming=is_streaming,
+                leaf=responses_leaf,
             )
             return method(**call_kwargs)
         method, call_kwargs = runtime.adapter.prepare_call(
@@ -1534,6 +1568,7 @@ class Solwyn(_SolwynBase):
         *,
         _force_stream: bool = False,
         _surface: str = "chat",
+        _responses_leaf: str = "create",
         **kwargs: object,
     ) -> Any:
         """Core interception logic: the classified candidate walk."""
@@ -1551,7 +1586,9 @@ class Solwyn(_SolwynBase):
             _surface == "responses"
             and getattr(primary.adapter, "prepare_responses_call", None) is None
         ):
-            raise UnsupportedSurfaceError(surface="responses.create", provider=primary.adapter.name)
+            raise UnsupportedSurfaceError(
+                surface=f"responses.{_responses_leaf}", provider=primary.adapter.name
+            )
         # Deadline starts here — it encompasses the budget pre-flight.
         deadline = Deadline(self._config.failover_total_timeout)
 
@@ -1570,7 +1607,15 @@ class Solwyn(_SolwynBase):
                 kwargs=kwargs,
             )
             _reject_responses_background(request_semantics)
-        is_streaming = bool(request_semantics.get("stream", False)) or _force_stream
+        is_streaming = (
+            _responses_is_streaming(
+                request_semantics,
+                leaf=_responses_leaf,
+                force_stream=_force_stream,
+            )
+            if _surface == "responses"
+            else bool(request_semantics.get("stream", False)) or _force_stream
+        )
 
         # Legacy GenerativeModel constructor defaults are applied by its
         # no-I/O _prepare_request seam, not exposed in the raw call kwargs.
@@ -1836,6 +1881,7 @@ class Solwyn(_SolwynBase):
                         read_timeout=tuning.failover_hop_read_timeout,
                         max_retries=0,
                         surface=_surface,
+                        responses_leaf=_responses_leaf,
                     )
                     if (
                         is_streaming
@@ -2356,12 +2402,13 @@ class AsyncSolwyn(_SolwynBase):
 
     @functools.cached_property
     def responses(self) -> Any:
-        """Expose metered Responses create only for native OpenAI clients.
+        """Expose metered Responses create and parse for native OpenAI clients.
 
-        The async proxy mirrors the sync contract: native foreground create is
-        intercepted through the primary Responses pipeline; all other leaves
-        and every OpenAI-compatible provider remain guarded raw operations.
-        Cached because provider identity is construction-time state.
+        The async proxy mirrors the sync contract: native foreground create and
+        non-streaming parse are intercepted through the primary Responses
+        pipeline; all other leaves and every OpenAI-compatible provider remain
+        guarded raw operations. Cached because provider identity is
+        construction-time state.
         """
         if (
             self._adapter.name == "openai"
@@ -2516,6 +2563,7 @@ class AsyncSolwyn(_SolwynBase):
         read_timeout: float,
         max_retries: int,
         surface: str = "chat",
+        responses_leaf: str = "create",
     ) -> Any:
         """Dispatch one hop to the runtime's async SDK client. Pure I/O.
 
@@ -2537,12 +2585,13 @@ class AsyncSolwyn(_SolwynBase):
             prepare = getattr(runtime.adapter, "prepare_responses_call", None)
             if prepare is None:
                 raise UnsupportedSurfaceError(
-                    surface="responses.create", provider=runtime.adapter.name
+                    surface=f"responses.{responses_leaf}", provider=runtime.adapter.name
                 )
             method, call_kwargs = prepare(
                 client,
                 cast("dict[str, Any]", kwargs),
                 is_streaming=is_streaming,
+                leaf=responses_leaf,
             )
             return await method(**call_kwargs)
         method, call_kwargs = runtime.adapter.prepare_call(
@@ -2786,6 +2835,7 @@ class AsyncSolwyn(_SolwynBase):
         *,
         _force_stream: bool = False,
         _surface: str = "chat",
+        _responses_leaf: str = "create",
         **kwargs: object,
     ) -> Any:
         """Async core interception logic: the classified candidate walk."""
@@ -2802,7 +2852,9 @@ class AsyncSolwyn(_SolwynBase):
             _surface == "responses"
             and getattr(primary.adapter, "prepare_responses_call", None) is None
         ):
-            raise UnsupportedSurfaceError(surface="responses.create", provider=primary.adapter.name)
+            raise UnsupportedSurfaceError(
+                surface=f"responses.{_responses_leaf}", provider=primary.adapter.name
+            )
         deadline = Deadline(self._config.failover_total_timeout)
 
         request_semantics = kwargs
@@ -2819,7 +2871,15 @@ class AsyncSolwyn(_SolwynBase):
                 kwargs=kwargs,
             )
             _reject_responses_background(request_semantics)
-        is_streaming = bool(request_semantics.get("stream", False)) or _force_stream
+        is_streaming = (
+            _responses_is_streaming(
+                request_semantics,
+                leaf=_responses_leaf,
+                force_stream=_force_stream,
+            )
+            if _surface == "responses"
+            else bool(request_semantics.get("stream", False)) or _force_stream
+        )
 
         char_count = (
             estimate_responses_content_length(cast("dict[str, Any]", request_semantics))
@@ -3048,6 +3108,7 @@ class AsyncSolwyn(_SolwynBase):
                         read_timeout=tuning.failover_hop_read_timeout,
                         max_retries=0,
                         surface=_surface,
+                        responses_leaf=_responses_leaf,
                     )
                     if (
                         is_streaming

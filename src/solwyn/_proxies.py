@@ -467,13 +467,14 @@ def _reject_responses_background(kwargs: Mapping[str, object]) -> None:
 
 
 class _SyncResponsesProxy:
-    """Native OpenAI Responses proxy with one metered ``create`` seam.
+    """Native OpenAI Responses proxy with metered ``create`` and ``parse`` seams.
 
-    ``responses.create`` rides the existing Responses interception pipeline: it
-    is primary-only, applies only Responses-compatible effective defaults, and
-    settles provider-reported usage. Queued background responses are refused
-    because create-time usage is unavailable. Every other Responses leaf stays
-    a raw provider operation resolved through the shared unmetered policy.
+    Both leaves ride the existing Responses interception pipeline: they are
+    primary-only, apply only Responses-compatible effective defaults, and
+    settle provider-reported usage. Queued background responses are refused
+    because create-time usage is unavailable, and parse refuses streaming
+    because the SDK helper is non-streaming. Every other Responses leaf stays a
+    raw provider operation resolved through the shared unmetered policy.
     """
 
     def __init__(self, solwyn: Solwyn) -> None:
@@ -485,8 +486,17 @@ class _SyncResponsesProxy:
         _reject_responses_background(kwargs)
         return self._solwyn._intercepted_call(_surface="responses", **kwargs)
 
+    def parse(self, **kwargs: Any) -> Any:
+        """Intercept a non-streaming native Responses parse call."""
+        self._solwyn._enforce_explicit_surface("responses.parse", source=SurfaceSource.WRAPPER)
+        return self._solwyn._intercepted_call(
+            _surface="responses",
+            _responses_leaf="parse",
+            **kwargs,
+        )
+
     def __getattr__(self, name: str) -> Any:
-        """Resolve non-create leaves as guarded raw Responses operations."""
+        """Resolve non-metered leaves as guarded raw Responses operations."""
         return self._solwyn._resolve_public_attribute(
             self._solwyn._client.responses,
             name=name,
@@ -891,12 +901,13 @@ class _SyncModelsProxy:
 
 
 class _AsyncResponsesProxy:
-    """Async native OpenAI Responses proxy with one metered ``create`` seam.
+    """Async native OpenAI Responses proxy with metered create and parse seams.
 
-    This mirrors ``_SyncResponsesProxy``: foreground ``create`` calls use the
-    primary-only Responses pipeline and its filtered effective defaults, while
-    background calls are refused because usage is unavailable at creation.
-    Every other leaf remains a shared-policy raw provider operation.
+    This mirrors ``_SyncResponsesProxy``: foreground ``create`` and
+    non-streaming ``parse`` calls use the primary-only Responses pipeline and
+    its filtered effective defaults, while background calls are refused because
+    usage is unavailable at creation. Every other leaf remains a shared-policy
+    raw provider operation.
     """
 
     def __init__(self, solwyn: AsyncSolwyn) -> None:
@@ -908,8 +919,17 @@ class _AsyncResponsesProxy:
         _reject_responses_background(kwargs)
         return await self._solwyn._intercepted_call(_surface="responses", **kwargs)
 
+    async def parse(self, **kwargs: Any) -> Any:
+        """Intercept a non-streaming native Responses parse call."""
+        self._solwyn._enforce_explicit_surface("responses.parse", source=SurfaceSource.WRAPPER)
+        return await self._solwyn._intercepted_call(
+            _surface="responses",
+            _responses_leaf="parse",
+            **kwargs,
+        )
+
     def __getattr__(self, name: str) -> Any:
-        """Resolve non-create leaves as guarded raw Responses operations."""
+        """Resolve non-metered leaves as guarded raw Responses operations."""
         return self._solwyn._resolve_public_attribute(
             self._solwyn._client.responses,
             name=name,
