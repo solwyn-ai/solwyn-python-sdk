@@ -46,3 +46,6 @@ todos/
 
 # Superpowers/SDD scratch (workflow ledger, not repo content)
 .superpowers/
+
+
+.DS_STORE

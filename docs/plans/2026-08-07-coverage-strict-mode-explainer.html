@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Every Door Gets a Label — Coverage Strict Mode, Explained</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #faf7f2;
+  --bg-glow: #f3ede2;
+  --surface: #ffffff;
+  --surface-soft: #f6f1e8;
+  --border: rgba(30, 43, 61, 0.12);
+  --border-soft: rgba(30, 43, 61, 0.07);
+  --text: #1c2733;
+  --text-dim: #5b6673;
+  --navy: #1e3a5f;
+  --navy-dim: rgba(30, 58, 95, 0.08);
+  --gold: #a8791c;
+  --gold-bright: #d4a73a;
+  --gold-dim: rgba(212, 167, 58, 0.14);
+  --danger: #b3401f;
+  --danger-dim: rgba(179, 64, 31, 0.09);
+  --good: #4d7c0f;
+  --good-dim: rgba(77, 124, 15, 0.10);
+  --info: #0e7490;
+  --info-dim: rgba(14, 116, 144, 0.09);
+  --shadow: 0 1px 2px rgba(28, 39, 51, 0.05), 0 8px 24px rgba(28, 39, 51, 0.07);
+  --shadow-hero: 0 2px 4px rgba(28, 39, 51, 0.06), 0 18px 48px rgba(28, 39, 51, 0.12);
+  --serif: "Instrument Serif", Georgia, "Times New Roman", serif;
+  --sans: "Plus Jakarta Sans", "Segoe UI", Avenir, sans-serif;
+  --mono: "JetBrains Mono", "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131a23;
+    --bg-glow: #18212d;
+    --surface: #1b2532;
+    --surface-soft: #202c3b;
+    --border: rgba(232, 224, 208, 0.14);
+    --border-soft: rgba(232, 224, 208, 0.07);
+    --text: #ece5d8;
+    --text-dim: #9aa5b1;
+    --navy: #8fb4dd;
+    --navy-dim: rgba(143, 180, 221, 0.10);
+    --gold: #d4a73a;
+    --gold-bright: #e4bc55;
+    --gold-dim: rgba(212, 167, 58, 0.13);
+    --danger: #e07a54;
+    --danger-dim: rgba(224, 122, 84, 0.12);
+    --good: #93c353;
+    --good-dim: rgba(147, 195, 83, 0.12);
+    --info: #56b8d0;
+    --info-dim: rgba(86, 184, 208, 0.12);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.35);
+    --shadow-hero: 0 2px 4px rgba(0, 0, 0, 0.35), 0 18px 48px rgba(0, 0, 0, 0.5);
+  }
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: var(--sans);
+  background:
+    radial-gradient(1100px 500px at 15% -5%, var(--bg-glow) 0%, transparent 60%),
+    radial-gradient(900px 600px at 110% 20%, var(--gold-dim) 0%, transparent 55%),
+    var(--bg);
+  color: var(--text);
+  line-height: 1.65;
+  font-size: 16.5px;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 980px; margin: 0 auto; padding: 0 28px 96px; }
+a { color: var(--gold); }
+
+/* ---------- animation ---------- */
+@keyframes fadeUp { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+@keyframes fadeScale { from { opacity: 0; transform: scale(0.94); } to { opacity: 1; transform: none; } }
+.anim { animation: fadeUp 0.6s cubic-bezier(0.2, 0.7, 0.3, 1) both; }
+.anim-scale { animation: fadeScale 0.5s cubic-bezier(0.2, 0.7, 0.3, 1) both; }
+@media (prefers-reduced-motion: reduce) {
+  .anim, .anim-scale { animation: none; }
+}
+
+/* ---------- hero ---------- */
+header.hero { padding: 84px 0 36px; }
+.kicker {
+  font-family: var(--mono); font-size: 12px; letter-spacing: 0.16em;
+  text-transform: uppercase; color: var(--gold); display: flex; align-items: center; gap: 10px;
+}
+.kicker::before { content: ""; width: 26px; height: 1px; background: var(--gold); }
+h1 {
+  font-family: var(--serif); font-weight: 400; font-size: clamp(40px, 6.4vw, 66px);
+  line-height: 1.06; margin: 18px 0 8px; letter-spacing: -0.01em;
+}
+h1 em { font-style: italic; color: var(--navy); }
+.hero-sub {
+  font-size: 19px; color: var(--text-dim); max-width: 640px; margin-top: 14px;
+}
+.hero-sub strong { color: var(--text); font-weight: 600; }
+.companion {
+  margin-top: 22px; font-family: var(--mono); font-size: 12px; color: var(--text-dim);
+  background: var(--surface-soft); border: 1px solid var(--border-soft);
+  border-radius: 8px; padding: 8px 14px; display: inline-block;
+  overflow-wrap: anywhere;
+}
+
+/* stat band: uneven by design */
+.stats { display: grid; grid-template-columns: 1.5fr 1fr 1fr; gap: 14px; margin: 44px 0 0; }
+.stat {
+  background: var(--surface); border: 1px solid var(--border-soft);
+  border-radius: 14px; padding: 22px 24px; box-shadow: var(--shadow); min-width: 0;
+}
+.stat--hero {
+  background: linear-gradient(135deg, var(--danger-dim), var(--surface));
+  border-color: rgba(179, 64, 31, 0.25); box-shadow: var(--shadow-hero);
+}
+.stat .num { font-family: var(--serif); font-size: 46px; line-height: 1; }
+.stat--hero .num { color: var(--danger); font-size: 56px; }
+.stat .lbl { font-size: 13.5px; color: var(--text-dim); margin-top: 8px; }
+@media (max-width: 720px) { .stats { grid-template-columns: 1fr 1fr; } .stat--hero { grid-column: 1 / -1; } }
+
+/* ---------- sections ---------- */
+section { margin-top: 84px; }
+.sec-label {
+  display: flex; align-items: baseline; gap: 14px; margin-bottom: 6px;
+}
+.sec-label .n {
+  font-family: var(--mono); font-size: 13px; color: var(--gold);
+  border: 1px solid var(--gold); border-radius: 999px; padding: 2px 10px;
+  line-height: 1.6; white-space: nowrap;
+}
+h2 { font-family: var(--serif); font-weight: 400; font-size: clamp(28px, 4vw, 38px); line-height: 1.15; }
+.lede { font-size: 18px; color: var(--text-dim); max-width: 660px; margin: 14px 0 30px; }
+.lede strong { color: var(--text); font-weight: 600; }
+code, .m {
+  font-family: var(--mono); font-size: 0.86em;
+  background: var(--navy-dim); border-radius: 5px; padding: 1.5px 6px;
+  overflow-wrap: anywhere;
+}
+
+/* term tag: plain-English gloss after a technical word */
+.gloss { color: var(--text-dim); font-size: 0.92em; }
+
+/* ---------- door cards ---------- */
+.doors { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+@media (max-width: 720px) { .doors { grid-template-columns: 1fr; } }
+.door {
+  position: relative; background: var(--surface); border: 1px solid var(--border-soft);
+  border-radius: 14px; padding: 22px 22px 20px; box-shadow: var(--shadow); min-width: 0;
+}
+.door-head { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.door-ico { flex: none; width: 34px; height: 44px; }
+.door h3 { font-size: 16.5px; font-weight: 700; }
+.door .tag {
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+  border-radius: 999px; padding: 2px 9px; margin-left: auto; white-space: nowrap;
+}
+.door p { font-size: 14.5px; color: var(--text-dim); }
+.door p b { color: var(--text); font-weight: 600; }
+.door .ex { margin-top: 10px; font-size: 12.5px; color: var(--text-dim); }
+.door--good .tag { background: var(--good-dim); color: var(--good); }
+.door--warn .tag { background: var(--gold-dim); color: var(--gold); }
+.door--lock .tag { background: var(--info-dim); color: var(--info); }
+.door--bad  { border-color: rgba(179, 64, 31, 0.35); background: linear-gradient(160deg, var(--danger-dim), var(--surface) 55%); box-shadow: var(--shadow-hero); }
+.door--bad .tag { background: var(--danger); color: #fff; }
+
+/* ---------- pull quote ---------- */
+.pull {
+  margin: 56px auto 0; max-width: 720px; text-align: center; padding: 0 12px;
+}
+.pull blockquote {
+  font-family: var(--serif); font-size: clamp(24px, 3.4vw, 32px); line-height: 1.3; font-style: italic;
+}
+.pull blockquote::before { content: "\201C"; color: var(--gold-bright); }
+.pull blockquote::after { content: "\201D"; color: var(--gold-bright); }
+.pull cite { display: block; margin-top: 14px; font-style: normal; font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
+
+/* ---------- evidence list ---------- */
+.evidence { display: grid; gap: 12px; }
+.ev {
+  display: grid; grid-template-columns: 220px 1fr; gap: 6px 22px; align-items: baseline;
+  background: var(--surface); border: 1px solid var(--border-soft); border-radius: 12px;
+  padding: 16px 20px; box-shadow: var(--shadow); min-width: 0;
+}
+.ev .who { font-family: var(--mono); font-size: 13px; color: var(--danger); overflow-wrap: anywhere; }
+.ev .what { font-size: 14.5px; color: var(--text-dim); }
+.ev .what b { color: var(--text); font-weight: 600; }
+.ev--big { border-color: rgba(179, 64, 31, 0.3); }
+.ev--big .what { font-size: 15.5px; }
+@media (max-width: 640px) { .ev { grid-template-columns: 1fr; } }
+
+/* ---------- callout ---------- */
+.callout {
+  display: grid; grid-template-columns: 56px 1fr; gap: 20px; align-items: start;
+  background: linear-gradient(135deg, var(--navy-dim), var(--surface));
+  border: 1px solid var(--border); border-radius: 16px; padding: 28px 30px;
+  box-shadow: var(--shadow-hero);
+}
+.callout svg { width: 56px; height: 56px; }
+.callout h3 { font-family: var(--serif); font-weight: 400; font-size: 24px; margin-bottom: 6px; }
+.callout p { color: var(--text-dim); font-size: 15.5px; }
+.callout p b { color: var(--text); font-weight: 600; }
+@media (max-width: 560px) { .callout { grid-template-columns: 1fr; } }
+
+/* ---------- fix pieces ---------- */
+.piece { margin-top: 46px; }
+.piece-head { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; }
+.piece-head .pn {
+  font-family: var(--serif); font-size: 30px; color: var(--gold); line-height: 1;
+}
+.piece-head h3 { font-size: 20px; font-weight: 700; }
+.piece-head .sub { font-size: 14px; color: var(--text-dim); }
+
+/* label chips grid */
+.labels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+@media (max-width: 760px) { .labels { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 480px) { .labels { grid-template-columns: 1fr; } }
+.lab {
+  background: var(--surface); border: 1px solid var(--border-soft); border-radius: 12px;
+  padding: 16px 16px 14px; box-shadow: var(--shadow); min-width: 0;
+}
+.lab .chip {
+  font-family: var(--mono); font-size: 11.5px; padding: 2.5px 9px; border-radius: 999px;
+  display: inline-block; margin-bottom: 9px;
+}
+.lab p { font-size: 13.5px; color: var(--text-dim); }
+.lab p b { color: var(--text); }
+.lab--metered .chip { background: var(--good-dim); color: var(--good); }
+.lab--blocked .chip { background: var(--info-dim); color: var(--info); }
+.lab--spend .chip { background: var(--danger-dim); color: var(--danger); }
+.lab--meta .chip, .lab--infra .chip { background: var(--navy-dim); color: var(--navy); }
+.lab--unknown .chip { background: var(--gold-dim); color: var(--gold); border: 1px dashed var(--gold); }
+
+/* the dial */
+.dial { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 6px; }
+@media (max-width: 720px) { .dial { grid-template-columns: 1fr; } }
+.mode {
+  background: var(--surface); border: 1px solid var(--border-soft); border-radius: 14px;
+  padding: 20px; box-shadow: var(--shadow); min-width: 0; position: relative;
+}
+.mode--default { border-color: var(--gold); box-shadow: var(--shadow-hero); }
+.mode .default-badge {
+  position: absolute; top: -11px; right: 14px; background: var(--gold); color: #fff;
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 2px 10px; border-radius: 999px;
+}
+.mode h4 { font-family: var(--mono); font-size: 15px; margin-bottom: 8px; }
+.mode p { font-size: 14px; color: var(--text-dim); }
+.mode p b { color: var(--text); }
+
+/* decision flow */
+.flow { margin-top: 34px; display: flex; flex-direction: column; align-items: center; gap: 0; }
+.fstep {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+  padding: 14px 22px; box-shadow: var(--shadow); text-align: center; max-width: 560px; width: 100%;
+  min-width: 0; font-size: 15px;
+}
+.fstep b { font-weight: 700; }
+.fstep small { display: block; color: var(--text-dim); font-size: 13px; margin-top: 2px; }
+.farrow { width: 2px; height: 26px; background: var(--border); position: relative; }
+.farrow::after {
+  content: ""; position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
+  border: 5px solid transparent; border-top-color: var(--text-dim); border-bottom: none;
+}
+.fsplit { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; width: 100%; max-width: 760px; margin-top: 26px; }
+@media (max-width: 640px) { .fsplit { grid-template-columns: 1fr; } }
+.fout { border-radius: 12px; padding: 14px 16px; font-size: 13.5px; min-width: 0; border: 1px solid var(--border-soft); background: var(--surface); }
+.fout .fo-h { font-family: var(--mono); font-size: 12px; margin-bottom: 5px; display: block; }
+.fout--pass { border-color: rgba(77, 124, 15, 0.35); } .fout--pass .fo-h { color: var(--good); }
+.fout--warn { border-color: rgba(168, 121, 28, 0.4); } .fout--warn .fo-h { color: var(--gold); }
+.fout--stop { border-color: rgba(179, 64, 31, 0.4); } .fout--stop .fo-h { color: var(--danger); }
+.fout p { color: var(--text-dim); }
+
+/* receipt / code */
+.receipt {
+  background: var(--surface); border: 1px solid var(--border-soft); border-radius: 14px;
+  box-shadow: var(--shadow); overflow: hidden; margin-top: 6px;
+}
+.receipt .rc-head {
+  font-family: var(--mono); font-size: 12px; color: var(--text-dim);
+  border-bottom: 1px solid var(--border-soft); padding: 10px 18px;
+  background: var(--surface-soft);
+}
+.receipt pre {
+  font-family: var(--mono); font-size: 13.5px; line-height: 1.7; padding: 18px 20px;
+  white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text);
+}
+.receipt pre .c { color: var(--text-dim); }
+.receipt pre .k { color: var(--danger); }
+.receipt pre .s { color: var(--good); }
+.rc-note { font-size: 14px; color: var(--text-dim); margin-top: 12px; max-width: 640px; }
+.rc-note b { color: var(--text); }
+
+/* ---------- weigh table ---------- */
+.weigh { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 720px) { .weigh { grid-template-columns: 1fr; } }
+.pan {
+  border-radius: 14px; padding: 22px 24px; min-width: 0;
+  background: var(--surface); border: 1px solid var(--border-soft); box-shadow: var(--shadow);
+}
+.pan h4 { font-size: 15.5px; margin-bottom: 12px; display: flex; gap: 8px; align-items: center; }
+.pan--against h4 { color: var(--danger); }
+.pan--for h4 { color: var(--good); }
+.pan ul { list-style: none; }
+.pan li { position: relative; padding-left: 20px; margin-bottom: 10px; font-size: 14.5px; color: var(--text-dim); }
+.pan li b { color: var(--text); }
+.pan li::before { content: ""; position: absolute; left: 2px; top: 9px; width: 7px; height: 7px; border-radius: 50%; }
+.pan--against li::before { background: var(--danger); }
+.pan--for li::before { background: var(--good); }
+.verdict {
+  margin-top: 18px; background: linear-gradient(135deg, var(--gold-dim), var(--surface));
+  border: 1px solid var(--gold); border-radius: 14px; padding: 20px 24px; font-size: 15.5px;
+}
+.verdict b { font-weight: 700; }
+
+/* ---------- timeline ---------- */
+.timeline { position: relative; margin-top: 10px; padding-left: 34px; }
+.timeline::before {
+  content: ""; position: absolute; left: 10px; top: 8px; bottom: 8px; width: 2px;
+  background: linear-gradient(var(--gold), var(--border));
+}
+.tl {
+  position: relative; margin-bottom: 22px; background: var(--surface);
+  border: 1px solid var(--border-soft); border-radius: 14px; padding: 20px 24px;
+  box-shadow: var(--shadow); min-width: 0;
+}
+.tl::before {
+  content: ""; position: absolute; left: -30px; top: 26px; width: 12px; height: 12px;
+  border-radius: 50%; background: var(--gold); border: 2.5px solid var(--bg);
+}
+.tl .tl-k { font-family: var(--mono); font-size: 12px; color: var(--gold); letter-spacing: 0.1em; text-transform: uppercase; }
+.tl h4 { font-size: 17px; margin: 4px 0 6px; }
+.tl p { font-size: 14.5px; color: var(--text-dim); }
+.tl p b { color: var(--text); }
+
+/* ---------- decision cards ---------- */
+.asks { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 720px) { .asks { grid-template-columns: 1fr; } }
+.ask {
+  background: linear-gradient(150deg, var(--navy-dim), var(--surface) 60%);
+  border: 1px solid var(--border); border-radius: 16px; padding: 26px;
+  box-shadow: var(--shadow-hero); min-width: 0;
+}
+.ask .ask-n {
+  font-family: var(--serif); font-size: 34px; color: var(--navy); line-height: 1;
+}
+.ask h3 { font-size: 18px; margin: 10px 0 8px; }
+.ask p { font-size: 14.5px; color: var(--text-dim); margin-bottom: 10px; }
+.ask p b { color: var(--text); }
+.ask .tradeoff { font-size: 13.5px; border-top: 1px dashed var(--border); padding-top: 10px; color: var(--text-dim); }
+.ask .tradeoff b { color: var(--danger); font-weight: 600; }
+
+/* ---------- fine print ---------- */
+details {
+  background: var(--surface); border: 1px solid var(--border-soft); border-radius: 12px;
+  margin-bottom: 12px; box-shadow: var(--shadow); overflow: hidden;
+}
+summary {
+  cursor: pointer; padding: 16px 20px; font-weight: 600; font-size: 15px;
+  list-style: none; display: flex; align-items: center; gap: 10px;
+}
+summary::before { content: "+"; font-family: var(--mono); color: var(--gold); font-size: 17px; width: 16px; }
+details[open] summary::before { content: "\2212"; }
+summary::-webkit-details-marker { display: none; }
+.det-body { padding: 0 20px 18px 46px; }
+.det-body table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.det-body th { text-align: left; font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-dim); padding: 8px 10px 8px 0; border-bottom: 1px solid var(--border); }
+.det-body td { padding: 10px 14px 10px 0; border-bottom: 1px solid var(--border-soft); vertical-align: top; color: var(--text-dim); }
+.det-body td:first-child { color: var(--text); font-weight: 500; width: 38%; }
+.det-body ul { list-style: none; }
+.det-body li { position: relative; padding-left: 18px; margin-bottom: 8px; font-size: 14px; color: var(--text-dim); }
+.det-body li::before { content: ""; position: absolute; left: 2px; top: 9px; width: 6px; height: 6px; border-radius: 50%; background: var(--navy); }
+.det-body li b { color: var(--text); }
+
+footer {
+  margin-top: 90px; padding-top: 26px; border-top: 1px solid var(--border-soft);
+  font-family: var(--mono); font-size: 12px; color: var(--text-dim);
+  display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="kicker anim">Solwyn Python SDK · Plan Companion · Aug 7, 2026</div>
+  <h1 class="anim" style="animation-delay:0.05s">Every door gets a label.<br><em>Nothing flies unlisted.</em></h1>
+  <p class="hero-sub anim" style="animation-delay:0.1s">
+    Solwyn has one job: <strong>no AI spending slips past the budget.</strong>
+    But the wrapper only watches the doors it knows about. When a provider adds a new door,
+    money can walk through it with no record. This plan closes that gap for good.
+  </p>
+  <div class="companion anim" style="animation-delay:0.15s">
+    Companion to docs/plans/2026-08-07-coverage-strict-mode-plan.md
+  </div>
+
+  <div class="stats">
+    <div class="stat stat--hero anim-scale" style="animation-delay:0.2s">
+      <div class="num">20+</div>
+      <div class="lbl"><b>Money-spending doors found with no alarm on them.</b> Including OpenAI's newest flagship API. Found while writing this plan.</div>
+    </div>
+    <div class="stat anim-scale" style="animation-delay:0.28s">
+      <div class="num">1</div>
+      <div class="lbl">Door on the official watch list today. One. Out of dozens.</div>
+    </div>
+    <div class="stat anim-scale" style="animation-delay:0.34s">
+      <div class="num">3</div>
+      <div class="lbl">Pull requests to fix it: a label for every door, a strictness dial, and a receipt you can pin in CI.</div>
+    </div>
+  </div>
+</header>
+
+<!-- ============ 01 THE FENCE TODAY ============ -->
+<section>
+  <div class="sec-label anim"><span class="n">01</span><h2>How the fence works today</h2></div>
+  <p class="lede anim">
+    Think of the AI provider as a building full of doors. Each door is one thing the service can do:
+    chat, make images, transcribe audio. <strong>Some doors cost money every time you open them.</strong>
+    Solwyn stands at the doors it knows. Today there are four kinds of doors.
+  </p>
+  <div class="doors">
+    <div class="door door--good anim">
+      <div class="door-head">
+        <svg class="door-ico" viewBox="0 0 34 44" fill="none" aria-hidden="true">
+          <rect x="3" y="2" width="28" height="40" rx="3" fill="var(--good-dim)" stroke="var(--good)" stroke-width="2"/>
+          <circle cx="25" cy="22" r="2.4" fill="var(--good)"/>
+          <path d="M9 22 l4 4 l8 -9" stroke="var(--good)" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <h3>Watched doors</h3><span class="tag">metered</span>
+      </div>
+      <p>Every use is <b>checked against the budget first, then counted</b>. This is the product working as promised.</p>
+      <div class="ex">Chat, embeddings, images, transcription, speech, video.</div>
+    </div>
+    <div class="door door--warn anim" style="animation-delay:0.06s">
+      <div class="door-head">
+        <svg class="door-ico" viewBox="0 0 34 44" fill="none" aria-hidden="true">
+          <rect x="3" y="2" width="28" height="40" rx="3" fill="var(--gold-dim)" stroke="var(--gold)" stroke-width="2"/>
+          <circle cx="25" cy="22" r="2.4" fill="var(--gold)"/>
+          <path d="M13 13 v12" stroke="var(--gold)" stroke-width="2.5" stroke-linecap="round"/>
+          <circle cx="13" cy="31" r="1.8" fill="var(--gold)"/>
+        </svg>
+        <h3>Noted doors</h3><span class="tag">warn once</span>
+      </div>
+      <p>Solwyn says <b>one sentence in the logs, once, ever</b>. Then the door stays open forever, uncounted.</p>
+      <div class="ex">Exactly one door is on this list today: audio translation.</div>
+    </div>
+    <div class="door door--lock anim" style="animation-delay:0.12s">
+      <div class="door-head">
+        <svg class="door-ico" viewBox="0 0 34 44" fill="none" aria-hidden="true">
+          <rect x="3" y="2" width="28" height="40" rx="3" fill="var(--info-dim)" stroke="var(--info)" stroke-width="2"/>
+          <rect x="10" y="20" width="14" height="11" rx="2" stroke="var(--info)" stroke-width="2" fill="none"/>
+          <path d="M13 20 v-3.5 a4 4 0 0 1 8 0 V20" stroke="var(--info)" stroke-width="2" fill="none"/>
+        </svg>
+        <h3>Locked doors</h3><span class="tag">blocked</span>
+      </div>
+      <p>Solwyn <b>refuses to open them</b>, because their cost can't be measured without reading your private content. You get a clear error instead.</p>
+      <div class="ex">Three Amazon Bedrock doors, like <code>invoke_model</code>.</div>
+    </div>
+    <div class="door door--bad anim" style="animation-delay:0.18s">
+      <div class="door-head">
+        <svg class="door-ico" viewBox="0 0 34 44" fill="none" aria-hidden="true">
+          <rect x="3" y="2" width="28" height="40" rx="3" fill="var(--danger-dim)" stroke="var(--danger)" stroke-width="2" stroke-dasharray="4 3"/>
+          <circle cx="25" cy="22" r="2.4" fill="var(--danger)"/>
+        </svg>
+        <h3>Silent doors</h3><span class="tag">the problem</span>
+      </div>
+      <p><b>Every door not on a list is wide open with no note, no count, no alarm.</b> And every NEW door a provider ships starts life in this pile.</p>
+      <div class="ex">This is the hole in the fence.</div>
+    </div>
+  </div>
+
+  <div class="pull anim">
+    <blockquote>Silent pass-through would be a budget bypass.</blockquote>
+    <cite>The codebase's own words, explaining why the Bedrock doors are locked. The same logic, applied everywhere, is this whole plan.</cite>
+  </div>
+</section>
+
+<!-- ============ 02 WHAT WE FOUND ============ -->
+<section>
+  <div class="sec-label anim"><span class="n">02</span><h2>What we found behind the silent doors</h2></div>
+  <p class="lede anim">
+    While writing the plan, we walked the building and checked every door against the real provider software.
+    The silent pile is not full of harmless closets. It holds some of the <strong>most expensive doors in the building.</strong>
+  </p>
+  <div class="evidence">
+    <div class="ev ev--big anim">
+      <span class="who">responses</span>
+      <span class="what"><b>OpenAI's newest flagship API.</b> The one OpenAI now tells everyone to build on. It spends money on every call. Solwyn does not watch it, does not note it, does not count it. A well-known competitor product had this exact blind spot and it became a public bug report.</span>
+    </div>
+    <div class="ev anim" style="animation-delay:0.05s">
+      <span class="who">chat.completions.parse</span>
+      <span class="what">A helper <b>inside the watched chat room</b>. Same cost as chat, but it slips around the meter through a side hatch.</span>
+    </div>
+    <div class="ev anim" style="animation-delay:0.1s">
+      <span class="who">messages.stream · messages.batches</span>
+      <span class="what">Anthropic's streaming helper and its bulk-processing service. Both spend money. Both silent.</span>
+    </div>
+    <div class="ev anim" style="animation-delay:0.15s">
+      <span class="who">batches · fine_tuning · realtime · evals …</span>
+      <span class="what">A dozen more OpenAI doors that bill real dollars: bulk jobs, model training, live voice, evaluations. All silent today.</span>
+    </div>
+    <div class="ev anim" style="animation-delay:0.2s">
+      <span class="who">invoke_model_with_bidirectional_stream</span>
+      <span class="what">The clincher. Amazon shipped a <b>new sibling of the very doors Solwyn locks</b>, after the locks were installed. The new sibling? Silent. This proves the point: lists rot, and new doors always start unwatched.</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 03 THE BORROWED IDEA ============ -->
+<section>
+  <div class="sec-label anim"><span class="n">03</span><h2>The idea we borrowed from aviation</h2></div>
+  <div class="callout anim">
+    <svg viewBox="0 0 56 56" fill="none" aria-hidden="true">
+      <path d="M6 34 L28 28 L50 34 L28 40 Z" fill="var(--gold-dim)" stroke="var(--gold)" stroke-width="2" stroke-linejoin="round"/>
+      <path d="M28 8 L28 28" stroke="var(--navy)" stroke-width="2.5" stroke-linecap="round"/>
+      <path d="M20 16 L28 8 L36 16" stroke="var(--navy)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+      <path d="M14 46 h28" stroke="var(--border)" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+    <div>
+      <h3>The Minimum Equipment List</h3>
+      <p>
+        Before any airliner takes off, every piece of equipment must be on a list that says one of two things:
+        <b>it works, or it's broken and here is why flying is still safe anyway.</b>
+        There is no third category. Nothing flies unlisted, and "nobody ever wrote it down" is not an answer.
+      </p>
+      <p style="margin-top:10px">
+        This plan applies that rule to spending: <b>every door gets a label, and "unlabeled" becomes a loud state instead of a silent one.</b>
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 04 THE FIX ============ -->
+<section>
+  <div class="sec-label anim"><span class="n">04</span><h2>The fix, in three pieces</h2></div>
+
+  <!-- Piece 1: the list -->
+  <div class="piece">
+    <div class="piece-head anim">
+      <span class="pn">a.</span>
+      <div><h3>The list — a label for every door</h3>
+      <div class="sub">One maintained table in the code. No guessing from names. If it's not on the list, that itself is a label.</div></div>
+    </div>
+    <div class="labels">
+      <div class="lab lab--metered anim"><span class="chip">metered</span><p><b>Counted.</b> Budget checked before, cost recorded after.</p></div>
+      <div class="lab lab--spend anim" style="animation-delay:0.04s"><span class="chip">costs money, uncounted</span><p><b>Known to bill, not yet watched.</b> The dial below decides what happens here.</p></div>
+      <div class="lab lab--blocked anim" style="animation-delay:0.08s"><span class="chip">blocked</span><p><b>Refused outright.</b> Cost is unmeasurable without reading private content.</p></div>
+      <div class="lab lab--meta anim" style="animation-delay:0.12s"><span class="chip">housekeeping</span><p><b>Free stuff.</b> Listing models, checking files. Passes through quietly, always.</p></div>
+      <div class="lab lab--infra anim" style="animation-delay:0.16s"><span class="chip">plumbing</span><p><b>Not a door at all.</b> Settings and internals of the client itself. Always fine.</p></div>
+      <div class="lab lab--unknown anim" style="animation-delay:0.2s"><span class="chip">unknown</span><p><b>Never seen it before.</b> Treated as if it costs money, until someone labels it. This is the MEL rule.</p></div>
+    </div>
+  </div>
+
+  <!-- Piece 2: the dial -->
+  <div class="piece">
+    <div class="piece-head anim">
+      <span class="pn">b.</span>
+      <div><h3>The dial — you choose how strict</h3>
+      <div class="sub">One setting, <code>on_unmetered</code>, with three positions. It only governs the risky labels: "costs money, uncounted" and "unknown."</div></div>
+    </div>
+    <div class="dial">
+      <div class="mode mode--default anim">
+        <span class="default-badge">default</span>
+        <h4>warn</h4>
+        <p><b>Let it through, but say so.</b> One log line per door, per app run. Today's silence is gone; nothing breaks.</p>
+      </div>
+      <div class="mode anim" style="animation-delay:0.06s">
+        <h4>raise</h4>
+        <p><b>Strict mode. Refuse the door with a clear error</b>, unless you've signed off on it by name. For teams where an untracked dollar is worse than a stopped program.</p>
+      </div>
+      <div class="mode anim" style="animation-delay:0.12s">
+        <h4>allow</h4>
+        <p><b>Let it through quietly.</b> An explicit "I know, stop telling me." The door still shows up on the receipt below.</p>
+      </div>
+    </div>
+
+    <div class="flow anim">
+      <div class="fstep"><b>Your code touches a door</b><small>for example <code>client.responses</code></small></div>
+      <div class="farrow"></div>
+      <div class="fstep"><b>Solwyn looks up its label</b><small>free stuff and plumbing pass right through, watched doors get metered as usual</small></div>
+      <div class="farrow"></div>
+      <div class="fstep" style="border-color: var(--danger); background: linear-gradient(150deg, var(--danger-dim), var(--surface))"><b>Label says: costs money, uncounted (or unknown)</b><small>now the dial decides</small></div>
+      <div class="fsplit">
+        <div class="fout fout--warn anim"><span class="fo-h">warn (default)</span><p>Door opens. One note in the log.</p></div>
+        <div class="fout fout--stop anim" style="animation-delay:0.05s"><span class="fo-h">raise (strict)</span><p>Door refused. Error names the door and shows the exact sign-off to add.</p></div>
+        <div class="fout fout--pass anim" style="animation-delay:0.1s"><span class="fo-h">allow / signed-off</span><p>Door opens quietly. Still listed on the receipt.</p></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Piece 3: the receipt -->
+  <div class="piece">
+    <div class="piece-head anim">
+      <span class="pn">c.</span>
+      <div><h3>The receipt — proof you can pin</h3>
+      <div class="sub">One function, <code>solwyn.coverage(client)</code>, prints the full door list with labels. No network call, nothing sent anywhere.</div></div>
+    </div>
+    <div class="receipt anim">
+      <div class="rc-head">a customer's test file · runs on every code change</div>
+      <pre><span class="c"># "Here is every uncounted door I accept. Nothing else."</span>
+report = solwyn.coverage(client)
+report.expect(
+    untracked=[<span class="s">"audio.translations"</span>, <span class="s">"beta"</span>, <span class="s">"responses"</span>],
+    unknown=[],   <span class="c"># zero surprise doors tolerated</span>
+)</pre>
+    </div>
+    <p class="rc-note anim">
+      This is the drift alarm. The day a provider ships a new door, or a Solwyn update starts
+      (or stops) watching one, this check <b>fails the customer's build with a message naming the exact door</b>.
+      Coverage rot stops being silent decay and becomes a red light. The same list is exported as a
+      data file so the future TypeScript SDK uses identical labels.
+    </p>
+  </div>
+</section>
+
+<!-- ============ 05 THE DEFAULT ============ -->
+<section>
+  <div class="sec-label anim"><span class="n">05</span><h2>Why "warn" stays the default</h2></div>
+  <p class="lede anim">
+    This was the one real product judgment in the plan. Should the strict setting be the default?
+    We weighed it and said no. Here is the scale.
+  </p>
+  <div class="weigh">
+    <div class="pan pan--against anim">
+      <h4>If strict were the default…</h4>
+      <ul>
+        <li><b>Provider updates would break customers.</b> When OpenAI ships a harmless new feature, it's "unknown" to Solwyn until we label it. Strict-by-default turns that into a crash, in production, for touching something that spends nothing.</li>
+        <li><b>Frameworks poke at clients constantly.</b> Popular AI libraries check "does this client have X?" dozens of times. Strict-by-default booby-traps those checks.</li>
+        <li>Solwyn's promise is "drop-in." A wrapper that randomly breaks after a routine update is not drop-in.</li>
+      </ul>
+    </div>
+    <div class="pan pan--for anim" style="animation-delay:0.06s">
+      <h4>What "warn" plus the receipt gives you</h4>
+      <ul>
+        <li><b>The silent category is abolished either way.</b> Every money door speaks up at least once. That's the actual fix.</li>
+        <li><b>Strict teams get strict.</b> One setting flips it, and the error message tells you the exact sign-off to paste.</li>
+        <li><b>The receipt catches drift without crashing anything.</b> The build fails, in CI, before production ever sees a new door.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="verdict anim">
+    <b>The call:</b> default stays <code>warn</code>. Strict mode (<code>raise</code>) is one line away, and the README will recommend
+    strict + a pinned receipt for anyone whose spending rules matter more than uptime. Worth noting: the famous scary example,
+    "listing your files would crash by default," was never real. File listing is labeled housekeeping and passes under every setting.
+  </div>
+</section>
+
+<!-- ============ 06 DELIVERY ============ -->
+<section>
+  <div class="sec-label anim"><span class="n">06</span><h2>How it ships</h2></div>
+  <p class="lede anim">Three pull requests, each one reviewable and tested on its own. Nothing lands half-wired.</p>
+  <div class="timeline">
+    <div class="tl anim">
+      <span class="tl-k">PR 1 · The list</span>
+      <h4>Every door gets a label; the silent category dies</h4>
+      <p>The label table becomes real code, replacing two scattered half-lists. All 20+ silent money doors start warning.
+      A new test builds real provider clients and <b>fails our own build if any door is unlabeled</b>, so provider updates force us to keep the list current.</p>
+    </div>
+    <div class="tl anim" style="animation-delay:0.07s">
+      <span class="tl-k">PR 2 · The dial</span>
+      <h4>Strict mode arrives</h4>
+      <p>The <code>on_unmetered</code> setting, the sign-off list, and the clear refusal error. Tests prove a brand-new
+      unknown door on a fake client <b>gets caught in strict mode</b>, and that the default behaves exactly like today, just louder.</p>
+    </div>
+    <div class="tl anim" style="animation-delay:0.14s">
+      <span class="tl-k">PR 3 · The receipt</span>
+      <h4>Coverage report + the CI pin</h4>
+      <p><code>solwyn.coverage()</code>, the <code>expect()</code> check that fails on drift in either direction,
+      and the README rewrite. The docs stop listing these holes as "known limitations" and start explaining the fence.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 07 YOUR CALLS ============ -->
+<section>
+  <div class="sec-label anim"><span class="n">07</span><h2>The two judgment calls — decided</h2></div>
+  <p class="lede anim">Everything else was a routine judgment. These two shaped the product. Both were reviewed and <strong>approved on Aug 7, 2026</strong>.</p>
+  <div class="asks">
+    <div class="ask anim">
+      <div class="ask-n">1</div>
+      <h3>Default = warn, not strict <span style="font-family: var(--mono); font-size: 11px; color: var(--good); background: var(--good-dim); border-radius: 999px; padding: 2px 9px; vertical-align: middle; margin-left: 6px;">approved</span></h3>
+      <p>The whole of section 05. <b>Warn is the default.</b> The fence still closes; strict is opt-in.</p>
+      <p class="tradeoff"><b>The road not taken:</b> strict-by-default would let routine provider updates crash customer apps on harmless doors until a label update ships. Rejected.</p>
+    </div>
+    <div class="ask anim" style="animation-delay:0.07s">
+      <div class="ask-n">2</div>
+      <h3>Strict errors bend for "just checking" <span style="font-family: var(--mono); font-size: 11px; color: var(--good); background: var(--good-dim); border-radius: 999px; padding: 2px 9px; vertical-align: middle; margin-left: 6px;">approved</span></h3>
+      <p>In strict mode, when a library merely <b>asks whether a door exists</b>, the answer is a polite "no such door." When code actually <b>walks through it</b>, it gets the loud refusal. This keeps popular frameworks from crashing on their routine checks.</p>
+      <p class="tradeoff"><b>The accepted cost:</b> sloppy code that catches all "no such door" answers could muffle the refusal and quietly fall back. The receipt still exposes the door in CI, which is why this trade is acceptable.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 08 FINE PRINT ============ -->
+<section>
+  <div class="sec-label anim"><span class="n">08</span><h2>The fine print</h2></div>
+  <p class="lede anim">Deliberately out of scope, and the honest risk list. Click to expand.</p>
+
+  <details class="anim">
+    <summary>What this plan deliberately does not do</summary>
+    <div class="det-body">
+      <ul>
+        <li><b>It doesn't start counting the new doors.</b> Making <code>responses</code> or batch jobs fully metered is future work. This plan makes the holes loud and refusable, and hands us a ranked to-do list.</li>
+        <li><b>It doesn't fix the <code>solwyn_tags</code> quirk</b> (a labeling option that errors on unwatched doors). Fixing it would mean disguising every passed-through object, which breaks the "drop-in, untouched" promise. Deferred, with reasons written down.</li>
+        <li><b>No server or dashboard changes.</b> The receipt is computed locally and sends nothing anywhere.</li>
+        <li><b>Privacy unchanged:</b> the labels are door <i>names</i> only. No prompts, no responses, ever.</li>
+      </ul>
+    </div>
+  </details>
+
+  <details class="anim" style="animation-delay:0.05s">
+    <summary>Risks, and what blunts them</summary>
+    <div class="det-body">
+      <table>
+        <tr><th>Risk</th><th>What blunts it</th></tr>
+        <tr><td>Our label list itself goes stale — the same disease, one level up.</td><td>Two independent alarms: our own build fails when a provider update ships an unlabeled door, and every customer's pinned receipt fails on their side too.</td></tr>
+        <tr><td>A mislabeled door nags people in the logs.</td><td>Warnings fire once per app run, not per call. The "allow" setting and per-door sign-offs are the escape hatches.</td></tr>
+        <tr><td>Strict mode's polite "no such door" answer gets swallowed by careless code.</td><td>Accepted on purpose (decision 2). The receipt still exposes the door in CI.</td></tr>
+        <tr><td>Google's door list was drafted from documentation, not a live client.</td><td>PR 1 includes an audit step against the real installed software before the list ships.</td></tr>
+      </table>
+    </div>
+  </details>
+</section>
+
+<footer>
+  <span>solwyn-python-sdk · coverage strict mode</span>
+  <span>full plan: docs/plans/2026-08-07-coverage-strict-mode-plan.md</span>
+</footer>
+
+</div>
+</body>
+</html>

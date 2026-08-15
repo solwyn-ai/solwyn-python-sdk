@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ideation: Solwyn Python SDK — Top 5 ROI Product Projects</title>
+<style>
+  :root{
+    --bg:#faf9f7; --surface:#ffffff; --ink:#1f2430; --muted:#5c6472;
+    --line:#e3e0da; --accent:#1a56db; --accent-soft:#eaf1fd; --accent-text:#173e9c;
+    --good:#0e7a4a; --good-soft:#e7f5ee; --warn:#9a6700; --warn-soft:#fdf3df;
+    --danger:#b3341f; --danger-soft:#fdece8; --chip:#f1efe9;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .page{max-width:900px;margin-inline:auto;padding:40px 28px 64px}
+  p,li,dd{max-width:72ch}
+  h1{font-size:1.7rem;line-height:1.25;margin:.2em 0 .3em}
+  h2{font-size:1.25rem;margin:2.2em 0 .6em;padding-top:.6em;border-top:1px solid var(--line)}
+  h3{font-size:1.05rem;margin:1.4em 0 .4em}
+  code{font-family:var(--mono);font-size:.86em;background:var(--chip);padding:.08em .35em;border-radius:4px}
+  a{color:var(--accent)}
+  .eyebrow{font-size:.72rem;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:600}
+  .meta{display:flex;flex-wrap:wrap;gap:.5rem 1.4rem;color:var(--muted);font-size:.86rem;margin:.4rem 0 0}
+  .meta b{color:var(--ink);font-weight:600}
+  .stats{display:flex;flex-wrap:wrap;gap:12px;margin:22px 0 6px}
+  .stat{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:10px 16px;min-width:118px}
+  .stat .n{font-size:1.35rem;font-weight:700}
+  .stat .l{font-size:.76rem;color:var(--muted)}
+  .jump{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:12px 18px;margin:14px 0 22px}
+  .jump ol{margin:.3em 0 .2em 1.2em;padding:0}
+  .jump li{margin:.18em 0}
+  article.idea{background:var(--surface);border:1px solid var(--line);border-radius:12px;
+    padding:20px 24px;margin:18px 0}
+  .idea-head{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  .idchip{font-family:var(--mono);font-weight:700;font-size:.8rem;background:var(--accent-soft);
+    color:var(--accent-text);border-radius:999px;padding:.18em .7em}
+  .axis{font-size:.78rem;background:var(--chip);color:var(--muted);border-radius:999px;padding:.18em .7em}
+  .conf-hi{background:var(--good-soft);color:var(--good)}
+  .conf-md{background:var(--warn-soft);color:var(--warn)}
+  .pill{font-size:.78rem;border-radius:999px;padding:.18em .7em;font-weight:600}
+  .cx{background:var(--chip);color:var(--muted)}
+  .idea h3{margin:.1em 0 .5em;font-size:1.12rem}
+  .idea dl{margin:.6em 0 0}
+  .idea dt{font-size:.72rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
+    font-weight:700;margin-top:.9em}
+  .idea dd{margin:.25em 0 0}
+  table{border-collapse:collapse;width:100%;margin:.8em 0;font-size:.9rem;background:var(--surface)}
+  th,td{border:1px solid var(--line);padding:.5em .7em;text-align:left;vertical-align:top}
+  th{background:var(--chip);font-size:.78rem;letter-spacing:.06em;text-transform:uppercase}
+  .figwrap{margin:1em 0 .4em;overflow-x:auto}
+  figcaption{font-size:.8rem;color:var(--muted);margin-top:.3em}
+  footer.composition-signal{margin-top:48px;padding-top:14px;border-top:1px solid var(--line);
+    color:var(--muted);font-size:.8rem}
+  ul{padding-left:1.2em}
+</style>
+</head>
+<body>
+<div class="page">
+
+<header>
+  <div class="eyebrow">Ideation · repo-grounded</div>
+  <h1>Solwyn Python SDK — Top 5 ROI Product Projects</h1>
+  <div class="meta">
+    <span><b>Date:</b> 2026-08-07</span>
+    <span><b>Topic:</b> sdk-top5-roi-projects</span>
+    <span><b>Focus:</b> highest-ROI product projects, open across the whole SDK</span>
+    <span><b>Mode:</b> repo-grounded</span>
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="n">41</div><div class="l">raw ideas</div></div>
+    <div class="stat"><div class="n">21</div><div class="l">merged candidates</div></div>
+    <div class="stat"><div class="n">5</div><div class="l">survivors</div></div>
+    <div class="stat"><div class="n">5</div><div class="l">axes, all covered</div></div>
+  </div>
+</header>
+
+<section id="grounding-context">
+<h2>Grounding Context</h2>
+<p><b>Codebase context.</b> Solwyn Python SDK v0.4.x is a privacy-first drop-in wrapper
+(<code>Solwyn</code>/<code>AsyncSolwyn</code>) around <code>openai</code>, <code>anthropic</code>,
+<code>google-genai</code>, and boto3 <code>bedrock-runtime</code> clients plus ~14 OpenAI-compatible
+providers via <code>base_url</code> detection. It extracts token usage, runs pre-flight budget checks
+against the Solwyn Cloud API (which owns all pricing), settles usage off-thread with at-least-once
+delivery, and does health-based cross-provider failover. It never captures prompt or response content.
+Recent delivery: run-scoped token leases, settlement reliability, failover ergonomics, run
+hierarchy/inherited tags (PR #50). Pre-launch, zero customers — breaking changes are cheap right now.
+Test posture is strong (87 test files, privacy firewall + live wire-contract tests).</p>
+<p><b>Known gaps found in the scan.</b> <code>CostPolicy</code> is selectable but inert (no server
+price hints yet; falls back to health ordering with a one-time warning). Unrecognized client surfaces
+pass through with at most a warn-once (vs Bedrock <code>invoke_model</code>, which fails loud).
+No CI dry-run mode — budget checks always hit a live API. No framework integrations exist; the wrapper
+fails frameworks' <code>isinstance</code> checks. No loop/retry-storm detection, no mid-run kill switch.
+Same-name compat providers share one health domain (known limitation).</p>
+<p><b>External context.</b> Market research (reused from a parallel session plus a fresh SDK-layer
+pass): provider and gateway hard caps are commoditizing; the unclaimed gaps are mid-run termination,
+loop/retry-storm detection, identity-aggregated budgets, and denied-spend reporting. Runaway-agent
+postmortems are a genre ($47K/11-day ping-pong loop; $4.2K/63h retry loop). At the SDK layer:
+AgentBudget (closest competitor) ships LangChain/CrewAI budget glue with no cloud account; the OpenAI
+Agents SDK deliberately ships no budget primitive; OTel GenAI semconv is still in Development status
+with no cost attribute (validating server-side pricing); streaming-usage extraction bugs and upstream
+SDK version churn are recurring cross-vendor pain.</p>
+<p><b>Evidence dossiers</b> (scratch, session-local):
+<code>/tmp/compound-engineering-501/ce-ideate/d9e4bc6e/evidence-*.md</code> — five axis dossiers with
+<code>file:line</code> quotes; <code>web-research-result.md</code> — SDK-layer research digest.
+All five ideation frames generated against these; a fresh-context verifier spot-checked the
+load-bearing citations in the repo before ranking.</p>
+</section>
+
+<section id="topic-axes">
+<h2>Topic Axes</h2>
+<ul>
+  <li><b>provider-surface-coverage</b> — which API call surfaces get tracked/enforced vs slip through</li>
+  <li><b>runaway-protection</b> — stopping looping/runaway agents fast (detection, termination, kill switch)</li>
+  <li><b>attach-ergonomics</b> — how teams adopt, configure, test, and keep the wrapper working</li>
+  <li><b>ecosystem-integrations</b> — agent frameworks, OTel, TS-SDK parity leverage</li>
+  <li><b>cost-aware-routing</b> — failover, CostPolicy/price hints, health domains, model-level routing</li>
+</ul>
+</section>
+
+<section id="ranked-ideas">
+<h2>Ranked Ideas</h2>
+<div class="jump">
+  <div class="eyebrow">Jump to</div>
+  <ol>
+    <li><a href="#i1">Runaway Protection Flagship: detect → terminate → prove</a></li>
+    <li><a href="#i2">Ecosystem Admission Pack: type-transparent wrapper + framework glue</a></li>
+    <li><a href="#i3">Deterministic control-plane test double (<code>solwyn.testing</code>)</a></li>
+    <li><a href="#i4">Coverage strict mode + coverage manifest</a></li>
+    <li><a href="#i5">Graduated budget pressure + cost-aware degrade ladder</a></li>
+  </ol>
+</div>
+
+<article class="idea" id="i1">
+  <div class="idea-head">
+    <span class="idchip">1</span>
+    <span class="axis">runaway-protection</span>
+    <span class="pill conf-hi">Confidence 85%</span>
+    <span class="pill cx">Complexity High</span>
+  </div>
+  <h3>Runaway Protection Flagship: detect → terminate → prove</h3>
+  <dl>
+    <dt>Description</dt>
+    <dd>One program, three deliverables riding shared machinery. <b>Detect:</b> a content-free
+    velocity engine (card-network-style rules over call sizes, cadence, and run identity — N
+    near-identical-size calls in M seconds, monotonically growing context, call-rate acceleration)
+    that flags retry storms and agent ping-pong without ever seeing prompt content. <b>Terminate:</b>
+    a server-pushed <code>terminate_run</code> directive riding the existing budget-check and
+    lease-renewal channel, enforced through the existing sticky per-run denial cache, plus a
+    dashboard "kill this run" button — the run stops within one call or one renewal. <b>Prove:</b>
+    denial receipts — every deny (server, sticky replay, or local breaker-open) becomes a durable
+    event through the reporter, powering a "what the cap saved you" number.</dd>
+    <dt>Basis</dt>
+    <dd><code>direct:</code> the runaway dossier lists exactly these as missing ("client-side
+    runaway_run enforcement, mid-run kill-switch API, retry-storm detection"); verified seams:
+    check requests already carry model/provider/estimated-tokens/run-id (<code>budget.py:263-272</code>),
+    the server-directive pattern already works (<code>_apply_failover_tuning_directive</code>,
+    <code>_base.py:620-677</code>), sticky per-run denial replay exists (<code>budget.py:328-336</code>),
+    and the hard-deny path currently emits nothing durable (<code>budget.py:407-477</code>).
+    <code>external:</code> market research names mid-run termination, loop detection, and denied-spend
+    reporting as the three biggest unclaimed gaps; $47K and $4.2K loop postmortems are the category's
+    defining horror stories; AWS Budgets Actions is prior art for typed, auditable breach actions.</dd>
+    <dt>Rationale</dt>
+    <dd>This claims the flagship differentiator while the whole market looks the other way — caps are
+    commoditizing, but nobody stops a loop <em>mid-run</em>. Privacy becomes the moat instead of a
+    limitation: competitors that detect loops server-side must ingest prompts; Solwyn detects
+    client-side and transmits only the verdict. Roughly 80% of the machinery already exists, so this
+    is assembly plus one wire field plus a detection module, not new infrastructure. The demo writes
+    itself: "we detected the $47K loop, you killed it from the dashboard, here's the receipt."</dd>
+    <dt>Downsides</dt>
+    <dd>Cross-repo: needs API-contract and dashboard work in lockstep. False-positive posture for the
+    velocity rules needs careful design (warn-first, then deny). Streaming abort semantics (stopping
+    iteration between chunks) need a crisp contract. Nuance from verification: the first live
+    hard-deny is already server-visible; it is the sticky/local replays that are invisible today.</dd>
+  </dl>
+  <div class="figwrap">
+  <figure>
+  <svg viewBox="0 0 760 150" width="760" height="150" role="img" aria-label="Three-stage flow: detect, terminate, prove, each riding existing machinery">
+    <defs>
+      <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#5c6472"/></marker>
+    </defs>
+    <rect x="10" y="18" width="220" height="62" rx="10" fill="#eaf1fd" stroke="#1a56db"/>
+    <text x="120" y="44" text-anchor="middle" font-size="14" font-weight="700" fill="#173e9c">DETECT</text>
+    <text x="120" y="64" text-anchor="middle" font-size="12" fill="#1f2430">content-free velocity rules</text>
+    <rect x="270" y="18" width="220" height="62" rx="10" fill="#fdf3df" stroke="#9a6700"/>
+    <text x="380" y="44" text-anchor="middle" font-size="14" font-weight="700" fill="#9a6700">TERMINATE</text>
+    <text x="380" y="64" text-anchor="middle" font-size="12" fill="#1f2430">terminate_run directive</text>
+    <rect x="530" y="18" width="220" height="62" rx="10" fill="#e7f5ee" stroke="#0e7a4a"/>
+    <text x="640" y="44" text-anchor="middle" font-size="14" font-weight="700" fill="#0e7a4a">PROVE</text>
+    <text x="640" y="64" text-anchor="middle" font-size="12" fill="#1f2430">denial receipts</text>
+    <line x1="230" y1="49" x2="266" y2="49" stroke="#5c6472" stroke-width="1.6" marker-end="url(#arr)"/>
+    <line x1="490" y1="49" x2="526" y2="49" stroke="#5c6472" stroke-width="1.6" marker-end="url(#arr)"/>
+    <text x="120" y="112" text-anchor="middle" font-size="11" fill="#5c6472">rides: check-request fields</text>
+    <text x="120" y="128" text-anchor="middle" font-size="11" fill="#5c6472">(budget.py:263)</text>
+    <text x="380" y="112" text-anchor="middle" font-size="11" fill="#5c6472">rides: directive channel + sticky deny</text>
+    <text x="380" y="128" text-anchor="middle" font-size="11" fill="#5c6472">(_base.py:620, budget.py:328)</text>
+    <text x="640" y="112" text-anchor="middle" font-size="11" fill="#5c6472">rides: reporter settlement pipe</text>
+    <text x="640" y="128" text-anchor="middle" font-size="11" fill="#5c6472">(report_settlement)</text>
+  </svg>
+  <figcaption>Each stage rides machinery that already shipped — the program is mostly assembly.</figcaption>
+  </figure>
+  </div>
+</article>
+
+<article class="idea" id="i2">
+  <div class="idea-head">
+    <span class="idchip">2</span>
+    <span class="axis">ecosystem-integrations</span>
+    <span class="pill conf-hi">Confidence 80%</span>
+    <span class="pill cx">Complexity Medium</span>
+  </div>
+  <h3>Ecosystem Admission Pack: type-transparent wrapper + framework glue</h3>
+  <dl>
+    <dt>Description</dt>
+    <dd>Two coupled moves. <b>Enabler:</b> make the wrapper pass frameworks' client validation — a
+    wrapt-ObjectProxy-style transparent proxy (or runtime subclass of the caller's own client class)
+    so <code>isinstance(Solwyn(OpenAI()), openai.OpenAI)</code> is true, with no provider imports in
+    core (stays duck-typed). <b>Distribution:</b> a thin integration pack where the buyers are — a
+    documented OpenAI Agents SDK recipe (<code>set_default_openai_client(Solwyn(...))</code> with
+    per-agent/handoff run scoping), a LangChain/LangGraph callback, and CrewAI middleware — all built
+    on the run-hierarchy and tags event contract that just landed (PR #50).</dd>
+    <dt>Basis</dt>
+    <dd><code>direct:</code> the ecosystem dossier's headline pain: the wrapper does not override
+    <code>__instancecheck__</code>, so frameworks that validate provider client types reject it; grep
+    confirms zero framework integrations exist while seven integration seams (run scoping, hierarchy
+    fields, fire-and-forget reporter) sit ready. <code>external:</code> strands-agents#1103 shows
+    users demanding injectable pre-configured clients; AgentBudget already ships LangChain callback +
+    CrewAI middleware; the OpenAI Agents SDK deliberately ships no budget primitive — a vacuum.</dd>
+    <dt>Rationale</dt>
+    <dd>Agent frameworks are where runaway-spend buyers already are, and the closest competitor wins
+    evaluations today purely on "works inside my framework." The type-identity fix is one mechanism
+    that unblocks every injectable-client path at once — cheaper and more durable than N bespoke
+    adapters — and the glue on top is mostly docs and thin callbacks over finished seams. The same
+    proxy concept ports to the TS SDK (JS Proxy), so the design pays twice.</dd>
+    <dt>Downsides</dt>
+    <dd>Transparent proxying trades away implementation simplicity (pickling, attribute shadowing,
+    <code>__init__</code> bypass edge cases need tests). Framework APIs churn, so glue carries a
+    maintenance tail — keep adapters thin and contract-driven. Choosing which frameworks get
+    first-party support is a roadmap call.</dd>
+  </dl>
+  <div class="figwrap">
+  <figure>
+  <svg viewBox="0 0 760 140" width="760" height="140" role="img" aria-label="One type-transparent wrapper unlocks four frameworks">
+    <defs>
+      <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#5c6472"/></marker>
+    </defs>
+    <rect x="10" y="40" width="250" height="60" rx="10" fill="#eaf1fd" stroke="#1a56db"/>
+    <text x="135" y="65" text-anchor="middle" font-size="13" font-weight="700" fill="#173e9c">Solwyn(client)</text>
+    <text x="135" y="84" text-anchor="middle" font-size="11.5" fill="#1f2430">isinstance passes — one fix</text>
+    <rect x="480" y="6" width="270" height="26" rx="8" fill="#ffffff" stroke="#e3e0da"/>
+    <text x="615" y="24" text-anchor="middle" font-size="12" fill="#1f2430">OpenAI Agents SDK (budget vacuum)</text>
+    <rect x="480" y="40" width="270" height="26" rx="8" fill="#ffffff" stroke="#e3e0da"/>
+    <text x="615" y="58" text-anchor="middle" font-size="12" fill="#1f2430">LangChain / LangGraph callback</text>
+    <rect x="480" y="74" width="270" height="26" rx="8" fill="#ffffff" stroke="#e3e0da"/>
+    <text x="615" y="92" text-anchor="middle" font-size="12" fill="#1f2430">CrewAI middleware</text>
+    <rect x="480" y="108" width="270" height="26" rx="8" fill="#ffffff" stroke="#e3e0da"/>
+    <text x="615" y="126" text-anchor="middle" font-size="12" fill="#1f2430">any code that type-checks its client</text>
+    <line x1="260" y1="58" x2="476" y2="19" stroke="#5c6472" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <line x1="260" y1="66" x2="476" y2="53" stroke="#5c6472" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <line x1="260" y1="74" x2="476" y2="87" stroke="#5c6472" stroke-width="1.4" marker-end="url(#arr2)"/>
+    <line x1="260" y1="82" x2="476" y2="121" stroke="#5c6472" stroke-width="1.4" marker-end="url(#arr2)"/>
+  </svg>
+  <figcaption>Fix type identity once; every injectable-client integration falls out of it.</figcaption>
+  </figure>
+  </div>
+</article>
+
+<article class="idea" id="i3">
+  <div class="idea-head">
+    <span class="idchip">3</span>
+    <span class="axis">attach-ergonomics</span>
+    <span class="pill conf-hi">Confidence 90%</span>
+    <span class="pill cx">Complexity Medium</span>
+  </div>
+  <h3>Deterministic control-plane test double (<code>solwyn.testing</code>)</h3>
+  <dl>
+    <dt>Description</dt>
+    <dd>An in-process control-plane double plus deterministic scenario triggers, modeled on Stripe's
+    magic test cards. A magic tag or model name deterministically produces a hard deny, a lease 503,
+    a control-plane outage, slow settlement, or a runaway-run denial — so teams can exercise
+    <code>BudgetExceededError</code> handling, fail-open posture, and exit-flush behavior in CI with
+    zero network and zero credentials. The same scenarios double as chaos game days for spend
+    infrastructure, and as Solwyn's own integration-test harness.</dd>
+    <dt>Basis</dt>
+    <dd><code>direct:</code> <code>BudgetMode</code> has exactly two values, <code>ALERT_ONLY</code>
+    and <code>HARD_DENY</code> (<code>_types.py:46-51</code>, verified) — no dry-run or offline mode
+    exists, and the attach dossier confirms budget checks always hit a real API (the repo's own
+    integration tests need a live server at localhost:8080). <code>external:</code> Stripe's
+    deterministic test cards are the industry-standard pattern for making an external authorization
+    plane testable; chaos-engineering game days are the same premise for failure paths.</dd>
+    <dt>Rationale</dt>
+    <dd>An enforcement SDK's deny path <em>is</em> the product, and today the first time a customer's
+    deny handler runs is in production. This removes the biggest adoption objection ("how do I test
+    this without your prod API?") once, in the SDK, instead of every adopting team building a fake
+    server. It is the highest-confidence, most self-contained project on this list — no cross-repo
+    dependency.</dd>
+    <dt>Downsides</dt>
+    <dd>Scoping how much of the control-plane contract the double must faithfully simulate (leases,
+    directives, settlement acks) is the real design work — too little fidelity and tests lie, too
+    much and it becomes a second server. A deliberately-cut LocalBudget/freemium variant was rejected
+    (see Rejection Summary) — this project must not drift into local pricing.</dd>
+  </dl>
+</article>
+
+<article class="idea" id="i4">
+  <div class="idea-head">
+    <span class="idchip">4</span>
+    <span class="axis">provider-surface-coverage</span>
+    <span class="pill conf-hi">Confidence 85%</span>
+    <span class="pill cx">Complexity Low</span>
+  </div>
+  <h3>Coverage strict mode + coverage manifest</h3>
+  <dl>
+    <dt>Description</dt>
+    <dd>Aviation's Minimum Equipment List applied to spend surfaces: nothing flies unlisted. (a) A
+    <code>solwyn.coverage()</code> manifest reporting every surface of the attached client as
+    metered / estimated / warn-once / pass-through, assertable in CI; (b) an opt-in
+    <code>on_unmetered="warn" | "raise" | "allow"</code> posture where a spend-shaped surface outside
+    the tracked set raises unless explicitly acknowledged
+    (<code>acknowledge_untracked=["translations"]</code>).</dd>
+    <dt>Basis</dt>
+    <dd><code>direct:</code> verified internal inconsistency — Bedrock <code>invoke_model</code>
+    fails loud because "silent pass-through would be a budget bypass," while every other unrecognized
+    surface warn-onces and passes through forever (<code>client.py:1810-1816</code>); the
+    known-unmetered registry has exactly one entry (<code>_base.py:143-145</code>).
+    <code>external:</code> LangSmith's <code>wrap_openai</code> missing the Responses API
+    (langsmith-sdk#1588) is the canonical case of wrapper coverage silently rotting as providers add
+    surfaces.</dd>
+    <dt>Rationale</dt>
+    <dd>For an enforcement-first product, a silently untracked surface is a hole in the fence exactly
+    where customers assume there isn't one — and the current posture guarantees each new provider
+    surface starts as a silent hole. Strict mode turns coverage drift from silent decay into a loud,
+    auditable contract, is the client-side answer to gateways' "impossible to bypass" pitch, and is
+    the cheapest project on this list relative to how directly it protects the core promise.</dd>
+    <dt>Downsides</dt>
+    <dd>Choosing the default posture (warn vs raise) is a real product-risk tradeoff — raise-by-default
+    breaks innocent <code>client.files.list()</code> calls. Needs a maintained classification of which
+    surfaces are spend-shaped vs metadata-shaped per provider.</dd>
+  </dl>
+</article>
+
+<article class="idea" id="i5">
+  <div class="idea-head">
+    <span class="idchip">5</span>
+    <span class="axis">cost-aware-routing</span>
+    <span class="pill conf-md">Confidence 70%</span>
+    <span class="pill cx">Complexity Medium-High</span>
+  </div>
+  <h3>Graduated budget pressure + cost-aware degrade ladder</h3>
+  <dl>
+    <dt>Description</dt>
+    <dd>Break "budget answers are binary." The server sends a pressure tier on check responses and
+    lease renewals (zero extra round-trips, riding the proven directive pattern): at ~80% of budget
+    the SDK flips chain ordering to cost-first; at ~95% it prefers the customer's declared cheaper
+    model entries; at 100% the existing hard deny applies. Every degradation is loudly tagged on
+    events, never silent. Prerequisite folded in: the name-keyed health-domain identity fix (same-name
+    compat entries currently share one health domain and skip sanitization), so routing decisions rest
+    on correct per-endpoint state.</dd>
+    <dt>Basis</dt>
+    <dd><code>direct:</code> <code>CostPolicy</code> is shipped but inert — README:424 says the API
+    sends no price hints yet, and <code>_routing.py:186</code> confirms the silent fall-back to health
+    ordering; <code>price_hints</code> and <code>failover_directive</code> slots already exist on
+    <code>BudgetCheckResponse</code> (<code>_types.py:473-507</code>, verified); check requests
+    already send the element-aligned fallback chain the server would hint against
+    (<code>budget.py:263-272</code>). README:225 documents the health-domain collision.
+    <code>external:</code> utility demand response is the proven governance split — the server owns
+    the price signal, the edge sheds load within owner-declared comfort bounds; Cloudflare's
+    block-or-fallback shows degrade-on-exhaustion is becoming table stakes.</dd>
+    <dt>Rationale</dt>
+    <dd>Between "spend freely" and "hard stop" is where real teams live; with agentic workloads at
+    5–30x chat tokens, "finish the run cheaper" beats "die at the cap." The wire fields, the pure
+    policy class, and the directive channel are all built and idle — this is the highest-leverage way
+    to make dead code load-bearing, and it makes <code>CostPolicy</code> honest (today a user who
+    selects it silently gets the default behavior).</dd>
+    <dt>Downsides</dt>
+    <dd>Hard dependency on the Core API shipping price hints and a pressure signal — a cross-repo
+    commitment that must be sequenced (hence the lower confidence). Degrade semantics (which calls may
+    be downgraded, how loudly) are a genuine product-design question. The health-domain prerequisite
+    adds scope, but skipping it builds routing on a known landmine.</dd>
+  </dl>
+  <div class="figwrap">
+  <figure>
+  <svg viewBox="0 0 760 120" width="760" height="120" role="img" aria-label="Budget pressure ladder from allow through cost-first and degrade to deny">
+    <rect x="10" y="30" width="360" height="40" rx="8" fill="#e7f5ee" stroke="#0e7a4a"/>
+    <text x="190" y="55" text-anchor="middle" font-size="12.5" fill="#0e7a4a" font-weight="600">0–80% · normal routing</text>
+    <rect x="378" y="30" width="150" height="40" rx="8" fill="#fdf3df" stroke="#9a6700"/>
+    <text x="453" y="49" text-anchor="middle" font-size="12" fill="#9a6700" font-weight="600">80% · cost-first</text>
+    <text x="453" y="63" text-anchor="middle" font-size="11" fill="#9a6700">ordering</text>
+    <rect x="536" y="30" width="130" height="40" rx="8" fill="#fdeadd" stroke="#c05621"/>
+    <text x="601" y="49" text-anchor="middle" font-size="12" fill="#c05621" font-weight="600">95% · cheaper</text>
+    <text x="601" y="63" text-anchor="middle" font-size="11" fill="#c05621">model chain</text>
+    <rect x="674" y="30" width="76" height="40" rx="8" fill="#fdece8" stroke="#b3341f"/>
+    <text x="712" y="55" text-anchor="middle" font-size="12" fill="#b3341f" font-weight="700">deny</text>
+    <text x="10" y="95" font-size="11" fill="#5c6472">server sends the pressure tier on existing check/renewal responses; the SDK sheds load within customer-declared bounds</text>
+  </svg>
+  <figcaption>The middle tiers are the product: today the SDK jumps straight from green to red.</figcaption>
+  </figure>
+  </div>
+</article>
+</section>
+
+<section id="rejection-summary">
+<h2>Rejection Summary</h2>
+<p>41 raw ideas merged into 17 clusters + 4 syntheses; a fresh-context verifier spot-checked citations
+in the repo before the cut. Every load-bearing citation above survived verification (two dossier
+counts were corrected: <code>SolwynConfig</code> has 31 fields, 24 env-mapped).</p>
+<table>
+  <tr><th>#</th><th>Idea</th><th>Reason rejected</th></tr>
+  <tr><td>1</td><td>LocalBudget / freemium local enforcement (no cloud account)</td>
+    <td>Conflicts with the "API owns pricing" invariant — the only local cost math is a flat-rate
+    outage placeholder (<code>budget.py:56</code>); would require reversing a core design tenet. The
+    testable half survives as project 3.</td></tr>
+  <tr><td>2</td><td>Contract-as-code (shared schema + portable provider table for Python/TS/API)</td>
+    <td>Strongest runner-up (#6). Real leverage for the TS port, but delivery spans three repos;
+    sequence it with the TS-port kickoff rather than a standalone SDK project now.</td></tr>
+  <tr><td>3</td><td>Live provider-quirk conformance grid / nightly SDK canary</td>
+    <td>Strong and verified, but carries an ongoing funded-API-key ops commitment; natural follow-on
+    to project 4 once the coverage manifest exists.</td></tr>
+  <tr><td>4</td><td>Name-keyed health-domain rework (standalone)</td>
+    <td>Folded into project 5 as its prerequisite — already tracked as a follow-up; prerequisite-shaped,
+    not a standalone product project.</td></tr>
+  <tr><td>5</td><td>Auto-instrument import hook + wrap-site codemod</td>
+    <td>The cited evidence argues against ambient monkeypatching (OTel/Datadog friction; users prefer
+    explicit injectable clients); the codemod half is a DX task below the strategic floor.</td></tr>
+  <tr><td>6</td><td><code>solwyn.doctor()</code> config/detection diagnostic</td>
+    <td>Real pain (31 config fields), but a well-scoped DX task, not a strategic project — ride along
+    project 3's testing work.</td></tr>
+  <tr><td>7</td><td>Privacy firewall as portable trust collateral</td>
+    <td>Sound (the AST-based firewall test is real and rare), but it is positioning/collateral work
+    that pairs naturally with the TS port, not a standalone SDK build.</td></tr>
+  <tr><td>8</td><td>Emergency credit: bounded fail-open during outages</td>
+    <td>Trips the binding PJ-2 lease design ("don't re-open" per team memory). Worth raising as an
+    explicit reopen decision someday; not schedulable as-is.</td></tr>
+  <tr><td>9</td><td>Server-governed config (dashboard-run fleet)</td>
+    <td>Sound trust-boundary question and the directive plumbing exists, but low urgency pre-launch
+    with zero fleets to govern; revisit post-launch.</td></tr>
+  <tr><td>10</td><td>"Machine-verified trust" bundle (strict mode + canary + privacy collateral)</td>
+    <td>Verifier: weakest synthesis — three unrelated workstreams unified only at the messaging
+    layer; its parts stand on their own (see rows 3, 7 and project 4).</td></tr>
+</table>
+<p>All five axes have at least one survivor; no coverage gaps.</p>
+</section>
+
+<footer class="composition-signal">Composed 2026-08-07 by ce-ideate (run d9e4bc6e) from repo grounding
+(5 evidence dossiers, spot-verified) + market-layer research (reused from a parallel session) + fresh
+SDK-layer web research.</footer>
+
+</div>
+</body>
+</html>

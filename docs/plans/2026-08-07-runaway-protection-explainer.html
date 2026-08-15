@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>How Solwyn Stops Runaway AI Agents — Plain-Language Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Azeret+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --font-display: 'Bricolage Grotesque', Georgia, serif;
+  --font-body: 'Plus Jakarta Sans', -apple-system, sans-serif;
+  --font-mono: 'Azeret Mono', 'SF Mono', Consolas, monospace;
+
+  --bg: #faf7f2;
+  --surface: #ffffff;
+  --surface-warm: #fdfbf7;
+  --border: rgba(60, 45, 30, 0.12);
+  --border-bright: rgba(60, 45, 30, 0.22);
+  --text: #2b2520;
+  --text-dim: #7a6f63;
+
+  --stop: #c2410c;          /* terracotta — stopping, denying, danger stories */
+  --stop-dim: rgba(194, 65, 12, 0.09);
+  --safe: #5f8c2e;          /* sage — allowed, working, built */
+  --safe-dim: rgba(101, 163, 13, 0.10);
+  --warn: #b45309;          /* amber — warnings, open decisions */
+  --warn-dim: rgba(180, 83, 9, 0.10);
+  --info: #0f766e;          /* teal — neutral facts, receipts */
+  --info-dim: rgba(15, 118, 110, 0.09);
+  --ink: #44403c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1b1713;
+    --surface: #262019;
+    --surface-warm: #2b241d;
+    --border: rgba(255, 240, 220, 0.10);
+    --border-bright: rgba(255, 240, 220, 0.20);
+    --text: #ece4d9;
+    --text-dim: #a89c8d;
+    --stop: #f0793a;
+    --stop-dim: rgba(240, 121, 58, 0.13);
+    --safe: #96c355;
+    --safe-dim: rgba(150, 195, 85, 0.13);
+    --warn: #e0973a;
+    --warn-dim: rgba(224, 151, 58, 0.13);
+    --info: #3bb8ac;
+    --info-dim: rgba(59, 184, 172, 0.12);
+    --ink: #d6cabb;
+  }
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: var(--font-body);
+  background-color: var(--bg);
+  background-image: radial-gradient(circle, var(--border) 1px, transparent 1px);
+  background-size: 26px 26px;
+  color: var(--text);
+  line-height: 1.65;
+  font-size: 16px;
+  overflow-wrap: break-word;
+}
+
+.page { max-width: 880px; margin: 0 auto; padding: 56px 24px 80px; }
+
+/* ---------- animations ---------- */
+@keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes fadeScale { from { opacity: 0; transform: scale(0.94); } to { opacity: 1; transform: scale(1); } }
+.rise { animation: fadeUp 0.5s ease-out both; animation-delay: calc(var(--i, 0) * 0.07s); }
+.pop  { animation: fadeScale 0.45s ease-out both; animation-delay: calc(var(--i, 0) * 0.08s); }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+
+/* ---------- hero ---------- */
+.kicker {
+  font-family: var(--font-mono);
+  font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 2px;
+  color: var(--stop);
+  display: flex; align-items: center; gap: 8px;
+}
+.kicker::before { content: ''; width: 9px; height: 9px; border-radius: 50%; background: currentColor; }
+
+h1 {
+  font-family: var(--font-display);
+  font-size: clamp(34px, 5.4vw, 54px);
+  font-weight: 800; line-height: 1.06;
+  letter-spacing: -1px;
+  margin: 14px 0 18px;
+}
+h1 em { font-style: normal; color: var(--stop); }
+
+.lead {
+  font-size: 19px; line-height: 1.6;
+  color: var(--ink);
+  max-width: 64ch;
+  margin-bottom: 10px;
+}
+.hero-meta { font-family: var(--font-mono); font-size: 12px; color: var(--text-dim); margin-bottom: 36px; }
+.hero-meta code { background: var(--info-dim); color: var(--info); padding: 1px 6px; border-radius: 4px; font-size: 11px; }
+
+/* ---------- horror stories ---------- */
+.stories { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 8px; }
+.stories > * { min-width: 0; }
+.story {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--stop);
+  border-radius: 12px;
+  padding: 20px 22px;
+  box-shadow: 0 3px 14px rgba(70, 40, 20, 0.06);
+}
+.story__num {
+  font-family: var(--font-display);
+  font-size: 40px; font-weight: 800; letter-spacing: -1.5px;
+  color: var(--stop); line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+}
+.story__what { font-size: 14px; margin-top: 6px; color: var(--text); font-weight: 600; }
+.story__how { font-size: 13px; color: var(--text-dim); margin-top: 2px; }
+
+/* ---------- sections ---------- */
+section { margin-top: 64px; }
+.sec-head { display: flex; align-items: baseline; gap: 14px; margin-bottom: 8px; }
+.sec-num {
+  font-family: var(--font-mono);
+  font-size: 12px; font-weight: 600;
+  color: var(--bg);
+  background: var(--ink);
+  border-radius: 6px;
+  padding: 3px 9px;
+  flex-shrink: 0;
+  transform: translateY(-2px);
+}
+h2 {
+  font-family: var(--font-display);
+  font-size: clamp(24px, 3.4vw, 32px);
+  font-weight: 700; letter-spacing: -0.5px; line-height: 1.15;
+}
+.sec-sub { color: var(--text-dim); font-size: 15px; max-width: 62ch; margin-bottom: 26px; }
+
+/* ---------- three-part plan ---------- */
+.trio { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.trio > * { min-width: 0; }
+.part {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 22px;
+  display: flex; flex-direction: column; gap: 10px;
+  box-shadow: 0 2px 10px rgba(70, 40, 20, 0.05);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.part:hover { transform: translateY(-3px); box-shadow: 0 8px 22px rgba(70, 40, 20, 0.10); }
+.part__label {
+  font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1.8px;
+  display: flex; align-items: center; gap: 7px;
+}
+.part__label::before { content: ''; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.part--detect .part__label { color: var(--warn); }
+.part--stop .part__label { color: var(--stop); }
+.part--prove .part__label { color: var(--info); }
+.part h3 { font-family: var(--font-display); font-size: 21px; font-weight: 700; line-height: 1.2; }
+.part p { font-size: 14px; color: var(--ink); }
+.part .like {
+  margin-top: auto;
+  font-size: 12.5px; color: var(--text-dim);
+  border-top: 1px dashed var(--border-bright);
+  padding-top: 10px;
+}
+.part .like strong { color: var(--text); font-weight: 600; }
+
+/* ---------- sees / never sees ---------- */
+.privacy { display: grid; grid-template-columns: 1fr 1fr; gap: 0; border: 1px solid var(--border); border-radius: 14px; overflow: hidden; background: var(--surface); }
+.privacy > * { min-width: 0; }
+.privacy__head {
+  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1.4px;
+  padding: 12px 20px;
+}
+.privacy__head--sees { background: var(--safe-dim); color: var(--safe); border-bottom: 2px solid var(--safe); }
+.privacy__head--never { background: var(--stop-dim); color: var(--stop); border-bottom: 2px solid var(--stop); }
+.privacy__body { padding: 18px 20px 20px; font-size: 14px; }
+.privacy__body ul { list-style: none; }
+.privacy__body li { padding-left: 18px; position: relative; margin-bottom: 8px; }
+.privacy__body--sees li::before { content: '✓'; position: absolute; left: 0; color: var(--safe); font-weight: 700; }
+.privacy__body--never li::before { content: '✕'; position: absolute; left: 0; color: var(--stop); font-weight: 700; }
+.privacy__body li small { display: block; color: var(--text-dim); font-size: 12px; }
+
+.aside-note {
+  margin-top: 18px;
+  padding: 14px 20px;
+  border-left: 4px solid var(--info);
+  background: var(--info-dim);
+  border-radius: 8px;
+  font-size: 14px;
+  color: var(--ink);
+}
+.aside-note strong { color: var(--info); }
+
+/* ---------- tripwires ---------- */
+.wires { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.wires > * { min-width: 0; }
+.wire {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-top: 4px solid var(--warn);
+  border-radius: 12px;
+  padding: 20px;
+}
+.wire h3 { font-family: var(--font-display); font-size: 18px; font-weight: 700; margin-bottom: 6px; }
+.wire p { font-size: 13.5px; color: var(--ink); }
+.wire .sig {
+  margin-top: 12px;
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--text-dim);
+}
+.wire .badge {
+  display: inline-block; margin-top: 12px;
+  font-family: var(--font-mono); font-size: 10.5px; font-weight: 600;
+  padding: 3px 10px; border-radius: 999px;
+}
+.badge--kill { background: var(--stop-dim); color: var(--stop); }
+.badge--warnonly { background: var(--warn-dim); color: var(--warn); }
+
+.posture {
+  margin-top: 18px;
+  background: var(--surface-warm);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 22px;
+  font-size: 14.5px;
+  color: var(--ink);
+}
+.posture strong { color: var(--text); }
+
+/* ---------- kill flow ---------- */
+.flow { display: flex; flex-direction: column; gap: 0; max-width: 640px; margin: 0 auto; }
+.flow-step {
+  display: grid;
+  grid-template-columns: 44px 1fr;
+  gap: 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px 18px;
+  align-items: start;
+  box-shadow: 0 2px 8px rgba(70, 40, 20, 0.05);
+}
+.flow-step__n {
+  font-family: var(--font-display);
+  font-size: 22px; font-weight: 800;
+  width: 40px; height: 40px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 10px;
+  background: var(--stop-dim); color: var(--stop);
+}
+.flow-step--calm .flow-step__n { background: var(--info-dim); color: var(--info); }
+.flow-step--good .flow-step__n { background: var(--safe-dim); color: var(--safe); }
+.flow-step__where {
+  font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1.4px;
+  color: var(--text-dim); margin-bottom: 3px;
+}
+.flow-step__text { font-size: 14.5px; }
+.flow-step__text strong { font-weight: 700; }
+.flow-arrow {
+  display: flex; justify-content: center;
+  padding: 4px 0;
+}
+.flow-arrow svg { width: 20px; height: 20px; fill: none; stroke: var(--border-bright); stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.flow-note {
+  max-width: 640px; margin: 18px auto 0;
+  text-align: center; font-size: 13.5px; color: var(--text-dim);
+}
+.flow-note strong { color: var(--stop); }
+
+/* ---------- built vs new ---------- */
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.split > * { min-width: 0; }
+.half {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+}
+.half__head {
+  padding: 12px 20px;
+  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1.4px;
+}
+.half--built .half__head { background: var(--safe-dim); color: var(--safe); border-bottom: 2px solid var(--safe); }
+.half--new .half__head { background: var(--warn-dim); color: var(--warn); border-bottom: 2px solid var(--warn); }
+.half ul { list-style: none; padding: 16px 20px 18px; font-size: 14px; }
+.half li { padding-left: 16px; position: relative; margin-bottom: 9px; }
+.half li::before { content: '›'; position: absolute; left: 0; color: var(--text-dim); font-weight: 700; }
+.half li small { display: block; color: var(--text-dim); font-size: 12px; }
+
+/* ---------- build order ---------- */
+.phases { display: flex; flex-direction: column; gap: 14px; }
+.phase {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 20px 22px;
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  gap: 20px;
+  align-items: start;
+}
+.phase > * { min-width: 0; }
+.phase__tag {
+  font-family: var(--font-mono); font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1.2px;
+  line-height: 1.5;
+}
+.phase__tag .ph-n { display: block; font-family: var(--font-display); font-size: 26px; font-weight: 800; letter-spacing: 0; text-transform: none; }
+.phase--a .phase__tag { color: var(--safe); }
+.phase--b .phase__tag { color: var(--warn); }
+.phase--c .phase__tag { color: var(--info); }
+.phase h3 { font-family: var(--font-display); font-size: 18px; font-weight: 700; margin-bottom: 4px; }
+.phase p { font-size: 14px; color: var(--ink); }
+.phase .payoff {
+  margin-top: 10px; font-size: 13px;
+  padding: 8px 14px; border-radius: 8px; display: inline-block;
+}
+.phase--a .payoff { background: var(--safe-dim); color: var(--safe); }
+.phase--b .payoff { background: var(--warn-dim); color: var(--warn); }
+.phase--c .payoff { background: var(--info-dim); color: var(--info); }
+
+/* ---------- decisions ---------- */
+.decisions { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.decisions > * { min-width: 0; }
+.decision {
+  background: color-mix(in srgb, var(--surface) 90%, var(--warn) 10%);
+  border: 1px solid color-mix(in srgb, var(--border) 40%, var(--warn) 60%);
+  border-radius: 14px;
+  padding: 22px;
+  box-shadow: 0 4px 18px rgba(140, 80, 10, 0.09);
+}
+.decision__q {
+  font-family: var(--font-mono); font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1.8px; color: var(--warn);
+  margin-bottom: 8px;
+}
+.decision h3 { font-family: var(--font-display); font-size: 20px; font-weight: 700; line-height: 1.25; margin-bottom: 8px; }
+.decision p { font-size: 14px; color: var(--ink); }
+.decision .rec {
+  margin-top: 12px; font-size: 13.5px;
+  border-top: 1px dashed var(--border-bright); padding-top: 10px;
+}
+.decision .rec strong { color: var(--warn); }
+
+/* ---------- risks ---------- */
+.risks { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.risks > * { min-width: 0; }
+.risk {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px;
+}
+.risk h3 { font-size: 15px; font-weight: 700; margin-bottom: 5px; }
+.risk h3::before { content: '!'; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; border-radius: 50%; background: var(--stop-dim); color: var(--stop); font-weight: 800; font-size: 13px; margin-right: 9px; }
+.risk p { font-size: 13.5px; color: var(--ink); }
+.risk p strong { color: var(--safe); }
+
+/* ---------- glossary ---------- */
+details.gloss {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--surface);
+}
+details.gloss summary {
+  padding: 15px 22px;
+  font-family: var(--font-mono); font-size: 12px; font-weight: 600;
+  cursor: pointer; list-style: none;
+  display: flex; align-items: center; gap: 9px;
+}
+details.gloss summary::-webkit-details-marker { display: none; }
+details.gloss summary::before { content: '▸'; font-size: 11px; color: var(--text-dim); transition: transform 0.15s ease; }
+details.gloss[open] summary::before { transform: rotate(90deg); }
+.gloss__body { border-top: 1px solid var(--border); padding: 6px 22px 10px; }
+.gloss__body dl { display: grid; grid-template-columns: 170px 1fr; }
+.gloss__body dt {
+  font-family: var(--font-mono); font-size: 12px; font-weight: 600;
+  color: var(--info); padding: 10px 0;
+}
+.gloss__body dd { font-size: 13.5px; color: var(--ink); padding: 10px 0; border-bottom: 1px dashed var(--border); }
+.gloss__body dt { border-bottom: 1px dashed var(--border); }
+.gloss__body dt:nth-last-of-type(1), .gloss__body dd:last-of-type { border-bottom: none; }
+
+footer {
+  margin-top: 72px;
+  border-top: 1px solid var(--border);
+  padding-top: 20px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.8;
+}
+footer code { background: var(--info-dim); color: var(--info); padding: 1px 6px; border-radius: 4px; }
+
+@media (max-width: 720px) {
+  .stories, .trio, .privacy, .wires, .split, .decisions, .risks { grid-template-columns: 1fr; }
+  .phase { grid-template-columns: 1fr; gap: 8px; }
+  .gloss__body dl { grid-template-columns: 1fr; }
+  .gloss__body dt { border-bottom: none; padding-bottom: 0; }
+  .page { padding: 36px 18px 60px; }
+}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <!-- HERO -->
+  <header>
+    <div class="kicker rise" style="--i:0">Runaway Protection · Plain-Language Companion</div>
+    <h1 class="rise" style="--i:1">How Solwyn catches a runaway AI agent — <em>and stops it</em></h1>
+    <p class="lead rise" style="--i:2">
+      AI agents sometimes get stuck in loops. They call the AI over and over, doing no useful work,
+      and every call costs money. This page explains, in plain words, the plan to spot those loops,
+      shut them down with one click, and show you the money you didn't lose.
+    </p>
+    <div class="hero-meta rise" style="--i:3">
+      Companion to the full technical plan: <code>docs/plans/2026-08-07-runaway-protection-plan.md</code> · August 7, 2026
+    </div>
+  </header>
+
+  <!-- THE PROBLEM -->
+  <section>
+    <div class="sec-head"><span class="sec-num">01</span><h2>The problem, in two true stories</h2></div>
+    <p class="sec-sub">These are real incidents from the industry. Nobody noticed until the bill arrived. Spending caps exist, but a cap alone just means the run dies at the limit. Nothing on the market stops a loop <em>while it is running</em>. That is the gap this plan claims.</p>
+    <div class="stories">
+      <div class="story pop" style="--i:0">
+        <div class="story__num">$47,000</div>
+        <div class="story__what">Two agents talked to each other for 11 days</div>
+        <div class="story__how">Each reply fed the next one. The conversation snowballed. Nobody was watching.</div>
+      </div>
+      <div class="story pop" style="--i:1">
+        <div class="story__num">$4,200</div>
+        <div class="story__what">One agent retried the same failing call for 63 hours</div>
+        <div class="story__how">Same request, over and over, all weekend. Every retry cost money.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- THE PLAN -->
+  <section>
+    <div class="sec-head"><span class="sec-num">02</span><h2>The plan has three parts</h2></div>
+    <p class="sec-sub">See it. Stop it. Prove it. Each part builds on machinery Solwyn already shipped, which is why most of this is assembly, not invention.</p>
+    <div class="trio">
+      <div class="part part--detect rise" style="--i:0">
+        <div class="part__label">Part 1 · Detect</div>
+        <h3>See the loop as it starts</h3>
+        <p>The Solwyn software that sits inside your app watches the <em>shape</em> of the calls: how big, how often, how fast they grow. Loops have shapes. Retries look identical. Snowballs keep growing.</p>
+        <div class="like"><strong>Like a credit card company:</strong> it flags five identical charges in a minute without reading what you bought.</div>
+      </div>
+      <div class="part part--stop rise" style="--i:1">
+        <div class="part__label">Part 2 · Terminate</div>
+        <h3>Kill it with one click</h3>
+        <p>A "Kill run" button in your dashboard. The stop order rides back on messages the software already exchanges with Solwyn, so the run halts within <strong>one call</strong> or a few seconds. No new plumbing, no waiting.</p>
+        <div class="like"><strong>Like a circuit breaker:</strong> flip it once, the power stays off, even if the toaster keeps asking.</div>
+      </div>
+      <div class="part part--prove rise" style="--i:2">
+        <div class="part__label">Part 3 · Prove</div>
+        <h3>Show the money you saved</h3>
+        <p>Every blocked call gets a receipt: what was blocked, who blocked it, and roughly what it would have cost. The receipts add up to one number: <em>what the cap saved you</em>.</p>
+        <div class="like"><strong>Like an itemized statement:</strong> not just "we stopped it," but "here's each thing we stopped."</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PRIVACY -->
+  <section>
+    <div class="sec-head"><span class="sec-num">03</span><h2>It never reads your data</h2></div>
+    <p class="sec-sub">This is the part competitors can't copy. To find loops, they read your prompts on their servers. Solwyn finds loops using only numbers, inside your own app, and sends out only the verdict. An automated test suite enforces this on every code change.</p>
+    <div class="privacy">
+      <div class="privacy__head privacy__head--sees">What it looks at</div>
+      <div class="privacy__head privacy__head--never">What it never sees</div>
+      <div class="privacy__body privacy__body--sees">
+        <ul>
+          <li>How <strong>big</strong> each call is <small>a size estimate, just a number</small></li>
+          <li>How <strong>often</strong> calls happen <small>timestamps and counts</small></li>
+          <li>Which <strong>run</strong> they belong to <small>an ID label, like a ticket number</small></li>
+          <li>Which <strong>model</strong> was asked <small>a name, like "gpt-5"</small></li>
+        </ul>
+      </div>
+      <div class="privacy__body privacy__body--never">
+        <ul>
+          <li>Your prompts <small>the words you send the AI</small></li>
+          <li>The AI's answers</li>
+          <li>Your documents or user data</li>
+          <li>Anything typed by your customers</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- TRIPWIRES -->
+  <section>
+    <div class="sec-head"><span class="sec-num">04</span><h2>Three tripwires ship first</h2></div>
+    <p class="sec-sub">Each tripwire matches one known loop shape. All numbers below are the starting defaults and can be tuned.</p>
+    <div class="wires">
+      <div class="wire rise" style="--i:0">
+        <h3>Same size, on repeat</h3>
+        <p>Five calls of nearly identical size to the same model within a minute. That's the shape of a stuck retry — the $4,200 story.</p>
+        <div class="sig">default: 5 near-twins in 60 seconds</div>
+        <span class="badge badge--kill">can auto-stop (if you opt in)</span>
+      </div>
+      <div class="wire rise" style="--i:1">
+        <h3>The snowball</h3>
+        <p>Eight calls in a row, each bigger than the last, growing fast with no human-speed pauses. That's two agents feeding each other — the $47,000 story.</p>
+        <div class="sig">default: 8 growing calls, 3× total growth</div>
+        <span class="badge badge--kill">can auto-stop (if you opt in)</span>
+      </div>
+      <div class="wire rise" style="--i:2">
+        <h3>The sudden burst</h3>
+        <p>Call rate jumps to triple the recent pace. Sometimes a loop — but sometimes just a busy job doing honest work in parallel.</p>
+        <div class="sig">default: 30+ calls/min and 3× the prior minute</div>
+        <span class="badge badge--warnonly">warns only, never stops</span>
+      </div>
+    </div>
+    <div class="posture">
+      <strong>The safety posture: warn first.</strong> Out of the box, tripwires only raise a flag — in your logs and on your dashboard. Nothing gets stopped automatically unless you turn that on. And the burst tripwire can never stop anything, because busy-but-honest work trips it too often. You watch the flags, tune the numbers, and only then decide if you want auto-stop.
+    </div>
+  </section>
+
+  <!-- KILL FLOW -->
+  <section>
+    <div class="sec-head"><span class="sec-num">05</span><h2>What happens when you click "Kill run"</h2></div>
+    <p class="sec-sub">The whole point of the design: the stop order needs no new connection to your app. It hitches a ride on check-ins that already happen.</p>
+    <div class="flow">
+      <div class="flow-step rise" style="--i:0">
+        <div class="flow-step__n">1</div>
+        <div><div class="flow-step__where">Your app</div><div class="flow-step__text">An agent run starts looping. The tripwire flags it.</div></div>
+      </div>
+      <div class="flow-arrow"><svg viewBox="0 0 20 20"><path d="M10 4 L10 16 M6 12 L10 16 L14 12"/></svg></div>
+      <div class="flow-step flow-step--calm rise" style="--i:1">
+        <div class="flow-step__n">2</div>
+        <div><div class="flow-step__where">Your dashboard</div><div class="flow-step__text">Within seconds, the run shows a <strong>Flagged</strong> badge. You look, and it does look wrong.</div></div>
+      </div>
+      <div class="flow-arrow"><svg viewBox="0 0 20 20"><path d="M10 4 L10 16 M6 12 L10 16 L14 12"/></svg></div>
+      <div class="flow-step rise" style="--i:2">
+        <div class="flow-step__n">3</div>
+        <div><div class="flow-step__where">Your dashboard</div><div class="flow-step__text">You click <strong>Kill run</strong> and confirm. Solwyn's servers mark that run as dead.</div></div>
+      </div>
+      <div class="flow-arrow"><svg viewBox="0 0 20 20"><path d="M10 4 L10 16 M6 12 L10 16 L14 12"/></svg></div>
+      <div class="flow-step rise" style="--i:3">
+        <div class="flow-step__n">4</div>
+        <div><div class="flow-step__where">Your app</div><div class="flow-step__text">The very next time the run checks in — before its next call, or at its regular allowance renewal a few seconds later — the stop order comes back with the answer. The run halts. Even a half-finished streaming reply stops at its next chunk.</div></div>
+      </div>
+      <div class="flow-arrow"><svg viewBox="0 0 20 20"><path d="M10 4 L10 16 M6 12 L10 16 L14 12"/></svg></div>
+      <div class="flow-step flow-step--good rise" style="--i:4">
+        <div class="flow-step__n">5</div>
+        <div><div class="flow-step__where">Your dashboard</div><div class="flow-step__text">Every call the dead run tries afterward is blocked and gets a <strong>receipt</strong>. The "saved you" number grows with each one.</div></div>
+      </div>
+    </div>
+    <p class="flow-note">The stop is sticky. Your app remembers the kill locally, so even if Solwyn's own servers go down right after, <strong>the dead run stays dead</strong>. And your code hears a clear, distinct error — "this run was terminated" — not a vague failure it might retry.</p>
+  </section>
+
+  <!-- ALREADY BUILT -->
+  <section>
+    <div class="sec-head"><span class="sec-num">06</span><h2>A pleasant surprise: much of this already exists</h2></div>
+    <p class="sec-sub">Before planning, every claim was checked against the real code — on both the app side and the server side. Two claims in the original pitch turned out to be wrong in a good way.</p>
+    <div class="split">
+      <div class="half half--built">
+        <div class="half__head">Already built &amp; running</div>
+        <ul>
+          <li>Blocked calls already send a report event <small>the pitch said they left no trace — they do</small></li>
+          <li>The "saved you" dollar total already exists on the server <small>and the dashboard already shows a "~$X saved" note</small></li>
+          <li>Each run already shows its lifetime blocked cost in the dashboard</li>
+          <li>The message channel a stop order needs is already proven <small>a different server order already rides it today</small></li>
+          <li>The "stay blocked even during outages" memory already works per run</li>
+        </ul>
+      </div>
+      <div class="half half--new">
+        <div class="half__head">What this plan adds</div>
+        <ul>
+          <li>The three tripwires <small>nothing watches call shapes today</small></li>
+          <li>The kill order, the Kill button, and the clear "terminated" error <small>no kill concept exists anywhere yet</small></li>
+          <li>Receipts that say <em>who</em> blocked a call and <em>why</em> <small>today's reports are anonymous</small></li>
+          <li>Receipts that survive outages <small>today, reports during an outage can get lost — exactly when blocking happens most</small></li>
+          <li>Mid-stream stopping <small>today a long reply can't be interrupted</small></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- BUILD ORDER -->
+  <section>
+    <div class="sec-head"><span class="sec-num">07</span><h2>The build order</h2></div>
+    <p class="sec-sub">Eleven work packages across three codebases — the app-side software, the server, and the dashboard — grouped into three phases. Each package is one reviewable chunk with its own tests.</p>
+    <div class="phases">
+      <div class="phase phase--a rise" style="--i:0">
+        <div class="phase__tag"><span class="ph-n">Phase 1</span>App-side only · 3 packages</div>
+        <div>
+          <h3>Tripwires, local kill switch, stream stopping</h3>
+          <p>Everything that works without touching the server: the three tripwires (warn mode), the machinery to stop a run and raise the clear error, and mid-stream stopping. Opt-in auto-stop works here too.</p>
+          <div class="payoff">Payoff: a working local demo — loop detected, loop killed, no server changes needed</div>
+        </div>
+      </div>
+      <div class="phase phase--b rise" style="--i:1">
+        <div class="phase__tag"><span class="ph-n">Phase 2</span>Server + dashboard · 5 packages</div>
+        <div>
+          <h3>The Kill button, wired end to end</h3>
+          <p>The server learns to store a kill, attach the stop order to check-ins, and accept the richer receipts. The dashboard gets the Flagged badge and the Kill button. Server changes always ship first so old app versions never break.</p>
+          <div class="payoff">Payoff: the flagship demo — "we saw the loop, you killed it from the dashboard, here's the receipt"</div>
+        </div>
+      </div>
+      <div class="phase phase--c rise" style="--i:2">
+        <div class="phase__tag"><span class="ph-n">Phase 3</span>Polish · 3 packages</div>
+        <div>
+          <h3>Receipts everywhere, outage-proof</h3>
+          <p>Each blocked call's receipt appears in the cost views with its reason. The saved-you number gains an "up to" range. Receipts that can't be delivered during an outage get bundled into tallies and sent when the connection returns, instead of being lost.</p>
+          <div class="payoff">Payoff: the "what the cap saved you" story is complete and trustworthy</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- DECISIONS -->
+  <section>
+    <div class="sec-head"><span class="sec-num">08</span><h2>Two decisions that need you</h2></div>
+    <p class="sec-sub">Everything else in the plan is settled. These two are product judgment calls, and building starts after you confirm them.</p>
+    <div class="decisions">
+      <div class="decision pop" style="--i:0">
+        <div class="decision__q">Decision 1</div>
+        <h3>Should tripwires only warn by default?</h3>
+        <p>The plan says yes: out of the box, flags only. Auto-stop is something a customer turns on after watching the flags for a while. The alternative is auto-stop from day one, which catches loops faster but risks killing honest work and losing trust.</p>
+        <div class="rec"><strong>Recommendation: warn first.</strong> A false alarm that warns costs nothing. A false alarm that kills costs a customer.</div>
+      </div>
+      <div class="decision pop" style="--i:1">
+        <div class="decision__q">Decision 2</div>
+        <h3>Should a kill beat "alert-only" mode?</h3>
+        <p>Some projects run Solwyn in a gentle mode that warns about overspending but never blocks. If you click Kill on such a project, should the run still stop? The plan says yes: a human pressing the button should always win.</p>
+        <div class="rec"><strong>Recommendation: the button always wins.</strong> Clicking Kill is an explicit order, not a budget policy.</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- RISKS -->
+  <section>
+    <div class="sec-head"><span class="sec-num">09</span><h2>What could go wrong, and the answer for each</h2></div>
+    <p class="sec-sub">The full plan lists more; these are the four worth knowing about.</p>
+    <div class="risks">
+      <div class="risk rise" style="--i:0">
+        <h3>False alarms on honest work</h3>
+        <p>A job that fans out fifty similar tasks looks a bit like a retry loop. <strong>Answer:</strong> warn-first defaults, tight matching rules, and the noisy burst tripwire can never kill. Every flag is logged so the numbers can be tuned before anyone enables auto-stop.</p>
+      </div>
+      <div class="risk rise" style="--i:1">
+        <h3>A kill that silently fails</h3>
+        <p>The worst outcome: you click Kill, believe it worked, and the run keeps spending. <strong>Answer:</strong> the stop-order code is built to fail loudly. If it can't attach the order, the whole check-in errors — it never quietly drops the kill.</p>
+      </div>
+      <div class="risk rise" style="--i:2">
+        <h3>Receipts lost during outages</h3>
+        <p>Blocking happens most when Solwyn's own servers are unreachable — exactly when reports can't be delivered. <strong>Answer:</strong> undeliverable receipts fold into a small tally kept in memory and are sent when the connection returns.</p>
+      </div>
+      <div class="risk rise" style="--i:3">
+        <h3>A loop split across two apps</h3>
+        <p>If two separate app processes share one run, each sees only half the calls and might not trip a wire alone. <strong>Answer:</strong> both halves' flags still land in the dashboard, where you see the whole picture and can kill it. Fully automatic cross-app detection is future work, on purpose.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- GLOSSARY -->
+  <section>
+    <div class="sec-head"><span class="sec-num">10</span><h2>Six words the plan uses a lot</h2></div>
+    <details class="gloss">
+      <summary>Open the plain-word glossary</summary>
+      <div class="gloss__body">
+        <dl>
+          <dt>run</dt>
+          <dd>One job an agent is doing, with its own ID. Like one ticket at a help desk. Kills and receipts are per run.</dd>
+          <dt>the SDK</dt>
+          <dd>The Solwyn software that lives inside your app and wraps your AI calls. This is where the tripwires run.</dd>
+          <dt>check-in</dt>
+          <dd>The quick "am I still within budget?" question your app asks Solwyn around its AI calls. Stop orders ride back on the answers.</dd>
+          <dt>lease</dt>
+          <dd>A prepaid spending allowance for a busy run, so it doesn't have to ask before every single call. Leases renew every few seconds — another ride for the stop order.</dd>
+          <dt>sticky denial</dt>
+          <dd>Once a run is refused, your app remembers it locally. Even if Solwyn goes offline, the refused run stays refused.</dd>
+          <dt>receipt</dt>
+          <dd>The record a blocked call leaves behind: what was blocked, who blocked it, why, and roughly what it would have cost.</dd>
+        </dl>
+      </div>
+    </details>
+  </section>
+
+  <footer>
+    Plain-language companion to <code>docs/plans/2026-08-07-runaway-protection-plan.md</code> —
+    the technical plan holds the full detail: exact rules and thresholds, message formats,
+    all eleven work packages with their tests, the complete risk table, and what is deliberately out of scope.
+  </footer>
+
+</div>
+</body>
+</html>

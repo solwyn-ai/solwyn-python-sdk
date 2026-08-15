@@ -1,0 +1,851 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Getting Solwyn Through the Door — a plain-language guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Fragment+Mono&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --font-display: 'Bricolage Grotesque', Georgia, serif;
+    --font-body: 'Plus Jakarta Sans', 'Segoe UI', system-ui, sans-serif;
+    --font-mono: 'Fragment Mono', 'SF Mono', Consolas, monospace;
+
+    --bg: #faf7f2;
+    --surface: #ffffff;
+    --surface2: #f3ede4;
+    --border: rgba(60, 40, 20, 0.10);
+    --border-bright: rgba(60, 40, 20, 0.20);
+    --text: #2b2320;
+    --text-dim: #7d7168;
+
+    --terra: #c2410c;          /* terracotta: the fix, headline accent */
+    --terra-dim: rgba(194, 65, 12, 0.09);
+    --sage: #5f8a1e;           /* sage green: things going right */
+    --sage-dim: rgba(101, 163, 13, 0.11);
+    --ink: #1e3a5f;            /* deep blue: frameworks / the outside world */
+    --ink-dim: rgba(30, 58, 95, 0.09);
+    --gold: #a16207;           /* amber: warnings, decisions */
+    --gold-dim: rgba(161, 98, 7, 0.11);
+    --red: #b42318;
+    --red-dim: rgba(180, 35, 24, 0.09);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #171310;
+      --surface: #211c18;
+      --surface2: #2a241f;
+      --border: rgba(255, 240, 220, 0.09);
+      --border-bright: rgba(255, 240, 220, 0.18);
+      --text: #ece5dc;
+      --text-dim: #a3968b;
+
+      --terra: #e8845c;
+      --terra-dim: rgba(232, 132, 92, 0.12);
+      --sage: #a4c96a;
+      --sage-dim: rgba(164, 201, 106, 0.12);
+      --ink: #8fb4dd;
+      --ink-dim: rgba(143, 180, 221, 0.10);
+      --gold: #ddb257;
+      --gold-dim: rgba(221, 178, 87, 0.12);
+      --red: #e5735f;
+      --red-dim: rgba(229, 115, 95, 0.12);
+    }
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font-body);
+    background-color: var(--bg);
+    background-image:
+      radial-gradient(ellipse at 20% 0%, var(--terra-dim) 0%, transparent 55%),
+      radial-gradient(ellipse at 90% 10%, var(--ink-dim) 0%, transparent 45%);
+    background-repeat: no-repeat;
+    color: var(--text);
+    line-height: 1.65;
+    padding: 32px 40px 80px;
+    overflow-wrap: break-word;
+  }
+
+  a { color: var(--terra); text-decoration: underline; text-underline-offset: 2px; }
+
+  .wrap {
+    max-width: 1280px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: 185px 1fr;
+    gap: 0 44px;
+  }
+  .main { min-width: 0; max-width: 880px; }
+
+  /* ---------- TOC ---------- */
+  .toc {
+    position: sticky; top: 24px; align-self: start;
+    padding: 14px 0; grid-row: 1 / -1;
+    max-height: calc(100dvh - 48px); overflow-y: auto;
+  }
+  .toc::-webkit-scrollbar { width: 3px; }
+  .toc::-webkit-scrollbar-thumb { background: var(--surface2); border-radius: 2px; }
+  .toc-title {
+    font-family: var(--font-mono); font-size: 9px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 2px; color: var(--text-dim);
+    padding-bottom: 10px; margin-bottom: 8px; border-bottom: 1px solid var(--border);
+  }
+  .toc a {
+    display: block; font-size: 11.5px; color: var(--text-dim); text-decoration: none;
+    padding: 4px 8px; border-radius: 5px; border-left: 2px solid transparent;
+    transition: all 0.15s; line-height: 1.4; margin-bottom: 1px;
+  }
+  .toc a:hover { color: var(--text); background: var(--surface2); }
+  .toc a.active { color: var(--text); border-left-color: var(--terra); }
+
+  /* ---------- Hero ---------- */
+  .hero { padding: 40px 0 20px; }
+  .hero__kicker {
+    font-family: var(--font-mono); font-size: 11px; font-weight: 500;
+    text-transform: uppercase; letter-spacing: 2.5px; color: var(--terra);
+    margin-bottom: 18px;
+  }
+  .hero__title {
+    font-family: var(--font-display);
+    font-size: clamp(38px, 6vw, 62px);
+    font-weight: 800; line-height: 1.02; letter-spacing: -1.5px;
+    margin-bottom: 22px;
+  }
+  .hero__title em { font-style: normal; color: var(--terra); }
+  .lead {
+    font-size: 19px; line-height: 1.7; max-width: 62ch; color: var(--text);
+    margin-bottom: 14px;
+  }
+  .lead + .lead { color: var(--text-dim); font-size: 17px; }
+
+  .stat-row {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 14px; margin: 34px 0 10px;
+  }
+  .stat-row > * { min-width: 0; }
+  .stat {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px 20px;
+    box-shadow: 0 2px 10px rgba(60, 30, 10, 0.05);
+    animation: fadeScale 0.35s ease-out both;
+    animation-delay: calc(var(--i, 0) * 0.07s);
+  }
+  .stat__num {
+    font-family: var(--font-display); font-size: 34px; font-weight: 700;
+    line-height: 1.1; letter-spacing: -1px;
+  }
+  .stat__label { font-size: 12.5px; color: var(--text-dim); margin-top: 4px; line-height: 1.45; }
+  .stat--terra .stat__num { color: var(--terra); }
+  .stat--sage .stat__num { color: var(--sage); }
+  .stat--gold .stat__num { color: var(--gold); }
+  .stat--ink .stat__num { color: var(--ink); }
+
+  /* ---------- Sections ---------- */
+  .sec-head {
+    display: flex; align-items: baseline; gap: 14px;
+    margin: 64px 0 8px; scroll-margin-top: 20px;
+  }
+  .sec-head__num {
+    font-family: var(--font-mono); font-size: 13px; font-weight: 500;
+    color: var(--terra); background: var(--terra-dim);
+    border-radius: 7px; padding: 3px 9px; flex-shrink: 0;
+  }
+  .sec-head__title {
+    font-family: var(--font-display); font-size: clamp(26px, 3.4vw, 34px);
+    font-weight: 700; letter-spacing: -0.5px; line-height: 1.15;
+  }
+  .sec-intro { color: var(--text-dim); font-size: 15.5px; max-width: 68ch; margin-bottom: 22px; }
+
+  p.body-para { max-width: 70ch; margin-bottom: 14px; font-size: 15.5px; }
+
+  /* ---------- Cards ---------- */
+  .ve-card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px 22px; position: relative; min-width: 0;
+    animation: fadeUp 0.45s ease-out both;
+    animation-delay: calc(var(--i, 0) * 0.06s);
+  }
+  .ve-card__label {
+    font-family: var(--font-mono); font-size: 10px; font-weight: 500;
+    text-transform: uppercase; letter-spacing: 1.5px; color: var(--terra);
+    margin-bottom: 10px; display: flex; align-items: center; gap: 8px;
+  }
+  .ve-card__label::before {
+    content: ''; width: 8px; height: 8px; border-radius: 50%; background: currentColor; flex-shrink: 0;
+  }
+  .ve-card__label--sage { color: var(--sage); }
+  .ve-card__label--ink { color: var(--ink); }
+  .ve-card__label--gold { color: var(--gold); }
+  .ve-card__label--red { color: var(--red); }
+  .ve-card h3 {
+    font-family: var(--font-display); font-size: 19px; font-weight: 700;
+    letter-spacing: -0.3px; margin-bottom: 8px; line-height: 1.25;
+  }
+  .ve-card p { font-size: 14px; color: var(--text-dim); }
+  .ve-card p strong { color: var(--text); font-weight: 600; }
+  .ve-card p + p { margin-top: 8px; }
+
+  .card-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 16px; margin: 22px 0;
+  }
+  .card-grid > * { min-width: 0; }
+
+  /* ---------- Before / After ---------- */
+  .diff-panels {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 0;
+    border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+    margin: 24px 0; background: var(--surface);
+  }
+  .diff-panels > * { min-width: 0; overflow-wrap: break-word; }
+  .diff-panel__header {
+    font-family: var(--font-mono); font-size: 11px; font-weight: 500;
+    text-transform: uppercase; letter-spacing: 1.5px; padding: 11px 20px;
+  }
+  .diff-panel__header--before { background: var(--red-dim); color: var(--red); border-bottom: 2px solid var(--red); }
+  .diff-panel__header--after { background: var(--sage-dim); color: var(--sage); border-bottom: 2px solid var(--sage); }
+  .diff-panel__body { padding: 18px 20px 22px; font-size: 14.5px; line-height: 1.65; }
+  .diff-panel__body .who {
+    font-family: var(--font-mono); font-size: 10.5px; text-transform: uppercase;
+    letter-spacing: 1px; color: var(--text-dim); display: block; margin-top: 12px;
+  }
+  .diff-panel__body .who:first-child { margin-top: 0; }
+  .diff-panel__verdict {
+    margin-top: 14px; font-weight: 600; font-size: 14px;
+    padding-top: 12px; border-top: 1px dashed var(--border-bright);
+  }
+  .diff-panel__body--before .diff-panel__verdict { color: var(--red); }
+  .diff-panel__body--after .diff-panel__verdict { color: var(--sage); }
+
+  /* ---------- Flow strip ---------- */
+  .flow {
+    display: flex; align-items: stretch; gap: 0; overflow-x: auto;
+    padding: 6px 2px 14px; margin: 20px 0 6px;
+  }
+  .flow__step {
+    min-width: 148px; flex: 1 1 0; flex-shrink: 0;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 11px;
+    padding: 14px 15px;
+    animation: fadeUp 0.45s ease-out both;
+    animation-delay: calc(var(--i, 0) * 0.08s);
+  }
+  .flow__tag {
+    font-family: var(--font-mono); font-size: 9.5px; text-transform: uppercase;
+    letter-spacing: 1.2px; margin-bottom: 7px; display: block;
+  }
+  .flow__step strong { display: block; font-size: 13.5px; margin-bottom: 4px; line-height: 1.3; }
+  .flow__step span.desc { font-size: 12px; color: var(--text-dim); line-height: 1.45; display: block; }
+  .flow__arrow {
+    display: flex; align-items: center; padding: 0 7px;
+    color: var(--border-bright); flex-shrink: 0;
+  }
+  .flow__arrow svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .flow--ink .flow__tag { color: var(--ink); }
+  .flow__step--terra { border-top: 3px solid var(--terra); }
+  .flow__step--terra .flow__tag { color: var(--terra); }
+  .flow__step--sage { border-top: 3px solid var(--sage); }
+  .flow__step--sage .flow__tag { color: var(--sage); }
+  .flow__step--ink { border-top: 3px solid var(--ink); }
+  .flow__step--ink .flow__tag { color: var(--ink); }
+  .flow-caption {
+    font-size: 12.5px; color: var(--text-dim); font-family: var(--font-mono);
+    margin-bottom: 20px;
+  }
+
+  /* ---------- Callouts ---------- */
+  .callout {
+    padding: 18px 22px; border-radius: 10px;
+    border-left: 4px solid var(--callout-border);
+    background: var(--callout-bg); margin: 20px 0; max-width: 74ch;
+  }
+  .callout--warning { --callout-border: var(--gold); --callout-bg: var(--gold-dim); }
+  .callout--info { --callout-border: var(--ink); --callout-bg: var(--ink-dim); }
+  .callout--success { --callout-border: var(--sage); --callout-bg: var(--sage-dim); }
+  .callout__title { font-weight: 700; margin-bottom: 6px; color: var(--callout-border); font-size: 15px; }
+  .callout p { font-size: 14.5px; }
+  .callout p + p { margin-top: 8px; }
+
+  /* ---------- Pull quote ---------- */
+  .pullquote { margin: 40px 0; padding-left: 24px; border-left: 3px solid var(--terra); max-width: 60ch; }
+  .pullquote p {
+    font-family: var(--font-display); font-size: 22px; font-weight: 600;
+    line-height: 1.4; color: var(--text);
+  }
+
+  /* ---------- Framework cards ---------- */
+  .fw-card { display: grid; grid-template-columns: 52px 1fr; gap: 18px; align-items: start; }
+  .fw-card__order {
+    font-family: var(--font-display); font-size: 26px; font-weight: 800;
+    color: var(--terra); background: var(--terra-dim); border-radius: 10px;
+    width: 52px; height: 52px; display: flex; align-items: center; justify-content: center;
+  }
+  .fw-card__body { min-width: 0; }
+  .fw-chip {
+    display: inline-block; font-family: var(--font-mono); font-size: 10.5px;
+    padding: 3px 10px; border-radius: 6px; margin-left: 8px; vertical-align: 2px;
+    white-space: nowrap;
+  }
+  .fw-chip--full { background: var(--sage-dim); color: var(--sage); }
+  .fw-chip--partial { background: var(--gold-dim); color: var(--gold); }
+  .fw-stack { display: grid; gap: 14px; margin: 22px 0; }
+  .fw-stack > * { min-width: 0; }
+
+  /* ---------- Timeline ---------- */
+  .timeline { position: relative; margin: 26px 0 10px; padding-left: 34px; max-width: 76ch; }
+  .timeline::before {
+    content: ''; position: absolute; left: 13px; top: 8px; bottom: 8px;
+    width: 2px; background: var(--border-bright); border-radius: 1px;
+  }
+  .tl-item { position: relative; padding-bottom: 26px; animation: fadeUp 0.45s ease-out both; animation-delay: calc(var(--i, 0) * 0.05s); }
+  .tl-item:last-child { padding-bottom: 0; }
+  .tl-item__dot {
+    position: absolute; left: -34px; top: 1px;
+    width: 28px; height: 28px; border-radius: 50%;
+    background: var(--surface); border: 2px solid var(--terra);
+    color: var(--terra); font-family: var(--font-mono); font-size: 12px; font-weight: 500;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .tl-item--sage .tl-item__dot { border-color: var(--sage); color: var(--sage); }
+  .tl-item--ink .tl-item__dot { border-color: var(--ink); color: var(--ink); }
+  .tl-item h3 {
+    font-family: var(--font-display); font-size: 17.5px; font-weight: 700;
+    letter-spacing: -0.2px; margin-bottom: 4px; line-height: 1.3;
+  }
+  .tl-item p { font-size: 14px; color: var(--text-dim); max-width: 66ch; }
+  .tl-item .proof {
+    display: block; margin-top: 6px; font-family: var(--font-mono);
+    font-size: 11.5px; color: var(--sage);
+  }
+  .tl-item .proof::before { content: '✓ '; }
+
+  /* ---------- Table ---------- */
+  .table-wrap {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    overflow: hidden; margin: 22px 0;
+  }
+  .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .data-table { width: 100%; border-collapse: collapse; font-size: 14px; line-height: 1.55; }
+  .data-table th {
+    background: var(--surface2); font-family: var(--font-mono); font-size: 10.5px;
+    font-weight: 500; text-transform: uppercase; letter-spacing: 1px; color: var(--text-dim);
+    text-align: left; padding: 12px 18px; border-bottom: 2px solid var(--border-bright);
+    white-space: nowrap;
+  }
+  .data-table td { padding: 13px 18px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .data-table td.risk { font-weight: 600; min-width: 180px; max-width: 340px; }
+  .data-table td.answer { color: var(--text-dim); min-width: 240px; }
+  .data-table tbody tr:last-child td { border-bottom: none; }
+  .data-table tbody tr { transition: background 0.15s ease; }
+  .data-table tbody tr:hover { background: var(--terra-dim); }
+
+  /* ---------- Decision cards ---------- */
+  .decision {
+    background: color-mix(in srgb, var(--surface) 90%, var(--gold) 10%);
+    border: 1px solid color-mix(in srgb, var(--border) 40%, var(--gold) 60%);
+    border-radius: 14px; padding: 24px 26px; margin: 18px 0;
+    box-shadow: 0 4px 18px rgba(120, 80, 10, 0.08);
+  }
+  .decision__tag {
+    font-family: var(--font-mono); font-size: 10.5px; text-transform: uppercase;
+    letter-spacing: 1.5px; color: var(--gold); margin-bottom: 8px;
+  }
+  .decision h3 { font-family: var(--font-display); font-size: 20px; font-weight: 700; margin-bottom: 10px; letter-spacing: -0.3px; }
+  .decision p { font-size: 14.5px; color: var(--text); max-width: 70ch; }
+  .decision p + p { margin-top: 8px; }
+  .decision .why { color: var(--text-dim); }
+  .decision .rec { font-weight: 600; margin-top: 10px; }
+  .decision .rec::before { content: 'My call: '; color: var(--gold); }
+
+  /* ---------- Collapsible glossary ---------- */
+  details.collapsible { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; margin: 26px 0; background: var(--surface); }
+  details.collapsible summary {
+    padding: 14px 20px; font-family: var(--font-mono); font-size: 12.5px; font-weight: 500;
+    cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px;
+    transition: background 0.15s ease;
+  }
+  details.collapsible summary:hover { background: var(--surface2); }
+  details.collapsible summary::-webkit-details-marker { display: none; }
+  details.collapsible summary::before { content: '▸'; font-size: 11px; color: var(--text-dim); transition: transform 0.15s ease; }
+  details.collapsible[open] summary::before { transform: rotate(90deg); }
+  .collapsible__body { padding: 6px 20px 18px; border-top: 1px solid var(--border); }
+  .gloss { display: grid; grid-template-columns: 130px 1fr; gap: 10px 18px; font-size: 14px; padding-top: 12px; }
+  .gloss dt { font-family: var(--font-mono); font-size: 12.5px; color: var(--terra); }
+  .gloss dd { color: var(--text-dim); min-width: 0; }
+
+  footer {
+    margin-top: 70px; padding-top: 22px; border-top: 1px solid var(--border);
+    font-family: var(--font-mono); font-size: 11.5px; color: var(--text-dim); line-height: 1.8;
+  }
+  footer code { background: var(--surface2); padding: 1px 6px; border-radius: 4px; font-size: 11px; }
+
+  /* ---------- Animations ---------- */
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+  @keyframes fadeScale { from { opacity: 0; transform: scale(0.94); } to { opacity: 1; transform: none; } }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important; animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+
+  /* ---------- Mobile ---------- */
+  @media (max-width: 1000px) {
+    body { padding: 0 20px 60px; }
+    .wrap { grid-template-columns: 1fr; }
+    .toc {
+      position: sticky; top: 0; z-index: 200; max-height: none;
+      display: flex; gap: 4px; align-items: center; overflow-x: auto;
+      -webkit-overflow-scrolling: touch; background: var(--bg);
+      border-bottom: 1px solid var(--border); padding: 10px 20px;
+      margin: 0 -20px; grid-row: auto;
+    }
+    .toc::-webkit-scrollbar { display: none; }
+    .toc-title { display: none; }
+    .toc a {
+      white-space: nowrap; flex-shrink: 0; border-left: none;
+      border-bottom: 2px solid transparent; border-radius: 4px 4px 0 0;
+      padding: 6px 10px; font-size: 10.5px;
+    }
+    .toc a.active { border-left: none; border-bottom-color: var(--terra); background: var(--surface); }
+    .sec-head { scroll-margin-top: 56px; }
+    .diff-panels { grid-template-columns: 1fr; }
+    .diff-panel__header--after { border-top: 1px solid var(--border); }
+    .fw-card { grid-template-columns: 44px 1fr; gap: 14px; }
+    .fw-card__order { width: 44px; height: 44px; font-size: 21px; }
+    .gloss { grid-template-columns: 1fr; gap: 2px 0; }
+    .gloss dd { margin-bottom: 10px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <nav class="toc" id="toc">
+    <div class="toc-title">Contents</div>
+    <a href="#s1">1. The problem</a>
+    <a href="#s2">2. The fix</a>
+    <a href="#s3">3. Two ways in</a>
+    <a href="#s4">4. Two surprises</a>
+    <a href="#s5">5. Where it ships</a>
+    <a href="#s6">6. The build plan</a>
+    <a href="#s7">7. Safety rails</a>
+    <a href="#s8">8. What could go wrong</a>
+    <a href="#s9">9. Your two decisions</a>
+  </nav>
+
+  <div class="main">
+
+    <header class="hero">
+      <div class="hero__kicker">Solwyn · Plan companion · August 7, 2026</div>
+      <h1 class="hero__title">Getting Solwyn <em>through the door</em></h1>
+      <p class="lead">Solwyn watches AI spending and stops runaway bills. But the tools most buyers use every day, called agent frameworks, turn Solwyn away at the door. This plan fixes the door check once, then puts Solwyn inside the three biggest frameworks.</p>
+      <p class="lead">This page is the plain-language version of the technical plan. Same decisions, no code.</p>
+
+      <div class="stat-row">
+        <div class="stat stat--terra" style="--i:0">
+          <div class="stat__num">1</div>
+          <div class="stat__label">identity fix unlocks every framework at once</div>
+        </div>
+        <div class="stat stat--ink" style="--i:1">
+          <div class="stat__num">3</div>
+          <div class="stat__label">frameworks get first-class support</div>
+        </div>
+        <div class="stat stat--sage" style="--i:2">
+          <div class="stat__num">8</div>
+          <div class="stat__label">build steps, each small and tested</div>
+        </div>
+        <div class="stat stat--gold" style="--i:3">
+          <div class="stat__num">2</div>
+          <div class="stat__label">decisions that need your sign-off</div>
+        </div>
+      </div>
+    </header>
+
+    <!-- ============ 1. THE PROBLEM ============ -->
+    <div id="s1" class="sec-head">
+      <span class="sec-head__num">01</span>
+      <h2 class="sec-head__title">The problem: a bouncer at the door</h2>
+    </div>
+    <p class="sec-intro">Solwyn works like a smart sleeve around a company's AI account. Every request passes through the sleeve, gets a budget check, and gets counted. The sleeve never reads the messages inside.</p>
+
+    <p class="body-para">Agent frameworks are toolkits that teams use to build AI helpers. They are where the customers with runaway AI bills already are. Many frameworks let you hand them your own AI account to use. But before accepting it, they check its ID: "Are you a real OpenAI account?"</p>
+    <p class="body-para">Solwyn's sleeve fails that ID check. It acts exactly like the real thing, but its ID says "Solwyn," so the door closes.</p>
+
+    <div class="diff-panels">
+      <div class="diff-panel__header diff-panel__header--before">Today</div>
+      <div class="diff-panel__header diff-panel__header--after">After this plan</div>
+      <div class="diff-panel__body diff-panel__body--before">
+        <span class="who">Framework</span>
+        "Are you a real OpenAI client?"
+        <span class="who">Solwyn's sleeve</span>
+        "No. I am a Solwyn wrapper."
+        <div class="diff-panel__verdict">Rejected. The buyer picks the competitor that fits.</div>
+      </div>
+      <div class="diff-panel__body diff-panel__body--after">
+        <span class="who">Framework</span>
+        "Are you a real OpenAI client?"
+        <span class="who">Solwyn's sleeve</span>
+        "Yes." (It shows the ID of the account inside it.)
+        <div class="diff-panel__verdict">Admitted. Every AI call now gets a budget check.</div>
+      </div>
+    </div>
+
+    <p class="body-para">Our closest competitor, AgentBudget, wins deals today for one reason: it already works inside these frameworks. We checked our code. We ship zero framework support, while all the plumbing needed for it sits finished and waiting.</p>
+
+    <div class="pullquote">
+      <p>Fix the ID check once, and every framework that asks "who are you?" opens up at the same time.</p>
+    </div>
+
+    <!-- ============ 2. THE FIX ============ -->
+    <div id="s2" class="sec-head">
+      <span class="sec-head__num">02</span>
+      <h2 class="sec-head__title">The fix: answer with the ID of the card inside</h2>
+    </div>
+    <p class="sec-intro">The chosen design is called a transparent proxy (a see-through stand-in). Three small changes make the sleeve invisible to ID checks.</p>
+
+    <div class="card-grid">
+      <div class="ve-card" style="--i:0">
+        <div class="ve-card__label">Change one</div>
+        <h3>Borrowed ID</h3>
+        <p>When anything asks the sleeve "what are you?", it now answers with the identity of the real account inside it. This is a proven trick. Big monitoring companies have used it safely for years.</p>
+      </div>
+      <div class="ve-card" style="--i:1">
+        <div class="ve-card__label">Change two</div>
+        <h3>Name tags on our stuff</h3>
+        <p>Everything Solwyn stores inside the sleeve gets a <strong>solwyn_</strong> name tag. That way our stuff can never be confused with the account's own stuff. We found one real clash already (more in section 4).</p>
+      </div>
+      <div class="ve-card" style="--i:2">
+        <div class="ve-card__label">Change three</div>
+        <h3>Changes pass through</h3>
+        <p>If a framework adjusts a setting on the sleeve, like a timeout, the change now lands on the real account inside. Before, it would quietly land on the sleeve and do nothing.</p>
+      </div>
+    </div>
+
+    <p class="body-para">Here is the life of one AI call once a framework has admitted the sleeve:</p>
+
+    <div class="flow">
+      <div class="flow__step flow__step--ink" style="--i:0">
+        <span class="flow__tag">Step 1</span>
+        <strong>Your AI helper acts</strong>
+        <span class="desc">The framework sends a request to what it believes is a normal AI account.</span>
+      </div>
+      <div class="flow__arrow"><svg viewBox="0 0 20 20"><path d="M4 10 L16 10 M12 6 L16 10 L12 14"/></svg></div>
+      <div class="flow__step flow__step--terra" style="--i:1">
+        <span class="flow__tag">Step 2</span>
+        <strong>Budget check</strong>
+        <span class="desc">Solwyn asks its cloud: is there money left for this? If not, the call stops here.</span>
+      </div>
+      <div class="flow__arrow"><svg viewBox="0 0 20 20"><path d="M4 10 L16 10 M12 6 L16 10 L12 14"/></svg></div>
+      <div class="flow__step flow__step--ink" style="--i:2">
+        <span class="flow__tag">Step 3</span>
+        <strong>The AI answers</strong>
+        <span class="desc">The request goes straight to the real AI provider. Solwyn never touches the words.</span>
+      </div>
+      <div class="flow__arrow"><svg viewBox="0 0 20 20"><path d="M4 10 L16 10 M12 6 L16 10 L12 14"/></svg></div>
+      <div class="flow__step flow__step--sage" style="--i:3">
+        <span class="flow__tag">Step 4</span>
+        <strong>The receipt</strong>
+        <span class="desc">Solwyn sends usage numbers to its cloud. Counts and labels only, never message text.</span>
+      </div>
+    </div>
+    <div class="flow-caption">The money safety machinery does not change in this project. Only the front door does.</div>
+
+    <!-- ============ 3. TWO WAYS ============ -->
+    <div id="s3" class="sec-head">
+      <span class="sec-head__num">03</span>
+      <h2 class="sec-head__title">Two ways in, one winner</h2>
+    </div>
+    <p class="sec-intro">There were two candidate designs. The plan weighs both and picks the safer one.</p>
+
+    <div class="card-grid">
+      <div class="ve-card" style="--i:0; border-top: 3px solid var(--sage);">
+        <div class="ve-card__label ve-card__label--sage">Chosen · The mirrored badge</div>
+        <h3>Show the inner card's ID</h3>
+        <p>The sleeve keeps being a sleeve. It just answers ID questions with the real account's identity. Anything the sleeve does not handle itself gets passed to the real account, which does the work with <strong>its own</strong> tools and its own memory.</p>
+        <p><strong>Why it wins:</strong> there is always exactly one place where the account's real state lives. Nothing can drift out of sync.</p>
+      </div>
+      <div class="ve-card" style="--i:1; border-top: 3px solid var(--red);">
+        <div class="ve-card__label ve-card__label--red">Rejected · The costume</div>
+        <h3>Sew the account's own class onto ours</h3>
+        <p>Python allows building a new type on the fly that is legally "both" a Solwyn sleeve and an OpenAI account. Sounds elegant. In practice the account's inner machinery would run against the sleeve's body: it would <strong>read</strong> from the real account but <strong>write</strong> to the sleeve.</p>
+        <p><strong>Why it loses:</strong> two memories that quietly drift apart, and every provider update can reshuffle the seams. A slow leak, not a loud crash.</p>
+      </div>
+    </div>
+
+    <div class="callout callout--info">
+      <div class="callout__title">What the mirror trick cannot do</div>
+      <p>A rare, stricter kind of check asks "is your exact birth certificate OpenAI?" instead of "are you an OpenAI?" The mirror fails that one. We searched: none of the target frameworks check that way. If one ever appears, the plan keeps the costume approach on the shelf as a documented backup.</p>
+    </div>
+
+    <!-- ============ 4. SURPRISES ============ -->
+    <div id="s4" class="sec-head">
+      <span class="sec-head__num">04</span>
+      <h2 class="sec-head__title">Two surprises found while checking the code</h2>
+    </div>
+    <p class="sec-intro">Every claim in the project brief was re-checked against the actual code. Two new facts came out of that sweep, and both changed the plan.</p>
+
+    <div class="card-grid">
+      <div class="ve-card" style="--i:0">
+        <div class="ve-card__label ve-card__label--gold">Surprise one</div>
+        <h3>An unwatched side door</h3>
+        <p>OpenAI has a newer calling channel called the Responses API. Solwyn does not watch it yet. Calls through it are <strong>not counted and not budget-checked</strong>, and today they pass in complete silence.</p>
+        <p>That matters a lot: OpenAI's own agent framework uses this channel <strong>by default</strong>. The plan closes the gap two ways: Solwyn will shout a warning if the side door is used, and the setup recipe pins the framework to the watched channel.</p>
+      </div>
+      <div class="ve-card" style="--i:1">
+        <div class="ve-card__label ve-card__label--gold">Surprise two</div>
+        <h3>A name clash waiting to bite</h3>
+        <p>The sleeve stores the real account under an internal name that OpenAI's own code <strong>also uses</strong> for something different. Once frameworks accept the sleeve as real, outside code reaching for that name would grab the wrong thing.</p>
+        <p>That is why build step 1 renames all of Solwyn's internal storage with the <strong>solwyn_</strong> tag before the identity fix turns on.</p>
+      </div>
+    </div>
+
+    <!-- ============ 5. WHERE IT SHIPS ============ -->
+    <div id="s5" class="sec-head">
+      <span class="sec-head__num">05</span>
+      <h2 class="sec-head__title">Where it ships, in order</h2>
+    </div>
+    <p class="sec-intro">Three frameworks, ordered by how much value each unlocks versus how much work it needs. In all three, Solwyn's add-ons only label spending. They never read messages, and the sleeve stays the only thing that counts money, so nothing gets counted twice.</p>
+
+    <div class="fw-stack">
+      <div class="ve-card fw-card" style="--i:0">
+        <div class="fw-card__order">1</div>
+        <div class="fw-card__body">
+          <h3>OpenAI Agents SDK <span class="fw-chip fw-chip--full">Full budget control</span></h3>
+          <p>OpenAI's own toolkit for building AI agents. It has a slot for handing over your account, and it ships <strong>no budget feature at all</strong>. A vacuum we fill. This one needs no new code from us, just a well-tested setup guide: hand it the Solwyn sleeve, pin the watched channel, and each agent's spending shows up under its own name.</p>
+        </div>
+      </div>
+      <div class="ve-card fw-card" style="--i:1">
+        <div class="fw-card__order">2</div>
+        <div class="fw-card__body">
+          <h3>LangChain / LangGraph <span class="fw-chip fw-chip--full">Full budget control</span></h3>
+          <p>The most widely used framework. It also takes your own account (budget control comes free once the door opens), and it lets outside tools listen to progress events. We ship a small listener that labels spending by chain and by graph step, so the bill reads like a story instead of one big number. This is where the competitor lives; this closes the gap.</p>
+        </div>
+      </div>
+      <div class="ve-card fw-card" style="--i:2">
+        <div class="fw-card__order">3</div>
+        <div class="fw-card__body">
+          <h3>CrewAI <span class="fw-chip fw-chip--partial">Labels first</span></h3>
+          <p>A popular framework for teams of AI agents. It does not accept an outside account today, so Solwyn cannot block its calls yet. Honest version one: a listener that labels spending by crew and by task, plus a documented recipe for full control for teams that want to wire it. If CrewAI adds account hand-over later, we are ready the same day.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============ 6. BUILD PLAN ============ -->
+    <div id="s6" class="sec-head">
+      <span class="sec-head__num">06</span>
+      <h2 class="sec-head__title">The build plan: eight small steps</h2>
+    </div>
+    <p class="sec-intro">Each step is one reviewable chunk with its own tests, written test-first. Nothing ships without the full quality gate passing.</p>
+
+    <div class="timeline">
+      <div class="tl-item" style="--i:0">
+        <div class="tl-item__dot">1</div>
+        <h3>Put name tags on everything</h3>
+        <p>Rename all of Solwyn's internal storage with the solwyn_ tag so nothing can clash with a real account's own names.</p>
+        <span class="proof">An automatic check fails the build if any future code forgets the tag.</span>
+      </div>
+      <div class="tl-item" style="--i:1">
+        <div class="tl-item__dot">2</div>
+        <h3>Turn on the borrowed ID</h3>
+        <p>The identity fix itself, plus safe answers for edge cases: copying the sleeve, saving it to disk, listing what it can do.</p>
+        <span class="proof">A test pretends to be a strict framework and confirms the sleeve gets in.</span>
+      </div>
+      <div class="tl-item" style="--i:2">
+        <div class="tl-item__dot">3</div>
+        <h3>Make the side doors loud</h3>
+        <p>The unwatched Responses channel and two "hand me a plain account" shortcuts now shout a clear warning the first time they are used.</p>
+        <span class="proof">Tests confirm the warning fires once and says exactly what to do instead.</span>
+      </div>
+      <div class="tl-item" style="--i:3">
+        <div class="tl-item__dot">4</div>
+        <h3>Add a start/finish switch for labels</h3>
+        <p>Frameworks tell us "a task started" and "a task ended" as two separate moments. Solwyn's labeling tool only worked as one wrapped block. This adds the two-moment version.</p>
+        <span class="proof">Tests cover nesting, wrong ordering, and async use.</span>
+      </div>
+      <div class="tl-item tl-item--ink" style="--i:4">
+        <div class="tl-item__dot">5</div>
+        <h3>OpenAI Agents SDK recipe</h3>
+        <p>The setup guide plus a live test that proves admission works, budgets fire on every call, and each agent's spending carries its name.</p>
+        <span class="proof">A scheduled test job re-checks against the newest framework version weekly.</span>
+      </div>
+      <div class="tl-item tl-item--ink" style="--i:5">
+        <div class="tl-item__dot">6</div>
+        <h3>LangChain add-on</h3>
+        <p>The spending-label listener, shipped as an optional install so core Solwyn stays lean. Includes the strongest safety test: proof that every framework call really hits the budget check.</p>
+        <span class="proof">The privacy firewall test now also covers add-on code.</span>
+      </div>
+      <div class="tl-item tl-item--ink" style="--i:6">
+        <div class="tl-item__dot">7</div>
+        <h3>CrewAI add-on</h3>
+        <p>The crew and task labeler, plus the documented full-control recipe. Honest about what it does and does not enforce yet.</p>
+        <span class="proof">A test pins today's limits, so any CrewAI change that unlocks more flips it loudly.</span>
+      </div>
+      <div class="tl-item tl-item--sage" style="--i:7">
+        <div class="tl-item__dot">8</div>
+        <h3>Tell the story</h3>
+        <p>A one-page framework matrix, an updated readme, and the changelog. What works where, in plain terms.</p>
+        <span class="proof">Docs reviewed against the shipped behavior, not the planned behavior.</span>
+      </div>
+    </div>
+
+    <!-- ============ 7. SAFETY RAILS ============ -->
+    <div id="s7" class="sec-head">
+      <span class="sec-head__num">07</span>
+      <h2 class="sec-head__title">Safety rails that do not move</h2>
+    </div>
+    <p class="sec-intro">Three promises hold through every step of this project, and each one is enforced by automatic tests, not by good intentions.</p>
+
+    <div class="card-grid">
+      <div class="ve-card" style="--i:0">
+        <div class="ve-card__label ve-card__label--sage">Privacy</div>
+        <h3>No message text, ever</h3>
+        <p>Framework add-ons receive progress events that can contain message text. Our add-ons are built so they <strong>cannot even look</strong> at those parts, and an automatic scan of the code fails the build if anyone tries.</p>
+      </div>
+      <div class="ve-card" style="--i:1">
+        <div class="ve-card__label ve-card__label--sage">Accuracy</div>
+        <h3>Every dollar counted once</h3>
+        <p>Only the sleeve reports spending. Add-ons attach labels and nothing else. There is no second reporter, so double counting is impossible by design.</p>
+      </div>
+      <div class="ve-card" style="--i:2">
+        <div class="ve-card__label ve-card__label--sage">Honesty</div>
+        <h3>Nothing silently untracked</h3>
+        <p>Any path that skips the budget check now announces itself with a clear warning and tells you the fix. Silence was the old behavior. It ends with step 3.</p>
+      </div>
+    </div>
+
+    <!-- ============ 8. RISKS ============ -->
+    <div id="s8" class="sec-head">
+      <span class="sec-head__num">08</span>
+      <h2 class="sec-head__title">What could go wrong, and the answer for each</h2>
+    </div>
+
+    <div class="table-wrap">
+      <div class="table-scroll">
+        <table class="data-table">
+          <thead>
+            <tr><th>What could go wrong</th><th>How the plan handles it</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="risk">Frameworks change fast and break our add-ons</td>
+              <td class="answer">Add-ons are thin, disposable layers over our own stable event system. A weekly automatic test against the newest framework versions catches breakage without blocking our releases. For the fastest-moving framework we ship only a guide, no code.</td>
+            </tr>
+            <tr>
+              <td class="risk">A framework uses one of the side doors and spending goes uncounted</td>
+              <td class="answer">Loud warnings on every side door, plus a tripwire test that proves each framework call hits the budget check. If a real framework does use one, a pre-designed fix is ready to build.</td>
+            </tr>
+            <tr>
+              <td class="risk">The borrowed ID confuses a developer while debugging</td>
+              <td class="answer">The sleeve's printed description always shows both identities. The docs explain the one question that still reveals the sleeve, on purpose.</td>
+            </tr>
+            <tr>
+              <td class="risk">Message text leaks through a framework add-on</td>
+              <td class="answer">The add-ons subscribe only to events without content. The automatic code scan blocks any attempt to read, store, or log the content-bearing parts.</td>
+            </tr>
+            <tr>
+              <td class="risk">A framework saves the sleeve to disk or sends it to another process</td>
+              <td class="answer">That fails with a clear, helpful error instead of corrupted data. The real accounts cannot be saved that way either, so this matches what frameworks already expect.</td>
+            </tr>
+            <tr>
+              <td class="risk">Someone wraps a sleeve inside another sleeve</td>
+              <td class="answer">Rejected immediately with a plain error message. No double counting, no confusion.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ============ 9. DECISIONS ============ -->
+    <div id="s9" class="sec-head">
+      <span class="sec-head__num">09</span>
+      <h2 class="sec-head__title">The two decisions that need you</h2>
+    </div>
+    <p class="sec-intro">Everything else in the plan is settled with evidence. These two are judgment calls where I picked a side and want your sign-off.</p>
+
+    <div class="decision">
+      <div class="decision__tag">Decision one</div>
+      <h3>When a framework copies the sleeve, hand back the same sleeve</h3>
+      <p>Some frameworks routinely make copies of their whole setup, including the AI account you gave them. Question: what should copying the sleeve produce?</p>
+      <p class="why">If a copy became a second, independent sleeve, the budget would split in two and money could be counted twice. If copying just failed, those frameworks would be locked out again, which defeats the whole project.</p>
+      <p class="rec">a "copy" is the same one sleeve, shared. One budget, one counter, no surprises. The fail-loud alternative is preserved in history if you disagree.</p>
+    </div>
+
+    <div class="decision">
+      <div class="decision__tag">Decision two</div>
+      <h3>Side doors warn loudly in version one; they are not rebuilt yet</h3>
+      <p>The unwatched Responses channel and the two "plain account" shortcuts could each be fully brought under budget control now. That is real engineering work, and we have no evidence yet that the target frameworks use them.</p>
+      <p class="why">Version one makes every side door loud and adds a tripwire test that tells us immediately if a real framework walks through one. The full fix is already designed on paper, so if the tripwire fires, it becomes a normal, bounded task instead of an emergency.</p>
+      <p class="rec">warn loudly now, build the full fix only on evidence. Say the word if you want it built up front instead.</p>
+    </div>
+
+    <details class="collapsible">
+      <summary>Small glossary (6 terms used on this page)</summary>
+      <div class="collapsible__body">
+        <dl class="gloss">
+          <dt>wrapper / sleeve</dt><dd>Solwyn's layer around a company's real AI account. All calls pass through it.</dd>
+          <dt>agent framework</dt><dd>A toolkit for building AI helpers that plan and act in steps. Examples: LangChain, CrewAI.</dd>
+          <dt>transparent proxy</dt><dd>A stand-in that behaves and identifies exactly like the thing it stands in for.</dd>
+          <dt>run scope</dt><dd>Solwyn's label for one job. Spending inside it is grouped under that job's name.</dd>
+          <dt>add-on / adapter</dt><dd>A small optional piece connecting Solwyn to one specific framework.</dd>
+          <dt>tripwire test</dt><dd>An automatic test whose only job is to go off the moment a hidden assumption stops being true.</dd>
+        </dl>
+      </div>
+    </details>
+
+    <footer>
+      Companion to the technical plan at <code>docs/plans/2026-08-07-ecosystem-admission-plan.md</code><br>
+      Solwyn Python SDK · ecosystem admission project · generated August 7, 2026
+    </footer>
+
+  </div><!-- /main -->
+</div><!-- /wrap -->
+
+<script>
+(function() {
+  const toc = document.getElementById('toc');
+  const links = toc.querySelectorAll('a');
+  const sections = [];
+
+  links.forEach(link => {
+    const id = link.getAttribute('href').slice(1);
+    const el = document.getElementById(id);
+    if (el) sections.push({ id, el, link });
+  });
+
+  const observer = new IntersectionObserver(entries => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        links.forEach(l => l.classList.remove('active'));
+        const match = sections.find(s => s.el === entry.target);
+        if (match) {
+          match.link.classList.add('active');
+          if (window.innerWidth <= 1000) {
+            match.link.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+          }
+        }
+      }
+    });
+  }, { rootMargin: '-10% 0px -80% 0px' });
+
+  sections.forEach(s => observer.observe(s.el));
+
+  links.forEach(link => {
+    link.addEventListener('click', e => {
+      e.preventDefault();
+      const id = link.getAttribute('href').slice(1);
+      const el = document.getElementById(id);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        history.replaceState(null, '', '#' + id);
+      }
+    });
+  });
+})();
+</script>
+</body>
+</html>
