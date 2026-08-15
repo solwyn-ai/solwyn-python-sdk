@@ -55,7 +55,12 @@ contains a structural dotted surface path; bounded execution-context and
 classification fields (provider, client shape, sync/async mode, rule kind,
 optional capability scope, and posture); approximate occurrence counts and
 first/last timestamps; and random SDK-instance/report identifiers. Model names,
-request arguments, prompts, and responses are never included.
+request arguments, prompts, and responses are never included. A public path that
+is identifier-clean but structurally unreportable (deeper or longer than the
+wire pattern allows, or non-ASCII) stays LOCAL-ONLY: it is warned and counted in
+the process registry exactly like any other untracked surface, and never reaches
+a reporter. Only a malformed path — an empty, private, or non-identifier
+segment — fails closed with a content-free `RuntimeError`.
 
 Only unacknowledged `warn`/`allow` observations enter advisory reporting;
 `raise` refusals and acknowledged escapes do not. Reporting adds neither a

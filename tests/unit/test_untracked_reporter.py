@@ -381,6 +381,92 @@ def test_validation_failed_advisory_key_is_throttled_after_one_cycle() -> None:
 
 
 @pytest.mark.unit
+def test_validation_failed_advisory_key_never_respawns_its_worker() -> None:
+    reporter = _quiet_sync_reporter()
+    state = reporter._untracked_state
+    assert state is not None
+    state.observe(
+        context=SurfaceContext(
+            provider="openai",
+            dialect="openai",
+            client_shape="openai_sdk",
+            mode="sync",
+        ),
+        surface="responses.create",
+        rule_kind="unmetered_spend",
+        capability_scope="future_scope",
+        posture="warn",
+        seen_at=datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
+    )
+    cycles: list[float | None] = []
+    flush = reporter._flush_untracked_reports
+
+    def counted(*, deadline: float | None = None) -> None:
+        cycles.append(deadline)
+        # Bound the respawn loop this test exists to forbid.
+        if len(cycles) > 3:
+            reporter._shutdown.set()
+        flush(deadline=deadline)
+
+    try:
+        with (
+            patch("solwyn.reporter._monotonic", return_value=100.0),
+            patch.object(reporter, "_flush_untracked_reports", side_effect=counted),
+            patch.object(reporter._http, "post", return_value=_ok_response()) as post,
+        ):
+            worker = reporter._start_untracked_cycle()
+            assert worker is not None
+            worker.join(timeout=5.0)
+            assert worker.is_alive() is False
+
+        assert cycles == [None]
+        assert reporter._untracked_worker is None
+        post.assert_not_called()
+    finally:
+        reporter._http.close()
+
+
+@pytest.mark.unit
+def test_validation_failed_advisory_key_does_not_block_a_buildable_sibling() -> None:
+    reporter = _quiet_sync_reporter()
+    state = reporter._untracked_state
+    assert state is not None
+    unbuildable_key = ("openai", "openai_sdk", "sync", "future.surface")
+    state.observe(
+        context=SurfaceContext(
+            provider="openai",
+            dialect="openai",
+            client_shape="openai_sdk",
+            mode="sync",
+        ),
+        surface="future.surface",
+        rule_kind="unmetered_spend",
+        capability_scope="future_scope_v2",
+        posture="warn",
+        seen_at=datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
+    )
+    _observe(reporter)
+
+    try:
+        with (
+            patch("solwyn.reporter._monotonic", return_value=100.0),
+            patch.object(reporter._http, "post", return_value=_ok_response()) as post,
+        ):
+            reporter._flush_untracked_reports()
+
+        assert post.call_count == 1
+        body = post.call_args.kwargs["json"]
+        assert [report["surface"] for report in body] == ["responses.create"]
+        assert state.last_sent_occurrences == {
+            ("openai", "openai_sdk", "sync", "responses.create"): 1
+        }
+        assert state.last_attempted_at[unbuildable_key] == 100.0
+        assert state.reports_due(999.999) is False
+    finally:
+        reporter._http.close()
+
+
+@pytest.mark.unit
 def test_sync_observation_during_successful_send_remains_in_next_delta() -> None:
     reporter = _quiet_sync_reporter()
     _observe(reporter)
@@ -1107,10 +1193,14 @@ def test_sync_close_does_not_start_untracked_work_after_deadline() -> None:
     reporter = _quiet_sync_reporter()
     _observe(reporter)
 
-    with patch.object(reporter, "_start_untracked_cycle") as start_cycle:
+    with (
+        patch.object(reporter._http, "post") as post,
+        patch.object(reporter, "_start_untracked_cycle") as start_cycle,
+    ):
         reporter.close(timeout=0.0)
 
     start_cycle.assert_not_called()
+    post.assert_not_called()
 
 
 @pytest.mark.unit

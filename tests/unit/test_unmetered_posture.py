@@ -1073,11 +1073,11 @@ def test_strict_invisible_dynamic_unknown_refuses_before_descriptor_evaluation()
 @pytest.mark.parametrize(
     "surface",
     [
-        "café",
         "not public",
+        "foo-bar",
         "a..b",
     ],
-    ids=["unicode", "space", "empty-segment"],
+    ids=["space", "hyphen", "empty-segment"],
 )
 def test_dynamic_access_rejects_a_non_structural_public_surface(
     surface: str,
@@ -1095,13 +1095,18 @@ def test_dynamic_access_rejects_a_non_structural_public_surface(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("posture", ["warn", "allow"])
-def test_overlong_identifier_forwards_without_an_advisory_observation(
+@pytest.mark.parametrize(
+    "surface",
+    ["a" * 129, "café"],
+    ids=["overlong", "non-ascii"],
+)
+def test_wire_ineligible_identifier_forwards_and_stays_local(
+    surface: str,
     posture: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     from solwyn import _base
 
-    surface = "a" * 129
     wrapper = _make_solwyn(_DynamicOpenAIClient(), on_unmetered=posture)
     notifier = wrapper._untracked_observation_notifier
     assert isinstance(notifier, MagicMock)
@@ -1113,7 +1118,8 @@ def test_overlong_identifier_forwards_without_an_advisory_observation(
 
     assert first() == surface
     assert second() == surface
-    assert ("openai", "openai_sdk", "sync", surface) not in _base._untracked_surface_observations
+    observation = _base._untracked_surface_observations[("openai", "openai_sdk", "sync", surface)]
+    assert observation["occurrences"] == 2
     notifier.assert_not_called()
     records = foreground_records(caplog)
     assert len(records) == (1 if posture == "warn" else 0)
@@ -1122,7 +1128,7 @@ def test_overlong_identifier_forwards_without_an_advisory_observation(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("posture", ["warn", "allow"])
-def test_nine_segment_identifier_chain_forwards_without_an_advisory_observation(
+def test_nine_segment_identifier_chain_forwards_without_an_advisory_report(
     posture: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1143,12 +1149,10 @@ def test_nine_segment_identifier_chain_forwards_without_an_advisory_observation(
         terminal = resource.call
 
     assert terminal() == "called"
-    assert (
-        "openai",
-        "openai_sdk",
-        "sync",
-        terminal_path,
-    ) not in _base._untracked_surface_observations
+    observation = _base._untracked_surface_observations[
+        ("openai", "openai_sdk", "sync", terminal_path)
+    ]
+    assert observation["occurrences"] >= 1
     notifier.assert_not_called()
     records = foreground_records(caplog)
     assert len(records) == (1 if posture == "warn" else 0)

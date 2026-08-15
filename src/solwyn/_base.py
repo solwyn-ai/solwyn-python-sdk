@@ -8,7 +8,6 @@ from this and add their own HTTP layer.
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import inspect
 import logging
 import os
@@ -48,7 +47,7 @@ from solwyn._surfaces import (
     SurfaceKind,
     SurfaceRule,
     SurfaceSource,
-    _surface_path_is_wire_eligible,
+    _surface_path_is_reportable,
     _validate_surface_path,
     context_is_declared,
     resolve_surface_rule,
@@ -190,7 +189,6 @@ _UntrackedObservationNotifier = Callable[..., None]
 
 _UNTRACKED_SURFACE_LIMIT = 512
 _untracked_surface_observations: dict[_UntrackedSurfaceKey, _UntrackedSurfaceObservation] = {}
-_unreportable_surface_warning_keys: set[_UntrackedSurfaceKey] = set()
 _warn_limit_reached = False
 _spend_surface_warn_lock = threading.Lock()
 
@@ -210,7 +208,6 @@ def _reset_unmetered_spend_warnings() -> None:
     global _warn_limit_reached
     with _spend_surface_warn_lock:
         _untracked_surface_observations.clear()
-        _unreportable_surface_warning_keys.clear()
         _warn_limit_reached = False
 
 
@@ -222,11 +219,11 @@ def _record_untracked_surface_observation(
     capability_scope: str | None,
     posture: Literal["warn", "allow"],
     notifier: _UntrackedObservationNotifier | None = None,
-) -> Literal["warn", "silent", "full", "unreportable"]:
+) -> Literal["warn", "silent", "full"]:
     """Record one content-free observation and return its registry status."""
 
-    if not _surface_path_is_wire_eligible(surface):
-        return "unreportable"
+    _validate_surface_path(surface)
+    reportable = _surface_path_is_reportable(surface)
     observation_key = (
         context.provider,
         context.client_shape,
@@ -264,8 +261,9 @@ def _record_untracked_surface_observation(
             registry_status = "warn" if posture == "warn" else "silent"
     # Never invoke reporter code under the process-global warning lock. The
     # notifier performs only origin-owned in-memory bookkeeping + wakeup; its
-    # reporter thread/task owns every network operation.
-    if notifier is not None:
+    # reporter thread/task owns every network operation. A path the wire cannot
+    # carry stays local: counted and warned here, never handed to a reporter.
+    if notifier is not None and reportable:
         # Advisory bookkeeping must never affect the provider call. The origin
         # reporter has its own bounded ledger, so global warning-registry
         # saturation is not a reason to suppress this callback.
@@ -279,26 +277,6 @@ def _record_untracked_surface_observation(
                 seen_at=seen_at,
             )
     return registry_status
-
-
-def _latch_unreportable_surface_warning(
-    *, context: SurfaceContext, surface: str
-) -> Literal["warn", "silent", "full"]:
-    """Bound warn-once state without retaining an over-limit surface path."""
-
-    warning_key = (
-        context.provider,
-        context.client_shape,
-        context.mode,
-        hashlib.sha256(surface.encode("ascii")).hexdigest(),
-    )
-    with _spend_surface_warn_lock:
-        if warning_key in _unreportable_surface_warning_keys:
-            return "silent"
-        if len(_unreportable_surface_warning_keys) >= _UNTRACKED_SURFACE_LIMIT:
-            return "full"
-        _unreportable_surface_warning_keys.add(warning_key)
-    return "warn"
 
 
 def _warn_contextual_surface_once(
@@ -321,12 +299,7 @@ def _warn_contextual_surface_once(
         posture="warn",
         notifier=notifier,
     )
-    wire_ineligible = registry_status == "unreportable"
-    if wire_ineligible:
-        registry_status = _latch_unreportable_surface_warning(
-            context=context,
-            surface=surface,
-        )
+    wire_ineligible = not _surface_path_is_reportable(surface)
     if registry_status == "silent":
         return
     warn_limit_reached_now = False

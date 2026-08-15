@@ -60,8 +60,9 @@ derived from git tags (hatch-vcs).
   its enforcement boundary.
 - **Identifier-clean provider paths that exceed advisory wire limits keep the
   configured local posture.** `warn` logs once and forwards, while `allow`
-  forwards silently; neither posture sends the over-length or over-depth path
-  externally. Malformed and non-ASCII public paths still fail closed.
+  forwards silently; an over-length, over-depth, or non-ASCII path is counted
+  locally and never sent externally. Malformed public paths (empty, private, or
+  non-identifier segments) still fail closed.
 - **`run_stopped` denials now stay sticky only for their run.** Per-call and
   lease denials use the same run-scoped classification as `agent_run`, so a
   control-plane outage cannot replay a dashboard stop against unrelated run
