@@ -12,16 +12,22 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from threading import Lock
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-try:
-    from langchain_core.callbacks import BaseCallbackHandler
-except ImportError as exc:  # pragma: no cover - exercised without the extra
-    raise ImportError(
-        "solwyn.integrations.langchain requires langchain-core; "
-        "install with: pip install 'solwyn[langchain]'"
-    ) from exc
+if TYPE_CHECKING:
+
+    class BaseCallbackHandler:
+        """Static base for type-checking without the optional dependency."""
+
+else:
+    try:
+        from langchain_core.callbacks import BaseCallbackHandler
+    except ImportError as exc:  # pragma: no cover - exercised without the extra
+        raise ImportError(
+            "solwyn.integrations.langchain requires langchain-core; "
+            "install with: pip install 'solwyn[langchain]'"
+        ) from exc
 
 import solwyn
 
