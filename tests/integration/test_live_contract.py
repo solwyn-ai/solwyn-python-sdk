@@ -178,6 +178,10 @@ def run_capped_credentials(api_url: str) -> Credentials:
                     {
                         "type": "runaway_run",
                         "spend_threshold_usd": RUN_CAP_USD,
+                        # The API requires an explicit mode on a new or changed
+                        # runaway_run rule (it refuses to default silently); this
+                        # fixture exists to prove the run-scoped hard denial.
+                        "mode": "hard_deny",
                         "channel_ids": [],
                     }
                 ],
