@@ -9,6 +9,34 @@ derived from git tags (hatch-vcs).
 
 ### Added
 
+- **Provider wrappers now pass `isinstance`-shaped framework admission.**
+  `Solwyn(client)` and `AsyncSolwyn(client)` report the wrapped provider class
+  through `__class__` while `type(wrapper)` remains the truthful Solwyn class.
+  Public attribute writes and deletes forward to the provider client;
+  `copy.copy` and `copy.deepcopy` preserve one shared enforcement handle; and
+  pickling fails with guidance to construct a fresh wrapper in the target
+  process. Public passthrough reads still cross the capability guard, so known
+  untracked and newly observed leaves keep the existing warn-once default (or
+  the configured strict/allow posture) instead of silently acquiring coverage.
+- **Detached run identities support begin/end framework callbacks and
+  cross-task activation.** `start_run(...)` exposes the scoped `RunHandle`
+  lifecycle, while `create_run(...)` snapshots a stable run ID, parent, and
+  inherited tags without changing the current context. Its reusable
+  `handle.activate()` scope binds that identity around provider work in another
+  task or thread, and `finish()` fails loud while an activation remains live.
+- **OpenAI Agents, LangChain/LangGraph, and CrewAI have admitted integration
+  recipes and offline real-framework smokes.** OpenAI Agents uses a wrapped
+  `AsyncSolwyn` default client plus recipe-local model/provider adapters; its
+  locked/current smoke covers Chat Completions retries, streaming, handoffs,
+  function-tool turns, and budget denial, but no
+  `solwyn.integrations.agents` module ships. `solwyn[langchain]` adds the
+  content-free `SolwynRunScopeHandler`; the exact docs/test raw-response shim
+  admits basic non-streaming `invoke`/`ainvoke` and two-node LangGraph calls.
+  `solwyn[crewai]` adds the content-free structural `SolwynEventListener`;
+  native LiteLLM remains attribution-only with zero Solwyn enforcement, while
+  the narrowly tested sync plain-text custom-`BaseLLM` recipe crosses a wrapped
+  client. CrewAI/LiteLLM run in an isolated dependency lane, and scheduled
+  smoke jobs re-resolve current framework releases to expose churn.
 - **Native OpenAI and Azure OpenAI Responses calls are now budget-metered.**
   Sync and async `responses.create(...)`, `responses.parse(...)`, and new-response
   `responses.stream(...)` helper calls use one primary-only path with
@@ -82,6 +110,12 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **Breaking only for consumers of private wrapper attributes: Solwyn-owned
+  state now lives under `_solwyn_*`.** Names such as the former wrapper
+  `_client`, `_budget`, and `_reporter` no longer expose Solwyn internals;
+  non-prefixed names belong to the wrapped provider client. Public Solwyn APIs
+  are unchanged, and the partition prevents collisions with provider SDK
+  private state after type-transparent framework admission.
 - **Breaking (pre-launch): native OpenAI and Azure OpenAI Responses create,
   parse, and stream leaves are no longer acknowledgeable unmetered
   capabilities.** Remove those leaves from `acknowledge_untracked`; they are

@@ -67,9 +67,10 @@ assert isinstance(client, type(raw))
 
 `type(client)` remains the truthful wrapper class (`Solwyn` or
 `AsyncSolwyn`), while `client.__class__` reports the wrapped provider class for
-`isinstance`-based framework compatibility. Every non-`_solwyn_*` attribute
-assignment and deletion forwards to the provider client, including names also
-defined by the wrapper; only `_solwyn_*` state remains local.
+`isinstance`-based framework compatibility. The same contract holds for
+`AsyncSolwyn(AsyncOpenAI(...))`. Every non-`_solwyn_*` attribute assignment and
+deletion forwards to the provider client, including names also defined by the
+wrapper; only `_solwyn_*` state remains local.
 
 These clients own live reporter, budget, and provider-transport state.
 `copy.copy(client)` and `copy.deepcopy(client)` therefore return the same
@@ -79,9 +80,23 @@ process.
 
 ## Framework integrations
 
-- [OpenAI Agents SDK](docs/integrations/openai-agents.md) — inject an
-  `AsyncSolwyn(AsyncOpenAI(...))` default client and attribute model calls to
-  workflow and per-agent runs.
+See the [framework support matrix](docs/integrations/README.md) for the exact
+enforcement boundary, admitted call surfaces, dependency posture, and current
+limitations.
+
+- [OpenAI Agents SDK](docs/integrations/openai-agents.md) — a docs-and-smoke
+  recipe injects an `AsyncSolwyn` default client for enforced Chat Completions
+  and stable workflow/agent attribution; no Agents integration module ships.
+- [LangChain and LangGraph](docs/integrations/langchain.md) — the shipped
+  content-free handler plus the exact recipe shim covers basic non-streaming
+  `invoke`/`ainvoke` Chat Completions and explicit graph hierarchy.
+- [CrewAI](docs/integrations/crewai.md) — the shipped content-free listener
+  adds crew/task hierarchy; native LiteLLM has no Solwyn enforcement, while the
+  narrow custom-`BaseLLM` recipe routes one sync plain-text call through a
+  wrapped client.
+
+Compatibility is limited to the paths named in the matrix and recipes; do not
+infer budget enforcement for other framework call surfaces.
 
 ## Providers
 
