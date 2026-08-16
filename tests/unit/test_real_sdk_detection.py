@@ -293,10 +293,10 @@ class TestLegacyGoogleRealClient:
         settlements: list[tuple[Any, Any]] = []
 
         with (
-            patch.object(solwyn._budget._http, "post", return_value=budget_response),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=budget_response),
             patch.object(model, "generate_content", return_value=response) as generate_content,
             patch.object(
-                solwyn._reporter,
+                solwyn._solwyn_reporter,
                 "report_settlement",
                 side_effect=lambda confirm, event: settlements.append((confirm, event)),
             ),
@@ -380,15 +380,15 @@ class TestLegacyGoogleRealClient:
         budget_response.raise_for_status.return_value = None
 
         with (
-            patch.object(solwyn._budget._http, "post", return_value=budget_response),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=budget_response),
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
-                wraps=solwyn._budget.check_budget,
+                wraps=solwyn._solwyn_budget.check_budget,
             ) as check_budget,
             patch.object(model, "generate_content", return_value=response) as generate_content,
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
         ):
             result = solwyn.generate_content(
                 "Hi",
@@ -466,9 +466,9 @@ class TestLegacyGoogleRealClient:
                 "create",
                 side_effect=RetryableError("primary unavailable"),
             ),
-            patch.object(solwyn._budget._http, "post", return_value=budget_response),
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=budget_response),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
         ):
             response = solwyn.chat.completions.create(
                 model="gpt-5.5",
@@ -560,14 +560,14 @@ class TestLegacyGoogleRealClient:
                 "generate_content",
                 side_effect=RetryableError("primary unavailable"),
             ),
-            patch.object(solwyn._budget._http, "post", return_value=budget_response),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=budget_response),
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
-                wraps=solwyn._budget.check_budget,
+                wraps=solwyn._solwyn_budget.check_budget,
             ) as check_budget,
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
         ):
             response = solwyn.models.generate_content(
                 model="gemini-2.5-flash",
@@ -648,14 +648,14 @@ class TestLegacyGoogleRealClient:
         budget_response.raise_for_status.return_value = None
 
         with (
-            patch.object(solwyn._budget._http, "post", return_value=budget_response),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=budget_response),
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
-                wraps=solwyn._budget.check_budget,
+                wraps=solwyn._solwyn_budget.check_budget,
             ) as check_budget,
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
         ):
             response = solwyn.generate_content(
                 "Hello",
@@ -703,11 +703,11 @@ class TestLegacyGoogleRealClient:
         budget_response.raise_for_status.return_value = None
 
         with (
-            patch.object(solwyn._budget._http, "post", return_value=budget_response),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=budget_response),
             patch.object(primary, "generate_content", return_value=success) as primary_call,
             patch.object(fallback, "generate_content") as fallback_call,
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
         ):
             assert solwyn.generate_content("Hello") is success
             primary_call.side_effect = RetryableError("primary unavailable")
@@ -749,15 +749,15 @@ class TestLegacyGoogleRealClient:
                 "generate_content",
                 return_value=primary_response,
             ) as primary_call,
-            patch.object(solwyn._budget._http, "post", return_value=budget_response),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=budget_response),
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
-                wraps=solwyn._budget.check_budget,
+                wraps=solwyn._solwyn_budget.check_budget,
             ) as check_budget,
             patch.object(fallback, "generate_content") as fallback_call,
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
         ):
             response = solwyn.models.generate_content(
                 model="gemini-2.5-flash",
@@ -826,9 +826,9 @@ class TestLegacyGoogleRealClient:
                 autospec=True,
                 return_value=fallback_response,
             ) as generate_content,
-            patch.object(solwyn._budget._http, "post", return_value=budget_response),
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=budget_response),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
         ):
             response = solwyn.generate_content(
                 contents="Hello",
@@ -900,9 +900,9 @@ class TestLegacyGoogleRealClient:
                 autospec=True,
                 return_value=fallback_response,
             ) as create,
-            patch.object(solwyn._budget._http, "post", return_value=budget_response),
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=budget_response),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
         ):
             response = solwyn.generate_content(
                 "Hello",
@@ -960,9 +960,9 @@ class TestLegacyGoogleRealClient:
                 autospec=True,
                 return_value=fallback_response,
             ) as create,
-            patch.object(solwyn._budget._http, "post", return_value=budget_response),
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=budget_response),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
         ):
             response = solwyn.generate_content("Hello")
 
@@ -1043,14 +1043,14 @@ class TestLegacyGoogleRealClient:
                 autospec=True,
                 return_value=fallback_response,
             ) as generate_content,
-            patch.object(solwyn._budget._http, "post", return_value=budget_response),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=budget_response),
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
-                wraps=solwyn._budget.check_budget,
+                wraps=solwyn._solwyn_budget.check_budget,
             ) as check_budget,
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
         ):
             response = solwyn.generate_content(
                 "Hello",
@@ -1144,9 +1144,9 @@ class TestLegacyGoogleRealClient:
         settlements: list[tuple[Any, Any]] = []
 
         with (
-            patch.object(solwyn._budget._http, "post", return_value=budget_response),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=budget_response),
             patch.object(
-                solwyn._reporter,
+                solwyn._solwyn_reporter,
                 "report_settlement",
                 side_effect=lambda confirm, event: settlements.append((confirm, event)),
             ),

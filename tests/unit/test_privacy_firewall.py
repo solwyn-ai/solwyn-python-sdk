@@ -733,10 +733,10 @@ class _RecordingResponse:
 class _RecordingHttpClient:
     """Fake httpx client capturing every ``json=`` body POSTed to the Cloud API.
 
-    Stands in for BOTH ``_budget._http`` and ``_reporter._http`` so the test
-    sees the budget check, the confirm, AND the metadata-ingest payloads. The
-    budget-check URL returns an allow-response so the call proceeds and the
-    cross-provider hop (translation + Anthropic serve) actually fires.
+    Stands in for BOTH ``_solwyn_budget._http`` and ``_solwyn_reporter._http``
+    so the test sees the budget check, the confirm, AND the metadata-ingest
+    payloads. The budget-check URL returns an allow-response so the call proceeds
+    and the cross-provider hop (translation + Anthropic serve) actually fires.
     """
 
     def __init__(self, captured: list[object]) -> None:
@@ -786,12 +786,12 @@ def test_failover_solwyn_payloads_carry_no_content() -> None:
     # The background thread ran the no-op _flush_loop and exited; _shutdown stays
     # UNSET so the non-streaming report_settlement can still enqueue the
     # settlement (report_settlement drops items once shutdown is set).
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
 
     # Capture every json= body POSTed to config.api_url on BOTH clients.
     captured: list[object] = []
-    solwyn._budget._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
-    solwyn._reporter._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
+    solwyn._solwyn_budget._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
+    solwyn._solwyn_reporter._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
 
     # Force the primary circuit OPEN so the chain skips OpenAI and the
     # cross-provider Anthropic hop fires (translation + normalization run).
@@ -809,7 +809,7 @@ def test_failover_solwyn_payloads_carry_no_content() -> None:
 
     # ── Act: run the call; then drain the reporter queue through the fake. ─
     result = solwyn.chat.completions.create(**request)
-    solwyn._reporter._flush_remaining()  # drives metadata-ingest through the fake
+    solwyn._solwyn_reporter._flush_remaining()  # drives metadata-ingest through the fake
 
     # Sanity: the cross-provider hop actually served (so translation DID run on
     # SENTINEL-bearing content) and the response normalized back to OpenAI shape.
@@ -825,8 +825,8 @@ def test_failover_solwyn_payloads_carry_no_content() -> None:
         "the translating cross-provider failover path."
     )
 
-    solwyn._budget._http.close()
-    solwyn._reporter._http.close()
+    solwyn._solwyn_budget._http.close()
+    solwyn._solwyn_reporter._http.close()
 
 
 @pytest.mark.unit
@@ -891,11 +891,11 @@ def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
         )
     # The background thread ran the no-op _flush_loop and exited; _shutdown stays
     # UNSET so on_complete's report_settlement can still enqueue the settlement.
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
 
     captured: list[object] = []
-    solwyn._budget._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
-    solwyn._reporter._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
+    solwyn._solwyn_budget._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
+    solwyn._solwyn_reporter._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
 
     # Force the primary circuit OPEN so the cross-provider Anthropic stream hop
     # fires (per-chunk translation runs on SENTINEL-bearing chunk content).
@@ -916,7 +916,7 @@ def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
     #         fires; then flush the reporter queue through the fake. ───────────
     stream = solwyn.chat.completions.create(**request)
     chunks = list(stream)
-    solwyn._reporter._flush_remaining()
+    solwyn._solwyn_reporter._flush_remaining()
 
     # Sanity: the cross-provider stream hop actually served, and the caller saw
     # OpenAI-dialect chunks carrying the (SENTINEL-bearing) Anthropic text.
@@ -932,8 +932,8 @@ def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
         "API on the translating cross-provider failover STREAM path."
     )
 
-    solwyn._budget._http.close()
-    solwyn._reporter._http.close()
+    solwyn._solwyn_budget._http.close()
+    solwyn._solwyn_reporter._http.close()
 
 
 # --------------------------------------------------------------------------- #

@@ -379,20 +379,20 @@ class TestSyncBreakerReporter:
                 fallback=[(anthropic, "claude-sonnet-5")],
                 breaker_reporting_enabled=False,
             )
-        solwyn._reporter._thread.join(timeout=2.0)
+        solwyn._solwyn_reporter._thread.join(timeout=2.0)
 
-        assert solwyn._reporter._breaker_snapshots is not None
-        snapshots = solwyn._reporter._breaker_snapshots()
+        assert solwyn._solwyn_reporter._breaker_snapshots is not None
+        snapshots = solwyn._solwyn_reporter._breaker_snapshots()
         assert {provider for provider, _snapshot in snapshots} == {
             ProviderName.OPENAI,
             ProviderName.ANTHROPIC,
         }
         assert all(snapshot.model_config["frozen"] for _provider, snapshot in snapshots)
-        assert solwyn._reporter._sdk_instance_id == solwyn._sdk_instance_id
-        assert solwyn._reporter._breaker_reporting_enabled is False
+        assert solwyn._solwyn_reporter._sdk_instance_id == solwyn._solwyn_sdk_instance_id
+        assert solwyn._solwyn_reporter._breaker_reporting_enabled is False
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_next_flush_uses_current_state_and_wall_clock_only(self) -> None:
         breaker = CircuitBreaker(failure_threshold=1)

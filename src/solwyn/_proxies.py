@@ -101,7 +101,7 @@ def _embeddings_spec(solwyn: Solwyn | AsyncSolwyn) -> MediaSurfaceSpec:
     ``usage.prompt_tokens`` response shape. The request-side estimator binds the
     primary provider name so the char->token ratio matches it.
     """
-    provider = solwyn._adapter.name
+    provider = solwyn._solwyn_adapter.name
     return MediaSurfaceSpec(
         surface="embeddings",
         modality="embedding",
@@ -516,7 +516,7 @@ class _SyncResponsesProxy:
         """Return a metered wrapper around OpenAI's stream-manager helper."""
         self._solwyn._enforce_explicit_surface("responses.stream", source=SurfaceSource.WRAPPER)
         if _is_existing_responses_stream(kwargs):
-            return self._solwyn._client.responses.stream(**kwargs)
+            return self._solwyn._solwyn_client.responses.stream(**kwargs)
         _reject_responses_background(kwargs)
         return self._solwyn._intercepted_call(
             _surface="responses",
@@ -527,7 +527,7 @@ class _SyncResponsesProxy:
     def __getattr__(self, name: str) -> Any:
         """Resolve non-metered leaves as guarded raw Responses operations."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.responses,
+            self._solwyn._solwyn_client.responses,
             name=name,
             path=f"responses.{name}",
             source=SurfaceSource.RAW,
@@ -550,7 +550,7 @@ class _SyncChatCompletionsProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to OpenAI's chat.completions."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.chat.completions,
+            self._solwyn._solwyn_client.chat.completions,
             name=name,
             path=f"chat.completions.{name}",
             source=SurfaceSource.RAW,
@@ -571,9 +571,9 @@ class _SyncChatProxy:
         plus every OpenAI-compatible provider). Any attribute that is not
         ``completions`` (set in __init__) falls through here.
         """
-        if self._solwyn._dialect == "openai":
+        if self._solwyn._solwyn_dialect == "openai":
             return self._solwyn._resolve_public_attribute(
-                self._solwyn._client.chat,
+                self._solwyn._solwyn_client.chat,
                 name=name,
                 path=f"chat.{name}",
                 source=SurfaceSource.RAW,
@@ -607,7 +607,7 @@ class _SyncEmbeddingsProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's embeddings."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.embeddings,
+            self._solwyn._solwyn_client.embeddings,
             name=name,
             path=f"embeddings.{name}",
             source=SurfaceSource.RAW,
@@ -652,7 +652,7 @@ class _SyncImagesProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through non-generate/edit attributes to the client's images."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.images,
+            self._solwyn._solwyn_client.images,
             name=name,
             path=f"images.{name}",
             source=SurfaceSource.RAW,
@@ -687,7 +687,7 @@ class _SyncAudioTranscriptionsProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's audio.transcriptions."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.audio.transcriptions,
+            self._solwyn._solwyn_client.audio.transcriptions,
             name=name,
             path=f"audio.transcriptions.{name}",
             source=SurfaceSource.RAW,
@@ -732,13 +732,13 @@ class _SyncAudioSpeechProxy:
                 source=SurfaceSource.SYNTHETIC_POLICY,
                 condition=SurfaceCondition.OPENAI_UNTRACKED_TTS_MODEL,
             )
-            return self._solwyn._client.audio.speech.create(**kwargs)
+            return self._solwyn._solwyn_client.audio.speech.create(**kwargs)
         return self._solwyn._media_call(self._spec, **{**kwargs, _AUDIO_OP_KEY: "speech"})
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's audio.speech."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.audio.speech,
+            self._solwyn._solwyn_client.audio.speech,
             name=name,
             path=f"audio.speech.{name}",
             source=SurfaceSource.RAW,
@@ -764,7 +764,7 @@ class _SyncAudioProxy:
     def translations(self) -> Any:
         """Resolve the client's untracked audio translations resource."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.audio,
+            self._solwyn._solwyn_client.audio,
             name="translations",
             path="audio.translations",
             source=SurfaceSource.RAW,
@@ -773,7 +773,7 @@ class _SyncAudioProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through other audio attributes (e.g. with_raw_response) to the client."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.audio,
+            self._solwyn._solwyn_client.audio,
             name=name,
             path=f"audio.{name}",
             source=SurfaceSource.RAW,
@@ -810,7 +810,7 @@ class _SyncVideosProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's videos."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.videos,
+            self._solwyn._solwyn_client.videos,
             name=name,
             path=f"videos.{name}",
             source=SurfaceSource.RAW,
@@ -833,7 +833,7 @@ class _SyncMessagesProxy:
 
     def __getattr__(self, name: str) -> Any:
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.messages,
+            self._solwyn._solwyn_client.messages,
             name=name,
             path=f"messages.{name}",
             source=SurfaceSource.RAW,
@@ -917,7 +917,7 @@ class _SyncModelsProxy:
         # Solwyn.__getattr__. The shared resolver applies exact-path policy;
         # explicit tracked methods above never reach this seam.
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.models,
+            self._solwyn._solwyn_client.models,
             name=name,
             path=f"models.{name}",
             source=SurfaceSource.RAW,
@@ -961,7 +961,7 @@ class _AsyncResponsesProxy:
         """Return OpenAI's async-manager shape while deferring Solwyn I/O."""
         self._solwyn._enforce_explicit_surface("responses.stream", source=SurfaceSource.WRAPPER)
         if _is_existing_responses_stream(kwargs):
-            return self._solwyn._client.responses.stream(**kwargs)
+            return self._solwyn._solwyn_client.responses.stream(**kwargs)
         _reject_responses_background(kwargs)
         return _DeferredAsyncResponsesStreamManagerWrapper(
             lambda: self._solwyn._intercepted_call(
@@ -972,7 +972,7 @@ class _AsyncResponsesProxy:
     def __getattr__(self, name: str) -> Any:
         """Resolve non-metered leaves as guarded raw Responses operations."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.responses,
+            self._solwyn._solwyn_client.responses,
             name=name,
             path=f"responses.{name}",
             source=SurfaceSource.RAW,
@@ -995,7 +995,7 @@ class _AsyncChatCompletionsProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to OpenAI's chat.completions."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.chat.completions,
+            self._solwyn._solwyn_client.chat.completions,
             name=name,
             path=f"chat.completions.{name}",
             source=SurfaceSource.RAW,
@@ -1010,9 +1010,9 @@ class _AsyncChatProxy:
         self.completions = _AsyncChatCompletionsProxy(solwyn)
 
     def __getattr__(self, name: str) -> Any:
-        if self._solwyn._dialect == "openai":
+        if self._solwyn._solwyn_dialect == "openai":
             return self._solwyn._resolve_public_attribute(
-                self._solwyn._client.chat,
+                self._solwyn._solwyn_client.chat,
                 name=name,
                 path=f"chat.{name}",
                 source=SurfaceSource.RAW,
@@ -1044,7 +1044,7 @@ class _AsyncEmbeddingsProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's embeddings."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.embeddings,
+            self._solwyn._solwyn_client.embeddings,
             name=name,
             path=f"embeddings.{name}",
             source=SurfaceSource.RAW,
@@ -1076,7 +1076,7 @@ class _AsyncImagesProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through non-generate/edit attributes to the client's images."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.images,
+            self._solwyn._solwyn_client.images,
             name=name,
             path=f"images.{name}",
             source=SurfaceSource.RAW,
@@ -1105,7 +1105,7 @@ class _AsyncAudioTranscriptionsProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's audio.transcriptions."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.audio.transcriptions,
+            self._solwyn._solwyn_client.audio.transcriptions,
             name=name,
             path=f"audio.transcriptions.{name}",
             source=SurfaceSource.RAW,
@@ -1135,13 +1135,13 @@ class _AsyncAudioSpeechProxy:
                 source=SurfaceSource.SYNTHETIC_POLICY,
                 condition=SurfaceCondition.OPENAI_UNTRACKED_TTS_MODEL,
             )
-            return await self._solwyn._client.audio.speech.create(**kwargs)
+            return await self._solwyn._solwyn_client.audio.speech.create(**kwargs)
         return await self._solwyn._media_call(self._spec, **{**kwargs, _AUDIO_OP_KEY: "speech"})
 
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's audio.speech."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.audio.speech,
+            self._solwyn._solwyn_client.audio.speech,
             name=name,
             path=f"audio.speech.{name}",
             source=SurfaceSource.RAW,
@@ -1166,7 +1166,7 @@ class _AsyncAudioProxy:
     def translations(self) -> Any:
         """Resolve the client's untracked audio translations resource."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.audio,
+            self._solwyn._solwyn_client.audio,
             name="translations",
             path="audio.translations",
             source=SurfaceSource.RAW,
@@ -1175,7 +1175,7 @@ class _AsyncAudioProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through other audio attributes to the client."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.audio,
+            self._solwyn._solwyn_client.audio,
             name=name,
             path=f"audio.{name}",
             source=SurfaceSource.RAW,
@@ -1207,7 +1207,7 @@ class _AsyncVideosProxy:
     def __getattr__(self, name: str) -> Any:
         """Pass through non-create attributes to the client's videos."""
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.videos,
+            self._solwyn._solwyn_client.videos,
             name=name,
             path=f"videos.{name}",
             source=SurfaceSource.RAW,
@@ -1226,7 +1226,7 @@ class _AsyncMessagesProxy:
 
     def __getattr__(self, name: str) -> Any:
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.messages,
+            self._solwyn._solwyn_client.messages,
             name=name,
             path=f"messages.{name}",
             source=SurfaceSource.RAW,
@@ -1298,7 +1298,7 @@ class _AsyncModelsProxy:
         # See _SyncModelsProxy.__getattr__: the shared resolver applies exact-path
         # policy, and explicit tracked methods never reach this seam.
         return self._solwyn._resolve_public_attribute(
-            self._solwyn._client.models,
+            self._solwyn._solwyn_client.models,
             name=name,
             path=f"models.{name}",
             source=SurfaceSource.RAW,

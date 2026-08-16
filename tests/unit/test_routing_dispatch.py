@@ -12,7 +12,7 @@ the wiring between dispatch and the routing signals is exercised for real:
 - latency observation wiring (fix C): successful non-streaming AND streamed
   hops feed ``record_latency`` so ``observed_p50`` transitions None -> value.
 - price-hint plumbing INTO ``update_price_hints`` (fix D): a budget check that
-  returns non-None ``price_hints`` populates ``_last_price_hints`` and a
+  returns non-None ``price_hints`` populates ``_solwyn_last_price_hints`` and a
   subsequent ``CostPolicy`` ordering reflects it.
 
 No real provider SDKs are importable; clients are duck-typed MagicMocks whose
@@ -109,15 +109,15 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
     defaults.update(overrides)
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
-    solwyn._reporter.report = MagicMock()
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter.report = MagicMock()
     return solwyn
 
 
 def _close(solwyn: Solwyn) -> None:
-    solwyn._reporter._http.close()
-    solwyn._budget._http.close()
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_budget._http.close()
 
 
 _PLAIN_REQUEST = {
@@ -154,16 +154,16 @@ class TestPriceHintLifetimeAcrossCacheHit:
                 _budget_result(price_hints={"openai": 10.0, "anthropic": 2.0}),
                 _budget_result(price_hints=None),  # cache hit
             ]
-            with patch.object(solwyn._budget, "check_budget", side_effect=results):
+            with patch.object(solwyn._solwyn_budget, "check_budget", side_effect=results):
                 solwyn.chat.completions.create(**_PLAIN_REQUEST)
                 # After the first (hint-bearing) call the signal is populated.
-                assert solwyn._last_price_hints == {"openai": 10.0, "anthropic": 2.0}
+                assert solwyn._solwyn_last_price_hints == {"openai": 10.0, "anthropic": 2.0}
 
                 solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
             # Assert — the cache-hit (None) response did NOT wipe the hints; the
             # CostPolicy signal is intact for the whole cache window.
-            assert solwyn._last_price_hints == {"openai": 10.0, "anthropic": 2.0}
+            assert solwyn._solwyn_last_price_hints == {"openai": 10.0, "anthropic": 2.0}
         finally:
             _close(solwyn)
 
@@ -178,21 +178,23 @@ class TestPriceHintLifetimeAcrossCacheHit:
             model="gpt-5.5",
             fallback=[(_anthropic_client(), "claude-sonnet-5")],
         )
-        solwyn._reporter.report = MagicMock()
+        solwyn._solwyn_reporter.report = MagicMock()
         try:
             results = [
                 _budget_result(price_hints={"openai": 10.0, "anthropic": 2.0}),
                 _budget_result(price_hints=None),
             ]
-            with patch.object(solwyn._budget, "check_budget", AsyncMock(side_effect=results)):
+            with patch.object(
+                solwyn._solwyn_budget, "check_budget", AsyncMock(side_effect=results)
+            ):
                 await solwyn.chat.completions.create(**_PLAIN_REQUEST)
-                assert solwyn._last_price_hints == {"openai": 10.0, "anthropic": 2.0}
+                assert solwyn._solwyn_last_price_hints == {"openai": 10.0, "anthropic": 2.0}
                 await solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-            assert solwyn._last_price_hints == {"openai": 10.0, "anthropic": 2.0}
+            assert solwyn._solwyn_last_price_hints == {"openai": 10.0, "anthropic": 2.0}
         finally:
-            await solwyn._reporter._http.aclose()
-            await solwyn._budget._http.aclose()
+            await solwyn._solwyn_reporter._http.aclose()
+            await solwyn._solwyn_budget._http.aclose()
 
 
 # ── B: POLICY-SWAP DROP-IN through the real dispatch loop ────────────────
@@ -220,7 +222,7 @@ class TestPolicySwapThroughDispatch:
             for _ in range(5):
                 solwyn.record_latency("openai", 400.0)
                 solwyn.record_latency("anthropic", 20.0)
-            with patch.object(solwyn._budget, "check_budget", return_value=_budget_result()):
+            with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_budget_result()):
                 result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
             # OpenAI primary returns native; an Anthropic served hop is normalized
             # back to OpenAI dialect but its text is "ok from claude".
@@ -246,7 +248,7 @@ class TestPolicySwapThroughDispatch:
         solwyn = _make_solwyn(c["primary"], selection_policy=CostPolicy(), **c["chain"])
         try:
             with patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
                 return_value=_budget_result(price_hints={"openai": 9.0, "anthropic": 1.0}),
             ):
@@ -269,7 +271,7 @@ class TestLatencyObservedThroughDispatch:
             # Below the min-sample threshold -> None.
             assert solwyn.observed_p50("openai") is None
 
-            with patch.object(solwyn._budget, "check_budget", return_value=_budget_result()):
+            with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_budget_result()):
                 for _ in range(4):
                     solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -289,7 +291,7 @@ class TestLatencyObservedThroughDispatch:
         )
         solwyn = _make_solwyn(openai, model="gpt-5.5")
         try:
-            with patch.object(solwyn._budget, "check_budget", return_value=_budget_result()):
+            with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_budget_result()):
                 for _ in range(3):
                     stream = solwyn.chat.completions.create(stream=True, **_PLAIN_REQUEST)
                     # Drain fully so the wrapper fires on_complete (latency record).
@@ -307,7 +309,7 @@ class TestLatencyObservedThroughDispatch:
 
 @pytest.mark.unit
 class TestPriceHintPlumbingFromBudgetCheck:
-    def test_budget_hints_populate_last_price_hints_and_drive_cost_order(self) -> None:
+    def test_budget_hints_populate_solwyn_last_price_hints_and_drive_cost_order(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
         anthropic = _anthropic_client()
@@ -320,18 +322,18 @@ class TestPriceHintPlumbingFromBudgetCheck:
         )
         try:
             # Before any check, no hints -> CostPolicy is on health/config order.
-            assert solwyn._last_price_hints == {}
+            assert solwyn._solwyn_last_price_hints == {}
             assert _ordered_providers(solwyn) == ["openai", "anthropic"]
 
             with patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
                 return_value=_budget_result(price_hints={"openai": 10.0, "anthropic": 2.0}),
             ):
                 solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-            # The budget check's hints flowed into _last_price_hints...
-            assert solwyn._last_price_hints == {"openai": 10.0, "anthropic": 2.0}
+            # The budget check's hints flowed into _solwyn_last_price_hints...
+            assert solwyn._solwyn_last_price_hints == {"openai": 10.0, "anthropic": 2.0}
             # ...and a subsequent CostPolicy ordering reflects them (anthropic
             # cheaper -> first).
             assert _ordered_providers(solwyn) == ["anthropic", "openai"]
@@ -351,7 +353,7 @@ class TestDeadlineBoundsThroughDispatch:
         )
         try:
             check_spy = MagicMock(return_value=_budget_result())
-            with patch.object(solwyn._budget, "check_budget", check_spy):
+            with patch.object(solwyn._solwyn_budget, "check_budget", check_spy):
                 solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
             budget_timeout = check_spy.call_args.kwargs["timeout"]

@@ -399,15 +399,17 @@ def _sync_solwyn(client: object, **overrides: object) -> Iterator[Solwyn]:
     defaults.update(overrides)
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
-    solwyn._reporter.report = MagicMock(spec=solwyn._reporter.report)
-    solwyn._reporter.report_settlement = MagicMock(spec=solwyn._reporter.report_settlement)
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter.report = MagicMock(spec=solwyn._solwyn_reporter.report)
+    solwyn._solwyn_reporter.report_settlement = MagicMock(
+        spec=solwyn._solwyn_reporter.report_settlement
+    )
     try:
         yield solwyn
     finally:
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
 
 @asynccontextmanager
@@ -415,13 +417,15 @@ async def _async_solwyn(client: object, **overrides: object) -> AsyncIterator[As
     defaults: dict[str, object] = {"api_key": VALID_API_KEY, "model": "gpt-5.5"}
     defaults.update(overrides)
     solwyn = AsyncSolwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter.report = MagicMock(spec=solwyn._reporter.report)
-    solwyn._reporter.report_settlement = MagicMock(spec=solwyn._reporter.report_settlement)
+    solwyn._solwyn_reporter.report = MagicMock(spec=solwyn._solwyn_reporter.report)
+    solwyn._solwyn_reporter.report_settlement = MagicMock(
+        spec=solwyn._solwyn_reporter.report_settlement
+    )
     try:
         yield solwyn
     finally:
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
 
 class _Status(Exception):
@@ -622,9 +626,9 @@ class TestResponsesPublicProxySync:
             call_kwargs["extra_body"] = extra_body
 
         with _sync_solwyn(client, default_params=defaults) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 if operation == "parse":
@@ -657,8 +661,8 @@ class TestResponsesPublicProxySync:
         extra_body = {"vendor_extension": {"mode": "safe"}}
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = solwyn.responses.create(
                     model="gpt-5.5",
                     input="hello",
@@ -686,8 +690,8 @@ class TestResponsesPublicProxySync:
             ) as detector,
             _sync_solwyn(client, provider="openai") as solwyn,
         ):
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
-            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._solwyn_budget._lease.true_up)
             kwargs: dict[str, object] = {
                 "model": "gpt-5.5",
                 "input": "12345678",
@@ -696,8 +700,8 @@ class TestResponsesPublicProxySync:
             if leaf == "parse":
                 kwargs["text_format"] = dict
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget._lease, "true_up", new=true_up),
             ):
                 result = getattr(solwyn.responses, leaf)(**kwargs)
 
@@ -708,7 +712,7 @@ class TestResponsesPublicProxySync:
                 claim_token=7,
                 floor_at_reservation=True,
             )
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert result is response
             assert event.provider.value == "openai"
             assert event.input_tokens == 2
@@ -731,16 +735,16 @@ class TestResponsesPublicProxySync:
             _sync_solwyn(client, provider="openai") as solwyn,
         ):
             assert isinstance(solwyn.responses, _SyncResponsesProxy)
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = solwyn.responses.create(model="gpt-5.5", input="hello")
 
             assert result is response
             detect.assert_not_called()
-            assert solwyn._adapter.name == "openai"
+            assert solwyn._solwyn_adapter.name == "openai"
             assert check.call_args.kwargs["provider"] == "openai"
-            solwyn._reporter.report_settlement.assert_called_once()
-            _, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            _, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.provider.value == "openai"
 
     def test_azure_create_uses_responses_defaults_and_azure_attribution(self) -> None:
@@ -757,8 +761,8 @@ class TestResponsesPublicProxySync:
                 "max_tokens": 999,
             },
         ) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = solwyn.responses.create(
                     model="deployment",
                     input="hello",
@@ -779,8 +783,8 @@ class TestResponsesPublicProxySync:
                     "max_output_tokens": 321,
                 }
             ]
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.provider.value == "azure_openai"
             assert event.input_tokens == 120
             assert event.output_tokens == 45
@@ -792,8 +796,8 @@ class TestResponsesPublicProxySync:
         client = AzureOpenAI(response)
 
         with _sync_solwyn(client, model="deployment") as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = solwyn.responses.parse(
                     model="deployment",
                     input="hello",
@@ -807,7 +811,7 @@ class TestResponsesPublicProxySync:
             assert client._responses.parse_calls == [
                 {"model": "deployment", "input": "hello", "text_format": dict}
             ]
-            solwyn._reporter.report_settlement.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.parametrize("usage_state", ["missing", "zero"])
     @pytest.mark.parametrize("leaf", ["create", "parse"])
@@ -820,8 +824,8 @@ class TestResponsesPublicProxySync:
         client = AzureOpenAI(response)
 
         with _sync_solwyn(client, model="deployment") as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
-            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._solwyn_budget._lease.true_up)
             kwargs: dict[str, object] = {
                 "model": "deployment",
                 "input": "12345678",
@@ -830,8 +834,8 @@ class TestResponsesPublicProxySync:
             if leaf == "parse":
                 kwargs["text_format"] = dict
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget._lease, "true_up", new=true_up),
             ):
                 result = getattr(solwyn.responses, leaf)(**kwargs)
 
@@ -842,8 +846,8 @@ class TestResponsesPublicProxySync:
                 claim_token=7,
                 floor_at_reservation=True,
             )
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert result is response
             assert event.provider.value == "azure_openai"
             assert event.input_tokens == 2
@@ -856,11 +860,11 @@ class TestResponsesPublicProxySync:
         client = AzureOpenAI(response)
 
         with _sync_solwyn(client, model="deployment") as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
-            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._solwyn_budget._lease.true_up)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget._lease, "true_up", new=true_up),
             ):
                 result = solwyn.responses.create(model="deployment", input="12345678")
 
@@ -872,7 +876,7 @@ class TestResponsesPublicProxySync:
                 floor_at_reservation=False,
             )
             assert result is response
-            _, event = solwyn._reporter.report_settlement.call_args.args
+            _, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 120
             assert event.output_tokens == 45
             assert event.token_details.is_estimated is False
@@ -885,8 +889,8 @@ class TestResponsesPublicProxySync:
         client = AzureOpenAI(provider_stream)
 
         with _sync_solwyn(client, model="deployment") as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 stream = solwyn.responses.create(
                     model="deployment",
                     input="hello",
@@ -898,8 +902,8 @@ class TestResponsesPublicProxySync:
             assert client._responses.create_calls == [
                 {"model": "deployment", "input": "hello", "stream": True}
             ]
-            solwyn._reporter.report_settlement.assert_called_once()
-            _, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            _, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.provider.value == "azure_openai"
             assert event.input_tokens == 30
             assert event.output_tokens == 12
@@ -912,11 +916,11 @@ class TestResponsesPublicProxySync:
         client = AzureOpenAI(provider_stream)
 
         with _sync_solwyn(client, model="deployment") as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
-            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._solwyn_budget._lease.true_up)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget._lease, "true_up", new=true_up),
             ):
                 stream = solwyn.responses.create(
                     model="deployment",
@@ -927,8 +931,8 @@ class TestResponsesPublicProxySync:
                 assert list(stream) == [delta]
 
             call_id = check.call_args.kwargs["call_id"]
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             # The accumulator's own length estimate is kept as telemetry, but it
             # cannot account for all output, so the lease holds its bound.
             assert event.token_details.is_estimated is True
@@ -948,9 +952,9 @@ class TestResponsesPublicProxySync:
         client = AzureOpenAI(provider_manager)
 
         with _sync_solwyn(client, model="deployment") as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 solwyn.responses.stream(model="deployment", input="hello") as events,
             ):
                 assert list(events) == [terminal]
@@ -958,8 +962,8 @@ class TestResponsesPublicProxySync:
 
             check.assert_called_once()
             assert client._responses.stream_calls == [{"model": "deployment", "input": "hello"}]
-            solwyn._reporter.report_settlement.assert_called_once()
-            _, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            _, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.provider.value == "azure_openai"
             assert event.input_tokens == 30
             assert event.output_tokens == 12
@@ -974,8 +978,8 @@ class TestResponsesPublicProxySync:
             model="deployment",
             default_params={"instructions": "must-not-leak"},
         ) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = solwyn.responses.stream(response_id="resp_123", starting_after=7)
 
             assert result is provider_manager
@@ -983,15 +987,15 @@ class TestResponsesPublicProxySync:
                 {"response_id": "resp_123", "starting_after": 7}
             ]
             check.assert_not_called()
-            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
 
     def test_azure_background_refusal_happens_before_budget_or_provider(self) -> None:
         client = AzureOpenAI(_responses_response())
 
         with _sync_solwyn(client, model="deployment") as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 solwyn.responses.create(
@@ -1010,12 +1014,12 @@ class TestResponsesPublicProxySync:
         client._responses.create = MagicMock(side_effect=error)  # type: ignore[method-assign]
 
         with _sync_solwyn(client, model="deployment") as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("azure_openai"),
                     "record_failure",
@@ -1036,14 +1040,14 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(response)
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = solwyn.responses.create(model="gpt-5.5", input="hello")
 
             assert result is response
             check.assert_called_once()
             assert client._responses.create_calls == [{"model": "gpt-5.5", "input": "hello"}]
-            solwyn._reporter.report_settlement.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     def test_native_parse_reuses_defaults_budgeting_dispatch_and_flat_settlement(self) -> None:
         # Arrange.
@@ -1058,8 +1062,8 @@ class TestResponsesPublicProxySync:
             client,
             default_params={"instructions": "12345678", "max_output_tokens": 321},
         ) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = solwyn.responses.parse(
                     model="gpt-5.5",
                     input="abcd",
@@ -1083,8 +1087,8 @@ class TestResponsesPublicProxySync:
                     "max_output_tokens": 321,
                 }
             ]
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 120
             assert event.output_tokens == 45
             assert event.service_tier == "priority"
@@ -1109,9 +1113,9 @@ class TestResponsesPublicProxySync:
 
         # Act.
         with _sync_solwyn(client, default_params=default_params) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 solwyn.responses.parse(
@@ -1134,9 +1138,9 @@ class TestResponsesPublicProxySync:
 
         # Act.
         with _sync_solwyn(client, default_params={"stream": True}) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 solwyn.responses.parse(
@@ -1167,17 +1171,17 @@ class TestResponsesPublicProxySync:
             default_params={"instructions": "12345678", "max_output_tokens": 321},
         ) as solwyn:
             check = MagicMock(
-                spec=solwyn._budget.check_budget,
+                spec=solwyn._solwyn_budget.check_budget,
                 side_effect=lambda **_kwargs: (order.append("budget.check"), _allow_budget())[1],
             )
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 manager = solwyn.responses.stream(
                     model="gpt-5.5",
                     input="abcd",
                     temperature=0.4,
                 )
                 assert order == ["budget.check", "manager.create"]
-                solwyn._reporter.report_settlement.assert_not_called()
+                solwyn._solwyn_reporter.report_settlement.assert_not_called()
 
                 with manager as events:
                     assert list(events) == [delta, terminal]
@@ -1196,8 +1200,8 @@ class TestResponsesPublicProxySync:
             assert provider_manager.enter_calls == 1
             assert len(provider_manager.exit_calls) == 1
             assert inner.close_calls == 1
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 30
             assert event.output_tokens == 12
             assert event.service_tier == "flex"
@@ -1214,8 +1218,8 @@ class TestResponsesPublicProxySync:
             default_params={"instructions": "must-not-leak", "max_output_tokens": 321},
             on_unmetered="raise",
         ) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 manager = solwyn.responses.stream(
                     response_id="resp_123",
                     starting_after=7,
@@ -1231,8 +1235,8 @@ class TestResponsesPublicProxySync:
                 }
             ]
             check.assert_not_called()
-            solwyn._reporter.report_settlement.assert_not_called()
-            solwyn._reporter.report.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_not_called()
 
     @pytest.mark.parametrize(
         "selector_kwargs",
@@ -1249,14 +1253,14 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(provider_manager)
 
         with _sync_solwyn(client, on_unmetered="raise") as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 manager = solwyn.responses.stream(**selector_kwargs)
 
             assert manager is provider_manager
             assert client._responses.stream_calls == [selector_kwargs]
             check.assert_not_called()
-            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
 
     @pytest.mark.parametrize(
         ("sentinel_key", "sentinel"),
@@ -1278,8 +1282,8 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(provider_manager)
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 manager = solwyn.responses.stream(
                     model="gpt-5.5",
                     input="1234",
@@ -1297,7 +1301,7 @@ class TestResponsesPublicProxySync:
                     sentinel_key: sentinel,
                 }
             ]
-            solwyn._reporter.report_settlement.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     def test_native_stream_helper_abandonment_estimates_and_holds_lease_floor(self) -> None:
         delta = SimpleNamespace(type="response.output_text.delta", delta="partial")
@@ -1306,11 +1310,11 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(provider_manager)
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
-            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._solwyn_budget._lease.true_up)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget._lease, "true_up", new=true_up),
                 solwyn.responses.stream(
                     model="gpt-5.5",
                     input="12345678",
@@ -1326,8 +1330,8 @@ class TestResponsesPublicProxySync:
                 claim_token=7,
                 floor_at_reservation=True,
             )
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 2
             assert event.output_tokens == 0
             assert event.token_details.is_estimated is True
@@ -1341,9 +1345,9 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(_FakeSyncResponseStreamManager(inner))
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 solwyn.responses.stream(model="gpt-5.5", input="1234") as events,
             ):
                 result = events.get_final_response()
@@ -1352,8 +1356,8 @@ class TestResponsesPublicProxySync:
             assert hasattr(events, "until_done")
             assert hasattr(events, "get_final_response")
             assert inner.get_final_response_calls == 1
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 30
             assert event.output_tokens == 12
             assert event.service_tier == "flex"
@@ -1365,12 +1369,12 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(provider_manager)
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_success = MagicMock()
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_success",
@@ -1387,8 +1391,8 @@ class TestResponsesPublicProxySync:
             assert len(provider_manager.exit_calls) == 1
             release.assert_called_once()
             breaker_success.assert_not_called()
-            solwyn._reporter.report_settlement.assert_not_called()
-            solwyn._reporter.report.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_not_called()
 
     def test_native_stream_helper_enter_failure_releases_reservation(self) -> None:
         error = _Status(503, "stream open failed")
@@ -1397,12 +1401,12 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(provider_manager)
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -1418,9 +1422,9 @@ class TestResponsesPublicProxySync:
             # 5xx is post-send ambiguous: a health failure whose charge the
             # server must reconcile.
             breaker_failure.assert_called_once_with()
-            solwyn._reporter.report_settlement.assert_not_called()
-            solwyn._reporter.report.assert_called_once()
-            event = solwyn._reporter.report.call_args.args[0]
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
+            event = solwyn._solwyn_reporter.report.call_args.args[0]
             assert event.possibly_succeeded is True
             assert event.failover_error_class == "_Status"
 
@@ -1431,12 +1435,12 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(provider_manager)
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -1452,9 +1456,9 @@ class TestResponsesPublicProxySync:
             # status on create(stream=True) records nothing either.
             breaker_failure.assert_not_called()
             release.assert_called_once()
-            solwyn._reporter.report_settlement.assert_not_called()
-            solwyn._reporter.report.assert_called_once()
-            event = solwyn._reporter.report.call_args.args[0]
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
+            event = solwyn._solwyn_reporter.report.call_args.args[0]
             assert event.possibly_succeeded is None
             assert event.failover_error_class == "_Status"
 
@@ -1467,15 +1471,15 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(provider_manager)
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ValueError, match="application failed"),
                 solwyn.responses.stream(model="gpt-5.5", input="1234"),
             ):
                 raise ValueError("application failed")
 
-            solwyn._reporter.report_settlement.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     def test_native_stream_helper_wrap_failure_releases_and_closes_once(self) -> None:
         original = ValueError("wrapping failed")
@@ -1484,12 +1488,12 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(provider_manager)
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 patch.object(solwyn, "_wrap_stream", side_effect=original),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
@@ -1505,8 +1509,8 @@ class TestResponsesPublicProxySync:
             assert exc_info.value is original
             release.assert_called_once()
             breaker_failure.assert_called_once_with()
-            solwyn._reporter.report.assert_called_once()
-            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert len(provider_manager.exit_calls) == 1
             assert inner.close_calls == 1
 
@@ -1516,9 +1520,9 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(_responses_response())
 
         with _sync_solwyn(client, report_untracked_surfaces=False) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
                 solwyn.responses.create(model="gpt-5.5", input="hello")
@@ -1529,9 +1533,9 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(_responses_response())
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 solwyn.responses.create(model="gpt-5.5", input="hello", background=True)
@@ -1547,9 +1551,9 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(_responses_response())
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 solwyn.responses.create(
@@ -1569,9 +1573,9 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(_responses_response())
 
         with _sync_solwyn(client, default_params={"background": True}) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 solwyn.responses.create(model="gpt-5.5", input="hello")
@@ -1588,8 +1592,8 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(response)
 
         with _sync_solwyn(client, default_params={"background": True}) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = solwyn.responses.create(
                     model="gpt-5.5",
                     input="hello",
@@ -1614,9 +1618,9 @@ class TestResponsesPublicProxySync:
         client = _NativeOpenAIClient(response)
 
         with _sync_solwyn(client, report_untracked_surfaces=False) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
                 result = solwyn.responses.retrieve("resp_1")
@@ -1640,9 +1644,9 @@ class TestResponsesPublicProxySync:
             model="llama-3.3-70b-versatile",
             report_untracked_surfaces=False,
         ) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
                 result = solwyn.responses.create(model="llama-3.3-70b-versatile", input="hello")
@@ -1670,9 +1674,9 @@ class TestResponsesPublicProxySync:
             model="llama-3.3-70b-versatile",
             report_untracked_surfaces=False,
         ) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
                 result = solwyn.responses.parse(
@@ -1708,9 +1712,9 @@ class TestResponsesPublicProxySync:
             model="llama-3.3-70b-versatile",
             report_untracked_surfaces=False,
         ) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
                 result = solwyn.responses.stream(
@@ -1740,9 +1744,9 @@ class TestResponsesPublicProxySync:
             default_params={"instructions": "must-not-leak"},
             report_untracked_surfaces=False,
         ) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
                 result = solwyn.responses.stream(response_id="resp_123", starting_after=7)
@@ -1752,7 +1756,7 @@ class TestResponsesPublicProxySync:
                 {"response_id": "resp_123", "starting_after": 7}
             ]
             check.assert_not_called()
-            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert any(
                 "untracked surface 'responses.stream'" in record.getMessage()
                 for record in caplog.records
@@ -1778,12 +1782,12 @@ class TestResponsesPublicProxySync:
             model="deployment",
             report_untracked_surfaces=False,
         ) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
-                preparer = _responses_preparer(solwyn._adapter)
+                preparer = _responses_preparer(solwyn._solwyn_adapter)
                 namespace = solwyn.responses
 
                 assert (preparer is not None) is expects_metering
@@ -1906,9 +1910,9 @@ class TestResponsesPublicProxyAsync:
             call_kwargs["extra_body"] = extra_body
 
         async with _async_solwyn(client, default_params=defaults) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 if operation == "parse":
@@ -1942,8 +1946,8 @@ class TestResponsesPublicProxyAsync:
         extra_body = {"vendor_extension": {"mode": "safe"}}
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = await solwyn.responses.create(
                     model="gpt-5.5",
                     input="hello",
@@ -1970,8 +1974,10 @@ class TestResponsesPublicProxyAsync:
             side_effect=AssertionError("provider detection must not run"),
         ) as detector:
             async with _async_solwyn(client, provider="openai") as solwyn:
-                check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
-                true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+                check = AsyncMock(
+                    spec=solwyn._solwyn_budget.check_budget, return_value=_allow_lease()
+                )
+                true_up = MagicMock(spec=solwyn._solwyn_budget._lease.true_up)
                 kwargs: dict[str, object] = {
                     "model": "gpt-5.5",
                     "input": "12345678",
@@ -1980,8 +1986,8 @@ class TestResponsesPublicProxyAsync:
                 if leaf == "parse":
                     kwargs["text_format"] = dict
                 with (
-                    patch.object(solwyn._budget, "check_budget", new=check),
-                    patch.object(solwyn._budget._lease, "true_up", new=true_up),
+                    patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                    patch.object(solwyn._solwyn_budget._lease, "true_up", new=true_up),
                 ):
                     result = await getattr(solwyn.responses, leaf)(**kwargs)
 
@@ -1992,7 +1998,7 @@ class TestResponsesPublicProxyAsync:
                     claim_token=7,
                     floor_at_reservation=True,
                 )
-                confirm, event = solwyn._reporter.report_settlement.call_args.args
+                confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
                 assert result is response
                 assert event.provider.value == "openai"
                 assert event.input_tokens == 2
@@ -2016,16 +2022,18 @@ class TestResponsesPublicProxyAsync:
         ) as detect:
             async with _async_solwyn(client, provider="openai") as solwyn:
                 assert isinstance(solwyn.responses, _AsyncResponsesProxy)
-                check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-                with patch.object(solwyn._budget, "check_budget", new=check):
+                check = AsyncMock(
+                    spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget()
+                )
+                with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                     result = await solwyn.responses.create(model="gpt-5.5", input="hello")
 
                 assert result is response
                 detect.assert_not_called()
-                assert solwyn._adapter.name == "openai"
+                assert solwyn._solwyn_adapter.name == "openai"
                 assert check.call_args.kwargs["provider"] == "openai"
-                solwyn._reporter.report_settlement.assert_called_once()
-                _, event = solwyn._reporter.report_settlement.call_args.args
+                solwyn._solwyn_reporter.report_settlement.assert_called_once()
+                _, event = solwyn._solwyn_reporter.report_settlement.call_args.args
                 assert event.provider.value == "openai"
 
     @pytest.mark.asyncio
@@ -2040,8 +2048,8 @@ class TestResponsesPublicProxyAsync:
             model="deployment",
             default_params={"instructions": "default", "max_output_tokens": 222},
         ) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = await solwyn.responses.create(
                     model="deployment",
                     input="hello",
@@ -2060,8 +2068,8 @@ class TestResponsesPublicProxyAsync:
                     "max_output_tokens": 333,
                 }
             ]
-            solwyn._reporter.report_settlement.assert_called_once()
-            _, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            _, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.provider.value == "azure_openai"
             assert event.input_tokens == 120
             assert event.output_tokens == 45
@@ -2072,8 +2080,8 @@ class TestResponsesPublicProxyAsync:
         client = AsyncAzureOpenAI(response)
 
         async with _async_solwyn(client, model="deployment") as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = await solwyn.responses.parse(
                     model="deployment",
                     input="hello",
@@ -2087,7 +2095,7 @@ class TestResponsesPublicProxyAsync:
             assert client._responses.parse_calls == [
                 {"model": "deployment", "input": "hello", "text_format": dict}
             ]
-            solwyn._reporter.report_settlement.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("usage_state", ["missing", "zero"])
@@ -2101,8 +2109,8 @@ class TestResponsesPublicProxyAsync:
         client = AsyncAzureOpenAI(response)
 
         async with _async_solwyn(client, model="deployment") as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
-            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._solwyn_budget._lease.true_up)
             kwargs: dict[str, object] = {
                 "model": "deployment",
                 "input": "12345678",
@@ -2111,8 +2119,8 @@ class TestResponsesPublicProxyAsync:
             if leaf == "parse":
                 kwargs["text_format"] = dict
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget._lease, "true_up", new=true_up),
             ):
                 result = await getattr(solwyn.responses, leaf)(**kwargs)
 
@@ -2123,8 +2131,8 @@ class TestResponsesPublicProxyAsync:
                 claim_token=7,
                 floor_at_reservation=True,
             )
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert result is response
             assert event.provider.value == "azure_openai"
             assert event.input_tokens == 2
@@ -2138,11 +2146,11 @@ class TestResponsesPublicProxyAsync:
         client = AsyncAzureOpenAI(response)
 
         async with _async_solwyn(client, model="deployment") as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
-            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._solwyn_budget._lease.true_up)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget._lease, "true_up", new=true_up),
             ):
                 result = await solwyn.responses.create(model="deployment", input="12345678")
 
@@ -2154,7 +2162,7 @@ class TestResponsesPublicProxyAsync:
                 floor_at_reservation=False,
             )
             assert result is response
-            _, event = solwyn._reporter.report_settlement.call_args.args
+            _, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 120
             assert event.output_tokens == 45
             assert event.token_details.is_estimated is False
@@ -2167,8 +2175,8 @@ class TestResponsesPublicProxyAsync:
         client = AsyncAzureOpenAI(provider_manager)
 
         async with _async_solwyn(client, model="deployment") as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 manager = solwyn.responses.stream(
                     model="deployment",
                     input="12345678",
@@ -2178,8 +2186,8 @@ class TestResponsesPublicProxyAsync:
 
             check.assert_awaited_once()
             assert client._responses.stream_calls == [{"model": "deployment", "input": "12345678"}]
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.provider.value == "azure_openai"
             assert event.input_tokens == 2
             assert event.output_tokens == 0
@@ -2194,11 +2202,11 @@ class TestResponsesPublicProxyAsync:
         client = AsyncAzureOpenAI(provider_manager)
 
         async with _async_solwyn(client, model="deployment") as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
-            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._solwyn_budget._lease.true_up)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget._lease, "true_up", new=true_up),
             ):
                 async with solwyn.responses.stream(
                     model="deployment",
@@ -2208,8 +2216,8 @@ class TestResponsesPublicProxyAsync:
                     assert [event async for event in events] == [delta]
 
             call_id = check.call_args.kwargs["call_id"]
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             # The accumulator's own length estimate is kept as telemetry, but it
             # cannot account for all output, so the lease holds its bound.
             assert event.token_details.is_estimated is True
@@ -2234,8 +2242,8 @@ class TestResponsesPublicProxyAsync:
             model="deployment",
             default_params={"instructions": "must-not-leak"},
         ) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = solwyn.responses.stream(response_id="resp_123", starting_after=7)
 
             assert result is provider_manager
@@ -2243,16 +2251,16 @@ class TestResponsesPublicProxyAsync:
                 {"response_id": "resp_123", "starting_after": 7}
             ]
             check.assert_not_awaited()
-            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_azure_parse_streaming_refusal_precedes_budget_and_provider(self) -> None:
         client = AsyncAzureOpenAI(_responses_response())
 
         async with _async_solwyn(client, model="deployment") as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 await solwyn.responses.parse(
@@ -2273,12 +2281,12 @@ class TestResponsesPublicProxyAsync:
         client._responses.create = AsyncMock(side_effect=error)  # type: ignore[method-assign]
 
         async with _async_solwyn(client, model="deployment") as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("azure_openai"),
                     "record_failure",
@@ -2300,14 +2308,14 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(response)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = await solwyn.responses.create(model="gpt-5.5", input="hello")
 
             assert result is response
             check.assert_awaited_once()
             assert client._responses.create_calls == [{"model": "gpt-5.5", "input": "hello"}]
-            solwyn._reporter.report_settlement.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_native_parse_reuses_defaults_budgeting_dispatch_and_flat_settlement(
@@ -2325,8 +2333,8 @@ class TestResponsesPublicProxyAsync:
             client,
             default_params={"instructions": "12345678", "max_output_tokens": 321},
         ) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = await solwyn.responses.parse(
                     model="gpt-5.5",
                     input="abcd",
@@ -2350,8 +2358,8 @@ class TestResponsesPublicProxyAsync:
                     "max_output_tokens": 321,
                 }
             ]
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 120
             assert event.output_tokens == 45
             assert event.service_tier == "priority"
@@ -2377,9 +2385,9 @@ class TestResponsesPublicProxyAsync:
 
         # Act.
         async with _async_solwyn(client, default_params=default_params) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 await solwyn.responses.parse(
@@ -2403,9 +2411,9 @@ class TestResponsesPublicProxyAsync:
 
         # Act.
         async with _async_solwyn(client, default_params={"stream": True}) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 await solwyn.responses.parse(
@@ -2441,15 +2449,15 @@ class TestResponsesPublicProxyAsync:
                 order.append("budget.check")
                 return _allow_budget()
 
-            check = AsyncMock(spec=solwyn._budget.check_budget, side_effect=budget_check)
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, side_effect=budget_check)
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 manager = solwyn.responses.stream(
                     model="gpt-5.5",
                     input="abcd",
                     temperature=0.4,
                 )
                 assert order == []
-                solwyn._reporter.report_settlement.assert_not_called()
+                solwyn._solwyn_reporter.report_settlement.assert_not_called()
 
                 async with manager as events:
                     assert [event async for event in events] == [delta, terminal]
@@ -2468,8 +2476,8 @@ class TestResponsesPublicProxyAsync:
             assert provider_manager.enter_calls == 1
             assert len(provider_manager.exit_calls) == 1
             assert inner.aclose_calls == 1
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 30
             assert event.output_tokens == 12
             assert event.service_tier == "flex"
@@ -2487,8 +2495,8 @@ class TestResponsesPublicProxyAsync:
             default_params={"instructions": "must-not-leak", "max_output_tokens": 321},
             on_unmetered="raise",
         ) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 manager = solwyn.responses.stream(
                     response_id="resp_123",
                     starting_after=7,
@@ -2504,8 +2512,8 @@ class TestResponsesPublicProxyAsync:
                 }
             ]
             check.assert_not_awaited()
-            solwyn._reporter.report_settlement.assert_not_called()
-            solwyn._reporter.report.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2523,14 +2531,14 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client, on_unmetered="raise") as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 manager = solwyn.responses.stream(**selector_kwargs)
 
             assert manager is provider_manager
             assert client._responses.stream_calls == [selector_kwargs]
             check.assert_not_awaited()
-            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2553,8 +2561,8 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 manager = solwyn.responses.stream(
                     model="gpt-5.5",
                     input="1234",
@@ -2572,7 +2580,7 @@ class TestResponsesPublicProxyAsync:
                     sentinel_key: sentinel,
                 }
             ]
-            solwyn._reporter.report_settlement.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_defers_pipeline_creation_until_context_entry(
@@ -2583,10 +2591,10 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(_FakeAsyncResponseStreamManager(inner))
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             intercepted = MagicMock(side_effect=solwyn._intercepted_call)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 patch.object(solwyn, "_intercepted_call", new=intercepted),
             ):
                 manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
@@ -2608,11 +2616,11 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
-            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._solwyn_budget._lease.true_up)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget._lease, "true_up", new=true_up),
             ):
                 async with solwyn.responses.stream(
                     model="gpt-5.5",
@@ -2628,8 +2636,8 @@ class TestResponsesPublicProxyAsync:
                 claim_token=7,
                 floor_at_reservation=True,
             )
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 2
             assert event.output_tokens == 0
             assert event.token_details.is_estimated is True
@@ -2644,8 +2652,8 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(_FakeAsyncResponseStreamManager(inner))
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 async with solwyn.responses.stream(model="gpt-5.5", input="1234") as events:
                     result = await events.get_final_response()
 
@@ -2653,8 +2661,8 @@ class TestResponsesPublicProxyAsync:
             assert hasattr(events, "until_done")
             assert hasattr(events, "get_final_response")
             assert inner.get_final_response_calls == 1
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 30
             assert event.output_tokens == 12
             assert event.service_tier == "flex"
@@ -2669,8 +2677,8 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
                 await manager.close()
                 await manager.close()
@@ -2679,7 +2687,7 @@ class TestResponsesPublicProxyAsync:
             assert provider_manager.exit_calls == []
             assert client._responses.stream_calls == []
             check.assert_not_awaited()
-            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_enter_failure_releases_reservation(self) -> None:
@@ -2689,12 +2697,12 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -2710,9 +2718,9 @@ class TestResponsesPublicProxyAsync:
             # 5xx is post-send ambiguous: a health failure whose charge the
             # server must reconcile.
             breaker_failure.assert_called_once_with()
-            solwyn._reporter.report_settlement.assert_not_called()
-            solwyn._reporter.report.assert_called_once()
-            event = solwyn._reporter.report.call_args.args[0]
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
+            event = solwyn._solwyn_reporter.report.call_args.args[0]
             assert event.possibly_succeeded is True
             assert event.failover_error_class == "_Status"
 
@@ -2724,12 +2732,12 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -2745,9 +2753,9 @@ class TestResponsesPublicProxyAsync:
             # status on create(stream=True) records nothing either.
             breaker_failure.assert_not_called()
             release.assert_called_once()
-            solwyn._reporter.report_settlement.assert_not_called()
-            solwyn._reporter.report.assert_called_once()
-            event = solwyn._reporter.report.call_args.args[0]
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
+            event = solwyn._solwyn_reporter.report.call_args.args[0]
             assert event.possibly_succeeded is None
             assert event.failover_error_class == "_Status"
 
@@ -2761,15 +2769,15 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ValueError, match="application failed"),
             ):
                 async with solwyn.responses.stream(model="gpt-5.5", input="1234"):
                     raise ValueError("application failed")
 
-            solwyn._reporter.report_settlement.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("opened_before_wait", [False, True])
@@ -2804,12 +2812,12 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -2828,8 +2836,8 @@ class TestResponsesPublicProxyAsync:
             check.assert_awaited_once()
             release.assert_called_once()
             breaker_failure.assert_called_once_with()
-            solwyn._reporter.report.assert_called_once()
-            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert provider_manager.enter_calls == 1
             assert len(provider_manager.exit_calls) == 1
             exit_args = provider_manager.exit_calls[0]
@@ -2844,11 +2852,11 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
             ):
                 manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
                 first = await manager.__aenter__()
@@ -2862,8 +2870,8 @@ class TestResponsesPublicProxyAsync:
             assert len(provider_manager.exit_calls) == 1
             assert inner.aclose_calls == 1
             release.assert_not_called()
-            solwyn._reporter.report.assert_not_called()
-            solwyn._reporter.report_settlement.assert_called_once()
+            solwyn._solwyn_reporter.report.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_concurrent_reentry_keeps_first_entry_closable(
@@ -2894,11 +2902,11 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
             ):
                 manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
                 first_task = asyncio.create_task(manager.__aenter__())
@@ -2918,8 +2926,8 @@ class TestResponsesPublicProxyAsync:
             assert len(provider_manager.exit_calls) == 1
             assert inner.aclose_calls == 1
             release.assert_not_called()
-            solwyn._reporter.report.assert_not_called()
-            solwyn._reporter.report_settlement.assert_called_once()
+            solwyn._solwyn_reporter.report.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_cancelled_close_is_publicly_retryable(self) -> None:
@@ -2957,11 +2965,11 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
             ):
                 manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
                 await manager.__aenter__()
@@ -2987,8 +2995,8 @@ class TestResponsesPublicProxyAsync:
             assert provider_manager.max_active_exits == 1
             assert inner.aclose_calls == 1
             release.assert_not_called()
-            solwyn._reporter.report.assert_not_called()
-            solwyn._reporter.report_settlement.assert_called_once()
+            solwyn._solwyn_reporter.report.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_wrap_failure_releases_and_closes_once(self) -> None:
@@ -2998,12 +3006,12 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 patch.object(solwyn, "_wrap_stream_async", side_effect=original),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
@@ -3019,8 +3027,8 @@ class TestResponsesPublicProxyAsync:
             assert exc_info.value is original
             release.assert_called_once()
             breaker_failure.assert_called_once_with()
-            solwyn._reporter.report.assert_called_once()
-            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert len(provider_manager.exit_calls) == 1
             assert inner.aclose_calls == 1
 
@@ -3031,9 +3039,9 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(_responses_response())
 
         async with _async_solwyn(client, report_untracked_surfaces=False) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
                 await solwyn.responses.create(model="gpt-5.5", input="hello")
@@ -3045,9 +3053,9 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(_responses_response())
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 await solwyn.responses.create(model="gpt-5.5", input="hello", background=True)
@@ -3064,9 +3072,9 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(_responses_response())
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 await solwyn.responses.create(
@@ -3087,9 +3095,9 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(_responses_response())
 
         async with _async_solwyn(client, default_params={"background": True}) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(ConfigurationError) as exc_info,
             ):
                 await solwyn.responses.create(model="gpt-5.5", input="hello")
@@ -3107,8 +3115,8 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(response)
 
         async with _async_solwyn(client, default_params={"background": True}) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = await solwyn.responses.create(
                     model="gpt-5.5",
                     input="hello",
@@ -3134,9 +3142,9 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(response)
 
         async with _async_solwyn(client, report_untracked_surfaces=False) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
                 result = await solwyn.responses.retrieve("resp_1")
@@ -3161,9 +3169,9 @@ class TestResponsesPublicProxyAsync:
             model="llama-3.3-70b-versatile",
             report_untracked_surfaces=False,
         ) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
                 result = await solwyn.responses.create(
@@ -3194,9 +3202,9 @@ class TestResponsesPublicProxyAsync:
             model="llama-3.3-70b-versatile",
             report_untracked_surfaces=False,
         ) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
                 result = await solwyn.responses.parse(
@@ -3233,9 +3241,9 @@ class TestResponsesPublicProxyAsync:
             model="llama-3.3-70b-versatile",
             report_untracked_surfaces=False,
         ) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
                 result = solwyn.responses.stream(
@@ -3266,9 +3274,9 @@ class TestResponsesPublicProxyAsync:
             default_params={"instructions": "must-not-leak"},
             report_untracked_surfaces=False,
         ) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
                 result = solwyn.responses.stream(response_id="resp_123", starting_after=7)
@@ -3278,7 +3286,7 @@ class TestResponsesPublicProxyAsync:
                 {"response_id": "resp_123", "starting_after": 7}
             ]
             check.assert_not_awaited()
-            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert any(
                 "untracked surface 'responses.stream'" in record.getMessage()
                 for record in caplog.records
@@ -3304,12 +3312,12 @@ class TestResponsesPublicProxyAsync:
             model="deployment",
             report_untracked_surfaces=False,
         ) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 caplog.at_level(logging.WARNING, logger="solwyn._base"),
             ):
-                preparer = _responses_preparer(solwyn._adapter)
+                preparer = _responses_preparer(solwyn._solwyn_adapter)
                 namespace = solwyn.responses
 
                 assert (preparer is not None) is expects_metering
@@ -3419,8 +3427,8 @@ class TestResponsesInterceptedCallSync:
         messages = [{"role": "user", "content": "hello"}]
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = solwyn._intercepted_call(model="gpt-5.5", messages=messages)
 
             assert result is response
@@ -3429,8 +3437,8 @@ class TestResponsesInterceptedCallSync:
             )
             client.responses.create.assert_not_called()
             check.assert_called_once()
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 21
             assert event.output_tokens == 9
             assert event.service_tier == "default"
@@ -3442,8 +3450,8 @@ class TestResponsesInterceptedCallSync:
         client.chat.completions.create.return_value = _FakeSyncStream([])
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 stream = solwyn._intercepted_call(
                     model="gpt-5.5",
                     messages=[],
@@ -3466,7 +3474,7 @@ class TestResponsesInterceptedCallSync:
 
         with _sync_solwyn(client) as solwyn:
             result = solwyn._sync_dispatch(
-                solwyn._runtimes[0],
+                solwyn._solwyn_runtimes[0],
                 kwargs,
                 is_streaming=False,
                 timeout=1.0,
@@ -3482,8 +3490,8 @@ class TestResponsesInterceptedCallSync:
         client, response = _mock_openai_client()
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = solwyn._intercepted_call(
                     _surface="responses",
                     model="gpt-5.5",
@@ -3493,8 +3501,8 @@ class TestResponsesInterceptedCallSync:
             assert result is response
             client.responses.create.assert_called_once()
             client.chat.completions.create.assert_not_called()
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 120
             assert event.output_tokens == 45
             assert event.token_details.cached_input_tokens == 10
@@ -3509,8 +3517,8 @@ class TestResponsesInterceptedCallSync:
         fallback = _mock_anthropic_client()
 
         with _sync_solwyn(client, fallback=[(fallback, "claude-x")]) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 solwyn._intercepted_call(
                     _surface="responses",
                     model="gpt-5.5",
@@ -3556,12 +3564,12 @@ class TestResponsesInterceptedCallSync:
             default_params={"instructions": "12345678"},
         ) as solwyn:
             if entry_instructions is not None:
-                solwyn._runtimes[0].entry.default_params["instructions"] = entry_instructions
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+                solwyn._solwyn_runtimes[0].entry.default_params["instructions"] = entry_instructions
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             call_kwargs: dict[str, object] = {"model": "gpt-5.5", "input": "abcd"}
             if caller_instructions is not None:
                 call_kwargs["instructions"] = caller_instructions
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 solwyn._intercepted_call(_surface="responses", **call_kwargs)
 
             assert check.call_args.kwargs["estimated_input_tokens"] == expected_tokens
@@ -3585,12 +3593,12 @@ class TestResponsesInterceptedCallSync:
             default_params={"max_output_tokens": 111},
         ) as solwyn:
             if entry_cap is not None:
-                solwyn._runtimes[0].entry.default_params["max_output_tokens"] = entry_cap
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+                solwyn._solwyn_runtimes[0].entry.default_params["max_output_tokens"] = entry_cap
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             call_kwargs: dict[str, object] = {"model": "gpt-5.5", "input": "x"}
             if caller_cap is not None:
                 call_kwargs["max_output_tokens"] = caller_cap
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 solwyn._intercepted_call(_surface="responses", **call_kwargs)
 
             assert check.call_args.kwargs["estimated_output_bound"] == expected_cap
@@ -3607,11 +3615,11 @@ class TestResponsesInterceptedCallSync:
             lease_output_bound_default=777,
             default_params={"max_tokens": 999},
         ) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             call_kwargs: dict[str, object] = {"model": "gpt-5.5", "input": "x"}
             if cap is not None:
                 call_kwargs["max_output_tokens"] = cap
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 solwyn._intercepted_call(_surface="responses", **call_kwargs)
 
             assert check.call_args.kwargs["estimated_output_bound"] == expected
@@ -3628,15 +3636,15 @@ class TestResponsesInterceptedCallSync:
         }
 
         with _sync_solwyn(client, default_params=global_defaults) as solwyn:
-            solwyn._runtimes[0].entry.default_params.update(
+            solwyn._solwyn_runtimes[0].entry.default_params.update(
                 {
                     "temperature": 0.4,
                     "top_p": 0.6,
                     "max_completion_tokens": 200,
                 }
             )
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 solwyn._intercepted_call(
                     _surface="responses",
                     model="gpt-5.5",
@@ -3659,11 +3667,11 @@ class TestResponsesInterceptedCallSync:
         client.responses.create.side_effect = _Status(429)
 
         with _sync_solwyn(client, fallback=[(fallback, "claude-x")]) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 pytest.raises(_Status),
             ):
                 solwyn._intercepted_call(
@@ -3687,11 +3695,11 @@ class TestResponsesInterceptedCallSync:
         client.responses.create.return_value = inner
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             call_kwargs: dict[str, object] = {"model": "gpt-5.5", "input": "x"}
             if caller_stream is not None:
                 call_kwargs["stream"] = caller_stream
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 stream = solwyn._intercepted_call(
                     _surface="responses",
                     _force_stream=force_stream,
@@ -3709,8 +3717,8 @@ class TestResponsesInterceptedCallSync:
             sent = client.responses.create.call_args.kwargs
             assert sent["stream"] is True
             assert "stream_options" not in sent
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 30
             assert event.output_tokens == 12
             assert event.token_details.cached_input_tokens == 7
@@ -3725,21 +3733,21 @@ class TestResponsesInterceptedCallSync:
         client.responses.create.return_value = inner
 
         with _sync_solwyn(client, default_params={"stream": True}) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 stream = solwyn._intercepted_call(
                     _surface="responses",
                     model="gpt-5.5",
                     input="x",
                 )
 
-            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert list(stream) == [terminal]
             sent = client.responses.create.call_args.kwargs
             assert sent["stream"] is True
             assert "stream_options" not in sent
-            solwyn._reporter.report_settlement.assert_called_once()
-            _, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            _, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 30
             assert event.output_tokens == 12
 
@@ -3751,8 +3759,8 @@ class TestResponsesInterceptedCallSync:
         client.responses.create.return_value = inner
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 stream = solwyn._intercepted_call(
                     _surface="responses",
                     model="gpt-5.5",
@@ -3764,8 +3772,8 @@ class TestResponsesInterceptedCallSync:
             stream.close()
             stream.close()
 
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.token_details.input_tokens == 2
             assert event.token_details.is_estimated is True
             assert confirm.token_details == event.token_details
@@ -3778,11 +3786,11 @@ class TestResponsesInterceptedCallSync:
         client.responses.create.return_value = inner
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
-            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._solwyn_budget._lease.true_up)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget._lease, "true_up", new=true_up),
             ):
                 stream = solwyn._intercepted_call(
                     _surface="responses",
@@ -3802,15 +3810,15 @@ class TestResponsesInterceptedCallSync:
                 claim_token=7,
                 floor_at_reservation=True,
             )
-            solwyn._reporter.report_settlement.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     def test_adapter_without_responses_seam_fails_before_budget_check(self) -> None:
         client = _mock_anthropic_client()
 
         with _sync_solwyn(client, model="claude-x") as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(UnsupportedSurfaceError) as exc_info,
             ):
                 solwyn._intercepted_call(
@@ -3830,9 +3838,9 @@ class TestResponsesInterceptedCallSync:
 
         # Act.
         with _sync_solwyn(client, model="claude-x") as solwyn:
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(UnsupportedSurfaceError) as exc_info,
             ):
                 solwyn._intercepted_call(
@@ -3857,11 +3865,11 @@ class TestResponsesInterceptedCallSync:
             breaker = solwyn._get_circuit_breaker("openai")
             for _ in range(3):
                 breaker.record_failure()
-            check = MagicMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 pytest.raises(ProviderUnavailableError) as exc_info,
             ):
                 solwyn._intercepted_call(
@@ -3886,8 +3894,8 @@ class TestResponsesInterceptedCallAsync:
         messages = [{"role": "user", "content": "hello"}]
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = await solwyn._intercepted_call(model="gpt-5.5", messages=messages)
 
             assert result is response
@@ -3896,8 +3904,8 @@ class TestResponsesInterceptedCallAsync:
             )
             client.responses.create.assert_not_awaited()
             check.assert_awaited_once()
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 21
             assert event.output_tokens == 9
             assert event.service_tier == "default"
@@ -3910,8 +3918,8 @@ class TestResponsesInterceptedCallAsync:
         client.chat.completions.create.return_value = _FakeAsyncStream([])
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 stream = await solwyn._intercepted_call(
                     model="gpt-5.5",
                     messages=[],
@@ -3935,7 +3943,7 @@ class TestResponsesInterceptedCallAsync:
 
         async with _async_solwyn(client) as solwyn:
             result = await solwyn._async_dispatch(
-                solwyn._runtimes[0],
+                solwyn._solwyn_runtimes[0],
                 kwargs,
                 is_streaming=False,
                 timeout=1.0,
@@ -3952,8 +3960,8 @@ class TestResponsesInterceptedCallAsync:
         client, response = _mock_async_openai_client()
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 result = await solwyn._intercepted_call(
                     _surface="responses",
                     model="gpt-5.5",
@@ -3963,8 +3971,8 @@ class TestResponsesInterceptedCallAsync:
             assert result is response
             client.responses.create.assert_awaited_once()
             client.chat.completions.create.assert_not_awaited()
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 120
             assert event.output_tokens == 45
             assert event.token_details.cached_input_tokens == 10
@@ -3982,8 +3990,8 @@ class TestResponsesInterceptedCallAsync:
         fallback = _mock_async_anthropic_client()
 
         async with _async_solwyn(client, fallback=[(fallback, "claude-x")]) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 await solwyn._intercepted_call(
                     _surface="responses",
                     model="gpt-5.5",
@@ -4030,12 +4038,12 @@ class TestResponsesInterceptedCallAsync:
             default_params={"instructions": "12345678"},
         ) as solwyn:
             if entry_instructions is not None:
-                solwyn._runtimes[0].entry.default_params["instructions"] = entry_instructions
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+                solwyn._solwyn_runtimes[0].entry.default_params["instructions"] = entry_instructions
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             call_kwargs: dict[str, object] = {"model": "gpt-5.5", "input": "abcd"}
             if caller_instructions is not None:
                 call_kwargs["instructions"] = caller_instructions
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 await solwyn._intercepted_call(_surface="responses", **call_kwargs)
 
             assert check.call_args.kwargs["estimated_input_tokens"] == expected_tokens
@@ -4060,12 +4068,12 @@ class TestResponsesInterceptedCallAsync:
             default_params={"max_output_tokens": 111},
         ) as solwyn:
             if entry_cap is not None:
-                solwyn._runtimes[0].entry.default_params["max_output_tokens"] = entry_cap
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+                solwyn._solwyn_runtimes[0].entry.default_params["max_output_tokens"] = entry_cap
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             call_kwargs: dict[str, object] = {"model": "gpt-5.5", "input": "x"}
             if caller_cap is not None:
                 call_kwargs["max_output_tokens"] = caller_cap
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 await solwyn._intercepted_call(_surface="responses", **call_kwargs)
 
             assert check.call_args.kwargs["estimated_output_bound"] == expected_cap
@@ -4083,11 +4091,11 @@ class TestResponsesInterceptedCallAsync:
             lease_output_bound_default=777,
             default_params={"max_tokens": 999},
         ) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             call_kwargs: dict[str, object] = {"model": "gpt-5.5", "input": "x"}
             if cap is not None:
                 call_kwargs["max_output_tokens"] = cap
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 await solwyn._intercepted_call(_surface="responses", **call_kwargs)
 
             assert check.call_args.kwargs["estimated_output_bound"] == expected
@@ -4107,15 +4115,15 @@ class TestResponsesInterceptedCallAsync:
         }
 
         async with _async_solwyn(client, default_params=global_defaults) as solwyn:
-            solwyn._runtimes[0].entry.default_params.update(
+            solwyn._solwyn_runtimes[0].entry.default_params.update(
                 {
                     "temperature": 0.4,
                     "top_p": 0.6,
                     "max_completion_tokens": 200,
                 }
             )
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 await solwyn._intercepted_call(
                     _surface="responses",
                     model="gpt-5.5",
@@ -4141,11 +4149,11 @@ class TestResponsesInterceptedCallAsync:
         client.responses.create.side_effect = _Status(429)
 
         async with _async_solwyn(client, fallback=[(fallback, "claude-x")]) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 pytest.raises(_Status),
             ):
                 await solwyn._intercepted_call(
@@ -4170,11 +4178,11 @@ class TestResponsesInterceptedCallAsync:
         client.responses.create.return_value = inner
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             call_kwargs: dict[str, object] = {"model": "gpt-5.5", "input": "x"}
             if caller_stream is not None:
                 call_kwargs["stream"] = caller_stream
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 stream = await solwyn._intercepted_call(
                     _surface="responses",
                     _force_stream=force_stream,
@@ -4192,8 +4200,8 @@ class TestResponsesInterceptedCallAsync:
             sent = client.responses.create.call_args.kwargs
             assert sent["stream"] is True
             assert "stream_options" not in sent
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 30
             assert event.output_tokens == 12
             assert event.token_details.cached_input_tokens == 7
@@ -4211,21 +4219,21 @@ class TestResponsesInterceptedCallAsync:
         client.responses.create.return_value = inner
 
         async with _async_solwyn(client, default_params={"stream": True}) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 stream = await solwyn._intercepted_call(
                     _surface="responses",
                     model="gpt-5.5",
                     input="x",
                 )
 
-            solwyn._reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert [event async for event in stream] == [terminal]
             sent = client.responses.create.call_args.kwargs
             assert sent["stream"] is True
             assert "stream_options" not in sent
-            solwyn._reporter.report_settlement.assert_called_once()
-            _, event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            _, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.input_tokens == 30
             assert event.output_tokens == 12
 
@@ -4238,8 +4246,8 @@ class TestResponsesInterceptedCallAsync:
         client.responses.create.return_value = inner
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            with patch.object(solwyn._budget, "check_budget", new=check):
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            with patch.object(solwyn._solwyn_budget, "check_budget", new=check):
                 stream = await solwyn._intercepted_call(
                     _surface="responses",
                     model="gpt-5.5",
@@ -4252,8 +4260,8 @@ class TestResponsesInterceptedCallAsync:
             await stream.close()
             await stream.close()
 
-            solwyn._reporter.report_settlement.assert_called_once()
-            confirm, settled_event = solwyn._reporter.report_settlement.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, settled_event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert settled_event.token_details.input_tokens == 2
             assert settled_event.token_details.is_estimated is True
             assert confirm.token_details == settled_event.token_details
@@ -4267,11 +4275,11 @@ class TestResponsesInterceptedCallAsync:
         client.responses.create.return_value = inner
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_lease())
-            true_up = MagicMock(spec=solwyn._budget._lease.true_up)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_lease())
+            true_up = MagicMock(spec=solwyn._solwyn_budget._lease.true_up)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget._lease, "true_up", new=true_up),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget._lease, "true_up", new=true_up),
             ):
                 stream = await solwyn._intercepted_call(
                     _surface="responses",
@@ -4292,16 +4300,16 @@ class TestResponsesInterceptedCallAsync:
                 claim_token=7,
                 floor_at_reservation=True,
             )
-            solwyn._reporter.report_settlement.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_adapter_without_responses_seam_fails_before_budget_check(self) -> None:
         client = _mock_async_anthropic_client()
 
         async with _async_solwyn(client, model="claude-x") as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(UnsupportedSurfaceError) as exc_info,
             ):
                 await solwyn._intercepted_call(
@@ -4322,9 +4330,9 @@ class TestResponsesInterceptedCallAsync:
 
         # Act.
         async with _async_solwyn(client, model="claude-x") as solwyn:
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 pytest.raises(UnsupportedSurfaceError) as exc_info,
             ):
                 await solwyn._intercepted_call(
@@ -4352,11 +4360,11 @@ class TestResponsesInterceptedCallAsync:
             breaker = solwyn._get_circuit_breaker("openai")
             for _ in range(3):
                 breaker.record_failure()
-            check = AsyncMock(spec=solwyn._budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._budget.release_reservation)
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             with (
-                patch.object(solwyn._budget, "check_budget", new=check),
-                patch.object(solwyn._budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "check_budget", new=check),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
                 pytest.raises(ProviderUnavailableError) as exc_info,
             ):
                 await solwyn._intercepted_call(

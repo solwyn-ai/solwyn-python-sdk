@@ -11,7 +11,7 @@ Also covers the two signal seams that feed those policies:
 - latency observation: ``record_latency`` / ``observed_p50`` (min-sample
   threshold, correct median, thread-safety smoke), surfaced onto the candidate.
 - price-hint plumbing: a ``BudgetCheckResponse.price_hints`` flows through
-  ``BudgetCheckResult`` -> ``update_price_hints`` -> ``self._last_price_hints``
+  ``BudgetCheckResult`` -> ``update_price_hints`` -> ``self._solwyn_last_price_hints``
   -> ``ProviderCandidate.price_hint``, and ``CostPolicy`` orders by it. The SDK
   performs NO price arithmetic — the only price input is the server hint.
 """
@@ -64,15 +64,15 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
     defaults.update(overrides)
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
-    solwyn._reporter.report = MagicMock()
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter.report = MagicMock()
     return solwyn
 
 
 def _close(solwyn: Solwyn) -> None:
-    solwyn._reporter._http.close()
-    solwyn._budget._http.close()
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_budget._http.close()
 
 
 def _req() -> RoutingRequest:
@@ -97,7 +97,7 @@ def test_default_policy_is_health_based_when_none_injected() -> None:
     )
     try:
         # Assert — health policy is the default; configured order preserved
-        assert isinstance(solwyn._policy, HealthBasedPolicy)
+        assert isinstance(solwyn._solwyn_policy, HealthBasedPolicy)
         assert _ordered_providers(solwyn) == ["openai", "anthropic"]
     finally:
         _close(solwyn)
@@ -128,8 +128,8 @@ def test_latency_policy_swap_changes_order_zero_dispatch_change() -> None:
         assert health_order != latency_order
 
         # Drop-in proof: only the policy object differs between the two clients.
-        assert isinstance(health._policy, HealthBasedPolicy)
-        assert isinstance(latency._policy, LatencyPolicy)
+        assert isinstance(health._solwyn_policy, HealthBasedPolicy)
+        assert isinstance(latency._solwyn_policy, LatencyPolicy)
     finally:
         _close(health)
         _close(latency)
@@ -218,8 +218,8 @@ def test_record_latency_thread_safety_smoke() -> None:
 
         # Assert — no corruption: window is capped at _LATENCY_WINDOW and the
         # median of an all-100.0 window is exactly 100.0 (no torn writes).
-        with solwyn._signal_lock:
-            window_len = len(solwyn._latency_windows["openai"])
+        with solwyn._solwyn_signal_lock:
+            window_len = len(solwyn._solwyn_latency_windows["openai"])
         assert window_len == _LATENCY_WINDOW
         assert solwyn.observed_p50("openai") == 100.0
     finally:
@@ -270,7 +270,7 @@ def test_select_candidates_reads_each_breaker_once_per_runtime() -> None:
         ) as get_breaker:
             solwyn._select_candidates(_req())
 
-        assert get_breaker.call_count == len(solwyn._runtimes)
+        assert get_breaker.call_count == len(solwyn._solwyn_runtimes)
     finally:
         _close(solwyn)
 
@@ -303,7 +303,7 @@ def test_price_hints_flow_from_response_to_result() -> None:
 
 
 @pytest.mark.unit
-def test_price_hints_plumb_into_last_price_hints_and_candidate() -> None:
+def test_price_hints_plumb_into_solwyn_last_price_hints_and_candidate() -> None:
     solwyn = _make_solwyn(
         _openai_client(),
         model="gpt-5.5",
@@ -316,7 +316,7 @@ def test_price_hints_plumb_into_last_price_hints_and_candidate() -> None:
         solwyn.update_price_hints({"openai": 10.0, "anthropic": 2.0})
 
         # Assert — stored on the instance...
-        assert solwyn._last_price_hints == {"openai": 10.0, "anthropic": 2.0}
+        assert solwyn._solwyn_last_price_hints == {"openai": 10.0, "anthropic": 2.0}
 
         # ...surfaced onto each candidate and consumed by CostPolicy to reorder.
         ordered = _ordered_providers(solwyn)
@@ -377,7 +377,7 @@ def test_no_price_hints_leaves_cost_policy_on_health_order() -> None:
     )
     try:
         # Assert — falls back to health/config order (identical to today).
-        assert solwyn._last_price_hints == {}
+        assert solwyn._solwyn_last_price_hints == {}
         assert _ordered_providers(solwyn) == ["openai", "anthropic"]
     finally:
         _close(solwyn)
@@ -390,7 +390,7 @@ def test_no_price_hints_leaves_cost_policy_on_health_order() -> None:
 def test_select_candidates_drops_foreign_runtime_from_misbehaving_policy() -> None:
     # A custom SelectionPolicy must not be able to inject a runtime that was never
     # in the configured chain into the dispatch walk. _select_candidates keeps
-    # only candidates whose runtime is one of self._runtimes, preserving the
+    # only candidates whose runtime is one of self._solwyn_runtimes, preserving the
     # policy's order for the valid subset.
     class _ForeignAppendingPolicy:
         """Returns the real candidates THEN appends a fabricated foreign one."""
@@ -419,10 +419,10 @@ def test_select_candidates_drops_foreign_runtime_from_misbehaving_policy() -> No
         names = [rt.adapter.name for rt in ordered]
 
         # Assert — the fabricated foreign runtime is dropped; only chain runtimes
-        # survive, and every survivor is an identity from self._runtimes.
+        # survive, and every survivor is an identity from self._solwyn_runtimes.
         assert "evil-provider" not in names
         assert names == ["openai", "anthropic"]
-        assert all(rt in solwyn._runtimes for rt in ordered)
+        assert all(rt in solwyn._solwyn_runtimes for rt in ordered)
     finally:
         _close(solwyn)
 

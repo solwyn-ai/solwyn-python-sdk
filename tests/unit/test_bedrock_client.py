@@ -165,12 +165,12 @@ def _mock_budget(solwyn: Any, response: dict[str, Any] | None = None) -> Any:
     resp = MagicMock(spec=httpx.Response)
     resp.json.return_value = response or ALLOW_BUDGET_RESPONSE
     resp.raise_for_status = MagicMock()
-    return patch.object(solwyn._budget._http, "post", return_value=resp)
+    return patch.object(solwyn._solwyn_budget._http, "post", return_value=resp)
 
 
 def _mock_reporting(solwyn: Any) -> Any:
     resp = _accepted_response({"ingested": 2, "rejected": []})
-    return patch.object(solwyn._reporter._http, "post", return_value=resp)
+    return patch.object(solwyn._solwyn_reporter._http, "post", return_value=resp)
 
 
 # ---------------------------------------------------------------------------
@@ -183,12 +183,12 @@ class TestBedrockConverseInterception:
     def test_converse_is_intercepted_and_returns_raw_response(self) -> None:
         client = _mock_bedrock_client()
         solwyn = _make_solwyn(client)
-        assert solwyn._surface_context.client_shape == "bedrock_boto3"
+        assert solwyn._solwyn_surface_context.client_shape == "bedrock_boto3"
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Settlement rides report_settlement; forward its SUCCESS event into the
         # same list so the metadata assertions observe it.
-        solwyn._reporter.report_settlement = lambda _c, e: reported.append(e)
+        solwyn._solwyn_reporter.report_settlement = lambda _c, e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = solwyn.converse(
@@ -219,8 +219,8 @@ class TestBedrockConverseInterception:
         client = _mock_bedrock_client(region="eu-west-1")
         solwyn = _make_solwyn(client)
         settlements: list = []
-        solwyn._reporter.report = lambda e: None
-        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+        solwyn._solwyn_reporter.report = lambda e: None
+        solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             solwyn.converse(
@@ -242,8 +242,8 @@ class TestBedrockConverseInterception:
         client.converse.return_value = response
         solwyn = _make_solwyn(client)
         settlements: list = []
-        solwyn._reporter.report = lambda e: None
-        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+        solwyn._solwyn_reporter.report = lambda e: None
+        solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             solwyn.converse(
@@ -382,8 +382,8 @@ class TestBedrockConverseStream:
         solwyn = _make_solwyn(client)
         reported: list = []
         settlements: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
-        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             result = solwyn.converse_stream(
@@ -424,8 +424,8 @@ class TestBedrockConverseStream:
         }
         solwyn = _make_solwyn(client)
         settlements: list = []
-        solwyn._reporter.report = lambda e: None
-        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+        solwyn._solwyn_reporter.report = lambda e: None
+        solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             result = solwyn.converse_stream(
@@ -452,8 +452,8 @@ class TestBedrockConverseStream:
         client = _mock_bedrock_client()
         solwyn = _make_solwyn(client)
         settlements: list = []
-        solwyn._reporter.report = lambda e: None
-        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+        solwyn._solwyn_reporter.report = lambda e: None
+        solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             result = solwyn.converse_stream(
@@ -488,8 +488,8 @@ class TestBedrockConverseStream:
         client = _mock_bedrock_client()
         solwyn = _make_solwyn(client)
         settlements: list = []
-        solwyn._reporter.report = lambda e: None
-        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+        solwyn._solwyn_reporter.report = lambda e: None
+        solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             result = solwyn.converse_stream(
@@ -523,8 +523,8 @@ class TestBedrockFailover:
         anthropic = _mock_anthropic_client()
         solwyn = _make_solwyn(bedrock, fallback=[(anthropic, "claude-sonnet-5")])
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
-        solwyn._reporter.report_settlement = lambda _c, e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report_settlement = lambda _c, e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = solwyn.converse(
@@ -561,8 +561,8 @@ class TestBedrockFailover:
         bedrock = _mock_bedrock_client(region="eu-central-1")
         solwyn = _make_solwyn(openai, fallback=[(bedrock, BEDROCK_MODEL)])
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
-        solwyn._reporter.report_settlement = lambda _c, e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report_settlement = lambda _c, e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = solwyn.chat.completions.create(
@@ -598,8 +598,8 @@ class TestBedrockFailover:
         bedrock = _mock_bedrock_client()
         solwyn = _make_solwyn(openai, fallback=[(bedrock, BEDROCK_MODEL)])
         settlements: list = []
-        solwyn._reporter.report = lambda e: None
-        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+        solwyn._solwyn_reporter.report = lambda e: None
+        solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             stream = solwyn.chat.completions.create(
@@ -653,8 +653,8 @@ class TestBedrockFailover:
         )
         solwyn = _make_solwyn(bedrock, fallback=[(anthropic, "claude-sonnet-5")])
         settlements: list = []
-        solwyn._reporter.report = lambda e: None
-        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+        solwyn._solwyn_reporter.report = lambda e: None
+        solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             result = solwyn.converse_stream(
@@ -689,7 +689,7 @@ class TestBedrockFailover:
         anthropic = _mock_anthropic_client()
         solwyn = _make_solwyn(bedrock, fallback=[(anthropic, "claude-sonnet-5")])
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
 
         with _mock_budget(solwyn), pytest.raises(_ClientError) as excinfo:
             solwyn.converse(
@@ -730,7 +730,7 @@ class TestBedrockErrorRegionAttribution:
         client.converse.side_effect = _Status(500)  # POST_SEND_AMBIGUOUS
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
 
         with _mock_budget(solwyn), pytest.raises(_Status):
             solwyn.converse(
@@ -753,7 +753,7 @@ class TestBedrockErrorRegionAttribution:
         client = _mock_bedrock_client(region="eu-central-1")
         solwyn = _make_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         deny = {
             **ALLOW_BUDGET_RESPONSE,
             "allowed": False,
@@ -781,7 +781,7 @@ class TestBedrockErrorRegionAttribution:
         }
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = solwyn.converse_stream(
@@ -869,7 +869,7 @@ async def test_async_wrapper_accepts_an_async_bedrock_fallback() -> None:
         fallback=[(fallback, BEDROCK_MODEL)],
     ) as wrapper:
         # Assert
-        assert wrapper._runtimes[1].sdk_client is fallback
+        assert wrapper._solwyn_runtimes[1].sdk_client is fallback
 
 
 @pytest.mark.unit
@@ -880,10 +880,10 @@ class TestAsyncBedrockConverse:
         client = _mock_async_bedrock_client()
         client.converse = AsyncMockFn(return_value=_converse_response())
         solwyn = _make_async_solwyn(client)
-        assert solwyn._surface_context.client_shape == "bedrock_aioboto3"
+        assert solwyn._solwyn_surface_context.client_shape == "bedrock_aioboto3"
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
-        solwyn._reporter.report_settlement = lambda _c, e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report_settlement = lambda _c, e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = await solwyn.converse(
@@ -898,8 +898,8 @@ class TestAsyncBedrockConverse:
         assert reported[0].provider == "bedrock"
         assert reported[0].provider_region == "us-east-1"
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1006,8 +1006,8 @@ class TestAsyncBedrockConverse:
         solwyn = _make_async_solwyn(client)
         reported: list = []
         settlements: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
-        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             result = await solwyn.converse_stream(
@@ -1022,8 +1022,8 @@ class TestAsyncBedrockConverse:
         assert event.input_tokens == 9
         assert event.output_tokens == 4
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1041,8 +1041,8 @@ class TestAsyncBedrockConverse:
         )
         solwyn = _make_async_solwyn(client)
         settlements: list = []
-        solwyn._reporter.report = lambda e: None
-        solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+        solwyn._solwyn_reporter.report = lambda e: None
+        solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
             result = await solwyn.converse_stream(
@@ -1069,8 +1069,8 @@ class TestAsyncBedrockConverse:
         await result["stream"].close()
         assert len(settlements) == 1
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1084,8 +1084,8 @@ class TestAsyncBedrockConverse:
             await solwyn.invoke_model(modelId=BEDROCK_MODEL, body=b"{}")
 
         client.invoke_model.assert_not_called()
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1097,8 +1097,8 @@ class TestAsyncBedrockConverse:
             await solwyn.invoke_model_with_response_stream(modelId=BEDROCK_MODEL, body=b"{}")
 
         client.invoke_model_with_response_stream.assert_not_called()
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1112,8 +1112,8 @@ class TestAsyncBedrockConverse:
             await solwyn.start_async_invoke(modelId=BEDROCK_MODEL, modelInput={})
 
         client.start_async_invoke.assert_not_called()
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1122,7 +1122,7 @@ class TestAsyncBedrockConverse:
         client.converse = AsyncMockFn(side_effect=_Status(500))  # POST_SEND_AMBIGUOUS
         solwyn = _make_async_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
 
         with _mock_budget(solwyn), pytest.raises(_Status):
             await solwyn.converse(
@@ -1135,8 +1135,8 @@ class TestAsyncBedrockConverse:
         assert errors[0].possibly_succeeded is True
         assert errors[0].provider_region == "ap-southeast-2"
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1158,7 +1158,7 @@ class TestAsyncBedrockConverse:
         )
         solwyn = _make_async_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
 
         with _mock_budget(solwyn):
             result = await solwyn.converse_stream(
@@ -1173,8 +1173,8 @@ class TestAsyncBedrockConverse:
         assert errors[0].possibly_succeeded is True
         assert errors[0].provider_region == "eu-west-1"
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
 
 # ---------------------------------------------------------------------------

@@ -201,8 +201,8 @@ def coverage(client: object) -> CoverageReport:
     if not isinstance(client, _SolwynBase):
         raise TypeError("coverage() requires a Solwyn or AsyncSolwyn client")
 
-    context = client._surface_context
-    raw_client = client._runtimes[0].sdk_client
+    context = client._solwyn_surface_context
+    raw_client = client._solwyn_runtimes[0].sdk_client
 
     def resolve_raw(path: str) -> SurfaceRule | None:
         return resolve_surface_rule(
@@ -274,15 +274,15 @@ def coverage(client: object) -> CoverageReport:
             ),
             model=runtime.entry.model,
         )
-        for index, runtime in enumerate(client._runtimes)
+        for index, runtime in enumerate(client._solwyn_runtimes)
     )
     return CoverageReport(
         provider=context.provider,
         dialect=context.dialect,
         client_shape=context.client_shape,
-        posture=client._config.on_unmetered,
+        posture=client._solwyn_config.on_unmetered,
         provider_chain=provider_chain,
-        acknowledgments=tuple(sorted(client._config.acknowledge_untracked)),
+        acknowledgments=tuple(sorted(client._solwyn_config.acknowledge_untracked)),
         entries=tuple(sorted(entries.values(), key=lambda item: (item.surface, item.rule_id))),
     )
 
@@ -386,7 +386,7 @@ def _unknown_entry(
     observed_shape: AttributeShape,
     capability_scope: CapabilityScope | None,
 ) -> CoverageEntry:
-    context = client._surface_context
+    context = client._solwyn_surface_context
     policy_action, dispatch_action = _effective_actions(
         kind=SurfaceKind.UNKNOWN,
         token=surface,
@@ -438,14 +438,14 @@ def _effective_actions(
     if kind not in {SurfaceKind.UNMETERED_SPEND, SurfaceKind.UNKNOWN}:
         raise RuntimeError(f"unsupported coverage kind: {kind}")
 
-    acknowledgments = client._config.acknowledge_untracked
+    acknowledgments = client._solwyn_config.acknowledge_untracked
     has_acknowledged_descendant = any(
         acknowledged.startswith(f"{surface}.") for acknowledged in acknowledgments
     )
     if token in acknowledgments or has_acknowledged_descendant:
         policy_action = "acknowledged"
     else:
-        policy_action = client._config.on_unmetered
+        policy_action = client._solwyn_config.on_unmetered
     if policy_action == "raise":
         return policy_action, "refuse"
     if (
@@ -485,12 +485,12 @@ def _effective_usage_basis(rule: SurfaceRule, client: _SolwynBase) -> str | None
         return rule.usage_basis.value
 
     bases: list[str] = []
-    for runtime in client._runtimes:
+    for runtime in client._solwyn_runtimes:
         context = SurfaceContext(
             provider=runtime.adapter.name,
             dialect=runtime.adapter.dialect,
             client_shape=_client_shape(runtime.sdk_client, runtime.adapter.dialect),
-            mode=client._surface_context.mode,
+            mode=client._solwyn_surface_context.mode,
         )
         reachable = _resolve_rule(
             context=context,

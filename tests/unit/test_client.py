@@ -81,13 +81,13 @@ def _make_solwyn(client, **overrides):
         solwyn = Solwyn(client, **defaults)
 
     # Stop reporter thread
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
 
     def report_settlement(_request, event):
-        solwyn._reporter.report(event)
+        solwyn._solwyn_reporter.report(event)
 
-    solwyn._reporter.report_settlement = report_settlement
+    solwyn._solwyn_reporter.report_settlement = report_settlement
     return solwyn
 
 
@@ -324,7 +324,7 @@ class TestBasicWrapping:
         solwyn = _make_solwyn(client)
 
         def create_after_project_learned(**_kwargs):
-            assert solwyn._reporter._breaker_project_id == VALID_PROJECT_ID
+            assert solwyn._solwyn_reporter._breaker_project_id == VALID_PROJECT_ID
             return mock_response
 
         client.chat.completions.create.side_effect = create_after_project_learned
@@ -334,7 +334,7 @@ class TestBasicWrapping:
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             result = solwyn.chat.completions.create(
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -342,8 +342,8 @@ class TestBasicWrapping:
 
         assert result is mock_response
         client.chat.completions.create.assert_called_once()
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_anthropic_call_goes_through(self) -> None:
         client, mock_response = _mock_anthropic_client()
@@ -353,7 +353,7 @@ class TestBasicWrapping:
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             result = solwyn.chat.completions.create(
                 model="claude-sonnet-5",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -361,8 +361,8 @@ class TestBasicWrapping:
 
         assert result is mock_response
         client.messages.create.assert_called_once()
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +393,7 @@ class TestBudgetCheckBeforeCall:
         mock_budget_response.raise_for_status = MagicMock()
 
         with (
-            patch.object(solwyn._budget._http, "post", return_value=mock_budget_response),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response),
             pytest.raises(BudgetExceededError),
         ):
             solwyn.chat.completions.create(
@@ -403,8 +403,8 @@ class TestBudgetCheckBeforeCall:
 
         # LLM client should NOT have been called
         client.chat.completions.create.assert_not_called()
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     @pytest.mark.parametrize("stream", [False, True])
     def test_run_stopped_raises_typed_error_before_chat_dispatch(self, stream: bool) -> None:
@@ -413,11 +413,11 @@ class TestBudgetCheckBeforeCall:
 
         with (
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
                 return_value=_deny_budget_result("run_stopped"),
             ),
-            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report"),
             solwyn_pkg.run("dashboard-stopped") as run_id,
             pytest.raises(RunStoppedError) as exc_info,
         ):
@@ -428,8 +428,8 @@ class TestBudgetCheckBeforeCall:
             )
 
         client.chat.completions.create.assert_not_called()
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
         error = exc_info.value
         assert type(error) is RunStoppedError
@@ -448,11 +448,11 @@ class TestBudgetCheckBeforeCall:
 
         with (
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
                 return_value=_deny_budget_result("run_stopped"),
             ),
-            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report"),
             pytest.raises(BudgetExceededError) as exc_info,
         ):
             solwyn.chat.completions.create(
@@ -461,8 +461,8 @@ class TestBudgetCheckBeforeCall:
             )
 
         client.chat.completions.create.assert_not_called()
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
         assert type(exc_info.value) is BudgetExceededError
         assert exc_info.value.budget_period == "run_stopped"
@@ -482,11 +482,11 @@ class TestBudgetCheckBeforeCall:
 
         with (
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
                 return_value=_deny_budget_result(denied_by_period),
             ),
-            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report"),
             pytest.raises(BudgetExceededError) as exc_info,
         ):
             solwyn.chat.completions.create(
@@ -494,8 +494,8 @@ class TestBudgetCheckBeforeCall:
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
         assert type(exc_info.value) is BudgetExceededError
         assert exc_info.value.budget_period == expected_budget_period
@@ -520,7 +520,7 @@ class TestBudgetCheckBeforeCall:
         mock_budget_response.raise_for_status = MagicMock()
 
         with patch.object(
-            solwyn._budget._http,
+            solwyn._solwyn_budget._http,
             "post",
             side_effect=[mock_budget_response, httpx.ConnectError("unreachable")],
         ) as mock_post:
@@ -537,8 +537,8 @@ class TestBudgetCheckBeforeCall:
 
         client.chat.completions.create.assert_not_called()
         assert mock_post.call_count == 2
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_budget_denied_reports_metadata_with_estimated_tokens(self) -> None:
         """When hard-deny blocks a call, a budget_denied metadata event is still reported."""
@@ -560,8 +560,8 @@ class TestBudgetCheckBeforeCall:
         mock_budget_response.raise_for_status = MagicMock()
 
         with (
-            patch.object(solwyn._budget._http, "post", return_value=mock_budget_response),
-            patch.object(solwyn._reporter, "report") as mock_report,
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response),
+            patch.object(solwyn._solwyn_reporter, "report") as mock_report,
             pytest.raises(BudgetExceededError),
         ):
             solwyn.chat.completions.create(
@@ -578,8 +578,8 @@ class TestBudgetCheckBeforeCall:
         assert event.latency_ms == 0.0
         assert event.is_model_fallback is False
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_budget_denied_event_tags_agent_run_id(self) -> None:
         client, _ = _mock_openai_client()
@@ -606,9 +606,9 @@ class TestBudgetCheckBeforeCall:
 
         with (
             patch.object(
-                solwyn._budget._http, "post", return_value=mock_budget_response
+                solwyn._solwyn_budget._http, "post", return_value=mock_budget_response
             ) as mock_post,
-            patch.object(solwyn._reporter, "report") as mock_report,
+            patch.object(solwyn._solwyn_reporter, "report") as mock_report,
             solwyn_pkg.run("expensive-job") as run_id,
             pytest.raises(BudgetExceededError),
         ):
@@ -625,8 +625,8 @@ class TestBudgetCheckBeforeCall:
         assert mock_post.call_args.kwargs["json"]["agent_run_id"] == run_id
         client.chat.completions.create.assert_not_called()
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_google_budget_denied_reports_nonzero_input_tokens(self) -> None:
         """Hard-deny for a Google call with contents='Hello' reports input_tokens > 0."""
@@ -650,8 +650,8 @@ class TestBudgetCheckBeforeCall:
         mock_budget_response.raise_for_status = MagicMock()
 
         with (
-            patch.object(solwyn._budget._http, "post", return_value=mock_budget_response),
-            patch.object(solwyn._reporter, "report") as mock_report,
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response),
+            patch.object(solwyn._solwyn_reporter, "report") as mock_report,
             pytest.raises(BudgetExceededError) as exc_info,
         ):
             solwyn.models.generate_content(
@@ -674,8 +674,8 @@ class TestBudgetCheckBeforeCall:
         # BudgetExceededError.estimated_cost should be non-zero
         assert exc_info.value.estimated_cost > 0
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
 
 # ---------------------------------------------------------------------------
@@ -701,7 +701,7 @@ class TestCircuitBreakerFailover:
         mock_budget_response.raise_for_status = MagicMock()
 
         with (
-            patch.object(solwyn._budget._http, "post", return_value=mock_budget_response),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response),
             pytest.raises(ProviderUnavailableError),
         ):
             solwyn.chat.completions.create(
@@ -709,8 +709,8 @@ class TestCircuitBreakerFailover:
                 messages=[{"role": "user", "content": "Hello"}],
             )
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
 
 # ---------------------------------------------------------------------------
@@ -731,8 +731,8 @@ class TestGetAttrPassThrough:
         result = solwyn.models.list()
         assert result == ["gpt-5.5"]
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_solwyn_tags_reaches_non_intercepted_surface_and_provider_rejects_it(self) -> None:
         class FilesResource:
@@ -750,8 +750,8 @@ class TestGetAttrPassThrough:
                 solwyn_tags={"team": "research"},
             )
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
 
 @pytest.mark.unit
@@ -767,8 +767,8 @@ class TestUnshippedSpendSurfacePosture:
     """
 
     def _close(self, solwyn: Solwyn) -> None:
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_translations_warns_once_and_passes_through(
         self, caplog: pytest.LogCaptureFixture
@@ -879,9 +879,9 @@ class TestContextManager:
             ) as solwyn,
         ):
             # Stop reporter thread
-            solwyn._reporter._shutdown.set()
-            solwyn._reporter._thread.join(timeout=2.0)
-            assert solwyn._client is client
+            solwyn._solwyn_reporter._shutdown.set()
+            solwyn._solwyn_reporter._thread.join(timeout=2.0)
+            assert solwyn._solwyn_client is client
 
 
 # ---------------------------------------------------------------------------
@@ -913,13 +913,13 @@ class TestRichTokenExtraction:
         solwyn = _make_solwyn(client)
 
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             solwyn.chat.completions.create(
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -932,8 +932,8 @@ class TestRichTokenExtraction:
         # MetadataEvent no longer carries cost fields
         assert not hasattr(event, "actual_cost")
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_anthropic_token_details_in_event(self) -> None:
         """Adapter extracts TokenDetails including cache fields from Anthropic response."""
@@ -952,13 +952,13 @@ class TestRichTokenExtraction:
         solwyn = _make_solwyn(client)
 
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             solwyn.chat.completions.create(
                 model="claude-sonnet-5",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -973,8 +973,8 @@ class TestRichTokenExtraction:
         assert event.token_details.cache_creation_1h_tokens == 25
         assert event.token_details.output_tokens == 200
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_openai_non_streaming_service_tier_in_event(self) -> None:
         """OpenAI service_tier reaches MetadataEvent on sync non-streaming calls."""
@@ -983,9 +983,11 @@ class TestRichTokenExtraction:
         solwyn = _make_solwyn(client)
 
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()):
+        with patch.object(
+            solwyn._solwyn_budget, "check_budget", return_value=_allow_budget_result()
+        ):
             solwyn.chat.completions.create(
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -993,19 +995,19 @@ class TestRichTokenExtraction:
 
         assert reported_events[0].service_tier == "priority"
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_openai_non_streaming_call_tags_agent_run_id(self) -> None:
         client, _ = _mock_openai_client()
         solwyn = _make_solwyn(client)
 
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         with (
             patch.object(
-                solwyn._budget, "check_budget", return_value=_allow_budget_result()
+                solwyn._solwyn_budget, "check_budget", return_value=_allow_budget_result()
             ) as check,
             solwyn_pkg.run("orchestrator") as parent_run_id,
             solwyn_pkg.run("nightly-batch", tags={"team": "platform", "env": "prod"}) as run_id,
@@ -1029,8 +1031,8 @@ class TestRichTokenExtraction:
         }
         assert "solwyn_tags" not in client.chat.completions.create.call_args.kwargs
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_global_default_solwyn_tags_never_reaches_primary_or_metadata(self) -> None:
         client, _ = _mock_openai_client()
@@ -1042,9 +1044,11 @@ class TestRichTokenExtraction:
             },
         )
         reported_events: list = []
-        solwyn._reporter.report = lambda event: reported_events.append(event)
+        solwyn._solwyn_reporter.report = lambda event: reported_events.append(event)
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()):
+        with patch.object(
+            solwyn._solwyn_budget, "check_budget", return_value=_allow_budget_result()
+        ):
             solwyn.chat.completions.create(
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -1055,8 +1059,8 @@ class TestRichTokenExtraction:
         assert "solwyn_tags" not in called
         assert reported_events[0].tags is None
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_client_tags_take_part_in_precedence_while_default_params_tags_are_discarded(
         self,
@@ -1068,10 +1072,12 @@ class TestRichTokenExtraction:
             default_params={"solwyn_tags": {"discarded": "default_params"}},
         )
         reported_events: list = []
-        solwyn._reporter.report = lambda event: reported_events.append(event)
+        solwyn._solwyn_reporter.report = lambda event: reported_events.append(event)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()),
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", return_value=_allow_budget_result()
+            ),
             solwyn_pkg.run(
                 "precedence",
                 tags={"shared": "scope", "scope": "only"},
@@ -1092,8 +1098,8 @@ class TestRichTokenExtraction:
         assert "discarded" not in reported_events[0].tags
         assert "solwyn_tags" not in client.chat.completions.create.call_args.kwargs
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     @pytest.mark.parametrize(
         "tags",
@@ -1113,7 +1119,7 @@ class TestRichTokenExtraction:
         solwyn = _make_solwyn(client)
 
         with (
-            patch.object(solwyn._budget, "check_budget") as check,
+            patch.object(solwyn._solwyn_budget, "check_budget") as check,
             pytest.raises((TypeError, ValueError)),
         ):
             solwyn.chat.completions.create(
@@ -1124,8 +1130,8 @@ class TestRichTokenExtraction:
 
         check.assert_not_called()
         client.chat.completions.create.assert_not_called()
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_merged_tag_limit_survives_warning_as_error_and_dispatches(self) -> None:
         client, _ = _mock_openai_client()
@@ -1134,13 +1140,13 @@ class TestRichTokenExtraction:
             tags={f"default-{index}": "default" for index in range(4)},
         )
         reported_events: list = []
-        solwyn._reporter.report = lambda event: reported_events.append(event)
+        solwyn._solwyn_reporter.report = lambda event: reported_events.append(event)
 
         with warnings.catch_warnings():
             warnings.simplefilter("error", solwyn_exceptions.SolwynTagsClampedWarning)
             with (
                 patch.object(
-                    solwyn._budget,
+                    solwyn._solwyn_budget,
                     "check_budget",
                     return_value=_allow_budget_result(),
                 ) as check,
@@ -1165,8 +1171,8 @@ class TestRichTokenExtraction:
         }
         assert len(reported_events[0].tags) == 10
         assert check.call_args.kwargs["tags"] == reported_events[0].tags
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_anthropic_non_streaming_service_tier_none_in_event(self) -> None:
         """Providers without a service tier report None behaviorally through the client."""
@@ -1174,9 +1180,11 @@ class TestRichTokenExtraction:
         solwyn = _make_solwyn(client)
 
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()):
+        with patch.object(
+            solwyn._solwyn_budget, "check_budget", return_value=_allow_budget_result()
+        ):
             solwyn.messages.create(
                 model="claude-sonnet-5",
                 max_tokens=1024,
@@ -1185,8 +1193,8 @@ class TestRichTokenExtraction:
 
         assert reported_events[0].service_tier is None
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
 
 @pytest.mark.unit
@@ -1199,10 +1207,12 @@ class TestSyncErrorAgentRunTagging:
         solwyn = _make_solwyn(client)
 
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()),
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", return_value=_allow_budget_result()
+            ),
             solwyn_pkg.run("doomed") as run_id,
             pytest.raises(RuntimeError, match="primary failed"),
         ):
@@ -1216,8 +1226,8 @@ class TestSyncErrorAgentRunTagging:
         assert reported_events[0].agent_run_id == run_id
         assert reported_events[0].agent_run_name == "doomed"
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_fallback_retry_error_events_tag_agent_run_id(self) -> None:
         # Same-provider model-swap fallback: the SAME client serves both hops.
@@ -1231,10 +1241,12 @@ class TestSyncErrorAgentRunTagging:
         solwyn = _make_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
 
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()),
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", return_value=_allow_budget_result()
+            ),
             solwyn_pkg.run("retry-doomed") as run_id,
             pytest.raises(_Status, match="fallback failed"),
         ):
@@ -1249,8 +1261,8 @@ class TestSyncErrorAgentRunTagging:
         # Second hop swapped the model on the same client.
         assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-5.4-mini"
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1288,7 +1300,7 @@ class TestSyncStreamingInterception:
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             result = solwyn.chat.completions.create(
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -1296,8 +1308,8 @@ class TestSyncStreamingInterception:
             )
 
         assert isinstance(result, SyncStreamWrapper)
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_streaming_reports_metadata_after_exhaustion(self) -> None:
         client, _ = _mock_openai_client()
@@ -1320,13 +1332,13 @@ class TestSyncStreamingInterception:
 
         solwyn = _make_solwyn(client)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             stream = solwyn.chat.completions.create(
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -1350,8 +1362,8 @@ class TestSyncStreamingInterception:
         assert len(chunks) == 2
         assert chunks[0].choices[0].delta.content == "Hi"
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_streaming_uses_run_snapshot_when_consumed_after_scope(self) -> None:
         client, _ = _mock_openai_client()
@@ -1370,7 +1382,7 @@ class TestSyncStreamingInterception:
 
         solwyn = _make_solwyn(client)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
@@ -1379,7 +1391,7 @@ class TestSyncStreamingInterception:
         scope_tags = {"team": "platform", "env": "prod"}
         call_tags = {"env": "stage", "job": "stream"}
         with (
-            patch.object(solwyn._budget._http, "post", return_value=mock_budget_response),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response),
             solwyn_pkg.run("orchestrator") as parent_run_id,
             solwyn_pkg.run("nightly", tags=scope_tags) as run_id,
         ):
@@ -1405,8 +1417,8 @@ class TestSyncStreamingInterception:
         }
         assert "solwyn_tags" not in client.chat.completions.create.call_args.kwargs
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_streaming_openai_service_tier_in_event(self) -> None:
         """OpenAI service_tier reaches MetadataEvent on sync streaming calls."""
@@ -1430,9 +1442,11 @@ class TestSyncStreamingInterception:
 
         solwyn = _make_solwyn(client)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget_result()):
+        with patch.object(
+            solwyn._solwyn_budget, "check_budget", return_value=_allow_budget_result()
+        ):
             stream = solwyn.chat.completions.create(
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -1442,8 +1456,8 @@ class TestSyncStreamingInterception:
 
         assert reported_events[0].service_tier == "flex"
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_streaming_confirms_budget_after_exhaustion(self) -> None:
         client, _ = _mock_openai_client()
@@ -1468,11 +1482,11 @@ class TestSyncStreamingInterception:
 
         # Confirm now goes through reporter.report_settlement (not budget.confirm_cost)
         settlement_calls: list = []
-        solwyn._reporter.report_settlement = lambda request, event: settlement_calls.append(
+        solwyn._solwyn_reporter.report_settlement = lambda request, event: settlement_calls.append(
             (request, event)
         )
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             stream = solwyn.chat.completions.create(
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -1486,10 +1500,10 @@ class TestSyncStreamingInterception:
         assert len(settlement_calls) == 1
         assert settlement_calls[0][0].reservation_id == "res_123"
         # budget.confirm_cost must NOT have been called directly
-        assert not hasattr(solwyn._budget, "_direct_confirm_calls")
+        assert not hasattr(solwyn._solwyn_budget, "_direct_confirm_calls")
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_streaming_injects_stream_options_for_openai(self) -> None:
         client, _ = _mock_openai_client()
@@ -1501,7 +1515,7 @@ class TestSyncStreamingInterception:
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             stream = solwyn.chat.completions.create(
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -1512,8 +1526,8 @@ class TestSyncStreamingInterception:
         call_kwargs = client.chat.completions.create.call_args[1]
         assert call_kwargs["stream_options"] == {"include_usage": True}
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_google_generate_content_stream_reports_metadata(self) -> None:
         """Google models.generate_content_stream() wraps and reports after exhaustion."""
@@ -1543,13 +1557,13 @@ class TestSyncStreamingInterception:
 
         solwyn = _make_solwyn(client)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             stream = solwyn.models.generate_content_stream(
                 model="gemini-3.5-flash",
                 contents="Hello",
@@ -1570,8 +1584,8 @@ class TestSyncStreamingInterception:
         client.models.generate_content_stream.assert_called_once()
         client.models.generate_content.assert_not_called()
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_anthropic_messages_stream_reports_metadata(self) -> None:
         """Anthropic messages.create(stream=True) wraps and reports after exhaustion."""
@@ -1603,13 +1617,13 @@ class TestSyncStreamingInterception:
 
         solwyn = _make_solwyn(client)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             stream = solwyn.messages.create(
                 model="claude-sonnet-5",
                 max_tokens=1024,
@@ -1628,8 +1642,8 @@ class TestSyncStreamingInterception:
         assert event.token_details.cached_input_tokens == 50
         assert len(chunks) == 4
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1650,9 +1664,9 @@ def _make_async_solwyn(client, **overrides):
     solwyn = AsyncSolwyn(client, **defaults)
 
     def report_settlement(_request, event):
-        solwyn._reporter.report(event)
+        solwyn._solwyn_reporter.report(event)
 
-    solwyn._reporter.report_settlement = report_settlement
+    solwyn._solwyn_reporter.report_settlement = report_settlement
     return solwyn
 
 
@@ -1685,13 +1699,13 @@ class TestAsyncStreamingInterception:
 
         solwyn = _make_async_solwyn(client)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             stream = await solwyn.chat.completions.create(
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -1708,8 +1722,8 @@ class TestAsyncStreamingInterception:
         assert event.input_tokens == 100
         assert event.output_tokens == 50
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1731,7 +1745,7 @@ class TestAsyncStreamingInterception:
 
         solwyn = _make_async_solwyn(client)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
@@ -1739,7 +1753,7 @@ class TestAsyncStreamingInterception:
 
         scope_tags = {"team": "platform", "env": "prod"}
         call_tags = {"env": "stage", "job": "stream"}
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             async with solwyn_pkg.run("orchestrator") as parent_run_id:
                 async with solwyn_pkg.run("nightly", tags=scope_tags) as run_id:
                     stream = await solwyn.chat.completions.create(
@@ -1764,8 +1778,8 @@ class TestAsyncStreamingInterception:
         }
         assert "solwyn_tags" not in client.chat.completions.create.call_args.kwargs
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1793,10 +1807,10 @@ class TestAsyncStreamingInterception:
 
         solwyn = _make_async_solwyn(client)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         with patch.object(
-            solwyn._budget,
+            solwyn._solwyn_budget,
             "check_budget",
             new=AsyncMockFn(return_value=_allow_budget_result()),
         ):
@@ -1809,8 +1823,8 @@ class TestAsyncStreamingInterception:
 
         assert reported_events[0].service_tier == "flex"
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1835,13 +1849,13 @@ class TestAsyncStreamingInterception:
 
         solwyn = _make_async_solwyn(client)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             stream = await solwyn.models.generate_content_stream(
                 model="gemini-3.5-flash",
                 contents="Hello",
@@ -1854,8 +1868,8 @@ class TestAsyncStreamingInterception:
         assert reported_events[0].output_tokens == 90  # 80 candidates + 10 thoughts
         client.models.generate_content_stream.assert_called_once()
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1884,13 +1898,13 @@ class TestAsyncStreamingInterception:
 
         solwyn = _make_async_solwyn(client)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             stream = await solwyn.messages.create(
                 model="claude-sonnet-5",
                 max_tokens=1024,
@@ -1904,8 +1918,8 @@ class TestAsyncStreamingInterception:
         assert reported_events[0].output_tokens == 83
         assert len(chunks) == 2
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -1927,20 +1941,22 @@ class TestAsyncNonStreamingInterception:
         solwyn = _make_async_solwyn(client)
 
         async def create_after_project_learned(**_kwargs):
-            assert solwyn._reporter._breaker_project_id == VALID_PROJECT_ID
+            assert solwyn._solwyn_reporter._breaker_project_id == VALID_PROJECT_ID
             return mock_response
 
         client.chat.completions.create = AsyncMockFn(side_effect=create_after_project_learned)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
         settlements: list = []
-        solwyn._reporter.report_settlement = lambda req, event: settlements.append((req, event))
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: settlements.append(
+            (req, event)
+        )
 
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = ALLOW_BUDGET_RESPONSE
         mock_budget_response.raise_for_status = MagicMock()
 
-        with patch.object(solwyn._budget._http, "post", return_value=mock_budget_response):
+        with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
             result = await solwyn.chat.completions.create(
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
@@ -1957,8 +1973,8 @@ class TestAsyncNonStreamingInterception:
         assert confirm.call_id == event.call_id
         assert reported_events == []
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1970,10 +1986,10 @@ class TestAsyncNonStreamingInterception:
             tags={"shared": "client", "client": "only"},
         )
         reported_events: list = []
-        solwyn._reporter.report = lambda event: reported_events.append(event)
+        solwyn._solwyn_reporter.report = lambda event: reported_events.append(event)
 
         with patch.object(
-            solwyn._budget,
+            solwyn._solwyn_budget,
             "check_budget",
             new=AsyncMockFn(return_value=_allow_budget_result()),
         ) as check:
@@ -1996,8 +2012,8 @@ class TestAsyncNonStreamingInterception:
         assert check.call_args.kwargs["tags"] == reported_events[0].tags
         assert "solwyn_tags" not in client.chat.completions.create.call_args.kwargs
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -2007,7 +2023,7 @@ class TestAsyncNonStreamingInterception:
 
         solwyn = _make_async_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         deny_result = SimpleNamespace(
             allowed=False,
@@ -2020,7 +2036,7 @@ class TestAsyncNonStreamingInterception:
         )
 
         with patch.object(
-            solwyn._budget,
+            solwyn._solwyn_budget,
             "check_budget",
             new=AsyncMockFn(return_value=deny_result),
         ) as check:
@@ -2038,8 +2054,8 @@ class TestAsyncNonStreamingInterception:
         assert reported_events[0].agent_run_id == run_id
         assert reported_events[0].agent_run_name == "async-expensive-job"
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -2053,11 +2069,11 @@ class TestAsyncNonStreamingInterception:
 
         with (
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
                 new=AsyncMockFn(return_value=_deny_budget_result("run_stopped")),
             ),
-            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report"),
         ):
             async with solwyn_pkg.run("dashboard-stopped-async") as run_id:
                 with pytest.raises(RunStoppedError) as exc_info:
@@ -2068,8 +2084,8 @@ class TestAsyncNonStreamingInterception:
                     )
 
         client.chat.completions.create.assert_not_called()
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
         error = exc_info.value
         assert type(error) is RunStoppedError
@@ -2106,7 +2122,7 @@ class TestAsyncNonStreamingInterception:
         mock_budget_response = MagicMock()
         mock_budget_response.json.return_value = deny_response
         mock_budget_response.raise_for_status = MagicMock()
-        solwyn._budget._http.post = AsyncMockFn(
+        solwyn._solwyn_budget._http.post = AsyncMockFn(
             side_effect=[mock_budget_response, httpx.ConnectError("unreachable")]
         )
 
@@ -2122,10 +2138,10 @@ class TestAsyncNonStreamingInterception:
             )
 
         client.chat.completions.create.assert_not_called()
-        assert solwyn._budget._http.post.call_count == 2
+        assert solwyn._solwyn_budget._http.post.call_count == 2
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -2137,10 +2153,10 @@ class TestAsyncNonStreamingInterception:
 
         solwyn = _make_async_solwyn(client)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         with patch.object(
-            solwyn._budget,
+            solwyn._solwyn_budget,
             "check_budget",
             new=AsyncMockFn(return_value=_allow_budget_result()),
         ):
@@ -2151,8 +2167,8 @@ class TestAsyncNonStreamingInterception:
 
         assert reported_events[0].service_tier == "batch"
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -2162,10 +2178,10 @@ class TestAsyncNonStreamingInterception:
 
         solwyn = _make_async_solwyn(client)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         with patch.object(
-            solwyn._budget,
+            solwyn._solwyn_budget,
             "check_budget",
             new=AsyncMockFn(return_value=_allow_budget_result()),
         ) as check:
@@ -2182,8 +2198,8 @@ class TestAsyncNonStreamingInterception:
         assert reported_events[0].parent_agent_run_id == parent_run_id
         assert reported_events[0].agent_run_name == "async-nightly-batch"
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -2193,10 +2209,10 @@ class TestAsyncNonStreamingInterception:
 
         solwyn = _make_async_solwyn(client)
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         with patch.object(
-            solwyn._budget,
+            solwyn._solwyn_budget,
             "check_budget",
             new=AsyncMockFn(return_value=_allow_budget_result()),
         ):
@@ -2212,8 +2228,8 @@ class TestAsyncNonStreamingInterception:
         assert reported_events[0].agent_run_id == run_id
         assert reported_events[0].agent_run_name == "async-doomed"
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -2229,10 +2245,10 @@ class TestAsyncNonStreamingInterception:
 
         solwyn = _make_async_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
         reported_events: list = []
-        solwyn._reporter.report = lambda e: reported_events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported_events.append(e)
 
         with patch.object(
-            solwyn._budget,
+            solwyn._solwyn_budget,
             "check_budget",
             new=AsyncMockFn(return_value=_allow_budget_result()),
         ):
@@ -2248,5 +2264,5 @@ class TestAsyncNonStreamingInterception:
         assert all(event.agent_run_name == "async-retry-doomed" for event in reported_events)
         assert client.chat.completions.create.call_args_list[1].kwargs["model"] == "gpt-5.4-mini"
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()

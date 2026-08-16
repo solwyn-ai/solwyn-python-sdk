@@ -304,23 +304,23 @@ async def test_async_reporter_reset_clears_loop_state_and_swaps_client() -> None
 @pytest.mark.unit
 def test_solwyn_base_reset_replaces_client_locks() -> None:
     # _SolwynBase's two locks guard pure in-process state, but a user thread can
-    # hold _breaker_lock on the lazy provider-breaker creation path; inheriting it
+    # hold _solwyn_breaker_lock on the lazy provider-breaker creation path; inheriting it
     # held would deadlock the child's next breaker lookup.
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(make_mock_client(), api_key=VALID_API_KEY, model="gpt-5.5")
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
 
-    old_signal_lock = solwyn._signal_lock
-    old_breaker_lock = solwyn._breaker_lock
-    breakers_before = dict(solwyn._circuit_breakers)
+    old_signal_lock = solwyn._solwyn_signal_lock
+    old_breaker_lock = solwyn._solwyn_breaker_lock
+    breakers_before = dict(solwyn._solwyn_circuit_breakers)
 
     solwyn._reset_after_fork_in_child()
 
-    assert solwyn._signal_lock is not old_signal_lock
-    assert solwyn._breaker_lock is not old_breaker_lock
+    assert solwyn._solwyn_signal_lock is not old_signal_lock
+    assert solwyn._solwyn_breaker_lock is not old_breaker_lock
     # Breaker objects (and their health) are legitimately inherited.
-    assert solwyn._circuit_breakers == breakers_before
+    assert solwyn._solwyn_circuit_breakers == breakers_before
 
     solwyn.close()
 

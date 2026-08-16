@@ -1824,8 +1824,8 @@ def _openai_client() -> tuple[_OpenAIClient, object]:
 def _build_solwyn(client: object, **overrides: object) -> Solwyn:
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, api_key=VALID_API_KEY, **overrides)  # type: ignore[arg-type]
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
     return solwyn
 
 
@@ -1850,16 +1850,16 @@ class TestClientLeasePlumbing:
         client, _ = _openai_client()
         solwyn = _build_solwyn(client, lease_output_bound_default=777)
 
-        assert solwyn._budget._lease.holder_id == solwyn._sdk_instance_id
-        assert solwyn._budget._lease.enabled is True
-        assert solwyn._budget._lease.output_bound_default == 777
+        assert solwyn._solwyn_budget._lease.holder_id == solwyn._solwyn_sdk_instance_id
+        assert solwyn._solwyn_budget._lease.enabled is True
+        assert solwyn._solwyn_budget._lease.output_bound_default == 777
 
         disabled = _build_solwyn(client, lease_enabled=False)
-        assert disabled._budget._lease.enabled is False
+        assert disabled._solwyn_budget._lease.enabled is False
 
         for wrapper in (solwyn, disabled):
-            wrapper._reporter._http.close()
-            wrapper._budget._http.close()
+            wrapper._solwyn_reporter._http.close()
+            wrapper._solwyn_budget._http.close()
 
     @pytest.mark.parametrize("cap_field", ["max_tokens", "max_completion_tokens"])
     def test_the_calls_output_cap_becomes_the_lease_bound(self, cap_field: str) -> None:
@@ -1867,8 +1867,10 @@ class TestClientLeasePlumbing:
         solwyn = _build_solwyn(client)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
-            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", return_value=_lease_result()
+            ) as check,
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
             solwyn_pkg.run("bounded-job"),
         ):
             solwyn.chat.completions.create(
@@ -1879,8 +1881,8 @@ class TestClientLeasePlumbing:
 
         assert check.call_args.kwargs["estimated_output_bound"] == 256
         assert check.call_args.kwargs["call_id"]
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     @pytest.mark.parametrize(
         ("model", "expected_key"),
@@ -1907,8 +1909,10 @@ class TestClientLeasePlumbing:
         solwyn = _build_solwyn(client, default_params=global_defaults)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
-            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", return_value=_lease_result()
+            ) as check,
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
             solwyn_pkg.run("alias-precedence"),
         ):
             solwyn.chat.completions.create(
@@ -1921,8 +1925,8 @@ class TestClientLeasePlumbing:
         dispatched = client.chat.completions.create.call_args.kwargs
         assert dispatched[expected_key] == 256
         assert ({"max_tokens", "max_completion_tokens"} - {expected_key}).isdisjoint(dispatched)
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     @pytest.mark.parametrize(
         ("model", "expected_key"),
@@ -1956,11 +1960,11 @@ class TestClientLeasePlumbing:
         try:
             with (
                 patch.object(
-                    solwyn._budget,
+                    solwyn._solwyn_budget,
                     "check_budget",
                     AsyncMock(return_value=_lease_result()),
                 ) as check,
-                patch.object(solwyn._reporter, "report_settlement"),
+                patch.object(solwyn._solwyn_reporter, "report_settlement"),
                 solwyn_pkg.run("async-alias-precedence"),
             ):
                 await solwyn.chat.completions.create(
@@ -1974,16 +1978,18 @@ class TestClientLeasePlumbing:
             assert dispatched[expected_key] == 256
             assert ({"max_tokens", "max_completion_tokens"} - {expected_key}).isdisjoint(dispatched)
         finally:
-            await solwyn._reporter._http.aclose()
-            await solwyn._budget._http.aclose()
+            await solwyn._solwyn_reporter._http.aclose()
+            await solwyn._solwyn_budget._http.aclose()
 
     def test_an_uncapped_call_sends_the_configured_default_bound(self) -> None:
         client, _ = _openai_client()
         solwyn = _build_solwyn(client, lease_output_bound_default=777)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
-            patch.object(solwyn._reporter, "report_settlement"),
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", return_value=_lease_result()
+            ) as check,
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
             solwyn_pkg.run("uncapped-job"),
         ):
             solwyn.chat.completions.create(
@@ -1991,8 +1997,8 @@ class TestClientLeasePlumbing:
             )
 
         assert check.call_args.kwargs["estimated_output_bound"] == 777
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     @pytest.mark.parametrize(
         ("dialect", "kwargs", "global_defaults", "expected"),
@@ -2083,8 +2089,10 @@ class TestClientLeasePlumbing:
         solwyn = _build_solwyn(client)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
-            patch.object(solwyn._reporter, "report_settlement") as settle,
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", return_value=_lease_result()
+            ) as check,
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
             solwyn_pkg.run("leased-job"),
         ):
             solwyn.chat.completions.create(
@@ -2096,8 +2104,8 @@ class TestClientLeasePlumbing:
         assert confirm.lease_id == "lease_1"
         assert confirm.reservation_id is None
         assert confirm.call_id == check.call_args.kwargs["call_id"]
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_a_failed_call_hands_the_reservation_back(self) -> None:
         client, _ = _openai_client()
@@ -2105,9 +2113,11 @@ class TestClientLeasePlumbing:
         solwyn = _build_solwyn(client)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
-            patch.object(solwyn._budget, "release_reservation") as release,
-            patch.object(solwyn._reporter, "report"),
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", return_value=_lease_result()
+            ) as check,
+            patch.object(solwyn._solwyn_budget, "release_reservation") as release,
+            patch.object(solwyn._solwyn_reporter, "report"),
             solwyn_pkg.run("doomed-job"),
             pytest.raises(RuntimeError),
         ):
@@ -2119,8 +2129,8 @@ class TestClientLeasePlumbing:
             check.call_args.kwargs["call_id"],
             lease_claim_token=123,
         )
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_no_provider_can_serve_hands_the_reservation_back(self) -> None:
         client, _ = _openai_client()
@@ -2131,9 +2141,11 @@ class TestClientLeasePlumbing:
         solwyn._get_circuit_breaker("openai").record_failure()
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
-            patch.object(solwyn._budget, "release_reservation") as release,
-            patch.object(solwyn._reporter, "report"),
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", return_value=_lease_result()
+            ) as check,
+            patch.object(solwyn._solwyn_budget, "release_reservation") as release,
+            patch.object(solwyn._solwyn_reporter, "report"),
             solwyn_pkg.run("unavailable-job"),
             pytest.raises(ProviderUnavailableError),
         ):
@@ -2145,8 +2157,8 @@ class TestClientLeasePlumbing:
             check.call_args.kwargs["call_id"],
             lease_claim_token=123,
         )
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_media_calls_carry_the_join_key(self) -> None:
         client, _ = _openai_client()
@@ -2165,16 +2177,18 @@ class TestClientLeasePlumbing:
             return sdk_client.embeddings.create, dict(kwargs)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
-            patch.object(solwyn._reporter, "report_settlement"),
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route),
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", return_value=_lease_result()
+            ) as check,
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
+            patch.object(solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route),
             solwyn_pkg.run("media-job"),
         ):
             solwyn._media_call(spec, model="text-embedding-3-small", input="hello")
 
         assert check.call_args.kwargs["call_id"]
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_a_failed_media_call_hands_the_reservation_back(self) -> None:
         client, _ = _openai_client()
@@ -2191,10 +2205,12 @@ class TestClientLeasePlumbing:
             return sdk_client.embeddings.create, dict(kwargs)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_lease_result()) as check,
-            patch.object(solwyn._budget, "release_reservation") as release,
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route),
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", return_value=_lease_result()
+            ) as check,
+            patch.object(solwyn._solwyn_budget, "release_reservation") as release,
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route),
             solwyn_pkg.run("media-doomed"),
             pytest.raises(RuntimeError),
         ):
@@ -2204,8 +2220,8 @@ class TestClientLeasePlumbing:
             check.call_args.kwargs["call_id"],
             lease_claim_token=123,
         )
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2284,7 +2300,7 @@ class TestLeaseForkReset:
         enforcer._http.close()
 
     def test_fork_reset_takes_a_fresh_holder_identity(self) -> None:
-        # The client's _sdk_instance_id survives a fork unchanged, so the
+        # The client's _solwyn_sdk_instance_id survives a fork unchanged, so the
         # enforcer must mint its own holder id in the child: core releases a
         # same-(project, run, holder) active lease as stale when a grant lands,
         # so a child re-granting under the PARENT's id would kill the parent's

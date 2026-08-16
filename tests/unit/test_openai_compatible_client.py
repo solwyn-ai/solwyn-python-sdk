@@ -94,10 +94,10 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
     defaults.update(overrides)
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
-    solwyn._reporter.report = MagicMock()
-    solwyn._reporter.report_settlement = MagicMock()
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter.report = MagicMock()
+    solwyn._solwyn_reporter.report_settlement = MagicMock()
     return solwyn
 
 
@@ -152,7 +152,7 @@ _REQUEST: dict[str, Any] = {
 
 
 def _reported_events(solwyn: Solwyn) -> list[Any]:
-    return [call.args[0] for call in solwyn._reporter.report.call_args_list]
+    return [call.args[0] for call in solwyn._solwyn_reporter.report.call_args_list]
 
 
 def _open_breaker(solwyn: Solwyn, provider: str) -> None:
@@ -173,7 +173,9 @@ class TestCompatAttribution:
         client.chat.completions.create.return_value = _response()
         solwyn = _make_solwyn(client)
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()) as check:
+        with patch.object(
+            solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()
+        ) as check:
             solwyn.chat.completions.create(**_REQUEST)
 
         # Budget pre-flight names the detected provider, not "openai".
@@ -190,7 +192,9 @@ class TestCompatAttribution:
         client.chat.completions.create.return_value = _response(cached_tokens=4)
         solwyn = _make_solwyn(client)
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()) as check:
+        with patch.object(
+            solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()
+        ) as check:
             solwyn.chat.completions.create(**_REQUEST)
 
         assert check.call_args.kwargs["provider"] == "zai"
@@ -204,7 +208,7 @@ class TestCompatAttribution:
         client.chat.completions.create.return_value = _response()
         solwyn = _make_solwyn(client)
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(
                 model="anthropic/claude-sonnet-4.5",
                 messages=[{"role": "user", "content": "hi"}],
@@ -220,7 +224,9 @@ class TestCompatAttribution:
         primary.chat.completions.create.return_value = _response()
         solwyn = _make_solwyn(primary, fallback=[(fallback, "openrouter/auto")])
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()) as check:
+        with patch.object(
+            solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()
+        ) as check:
             solwyn.chat.completions.create(**_REQUEST)
 
         assert check.call_args.kwargs["fallback_providers"] == ["openrouter"]
@@ -239,7 +245,7 @@ class TestProviderOverride:
         client.chat.completions.create.return_value = _response()
         solwyn = _make_solwyn(client, provider="vllm")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_REQUEST)
 
         assert _reported_events(solwyn)[0].provider == ProviderName.VLLM
@@ -249,7 +255,7 @@ class TestProviderOverride:
         client.chat.completions.create.return_value = _response()
         solwyn = _make_solwyn(client, provider="zai")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_REQUEST)
 
         assert _reported_events(solwyn)[0].provider == "zai"
@@ -280,7 +286,7 @@ class TestProviderOverride:
         fallback = _compat_client("http://localhost:9999/v1")
         solwyn = _make_solwyn(primary, fallback=[(fallback, "my-model", {}, "vllm")])
 
-        assert solwyn._runtimes[1].entry.provider == ProviderName.VLLM
+        assert solwyn._solwyn_runtimes[1].entry.provider == ProviderName.VLLM
 
     def test_fallback_provider_pin_rejects_wrong_client_shape(self) -> None:
         primary = _compat_client("https://api.groq.com/openai/v1")
@@ -310,7 +316,7 @@ class TestStreamingUsagePolicy:
         client = _compat_client(base_url)
         client.chat.completions.create.return_value = iter([_text_chunk("hi"), _usage_chunk(5, 2)])
         solwyn = _make_solwyn(client)
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(**_REQUEST, stream=True)
             list(stream)
         return client.chat.completions.create.call_args.kwargs
@@ -338,7 +344,7 @@ class TestStreamingUsagePolicy:
             [_text_chunk("hello"), _usage_chunk(9, 4)]
         )
         solwyn = _make_solwyn(client)
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             list(solwyn.chat.completions.create(**_REQUEST, stream=True))
 
         event = _reported_events(solwyn)[0]
@@ -361,13 +367,15 @@ class TestEstimatedUsageFallback:
             prompt_tokens=None, content="z" * 80
         )
         solwyn = _make_solwyn(client)
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget("res_1")):
+        with patch.object(
+            solwyn._solwyn_budget, "check_budget", return_value=_allow_budget("res_1")
+        ):
             solwyn.chat.completions.create(**_REQUEST)
 
         # A reservation was granted, so settlement rides report_settlement(confirm,
         # event) — the SUCCESS event travels WITH the confirm.
-        solwyn._reporter.report_settlement.assert_called_once()
-        confirm, event = solwyn._reporter.report_settlement.call_args.args
+        solwyn._solwyn_reporter.report_settlement.assert_called_once()
+        confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
         assert event.token_details.is_estimated is True
         # Input from the pre-call length estimate ("hello there" = 11 chars).
         assert event.input_tokens > 0
@@ -382,7 +390,7 @@ class TestEstimatedUsageFallback:
             [_text_chunk("a" * 30), _text_chunk("b" * 10)]
         )
         solwyn = _make_solwyn(client)
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             list(solwyn.chat.completions.create(**_REQUEST, stream=True))
 
         event = _reported_events(solwyn)[0]
@@ -397,7 +405,7 @@ class TestEstimatedUsageFallback:
             [_text_chunk("a" * 30), _text_chunk("b" * 10)]
         )
         solwyn = _make_solwyn(client)
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             list(solwyn.chat.completions.create(**_REQUEST, stream=True))
 
         event = _reported_events(solwyn)[0]
@@ -412,7 +420,7 @@ class TestEstimatedUsageFallback:
             prompt_tokens=3, completion_tokens=1
         )
         solwyn = _make_solwyn(client)
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_REQUEST)
 
         event = _reported_events(solwyn)[0]
@@ -429,7 +437,7 @@ class TestEstimatedUsageFallback:
             prompt_tokens=-1, completion_tokens=-1, content="z" * 80
         )
         solwyn = _make_solwyn(client)
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_REQUEST)
 
         assert result.choices[0].message.content == "z" * 80
@@ -445,7 +453,7 @@ class TestEstimatedUsageFallback:
         client = _compat_client("http://localhost:1234/v1")
         client.chat.completions.create.return_value = response
         solwyn = _make_solwyn(client)
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_REQUEST)
 
         event = _reported_events(solwyn)[0]
@@ -462,7 +470,7 @@ class TestEstimatedUsageFallback:
             [_text_chunk("x" * 40), _usage_chunk(-1, -2)]
         )
         solwyn = _make_solwyn(client)
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             chunks = list(solwyn.chat.completions.create(**_REQUEST, stream=True))
 
         assert len(chunks) == 2  # the stream was delivered intact
@@ -490,7 +498,7 @@ class TestCompatFailover:
         )
         _open_breaker(solwyn, "groq")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_REQUEST)
 
         assert result is response
@@ -515,7 +523,7 @@ class TestCompatFailover:
         )
         _open_breaker(solwyn, "groq")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             chunks = list(
                 solwyn.chat.completions.create(
                     **_REQUEST,
@@ -551,7 +559,7 @@ class TestCompatFailover:
         )
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(TypeError, match="store") as exc_info,
         ):
             solwyn.chat.completions.create(**_REQUEST, store=True)
@@ -572,7 +580,7 @@ class TestCompatFailover:
         _open_breaker(solwyn, "groq")
 
         tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(**_REQUEST, stream=True, tools=tools)
             chunks = list(stream)
 
@@ -608,7 +616,7 @@ class TestCompatFailover:
         )
         _open_breaker(solwyn, "groq")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_REQUEST)
 
         anthropic.messages.create.assert_called_once()
@@ -624,7 +632,7 @@ class TestCompatFailover:
         client = _compat_client("https://api.x.ai/v1")
         client.chat.completions.create.return_value = iter([_usage_chunk(5, 2)])
         solwyn = _make_solwyn(client)
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             list(
                 solwyn.chat.completions.create(
                     **_REQUEST, stream=True, stream_options={"include_usage": True}
@@ -642,7 +650,7 @@ class TestCompatFailover:
         solwyn = _make_solwyn(primary, fallback=[(fallback, "mistral-large-latest")])
         _open_breaker(solwyn, "groq")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             list(
                 solwyn.chat.completions.create(
                     **_REQUEST, stream=True, stream_options={"include_usage": True}
@@ -660,7 +668,7 @@ class TestCompatFailover:
         solwyn = _make_solwyn(primary, fallback=[(fallback, "deepseek-chat")])
         _open_breaker(solwyn, "openai")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(
                 model="gpt-5",
                 messages=[{"role": "user", "content": "hi"}],
@@ -681,7 +689,7 @@ class TestCompatFailover:
         solwyn = _make_solwyn(primary, fallback=[(fallback, "deepseek-chat", {"max_tokens": 4096})])
         _open_breaker(solwyn, "openai")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(
                 model="gpt-5",
                 messages=[{"role": "user", "content": "hi"}],
@@ -707,7 +715,7 @@ class TestCompatFailover:
         )
         _open_breaker(solwyn, "openai")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(
                 model="gpt-5",
                 messages=[{"role": "user", "content": "hi"}],
@@ -729,7 +737,7 @@ class TestCompatFailover:
         solwyn = _make_solwyn(primary, fallback=[(fallback, "deepseek-chat")])
         _open_breaker(solwyn, "openai")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(
                 model="gpt-5",
                 messages=[{"role": "user", "content": "hi"}],
@@ -751,7 +759,7 @@ class TestCompatFailover:
         solwyn = _make_solwyn(primary, fallback=[(fallback, "openrouter/auto")])
         _open_breaker(solwyn, "groq")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(
                 **_REQUEST,
                 extra_headers={"Helicone-Auth": "Bearer sk-helicone-secret"},
@@ -771,7 +779,7 @@ class TestCompatFailover:
         client.chat.completions.create.return_value = _response()
         solwyn = _make_solwyn(client)
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(
                 **_REQUEST,
                 extra_headers={"Helicone-Auth": "Bearer sk-helicone-secret"},
@@ -793,7 +801,7 @@ class TestCompatFailover:
         swap.chat.completions.create.return_value = _response()
         solwyn = _make_solwyn(primary, fallback=[(swap, "llama-3.1-8b-instant")])
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(
                 **_REQUEST, extra_headers={"Helicone-Auth": "Bearer sk-helicone-secret"}
             )
@@ -814,7 +822,7 @@ class TestCompatFailover:
         )
         _open_breaker(solwyn, "groq")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(
                 **_REQUEST, extra_headers={"Helicone-Auth": "Bearer sk-helicone-secret"}
             )
@@ -835,7 +843,7 @@ class TestCompatFailover:
 
         tools = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(UntranslatableRequestError),
         ):
             solwyn.chat.completions.create(**_REQUEST, stream=True, tools=tools)
@@ -859,13 +867,13 @@ def _make_async_solwyn(client: object, **overrides: object) -> AsyncSolwyn:
     defaults: dict[str, object] = {"api_key": VALID_API_KEY}
     defaults.update(overrides)
     solwyn = AsyncSolwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter.report = MagicMock()
-    solwyn._reporter.report_settlement = MagicMock()
+    solwyn._solwyn_reporter.report = MagicMock()
+    solwyn._solwyn_reporter.report_settlement = MagicMock()
     return solwyn
 
 
 def _async_reported_events(solwyn: AsyncSolwyn) -> list[Any]:
-    return [call.args[0] for call in solwyn._reporter.report.call_args_list]
+    return [call.args[0] for call in solwyn._solwyn_reporter.report.call_args_list]
 
 
 @pytest.mark.unit
@@ -879,7 +887,7 @@ class TestAsyncCompat:
         solwyn = _make_async_solwyn(client)
 
         with patch.object(
-            solwyn._budget, "check_budget", AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", AsyncMock(return_value=_allow_budget())
         ) as check:
             await solwyn.chat.completions.create(**_REQUEST)
 
@@ -898,7 +906,9 @@ class TestAsyncCompat:
         )
         solwyn = _make_async_solwyn(client)
 
-        with patch.object(solwyn._budget, "check_budget", AsyncMock(return_value=_allow_budget())):
+        with patch.object(
+            solwyn._solwyn_budget, "check_budget", AsyncMock(return_value=_allow_budget())
+        ):
             stream = await solwyn.chat.completions.create(**_REQUEST, stream=True)
             async for _ in stream:
                 pass
@@ -917,7 +927,9 @@ class TestAsyncCompat:
         client.chat.completions.create = AsyncMock(return_value=_response())
         solwyn = _make_async_solwyn(client, provider="vllm")
 
-        with patch.object(solwyn._budget, "check_budget", AsyncMock(return_value=_allow_budget())):
+        with patch.object(
+            solwyn._solwyn_budget, "check_budget", AsyncMock(return_value=_allow_budget())
+        ):
             await solwyn.chat.completions.create(**_REQUEST)
 
         assert _async_reported_events(solwyn)[0].provider == ProviderName.VLLM

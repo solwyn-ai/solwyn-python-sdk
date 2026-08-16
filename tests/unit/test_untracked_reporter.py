@@ -575,8 +575,8 @@ def test_sync_reporters_only_drain_their_originating_observations(second_api_key
 
     try:
         with (
-            patch.object(first._reporter, "_start_untracked_cycle") as first_start,
-            patch.object(second._reporter, "_start_untracked_cycle") as second_start,
+            patch.object(first._solwyn_reporter, "_start_untracked_cycle") as first_start,
+            patch.object(second._solwyn_reporter, "_start_untracked_cycle") as second_start,
         ):
             assert first.post() == "posted"
             assert first.post() == "posted"
@@ -584,15 +584,17 @@ def test_sync_reporters_only_drain_their_originating_observations(second_api_key
         assert first_start.call_count == 2
         second_start.assert_not_called()
         with (
-            patch.object(first._reporter._http, "post", return_value=_ok_response()) as first_post,
             patch.object(
-                second._reporter._http,
+                first._solwyn_reporter._http, "post", return_value=_ok_response()
+            ) as first_post,
+            patch.object(
+                second._solwyn_reporter._http,
                 "post",
                 return_value=_ok_response(),
             ) as second_post,
         ):
-            first._reporter._flush_untracked_reports()
-            second._reporter._flush_untracked_reports()
+            first._solwyn_reporter._flush_untracked_reports()
+            second._solwyn_reporter._flush_untracked_reports()
 
         first_post.assert_called_once()
         assert first_post.call_args.kwargs["json"][0]["occurrences"] == 2
@@ -840,11 +842,11 @@ def test_sync_shipping_defaults_post_exact_advisory_wire_without_budget_bootstra
         return _ok_response()
 
     try:
-        assert client._config.on_unmetered == "warn"
-        assert client._config.report_untracked_surfaces is True
+        assert client._solwyn_config.on_unmetered == "warn"
+        assert client._solwyn_config.report_untracked_surfaces is True
         with (
-            patch.object(client._reporter._http, "post", side_effect=send),
-            patch.object(client._budget._http, "post") as budget_post,
+            patch.object(client._solwyn_reporter._http, "post", side_effect=send),
+            patch.object(client._solwyn_budget._http, "post") as budget_post,
         ):
             with caplog.at_level(logging.WARNING, logger="solwyn._base"):
                 assert client.post() == "posted"
@@ -852,7 +854,7 @@ def test_sync_shipping_defaults_post_exact_advisory_wire_without_budget_bootstra
             budget_post.assert_not_called()
         assert len(wire_calls) == 1
         url, kwargs, worker_thread = wire_calls[0]
-        assert url == f"{client._config.api_url}/api/v1/untracked-surfaces"
+        assert url == f"{client._solwyn_config.api_url}/api/v1/untracked-surfaces"
         assert worker_thread is not caller_thread
         assert kwargs["headers"] == {
             "Authorization": f"Bearer {VALID_API_KEY}",
@@ -881,7 +883,7 @@ def test_sync_disabled_reporting_stays_local_through_periodic_flush_and_close(
         reporter_flush_interval=0.01,
     )
 
-    with patch.object(client._reporter._http, "post", return_value=_ok_response()) as post:
+    with patch.object(client._solwyn_reporter._http, "post", return_value=_ok_response()) as post:
         with caplog.at_level(logging.WARNING, logger="solwyn._base"):
             assert client.post() == "posted"
             assert client.post() == "posted"
@@ -891,9 +893,9 @@ def test_sync_disabled_reporting_stays_local_through_periodic_flush_and_close(
     key = ("openai", "openai_sdk", "sync", "post")
     assert _base._untracked_surface_observations[key]["occurrences"] == 2
     assert len([record for record in caplog.records if record.name == "solwyn._base"]) == 1
-    assert client._untracked_observation_notifier is None
-    assert client._reporter._untracked_state is None
-    assert client._reporter._untracked_worker is None
+    assert client._solwyn_untracked_observation_notifier is None
+    assert client._solwyn_reporter._untracked_state is None
+    assert client._solwyn_reporter._untracked_worker is None
     post.assert_not_called()
 
 
@@ -1073,18 +1075,18 @@ async def test_async_untracked_only_call_auto_starts_and_wakes_reporter() -> Non
     sent = asyncio.Event()
 
     async def send(url: str, **_kwargs: object) -> MagicMock:
-        assert url == f"{client._config.api_url}/api/v1/untracked-surfaces"
+        assert url == f"{client._solwyn_config.api_url}/api/v1/untracked-surfaces"
         sent.set()
         return _ok_response()
 
     try:
         with (
-            patch.object(client._reporter._http, "post", new=AsyncMock(side_effect=send)),
-            patch.object(client._budget._http, "post", new=AsyncMock()) as budget_post,
+            patch.object(client._solwyn_reporter._http, "post", new=AsyncMock(side_effect=send)),
+            patch.object(client._solwyn_budget._http, "post", new=AsyncMock()) as budget_post,
         ):
             assert await client.post() == "posted"
             await asyncio.wait_for(sent.wait(), timeout=1.0)
-            assert client._reporter._flush_task is not None
+            assert client._solwyn_reporter._flush_task is not None
             budget_post.assert_not_awaited()
     finally:
         await client.close()
@@ -1102,10 +1104,10 @@ async def test_async_disabled_reporting_stays_local_through_periodic_flush_and_c
         report_untracked_surfaces=False,
         reporter_flush_interval=0.01,
     )
-    client._reporter.start()
+    client._solwyn_reporter.start()
 
     with patch.object(
-        client._reporter._http,
+        client._solwyn_reporter._http,
         "post",
         new=AsyncMock(return_value=_ok_response()),
     ) as post:
@@ -1118,9 +1120,9 @@ async def test_async_disabled_reporting_stays_local_through_periodic_flush_and_c
     key = ("openai", "openai_sdk", "async", "post")
     assert _base._untracked_surface_observations[key]["occurrences"] == 2
     assert len([record for record in caplog.records if record.name == "solwyn._base"]) == 1
-    assert client._untracked_observation_notifier is None
-    assert client._reporter._untracked_state is None
-    assert client._reporter._untracked_task is None
+    assert client._solwyn_untracked_observation_notifier is None
+    assert client._solwyn_reporter._untracked_state is None
+    assert client._solwyn_reporter._untracked_task is None
     post.assert_not_awaited()
 
 

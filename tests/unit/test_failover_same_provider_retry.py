@@ -111,15 +111,15 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
     defaults.update(overrides)
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
-    solwyn._reporter.report = MagicMock()
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter.report = MagicMock()
     return solwyn
 
 
 def _close(solwyn: Solwyn) -> None:
-    solwyn._reporter._http.close()
-    solwyn._budget._http.close()
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_budget._http.close()
 
 
 class _FixedDeadline:
@@ -173,11 +173,11 @@ class TestSameProviderRetryOn429:
         )
         openai_cb = solwyn._get_circuit_breaker("openai")
         events: list = []
-        solwyn._reporter.report = lambda event: events.append(event)
+        solwyn._solwyn_reporter.report = lambda event: events.append(event)
 
         with (
             patch("solwyn.client.time.sleep") as sleep,
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             run("retry-agent", tags={"route": "same-provider"}) as run_id,
         ):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -219,7 +219,7 @@ class TestSameProviderRetryOn429:
                 openai_cb, "record_failure", wraps=openai_cb.record_failure
             ) as record_failure,
             patch("solwyn.client.time.sleep") as sleep,
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
 
             def openai_create(*_args: object, **_kwargs: object) -> object:
@@ -264,7 +264,7 @@ class TestSameProviderRetryOn429:
         with (
             patch("solwyn.client.Deadline", _FixedDeadline),
             patch("solwyn.client.time.sleep") as sleep,
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -293,7 +293,7 @@ class TestSameProviderRetryOn429:
 
         with (
             patch("solwyn.client.time.sleep") as sleep,
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -326,7 +326,7 @@ class TestSameProviderRetryOn429:
 
         with (
             patch("solwyn.client.time.sleep") as sleep,
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -347,11 +347,11 @@ class TestSameProviderRetryOn429:
 
         solwyn = _make_solwyn(openai, model="gpt-5.5", same_provider_retries=1)
         events: list = []
-        solwyn._reporter.report = lambda e: events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: events.append(e)
 
         with (
             patch("solwyn.client.time.sleep"),
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -379,11 +379,11 @@ class TestSameProviderRetryOn429:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list = []
-        solwyn._reporter.report = lambda e: events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: events.append(e)
 
         with (
             patch("solwyn.client.time.sleep"),
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -412,7 +412,7 @@ class TestSameProviderRetryOn429:
 
         with (
             patch("solwyn.client.time.sleep") as sleep,
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -440,7 +440,7 @@ class TestSameProviderRetryOn429:
 
         with (
             patch("solwyn.client.time.sleep") as sleep,
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -469,7 +469,7 @@ class TestSameProviderRetryOn429:
         with (
             patch("solwyn.client.Deadline", _FixedDeadline),
             patch("solwyn.client.time.sleep") as sleep,
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -491,7 +491,7 @@ class TestSameProviderRetryOn429:
         with (
             patch("solwyn.client.Deadline", _FixedDeadline),
             patch("solwyn.client.time.sleep") as sleep,
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -520,7 +520,7 @@ class TestSameProviderRetryOn429:
 
         with (
             patch("solwyn.client.time.sleep"),
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(_Status) as exc_info,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -555,7 +555,7 @@ class TestSameProviderRetryOn429:
 
         with (
             patch("solwyn.client.time.sleep"),
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(_Status) as exc_info,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -588,7 +588,7 @@ class TestSameProviderRetryOn429:
 
         with (
             patch("solwyn.client.time.sleep") as sleep,
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -614,7 +614,7 @@ class TestSameProviderRetryOn429:
 
         with (
             patch("solwyn.client.time.sleep") as sleep,
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -647,7 +647,7 @@ class TestSameProviderRetryOn429:
 
         with (
             patch("solwyn.client.time.sleep") as sleep,
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -685,13 +685,13 @@ class TestAsyncSameProviderRetryOn429:
             same_provider_retries=1,
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
-        solwyn._reporter.report = MagicMock()
+        solwyn._solwyn_reporter.report = MagicMock()
         openai_cb = solwyn._get_circuit_breaker("openai")
 
         with (
             patch("solwyn.client.asyncio.sleep", new=AsyncMock()) as sleep,
             patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
             ),
         ):
             result = await solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -703,8 +703,8 @@ class TestAsyncSameProviderRetryOn429:
         assert openai_cb.failure_count == 0
         assert openai_cb.state == CircuitState.CLOSED
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_retry_exhausted_falls_over(self) -> None:
@@ -720,7 +720,7 @@ class TestAsyncSameProviderRetryOn429:
             same_provider_retries=1,
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
-        solwyn._reporter.report = MagicMock()
+        solwyn._solwyn_reporter.report = MagicMock()
         openai_cb = solwyn._get_circuit_breaker("openai")
         anthropic_cb = solwyn._get_circuit_breaker("anthropic")
         attempts = 0
@@ -731,7 +731,7 @@ class TestAsyncSameProviderRetryOn429:
             ) as record_failure,
             patch("solwyn.client.asyncio.sleep", new=AsyncMock()) as sleep,
             patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
             ),
         ):
 
@@ -756,8 +756,8 @@ class TestAsyncSameProviderRetryOn429:
         assert openai_cb.failure_count == 1
         assert anthropic_cb.failure_count == 0
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_retry_after_exceeds_deadline_skips_retry(self) -> None:
@@ -775,14 +775,14 @@ class TestAsyncSameProviderRetryOn429:
             same_provider_retries=1,
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
-        solwyn._reporter.report = MagicMock()
+        solwyn._solwyn_reporter.report = MagicMock()
         openai_cb = solwyn._get_circuit_breaker("openai")
 
         with (
             patch("solwyn.client.Deadline", _FixedDeadline),
             patch("solwyn.client.asyncio.sleep", new=AsyncMock()) as sleep,
             patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
             ),
         ):
             result = await solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -793,8 +793,8 @@ class TestAsyncSameProviderRetryOn429:
         sleep.assert_not_awaited()
         assert openai_cb.failure_count == 1
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_default_zero_fails_over_immediately(self) -> None:
@@ -809,13 +809,13 @@ class TestAsyncSameProviderRetryOn429:
             model="gpt-5.5",
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
-        solwyn._reporter.report = MagicMock()
+        solwyn._solwyn_reporter.report = MagicMock()
         openai_cb = solwyn._get_circuit_breaker("openai")
 
         with (
             patch("solwyn.client.asyncio.sleep", new=AsyncMock()) as sleep,
             patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
             ),
         ):
             await solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -825,8 +825,8 @@ class TestAsyncSameProviderRetryOn429:
         sleep.assert_not_awaited()
         assert openai_cb.failure_count == 1
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_half_open_probe_not_stranded_on_retry(self) -> None:
@@ -845,7 +845,7 @@ class TestAsyncSameProviderRetryOn429:
             circuit_breaker_recovery_timeout=0,
             circuit_breaker_success_threshold=1,
         )
-        solwyn._reporter.report = MagicMock()
+        solwyn._solwyn_reporter.report = MagicMock()
         openai_cb = solwyn._get_circuit_breaker("openai")
         openai_cb.record_failure()  # -> OPEN; recovery_timeout=0 so admit() probes
         assert openai_cb.state == CircuitState.OPEN
@@ -853,7 +853,7 @@ class TestAsyncSameProviderRetryOn429:
         with (
             patch("solwyn.client.asyncio.sleep", new=AsyncMock()) as sleep,
             patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
             ),
         ):
             result = await solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -864,8 +864,8 @@ class TestAsyncSameProviderRetryOn429:
         assert openai_cb.state == CircuitState.CLOSED
         assert openai_cb._half_open_probe_active is False
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_intermediate_retry_emits_no_error_event(self) -> None:
@@ -878,13 +878,13 @@ class TestAsyncSameProviderRetryOn429:
             openai, api_key=VALID_API_KEY, model="gpt-5.5", same_provider_retries=1
         )
         events: list = []
-        solwyn._reporter.report = lambda e: events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: events.append(e)
         openai_cb = solwyn._get_circuit_breaker("openai")
 
         with (
             patch("solwyn.client.asyncio.sleep", new=AsyncMock()),
             patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
             ),
         ):
             result = await solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -894,5 +894,5 @@ class TestAsyncSameProviderRetryOn429:
         assert len([e for e in events if e.status.value == "success"]) == 1
         assert openai_cb.failure_count == 0
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()

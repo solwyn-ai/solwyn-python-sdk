@@ -79,23 +79,23 @@ def _allow_budget(reservation_id: str | None = "res_123") -> SimpleNamespace:
 
 def _teardown_sync(solwyn: Solwyn) -> None:
     """Drop queued I/O (it would flush into the black hole) and shut down."""
-    reporter = solwyn._reporter
+    reporter = solwyn._solwyn_reporter
     reporter._queue.clear()
     reporter._confirm_queue.clear()
     reporter._settlement_queue.clear()
     reporter._shutdown.set()
     reporter._thread.join(timeout=2.0)
     reporter._http.close()
-    solwyn._budget._http.close()
+    solwyn._solwyn_budget._http.close()
 
 
 async def _teardown_async(solwyn: AsyncSolwyn) -> None:
-    reporter = solwyn._reporter
+    reporter = solwyn._solwyn_reporter
     reporter._queue.clear()
     reporter._confirm_queue.clear()
     reporter._settlement_queue.clear()
     await reporter.close()
-    await solwyn._budget._http.aclose()
+    await solwyn._solwyn_budget._http.aclose()
 
 
 _PLAIN_REQUEST = {
@@ -134,7 +134,7 @@ class TestSyncBrownout:
                 f"pre-flight must be bounded by ~1s and confirm must not block"
             )
             # ...which opens the shared control-plane breaker...
-            assert solwyn._control_plane_breaker.get_state().state is CircuitState.OPEN
+            assert solwyn._solwyn_control_plane_breaker.get_state().state is CircuitState.OPEN
             # ...so the next call applies the posture instantly.
             assert second_elapsed < SHORT_CIRCUIT_BOUND, (
                 f"second brownout call took {second_elapsed:.2f}s — the breaker "
@@ -153,7 +153,7 @@ class TestSyncBrownout:
             reporter_flush_interval=3600.0,
         )
         try:
-            with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+            with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
                 start = time.monotonic()
                 result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
                 elapsed = time.monotonic() - start
@@ -164,8 +164,8 @@ class TestSyncBrownout:
                 f"black-holed API — confirm must be queued, never awaited"
             )
             # The settlement (confirm + event, one ordered item) was queued.
-            assert len(solwyn._reporter._settlement_queue) == 1
-            settlement = solwyn._reporter._settlement_queue[0]
+            assert len(solwyn._solwyn_reporter._settlement_queue) == 1
+            settlement = solwyn._solwyn_reporter._settlement_queue[0]
             confirm, event = settlement.confirm.request, settlement.event
             assert confirm.reservation_id == "res_123"
             assert confirm.call_id == event.call_id
@@ -198,7 +198,7 @@ class TestAsyncBrownout:
             assert first is response
             assert second is response
             assert first_elapsed < FIRST_CALL_BOUND
-            assert solwyn._control_plane_breaker.get_state().state is CircuitState.OPEN
+            assert solwyn._solwyn_control_plane_breaker.get_state().state is CircuitState.OPEN
             assert second_elapsed < SHORT_CIRCUIT_BOUND
         finally:
             await _teardown_async(solwyn)
@@ -215,7 +215,7 @@ class TestAsyncBrownout:
         )
         try:
             with patch.object(
-                solwyn._budget, "check_budget", AsyncMock(return_value=_allow_budget())
+                solwyn._solwyn_budget, "check_budget", AsyncMock(return_value=_allow_budget())
             ):
                 start = time.monotonic()
                 result = await solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -223,8 +223,8 @@ class TestAsyncBrownout:
 
             assert result is response
             assert elapsed < CONFIRM_NEVER_GATES_BOUND
-            assert len(solwyn._reporter._settlement_queue) == 1
-            settlement = solwyn._reporter._settlement_queue[0]
+            assert len(solwyn._solwyn_reporter._settlement_queue) == 1
+            settlement = solwyn._solwyn_reporter._settlement_queue[0]
             confirm, event = settlement.confirm.request, settlement.event
             assert confirm.reservation_id == "res_123"
             assert confirm.call_id == event.call_id

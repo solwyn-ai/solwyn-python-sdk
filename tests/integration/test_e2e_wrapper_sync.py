@@ -102,10 +102,10 @@ class TestSyncHappyPath:
         fake_provider.fail_next(429)
         with pytest.raises(openai.RateLimitError):
             client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
-        assert len(client._reporter._settlement_queue) == 1
-        assert len(client._reporter._queue) == 1
+        assert len(client._solwyn_reporter._settlement_queue) == 1
+        assert len(client._solwyn_reporter._queue) == 1
 
         client.close()
 
-        assert len(client._reporter._queue) == 0
-        assert len(client._reporter._settlement_queue) == 0
+        assert len(client._solwyn_reporter._queue) == 0
+        assert len(client._solwyn_reporter._settlement_queue) == 0
