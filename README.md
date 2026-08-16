@@ -77,6 +77,12 @@ shared wrapper, rather than cloning those resources. Pickling is rejected with
 guidance to construct a fresh `Solwyn(...)` or `AsyncSolwyn(...)` in the target
 process.
 
+## Framework integrations
+
+- [OpenAI Agents SDK](docs/integrations/openai-agents.md) — inject an
+  `AsyncSolwyn(AsyncOpenAI(...))` default client and attribute model calls to
+  workflow and per-agent runs.
+
 ## Providers
 
 ### OpenAI

@@ -36,6 +36,7 @@ from solwyn._routing import (
 from solwyn._run import (
     RunContext,
     RunHandle,
+    create_run,
     current_run,
     current_run_context,
     run,
@@ -98,6 +99,7 @@ __all__ = [
     "LatencyPolicy",
     "CostPolicy",
     "run",
+    "create_run",
     "start_run",
     "run_in_executor",
     "current_run",

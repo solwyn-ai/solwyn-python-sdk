@@ -79,6 +79,7 @@ testpaths = ["tests"]
 markers = [
     "unit: marks tests as unit tests that mock all external dependencies",
     "integration: marks tests as integration tests that may use real services",
+    "framework_smoke: marks offline smoke tests against real framework packages",
     "performance: marks tests as performance tests",
     "stress: marks tests as long-running stress tests",
     "chaos: marks tests as chaos tests that intentionally cause failures",
@@ -101,4 +102,7 @@ strict = true
 [dependency-groups]
 dev = [
     "respx>=0.21",
+]
+frameworks = [
+    "openai-agents",
 ]

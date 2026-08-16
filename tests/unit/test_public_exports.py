@@ -75,8 +75,9 @@ def test_run_context_and_tag_bounds_are_publicly_exported() -> None:
 
 @pytest.mark.unit
 def test_run_handle_api_is_publicly_exported() -> None:
-    expected = {"RunHandle", "start_run"}
+    expected = {"RunHandle", "create_run", "start_run"}
 
     assert expected <= set(solwyn.__all__)
     assert solwyn.RunHandle is not None
+    assert callable(solwyn.create_run)
     assert callable(solwyn.start_run)

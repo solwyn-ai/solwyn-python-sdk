@@ -1,4 +1,4 @@
-.PHONY: install install-hooks lint fmt fmt-check typecheck test test-unit test-integration check capture-provider-surfaces check-provider-surfaces check-surface-canary export-surface-contract check-surface-contract
+.PHONY: install install-hooks lint fmt fmt-check typecheck test test-unit test-integration test-frameworks check capture-provider-surfaces check-provider-surfaces check-surface-canary export-surface-contract check-surface-contract
 
 ##@ Setup
 
@@ -38,10 +38,13 @@ check: lint fmt-check typecheck ## Full quality gate (pre-commit hook)
 test: test-unit check-surface-canary ## Run unit tests and the real-SDK canary (default)
 
 test-unit: ## Run unit tests
-	uv run pytest tests/ -m unit -v --tb=short --ignore=tests/unit/test_surface_canary.py
+	uv run pytest tests/ -m unit -v --tb=short --ignore=tests/unit/test_surface_canary.py --ignore=tests/integration/frameworks
 
 test-integration: ## Run integration tests (requires API at localhost:8080)
-	uv run pytest tests/ -m integration -v --tb=short
+	uv run pytest tests/ -m integration -v --tb=short --ignore=tests/integration/frameworks
+
+test-frameworks: ## Run offline smoke tests against real framework packages
+	uv run --extra dev --group frameworks pytest tests/integration/frameworks/ -m framework_smoke -v --tb=short
 
 capture-provider-surfaces: ## Refresh latest real-SDK surface fingerprints
 	uv run --extra dev --with 'aioboto3>=13.0' python scripts/capture_surface_inventory.py --interval latest --output-dir build/provider_surface_inventory
