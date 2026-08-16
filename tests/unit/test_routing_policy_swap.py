@@ -24,7 +24,7 @@ from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, patch_wrapper_local
 
 from solwyn import _base
 from solwyn._base import _LATENCY_WINDOW
@@ -265,9 +265,8 @@ def test_select_candidates_reads_each_breaker_once_per_runtime() -> None:
         fallback=[(_anthropic_client(), "claude-sonnet-5")],
     )
     try:
-        with patch.object(
-            solwyn, "_get_circuit_breaker", wraps=solwyn._get_circuit_breaker
-        ) as get_breaker:
+        get_breaker = MagicMock(wraps=solwyn._get_circuit_breaker)
+        with patch_wrapper_local(solwyn, "_get_circuit_breaker", get_breaker):
             solwyn._select_candidates(_req())
 
         assert get_breaker.call_count == len(solwyn._solwyn_runtimes)

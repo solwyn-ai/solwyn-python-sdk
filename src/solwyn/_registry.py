@@ -38,6 +38,15 @@ class ProviderRuntime:
     provider_pinned: bool = False
 
 
+def _reject_wrapped_client(client: Any) -> None:
+    """Reject Solwyn wrappers without trusting their type-transparent ``__class__``."""
+    if getattr(type(client), "_solwyn_is_wrapper_type", False):
+        raise ConfigurationError(
+            "client is already wrapped by Solwyn — pass the raw provider client",
+            field="client",
+        )
+
+
 def _resolve_adapter(client: Any, provider_override: str | None) -> ProviderAdapter:
     """Detect *client*'s adapter unless its provider identity is pinned.
 
@@ -61,6 +70,7 @@ def _runtime_for(
     provider_override: str | None = None,
 ) -> ProviderRuntime:
     """Detect *client*'s adapter and build a ProviderRuntime for it (no I/O)."""
+    _reject_wrapped_client(client)
     adapter = _resolve_adapter(client, provider_override)
     entry = ProviderEntry(
         provider=ProviderName(adapter.name),

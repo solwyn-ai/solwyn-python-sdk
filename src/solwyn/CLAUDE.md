@@ -2,7 +2,7 @@
 
 ## Module Map
 
-- `client.py` — `Solwyn` (sync) + `AsyncSolwyn` (async) wrappers
+- `client.py` — `Solwyn` (sync) + `AsyncSolwyn` (async) wrappers. Both are type-transparent for framework admission: `__class__` reports the raw provider type so `isinstance(wrapper, type(raw))` succeeds while `type(wrapper)` remains the Solwyn class. Every non-`_solwyn_*` write/delete forwards to the provider, including wrapper-defined names; only `_solwyn_*` state stays local; shallow/deep copies preserve shared identity; pickle is rejected; and close shuts down reporter then budget before forwarding the provider's close seam when present
 - `_base.py` — shared sans-I/O logic (budget request construction, metadata formatting, guarded surface resolution and posture enforcement)
 - `_surface_graph.py` — offline, operation-free observer for provider client capability graphs; raises `SurfaceInspectionError` on inaccessible declared namespaces or cycles
 - `_surfaces.py` — sole sans-I/O owner of contextual surface classifications, applicability, shapes, usage basis, and JSON-ready contract data

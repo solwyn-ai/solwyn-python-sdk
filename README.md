@@ -52,6 +52,31 @@ with Solwyn(OpenAI(), api_key="sk_proj_...") as client:
     )
 ```
 
+### Drop-in type compatibility
+
+Solwyn wrappers pass framework admission checks that require the concrete
+provider SDK type:
+
+```python
+raw = OpenAI()
+client = Solwyn(raw, api_key="sk_proj_...")
+
+assert isinstance(client, OpenAI)
+assert isinstance(client, type(raw))
+```
+
+`type(client)` remains the truthful wrapper class (`Solwyn` or
+`AsyncSolwyn`), while `client.__class__` reports the wrapped provider class for
+`isinstance`-based framework compatibility. Every non-`_solwyn_*` attribute
+assignment and deletion forwards to the provider client, including names also
+defined by the wrapper; only `_solwyn_*` state remains local.
+
+These clients own live reporter, budget, and provider-transport state.
+`copy.copy(client)` and `copy.deepcopy(client)` therefore return the same
+shared wrapper, rather than cloning those resources. Pickling is rejected with
+guidance to construct a fresh `Solwyn(...)` or `AsyncSolwyn(...)` in the target
+process.
+
 ## Providers
 
 ### OpenAI

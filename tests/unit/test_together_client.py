@@ -19,7 +19,12 @@ from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import VALID_API_KEY, VALID_PROJECT_ID, foreground_records
+from conftest import (
+    VALID_API_KEY,
+    VALID_PROJECT_ID,
+    foreground_records,
+    patch_wrapper_local,
+)
 
 from solwyn import _base
 from solwyn._base import _reset_unmetered_spend_warnings
@@ -240,8 +245,9 @@ def test_sync_unmetered_surface_warns_and_passes_through(caplog: pytest.LogCaptu
 def test_native_together_video_is_unsupported_before_dispatch() -> None:
     solwyn = _make_solwyn(FakeTogetherClient(_completion_response()))
 
+    dispatch = MagicMock()
     with (
-        patch.object(solwyn, "_media_call") as dispatch,
+        patch_wrapper_local(solwyn, "_media_call", dispatch),
         pytest.raises(UnsupportedSurfaceError) as exc_info,
     ):
         solwyn.videos.create(model="video", prompt="private")
@@ -328,8 +334,9 @@ async def test_async_unmetered_surface_warns_and_passes_through(
 async def test_async_native_together_video_is_unsupported_before_dispatch() -> None:
     solwyn = _make_async_solwyn(AsyncTogether(_completion_response()))
 
+    dispatch = AsyncMock()
     with (
-        patch.object(solwyn, "_media_call", new=AsyncMock()) as dispatch,
+        patch_wrapper_local(solwyn, "_media_call", dispatch),
         pytest.raises(UnsupportedSurfaceError) as exc_info,
     ):
         await solwyn.videos.create(model="video", prompt="private")

@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, VALID_PROJECT_ID
+from conftest import VALID_API_KEY, VALID_PROJECT_ID, patch_wrapper_local
 
 from solwyn import run
 from solwyn._base import FailoverTuning
@@ -213,47 +213,41 @@ def test_routing_request_is_a_frozen_dataclass() -> None:
 
 @pytest.mark.unit
 class TestRoutingSignalCapabilities:
-    def test_health_policy_skips_latency_median(
-        self, wrapped_client: Solwyn, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_health_policy_skips_latency_median(self, wrapped_client: Solwyn) -> None:
         def _boom(provider: str) -> None:
             raise AssertionError("observed_p50 must not be called under HealthBasedPolicy")
 
-        monkeypatch.setattr(wrapped_client, "observed_p50", _boom)
         req = RoutingRequest(requested_provider=wrapped_client._solwyn_runtimes[0].entry.provider)
-        candidates = wrapped_client._select_candidates(req)
+        with patch_wrapper_local(wrapped_client, "observed_p50", _boom):
+            candidates = wrapped_client._select_candidates(req)
         assert candidates
 
-    def test_latency_policy_still_receives_p50(
-        self, wrapped_client: Solwyn, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_latency_policy_still_receives_p50(self, wrapped_client: Solwyn) -> None:
         wrapped_client._solwyn_policy = LatencyPolicy()
         calls: list[str] = []
-        monkeypatch.setattr(
+        req = RoutingRequest(requested_provider=wrapped_client._solwyn_runtimes[0].entry.provider)
+        with patch_wrapper_local(
             wrapped_client,
             "observed_p50",
             lambda provider: calls.append(provider) or None,
-        )
-        req = RoutingRequest(requested_provider=wrapped_client._solwyn_runtimes[0].entry.provider)
-        wrapped_client._select_candidates(req)
+        ):
+            wrapped_client._select_candidates(req)
         assert len(calls) == len(wrapped_client._solwyn_runtimes)
 
-    def test_unknown_custom_policy_gets_full_signals(
-        self, wrapped_client: Solwyn, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_unknown_custom_policy_gets_full_signals(self, wrapped_client: Solwyn) -> None:
         class LegacyPolicy:
             def order(self, candidates: list, req: RoutingRequest) -> list:
                 return list(candidates)
 
         wrapped_client._solwyn_policy = LegacyPolicy()
         calls: list[str] = []
-        monkeypatch.setattr(
+        req = RoutingRequest(requested_provider=wrapped_client._solwyn_runtimes[0].entry.provider)
+        with patch_wrapper_local(
             wrapped_client,
             "observed_p50",
             lambda provider: calls.append(provider) or None,
-        )
-        req = RoutingRequest(requested_provider=wrapped_client._solwyn_runtimes[0].entry.provider)
-        wrapped_client._select_candidates(req)
+        ):
+            wrapped_client._select_candidates(req)
         assert len(calls) == len(wrapped_client._solwyn_runtimes)
 
     def test_builtin_policy_signal_declarations(self) -> None:
@@ -1333,8 +1327,9 @@ class TestCircuitBreakerLazyCreation:
             created.append(breaker)
             return breaker
 
+        replacement = MagicMock(side_effect=slow_new_breaker)
         with (
-            patch.object(solwyn, "_new_circuit_breaker", side_effect=slow_new_breaker),
+            patch_wrapper_local(solwyn, "_new_circuit_breaker", replacement),
             ThreadPoolExecutor(max_workers=12) as pool,
         ):
             breakers = list(pool.map(lambda _i: solwyn._get_circuit_breaker("google"), range(12)))
@@ -1430,10 +1425,10 @@ class TestFailoverTuningSnapshot:
         )
         with (
             patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
-            patch.object(
+            patch_wrapper_local(
                 solwyn,
                 "_apply_failover_tuning_directive",
-                return_value=never_snapshot,
+                MagicMock(return_value=never_snapshot),
             ),
             pytest.raises(_Status),
         ):
@@ -1457,10 +1452,10 @@ class TestFailoverTuningSnapshot:
         )
         with (
             patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
-            patch.object(
+            patch_wrapper_local(
                 solwyn,
                 "_apply_failover_tuning_directive",
-                return_value=retry_snapshot,
+                MagicMock(return_value=retry_snapshot),
             ),
         ):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)

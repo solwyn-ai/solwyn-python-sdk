@@ -104,6 +104,8 @@ from solwyn.stream import (
 
 logger = logging.getLogger(__name__)
 
+_SOLWYN_INTERNAL_PREFIX = "_solwyn_"
+
 
 def _budget_denial_error(
     *,
@@ -1254,6 +1256,8 @@ class Solwyn(_SolwynBase):
         )
         client.close()
     """
+
+    _solwyn_is_wrapper_type = True
 
     def __init__(
         self,
@@ -2601,9 +2605,18 @@ class Solwyn(_SolwynBase):
         return primary.adapter.wrap_stream_result(wrapper, response)
 
     def close(self) -> None:
-        """Shut down the reporter and close HTTP clients."""
+        """Shut down Solwyn state, then close the wrapped provider client."""
         self._solwyn_reporter.close()
         self._solwyn_budget.close()
+        provider_close = getattr(self._solwyn_client, "close", None)
+        if callable(provider_close):
+            try:
+                provider_close()
+            except AttributeError as exc:
+                # A type-only/duck-typed client can inherit ``close`` without
+                # initialized lifecycle state. Treat that as no usable seam.
+                if exc.obj is not self._solwyn_client:
+                    raise
 
     def __enter__(self) -> Solwyn:
         return self
@@ -2611,14 +2624,58 @@ class Solwyn(_SolwynBase):
     def __exit__(self, *args: object) -> None:
         self.close()
 
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        """Report wrapped class for isinstance admission; type(self) stays truthful."""
+        return type(self._solwyn_client)
+
     def __getattr__(self, name: str) -> Any:
         """Resolve public pass-throughs through the contextual capability guard."""
+        if name.startswith(_SOLWYN_INTERNAL_PREFIX):
+            raise AttributeError(name)
         return self._resolve_public_attribute(
             self._solwyn_client,
             name=name,
             path=name,
             source=SurfaceSource.RAW,
         )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Keep ``_solwyn_*`` state local and forward every other name."""
+        if name.startswith(_SOLWYN_INTERNAL_PREFIX):
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._solwyn_client, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        """Delete ``_solwyn_*`` state locally and every other name remotely."""
+        if name.startswith(_SOLWYN_INTERNAL_PREFIX):
+            object.__delattr__(self, name)
+            return
+        delattr(self._solwyn_client, name)
+
+    def __dir__(self) -> list[str]:
+        """Return the union of wrapper and provider client names."""
+        return sorted(set(object.__dir__(self)) | set(dir(self._solwyn_client)))
+
+    def __reduce_ex__(self, protocol: int) -> Any:  # type: ignore[override]
+        """Refuse to pickle live reporter and budget state."""
+        raise TypeError(
+            "Solwyn clients hold live reporter/budget state and cannot be pickled; "
+            "construct a fresh Solwyn(...) in the target process"
+        )
+
+    def __copy__(self) -> Solwyn:
+        """Share this stateful wrapper rather than cloning live resources."""
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Solwyn:
+        """Share this stateful wrapper rather than cloning live resources."""
+        return self
+
+    def __repr__(self) -> str:
+        """Show both the truthful wrapper type and wrapped client."""
+        return f"{type(self).__name__}({self._solwyn_client!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -2645,6 +2702,8 @@ class AsyncSolwyn(_SolwynBase):
                 messages=[{"role": "user", "content": "Hello"}],
             )
     """
+
+    _solwyn_is_wrapper_type = True
 
     def __init__(
         self,
@@ -3859,9 +3918,22 @@ class AsyncSolwyn(_SolwynBase):
         return primary.adapter.wrap_stream_result(wrapper, response)
 
     async def close(self) -> None:
-        """Shut down the reporter and close HTTP clients."""
+        """Shut down Solwyn state, then close the wrapped provider client."""
         await self._solwyn_reporter.close()
         await self._solwyn_budget.close()
+        provider_close = getattr(self._solwyn_client, "aclose", None)
+        if not callable(provider_close):
+            provider_close = getattr(self._solwyn_client, "close", None)
+        if callable(provider_close):
+            try:
+                close_result = provider_close()
+                if isinstance(close_result, Awaitable):
+                    await close_result
+            except AttributeError as exc:
+                # See the synchronous close path: an inherited method alone
+                # does not guarantee initialized provider lifecycle state.
+                if exc.obj is not self._solwyn_client:
+                    raise
 
     async def __aenter__(self) -> AsyncSolwyn:
         self._solwyn_reporter.start()
@@ -3870,11 +3942,55 @@ class AsyncSolwyn(_SolwynBase):
     async def __aexit__(self, *args: object) -> None:
         await self.close()
 
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        """Report wrapped class for isinstance admission; type(self) stays truthful."""
+        return type(self._solwyn_client)
+
     def __getattr__(self, name: str) -> Any:
         """Resolve public pass-throughs through the contextual capability guard."""
+        if name.startswith(_SOLWYN_INTERNAL_PREFIX):
+            raise AttributeError(name)
         return self._resolve_public_attribute(
             self._solwyn_client,
             name=name,
             path=name,
             source=SurfaceSource.RAW,
         )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Keep ``_solwyn_*`` state local and forward every other name."""
+        if name.startswith(_SOLWYN_INTERNAL_PREFIX):
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._solwyn_client, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        """Delete ``_solwyn_*`` state locally and every other name remotely."""
+        if name.startswith(_SOLWYN_INTERNAL_PREFIX):
+            object.__delattr__(self, name)
+            return
+        delattr(self._solwyn_client, name)
+
+    def __dir__(self) -> list[str]:
+        """Return the union of wrapper and provider client names."""
+        return sorted(set(object.__dir__(self)) | set(dir(self._solwyn_client)))
+
+    def __reduce_ex__(self, protocol: int) -> Any:  # type: ignore[override]
+        """Refuse to pickle live reporter and budget state."""
+        raise TypeError(
+            "Solwyn clients hold live reporter/budget state and cannot be pickled; "
+            "construct a fresh Solwyn(...) in the target process"
+        )
+
+    def __copy__(self) -> AsyncSolwyn:
+        """Share this stateful wrapper rather than cloning live resources."""
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> AsyncSolwyn:
+        """Share this stateful wrapper rather than cloning live resources."""
+        return self
+
+    def __repr__(self) -> str:
+        """Show both the truthful wrapper type and wrapped client."""
+        return f"{type(self).__name__}({self._solwyn_client!r})"

@@ -18,7 +18,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import VALID_API_KEY, VALID_PROJECT_ID
+from conftest import VALID_API_KEY, VALID_PROJECT_ID, patch_wrapper_local
 from openai import NOT_GIVEN, omit
 
 from solwyn._base import _reset_unmetered_spend_warnings
@@ -1494,7 +1494,7 @@ class TestResponsesPublicProxySync:
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
-                patch.object(solwyn, "_wrap_stream", side_effect=original),
+                patch_wrapper_local(solwyn, "_wrap_stream", MagicMock(side_effect=original)),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -2595,7 +2595,7 @@ class TestResponsesPublicProxyAsync:
             intercepted = MagicMock(side_effect=solwyn._intercepted_call)
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
-                patch.object(solwyn, "_intercepted_call", new=intercepted),
+                patch_wrapper_local(solwyn, "_intercepted_call", intercepted),
             ):
                 manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
                 intercepted.assert_not_called()
@@ -3012,7 +3012,7 @@ class TestResponsesPublicProxyAsync:
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
-                patch.object(solwyn, "_wrap_stream_async", side_effect=original),
+                patch_wrapper_local(solwyn, "_wrap_stream_async", MagicMock(side_effect=original)),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
