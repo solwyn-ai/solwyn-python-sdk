@@ -202,7 +202,7 @@ Auto-detected providers:
 | LM Studio | `localhost:1234` | `include_usage` injected (pre-0.3.18 omits usage → estimate) |
 | Anything else | any non-OpenAI `base_url` | generic `openai_compatible`; `stream_options` never sent |
 
-For endpoints auto-detection can't name (e.g. vLLM on a non-default port), pass the provider explicitly — on the constructor for the primary, or as the 4th element of a fallback spec:
+For endpoints auto-detection can't name, pin the provider explicitly — on the constructor for the primary, or as the 4th element of a fallback spec:
 
 ```python
 client = Solwyn(
@@ -214,7 +214,38 @@ client = Solwyn(
 )
 ```
 
-**Token accounting.** Budgets and attribution depend on accurate per-call usage, and "OpenAI-compatible" endpoints differ most in exactly that. Solwyn requests streaming usage only from providers where that's documented-safe, reads it from the final chunk where it arrives automatically, and — when a provider reports no usage at all (or reports an unparseable/zeroed block alongside real content) — falls back to a length-based estimate that is **explicitly marked** (`token_details.is_estimated = true` on the wire, plus a one-time SDK warning). Degraded accounting is loud and flagged, never silently zero.
+`provider=` is an identity assertion, not a label applied after detection. It
+bypasses `base_url` detection entirely and selects the named adapter. The pin
+does not translate dialects, rewrite the endpoint, or synthesize a different
+SDK client; construction still validates the actual client family and
+sync/async mode, and raises `ConfigurationError(field="client")` for a mismatch.
+Unknown provider names raise `ConfigurationError(field="provider")`. Fallback
+provider pins follow the same rules.
+
+This is useful for native OpenAI behind a corporate gateway or local proxy,
+where an arbitrary `base_url` would otherwise look like a generic compatible
+provider. Pinning `openai` preserves the native Responses surface and OpenAI
+budget attribution:
+
+```python
+gateway = OpenAI(base_url="http://localhost:9999/v1", api_key="...")
+client = Solwyn(gateway, api_key="sk_proj_...", provider="openai")
+
+response = client.responses.create(
+    model="gpt-5.5",
+    input="Summarize the release notes.",
+)
+```
+
+If that gateway omits or zeroes foreground Responses usage, `create` and
+`parse` settle the request-length input estimate with
+`token_details.is_estimated = true` instead of reporting exact `0/0`. The
+unknown output remains zero in the estimate, and a lease-backed call keeps its
+full reserved bound so that unseen output spend is not re-lent. Streaming and
+the stream helper apply the same conservative policy when terminal usage is
+missing.
+
+**Token accounting.** Budgets and attribution depend on accurate per-call usage, and "OpenAI-compatible" endpoints differ most in exactly that. Solwyn requests streaming usage only from providers where that's documented-safe, reads it from the final chunk where it arrives automatically, and — when a provider reports no usage at all (or reports an unparseable/zeroed block alongside real content) — falls back to a length-based estimate that is **explicitly marked** (`token_details.is_estimated = true` on the wire; compatible-provider degradation also emits the existing one-time SDK warning where applicable). Degraded accounting is flagged, never silently zero.
 
 The "never sent" entries above describe Solwyn's own injection policy. A `stream_options` you pass explicitly always reaches your configured provider untouched (drop-in contract); it is only stripped when a *failover hop* lands on a provider known to reject it.
 
@@ -237,6 +268,7 @@ Beyond chat, Solwyn tracks the non-text surfaces that spend money. Each rides th
 | Audio — transcription | `client.audio.transcriptions.create` (incl. Groq whisper) | — |
 | Audio — speech (TTS) | `client.audio.speech.create` | — |
 | Video | `client.videos.create` (Sora) | `client.models.generate_videos` (Veo) |
+| Responses | Native OpenAI + Azure OpenAI: `client.responses.create` / `.parse` / `.stream` | — |
 
 Billable quantities are read from the response's usage block where it exists (gpt-image token buckets, whisper duration) and derived from the request where a provider reports none — image counts from `n=`, TTS character counts from `input=`, video seconds from the request. Whatever the SDK can't observe stays `None`, and the call is tracked **unpriced** rather than settled at a silent $0. Only lengths, counts, durations, and variant selectors are ever measured — never the media itself.
 
@@ -247,6 +279,32 @@ Billable quantities are read from the response's usage block where it exists (gp
 - **`audio.translations` is untracked.** The translations sub-surface isn't intercepted yet, so it follows the same configured posture.
 
 ## Strict coverage controls
+
+- **OpenAI Responses:** Native OpenAI and Azure OpenAI
+  `responses.create(...)`, `responses.parse(...)`, and the
+  `responses.stream(...)` context-manager helper are budget-metered for sync
+  and async clients. `create(stream=True)` is
+  supported; streaming `parse` is not metered, so any effective streaming parse
+  request is refused. The stream helper's new-response overload preserves the
+  SDK's context-manager and `get_final_response()` behavior while settling
+  terminal usage or a conservative estimate on early exit; a helper closed
+  before it is ever entered sent no provider request, so it releases its
+  reservation instead of settling. Foreground non-streaming
+  calls likewise settle a conservative marked
+  estimate when Responses usage is missing or zeroed; lease-backed calls hold
+  the reserved bound because output usage is unobservable. Its existing-response
+  retrieval overload (`response_id` / `starting_after`) creates no new spend,
+  so it is a reviewed raw pass-through: no defaults, budget check, or duplicate
+  settlement are applied. Every other Responses leaf, including beta and raw
+  response helpers, remains guarded by `on_unmetered`.
+  `background=True` create calls are refused because queued responses expose no
+  create-time usage. Because the OpenAI SDK serializes `extra_body` after named
+  arguments, metering-critical overrides for `model`, `input`, `instructions`,
+  `max_output_tokens`, or `stream` are refused with
+  `ConfigurationError(field="extra_body")`; pass those values as top-level
+  Responses arguments instead. Other vendor-specific `extra_body` extensions
+  pass through unchanged. Other OpenAI-compatible providers retain their raw
+  Responses managers and follow the guarded unmetered posture.
 
 Solwyn classifies the public pre-call capability graph of every supported
 wrapped client. Tracked leaves are intercepted as usual. Resource namespaces
@@ -284,7 +342,7 @@ client = Solwyn(
     OpenAI(),
     api_key="sk_proj_...",
     on_unmetered="raise",
-    acknowledge_untracked={"responses.create"},
+    acknowledge_untracked={"responses.retrieve"},
 )
 ```
 
@@ -292,10 +350,10 @@ Acknowledgments are narrow, deliberate exceptions to the posture. Each token
 must name an applicable, observed terminal capability; it grants only that
 leaf. Namespace tokens such as `responses` are invalid, as are wildcards,
 typos, tracked leaves, blocked leaves, and unsupported leaves. Namespace
-objects remain guarded after an acknowledgment, so `responses.create` does not
+objects remain guarded after an acknowledgment, so `responses.retrieve` does not
 authorize a future sibling. The equivalent comma-delimited environment
 encoding is
-`SOLWYN_ACKNOWLEDGE_UNTRACKED="responses.create,audio.speech.create:gpt-4o-mini-tts"`.
+`SOLWYN_ACKNOWLEDGE_UNTRACKED="responses.retrieve,audio.speech.create:gpt-4o-mini-tts"`.
 The conditional token for token-billed TTS is exactly
 `audio.speech.create:gpt-4o-mini-tts`; acknowledging ordinary
 `audio.speech.create` does not cover that model-specific exception.
@@ -334,9 +392,9 @@ audit_client = Solwyn(
 )
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
-    guarded_namespaces="sha256:770ba77e018f38c9b64af1d43770dfd6d79f3c1d1c9f5ac5253cfa3000d2b743",
-    tracked="sha256:ee52e554ddf531bea4560f69fdbef1ca0ac90e433fb9f93fba6e291d39e2aebc",
-    untracked="sha256:8f7d1bc744e022db61ec44c7e2ebfadcf3599ea225a021050ff3022620ecfd3c",
+    guarded_namespaces="sha256:38de7d9d718f03bc61f4a24e24f131c1a018434fcb38eb5cb7371290fc72e074",
+    tracked="sha256:586f19c33f350871240a3498fbfa255c9759bec35e1285a8fccfeb937ec68148",
+    untracked="sha256:1a3192143f409c0e38edcee32232d411c40706fcddd7a7d729403d67690ffb2c",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     scoped_escapes="sha256:6808a0f2ac290c9d4d1504b21b1c0ba98267636ced4234416b53533b29bb4073",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
@@ -348,6 +406,10 @@ OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
 report = coverage(audit_client)
 report.expect(OPENAI_STRICT_FINGERPRINT)
 ```
+
+Azure OpenAI exposes the same metered Responses trio, but its surrounding
+capability graph is distinct. Audit and pin an Azure client independently; do
+not reuse the native OpenAI fingerprint for Azure.
 
 When a provider SDK changes, inspect `report.entries`, decide whether each
 change is acceptable, and then paste a newly reviewed literal. Never approve a
@@ -583,7 +645,7 @@ All SDK errors inherit from `SolwynError`:
 | `BudgetExceededError` | Cloud denies a budget check in `hard_deny` mode, or local enforcement denies while Cloud is unreachable and `fail_open=False` |
 | `RunStoppedError` | A dashboard stop is learned for an agent run — on the next budget check for per-call traffic, or after lease renewal or re-grant for leased traffic |
 | `ProviderUnavailableError` | Circuit breaker is open, or the failover chain is exhausted |
-| `ConfigurationError` | Invalid API key format, invalid `provider=` override, or an untracked call surface (e.g. Bedrock `invoke_model`) |
+| `ConfigurationError` | Invalid API key format, invalid `provider=` pin/client pairing, or an untracked call surface (e.g. Bedrock `invoke_model`) |
 | `UntrackedSpendSurfaceError` | Strict coverage posture refuses an unacknowledged untracked or unknown capability before provider I/O |
 | `UnsupportedSurfaceError` | The selected provider adapter does not support an explicit Solwyn wrapper surface |
 | `UntranslatableRequestError` | A cross-provider failover hop cannot represent the request (structural labels only — never content) |

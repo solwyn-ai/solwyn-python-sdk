@@ -714,6 +714,54 @@ def _google_prompt_text_length(value: object) -> int:
     return total
 
 
+def estimate_responses_content_length(kwargs: dict[str, Any]) -> int:
+    """Return Responses request character length without retaining content.
+
+    This length-only heuristic recognizer must not reject calls. It is
+    deliberately separate from ``estimate_content_length`` so media calls do
+    not double-count embeddings or text-to-speech ``input``.
+    """
+    total = 0
+
+    instructions = kwargs.get("instructions")
+    if isinstance(instructions, str):
+        total += len(instructions)
+
+    input_value = kwargs.get("input")
+    if isinstance(input_value, str):
+        return total + len(input_value)
+    if not isinstance(input_value, list):
+        return total
+
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+
+        content = item.get("content")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text")
+                if isinstance(text, str):
+                    total += len(text)
+
+        output = item.get("output")
+        if isinstance(output, str):
+            total += len(output)
+        elif isinstance(output, list):
+            for part in output:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text")
+                if isinstance(text, str):
+                    total += len(text)
+
+    return total
+
+
 def estimate_tokens_from_length(char_count: int, provider: str) -> int:
     """Convert a character count to a token estimate using per-provider ratios.
 

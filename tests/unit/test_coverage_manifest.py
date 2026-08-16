@@ -44,6 +44,9 @@ class _Responses:
     def create(self) -> None:
         raise AssertionError("coverage must never invoke provider operations")
 
+    def retrieve(self) -> None:
+        raise AssertionError("coverage must never invoke provider operations")
+
 
 class _NovelResource:
     marker = "content-free"
@@ -176,12 +179,12 @@ def test_allowed_unknown_shapes_return_or_guard_and_acknowledgments_are_sorted()
         _wrapper(
             _OpenAIShape(),
             posture="allow",
-            acknowledgments=frozenset({"responses.create", "post"}),
+            acknowledgments=frozenset({"responses.retrieve", "post"}),
         )
     )
     entries = _by_identity(report)
 
-    assert report.acknowledgments == ("post", "responses.create")
+    assert report.acknowledgments == ("post", "responses.retrieve")
     assert entries[("novel_scalar", None)].policy_action == "allow"
     assert entries[("novel_scalar", None)].dispatch_action == "return"
     assert entries[("novel_resource", None)].policy_action == "allow"
@@ -404,6 +407,7 @@ def test_bedrock_service_model_operation_is_visible_only_through_wrapper_reachab
             service_model=SimpleNamespace(operation_names=("Converse", "FutureOperation"))
         )
 
+    ServiceOnlyBedrock.__module__ = "botocore.client"
     report = solwyn.coverage(
         _wrapper(
             ServiceOnlyBedrock(),
@@ -901,8 +905,8 @@ def test_readme_states_the_strict_coverage_and_trust_boundary_contract() -> None
         '`on_unmetered="raise"` refuses the call before provider I/O',
         '`on_unmetered="allow"` permits the call without warning',
         "`SOLWYN_ON_UNMETERED=raise`",
-        'acknowledge_untracked={"responses.create"}',
-        '`SOLWYN_ACKNOWLEDGE_UNTRACKED="responses.create,audio.speech.create:gpt-4o-mini-tts"`',
+        'acknowledge_untracked={"responses.retrieve"}',
+        '`SOLWYN_ACKNOWLEDGE_UNTRACKED="responses.retrieve,audio.speech.create:gpt-4o-mini-tts"`',
         "Namespace tokens such as `responses` are invalid",
         "`audio.speech.create:gpt-4o-mini-tts`",
         "Coverage is computed locally and transmits nothing.",

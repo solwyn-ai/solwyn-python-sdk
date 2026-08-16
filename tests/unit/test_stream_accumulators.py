@@ -128,6 +128,44 @@ class TestOpenAIStreamAccumulator:
         assert result.accepted_prediction_tokens == 10
         assert result.rejected_prediction_tokens == 5
 
+    def test_response_completed_event_extracts_nested_usage_and_service_tier(self) -> None:
+        acc = OpenAIStreamAccumulator()
+        acc.observe(SimpleNamespace(type="response.output_text.delta", delta="partial"))
+        acc.observe(
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(
+                    usage=SimpleNamespace(
+                        input_tokens=240,
+                        output_tokens=80,
+                        input_tokens_details=SimpleNamespace(cached_tokens=60),
+                        output_tokens_details=SimpleNamespace(reasoning_tokens=25),
+                    ),
+                    service_tier="flex",
+                ),
+            )
+        )
+
+        result = acc.finalize()
+
+        assert result.input_tokens == 240
+        assert result.output_tokens == 80
+        assert result.cached_input_tokens == 60
+        assert result.reasoning_tokens == 25
+        assert acc.get_service_tier() == "flex"
+
+    def test_pre_terminal_response_without_usage_is_ignored(self) -> None:
+        acc = OpenAIStreamAccumulator()
+        acc.observe(
+            SimpleNamespace(
+                type="response.created",
+                response=SimpleNamespace(usage=None, service_tier="flex"),
+            )
+        )
+
+        assert acc.finalize() == TokenDetails()
+        assert acc.get_service_tier() is None
+
 
 @pytest.mark.unit
 class TestOpenAIStreamAccumulatorServiceTier:

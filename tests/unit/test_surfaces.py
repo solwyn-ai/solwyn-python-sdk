@@ -48,6 +48,18 @@ OPENAI_ASYNC = SurfaceContext(
     client_shape="openai_sdk",
     mode="async",
 )
+AZURE_OPENAI_SYNC = SurfaceContext(
+    provider="azure_openai",
+    dialect="openai",
+    client_shape="openai_sdk",
+    mode="sync",
+)
+AZURE_OPENAI_ASYNC = SurfaceContext(
+    provider="azure_openai",
+    dialect="openai",
+    client_shape="openai_sdk",
+    mode="async",
+)
 ANTHROPIC_SYNC = SurfaceContext(
     provider="anthropic",
     dialect="anthropic",
@@ -555,8 +567,9 @@ def test_namespace_leaf_and_exact_infrastructure_depth_remain_distinct() -> None
 
     assert responses is not None and responses.kind is SurfaceKind.NAMESPACE
     assert responses.acknowledgment_token is None
-    assert create is not None and create.kind is SurfaceKind.UNMETERED_SPEND
-    assert create.acknowledgment_token == "responses.create"
+    assert create is not None and create.kind is SurfaceKind.METERED
+    assert create.usage_basis is UsageBasis.PROVIDER
+    assert create.acknowledgment_token is None
     assert close is not None and close.kind is SurfaceKind.INFRASTRUCTURE
     assert (
         resolve_surface_rule(
@@ -566,6 +579,99 @@ def test_namespace_leaf_and_exact_infrastructure_depth_remain_distinct() -> None
         )
         is None
     )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("context", [OPENAI_SYNC, OPENAI_ASYNC])
+def test_native_openai_responses_parse_is_metered_on_raw_and_wrapper(
+    context: SurfaceContext,
+) -> None:
+    # Arrange and act.
+    for source in (SurfaceSource.RAW, SurfaceSource.WRAPPER):
+        rule = resolve_surface_rule(
+            context=context,
+            path="responses.parse",
+            source=source,
+        )
+
+        # Assert.
+        assert rule is not None
+        assert rule.kind is SurfaceKind.METERED
+        assert rule.source is SurfaceSource.BOTH
+        assert rule.usage_basis is UsageBasis.PROVIDER
+        assert rule.acknowledgment_token is None
+        assert rule.policy_action == "track"
+        assert rule.dispatch_action == "intercept"
+        assert any(shape.return_shape == "callable" for shape in rule.expected_shapes)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("context", [AZURE_OPENAI_SYNC, AZURE_OPENAI_ASYNC])
+def test_azure_responses_namespace_and_spend_leaves_are_available_from_both_sources(
+    context: SurfaceContext,
+) -> None:
+    for source in (SurfaceSource.RAW, SurfaceSource.WRAPPER):
+        namespace = resolve_surface_rule(
+            context=context,
+            path="responses",
+            source=source,
+        )
+        assert namespace is not None
+        assert namespace.kind is SurfaceKind.NAMESPACE
+        assert namespace.source is SurfaceSource.BOTH
+        assert namespace.acknowledgment_token is None
+
+        for path in ("responses.create", "responses.parse", "responses.stream"):
+            rule = resolve_surface_rule(context=context, path=path, source=source)
+            assert rule is not None
+            assert rule.kind is SurfaceKind.METERED
+            assert rule.source is SurfaceSource.BOTH
+            assert rule.usage_basis is UsageBasis.PROVIDER
+            assert rule.acknowledgment_token is None
+            assert rule.policy_action == "track"
+            assert rule.dispatch_action == "intercept"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "context",
+    [
+        GROQ_SYNC,
+        SurfaceContext(
+            provider="openai_compatible",
+            dialect="openai",
+            client_shape="openai_sdk",
+            mode="sync",
+        ),
+        SurfaceContext(
+            provider="together",
+            dialect="openai",
+            client_shape="openai_sdk",
+            mode="sync",
+        ),
+    ],
+)
+def test_compatible_responses_parse_stays_raw_unmetered_without_wrapper_rule(
+    context: SurfaceContext,
+) -> None:
+    # Arrange and act.
+    raw = resolve_surface_rule(
+        context=context,
+        path="responses.parse",
+        source=SurfaceSource.RAW,
+    )
+    wrapper = resolve_surface_rule(
+        context=context,
+        path="responses.parse",
+        source=SurfaceSource.WRAPPER,
+    )
+
+    # Assert.
+    assert raw is not None
+    assert raw.kind is SurfaceKind.UNMETERED_SPEND
+    assert raw.source is SurfaceSource.RAW
+    assert raw.acknowledgment_token == "responses.parse"
+    assert wrapper is None
 
 
 def _assert_audio_translations_source_shapes(context: SurfaceContext) -> None:

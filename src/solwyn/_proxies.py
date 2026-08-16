@@ -7,6 +7,7 @@ while routing every provider pass-through through the shared surface policy.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from solwyn._base import MediaSurfaceSpec
@@ -23,6 +24,7 @@ from solwyn._privacy import (
 from solwyn._surfaces import SurfaceCondition, SurfaceSource
 from solwyn._token_details import TokenDetails
 from solwyn._types import MediaUsage
+from solwyn.exceptions import ConfigurationError
 from solwyn.providers.openai import (
     _AUDIO_OP_KEY,
     _IMAGE_OP_KEY,
@@ -31,6 +33,7 @@ from solwyn.providers.openai import (
     _is_untracked_tts_model,
     _measure_transcription_media,
 )
+from solwyn.stream import _DeferredAsyncResponsesStreamManagerWrapper
 
 if TYPE_CHECKING:
     from solwyn.client import AsyncSolwyn, Solwyn
@@ -446,6 +449,91 @@ def _openai_videos_spec() -> MediaSurfaceSpec:
 # ---------------------------------------------------------------------------
 
 
+_RESPONSES_BACKGROUND_GUIDANCE = (
+    "Queued background responses expose no create-time usage and cannot be "
+    "budget-metered by Solwyn. Use the raw OpenAI client for background responses."
+)
+
+
+def _reject_responses_background(kwargs: Mapping[str, object]) -> None:
+    """Reject effective Responses requests whose usage arrives out of band."""
+    extra_body = kwargs.get("extra_body")
+    background = (
+        extra_body["background"]
+        if isinstance(extra_body, Mapping) and "background" in extra_body
+        else kwargs.get("background")
+    )
+    if background is True:
+        raise ConfigurationError(_RESPONSES_BACKGROUND_GUIDANCE, field="background")
+
+
+def _is_existing_responses_stream(kwargs: Mapping[str, object]) -> bool:
+    """Recognize the SDK's no-new-spend existing-response stream overload."""
+    for name in ("response_id", "starting_after"):
+        if name not in kwargs:
+            continue
+        value_type = type(kwargs[name])
+        module = getattr(value_type, "__module__", "")
+        class_name = getattr(value_type, "__name__", "")
+        if not (
+            (module == "openai" or module.startswith("openai."))
+            and class_name in {"NotGiven", "Omit"}
+        ):
+            return True
+    return False
+
+
+class _SyncResponsesProxy:
+    """Native OpenAI Responses proxy with metered spend-producing seams.
+
+    These leaves ride the existing Responses interception pipeline: they are
+    primary-only, apply only Responses-compatible effective defaults, and
+    settle provider-reported usage. Queued background responses are refused
+    because create-time usage is unavailable, and parse refuses streaming
+    because the SDK helper is non-streaming. Every other Responses leaf stays a
+    raw provider operation resolved through the shared unmetered policy.
+    """
+
+    def __init__(self, solwyn: Solwyn) -> None:
+        self._solwyn = solwyn
+
+    def create(self, **kwargs: Any) -> Any:
+        """Intercept a foreground native Responses create call."""
+        self._solwyn._enforce_explicit_surface("responses.create", source=SurfaceSource.WRAPPER)
+        _reject_responses_background(kwargs)
+        return self._solwyn._intercepted_call(_surface="responses", **kwargs)
+
+    def parse(self, **kwargs: Any) -> Any:
+        """Intercept a non-streaming native Responses parse call."""
+        self._solwyn._enforce_explicit_surface("responses.parse", source=SurfaceSource.WRAPPER)
+        return self._solwyn._intercepted_call(
+            _surface="responses",
+            _responses_leaf="parse",
+            **kwargs,
+        )
+
+    def stream(self, **kwargs: Any) -> Any:
+        """Return a metered wrapper around OpenAI's stream-manager helper."""
+        self._solwyn._enforce_explicit_surface("responses.stream", source=SurfaceSource.WRAPPER)
+        if _is_existing_responses_stream(kwargs):
+            return self._solwyn._client.responses.stream(**kwargs)
+        _reject_responses_background(kwargs)
+        return self._solwyn._intercepted_call(
+            _surface="responses",
+            _responses_leaf="stream",
+            **kwargs,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        """Resolve non-metered leaves as guarded raw Responses operations."""
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.responses,
+            name=name,
+            path=f"responses.{name}",
+            source=SurfaceSource.RAW,
+        )
+
+
 class _SyncChatCompletionsProxy:
     """Proxy for client.chat.completions that intercepts create()."""
 
@@ -839,6 +927,56 @@ class _SyncModelsProxy:
 # ---------------------------------------------------------------------------
 # Async proxies
 # ---------------------------------------------------------------------------
+
+
+class _AsyncResponsesProxy:
+    """Async native OpenAI Responses proxy with metered spend-producing seams.
+
+    This mirrors ``_SyncResponsesProxy``: foreground ``create``, non-streaming
+    ``parse``, and the ``stream`` manager helper use the primary-only Responses
+    pipeline and its filtered effective defaults, while background calls are
+    refused because usage is unavailable at creation. Every other leaf remains
+    a shared-policy raw provider operation.
+    """
+
+    def __init__(self, solwyn: AsyncSolwyn) -> None:
+        self._solwyn = solwyn
+
+    async def create(self, **kwargs: Any) -> Any:
+        """Intercept a foreground native Responses create call."""
+        self._solwyn._enforce_explicit_surface("responses.create", source=SurfaceSource.WRAPPER)
+        _reject_responses_background(kwargs)
+        return await self._solwyn._intercepted_call(_surface="responses", **kwargs)
+
+    async def parse(self, **kwargs: Any) -> Any:
+        """Intercept a non-streaming native Responses parse call."""
+        self._solwyn._enforce_explicit_surface("responses.parse", source=SurfaceSource.WRAPPER)
+        return await self._solwyn._intercepted_call(
+            _surface="responses",
+            _responses_leaf="parse",
+            **kwargs,
+        )
+
+    def stream(self, **kwargs: Any) -> Any:
+        """Return OpenAI's async-manager shape while deferring Solwyn I/O."""
+        self._solwyn._enforce_explicit_surface("responses.stream", source=SurfaceSource.WRAPPER)
+        if _is_existing_responses_stream(kwargs):
+            return self._solwyn._client.responses.stream(**kwargs)
+        _reject_responses_background(kwargs)
+        return _DeferredAsyncResponsesStreamManagerWrapper(
+            lambda: self._solwyn._intercepted_call(
+                _surface="responses", _responses_leaf="stream", **kwargs
+            )
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        """Resolve non-metered leaves as guarded raw Responses operations."""
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._client.responses,
+            name=name,
+            path=f"responses.{name}",
+            source=SurfaceSource.RAW,
+        )
 
 
 class _AsyncChatCompletionsProxy:

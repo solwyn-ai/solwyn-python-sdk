@@ -88,6 +88,10 @@ class CompatProfile:
     # CROSS-PROVIDER failover hop it also strips a caller-supplied
     # stream_options (meant for the original target) so the hop does not 4xx.
     supports_include_usage: bool = True
+    # Whether this provider supports Solwyn's metered OpenAI Responses seam.
+    # Disabled by default: a compatible Chat Completions endpoint does not
+    # imply support for Responses or its terminal usage shape.
+    supports_responses: bool = False
     # The generic fallback profile: claims any openai-module client whose
     # base_url is a real http(s) URL pointing at neither OpenAI nor a host
     # matched by an earlier named profile (registry order enforces "earlier").
@@ -199,6 +203,7 @@ COMPAT_PROFILES: tuple[CompatProfile, ...] = (
         name="azure_openai",
         host_suffixes=(".openai.azure.com", ".cognitiveservices.azure.com"),
         client_class_prefixes=("AzureOpenAI", "AsyncAzureOpenAI"),
+        supports_responses=True,
     ),
     # OpenRouter: usage is always-on in the final chunk and stream_options is
     # deprecated with no effect — don't send.
@@ -291,6 +296,11 @@ class OpenAICompatibleAdapter:
     @property
     def profile(self) -> CompatProfile:
         return self._profile
+
+    @property
+    def supports_responses(self) -> bool:
+        """Whether this profile serves the metered Responses dispatch seam."""
+        return self._profile.supports_responses
 
     def detect_client(self, client: Any) -> bool:
         """Match an openai-SDK client whose base_url/class targets this provider."""
@@ -438,6 +448,29 @@ class OpenAICompatibleAdapter:
             kwargs["stream"] = True
         return client.chat.completions.create, kwargs
 
+    def prepare_responses_call(
+        self,
+        client: Any,
+        kwargs: dict[str, Any],
+        *,
+        is_streaming: bool,
+        leaf: str = "create",
+    ) -> tuple[Callable[..., Any], dict[str, Any]]:
+        """Select a capability-gated OpenAI-compatible Responses leaf.
+
+        Azure OpenAI is the only enabled compatible profile in v1. The call
+        shaping mirrors native OpenAI: defensive-copy kwargs, set ``stream``
+        only for streaming ``create``, and never inject ``stream_options``.
+        """
+        if not self.supports_responses:
+            raise UnsupportedSurfaceError(surface=f"responses.{leaf}", provider=self.name)
+        if leaf not in {"create", "parse", "stream"}:
+            raise RuntimeError(f"unsupported Azure OpenAI Responses leaf: {leaf}")
+        kwargs = dict(kwargs)
+        if is_streaming and leaf == "create":
+            kwargs["stream"] = True
+        return getattr(client.responses, leaf), kwargs
+
     def prepare_media_call(
         self,
         surface: str,
@@ -530,11 +563,18 @@ class CompatStreamAccumulator:
         # estimation; content-length accumulation below runs until a usage tier
         # latches.
         try:
-            if getattr(chunk, "usage", None) is not None:
-                extracted = _extract_openai_usage(chunk)
+            usage_holder = chunk
+            if getattr(usage_holder, "usage", None) is None:
+                response = getattr(chunk, "response", None)
+                if response is not None and getattr(response, "usage", None) is not None:
+                    usage_holder = response
+            if getattr(usage_holder, "usage", None) is not None:
+                extracted = _extract_openai_usage(usage_holder)
                 if extracted.input_tokens or extracted.output_tokens:
                     self._usage_details = extracted
-            tier = _extract_service_tier(chunk)
+            tier = _extract_service_tier(usage_holder)
+            if tier is None and usage_holder is not chunk:
+                tier = _extract_service_tier(chunk)
             if tier is not None:
                 self._service_tier = tier
             x_groq = getattr(chunk, "x_groq", None)

@@ -590,6 +590,96 @@ class TestOpenAIAdapterDispatchSeams:
 
 
 @pytest.mark.unit
+class TestOpenAIAdapterResponsesDispatch:
+    def test_non_streaming_selects_responses_create_with_defensive_copy(self) -> None:
+        def create(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(responses=SimpleNamespace(create=create))
+        kwargs: dict[str, Any] = {"model": "gpt-5.5", "metadata": {"request_id": "req-1"}}
+
+        method, shaped = OpenAIAdapter().prepare_responses_call(client, kwargs, is_streaming=False)
+
+        assert method is create
+        assert shaped == kwargs
+        assert shaped is not kwargs
+
+    def test_parse_leaf_selects_responses_parse_with_defensive_copy(self) -> None:
+        # Arrange.
+        def parse(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(responses=SimpleNamespace(parse=parse))
+        kwargs: dict[str, Any] = {
+            "model": "gpt-5.5",
+            "input": "hello",
+            "text_format": dict,
+        }
+
+        # Act.
+        method, shaped = OpenAIAdapter().prepare_responses_call(
+            client,
+            kwargs,
+            is_streaming=False,
+            leaf="parse",
+        )
+
+        # Assert.
+        assert method is parse
+        assert shaped == kwargs
+        assert shaped is not kwargs
+
+    def test_stream_leaf_selects_manager_helper_without_injecting_stream(self) -> None:
+        def stream(**kwargs: Any) -> dict[str, Any]:
+            return kwargs
+
+        client = SimpleNamespace(responses=SimpleNamespace(stream=stream))
+        kwargs: dict[str, Any] = {"model": "gpt-5.5", "input": "hello"}
+
+        method, shaped = OpenAIAdapter().prepare_responses_call(
+            client,
+            kwargs,
+            is_streaming=True,
+            leaf="stream",
+        )
+
+        assert method is stream
+        assert shaped == kwargs
+        assert shaped is not kwargs
+
+    def test_unsupported_internal_leaf_fails_loud(self) -> None:
+        # Arrange.
+        client = SimpleNamespace(responses=SimpleNamespace(create=lambda **kwargs: kwargs))
+
+        # Act and assert.
+        with pytest.raises(RuntimeError, match="unsupported OpenAI Responses leaf"):
+            OpenAIAdapter().prepare_responses_call(
+                client,
+                {"model": "gpt-5.5"},
+                is_streaming=False,
+                leaf="retrieve",
+            )
+
+    def test_streaming_adds_stream_true_without_mutating_input(self) -> None:
+        client = SimpleNamespace(responses=SimpleNamespace(create=lambda **kwargs: kwargs))
+        kwargs: dict[str, Any] = {"model": "gpt-5.5"}
+
+        _, shaped = OpenAIAdapter().prepare_responses_call(client, kwargs, is_streaming=True)
+
+        assert shaped == {"model": "gpt-5.5", "stream": True}
+        assert "stream" not in kwargs
+
+    def test_streaming_does_not_inject_stream_options(self) -> None:
+        client = SimpleNamespace(responses=SimpleNamespace(create=lambda **kwargs: kwargs))
+
+        _, shaped = OpenAIAdapter().prepare_responses_call(
+            client, {"model": "gpt-5.5"}, is_streaming=True
+        )
+
+        assert "stream_options" not in shaped
+
+
+@pytest.mark.unit
 class TestExtractImageUsage:
     """gpt-image images.generate/edit usage extraction."""
 

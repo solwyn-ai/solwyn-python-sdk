@@ -7,6 +7,7 @@ credentials are available (CI).
 
 from __future__ import annotations
 
+import inspect
 import os
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -55,14 +56,30 @@ def api_url() -> str:
     return os.environ.get("SOLWYN_TEST_API_URL", "http://127.0.0.1:8080")
 
 
+_REQUIRE_LIVE_API = True
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Let a direct fake-provider-only run proceed without the control plane."""
+    global _REQUIRE_LIVE_API
+    _REQUIRE_LIVE_API = any("fake_provider_harness_only" not in item.fixturenames for item in items)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def require_api(api_url: str) -> None:
-    """Skip the entire session if the Solwyn API is unreachable."""
+    """Skip live-pipeline runs if the Solwyn API is unreachable."""
+    if not _REQUIRE_LIVE_API:
+        return
     try:
         r = httpx.get(f"{api_url}/health", timeout=3)
         r.raise_for_status()
     except (httpx.HTTPError, OSError):
         pytest.skip("Solwyn API not available")
+
+
+@pytest.fixture
+def fake_provider_harness_only() -> None:
+    """Mark a direct fake-provider test that has no Solwyn API dependency."""
 
 
 def _signup_token(http: httpx.Client, session_id: str) -> str:
@@ -453,13 +470,28 @@ class WireRecorder:
     """
 
     def __init__(self) -> None:
+        self.budget_checks: list[dict[str, Any]] = []
         self.events: list[MetadataEvent] = []
         self.settlements: list[tuple[Any, MetadataEvent]] = []
 
     def attach(self, client: Any) -> WireRecorder:
+        budget = client._budget
         reporter = client._reporter
+        real_check = budget.check_budget
         real_report = reporter.report
         real_settlement = reporter.report_settlement
+
+        if inspect.iscoroutinefunction(real_check):
+
+            async def recording_check(**kwargs: Any) -> Any:
+                self.budget_checks.append(dict(kwargs))
+                return await real_check(**kwargs)
+
+        else:
+
+            def recording_check(**kwargs: Any) -> Any:
+                self.budget_checks.append(dict(kwargs))
+                return real_check(**kwargs)
 
         def recording_report(event: MetadataEvent) -> None:
             self.events.append(event)
@@ -469,6 +501,7 @@ class WireRecorder:
             self.settlements.append((confirm_request, event))
             real_settlement(confirm_request, event)
 
+        budget.check_budget = recording_check
         reporter.report = recording_report
         reporter.report_settlement = recording_settlement
         return self

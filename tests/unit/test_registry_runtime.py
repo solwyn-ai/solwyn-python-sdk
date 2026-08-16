@@ -9,7 +9,7 @@ them.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -154,3 +154,56 @@ def test_runtime_is_frozen_dataclass() -> None:
     # Act / Assert — frozen dataclass rejects attribute assignment
     with pytest.raises(Exception):  # noqa: B017 — FrozenInstanceError subclass varies
         runtimes[0].entry = None  # type: ignore[misc]
+
+
+@pytest.mark.unit
+def test_explicit_provider_pin_bypasses_client_detection() -> None:
+    """A provider pin is an identity assertion, not detected-client relabeling."""
+    primary = _mock_client("openai._client")
+    primary.__class__.__name__ = "OpenAI"
+
+    with patch(
+        "solwyn._registry.get_adapter_for_client",
+        side_effect=AssertionError("provider detection must not run"),
+    ) as detect:
+        runtimes = build_runtimes(
+            primary,
+            "gpt-5.5",
+            [],
+            primary_provider="openai",
+        )
+
+    detect.assert_not_called()
+    assert runtimes[0].adapter.name == "openai"
+    assert runtimes[0].entry.provider == ProviderName.OPENAI
+
+
+@pytest.mark.unit
+def test_fallback_provider_pin_bypasses_client_detection() -> None:
+    primary = _mock_client("openai._client")
+    fallback = _mock_client("openai._client")
+
+    with patch(
+        "solwyn._registry.get_adapter_for_client",
+        side_effect=AssertionError("provider detection must not run for a named fallback"),
+    ):
+        runtimes = build_runtimes(
+            primary,
+            "gpt-5.5",
+            [(fallback, "fallback-model", {}, "vllm")],
+            primary_provider="openai",
+        )
+
+    assert [runtime.adapter.name for runtime in runtimes] == ["openai", "vllm"]
+    assert runtimes[1].entry.provider == ProviderName.VLLM
+
+
+@pytest.mark.unit
+def test_unknown_primary_provider_pin_uses_provider_field() -> None:
+    primary = _mock_client("openai._client")
+
+    with pytest.raises(ConfigurationError) as exc_info:
+        build_runtimes(primary, "gpt-5.5", [], primary_provider="not-a-provider")
+
+    assert exc_info.value.field == "provider"
+    assert "Unknown provider" in str(exc_info.value)

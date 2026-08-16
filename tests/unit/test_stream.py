@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -30,6 +32,80 @@ class FakeAccumulator:
 
     def get_service_tier(self) -> str | None:
         return None
+
+
+class _CloseableSyncStream:
+    def __init__(self, items: list[object]) -> None:
+        self._items = items
+        self.close_calls = 0
+
+    def __iter__(self):
+        yield from self._items
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _CloseableAsyncStream:
+    def __init__(self, items: list[object]) -> None:
+        self._items = items
+        self.aclose_calls = 0
+
+    async def __aiter__(self):
+        for item in self._items:
+            yield item
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+
+
+class _BlockingAsyncCleanup:
+    def __init__(self) -> None:
+        self.first_started = asyncio.Event()
+        self.second_started = asyncio.Event()
+        self.allow = asyncio.Event()
+        self.attempts = 0
+        self.completed = 0
+        self.active = 0
+        self.max_active = 0
+
+    async def run(self) -> None:
+        self.attempts += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        if self.attempts == 1:
+            self.first_started.set()
+        else:
+            self.second_started.set()
+        try:
+            await self.allow.wait()
+            self.completed += 1
+        finally:
+            self.active -= 1
+
+
+class _BlockingAcloseStream:
+    def __init__(self, cleanup: _BlockingAsyncCleanup) -> None:
+        self._cleanup = cleanup
+
+    async def __aiter__(self):
+        return
+        yield
+
+    async def aclose(self) -> None:
+        await self._cleanup.run()
+
+
+class _BlockingAsyncCloseStream:
+    def __init__(self, cleanup: _BlockingAsyncCleanup) -> None:
+        self._cleanup = cleanup
+
+    async def __aiter__(self):
+        return
+        yield
+
+    async def close(self) -> None:
+        await self._cleanup.run()
 
 
 def test_fake_accumulator_satisfies_stream_usage_accumulator_protocol() -> None:
@@ -172,6 +248,42 @@ class TestSyncStreamWrapperErrorPath:
 
         with pytest.raises(ConnectionError, match="provider down"):
             list(wrapper)
+
+    @pytest.mark.parametrize("failure_stage", ["iterator", "observer", "translator"])
+    def test_chunk_processing_error_settles_as_error(self, failure_stage: str) -> None:
+        from solwyn.stream import SyncStreamWrapper
+
+        failure = ValueError(f"{failure_stage} failed")
+
+        class BrokenIterator:
+            def __iter__(self):
+                raise failure
+
+        accumulator = FakeAccumulator()
+        if failure_stage == "observer":
+            accumulator.observe = MagicMock(side_effect=failure)
+
+        def translate(chunk: object) -> list[object]:
+            if failure_stage == "translator":
+                raise failure
+            return [chunk]
+
+        on_complete = MagicMock()
+        on_error = MagicMock()
+        stream = BrokenIterator() if failure_stage == "iterator" else [object()]
+        wrapper = SyncStreamWrapper(
+            stream=stream,
+            accumulator=accumulator,
+            on_complete=on_complete,
+            on_error=on_error,
+            chunk_translator=translate,
+        )
+
+        with pytest.raises(ValueError, match=rf"{failure_stage} failed") as exc_info:
+            next(wrapper)
+
+        on_error.assert_called_once_with(exc_info.value)
+        on_complete.assert_not_called()
 
 
 @pytest.mark.unit
@@ -439,6 +551,43 @@ class TestAsyncStreamWrapper:
 
         with pytest.raises(ConnectionError, match="boom"):
             _ = [c async for c in wrapper]
+
+    @pytest.mark.parametrize("failure_stage", ["iterator", "observer", "translator"])
+    @pytest.mark.asyncio
+    async def test_chunk_processing_error_settles_as_error(self, failure_stage: str) -> None:
+        from solwyn.stream import AsyncStreamWrapper
+
+        failure = ValueError(f"{failure_stage} failed")
+
+        class BrokenAsyncIterator:
+            def __aiter__(self):
+                raise failure
+
+        accumulator = FakeAccumulator()
+        if failure_stage == "observer":
+            accumulator.observe = MagicMock(side_effect=failure)
+
+        def translate(chunk: object) -> list[object]:
+            if failure_stage == "translator":
+                raise failure
+            return [chunk]
+
+        on_complete = AsyncMock()
+        on_error = AsyncMock()
+        stream = BrokenAsyncIterator() if failure_stage == "iterator" else _aiter([object()])
+        wrapper = AsyncStreamWrapper(
+            stream=stream,
+            accumulator=accumulator,
+            on_complete=on_complete,
+            on_error=on_error,
+            chunk_translator=translate,
+        )
+
+        with pytest.raises(ValueError, match=rf"{failure_stage} failed") as exc_info:
+            await anext(wrapper)
+
+        on_error.assert_awaited_once_with(exc_info.value)
+        on_complete.assert_not_awaited()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1001,6 +1150,614 @@ class TestAsyncStreamWrapperInnerClose:
 
         assert inner.close_called == 1
         assert completion_count == 1
+
+    @pytest.mark.parametrize(
+        "stream_type",
+        [_BlockingAcloseStream, _BlockingAsyncCloseStream],
+        ids=["aclose", "async-close"],
+    )
+    @pytest.mark.asyncio
+    async def test_cancelled_provider_cleanup_is_retryable_and_serialized(
+        self,
+        stream_type: type[_BlockingAcloseStream] | type[_BlockingAsyncCloseStream],
+    ) -> None:
+        from solwyn.stream import AsyncStreamWrapper
+
+        cleanup = _BlockingAsyncCleanup()
+        on_complete = AsyncMock()
+        on_error = AsyncMock()
+        wrapper = AsyncStreamWrapper(
+            stream=stream_type(cleanup),
+            accumulator=FakeAccumulator(),
+            on_complete=on_complete,
+            on_error=on_error,
+        )
+
+        first_close = asyncio.create_task(wrapper.close())
+        await cleanup.first_started.wait()
+        second_close = asyncio.create_task(wrapper.close())
+        await asyncio.sleep(0)
+        assert cleanup.attempts == 1
+
+        first_close.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_close
+        try:
+            await asyncio.wait_for(cleanup.second_started.wait(), timeout=1)
+        finally:
+            cleanup.allow.set()
+        await second_close
+        await wrapper.close()
+
+        assert cleanup.attempts == 2
+        assert cleanup.completed == 1
+        assert cleanup.max_active == 1
+        on_complete.assert_awaited_once()
+        on_error.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_settlement_cancellation_leaves_provider_cleanup_retryable(self) -> None:
+        from solwyn.stream import AsyncStreamWrapper
+
+        inner = _CloseableAsyncStream([])
+        settlement_started = asyncio.Event()
+        never_finish_settlement = asyncio.Event()
+        completion_calls = 0
+
+        async def on_complete(_details: TokenDetails, _elapsed_ms: float) -> None:
+            nonlocal completion_calls
+            completion_calls += 1
+            settlement_started.set()
+            await never_finish_settlement.wait()
+
+        on_error = AsyncMock()
+        wrapper = AsyncStreamWrapper(
+            stream=inner,
+            accumulator=FakeAccumulator(),
+            on_complete=on_complete,
+            on_error=on_error,
+        )
+
+        first_close = asyncio.create_task(wrapper.close())
+        await settlement_started.wait()
+        first_close.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_close
+        await wrapper.close()
+        await wrapper.close()
+
+        assert completion_calls == 1
+        assert inner.aclose_calls == 1
+        on_error.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_provider_cleanup_error_is_retryable_without_double_settlement(self) -> None:
+        from solwyn.stream import AsyncStreamWrapper
+
+        class FailsOnceStream:
+            def __init__(self) -> None:
+                self.aclose_calls = 0
+
+            async def __aiter__(self):
+                return
+                yield
+
+            async def aclose(self) -> None:
+                self.aclose_calls += 1
+                if self.aclose_calls == 1:
+                    raise RuntimeError("cleanup failed")
+
+        inner = FailsOnceStream()
+        on_complete = AsyncMock()
+        on_error = AsyncMock()
+        wrapper = AsyncStreamWrapper(
+            stream=inner,
+            accumulator=FakeAccumulator(),
+            on_complete=on_complete,
+            on_error=on_error,
+        )
+
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            await wrapper.close()
+        await wrapper.close()
+        await wrapper.close()
+
+        assert inner.aclose_calls == 2
+        on_complete.assert_awaited_once()
+        on_error.assert_not_awaited()
+
+
+@pytest.mark.unit
+class TestSyncResponsesStreamManagerLifecycle:
+    @staticmethod
+    def _wrap(source: object):
+        from solwyn.stream import SyncStreamWrapper
+
+        return SyncStreamWrapper(
+            stream=source,
+            accumulator=FakeAccumulator(),
+            on_complete=MagicMock(),
+            on_error=MagicMock(),
+        )
+
+    def test_enter_and_close_serialize_without_losing_the_opened_stream(self) -> None:
+        from solwyn.stream import _SyncResponsesStreamManagerWrapper
+
+        enter_started = threading.Event()
+        allow_enter = threading.Event()
+        close_done = threading.Event()
+        event = object()
+
+        class BlockingManager:
+            def __init__(self) -> None:
+                self.stream = _CloseableSyncStream([event])
+                self.exit_calls: list[tuple[object, ...]] = []
+
+            def __enter__(self):
+                enter_started.set()
+                if not allow_enter.wait(timeout=2):
+                    raise TimeoutError("test did not release manager entry")
+                return self.stream
+
+            def __exit__(self, *args: object) -> None:
+                self.exit_calls.append(args)
+                self.stream.close()
+
+        manager = BlockingManager()
+        wrapper = _SyncResponsesStreamManagerWrapper(
+            manager,
+            self._wrap,
+            on_error=MagicMock(),
+            on_entry_error=MagicMock(),
+            on_abandoned_before_entry=MagicMock(),
+        )
+        entered: list[object] = []
+        errors: list[BaseException] = []
+
+        def enter() -> None:
+            try:
+                entered.append(wrapper.__enter__())
+            except BaseException as exc:
+                errors.append(exc)
+
+        def close() -> None:
+            try:
+                wrapper.close()
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                close_done.set()
+
+        enter_thread = threading.Thread(target=enter)
+        close_thread = threading.Thread(target=close)
+        enter_thread.start()
+        assert enter_started.wait(timeout=1)
+        close_thread.start()
+        try:
+            assert not close_done.wait(timeout=0.1)
+        finally:
+            allow_enter.set()
+            enter_thread.join(timeout=2)
+            close_thread.join(timeout=2)
+
+        assert not errors
+        assert len(entered) == 1
+        assert list(entered[0]) == [event]
+        assert len(manager.exit_calls) == 1
+        assert manager.stream.close_calls == 1
+
+    def test_reentry_is_rejected_and_close_is_idempotent(self) -> None:
+        from solwyn.stream import _SyncResponsesStreamManagerWrapper
+
+        inner = _CloseableSyncStream([])
+        manager = MagicMock()
+        manager.__enter__.return_value = inner
+        manager.__exit__.return_value = None
+        wrapper = _SyncResponsesStreamManagerWrapper(
+            manager,
+            self._wrap,
+            on_error=MagicMock(),
+            on_entry_error=MagicMock(),
+            on_abandoned_before_entry=MagicMock(),
+        )
+
+        wrapper.__enter__()
+        with pytest.raises(RuntimeError, match="already entered"):
+            wrapper.__enter__()
+        wrapper.close()
+        wrapper.close()
+
+        manager.__enter__.assert_called_once_with()
+        manager.__exit__.assert_called_once_with(None, None, None)
+
+    def test_enter_after_close_is_rejected(self) -> None:
+        from solwyn.stream import _SyncResponsesStreamManagerWrapper
+
+        manager = MagicMock()
+        manager.__exit__.return_value = None
+        wrap = MagicMock()
+        abandoned = MagicMock()
+        wrapper = _SyncResponsesStreamManagerWrapper(
+            manager,
+            wrap,
+            on_error=MagicMock(),
+            on_entry_error=MagicMock(),
+            on_abandoned_before_entry=abandoned,
+        )
+
+        wrapper.close()
+        wrapper.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            wrapper.__enter__()
+
+        manager.__enter__.assert_not_called()
+        manager.__exit__.assert_called_once_with(None, None, None)
+        # Nothing was dispatched: the reservation goes back and no stream is
+        # ever wrapped or settled.
+        abandoned.assert_called_once_with()
+        wrap.assert_not_called()
+
+    def test_wrap_failure_closes_opened_manager_without_masking_original(self) -> None:
+        from solwyn.stream import _SyncResponsesStreamManagerWrapper
+
+        original = ValueError("wrapping failed")
+        inner = _CloseableSyncStream([])
+        manager = MagicMock()
+        manager.__enter__.return_value = inner
+        manager.__exit__.side_effect = RuntimeError("cleanup failed")
+        on_error = MagicMock()
+        on_entry_error = MagicMock()
+        wrapper = _SyncResponsesStreamManagerWrapper(
+            manager,
+            MagicMock(side_effect=original),
+            on_error=on_error,
+            on_entry_error=on_entry_error,
+            on_abandoned_before_entry=MagicMock(),
+        )
+
+        with pytest.raises(ValueError, match="wrapping failed") as exc_info:
+            wrapper.__enter__()
+        wrapper.close()
+
+        assert exc_info.value is original
+        # The provider stream was already open: this is an established-stream
+        # failure, not an entry failure.
+        on_error.assert_called_once_with(original)
+        on_entry_error.assert_not_called()
+        manager.__exit__.assert_called_once()
+        exit_args = manager.__exit__.call_args.args
+        assert exit_args[0] is ValueError
+        assert exit_args[1] is original
+
+    def test_provider_entry_failure_uses_the_entry_error_path(self) -> None:
+        from solwyn.stream import _SyncResponsesStreamManagerWrapper
+
+        original = RuntimeError("entry failed")
+        manager = MagicMock()
+        manager.__enter__.side_effect = original
+        manager.__exit__.return_value = None
+        wrap = MagicMock()
+        on_error = MagicMock()
+        on_entry_error = MagicMock()
+        wrapper = _SyncResponsesStreamManagerWrapper(
+            manager,
+            wrap,
+            on_error=on_error,
+            on_entry_error=on_entry_error,
+            on_abandoned_before_entry=MagicMock(),
+        )
+
+        with pytest.raises(RuntimeError, match="entry failed"):
+            wrapper.__enter__()
+        wrapper.close()
+
+        on_entry_error.assert_called_once_with(original)
+        on_error.assert_not_called()
+        wrap.assert_not_called()
+        manager.__exit__.assert_called_once()
+
+
+@pytest.mark.unit
+class TestAsyncResponsesStreamManagerLifecycle:
+    @staticmethod
+    def _wrap(source: object, on_complete: AsyncMock, on_error: AsyncMock):
+        from solwyn.stream import AsyncStreamWrapper
+
+        return AsyncStreamWrapper(
+            stream=source,
+            accumulator=FakeAccumulator(),
+            on_complete=on_complete,
+            on_error=on_error,
+        )
+
+    @pytest.mark.asyncio
+    async def test_nested_reentry_is_rejected_without_poisoning_first_stream(self) -> None:
+        from solwyn.stream import _AsyncResponsesStreamManagerWrapper
+
+        event = object()
+        inner = _CloseableAsyncStream([event])
+        manager = MagicMock()
+        manager.__aenter__ = AsyncMock(return_value=inner)
+        manager.__aexit__ = AsyncMock(return_value=None)
+        on_complete = AsyncMock()
+        on_error = AsyncMock()
+        wrapper = _AsyncResponsesStreamManagerWrapper(
+            manager,
+            lambda source: self._wrap(source, on_complete, on_error),
+            on_error=on_error,
+            on_entry_error=AsyncMock(),
+            on_abandoned_before_entry=AsyncMock(),
+        )
+
+        first = await wrapper.__aenter__()
+        with pytest.raises(RuntimeError, match="already entered"):
+            await wrapper.__aenter__()
+        assert [item async for item in first] == [event]
+        await wrapper.__aexit__(None, None, None)
+
+        manager.__aenter__.assert_awaited_once_with()
+        manager.__aexit__.assert_awaited_once_with(None, None, None)
+        on_complete.assert_awaited_once()
+        on_error.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_reentry_waits_then_rejects_without_provider_reuse(self) -> None:
+        from solwyn.stream import _AsyncResponsesStreamManagerWrapper
+
+        event = object()
+        inner = _CloseableAsyncStream([event])
+        enter_started = asyncio.Event()
+        allow_enter = asyncio.Event()
+
+        class OneShotManager:
+            def __init__(self) -> None:
+                self.enter_calls = 0
+                self.exit_calls: list[tuple[object, ...]] = []
+
+            async def __aenter__(self):
+                self.enter_calls += 1
+                if self.enter_calls > 1:
+                    raise RuntimeError("one-shot manager reused")
+                enter_started.set()
+                await allow_enter.wait()
+                return inner
+
+            async def __aexit__(self, *args: object) -> None:
+                self.exit_calls.append(args)
+                await inner.aclose()
+
+        manager = OneShotManager()
+        on_complete = AsyncMock()
+        on_error = AsyncMock()
+        wrapper = _AsyncResponsesStreamManagerWrapper(
+            manager,
+            lambda source: self._wrap(source, on_complete, on_error),
+            on_error=on_error,
+            on_entry_error=AsyncMock(),
+            on_abandoned_before_entry=AsyncMock(),
+        )
+
+        first_task = asyncio.create_task(wrapper.__aenter__())
+        await enter_started.wait()
+        second_task = asyncio.create_task(wrapper.__aenter__())
+        await asyncio.sleep(0)
+        assert manager.enter_calls == 1
+        allow_enter.set()
+
+        first = await first_task
+        with pytest.raises(RuntimeError, match="already entered"):
+            await second_task
+        assert [item async for item in first] == [event]
+        await wrapper.close()
+
+        assert manager.enter_calls == 1
+        assert len(manager.exit_calls) == 1
+        on_complete.assert_awaited_once()
+        on_error.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_enter_after_close_is_rejected_and_close_is_idempotent(self) -> None:
+        from solwyn.stream import _AsyncResponsesStreamManagerWrapper
+
+        manager = MagicMock()
+        manager.__aenter__ = AsyncMock()
+        manager.__aexit__ = AsyncMock(return_value=None)
+        on_complete = AsyncMock()
+        on_error = AsyncMock()
+        abandoned = AsyncMock()
+        wrapper = _AsyncResponsesStreamManagerWrapper(
+            manager,
+            lambda source: self._wrap(source, on_complete, on_error),
+            on_error=on_error,
+            on_entry_error=AsyncMock(),
+            on_abandoned_before_entry=abandoned,
+        )
+
+        await wrapper.close()
+        await wrapper.close()
+        with pytest.raises(RuntimeError, match="closed"):
+            await wrapper.__aenter__()
+
+        manager.__aenter__.assert_not_awaited()
+        manager.__aexit__.assert_awaited_once_with(None, None, None)
+        # Nothing was dispatched: the reservation goes back instead of settling.
+        abandoned.assert_awaited_once_with()
+        on_complete.assert_not_awaited()
+        on_error.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_close_is_retryable_and_serializes_concurrent_closers(
+        self,
+    ) -> None:
+        from solwyn.stream import _AsyncResponsesStreamManagerWrapper
+
+        inner = _CloseableAsyncStream([])
+        first_exit_started = asyncio.Event()
+        second_exit_started = asyncio.Event()
+        allow_exit = asyncio.Event()
+
+        class RetryableExitManager:
+            def __init__(self) -> None:
+                self.exit_attempts = 0
+                self.completed_exits = 0
+                self.active_exits = 0
+                self.max_active_exits = 0
+
+            async def __aenter__(self):
+                return inner
+
+            async def __aexit__(self, *_args: object) -> None:
+                self.exit_attempts += 1
+                self.active_exits += 1
+                self.max_active_exits = max(self.max_active_exits, self.active_exits)
+                if self.exit_attempts == 1:
+                    first_exit_started.set()
+                else:
+                    second_exit_started.set()
+                try:
+                    await allow_exit.wait()
+                    await inner.aclose()
+                    self.completed_exits += 1
+                finally:
+                    self.active_exits -= 1
+
+        manager = RetryableExitManager()
+        on_complete = AsyncMock()
+        on_error = AsyncMock()
+        wrapper = _AsyncResponsesStreamManagerWrapper(
+            manager,
+            lambda source: self._wrap(source, on_complete, on_error),
+            on_error=on_error,
+            on_entry_error=AsyncMock(),
+            on_abandoned_before_entry=AsyncMock(),
+        )
+        await wrapper.__aenter__()
+
+        first_close = asyncio.create_task(wrapper.__aexit__(None, None, None))
+        await first_exit_started.wait()
+        second_close = asyncio.create_task(wrapper.close())
+        await asyncio.sleep(0)
+        assert manager.exit_attempts == 1
+
+        first_close.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_close
+        try:
+            await asyncio.wait_for(second_exit_started.wait(), timeout=1)
+        finally:
+            allow_exit.set()
+        await second_close
+        await wrapper.close()
+
+        assert manager.exit_attempts == 2
+        assert manager.completed_exits == 1
+        assert manager.max_active_exits == 1
+        assert inner.aclose_calls == 1
+        on_complete.assert_awaited_once()
+        on_error.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_settlement_cancellation_still_closes_provider_without_double_accounting(
+        self,
+    ) -> None:
+        from solwyn.stream import _AsyncResponsesStreamManagerWrapper
+
+        inner = _CloseableAsyncStream([])
+        settlement_started = asyncio.Event()
+        never_finish_settlement = asyncio.Event()
+        completion_calls = 0
+
+        async def on_complete(_details: TokenDetails, _elapsed_ms: float) -> None:
+            nonlocal completion_calls
+            completion_calls += 1
+            settlement_started.set()
+            await never_finish_settlement.wait()
+
+        on_error = AsyncMock()
+        manager = MagicMock()
+        manager.__aenter__ = AsyncMock(return_value=inner)
+        manager.__aexit__ = AsyncMock(return_value=None)
+        wrapper = _AsyncResponsesStreamManagerWrapper(
+            manager,
+            lambda source: self._wrap(source, on_complete, on_error),
+            on_error=on_error,
+            on_entry_error=AsyncMock(),
+            on_abandoned_before_entry=AsyncMock(),
+        )
+        await wrapper.__aenter__()
+
+        close_task = asyncio.create_task(wrapper.close())
+        await settlement_started.wait()
+        close_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+        await wrapper.close()
+
+        assert completion_calls == 1
+        manager.__aexit__.assert_awaited_once_with(None, None, None)
+        on_error.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_wrap_failure_settles_error_and_closes_without_masking_original(
+        self,
+    ) -> None:
+        from solwyn.stream import _AsyncResponsesStreamManagerWrapper
+
+        original = ValueError("wrapping failed")
+        manager = MagicMock()
+        manager.__aenter__ = AsyncMock(return_value=_CloseableAsyncStream([]))
+        manager.__aexit__ = AsyncMock(side_effect=RuntimeError("cleanup failed"))
+        on_error = AsyncMock()
+        on_entry_error = AsyncMock()
+        wrapper = _AsyncResponsesStreamManagerWrapper(
+            manager,
+            MagicMock(side_effect=original),
+            on_error=on_error,
+            on_entry_error=on_entry_error,
+            on_abandoned_before_entry=AsyncMock(),
+        )
+
+        with pytest.raises(ValueError, match="wrapping failed") as exc_info:
+            await wrapper.__aenter__()
+        await wrapper.close()
+
+        assert exc_info.value is original
+        # The provider stream was already open: this is an established-stream
+        # failure, not an entry failure.
+        on_error.assert_awaited_once_with(original)
+        on_entry_error.assert_not_awaited()
+        manager.__aexit__.assert_awaited_once()
+        exit_args = manager.__aexit__.await_args.args
+        assert exit_args[0] is ValueError
+        assert exit_args[1] is original
+
+    @pytest.mark.asyncio
+    async def test_provider_entry_failure_uses_the_entry_error_path(self) -> None:
+        from solwyn.stream import _AsyncResponsesStreamManagerWrapper
+
+        original = RuntimeError("entry failed")
+        manager = MagicMock()
+        manager.__aenter__ = AsyncMock(side_effect=original)
+        manager.__aexit__ = AsyncMock(return_value=None)
+        wrap = MagicMock()
+        on_error = AsyncMock()
+        on_entry_error = AsyncMock()
+        wrapper = _AsyncResponsesStreamManagerWrapper(
+            manager,
+            wrap,
+            on_error=on_error,
+            on_entry_error=on_entry_error,
+            on_abandoned_before_entry=AsyncMock(),
+        )
+
+        with pytest.raises(RuntimeError, match="entry failed"):
+            await wrapper.__aenter__()
+        await wrapper.close()
+
+        on_entry_error.assert_awaited_once_with(original)
+        on_error.assert_not_awaited()
+        wrap.assert_not_called()
+        manager.__aexit__.assert_awaited_once()
 
 
 @pytest.mark.unit

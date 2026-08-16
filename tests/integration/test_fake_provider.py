@@ -6,7 +6,19 @@ import json
 
 import httpx
 import pytest
-from fake_provider import RESPONSE_CONTENT, FakeAnthropicServer, FakeProviderServer
+from fake_provider import (
+    RESPONSE_CONTENT,
+    FakeAnthropicServer,
+    FakeProviderServer,
+)
+from pydantic import BaseModel
+
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("fake_provider_harness_only")]
+
+
+class _FakeStructuredResponse(BaseModel):
+    answer: str
+    score: int
 
 
 @pytest.mark.integration
@@ -48,6 +60,159 @@ class TestFakeProviderServer:
             assert lines[-1] == "[DONE]"
             final = json.loads(lines[-2])
             assert final["usage"]["prompt_tokens"] == server.prompt_tokens
+
+    @pytest.mark.integration
+    def test_json_response_with_flat_usage_and_request_recording(self) -> None:
+        with FakeProviderServer(prompt_tokens=7, completion_tokens=3) as server:
+            body = {"model": "gpt-5.5", "input": "hello", "service_tier": "priority"}
+            response = httpx.post(f"{server.base_url}/responses", json=body)
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["object"] == "response"
+            assert data["status"] == "completed"
+            assert data["output"][0]["content"][0] == {
+                "type": "output_text",
+                "text": RESPONSE_CONTENT,
+                "annotations": [],
+                "logprobs": [],
+            }
+            assert data["usage"] == {
+                "input_tokens": 7,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 3,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 10,
+            }
+            assert data["service_tier"] == "priority"
+            assert server.requests == [type(server.requests[0])(path="/v1/responses", body=body)]
+
+    @pytest.mark.integration
+    def test_structured_response_returns_json_output_text(self) -> None:
+        with FakeProviderServer() as server:
+            response = httpx.post(
+                f"{server.base_url}/responses",
+                json={
+                    "model": "gpt-5.5",
+                    "input": "return a small object",
+                    "text": {
+                        "format": {
+                            "type": "json_schema",
+                            "name": "fake_structured_response",
+                            "schema": {"type": "object"},
+                            "strict": True,
+                        }
+                    },
+                },
+            )
+
+            output_text = response.json()["output"][0]["content"][0]["text"]
+            assert json.loads(output_text) == {"answer": "structured fake response", "score": 7}
+
+    @pytest.mark.integration
+    def test_responses_sse_terminal_event_carries_full_response_and_usage(self) -> None:
+        with FakeProviderServer(prompt_tokens=13, completion_tokens=5) as server:
+            body = {"model": "gpt-5.5", "input": "hello", "stream": True}
+            with httpx.stream("POST", f"{server.base_url}/responses", json=body) as response:
+                assert response.headers["content-type"].startswith("text/event-stream")
+                payloads = [
+                    line.removeprefix("data: ")
+                    for line in response.iter_lines()
+                    if line.startswith("data: ")
+                ]
+
+            assert payloads[-1] == "[DONE]"
+            events = [json.loads(payload) for payload in payloads[:-1]]
+            assert [event["type"] for event in events] == [
+                "response.created",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.completed",
+            ]
+            terminal = events[-1]
+            assert terminal["response"]["output"][0]["content"][0]["text"] == RESPONSE_CONTENT
+            assert terminal["response"]["usage"]["input_tokens"] == 13
+            assert terminal["response"]["usage"]["output_tokens"] == 5
+            assert terminal["response"]["usage"]["total_tokens"] == 18
+            assert terminal["response"]["service_tier"] == "default"
+            assert server.requests[0].path == "/v1/responses"
+            assert server.requests[0].body == body
+
+    @pytest.mark.integration
+    def test_real_openai_stream_helper_consumes_responses_lifecycle(self) -> None:
+        openai = pytest.importorskip("openai")
+
+        with (
+            FakeProviderServer() as server,
+            openai.OpenAI(base_url=server.base_url, api_key="sk-fake") as client,
+            client.responses.stream(model="gpt-5.5", input="hello") as stream,
+        ):
+            final_response = stream.get_final_response()
+
+        assert final_response.output_text == RESPONSE_CONTENT
+        assert server.requests[0].path == "/v1/responses"
+        assert server.requests[0].body == {
+            "model": "gpt-5.5",
+            "input": "hello",
+            "stream": True,
+        }
+
+    @pytest.mark.integration
+    def test_real_openai_nonstream_and_parse_accept_omitted_responses_usage(self) -> None:
+        openai = pytest.importorskip("openai")
+
+        with (
+            FakeProviderServer() as server,
+            openai.OpenAI(base_url=server.base_url, api_key="sk-fake") as client,
+        ):
+            server.set_omit_usage(True)
+            response = client.responses.create(model="gpt-5.5", input="hello")
+            parsed = client.responses.parse(
+                model="gpt-5.5",
+                input="hello",
+                text_format=_FakeStructuredResponse,
+            )
+
+        assert response.output_text == RESPONSE_CONTENT
+        assert response.usage is None
+        assert parsed.output_parsed == _FakeStructuredResponse(
+            answer="structured fake response",
+            score=7,
+        )
+        assert parsed.usage is None
+        assert [request.path for request in server.requests] == [
+            "/v1/responses",
+            "/v1/responses",
+        ]
+
+    @pytest.mark.integration
+    def test_real_openai_extra_body_overrides_named_responses_fields_on_the_wire(self) -> None:
+        openai = pytest.importorskip("openai")
+
+        with (
+            FakeProviderServer() as server,
+            openai.OpenAI(base_url=server.base_url, api_key="sk-fake") as client,
+        ):
+            client.responses.create(
+                model="named-model",
+                input="named input",
+                instructions="named instructions",
+                max_output_tokens=10,
+                extra_body={
+                    "model": "body-model",
+                    "input": "body input",
+                    "instructions": "body instructions",
+                    "max_output_tokens": 99,
+                },
+            )
+
+        assert server.requests[0].body == {
+            "model": "body-model",
+            "input": "body input",
+            "instructions": "body instructions",
+            "max_output_tokens": 99,
+        }
 
     @pytest.mark.integration
     def test_fail_next_injects_error_then_recovers(self) -> None:
@@ -92,6 +257,37 @@ class TestFakeProviderServer:
                 ]
             assert payloads[-1] == "[DONE]"
             assert all(json.loads(p).get("usage") is None for p in payloads[:-1])
+
+            responses_json = httpx.post(
+                f"{server.base_url}/responses",
+                json={"model": "m", "input": "hello"},
+            )
+            assert "usage" not in responses_json.json()
+
+            parsed_json = httpx.post(
+                f"{server.base_url}/responses",
+                json={
+                    "model": "m",
+                    "input": "hello",
+                    "text": {"format": {"type": "json_schema", "schema": {}}},
+                },
+            )
+            assert "usage" not in parsed_json.json()
+
+            with httpx.stream(
+                "POST",
+                f"{server.base_url}/responses",
+                json={"model": "m", "input": "hello", "stream": True},
+            ) as responses_stream:
+                response_payloads = [
+                    line.removeprefix("data: ")
+                    for line in responses_stream.iter_lines()
+                    if line.startswith("data: ") and line != "data: [DONE]"
+                ]
+            terminal = json.loads(response_payloads[-1])
+            assert terminal["type"] == "response.completed"
+            assert "usage" not in terminal["response"]
+
             server.reset()
             r3 = httpx.post(
                 f"{server.base_url}/chat/completions", json={"model": "m", "messages": []}

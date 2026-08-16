@@ -9,6 +9,36 @@ derived from git tags (hatch-vcs).
 
 ### Added
 
+- **Native OpenAI and Azure OpenAI Responses calls are now budget-metered.**
+  Sync and async `responses.create(...)`, `responses.parse(...)`, and new-response
+  `responses.stream(...)` helper calls use one primary-only path with
+  Responses-compatible effective defaults: chat-only defaults are stripped,
+  caller arguments win, and budget preflight and provider dispatch see the same
+  mapping. `create(stream=True)` and completed helper streams settle
+  provider-reported usage from the terminal event; entered streams abandoned
+  before terminal usage settle a length-based estimate, with lease-backed
+  abandoned calls floored at the reserved authority. Non-streaming create/parse calls
+  with omitted or zeroed Responses usage now use that same explicitly marked
+  request-length estimate, and lease-backed calls likewise retain their full
+  reservation rather than settling as exact zero. Effective `background=True`
+  requests fail loud because queued responses expose no create-time usage, and
+  parse refuses effective streaming before budget or provider I/O. To keep
+  preflight and the serialized wire request identical, metering-critical
+  `extra_body` overrides (`model`, `input`, `instructions`,
+  `max_output_tokens`, and `stream`) are rejected; vendor-specific extensions
+  still pass through unchanged. The helper's
+  existing-response retrieval overload remains raw because it creates no new
+  spend. Azure admission is explicit through an Azure-only
+  `CompatProfile.supports_responses` capability flag; all other compatible
+  profiles retain their guarded raw Responses managers.
+- **Explicit provider identity pins bypass auto-detection.** Passing
+  `provider="openai"` (or a provider in a fallback 4-tuple) selects that named
+  adapter without inspecting `base_url`, enabling native OpenAI Responses
+  metering behind corporate gateways and local proxies. Pins do not translate
+  dialects or replace SDK clients: wrapper construction validates the actual
+  provider-client family and sync/async mode, rejects mismatches with
+  `ConfigurationError(field="client")`, and reports unknown names against the
+  `provider` field.
 - **Strict pre-call coverage controls and local coverage manifests.** Clients
   now classify and guard the reachable public provider-client graph. Set
   `on_unmetered="raise"` / `SOLWYN_ON_UNMETERED=raise` to refuse untracked or
@@ -52,6 +82,11 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **Breaking (pre-launch): native OpenAI and Azure OpenAI Responses create,
+  parse, and stream leaves are no longer acknowledgeable unmetered
+  capabilities.** Remove those leaves from `acknowledge_untracked`; they are
+  now tracked and rejected as acknowledgment tokens. Acknowledgment examples
+  continue to use the still-unmetered `responses.retrieve` leaf.
 - **Untracked capabilities now warn once by default instead of passing
   silently.** Guarded namespaces keep descendants inside the same posture
   decision. Strict mode is a cooperative pre-call guard, not a sandbox:
@@ -69,6 +104,33 @@ derived from git tags (hatch-vcs).
   ids. `BudgetCheckResult.denied_by_period` now carries the Cloud/lease label
   through client error construction; ordinary hard-deny errors expose the
   actual period and fall back to `unknown` only when no label was supplied.
+
+### Fixed
+
+- **A Responses stream-helper entry failure is classified instead of always
+  blaming the provider.** The SDK manager sends its request in `__enter__`,
+  after the candidate walk, so that failure now runs the same
+  `classify_exception` dispositions the walk uses: a request-shaped 4xx records
+  no circuit-breaker failure and reports no `possibly_succeeded`, while
+  failover and post-send-ambiguous errors keep the breaker verdict. Previously a
+  repeated 400 on `responses.stream(...)` could open the breaker and block all
+  traffic to a healthy provider. Failures after the provider stream opens are
+  unchanged.
+- **Compatible-provider Responses streams without readable usage hold their
+  lease floor.** A streaming settlement that falls back to the adapter's own
+  length estimate now settles as unmeasured, so a run lease trues up at its
+  reserved bound instead of re-lending output allowance the response already
+  spent. The estimated token details are still reported as telemetry. Chat
+  streaming is unaffected.
+- **Closing a Responses stream helper before entering it releases its
+  reservation.** No provider request was ever dispatched, so the wrapper no
+  longer ships a confirm for phantom spend, records no circuit-breaker success,
+  and reports no latency sample; it still forwards `close()` to the SDK
+  manager.
+- **`extra_body={"stream": ...}` is refused on metered Responses calls.**
+  The OpenAI SDK merges `extra_body` after named arguments, so an entry there
+  would desync Solwyn's streaming mode from the dispatched request and lose the
+  call's metered spend.
 
 ## [0.5.0] - 2026-08-07
 

@@ -8,10 +8,12 @@ and report metadata.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import threading
 import time
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any, Self, cast
 
@@ -50,10 +52,12 @@ class SyncStreamWrapper:
         stream: Any,
         accumulator: StreamUsageAccumulator,
         on_complete: Callable[[TokenDetails, float], None],
-        on_error: Callable[[Exception], None],
+        on_error: Callable[[BaseException], None],
         chunk_translator: Callable[[Any], list[Any]] | None = None,
     ) -> None:
         self._stream = stream
+        self._iterator: Iterator[Any] | None = None
+        self._pending_chunks: deque[Any] = deque()
         self._accumulator = accumulator
         self._on_complete = on_complete
         self._on_error = on_error
@@ -81,7 +85,7 @@ class SyncStreamWrapper:
                 type(cb_exc).__name__,
             )
 
-    def _settle_error(self, exc: Exception) -> None:
+    def _settle_error(self, exc: BaseException) -> None:
         """Fire on_error exactly once. Mirrors _settle() for the error path."""
         with self._lock:
             if self._settled:
@@ -97,22 +101,29 @@ class SyncStreamWrapper:
                 type(cb_exc).__name__,
             )
 
-    def __iter__(self) -> Iterator[Any]:
-        try:
-            for chunk in self._stream:
-                # The accumulator ALWAYS observes the RAW served chunk so usage
-                # settles against the served provider. Translation (if any) only
-                # reshapes what the caller SEES — never what we account.
+    def __next__(self) -> Any:
+        """Return one observed caller-dialect chunk."""
+        while not self._pending_chunks:
+            try:
+                iterator = self._iterator
+                if iterator is None:
+                    iterator = iter(self._stream)
+                    self._iterator = iterator
+                chunk = next(iterator)
                 self._accumulator.observe(chunk)
                 if self._chunk_translator is None:
-                    yield chunk
-                else:
-                    yield from self._chunk_translator(chunk)
-        except Exception as exc:
-            self._settle_error(exc)
-            raise
-        else:
-            self._settle()
+                    return chunk
+                self._pending_chunks.extend(self._chunk_translator(chunk))
+            except StopIteration:
+                self._settle()
+                raise
+            except Exception as exc:
+                self._settle_error(exc)
+                raise
+        return self._pending_chunks.popleft()
+
+    def __iter__(self) -> Iterator[Any]:
+        return self
 
     def close(self) -> None:
         """Settle the budget reservation with whatever data we have, then
@@ -161,8 +172,8 @@ class AsyncStreamWrapper:
 
     Call close() or use ``async with stream:`` to settle on early abort.
 
-    No lock needed: async wrappers run in a single-threaded event loop,
-    so concurrent settlement is not possible.
+    Settlement marks itself complete before awaiting its callback. Provider
+    cleanup is serialized separately so cancellation leaves it retryable.
 
     Cross-provider stream normalization: see ``SyncStreamWrapper`` — the
     optional ``chunk_translator`` reshapes raw served chunks into caller-dialect
@@ -174,16 +185,20 @@ class AsyncStreamWrapper:
         stream: Any,
         accumulator: StreamUsageAccumulator,
         on_complete: Callable[[TokenDetails, float], Awaitable[None]],
-        on_error: Callable[[Exception], Awaitable[None]],
+        on_error: Callable[[BaseException], Awaitable[None]],
         chunk_translator: Callable[[Any], list[Any]] | None = None,
     ) -> None:
         self._stream = stream
+        self._iterator: AsyncIterator[Any] | None = None
+        self._pending_chunks: deque[Any] = deque()
         self._accumulator = accumulator
         self._on_complete = on_complete
         self._on_error = on_error
         self._chunk_translator = chunk_translator
         self._start_time = time.monotonic()
         self._settled = False
+        self._cleanup_complete = False
+        self._close_lock = asyncio.Lock()
 
     async def _settle(self) -> None:
         """Fire on_complete exactly once with accumulated data."""
@@ -201,7 +216,7 @@ class AsyncStreamWrapper:
                 type(cb_exc).__name__,
             )
 
-    async def _settle_error(self, exc: Exception) -> None:
+    async def _settle_error(self, exc: BaseException) -> None:
         """Fire on_error exactly once. Mirrors _settle() for the error path."""
         if self._settled:
             return
@@ -216,23 +231,29 @@ class AsyncStreamWrapper:
                 type(cb_exc).__name__,
             )
 
-    async def __aiter__(self) -> AsyncIterator[Any]:
-        try:
-            async for chunk in self._stream:
-                # The accumulator ALWAYS observes the RAW served chunk so usage
-                # settles against the served provider. Translation (if any) only
-                # reshapes what the caller SEES — never what we account.
+    async def __anext__(self) -> Any:
+        """Return one observed caller-dialect chunk."""
+        while not self._pending_chunks:
+            try:
+                iterator = self._iterator
+                if iterator is None:
+                    iterator = self._stream.__aiter__()
+                    self._iterator = iterator
+                chunk = await iterator.__anext__()
                 self._accumulator.observe(chunk)
                 if self._chunk_translator is None:
-                    yield chunk
-                else:
-                    for translated in self._chunk_translator(chunk):
-                        yield translated
-        except Exception as exc:
-            await self._settle_error(exc)
-            raise
-        else:
-            await self._settle()
+                    return chunk
+                self._pending_chunks.extend(self._chunk_translator(chunk))
+            except StopAsyncIteration:
+                await self._settle()
+                raise
+            except Exception as exc:
+                await self._settle_error(exc)
+                raise
+        return self._pending_chunks.popleft()
+
+    def __aiter__(self) -> AsyncIterator[Any]:
+        return self
 
     async def close(self) -> None:
         """Settle the budget reservation with whatever data we have, then
@@ -242,13 +263,21 @@ class AsyncStreamWrapper:
         Forwarding to the inner stream is also safe if called multiple times;
         well-behaved stream implementations are idempotent.
         """
-        await self._settle()
-        if hasattr(self._stream, "aclose"):
-            await self._stream.aclose()
-        elif hasattr(self._stream, "close"):
-            close_result = self._stream.close()
-            if inspect.isawaitable(close_result):
-                await close_result
+        async with self._close_lock:
+            if self._cleanup_complete:
+                return
+            await self._settle()
+            if hasattr(self._stream, "aclose"):
+                await self._stream.aclose()
+            elif hasattr(self._stream, "close"):
+                close_result = self._stream.close()
+                if inspect.isawaitable(close_result):
+                    await close_result
+            self._cleanup_complete = True
+
+    async def aclose(self) -> None:
+        """Support the async-iterator cleanup protocol."""
+        await self.close()
 
     async def __aenter__(self) -> Self:
         if hasattr(self._stream, "__aenter__"):
@@ -274,3 +303,471 @@ class AsyncStreamWrapper:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._stream, name)
+
+
+class _SyncResponsesEnteredStreamWrapper:
+    """Add SDK Responses helpers without widening every stream's surface."""
+
+    def __init__(self, stream: SyncStreamWrapper) -> None:
+        self._stream = stream
+
+    def __next__(self) -> Any:
+        return next(self._stream)
+
+    def __iter__(self) -> Iterator[Any]:
+        return self
+
+    def until_done(self) -> Self:
+        """Consume through Solwyn's observer and preserve the SDK helper shape."""
+        for _event in self:
+            pass
+        return self
+
+    def get_final_response(self) -> Any:
+        """Return the SDK result after every event has passed through the observer."""
+        self.until_done()
+        return self._stream.get_final_response()
+
+    def __enter__(self) -> Self:
+        self._stream.__enter__()
+        return self
+
+    def __exit__(self, *args: object) -> bool | None:
+        return self._stream.__exit__(*args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+class _AsyncResponsesEnteredStreamWrapper:
+    """Async Responses-only helper surface around the generic observer."""
+
+    def __init__(self, stream: AsyncStreamWrapper) -> None:
+        self._stream = stream
+
+    async def __anext__(self) -> Any:
+        return await anext(self._stream)
+
+    def __aiter__(self) -> AsyncIterator[Any]:
+        return self
+
+    async def until_done(self) -> Self:
+        """Consume through Solwyn's observer and preserve the SDK helper shape."""
+        async for _event in self:
+            pass
+        return self
+
+    async def get_final_response(self) -> Any:
+        """Return the SDK result after every event has passed through the observer."""
+        await self.until_done()
+        return await self._stream.get_final_response()
+
+    async def __aenter__(self) -> Self:
+        await self._stream.__aenter__()
+        return self
+
+    async def __aexit__(self, *args: object) -> bool | None:
+        return await self._stream.__aexit__(*args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+class _SyncResponsesStreamManagerWrapper:
+    """Wrap an SDK Responses manager while preserving its context lifecycle.
+
+    The SDK manager opens the provider stream only in ``__enter__``. Solwyn
+    therefore wraps the returned inner stream at that point, allowing the
+    ordinary ``SyncStreamWrapper`` accumulator and settlement callbacks to
+    observe terminal Responses events. Closing before entry dispatched no
+    provider request at all, so it releases the reservation without settling
+    or reporting; a provider entry failure takes the classified entry-error
+    path, and any failure after the provider stream opens takes the
+    established stream-error path.
+    """
+
+    def __init__(
+        self,
+        manager: Any,
+        wrap_stream: Callable[[Any], SyncStreamWrapper],
+        *,
+        on_error: Callable[[BaseException], None],
+        on_entry_error: Callable[[BaseException], None],
+        on_abandoned_before_entry: Callable[[], None],
+    ) -> None:
+        self._manager = manager
+        self._wrap_stream = wrap_stream
+        self._on_error = on_error
+        self._on_entry_error = on_entry_error
+        self._on_abandoned_before_entry = on_abandoned_before_entry
+        self._stream: SyncStreamWrapper | None = None
+        self._pre_entry_settled = False
+        self._dispatched = False
+        self._state = "new"
+        self._lock = threading.RLock()
+
+    def _wrapped_stream(self, source: Any = ()) -> SyncStreamWrapper:
+        if self._stream is None:
+            self._stream = self._wrap_stream(source)
+        return self._stream
+
+    def _settle_before_stream(
+        self,
+        exc: BaseException,
+        handler: Callable[[BaseException], None],
+    ) -> None:
+        """Run at most ONE pre-entry reconciliation for this manager."""
+        if self._stream is not None:
+            self._stream._settle_error(exc)
+            return
+        if self._pre_entry_settled:
+            return
+        self._pre_entry_settled = True
+        try:
+            handler(exc)
+        except BaseException as settlement_exc:
+            logger.warning(
+                "Responses entry settlement raised; suppressing (%s)",
+                type(settlement_exc).__name__,
+            )
+
+    def _settle_entry_error(self, exc: BaseException) -> None:
+        """The provider request failed in ``__enter__``: classify it."""
+        self._settle_before_stream(exc, self._on_entry_error)
+
+    def _settle_wrap_error(self, exc: BaseException) -> None:
+        """The provider stream opened; wrapping failed after establishment."""
+        self._settle_before_stream(exc, self._on_error)
+
+    def _release_before_entry(self) -> None:
+        """Give the reservation back for a manager that never dispatched."""
+        if self._pre_entry_settled:
+            return
+        self._pre_entry_settled = True
+        self._on_abandoned_before_entry()
+
+    def _close_failed_entry(self, exc: BaseException) -> None:
+        try:
+            self._manager.__exit__(type(exc), exc, exc.__traceback__)
+        except BaseException as close_exc:
+            logger.warning(
+                "Responses manager close raised after entry failed; suppressing (%s)",
+                type(close_exc).__name__,
+            )
+
+    def __enter__(self) -> _SyncResponsesEnteredStreamWrapper:
+        # The lock spans provider entry and wrapping. A concurrent close must
+        # never cache an empty abandonment wrapper while the real stream opens.
+        with self._lock:
+            if self._state == "closed":
+                raise RuntimeError("Responses stream manager is closed")
+            if self._state != "new":
+                raise RuntimeError("Responses stream manager is already entered")
+            self._state = "entering"
+            try:
+                source = self._manager.__enter__()
+            except BaseException as exc:
+                self._state = "closed"
+                self._settle_entry_error(exc)
+                self._close_failed_entry(exc)
+                raise
+            self._dispatched = True
+
+            try:
+                stream = self._wrapped_stream(source)
+                entered_stream = _SyncResponsesEnteredStreamWrapper(stream)
+            except BaseException as exc:
+                self._state = "closed"
+                self._settle_wrap_error(exc)
+                self._close_failed_entry(exc)
+                raise
+
+            self._state = "entered"
+            return entered_stream
+
+    def _finish(self, args: tuple[object, ...]) -> bool | None:
+        with self._lock:
+            if self._state == "closed":
+                return False
+            self._state = "closed"
+            original_exception = bool(args and args[0] is not None)
+
+            settlement_error: BaseException | None = None
+            try:
+                if self._dispatched:
+                    self._wrapped_stream()._settle()
+                else:
+                    self._release_before_entry()
+            except BaseException as exc:
+                settlement_error = exc
+
+            try:
+                result = cast("bool | None", self._manager.__exit__(*args))
+            except BaseException as exc:
+                if original_exception:
+                    logger.warning(
+                        "Responses manager close raised during __exit__; suppressing (%s)",
+                        type(exc).__name__,
+                    )
+                    result = False
+                else:
+                    raise
+
+            if settlement_error is not None:
+                if original_exception:
+                    logger.warning(
+                        "Responses stream settlement raised during __exit__; suppressing (%s)",
+                        type(settlement_error).__name__,
+                    )
+                else:
+                    raise settlement_error
+            return result
+
+    def close(self) -> None:
+        """Reconcile once (settle, or release if never entered) and close."""
+        self._finish((None, None, None))
+
+    def __exit__(self, *args: object) -> bool | None:
+        return self._finish(args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._manager, name)
+
+
+class _AsyncResponsesStreamManagerWrapper:
+    """Async counterpart of ``_SyncResponsesStreamManagerWrapper``."""
+
+    def __init__(
+        self,
+        manager: Any,
+        wrap_stream: Callable[[Any], AsyncStreamWrapper],
+        *,
+        on_error: Callable[[BaseException], Awaitable[None]],
+        on_entry_error: Callable[[BaseException], Awaitable[None]],
+        on_abandoned_before_entry: Callable[[], Awaitable[None]],
+    ) -> None:
+        self._manager = manager
+        self._wrap_stream = wrap_stream
+        self._on_error = on_error
+        self._on_entry_error = on_entry_error
+        self._on_abandoned_before_entry = on_abandoned_before_entry
+        self._stream: AsyncStreamWrapper | None = None
+        self._pre_entry_settled = False
+        self._dispatched = False
+        self._state = "new"
+        self._lock = asyncio.Lock()
+
+    def _wrapped_stream(self, source: Any = ()) -> AsyncStreamWrapper:
+        if self._stream is None:
+            self._stream = self._wrap_stream(source)
+        return self._stream
+
+    @property
+    def _cleanup_complete(self) -> bool:
+        return self._state == "closed"
+
+    async def _settle_before_stream(
+        self,
+        exc: BaseException,
+        handler: Callable[[BaseException], Awaitable[None]],
+    ) -> None:
+        """Run at most ONE pre-entry reconciliation for this manager."""
+        if self._stream is not None:
+            await self._stream._settle_error(exc)
+            return
+        if self._pre_entry_settled:
+            return
+        self._pre_entry_settled = True
+        try:
+            await handler(exc)
+        except BaseException as settlement_exc:
+            logger.warning(
+                "Responses entry settlement raised; suppressing (%s)",
+                type(settlement_exc).__name__,
+            )
+
+    async def _settle_entry_error(self, exc: BaseException) -> None:
+        """The provider request failed in ``__aenter__``: classify it."""
+        await self._settle_before_stream(exc, self._on_entry_error)
+
+    async def _settle_wrap_error(self, exc: BaseException) -> None:
+        """The provider stream opened; wrapping failed after establishment."""
+        await self._settle_before_stream(exc, self._on_error)
+
+    async def _release_before_entry(self) -> None:
+        """Give the reservation back for a manager that never dispatched."""
+        if self._pre_entry_settled:
+            return
+        self._pre_entry_settled = True
+        await self._on_abandoned_before_entry()
+
+    async def _close_failed_entry(self, exc: BaseException) -> None:
+        try:
+            await self._manager.__aexit__(type(exc), exc, exc.__traceback__)
+        except BaseException as close_exc:
+            logger.warning(
+                "Responses manager close raised after entry failed; suppressing (%s)",
+                type(close_exc).__name__,
+            )
+
+    async def __aenter__(self) -> _AsyncResponsesEnteredStreamWrapper:
+        async with self._lock:
+            if self._state == "closed":
+                raise RuntimeError("Responses stream manager is closed")
+            if self._state != "new":
+                raise RuntimeError("Responses stream manager is already entered")
+            self._state = "entering"
+            try:
+                source = await self._manager.__aenter__()
+            except BaseException as exc:
+                self._state = "closed"
+                await self._settle_entry_error(exc)
+                await self._close_failed_entry(exc)
+                raise
+            self._dispatched = True
+
+            try:
+                stream = self._wrapped_stream(source)
+                entered_stream = _AsyncResponsesEnteredStreamWrapper(stream)
+            except BaseException as exc:
+                self._state = "closed"
+                await self._settle_wrap_error(exc)
+                await self._close_failed_entry(exc)
+                raise
+
+            self._state = "entered"
+            return entered_stream
+
+    async def _finish(self, args: tuple[object, ...]) -> bool | None:
+        async with self._lock:
+            if self._state == "closed":
+                return False
+            # Cancellation releases the lock. Keep cleanup retryable until the
+            # provider manager has actually finished closing its connection.
+            self._state = "closing"
+            original_exception = bool(args and args[0] is not None)
+
+            settlement_error: BaseException | None = None
+            try:
+                if self._dispatched:
+                    await self._wrapped_stream()._settle()
+                else:
+                    await self._release_before_entry()
+            except BaseException as exc:
+                settlement_error = exc
+
+            try:
+                result = cast("bool | None", await self._manager.__aexit__(*args))
+            except BaseException as exc:
+                if original_exception:
+                    logger.warning(
+                        "Responses manager close raised during __aexit__; suppressing (%s)",
+                        type(exc).__name__,
+                    )
+                    result = False
+                else:
+                    raise
+            else:
+                self._state = "closed"
+
+            if settlement_error is not None:
+                if original_exception:
+                    logger.warning(
+                        "Responses stream settlement raised during __aexit__; suppressing (%s)",
+                        type(settlement_error).__name__,
+                    )
+                else:
+                    raise settlement_error
+            return result
+
+    async def close(self) -> None:
+        """Reconcile once (settle, or release if never entered) and close."""
+        await self._finish((None, None, None))
+
+    async def __aexit__(self, *args: object) -> bool | None:
+        return await self._finish(args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._manager, name)
+
+
+class _DeferredAsyncResponsesStreamManagerWrapper:
+    """Keep ``AsyncResponses.stream()`` synchronous while awaiting Solwyn I/O.
+
+    OpenAI's async resource returns an async context manager directly; it is
+    not itself an async method. Solwyn's budget check is asynchronous, so the
+    public proxy returns this small bridge and resolves the pipeline-produced
+    manager wrapper on first entry or explicit close.
+    """
+
+    def __init__(
+        self,
+        manager_factory: Callable[[], Awaitable[_AsyncResponsesStreamManagerWrapper]],
+    ) -> None:
+        self._manager_factory: (
+            Callable[[], Awaitable[_AsyncResponsesStreamManagerWrapper]] | None
+        ) = manager_factory
+        self._manager: _AsyncResponsesStreamManagerWrapper | None = None
+        self._lock = asyncio.Lock()
+        self._state = "new"
+
+    async def _resolve_locked(self) -> _AsyncResponsesStreamManagerWrapper:
+        if self._manager is None:
+            manager_factory = self._manager_factory
+            if manager_factory is None:
+                raise RuntimeError("Responses stream manager resolution lost its factory")
+            self._manager = await manager_factory()
+            self._manager_factory = None
+        return self._manager
+
+    async def __aenter__(self) -> _AsyncResponsesEnteredStreamWrapper:
+        async with self._lock:
+            if self._state == "closed":
+                raise RuntimeError("Responses stream manager is closed")
+            if self._state != "new":
+                raise RuntimeError("Responses stream manager is already entered")
+            manager = await self._resolve_locked()
+            try:
+                stream = await manager.__aenter__()
+            except BaseException:
+                self._state = "closed"
+                raise
+            self._state = "entered"
+            return stream
+
+    async def _finish_resolved(self, cleanup: Awaitable[Any]) -> Any:
+        manager = self._manager
+        if manager is None:
+            raise RuntimeError("Responses stream manager resolution was lost")
+        self._state = "closing"
+        try:
+            result = await cleanup
+        except BaseException:
+            if manager._cleanup_complete:
+                self._state = "closed"
+            raise
+        self._state = "closed" if manager._cleanup_complete else "closing"
+        return result
+
+    async def __aexit__(self, *args: object) -> bool | None:
+        async with self._lock:
+            if self._state == "closed":
+                return False
+            if self._manager is None:
+                self._state = "closed"
+                self._manager_factory = None
+                return False
+            return cast(
+                "bool | None",
+                await self._finish_resolved(self._manager.__aexit__(*args)),
+            )
+
+    async def close(self) -> None:
+        async with self._lock:
+            if self._state == "closed":
+                return
+            if self._manager is None:
+                self._state = "closed"
+                self._manager_factory = None
+                return
+            await self._finish_resolved(self._manager.close())
