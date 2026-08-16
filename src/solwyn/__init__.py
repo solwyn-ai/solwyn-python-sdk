@@ -33,7 +33,15 @@ from solwyn._routing import (
     RoutingRequest,
     SelectionPolicy,
 )
-from solwyn._run import RunContext, current_run, current_run_context, run, run_in_executor
+from solwyn._run import (
+    RunContext,
+    RunHandle,
+    current_run,
+    current_run_context,
+    run,
+    run_in_executor,
+    start_run,
+)
 from solwyn._surface_graph import SurfaceInspectionError
 from solwyn._types import CircuitState, FailoverReason, ProviderEntry, ProviderName
 from solwyn.circuit_breaker import CircuitBreakerState
@@ -90,10 +98,12 @@ __all__ = [
     "LatencyPolicy",
     "CostPolicy",
     "run",
+    "start_run",
     "run_in_executor",
     "current_run",
     "current_run_context",
     "RunContext",
+    "RunHandle",
     "TAGS_MAX_KEYS",
     "TAG_KEY_MAX_LENGTH",
     "TAG_VALUE_MAX_LENGTH",

@@ -1,4 +1,4 @@
-"""Agent-run scope: ``with solwyn.run("name"):``.
+"""Agent-run scopes for context managers and begin/end-shaped adapters.
 
 Binds an active run id/name plus optional explicit customer tags to a
 ``ContextVar`` for the duration of a scope. Cost events emitted inside the
@@ -14,6 +14,10 @@ inherit the active run reliably; use ``run_in_executor(...)`` or
 Do not open a run scope inside an async generator; async generator yields
 share the consumer's context and would leak the generator's run into the
 consumer body.
+
+``start_run(...)`` exposes the same scope machinery to framework adapters
+whose boundaries arrive as separate callbacks. Its ``RunHandle.finish()``
+must run in the same context that called ``start_run(...)``.
 
 This module never touches prompt or response content.
 """
@@ -264,13 +268,28 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         )
         return run_id
 
-    def _exit(self) -> None:
+    def _exit(self, *, require_same_context: bool = False) -> None:
         frames = _run_frames.get()
         if not frames:
+            if require_same_context:
+                raise RuntimeError(
+                    "RunHandle.finish() must be called in the same context where "
+                    "start_run() created it"
+                )
             return
         frame = frames[-1]
         if frame.scope_id != self._scope_id:
             raise RuntimeError("solwyn.run scopes must exit in LIFO order")
+        if require_same_context:
+            try:
+                _active_run.reset(frame.token)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "RunHandle.finish() must be called in the same context where "
+                    "start_run() created it"
+                ) from exc
+            _run_frames.set(frames[:-1])
+            return
         try:
             _active_run.reset(frame.token)
         except ValueError:
@@ -304,6 +323,43 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         tb: TracebackType | None,
     ) -> None:
         self._exit()
+
+
+class RunHandle:
+    """Begin/end-shaped run scope for framework adapter callbacks.
+
+    Handles have the same ContextVar-backed, nested, LIFO semantics as
+    ``with solwyn.run(...):``. Call :meth:`finish` in the same context that
+    called :func:`start_run`.
+    """
+
+    def __init__(self, scope: _RunScope, run_id: str) -> None:
+        self._scope = scope
+        self._run_id = run_id
+        self._finished = False
+
+    @property
+    def run_id(self) -> str:
+        """Return the stable id for this run scope."""
+        return self._run_id
+
+    def finish(self) -> None:
+        """Close this run scope and restore its parent context."""
+        if self._finished:
+            raise RuntimeError(f"run handle {self._run_id!r} already finished")
+        self._scope._exit(require_same_context=True)
+        self._finished = True
+
+
+def start_run(
+    name: str,
+    tags: Mapping[str, str] | None = None,
+    *,
+    inherit_tags: bool = True,
+) -> RunHandle:
+    """Open a run scope for begin/end-shaped framework callbacks."""
+    scope = _RunScope(name, tags, inherit_tags=inherit_tags)
+    return RunHandle(scope, scope._enter())
 
 
 def run_in_executor(
