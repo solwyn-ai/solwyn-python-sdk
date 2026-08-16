@@ -28,4 +28,23 @@ jobs:
           --upgrade-package langgraph
       - name: Install package, dev tools, and framework smoke dependencies
         run: uv sync --extra dev --group frameworks
-      - run: make test-frameworks
+      - run: make test-frameworks-core
+
+  crewai:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e450dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
+      - name: Resolve the latest CrewAI SDK
+        run: >-
+          uv lock
+          --upgrade-package crewai
+          --upgrade-package litellm
+      - name: Install package, dev tools, and CrewAI smoke dependencies
+        run: uv sync --extra dev --group frameworks-crewai
+      - run: make test-frameworks-crewai

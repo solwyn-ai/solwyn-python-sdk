@@ -31,6 +31,7 @@ bedrock = ["boto3>=1.34"]
 # are admitted by the OpenAI-dialect compatibility adapter. Bring your own SDK.
 together = ["together>=2.0"]
 langchain = ["langchain-core>=0.3"]
+crewai = ["crewai>=0.157.0"]
 all = ["solwyn[openai,anthropic,google,bedrock,together]"]
 dev = [
     "pytest>=8.0",
@@ -100,6 +101,21 @@ select = ["E", "F", "I", "UP", "B", "SIM", "S101"]
 python_version = "3.11"
 strict = true
 
+[tool.uv]
+# Current CrewAI constrains MCP/OpenAI below the current OpenAI Agents stack.
+# Resolve and execute their real-framework smoke environments independently so
+# neither drift lane silently downgrades the other.
+conflicts = [
+    [
+        { group = "frameworks" },
+        { group = "frameworks-crewai" },
+    ],
+    [
+        { group = "frameworks" },
+        { extra = "crewai" },
+    ],
+]
+
 [dependency-groups]
 dev = [
     "respx>=0.21",
@@ -108,4 +124,7 @@ frameworks = [
     "langchain-openai",
     "langgraph",
     "openai-agents",
+]
+frameworks-crewai = [
+    "crewai[litellm]>=0.157.0",
 ]

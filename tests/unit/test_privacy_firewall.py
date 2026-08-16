@@ -64,6 +64,11 @@ _INTEGRATION_CONTENT_NAMES = frozenset(
         "chunk",
         "text",
         "content",
+        "event",
+        "output",
+        "raw",
+        "error",
+        "description",
     }
 )
 _INTEGRATION_STRUCTURAL_LOG_NAMES = frozenset({"run_id", "parent_run_id"})
@@ -218,6 +223,12 @@ def violate(run_id):
     )
     positional_violations = _integration_privacy_violations(unsafe_positional_fixture)
     assert [item.rsplit(":", 1)[-1] for item in positional_violations] == ["positional"]
+
+    for crewai_name in ("event", "output", "raw", "error", "description"):
+        crewai_fixture = tmp_path / f"unsafe_crewai_{crewai_name}.py"
+        crewai_fixture.write_text(f"def violate({crewai_name}):\n    return {crewai_name}\n")
+        crewai_violations = _integration_privacy_violations(crewai_fixture)
+        assert [item.rsplit(":", 1)[-1] for item in crewai_violations] == [crewai_name]
 
 
 def _content_privileged_paths() -> list[Path]:
