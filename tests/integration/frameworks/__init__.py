@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 import respx
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, OpenAI
 
 CONTROL_PLANE_URL = "https://control-plane.framework-smoke.test"
 OPENAI_BASE_URL = "https://openai.framework-smoke.test/v1"
@@ -188,9 +188,12 @@ class FrameworkSmokeHarness:
         handoff: bool = False,
         function_tool: bool = False,
         transient_failure: bool = False,
+        model_calls: int = 1,
     ) -> None:
         if handoff and function_tool:
             raise ValueError("framework smoke supports one canned tool path at a time")
+        if model_calls < 1:
+            raise ValueError("framework smoke requires at least one model call")
         self.budget_checks: list[dict[str, Any]] = []
         self.confirms: list[dict[str, Any]] = []
         self.events: list[dict[str, Any]] = []
@@ -223,12 +226,15 @@ class FrameworkSmokeHarness:
                             headers={"content-type": "text/event-stream"},
                         )
                     )
-                provider_responses.append(
-                    httpx.Response(
-                        200,
-                        text=_chat_completion_stream(content=final_content),
-                        headers={"content-type": "text/event-stream"},
-                    )
+                provider_responses.extend(
+                    [
+                        httpx.Response(
+                            200,
+                            text=_chat_completion_stream(content=final_content),
+                            headers={"content-type": "text/event-stream"},
+                        )
+                        for _ in range(model_calls)
+                    ]
                 )
             else:
                 provider_responses = []
@@ -243,18 +249,21 @@ class FrameworkSmokeHarness:
                             ),
                         )
                     )
-                provider_responses.append(
-                    httpx.Response(
-                        200,
-                        json=_chat_completion(
-                            content=final_content,
-                            response_id=(
-                                "chatcmpl-framework-specialist"
-                                if handoff
-                                else "chatcmpl-framework-smoke"
+                provider_responses.extend(
+                    [
+                        httpx.Response(
+                            200,
+                            json=_chat_completion(
+                                content=final_content,
+                                response_id=(
+                                    "chatcmpl-framework-specialist"
+                                    if handoff
+                                    else "chatcmpl-framework-smoke"
+                                ),
                             ),
-                        ),
-                    )
+                        )
+                        for _ in range(model_calls)
+                    ]
                 )
             response_iterator = iter(provider_responses)
             self.model_route = router.post(f"{OPENAI_BASE_URL}/chat/completions").mock(
@@ -331,6 +340,51 @@ def make_offline_openai_client(router: respx.MockRouter) -> AsyncOpenAI:
         **common,
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(router.async_handler)),
     )
+
+
+def make_offline_openai_sync_client(router: respx.MockRouter) -> OpenAI:
+    """Build a real OpenAI client whose transport terminates at respx."""
+    common = {
+        "base_url": OPENAI_BASE_URL,
+        "api_key": "sk-provider-test",
+        "max_retries": 0,
+    }
+    if _openai_major() >= 3:
+        import httpx2
+
+        return OpenAI(
+            **common,
+            http_client=httpx2.Client(transport=_respx_httpx2_sync_transport(router)),
+        )
+    return OpenAI(
+        **common,
+        http_client=httpx.Client(transport=httpx.MockTransport(router.handler)),
+    )
+
+
+def _respx_httpx2_sync_transport(router: respx.MockRouter) -> Any:
+    """Bridge OpenAI 3's sync httpx2 transport into the respx router."""
+    import httpx2
+
+    class RespxHttpx2Transport(httpx2.BaseTransport):
+        def handle_request(self, request: httpx2.Request) -> httpx2.Response:
+            content = request.read()
+            routed_request = httpx.Request(
+                request.method,
+                str(request.url),
+                headers=list(request.headers.multi_items()),
+                content=content,
+            )
+            routed_response = router.handler(routed_request)
+            routed_content = routed_response.read()
+            return httpx2.Response(
+                routed_response.status_code,
+                headers=list(routed_response.headers.multi_items()),
+                content=routed_content,
+                request=request,
+            )
+
+    return RespxHttpx2Transport()
 
 
 def _respx_httpx2_transport(router: respx.MockRouter) -> Any:

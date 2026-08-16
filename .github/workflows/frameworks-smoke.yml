@@ -19,8 +19,13 @@ jobs:
         with:
           python-version: "3.12"
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9  # v9.0.0
-      - name: Resolve the latest OpenAI Agents SDK
-        run: uv lock --upgrade-package openai-agents
+      - name: Resolve the latest framework SDKs
+        run: >-
+          uv lock
+          --upgrade-package openai-agents
+          --upgrade-package langchain-core
+          --upgrade-package langchain-openai
+          --upgrade-package langgraph
       - name: Install package, dev tools, and framework smoke dependencies
         run: uv sync --extra dev --group frameworks
       - run: make test-frameworks
