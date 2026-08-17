@@ -501,6 +501,17 @@ class FailoverDirective(BaseModel):
     failover_tuning_allowed: bool
 
 
+class RunControlDirective(BaseModel):
+    """Versioned server instruction that stops one exact agent run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: Literal["1"]
+    action: Literal["terminate"]
+    agent_run_id: str = Field(..., max_length=AGENT_RUN_ID_MAX_LENGTH)
+    reason: str = Field(..., max_length=64)
+
+
 class BudgetCheckRequest(BaseModel):
     """Pre-flight budget check sent before an LLM call."""
 
@@ -574,6 +585,10 @@ class BudgetCheckRequest(BaseModel):
         default=None,
         description="Explicit opt-in to the version 1 server failover directive.",
     )
+    run_directive_version: Literal["1"] | None = Field(
+        default=None,
+        description="Explicit opt-in to version 1 server run-control directives.",
+    )
 
     @model_validator(mode="after")
     def _check_chain_hint_alignment(self) -> BudgetCheckRequest:
@@ -617,6 +632,10 @@ class BudgetCheckResponse(BaseModel):
     failover_directive: FailoverDirective | None = Field(
         default=None,
         description="Versioned server policy for SDK-managed failover.",
+    )
+    run_control: RunControlDirective | None = Field(
+        default=None,
+        description="Versioned server instruction for the exact requested run.",
     )
 
 
@@ -674,6 +693,10 @@ class LeaseGrantRequest(BaseModel):
     )
     estimated_input_tokens: int = Field(
         default=0, ge=0, description="Triggering call's input estimate (demand hint)"
+    )
+    run_directive_version: Literal["1"] | None = Field(
+        default=None,
+        description="Explicit opt-in to version 1 server run-control directives.",
     )
 
     @model_validator(mode="after")
@@ -749,6 +772,10 @@ class LeaseRenewRequest(BaseModel):
         default_factory=list,
         max_length=8,
         description="Failover models aligned element-for-element with fallback_providers",
+    )
+    run_directive_version: Literal["1"] | None = Field(
+        default=None,
+        description="Explicit opt-in to version 1 server run-control directives.",
     )
 
     @model_validator(mode="after")
@@ -872,6 +899,10 @@ class LeaseGrantResponse(BaseModel):
     budget_limit: float = Field(..., description="Total budget limit for current period in USD")
     current_usage: float = Field(..., description="Current spend in USD for this period")
     remaining_budget: float = Field(..., description="Remaining budget in USD for current period")
+    run_control: RunControlDirective | None = Field(
+        default=None,
+        description="Versioned server instruction for the exact leased run.",
+    )
 
 
 class BudgetConfirmRequest(BaseModel):

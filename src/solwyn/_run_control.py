@@ -107,7 +107,7 @@ def _active_group_termination_locked(
     *,
     source: TerminationSource | None = None,
 ) -> RunTermination | None:
-    """Return a winner only from the active group's current generation."""
+    """Return a winner only from the active group's current clear epoch."""
     group = _STATE.active_handles.get(run_id)
     if group is None:
         return None

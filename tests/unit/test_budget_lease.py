@@ -257,6 +257,7 @@ class TestLeaseAdmission:
         assert payload["fallback_models"] == ["claude-opus-4"]
         assert payload["fail_open"] is True
         assert payload["estimated_input_tokens"] == 100
+        assert payload["run_directive_version"] == "1"
         enforcer._http.close()
 
     def test_n_admissions_ride_one_grant_and_never_touch_the_check_endpoint(self) -> None:
@@ -819,6 +820,7 @@ class TestLeaseRenewal:
         assert payload["lease_id"] == "lease_1"
         assert payload["holder_id"] == "sdk_instance_1"
         assert payload["generation"] == 1
+        assert payload["run_directive_version"] == "1"
         assert state.generation == 2
         enforcer._http.close()
 
@@ -1066,6 +1068,10 @@ class TestLeaseRenewal:
 
         assert renew.call_count == 1
         assert check.call_count == 0
+        import json as _json
+
+        payload = _json.loads(renew.calls[0].request.read())
+        assert payload["run_directive_version"] == "1"
         state = enforcer._lease.state_for(RUN)
         assert state is not None
         assert state.generation == 2

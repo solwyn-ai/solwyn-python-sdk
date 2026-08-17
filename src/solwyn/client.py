@@ -76,6 +76,7 @@ from solwyn._run import _capture_run_context, _RunContextSnapshot
 from solwyn._run_control import (
     RunTermination,
     _acquire_termination_handle,
+    _postcheck_termination,
     _TerminationHandle,
     mark_terminated,
     run_termination,
@@ -143,10 +144,15 @@ def _budget_denial_error(
     if budget_period is None:
         budget_period = "unknown"
     if budget_period == "run_stopped" and agent_run_id is not None:
+        termination = run_termination(agent_run_id)
         return RunStoppedError(
             agent_run_id=agent_run_id,
-            reason="run_stopped",
-            source="server",
+            reason=(
+                termination.reason
+                if termination is not None
+                else (getattr(budget, "deny_reason", None) or "run_stopped")
+            ),
+            source=termination.source if termination is not None else "server",
         )
     return BudgetExceededError(
         project_id=budget.project_id,
@@ -370,7 +376,27 @@ def _postcheck_run_control(
             source="local_velocity",
         )
     termination = run_termination(run_id)
+    retained_only = termination is None
+    if retained_only:
+        termination = _postcheck_termination(run_id)
     if termination is None:
+        return
+    # A same-call server directive is already represented by the exact budget
+    # denial. If only active-stream state survived registry eviction, a server
+    # run-stop denial carries more precise attribution than that sibling's
+    # immutable winner. This post-check gate is for a stop behind an ALLOW.
+    if (
+        termination.source == "server"
+        and not budget.allowed
+        and getattr(budget, "denied_by_period", None) == "run_stopped"
+        and (
+            retained_only
+            or (
+                getattr(budget, "deny_source", None) == "server"
+                and getattr(budget, "deny_reason", None) == termination.reason
+            )
+        )
+    ):
         return
     client._budget.release_reservation(
         call_id,

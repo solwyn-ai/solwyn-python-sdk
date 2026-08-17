@@ -69,6 +69,7 @@ def test_clear_termination_if_matches_source_and_public_clear_removes_any_source
 
 @pytest.mark.unit
 def test_registry_evicts_least_recently_read_entry() -> None:
+    from solwyn import _run_control
     from solwyn._run_control import mark_terminated, run_termination
 
     for index in range(256):
@@ -80,6 +81,7 @@ def test_registry_evicts_least_recently_read_entry() -> None:
     assert run_termination("run_0") is not None
     assert run_termination("run_1") is None
     assert run_termination("run_256") is not None
+    assert set(_run_control._STATE.observed_at) == set(_run_control._STATE.terminations)
 
 
 @pytest.mark.unit
@@ -315,6 +317,70 @@ def test_matching_source_clear_excludes_obsolete_active_siblings() -> None:
 
 
 @pytest.mark.unit
+def test_ordered_server_allow_starts_a_clean_active_handle_generation() -> None:
+    from solwyn import _run_control
+    from solwyn._run_control import _acquire_termination_handle, mark_terminated
+
+    old = _acquire_termination_handle("run_stream")
+    with patch("solwyn._run_control.time.monotonic", return_value=1.0):
+        mark_terminated("run_stream", reason="old_stop", source="server")
+    for index in range(257):
+        mark_terminated(f"other_{index}", reason="later", source="server")
+
+    with _run_control._locked_registry():
+        newer_stop = _run_control._clear_server_termination_before_request_locked(
+            "run_stream",
+            request_epoch=2.0,
+        )
+    clean = _acquire_termination_handle("run_stream")
+
+    assert newer_stop is None
+    assert old.termination is not None
+    assert old.termination.reason == "old_stop"
+    assert clean.termination is None
+    clean.release()
+    old.release()
+
+
+@pytest.mark.unit
+def test_newer_stop_after_eviction_remains_authoritative_over_ordered_allow() -> None:
+    from solwyn import _run_control
+    from solwyn._run_control import (
+        _acquire_termination_handle,
+        mark_terminated,
+        run_termination,
+    )
+
+    old = _acquire_termination_handle("run_stream")
+    with patch("solwyn._run_control.time.monotonic", return_value=1.0):
+        mark_terminated("run_stream", reason="first_stop", source="server")
+    for index in range(257):
+        mark_terminated(f"other_{index}", reason="later", source="server")
+    assert run_termination("run_stream") is None
+
+    with patch("solwyn._run_control.time.monotonic", return_value=3.0):
+        mark_terminated("run_stream", reason="repeated_stop", source="server")
+    for index in range(257, 514):
+        mark_terminated(f"other_{index}", reason="later", source="server")
+    assert run_termination("run_stream") is None
+    assert _run_control._STATE.active_handles["run_stream"].observed_at == 3.0
+    with _run_control._locked_registry():
+        newer_stop = _run_control._clear_server_termination_before_request_locked(
+            "run_stream",
+            request_epoch=2.0,
+        )
+    still_stopped = _acquire_termination_handle("run_stream")
+
+    assert newer_stop is not None
+    assert newer_stop.reason == "first_stop"
+    assert newer_stop.at_monotonic == 3.0
+    assert still_stopped.termination is old.termination
+    still_stopped.release()
+    old.release()
+    assert "run_stream" not in _run_control._STATE.active_handles
+
+
+@pytest.mark.unit
 def test_current_run_terminated_uses_ambient_run_scope() -> None:
     from solwyn._run_control import current_run_terminated, mark_terminated
 
@@ -341,6 +407,7 @@ def test_fork_reset_preserves_entries_and_replaces_lock() -> None:
 
     assert _run_control.run_termination("run_a") is not None
     assert _run_control._STATE.lock is not old_lock
+    assert "run_a" in _run_control._STATE.observed_at
     assert _run_control._STATE.active_handles == {}
     assert handle.termination is not None
     assert handle.termination.reason == "run_stopped"

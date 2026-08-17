@@ -108,6 +108,100 @@ class TestAsyncCloudAllow:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
+    async def test_ordered_live_allow_keeps_old_handle_stopped_but_new_handle_clean(
+        self,
+    ) -> None:
+        from solwyn._run_control import _acquire_termination_handle, mark_terminated
+
+        enforcer = _make_legacy_async_enforcer()
+        enforcer._http.post = AsyncMock(return_value=_response(ALLOW_BUDGET_RESPONSE))
+        old = _acquire_termination_handle("run_server_allow")
+        mark_terminated("run_server_allow", reason="old_stop", source="server")
+
+        result = await enforcer.check_budget(
+            estimated_input_tokens=500,
+            estimated_output_bound=100,
+            model="gpt-5.5",
+            provider="openai",
+            agent_run_id="run_server_allow",
+            call_id="3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b",
+        )
+        new = _acquire_termination_handle("run_server_allow")
+
+        assert result.allowed is True
+        assert old.termination is not None
+        assert old.termination.reason == "old_stop"
+        assert new.termination is None
+        new.release()
+        old.release()
+        await enforcer.close()
+
+    @pytest.mark.parametrize("first_stop_before_request", [False, True])
+    @pytest.mark.asyncio
+    async def test_newer_stop_observation_survives_registry_eviction_during_check(
+        self,
+        first_stop_before_request: bool,
+    ) -> None:
+        from solwyn._run_control import (
+            _acquire_termination_handle,
+            clear_run_termination,
+            mark_terminated,
+        )
+
+        run_id = f"run_ordered_lru_async_{first_stop_before_request}"
+        churn_prefix = f"ordered_lru_async_{first_stop_before_request}"
+        enforcer = _make_legacy_async_enforcer()
+        old = _acquire_termination_handle(run_id)
+        new = None
+        if first_stop_before_request:
+            with patch("solwyn._run_control.time.monotonic", return_value=1.0):
+                mark_terminated(run_id, reason="first_stop", source="server")
+
+        async def allow_after_newer_stop(
+            *_args: object,
+            **_kwargs: object,
+        ) -> MagicMock:
+            with patch("solwyn._run_control.time.monotonic", return_value=3.0):
+                mark_terminated(run_id, reason="newer_stop", source="server")
+                for index in range(300):
+                    mark_terminated(
+                        f"{churn_prefix}_{index}",
+                        reason="unrelated",
+                        source="server",
+                    )
+            return _response(ALLOW_BUDGET_RESPONSE)
+
+        enforcer._http.post = AsyncMock(side_effect=allow_after_newer_stop)
+        try:
+            with patch("solwyn.budget.time.monotonic", return_value=2.0):
+                result = await enforcer.check_budget(
+                    estimated_input_tokens=500,
+                    estimated_output_bound=100,
+                    model="gpt-5.5",
+                    provider="openai",
+                    agent_run_id=run_id,
+                    call_id="3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b",
+                )
+            new = _acquire_termination_handle(run_id)
+
+            assert (result.allowed, result.denied_by_period, result.deny_reason) == (
+                False,
+                "run_stopped",
+                "first_stop" if first_stop_before_request else "newer_stop",
+            )
+            assert old.termination is not None
+            assert new.termination is old.termination
+        finally:
+            if new is not None:
+                new.release()
+            old.release()
+            clear_run_termination(run_id)
+            for index in range(300):
+                clear_run_termination(f"{churn_prefix}_{index}")
+            await enforcer.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
     async def test_tagged_run_uses_per_call_check_and_sends_tags(self) -> None:
         enforcer = _make_async_enforcer()
         mock_response = MagicMock()

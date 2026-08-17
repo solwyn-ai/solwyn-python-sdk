@@ -50,11 +50,13 @@ from solwyn._types import (
     CallStatus,
     FailoverDirective,
     LeaseGrantRequest,
+    LeaseGrantResponse,
     LeaseRenewRequest,
     LeaseSurrenderRequest,
     MediaUsage,
     MetadataEvent,
     ProviderName,
+    RunControlDirective,
     UntrackedSurfaceReport,
 )
 from solwyn.client import AsyncSolwyn, Solwyn
@@ -79,6 +81,7 @@ EXPECTED_CHECK_FIELDS = {
     "agent_run_id",
     "tags",
     "failover_directive_version",
+    "run_directive_version",
 }
 
 # Optional check fields the None-skipping serializer drops when unset. Runtime
@@ -89,6 +92,7 @@ _NONE_SKIPPED_CHECK_FIELDS = {
     "agent_run_id",
     "tags",
     "failover_directive_version",
+    "run_directive_version",
 }
 
 EXPECTED_CHECK_RESPONSE_FIELDS = {
@@ -102,7 +106,58 @@ EXPECTED_CHECK_RESPONSE_FIELDS = {
     "project_id",
     "price_hints",
     "failover_directive",
+    "run_control",
 }
+
+EXPECTED_LEASE_GRANT_REQUEST_FIELDS = {
+    "agent_run_id",
+    "holder_id",
+    "model",
+    "provider",
+    "fallback_providers",
+    "fallback_models",
+    "fail_open",
+    "estimated_input_tokens",
+    "run_directive_version",
+}
+
+EXPECTED_LEASE_RENEW_REQUEST_FIELDS = {
+    "lease_id",
+    "holder_id",
+    "generation",
+    "spent_tokens",
+    "reserved_tokens",
+    "uncounted_calls",
+    "uncounted_tokens",
+    "model",
+    "provider",
+    "fallback_providers",
+    "fallback_models",
+    "run_directive_version",
+}
+
+EXPECTED_LEASE_GRANT_RESPONSE_FIELDS = {
+    "eligible",
+    "ineligible_reason",
+    "allowed",
+    "denied_by_period",
+    "lease_id",
+    "generation",
+    "granted_tokens",
+    "refresh_interval_s",
+    "lease_length_s",
+    "headroom_share_tokens",
+    "posture",
+    "final_grant",
+    "project_id",
+    "mode",
+    "budget_limit",
+    "current_usage",
+    "remaining_budget",
+    "run_control",
+}
+
+EXPECTED_RUN_CONTROL_DIRECTIVE_FIELDS = {"version", "action", "agent_run_id", "reason"}
 
 EXPECTED_CONFIRM_FIELDS = {
     "reservation_id",
@@ -263,6 +318,12 @@ class TestWireModelFieldSets:
 
     def test_budget_check_response_field_set(self) -> None:
         assert set(BudgetCheckResponse.model_fields) == EXPECTED_CHECK_RESPONSE_FIELDS
+
+    def test_lease_and_run_control_field_sets(self) -> None:
+        assert set(LeaseGrantRequest.model_fields) == EXPECTED_LEASE_GRANT_REQUEST_FIELDS
+        assert set(LeaseRenewRequest.model_fields) == EXPECTED_LEASE_RENEW_REQUEST_FIELDS
+        assert set(LeaseGrantResponse.model_fields) == EXPECTED_LEASE_GRANT_RESPONSE_FIELDS
+        assert set(RunControlDirective.model_fields) == EXPECTED_RUN_CONTROL_DIRECTIVE_FIELDS
 
     def test_every_nullable_budget_check_response_field_is_optional(self) -> None:
         nullable_fields = {
@@ -502,6 +563,7 @@ class TestWireModelDumpSnapshots:
             "estimated_media",
             "tags",
             "failover_directive_version",
+            "run_directive_version",
         }
         assert dumped["agent_run_id"] == "run_abc"
 
@@ -564,6 +626,7 @@ class TestWireModelDumpSnapshots:
             "agent_run_id",
             "tags",
             "failover_directive_version",
+            "run_directive_version",
         }
         assert dumped["estimated_media"]["image_count"] == 2
         assert dumped["modality"] == "image"
