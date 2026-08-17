@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 import re
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -66,12 +65,14 @@ def test_opt_in_exposes_fresh_shared_plane_and_denial_client(pytester: pytest.Py
         import pytest
 
         from solwyn import BudgetExceededError, Solwyn
+        from solwyn.testing import FakeControlPlane
 
         pytest_plugins = ["solwyn.testing.pytest_plugin"]
         seen_planes = []
 
 
         def test_first_plane_is_recorded(solwyn_control_plane):
+            assert isinstance(solwyn_control_plane, FakeControlPlane)
             solwyn_control_plane.deny_next()
             seen_planes.append(solwyn_control_plane)
 
@@ -135,14 +136,55 @@ def test_client_fixture_closes_after_a_failing_test(
 
 
 @pytest.mark.unit
+def test_client_fixture_closes_when_a_dependent_fixture_fails_during_setup(
+    pytester: pytest.Pytester,
+    tmp_path: Path,
+) -> None:
+    close_marker = tmp_path / "client-closed-after-setup-error"
+    pytester.makepyfile(
+        f"""
+        from pathlib import Path
+
+        import pytest
+
+        pytest_plugins = ["solwyn.testing.pytest_plugin"]
+
+
+        @pytest.fixture
+        def failing_dependency(solwyn_test_client):
+            original_close = solwyn_test_client.close
+
+            def observed_close():
+                Path({str(close_marker)!r}).write_text("closed")
+                original_close()
+
+            solwyn_test_client.close = observed_close
+            raise RuntimeError("intentional setup failure")
+
+
+        def test_never_runs(failing_dependency):
+            raise AssertionError("test body should not run")
+        """
+    )
+
+    result = pytester.runpytest("-q", "-p", "no:asyncio")
+
+    result.assert_outcomes(errors=1)
+    assert close_marker.read_text() == "closed"
+
+
+@pytest.mark.unit
 def test_readme_testing_guide_has_complete_boundary_and_magic_table() -> None:
     section = _read_testing_section()
+    normalized = " ".join(section.split())
 
     assert (
         "The double never prices anything — the API owns pricing. "
         "Scripted denials test your handling, not your budget math."
-    ) in section
-    assert "transport failure → endpoint refusal → verdict → allow" in section
+    ) in normalized
+    assert "Solwyn closes only its own control-plane resources" in normalized
+    assert "close caller-owned provider clients" in normalized
+    assert "transport failure → endpoint refusal → verdict → allow" in normalized
     for magic_model in (
         "solwyn-test/deny",
         "solwyn-test/deny-alert",
@@ -152,6 +194,36 @@ def test_readme_testing_guide_has_complete_boundary_and_magic_table() -> None:
         "solwyn-test/lease-ineligible",
     ):
         assert f"`{magic_model}`" in section
+
+
+@pytest.mark.unit
+def test_readme_magic_table_distinguishes_configured_and_forced_modes() -> None:
+    rows = {
+        cells[1].strip(" `"): cells[2].strip()
+        for line in _read_testing_section().splitlines()
+        if line.startswith("| `solwyn-test/")
+        for cells in [line.split("|")]
+    }
+
+    for model in ("deny", "deny-tag", "deny-stopped", "runaway"):
+        description = rows[f"solwyn-test/{model}"].lower()
+        assert "configured mode" in description
+        assert "hard_deny" in description
+    assert "forces" in rows["solwyn-test/deny-alert"].lower()
+    assert "alert_only" in rows["solwyn-test/deny-alert"].lower()
+
+
+@pytest.mark.unit
+def test_readme_provider_recipes_own_and_close_real_provider_clients() -> None:
+    snippets = _read_testing_snippets()
+
+    for name in ("deny-handler", "fail-open", "game-day"):
+        recipe = snippets[name]
+        assert "with OpenAI(" in recipe
+        assert "as provider" in recipe
+        assert "plane.wrap(provider" in recipe
+        assert "assert not provider.is_closed()" in recipe
+        assert "assert provider.is_closed()" in recipe
 
 
 @pytest.mark.unit
@@ -171,54 +243,7 @@ def test_each_readme_recipe_runs_verbatim_in_an_isolated_test_module(
     snippet_name: str,
 ) -> None:
     snippet = _read_testing_snippets()[snippet_name]
-    provider_prelude = """
-        import sys
-        from types import ModuleType, SimpleNamespace
-
-        import httpx
-
-
-        class _Completions:
-            def __init__(self, base_url):
-                self.base_url = base_url
-
-            def create(self, **kwargs):
-                if self.base_url is None:
-                    raise AssertionError("provider dispatch reached the denial-only client")
-                response = httpx.post(f"{self.base_url}/chat/completions", json=kwargs)
-                response.raise_for_status()
-                payload = response.json()
-                return SimpleNamespace(
-                    choices=[
-                        SimpleNamespace(
-                            message=SimpleNamespace(
-                                content=payload["choices"][0]["message"]["content"]
-                            )
-                        )
-                    ],
-                    usage=SimpleNamespace(prompt_tokens=2, completion_tokens=1),
-                )
-
-
-        class _Chat:
-            def __init__(self, base_url):
-                self.completions = _Completions(base_url)
-
-
-        class OpenAI:
-            def __init__(self, *, api_key, base_url=None):
-                self.chat = _Chat(base_url)
-
-            def with_options(self, **kwargs):
-                return self
-
-
-        OpenAI.__module__ = "openai._client"
-        openai_module = ModuleType("openai")
-        openai_module.OpenAI = OpenAI
-        sys.modules["openai"] = openai_module
-    """
-    pytester.makepyfile(textwrap.dedent(provider_prelude) + "\n\n" + snippet)
+    pytester.makepyfile(snippet)
 
     result = pytester.runpytest("-q", "-p", "no:asyncio")
 
@@ -233,8 +258,11 @@ def test_testing_package_docstring_states_the_three_boundaries() -> None:
         sentence.strip() for sentence in (testing.__doc__ or "").split(".") if sentence.strip()
     ]
     assert len(sentences) == 3
-    assert "zero network" in sentences[0].lower()
+    assert "fakecontrolplane" in sentences[0].lower()
+    assert "control-plane traffic" in sentences[0].lower()
+    assert "without network i/o" in sentences[0].lower()
     assert "real wire shapes" in sentences[1].lower()
+    assert "does not mock provider traffic" in sentences[1].lower()
     assert "no pricing" in sentences[2].lower()
 
 

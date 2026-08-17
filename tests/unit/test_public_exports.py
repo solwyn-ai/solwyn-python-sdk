@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 
 import solwyn
@@ -81,27 +84,30 @@ def test_testing_package_exports_are_deliberately_pinned() -> None:
 
 
 @pytest.mark.unit
-def test_testing_package_import_does_not_activate_or_require_pytest(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import builtins
-    import importlib
-    import sys
+def test_testing_package_cold_import_does_not_activate_or_require_pytest() -> None:
+    script = """
+import builtins
+import sys
 
-    real_import = builtins.__import__
+real_import = builtins.__import__
 
-    def import_without_pytest(
-        name: str,
-        globals: dict[str, object] | None = None,
-        locals: dict[str, object] | None = None,
-        fromlist: tuple[str, ...] = (),
-        level: int = 0,
-    ) -> object:
-        if name == "pytest" or name.startswith("pytest."):
-            raise ModuleNotFoundError("pytest intentionally unavailable")
-        return real_import(name, globals, locals, fromlist, level)
+def import_without_pytest(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "pytest" or name.startswith("pytest."):
+        raise ModuleNotFoundError("pytest intentionally unavailable")
+    return real_import(name, globals, locals, fromlist, level)
 
-    monkeypatch.setattr(builtins, "__import__", import_without_pytest)
-    importlib.reload(testing)
+builtins.__import__ = import_without_pytest
+import solwyn.testing as testing
+assert testing.__all__ == ["FakeControlPlane", "MAGIC_MODELS"]
+assert "solwyn.testing.pytest_plugin" not in sys.modules
+assert not any(name == "pytest" or name.startswith("pytest.") for name in sys.modules)
+"""
 
-    assert "solwyn.testing.pytest_plugin" not in sys.modules
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
