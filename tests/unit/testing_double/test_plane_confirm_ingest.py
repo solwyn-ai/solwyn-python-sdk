@@ -11,7 +11,14 @@ import httpx
 import pytest
 
 from solwyn._token_details import TokenDetails
-from solwyn._types import BudgetConfirmRequest, MetadataEvent, UntrackedSurfaceReport
+from solwyn._types import (
+    BreakerStateReport,
+    BudgetConfirmRequest,
+    CircuitState,
+    MetadataEvent,
+    ProviderName,
+    UntrackedSurfaceReport,
+)
 from solwyn.reporter import MetadataReporter
 from solwyn.testing import FakeControlPlane
 
@@ -266,6 +273,18 @@ def test_invalid_ingest_event_returns_422_without_partial_recording() -> None:
         )
 
     assert response.status_code == 422
+    # Pin the detail entry structure (index-prefixed loc from parse_model_list's
+    # batch wrapping) rather than an isinstance(..., list) shape check, so a
+    # mutation that drops/garbles a field still fails this test.
+    assert response.json() == {
+        "detail": [
+            {
+                "type": "extra_forbidden",
+                "loc": [1, "prompt"],
+                "msg": "Extra inputs are not permitted",
+            }
+        ]
+    }
     assert "forbidden contract drift" not in response.text
     assert plane.ingested == []
 
@@ -274,12 +293,17 @@ def test_invalid_ingest_event_returns_422_without_partial_recording() -> None:
 def test_untracked_accepts_up_to_100_and_rejects_larger_batches() -> None:
     plane = FakeControlPlane()
     accepted = [_untracked(index=index) for index in range(2)]
-    too_many = [_untracked(index=index + 100) for index in range(101)]
+    at_cap = [_untracked(index=index + 200) for index in range(100)]
+    too_many = [_untracked(index=index + 400) for index in range(101)]
 
     with httpx.Client(transport=plane.transport) as client:
         response = client.post(
             f"{plane.api_url}/api/v1/untracked-surfaces",
             json=[report.model_dump(mode="json") for report in accepted],
+        )
+        boundary = client.post(
+            f"{plane.api_url}/api/v1/untracked-surfaces",
+            json=[report.model_dump(mode="json") for report in at_cap],
         )
         rejected = client.post(
             f"{plane.api_url}/api/v1/untracked-surfaces",
@@ -288,8 +312,15 @@ def test_untracked_accepts_up_to_100_and_rejects_larger_batches() -> None:
 
     assert response.status_code == 202
     assert response.json() == {"accepted": 2}
+    # Exact boundary: exactly 100 is still accepted...
+    assert boundary.status_code == 202
+    assert boundary.json() == {"accepted": 100}
+    # ...and one more tips it into the 400 batch-size refusal.
     assert rejected.status_code == 400
-    assert plane.untracked_reports == accepted
+    assert rejected.json() == {
+        "detail": "untracked surface batches may contain at most 100 reports"
+    }
+    assert plane.untracked_reports == accepted + at_cap
 
 
 @pytest.mark.unit
@@ -363,14 +394,15 @@ def test_reset_recording_preserves_ingest_and_untracked_replay_state() -> None:
 @pytest.mark.unit
 def test_breaker_report_is_a_recording_sink_and_health_is_available() -> None:
     plane = FakeControlPlane()
-    payload = {
-        "provider": "openai",
-        "state": "closed",
-        "failure_count": 0,
-        "success_count": 1,
-        "reported_at": datetime.now(UTC).isoformat(),
-        "sdk_instance_id": "sdk-fake",
-    }
+    report = BreakerStateReport(
+        provider=ProviderName.OPENAI,
+        state=CircuitState.CLOSED,
+        failure_count=0,
+        success_count=1,
+        reported_at=datetime.now(UTC),
+        sdk_instance_id="sdk-fake",
+    )
+    payload = report.model_dump(mode="json")
 
     with httpx.Client(transport=plane.transport) as client:
         response = client.post(
@@ -379,10 +411,11 @@ def test_breaker_report_is_a_recording_sink_and_health_is_available() -> None:
         )
         health = client.get(f"{plane.api_url}/health")
 
-    assert response.is_success
-    assert len(plane.breaker_reports) == 1
-    assert plane.breaker_reports[0]["provider"] == "openai"
-    assert plane.breaker_reports[0]["sdk_instance_id"] == "sdk-fake"
+    assert response.status_code == 204
+    # Pin every field of the recorded dict against the posted BreakerStateReport
+    # — a recording that silently drops a field must fail this, not just a
+    # substring check on two of six fields.
+    assert plane.breaker_reports == [report.model_dump(mode="json")]
     assert health.status_code == 200
 
 

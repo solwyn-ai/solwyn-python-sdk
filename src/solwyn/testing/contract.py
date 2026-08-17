@@ -333,6 +333,19 @@ def assert_confirm_contract(http: httpx.Client, api_key: str) -> None:
     neither = _post(http, api_key, _CONFIRM_PATH, _raw_confirm_base())
     _require_status(neither, 422, "confirm with missing settlement key")
 
+    unknown_reservation = _post(
+        http,
+        api_key,
+        _CONFIRM_PATH,
+        _confirm_payload(call_id=str(uuid.uuid4()), reservation_id="res_contract_unknown"),
+    )
+    _require_status(unknown_reservation, 404, "confirm with unknown reservation")
+    unknown_body = _object_json(unknown_reservation, "confirm with unknown reservation")
+    _require(
+        unknown_body.get("detail") == "Reservation not found or expired",
+        f"confirm with unknown reservation detail drifted: {unknown_body!r}",
+    )
+
 
 def _grant_payload(
     run_id: str,

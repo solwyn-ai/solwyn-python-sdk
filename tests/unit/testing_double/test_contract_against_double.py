@@ -77,7 +77,7 @@ def _run_lease_contract(
 
 @pytest.mark.unit
 def test_shared_check_contract_against_double() -> None:
-    plane = FakeControlPlane()
+    plane = FakeControlPlane(price_hints={"openai": 0.5})
     plane.deny_next(period="monthly")
     plane.deny_next(period="run_stopped")
     plane.deny_next(period="tag")
@@ -85,6 +85,15 @@ def test_shared_check_contract_against_double() -> None:
 
     with httpx.Client(transport=plane.transport, base_url=plane.api_url) as http:
         assert_check_contract(http, plane.api_key)
+
+    # Prove the pack sent the REQUEST payloads it claims to, not just that the
+    # double's scripted-verdict queue happened to return the right shape —
+    # today the double pops its denial queue ignoring bodies, so this is the
+    # only thing in the double lane that would catch a pack payload drift.
+    assert plane.checks[0].tags == {"contract_case": "monthly"}
+    assert plane.checks[1].agent_run_id == "contract-stopped-run"
+    assert plane.checks[2].tags == {"customer": "acme"}
+    assert plane.checks[3].agent_run_id == "contract-agent-run"
 
 
 @pytest.mark.unit
