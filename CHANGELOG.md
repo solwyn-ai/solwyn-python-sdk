@@ -71,6 +71,12 @@ derived from git tags (hatch-vcs).
   `SOLWYN_REPORT_UNTRACKED_SURFACES=false` to disable optional external
   advisory egress without changing local `on_unmetered`
   `warn`/`allow`/`raise` behavior.
+- **Content-free run velocity detection is configurable and bounded.** Seven
+  `velocity_*` / `SOLWYN_VELOCITY_*` settings control mode, repeat-size,
+  monotonic-growth, and rate-acceleration thresholds. Only repeat-size and
+  monotonic-growth are deny-eligible; rate acceleration remains advisory.
+  State contains scalar token counts, timestamps, and structural identifiers
+  only, with 128×64 detailed history and fixed-memory conservative suppression.
 - **Dashboard-stopped runs raise `RunStoppedError`.** The public exception is
   a `BudgetExceededError` subclass, so existing hard-deny handlers remain
   compatible. It identifies the stopped run, preserves the budget snapshot

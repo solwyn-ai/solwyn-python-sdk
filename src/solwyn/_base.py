@@ -61,6 +61,7 @@ from solwyn._types import (
     Modality,
     ProviderName,
 )
+from solwyn._velocity import VelocityConfig, VelocityMonitor
 from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
 from solwyn.config import SolwynConfig
 from solwyn.exceptions import (
@@ -903,6 +904,17 @@ class _SolwynBase:
         }
         self._failover_tuning_suppression_logged = False
         self._sdk_instance_id = str(uuid.uuid4())
+        self._velocity = VelocityMonitor(
+            VelocityConfig(
+                mode=config.velocity_mode,
+                repeat_count=config.velocity_repeat_count,
+                repeat_window_s=config.velocity_repeat_window_s,
+                growth_streak=config.velocity_growth_streak,
+                growth_factor=config.velocity_growth_factor,
+                accel_floor_per_min=config.velocity_accel_floor_per_min,
+                accel_factor=config.velocity_accel_factor,
+            )
+        )
         # Injectable routing policy: defaults to the health-only policy.
         # Swapping in LatencyPolicy/CostPolicy reorders candidates with ZERO
         # changes to dispatch / translation / budget.
@@ -1406,16 +1418,24 @@ class _SolwynBase:
         raise RuntimeError(f"unsupported surface kind in runtime resolver: {rule.kind.value}")
 
     def _reset_after_fork_in_child(self) -> None:
-        """Replace this client's locks in a forked child.
+        """Replace locks and clear process-local velocity state in a child.
 
-        Only the locks: latency windows, price hints, breakers, and the
-        control-plane breaker are plain state the child legitimately inherits
-        (the breakers repair their own internal locks via their own
-        registration).
+        Latency windows, price hints, breakers, and the control-plane breaker
+        are plain state the child legitimately inherits (the breakers repair
+        their own internal locks via their own registration). Run velocity is
+        process-local and starts empty with a fresh lock.
         """
         self._signal_lock = threading.Lock()
         self._breaker_lock = threading.Lock()
         self._guard_lock = threading.Lock()
+        self._velocity._reset_after_fork_in_child()
+
+    def _warn_velocity(self, run_id: str, flags: tuple[str, ...]) -> None:
+        """Warn for newly flagged run rules, with monitor-owned rate limiting."""
+        now = time.monotonic()
+        for rule in flags:
+            if self._velocity.should_warn(run_id, rule, now):
+                logger.warning("velocity.flagged: rule=%s run=%s", rule, run_id)
 
     def _new_circuit_breaker(self) -> CircuitBreaker:
         """Create a circuit breaker from the configured tuning + jitter."""
