@@ -1668,6 +1668,15 @@ class Solwyn(_SolwynBase):
         char_count = estimate_content_length(kwargs)
         est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
         estimated_media = spec.estimate_media(kwargs) if spec.estimate_media is not None else None
+        flags: tuple[str, ...] = ()
+        if agent_run[0] is not None and self._solwyn_config.velocity_mode != "off":
+            flags = self._solwyn_velocity.observe(
+                run_id=agent_run[0],
+                estimated_input_tokens=est_in,
+                model=requested_model,
+                now=time.monotonic(),
+            )
+            self._warn_velocity(agent_run[0], flags)
 
         # 2. Budget check against the primary (no failover chain to hint). The
         #    surface's estimated_media rides the check so the server prices a
@@ -1948,6 +1957,15 @@ class Solwyn(_SolwynBase):
             if char_count
             else 0
         )
+        flags: tuple[str, ...] = ()
+        if agent_run[0] is not None and self._solwyn_config.velocity_mode != "off":
+            flags = self._solwyn_velocity.observe(
+                run_id=agent_run[0],
+                estimated_input_tokens=est_in,
+                model=requested_model,
+                now=time.monotonic(),
+            )
+            self._warn_velocity(agent_run[0], flags)
 
         # 2. Check budget against the PRIMARY (we don't yet know who serves).
         if _surface == "responses":
@@ -3062,6 +3080,15 @@ class AsyncSolwyn(_SolwynBase):
         char_count = estimate_content_length(kwargs)
         est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
         estimated_media = spec.estimate_media(kwargs) if spec.estimate_media is not None else None
+        flags: tuple[str, ...] = ()
+        if agent_run[0] is not None and self._solwyn_config.velocity_mode != "off":
+            flags = self._solwyn_velocity.observe(
+                run_id=agent_run[0],
+                estimated_input_tokens=est_in,
+                model=requested_model,
+                now=time.monotonic(),
+            )
+            self._warn_velocity(agent_run[0], flags)
 
         budget = await self._solwyn_budget.check_budget(
             estimated_input_tokens=est_in,
@@ -3297,6 +3324,15 @@ class AsyncSolwyn(_SolwynBase):
             if char_count
             else 0
         )
+        flags: tuple[str, ...] = ()
+        if agent_run[0] is not None and self._solwyn_config.velocity_mode != "off":
+            flags = self._solwyn_velocity.observe(
+                run_id=agent_run[0],
+                estimated_input_tokens=est_in,
+                model=requested_model,
+                now=time.monotonic(),
+            )
+            self._warn_velocity(agent_run[0], flags)
 
         if _surface == "responses":
             fallback_providers: list[str] = []

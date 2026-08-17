@@ -639,11 +639,25 @@ except BudgetExceededError as e:
 | `budget_check_timeout` | `SOLWYN_BUDGET_CHECK_TIMEOUT` | `1.0` | Hot-path control-plane check/grant timeout in seconds |
 | `lease_enabled` | `SOLWYN_LEASE_ENABLED` | `True` | Use in-memory token leases for eligible run-scoped calls |
 | `lease_output_bound_default` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token allowance when no configured provider hop has an explicit cap |
+| `velocity_mode` | `SOLWYN_VELOCITY_MODE` | `warn` | Content-free run velocity posture: `off`, advisory `warn`, or local `deny` |
+| `velocity_repeat_count` | `SOLWYN_VELOCITY_REPEAT_COUNT` | `5` | Near-identical same-model calls required inside the repeat window |
+| `velocity_repeat_window_s` | `SOLWYN_VELOCITY_REPEAT_WINDOW_S` | `60.0` | Seconds retained for repeat-size matching |
+| `velocity_growth_streak` | `SOLWYN_VELOCITY_GROWTH_STREAK` | `8` | Strictly increasing calls required for monotonic-growth detection |
+| `velocity_growth_factor` | `SOLWYN_VELOCITY_GROWTH_FACTOR` | `3.0` | Required last/first input-size ratio for monotonic growth |
+| `velocity_accel_floor_per_min` | `SOLWYN_VELOCITY_ACCEL_FLOOR_PER_MIN` | `30` | Minimum current-window call count for rate acceleration (maximum `64`) |
+| `velocity_accel_factor` | `SOLWYN_VELOCITY_ACCEL_FACTOR` | `3.0` | Required current/prior one-minute call-count ratio |
 | `on_unmetered` | `SOLWYN_ON_UNMETERED` | `warn` | Handle untracked or unknown pre-call capabilities with `warn`, `raise`, or `allow` |
 | `report_untracked_surfaces` | `SOLWYN_REPORT_UNTRACKED_SURFACES` | `True` | Send optional structural advisory reports for unacknowledged `warn`/`allow` observations; set false to keep them local |
 | `acknowledge_untracked` | `SOLWYN_ACKNOWLEDGE_UNTRACKED` | empty | Exact terminal capability tokens; env format is comma-delimited |
 | `control_plane_failure_threshold` | `SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD` | `3` | Consecutive Solwyn API failures before local outage posture applies |
 | `control_plane_recovery_timeout` | `SOLWYN_CONTROL_PLANE_RECOVERY_TIMEOUT` | `30.0` | Seconds before probing the Solwyn API after its breaker opens |
+
+Velocity detection retains only scalar token counts, monotonic timestamps, and
+structural run/model identifiers—never prompts or responses. `repeat_size` and
+`monotonic_growth` are eligible to stop a run in `deny` mode;
+`rate_acceleration` is advisory only. Scalar history is fixed at 128 runs × 64
+observations, with fixed-memory conservative suppression under extreme identity
+churn so losing an exact identifier can suppress a signal but can never invent one.
 
 Failover and routing (`model=`, `fallback=`, `provider=`, `default_params=`, `selection_policy=`, and the failover tuning knobs) are configured in code only — they take client objects and policies, not strings. See [Provider Failover](https://docs.solwyn.ai/docs/sdk/guides/provider-failover) and [Configuration](https://docs.solwyn.ai/docs/sdk/guides/configuration).
 

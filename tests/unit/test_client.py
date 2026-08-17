@@ -2266,3 +2266,142 @@ class TestAsyncNonStreamingInterception:
 
         await solwyn._solwyn_budget._http.aclose()
         await solwyn._solwyn_reporter._http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Run-scoped velocity wiring
+# ---------------------------------------------------------------------------
+
+
+def _velocity_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        record for record in caplog.records if record.getMessage().startswith("velocity.flagged")
+    ]
+
+
+@pytest.mark.unit
+class TestVelocityWiring:
+    def test_run_scoped_repeat_loop_warns_exactly_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client)
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+
+        with caplog.at_level(logging.WARNING), solwyn_pkg.run("repeat-loop") as run_id:
+            for _ in range(5):
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "same-sized request"}],
+                )
+
+        records = _velocity_records(caplog)
+        assert len(records) == 1
+        assert records[0].msg == "velocity.flagged: rule=%s run=%s"
+        assert records[0].args == ("repeat_size", run_id)
+        solwyn.close()
+
+    def test_off_mode_never_feeds_monitor_or_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, velocity_mode="off")
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+        solwyn._solwyn_velocity.observe = MagicMock(wraps=solwyn._solwyn_velocity.observe)
+
+        with caplog.at_level(logging.WARNING), solwyn_pkg.run("off-loop"):
+            for _ in range(5):
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "same-sized request"}],
+                )
+
+        solwyn._solwyn_velocity.observe.assert_not_called()
+        assert _velocity_records(caplog) == []
+        solwyn.close()
+
+    def test_unscoped_calls_never_feed_monitor(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client)
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+        solwyn._solwyn_velocity.observe = MagicMock(wraps=solwyn._solwyn_velocity.observe)
+
+        solwyn.chat.completions.create(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "same-sized request"}],
+        )
+
+        solwyn._solwyn_velocity.observe.assert_not_called()
+        solwyn.close()
+
+    def test_sync_media_call_feeds_same_run_monitor(self) -> None:
+        client, _ = _mock_openai_client()
+        client.embeddings.create.return_value = SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=10)
+        )
+        solwyn = _make_solwyn(client)
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+        solwyn._solwyn_velocity.observe = MagicMock(return_value=())
+
+        with solwyn_pkg.run("sync-media") as run_id:
+            solwyn.embeddings.create(model="text-embedding-3-small", input="hello")
+
+        solwyn._solwyn_velocity.observe.assert_called_once()
+        observed = solwyn._solwyn_velocity.observe.call_args.kwargs
+        assert observed["run_id"] == run_id
+        assert observed["model"] == "text-embedding-3-small"
+        assert isinstance(observed["estimated_input_tokens"], int)
+        assert isinstance(observed["now"], float)
+        solwyn.close()
+
+    def test_base_fork_reset_clears_velocity_monitor(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client)
+        solwyn._solwyn_velocity.observe(
+            run_id="parent-run",
+            estimated_input_tokens=1000,
+            model="gpt-5.5",
+            now=0.0,
+        )
+        old_lock = solwyn._solwyn_velocity._lock
+
+        solwyn._reset_after_fork_in_child()
+
+        assert solwyn._solwyn_velocity.run_count() == 0
+        assert solwyn._solwyn_velocity._lock is not old_lock
+        solwyn.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_velocity_async_chat_and_media_calls_feed_same_run_monitor() -> None:
+    client, response = _mock_openai_client()
+    client.chat.completions.create = AsyncMockFn(return_value=response)
+    client.embeddings.create = AsyncMockFn(
+        return_value=SimpleNamespace(usage=SimpleNamespace(prompt_tokens=10))
+    )
+    solwyn = _make_async_solwyn(client)
+    solwyn._solwyn_budget.check_budget = AsyncMockFn(return_value=_allow_budget_result())
+    solwyn._solwyn_reporter.report = MagicMock()
+    solwyn._solwyn_velocity.observe = MagicMock(return_value=())
+
+    async with solwyn_pkg.run("async-chat-media") as run_id:
+        await solwyn.chat.completions.create(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        await solwyn.embeddings.create(model="text-embedding-3-small", input="hello")
+
+    assert solwyn._solwyn_velocity.observe.call_count == 2
+    assert [call.kwargs["run_id"] for call in solwyn._solwyn_velocity.observe.call_args_list] == [
+        run_id,
+        run_id,
+    ]
+    assert [call.kwargs["model"] for call in solwyn._solwyn_velocity.observe.call_args_list] == [
+        "gpt-5.5",
+        "text-embedding-3-small",
+    ]
+    await solwyn._solwyn_budget._http.aclose()
+    await solwyn._solwyn_reporter._http.aclose()
