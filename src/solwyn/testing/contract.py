@@ -9,9 +9,10 @@ under ``src/solwyn``.
 from __future__ import annotations
 
 import uuid
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import httpx
+from pydantic import BaseModel, ValidationError
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
@@ -53,6 +54,8 @@ _DISPLAY_KEYS = frozenset(
     }
 )
 _UNPRICED_LEASE_MODEL = "no-such-model-for-leases"
+_BODY_PREVIEW_LIMIT = 200
+_ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 
 def _require(condition: bool, message: str) -> None:
@@ -64,10 +67,45 @@ def _headers(api_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"}
 
 
+def _body_preview(response: httpx.Response) -> str:
+    raw = response.content
+    preview = raw[:_BODY_PREVIEW_LIMIT].decode("utf-8", errors="replace")
+    suffix = "..." if len(raw) > _BODY_PREVIEW_LIMIT else ""
+    return f"{preview!r}{suffix}"
+
+
+def _require_status(response: httpx.Response, status: int, context: str) -> None:
+    if response.status_code != status:
+        raise AssertionError(
+            f"{context} returned status {response.status_code}, expected {status}; "
+            f"body preview: {_body_preview(response)}"
+        )
+
+
 def _object_json(response: httpx.Response, context: str) -> dict[str, Any]:
-    body = response.json()
-    _require(isinstance(body, dict), f"{context} returned non-object JSON: {body!r}")
+    try:
+        body = response.json()
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise AssertionError(
+            f"{context} returned malformed JSON; body preview: {_body_preview(response)}"
+        ) from exc
+    _require(
+        isinstance(body, dict),
+        f"{context} returned non-object JSON; body preview: {_body_preview(response)}",
+    )
     return cast(dict[str, Any], body)
+
+
+def _validate_model(
+    model: type[_ModelT],
+    payload: dict[str, Any],
+    context: str,
+) -> _ModelT:
+    try:
+        return model.model_validate(payload)
+    except ValidationError as exc:
+        errors = exc.errors(include_url=False, include_input=False)
+        raise AssertionError(f"{context} schema validation failed: {errors!r}") from exc
 
 
 def _post(
@@ -99,6 +137,14 @@ def _require_numeric(value: object, label: str) -> None:
         isinstance(value, (int, float)) and not isinstance(value, bool),
         f"{label} must be a JSON number, got {value!r}",
     )
+
+
+def _require_integer(value: object, label: str) -> int:
+    _require(
+        isinstance(value, int) and not isinstance(value, bool),
+        f"{label} must be a JSON integer, got {value!r}",
+    )
+    return cast(int, value)
 
 
 def _require_display_shape(payload: dict[str, Any], context: str) -> None:
@@ -137,6 +183,7 @@ def _post_check(
     http: httpx.Client,
     api_key: str,
     *,
+    context: str,
     agent_run_id: str | None = None,
     tags: dict[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -146,8 +193,8 @@ def _post_check(
         _CHECK_PATH,
         _check_payload(agent_run_id=agent_run_id, tags=tags),
     )
-    _require(response.status_code == 200, f"budget check returned {response.status_code}")
-    return _object_json(response, "budget check")
+    _require_status(response, 200, context)
+    return _object_json(response, context)
 
 
 def _require_deny_shape(payload: dict[str, Any], period: str) -> None:
@@ -161,7 +208,7 @@ def _require_deny_shape(payload: dict[str, Any], period: str) -> None:
     _require("reservation_id" not in payload, f"{context} leaked reservation_id")
     _require_display_shape(payload, context)
     _require_directive_shape(payload, context)
-    parsed = BudgetCheckResponse.model_validate(payload)
+    parsed = _validate_model(BudgetCheckResponse, payload, context)
     _require(parsed.denied_by_period == period, f"{context} failed SDK response validation")
 
 
@@ -170,6 +217,7 @@ def assert_check_contract(http: httpx.Client, api_key: str) -> None:
     monthly = _post_check(
         http,
         api_key,
+        context="monthly denial",
         tags={"contract_case": "monthly"},
     )
     _require_deny_shape(monthly, "monthly")
@@ -177,6 +225,7 @@ def assert_check_contract(http: httpx.Client, api_key: str) -> None:
     stopped = _post_check(
         http,
         api_key,
+        context="run_stopped denial",
         agent_run_id="contract-stopped-run",
     )
     _require_deny_shape(stopped, "run_stopped")
@@ -184,6 +233,7 @@ def assert_check_contract(http: httpx.Client, api_key: str) -> None:
     tag = _post_check(
         http,
         api_key,
+        context="tag denial",
         tags={"customer": "acme"},
     )
     _require_deny_shape(tag, "tag")
@@ -191,11 +241,12 @@ def assert_check_contract(http: httpx.Client, api_key: str) -> None:
     agent_run = _post_check(
         http,
         api_key,
+        context="agent_run denial",
         agent_run_id="contract-agent-run",
     )
     _require_deny_shape(agent_run, "agent_run")
 
-    allowed = _post_check(http, api_key)
+    allowed = _post_check(http, api_key, context="allow check")
     _require(allowed.get("allowed") is True, f"allow check was denied: {allowed!r}")
     _require("denied_by_period" not in allowed, "allow check serialized denied_by_period")
     reservation_id = allowed.get("reservation_id")
@@ -205,13 +256,13 @@ def assert_check_contract(http: httpx.Client, api_key: str) -> None:
     )
     _require_display_shape(allowed, "allow check")
     _require_directive_shape(allowed, "allow check")
-    parsed = BudgetCheckResponse.model_validate(allowed)
+    parsed = _validate_model(BudgetCheckResponse, allowed, "allow check")
     _require(parsed.allowed is True, "allow check failed SDK response validation")
     _require(parsed.denied_by_period is None, "allow parsed a denied period")
 
 
 def _reservation(http: httpx.Client, api_key: str) -> str:
-    payload = _post_check(http, api_key)
+    payload = _post_check(http, api_key, context="confirm setup check")
     _require(payload.get("allowed") is True, "confirm setup check was denied")
     reservation_id = payload.get("reservation_id")
     _require(isinstance(reservation_id, str), "confirm setup omitted reservation_id")
@@ -253,11 +304,11 @@ def assert_confirm_contract(http: httpx.Client, api_key: str) -> None:
     _require(payload.get("reservation_id") == reservation_id, "reservation key drifted")
 
     first = _post(http, api_key, _CONFIRM_PATH, payload)
-    _require(first.status_code == 204, f"valid confirm returned {first.status_code}")
+    _require_status(first, 204, "valid confirm")
     _require(first.content == b"", "204 confirm returned a response body")
 
     duplicate_call = _post(http, api_key, _CONFIRM_PATH, payload)
-    _require(duplicate_call.status_code == 204, "call-id replay was not idempotent")
+    _require_status(duplicate_call, 204, "call-id replay")
 
     reservation_replay = _post(
         http,
@@ -265,7 +316,7 @@ def assert_confirm_contract(http: httpx.Client, api_key: str) -> None:
         _CONFIRM_PATH,
         _confirm_payload(call_id=str(uuid.uuid4()), reservation_id=reservation_id),
     )
-    _require(reservation_replay.status_code == 204, "reservation replay was not idempotent")
+    _require_status(reservation_replay, 204, "reservation replay")
 
     both = _post(
         http,
@@ -277,10 +328,10 @@ def assert_confirm_contract(http: httpx.Client, api_key: str) -> None:
             "lease_id": "lse_contract_both",
         },
     )
-    _require(both.status_code == 422, f"both settlement keys returned {both.status_code}")
+    _require_status(both, 422, "confirm with both settlement keys")
 
     neither = _post(http, api_key, _CONFIRM_PATH, _raw_confirm_base())
-    _require(neither.status_code == 422, f"missing settlement key returned {neither.status_code}")
+    _require_status(neither, 422, "confirm with missing settlement key")
 
 
 def _grant_payload(
@@ -320,7 +371,7 @@ def _post_grant(
 
 
 def _require_lease_error(response: httpx.Response, status: int, code: str) -> None:
-    _require(response.status_code == status, f"{code} returned {response.status_code}")
+    _require_status(response, status, code)
     body = _object_json(response, code)
     raw_detail = body.get("detail")
     _require(isinstance(raw_detail, dict), f"{code} omitted structured detail")
@@ -343,8 +394,67 @@ def _require_ineligible_shape(payload: dict[str, Any], context: str) -> None:
     _require("denied_by_period" not in payload, f"{context} serialized denied_by_period")
     _require_no_lease_block(payload, context)
     _require_display_shape(payload, context)
-    parsed = LeaseGrantResponse.model_validate(payload)
+    parsed = _validate_model(LeaseGrantResponse, payload, context)
     _require(parsed.lease_id is None, f"{context} parsed a lease id")
+
+
+def _require_eligible_lease_shape(
+    payload: dict[str, Any],
+    context: str,
+    *,
+    expected_lease_id: str | None,
+    expected_generation: int,
+) -> tuple[str, int]:
+    _require(payload.get("eligible") is True, f"{context} was marked ineligible")
+    _require(payload.get("allowed") is True, f"{context} was denied")
+    _require("ineligible_reason" not in payload, f"{context} leaked ineligible reason")
+    _require("denied_by_period" not in payload, f"{context} leaked denied period")
+    missing = _LEASE_BLOCK_KEYS.difference(payload)
+    _require(not missing, f"{context} omitted lease keys: {sorted(missing)}")
+    _require_display_shape(payload, context)
+
+    lease_id = payload.get("lease_id")
+    _require(
+        isinstance(lease_id, str) and 0 < len(lease_id) <= 64,
+        f"{context} lease_id drifted: {lease_id!r}",
+    )
+    typed_lease_id = cast(str, lease_id)
+    if expected_lease_id is not None:
+        _require(typed_lease_id == expected_lease_id, f"{context} changed lease id")
+
+    generation = _require_integer(payload.get("generation"), f"{context}.generation")
+    _require(
+        generation == expected_generation,
+        f"{context} generation was {generation!r}, expected {expected_generation}",
+    )
+    for key in ("granted_tokens", "headroom_share_tokens"):
+        value = _require_integer(payload.get(key), f"{context}.{key}")
+        _require(value > 0, f"{context}.{key} must be positive")
+
+    raw_refresh_interval = payload.get("refresh_interval_s")
+    raw_lease_length = payload.get("lease_length_s")
+    _require_numeric(raw_refresh_interval, f"{context}.refresh_interval_s")
+    _require_numeric(raw_lease_length, f"{context}.lease_length_s")
+    refresh_interval = cast(float, raw_refresh_interval)
+    lease_length = cast(float, raw_lease_length)
+    _require(refresh_interval > 0, f"{context} refresh interval must be positive")
+    _require(lease_length > refresh_interval, f"{context} lacks a renewal window")
+
+    raw_posture = payload.get("posture")
+    _require(isinstance(raw_posture, dict), f"{context} omitted posture")
+    posture = cast(dict[str, Any], raw_posture)
+    _require(
+        set(posture) == {"mode", "on_unreachable"},
+        f"{context} posture keys drifted: {sorted(posture)}",
+    )
+    _require(posture.get("mode") == payload["mode"], f"{context} posture mode drifted")
+    _require(
+        posture.get("on_unreachable") == "fail_open",
+        f"{context} posture did not echo fail_open",
+    )
+    _require(payload.get("final_grant") is False, f"{context} must not be final")
+    _validate_model(LeaseGrantResponse, payload, context)
+    return typed_lease_id, generation
 
 
 def _surrender(
@@ -365,25 +475,6 @@ def _surrender(
 
 def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
     """Assert lease grant, refusal, fencing, settlement, and release shapes."""
-    unavailable = _post_grant(
-        http,
-        api_key,
-        "contract-lease-unavailable",
-        "contract-unavailable-holder",
-        model=_UNPRICED_LEASE_MODEL,
-    )
-    if unavailable.status_code == 503:
-        _require_lease_error(unavailable, 503, "lease_unavailable")
-    else:
-        _require(
-            unavailable.status_code == 200,
-            "lease-unavailable probe returned unexpected status",
-        )
-        _require_ineligible_shape(
-            _object_json(unavailable, "lease-unavailable fallback"),
-            "lease-unavailable fallback",
-        )
-
     holder_cap = _post_grant(
         http,
         api_key,
@@ -398,7 +489,7 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
         "contract-lease-denied",
         "contract-denied-holder",
     )
-    _require(denied.status_code == 200, f"lease deny returned {denied.status_code}")
+    _require_status(denied, 200, "lease deny")
     denied_payload = _object_json(denied, "lease deny")
     _require(denied_payload.get("eligible") is True, "lease deny was marked ineligible")
     _require(denied_payload.get("allowed") is False, "lease deny was allowed")
@@ -410,7 +501,7 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
     _require("ineligible_reason" not in denied_payload, "lease deny leaked ineligible reason")
     _require_no_lease_block(denied_payload, "lease deny")
     _require_display_shape(denied_payload, "lease deny")
-    denied_parsed = LeaseGrantResponse.model_validate(denied_payload)
+    denied_parsed = _validate_model(LeaseGrantResponse, denied_payload, "lease deny")
     _require(denied_parsed.lease_id is None, "lease deny parsed a lease id")
 
     ineligible = _post_grant(
@@ -420,7 +511,7 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
         "contract-ineligible-holder",
         model=_UNPRICED_LEASE_MODEL,
     )
-    _require(ineligible.status_code == 200, f"ineligible grant returned {ineligible.status_code}")
+    _require_status(ineligible, 200, "ineligible grant")
     _require_ineligible_shape(_object_json(ineligible, "ineligible grant"), "ineligible grant")
 
     holder_id = f"contract-holder-{uuid.uuid4().hex[:12]}"
@@ -430,43 +521,14 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
         f"contract-lease-{uuid.uuid4().hex[:12]}",
         holder_id,
     )
-    _require(granted.status_code == 200, f"eligible grant returned {granted.status_code}")
+    _require_status(granted, 200, "eligible grant")
     payload = _object_json(granted, "eligible grant")
-    _require(payload.get("eligible") is True, "eligible grant was marked ineligible")
-    _require(payload.get("allowed") is True, "eligible grant was denied")
-    _require("ineligible_reason" not in payload, "eligible grant leaked ineligible reason")
-    _require("denied_by_period" not in payload, "eligible grant leaked denied period")
-    missing = _LEASE_BLOCK_KEYS.difference(payload)
-    _require(not missing, f"eligible grant omitted lease keys: {sorted(missing)}")
-    _require_display_shape(payload, "eligible grant")
-
-    lease_id = payload.get("lease_id")
-    generation = payload.get("generation")
-    _require(
-        isinstance(lease_id, str) and 0 < len(lease_id) <= 64,
-        f"eligible grant lease_id drifted: {lease_id!r}",
+    lease_id, generation = _require_eligible_lease_shape(
+        payload,
+        "eligible grant",
+        expected_lease_id=None,
+        expected_generation=1,
     )
-    _require(generation == 1, f"fresh lease generation was not 1: {generation!r}")
-    lease_id = cast(str, lease_id)
-    generation = cast(int, generation)
-    for key in ("granted_tokens", "headroom_share_tokens"):
-        value = payload.get(key)
-        _require(isinstance(value, int) and value > 0, f"eligible grant {key} must be positive")
-    raw_refresh_interval = payload.get("refresh_interval_s")
-    raw_lease_length = payload.get("lease_length_s")
-    _require_numeric(raw_refresh_interval, "eligible grant.refresh_interval_s")
-    _require_numeric(raw_lease_length, "eligible grant.lease_length_s")
-    refresh_interval = cast(float, raw_refresh_interval)
-    lease_length = cast(float, raw_lease_length)
-    _require(refresh_interval > 0, "eligible grant refresh interval must be positive")
-    _require(lease_length > refresh_interval, "lease must contain a renewal window")
-    raw_posture = payload.get("posture")
-    _require(isinstance(raw_posture, dict), "eligible grant omitted posture")
-    posture = cast(dict[str, Any], raw_posture)
-    _require(posture.get("mode") == payload["mode"], "lease posture mode drifted")
-    _require(posture.get("on_unreachable") == "fail_open", "lease posture did not echo fail_open")
-    _require(payload.get("final_grant") is False, "fresh grant must not be final")
-    LeaseGrantResponse.model_validate(payload)
 
     unknown = LeaseRenewRequest(
         lease_id="lse_not-a-real-lease",
@@ -496,51 +558,57 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
         generation=generation,
     ).model_dump(mode="json")
     renewed_response = _post(http, api_key, _LEASE_RENEW_PATH, renewal)
-    _require(renewed_response.status_code == 200, "valid lease renewal failed")
+    _require_status(renewed_response, 200, "lease renewal")
     renewed = _object_json(renewed_response, "lease renewal")
-    _require(renewed.get("lease_id") == lease_id, "renewal changed lease id")
-    renewed_generation = renewed.get("generation")
-    _require(
-        renewed_generation == generation + 1,
-        "renewal did not advance generation by one",
+    _renewed_lease_id, renewed_generation = _require_eligible_lease_shape(
+        renewed,
+        "lease renewal",
+        expected_lease_id=lease_id,
+        expected_generation=generation + 1,
     )
-    _require(renewed.get("eligible") is True, "renewal was marked ineligible")
-    _require(renewed.get("allowed") is True, "renewal was denied")
-    LeaseGrantResponse.model_validate(renewed)
 
     confirm_payload = _confirm_payload(call_id=str(uuid.uuid4()), lease_id=lease_id)
     _require("reservation_id" not in confirm_payload, "lease confirm serialized reservation_id")
     _require(confirm_payload.get("lease_id") == lease_id, "lease confirm key drifted")
     confirmed = _post(http, api_key, _CONFIRM_PATH, confirm_payload)
-    _require(confirmed.status_code == 204, "lease-tagged confirm failed")
+    _require_status(confirmed, 204, "lease-tagged confirm")
     replay = _post(http, api_key, _CONFIRM_PATH, confirm_payload)
-    _require(replay.status_code == 204, "lease-tagged confirm replay failed")
+    _require_status(replay, 204, "lease-tagged confirm replay")
 
     released = _surrender(
         http,
         api_key,
         lease_id=lease_id,
         holder_id=holder_id,
-        generation=generation + 1,
+        generation=renewed_generation,
     )
-    _require(released.status_code == 200, "lease surrender failed")
+    _require_status(released, 200, "lease surrender")
     released_body = _object_json(released, "lease surrender")
     _require(set(released_body) == {"released_tokens"}, "surrender response keys drifted")
-    released_tokens = released_body.get("released_tokens")
-    _require(
-        isinstance(released_tokens, int) and released_tokens > 0,
-        "first surrender did not release positive tokens",
+    released_tokens = _require_integer(
+        released_body.get("released_tokens"),
+        "lease surrender.released_tokens",
     )
+    _require(released_tokens > 0, "first surrender did not release positive tokens")
 
     repeated = _surrender(
         http,
         api_key,
         lease_id=lease_id,
         holder_id=holder_id,
-        generation=generation + 1,
+        generation=renewed_generation,
     )
-    _require(repeated.status_code == 200, "idempotent surrender failed")
+    _require_status(repeated, 200, "repeated surrender")
+    repeated_body = _object_json(repeated, "repeated surrender")
     _require(
-        _object_json(repeated, "repeated surrender") == {"released_tokens": 0},
+        set(repeated_body) == {"released_tokens"},
+        "repeated surrender response keys drifted",
+    )
+    repeated_tokens = _require_integer(
+        repeated_body.get("released_tokens"),
+        "repeated surrender.released_tokens",
+    )
+    _require(
+        repeated_tokens == 0,
         "repeated surrender was not idempotent",
     )

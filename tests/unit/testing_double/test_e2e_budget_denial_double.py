@@ -40,12 +40,14 @@ def test_denial_raises_before_provider_dispatch_without_provider_network() -> No
     )
     client = plane.wrap(_OpenAIShape(), lease_enabled=False)
 
-    with pytest.raises(BudgetExceededError) as captured:
-        client.chat.completions.create(
-            model="solwyn-test/deny",
-            messages=[],
-        )
-    client.close()
+    try:
+        with pytest.raises(BudgetExceededError) as captured:
+            client.chat.completions.create(
+                model="solwyn-test/deny",
+                messages=[],
+            )
+    finally:
+        client.close()
 
     assert captured.value.budget_limit == pytest.approx(0.05)
     assert captured.value.current_usage > captured.value.budget_limit

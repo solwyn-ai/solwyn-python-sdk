@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from contextlib import closing
 from threading import Event
 from unittest.mock import patch
 
@@ -93,19 +94,20 @@ def _confirm(reservation_id: str) -> BudgetConfirmRequest:
 def test_deny_outage_recovery_preserves_then_clears_sticky_run_denial() -> None:
     plane = FakeControlPlane(budget_limit=5.0, current_usage=6.0, remaining_budget=-1.0)
     plane.deny_run("gameday-sticky-run")
-    enforcer = _legacy_enforcer(plane)
+    with closing(_legacy_enforcer(plane)) as enforcer:
+        denied = _legacy_check(enforcer, agent_run_id="gameday-sticky-run")
+        plane.clear_denials()
+        preserved_builder = enforcer._build_prior_hard_deny_unavailable_result("gameday-sticky-run")
+        with plane.outage(requests=1):
+            preserved = _legacy_check(enforcer, agent_run_id="gameday-sticky-run")
 
-    denied = _legacy_check(enforcer, agent_run_id="gameday-sticky-run")
-    plane.clear_denials()
-    preserved_builder = enforcer._build_prior_hard_deny_unavailable_result("gameday-sticky-run")
-    with plane.outage(requests=1):
-        preserved = _legacy_check(enforcer, agent_run_id="gameday-sticky-run")
-
-    recovered = _legacy_check(enforcer, agent_run_id="gameday-sticky-run")
-    cleared_builder = enforcer._build_prior_hard_deny_unavailable_result("gameday-sticky-run")
-    with plane.outage(requests=1):
-        post_recovery_outage = _legacy_check(enforcer, agent_run_id="gameday-sticky-run")
-    enforcer.close()
+        recovered = _legacy_check(enforcer, agent_run_id="gameday-sticky-run")
+        cleared_builder = enforcer._build_prior_hard_deny_unavailable_result("gameday-sticky-run")
+        with plane.outage(requests=1):
+            post_recovery_outage = _legacy_check(
+                enforcer,
+                agent_run_id="gameday-sticky-run",
+            )
 
     assert denied.allowed is False
     assert denied.denied_by_period == "agent_run"
@@ -132,26 +134,29 @@ def test_slow_confirm_is_bounded_by_reporter_shutdown_deadline_and_counted_once(
         shutdown_deadline=0.05,
         transport=plane.transport,
     )
-    confirm = _confirm(_reservation(plane))
-    reporter.report_confirm(confirm)
-    sleep_entered = Event()
-    release_sleep = Event()
-    sleep_finished = Event()
+    try:
+        confirm = _confirm(_reservation(plane))
+        reporter.report_confirm(confirm)
+        sleep_entered = Event()
+        release_sleep = Event()
+        sleep_finished = Event()
 
-    def blocked_sleep(_seconds: float) -> None:
-        sleep_entered.set()
-        release_sleep.wait(timeout=1.0)
-        sleep_finished.set()
+        def blocked_sleep(_seconds: float) -> None:
+            sleep_entered.set()
+            release_sleep.wait(timeout=1.0)
+            sleep_finished.set()
 
-    started = time.monotonic()
-    with (
-        plane.slow(1.0, path="/api/v1/budgets/confirm", requests=1),
-        patch("solwyn.testing._transport.time.sleep", side_effect=blocked_sleep),
-    ):
+        started = time.monotonic()
+        with (
+            plane.slow(1.0, path="/api/v1/budgets/confirm", requests=1),
+            patch("solwyn.testing._transport.time.sleep", side_effect=blocked_sleep),
+        ):
+            reporter.close()
+        elapsed = time.monotonic() - started
+        release_sleep.set()
+        assert sleep_finished.wait(timeout=1.0)
+    finally:
         reporter.close()
-    elapsed = time.monotonic() - started
-    release_sleep.set()
-    assert sleep_finished.wait(timeout=1.0)
 
     assert sleep_entered.is_set()
     assert elapsed < 0.2
@@ -176,30 +181,30 @@ def test_lease_refusal_ladder_uses_legacy_then_outage_drawdown_and_hard_deny() -
         success_threshold=1,
         name="control-plane",
     )
-    enforcer = BudgetEnforcer(
-        plane.api_url,
-        plane.api_key,
-        fail_open=True,
-        cache_ttl=0,
-        control_plane_breaker=breaker,
-        holder_id="gameday-holder",
-        transport=plane.transport,
-    )
+    with closing(
+        BudgetEnforcer(
+            plane.api_url,
+            plane.api_key,
+            fail_open=True,
+            cache_ttl=0,
+            control_plane_breaker=breaker,
+            holder_id="gameday-holder",
+            transport=plane.transport,
+        )
+    ) as enforcer:
+        with plane.refuse_leases(status=503, code="lease_unavailable", requests=1):
+            unavailable_fallback = _lease_check(enforcer, "gameday-unavailable")
+        with plane.refuse_leases(
+            status=409,
+            code="lease_holder_cap_exceeded",
+            requests=1,
+        ):
+            holder_cap_fallback = _lease_check(enforcer, "gameday-holder-cap")
 
-    with plane.refuse_leases(status=503, code="lease_unavailable", requests=1):
-        unavailable_fallback = _lease_check(enforcer, "gameday-unavailable")
-    with plane.refuse_leases(
-        status=409,
-        code="lease_holder_cap_exceeded",
-        requests=1,
-    ):
-        holder_cap_fallback = _lease_check(enforcer, "gameday-holder-cap")
-
-    granted = _lease_check(enforcer, "gameday-outage")
-    with plane.outage(requests=1):
-        from_share = _lease_check(enforcer, "gameday-outage")
-        exhausted = _lease_check(enforcer, "gameday-outage")
-    enforcer.close()
+        granted = _lease_check(enforcer, "gameday-outage")
+        with plane.outage(requests=1):
+            from_share = _lease_check(enforcer, "gameday-outage")
+            exhausted = _lease_check(enforcer, "gameday-outage")
 
     assert unavailable_fallback.allowed is True
     assert unavailable_fallback.lease_id is None
@@ -238,31 +243,36 @@ def test_breaker_held_confirm_recovers_and_drains_exactly_once() -> None:
         retry_backoff_cap=0.001,
         transport=plane.transport,
     )
-    admitted = _legacy_check(enforcer)
-    assert admitted.reservation_id is not None
-    confirm = _confirm(admitted.reservation_id)
-    with plane.outage(requests=1):
-        unavailable = _legacy_check(enforcer)
-    assert unavailable.reservation_id is None
-    assert breaker.get_state().state is CircuitState.OPEN
+    try:
+        admitted = _legacy_check(enforcer)
+        assert admitted.reservation_id is not None
+        confirm = _confirm(admitted.reservation_id)
+        with plane.outage(requests=1):
+            unavailable = _legacy_check(enforcer)
+        assert unavailable.reservation_id is None
+        assert breaker.get_state().state is CircuitState.OPEN
 
-    reporter.report_confirm(confirm)
-    reporter._flush_remaining()
+        reporter.report_confirm(confirm)
+        reporter._flush_remaining()
 
-    assert len(reporter._confirm_queue) == 1
-    assert plane.confirms == []
-    assert reporter.dropped_counts == {}
+        assert len(reporter._confirm_queue) == 1
+        assert plane.confirms == []
+        assert reporter.dropped_counts == {}
 
-    breaker.replace_tuning(
-        failure_threshold=1,
-        recovery_timeout=0,
-        success_threshold=1,
-        recovery_timeout_jitter=0.0,
-    )
-    reporter._flush_remaining()
-    reporter._flush_remaining()
-    reporter.close()
-    enforcer.close()
+        breaker.replace_tuning(
+            failure_threshold=1,
+            recovery_timeout=0,
+            success_threshold=1,
+            recovery_timeout_jitter=0.0,
+        )
+        reporter._flush_remaining()
+        reporter._flush_remaining()
+        reporter.close()
+    finally:
+        try:
+            reporter.close()
+        finally:
+            enforcer.close()
 
     assert breaker.get_state().state is CircuitState.CLOSED
     assert len(reporter._confirm_queue) == 0

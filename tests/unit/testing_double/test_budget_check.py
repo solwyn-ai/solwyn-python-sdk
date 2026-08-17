@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import closing
+
 import pytest
 
 from solwyn._types import BudgetMode, CircuitState
@@ -43,10 +45,8 @@ def test_check_budget_returns_allowed_with_complete_budget_metadata() -> None:
         current_usage=12.5,
         remaining_budget=87.5,
     )
-    enforcer = _enforcer(plane)
-
-    result = _check(enforcer)
-    enforcer.close()
+    with closing(_enforcer(plane)) as enforcer:
+        result = _check(enforcer)
 
     assert result.allowed is True
     assert result.reservation_id == "res_fake_00000001"
@@ -62,10 +62,8 @@ def test_check_budget_returns_allowed_with_complete_budget_metadata() -> None:
 def test_hard_denial_preserves_server_verdict_and_never_returns_reservation() -> None:
     plane = FakeControlPlane(budget_limit=5.0, current_usage=6.0, remaining_budget=-1.0)
     plane.deny_next(period="monthly")
-    enforcer = _enforcer(plane)
-
-    result = _check(enforcer)
-    enforcer.close()
+    with closing(_enforcer(plane)) as enforcer:
+        result = _check(enforcer)
 
     assert result.allowed is False
     assert result.reservation_id is None
@@ -83,10 +81,8 @@ def test_alert_only_denial_allows_with_warning_but_keeps_denial_metadata() -> No
         remaining_budget=-1.0,
     )
     plane.deny_next(period="monthly")
-    enforcer = _enforcer(plane)
-
-    result = _check(enforcer)
-    enforcer.close()
+    with closing(_enforcer(plane)) as enforcer:
+        result = _check(enforcer)
 
     assert result.allowed is True
     assert result.mode is BudgetMode.ALERT_ONLY
@@ -98,11 +94,9 @@ def test_alert_only_denial_allows_with_warning_but_keeps_denial_metadata() -> No
 @pytest.mark.unit
 def test_allow_cache_skips_second_network_check_without_reusing_reservation() -> None:
     plane = FakeControlPlane()
-    enforcer = _enforcer(plane, cache_ttl=60)
-
-    first = _check(enforcer)
-    cached = _check(enforcer)
-    enforcer.close()
+    with closing(_enforcer(plane, cache_ttl=60)) as enforcer:
+        first = _check(enforcer)
+        cached = _check(enforcer)
 
     assert first.allowed is True
     assert first.reservation_id is not None
@@ -120,12 +114,9 @@ def test_three_outages_fail_open_and_open_the_real_control_plane_breaker() -> No
         success_threshold=1,
         name="control-plane",
     )
-    enforcer = _enforcer(plane, breaker=breaker)
-
-    with plane.outage(requests=3):
+    with closing(_enforcer(plane, breaker=breaker)) as enforcer, plane.outage(requests=3):
         unavailable = [_check(enforcer) for _ in range(3)]
         breaker_skipped = _check(enforcer)
-    enforcer.close()
 
     assert all(result.allowed is True for result in unavailable)
     assert all(result.reservation_id is None for result in unavailable)
