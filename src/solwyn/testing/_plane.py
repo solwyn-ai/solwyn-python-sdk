@@ -138,29 +138,11 @@ class _LeaseRecord:
     lease_id: str
     generation: int
     granted_tokens: int
-    declaration: _LeaseDeclaration
+    declared_pairs: tuple[tuple[ProviderName, str], ...]
+    fail_open: bool
     last_response_json: str = ""
     last_renewal_request: LeaseRenewRequest | None = None
-    terminal: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class _LeaseDeclaration:
-    model: str
-    provider: ProviderName
-    fallback_providers: tuple[ProviderName, ...]
-    fallback_models: tuple[str, ...]
-    fail_open: bool
-
-    @classmethod
-    def from_request(cls, request: LeaseGrantRequest) -> _LeaseDeclaration:
-        return cls(
-            model=request.model,
-            provider=request.provider,
-            fallback_providers=tuple(request.fallback_providers),
-            fallback_models=tuple(request.fallback_models),
-            fail_open=request.fail_open,
-        )
+    terminal_successor: bool = False
 
 
 class FakeControlPlane:
@@ -186,6 +168,15 @@ class FakeControlPlane:
         refresh_interval_s: float = 30.0,
         lease_length_s: float = 90.0,
     ) -> None:
+        if not granted_tokens > 0:
+            raise ValueError("granted_tokens must be greater than zero")
+        if not lease_length_s > 0:
+            raise ValueError("lease_length_s must be greater than zero")
+        if not refresh_interval_s > 0:
+            raise ValueError("refresh_interval_s must be greater than zero")
+        if not refresh_interval_s < lease_length_s:
+            raise ValueError("refresh_interval_s must be less than lease_length_s")
+
         self.mode = BudgetMode(mode)
         self.budget_limit = budget_limit
         self.current_usage = current_usage
@@ -473,9 +464,9 @@ class FakeControlPlane:
         self.lease_grants.append(parsed)
         key = (parsed.agent_run_id, parsed.holder_id)
         current = self._leases.get(key)
-        declaration = _LeaseDeclaration.from_request(parsed)
+        declared_pairs = self._grant_declared_pairs(parsed)
         if current is not None and self._lease_is_active(current):
-            if current.declaration == declaration:
+            if current.declared_pairs == declared_pairs and current.fail_open == parsed.fail_open:
                 return self._replay_lease_response(current)
             return self._lease_error(
                 409,
@@ -516,7 +507,8 @@ class FakeControlPlane:
             lease_id=f"lse_fake{self._lease_counter}",
             generation=1,
             granted_tokens=self.granted_tokens,
-            declaration=declaration,
+            declared_pairs=declared_pairs,
+            fail_open=parsed.fail_open,
         )
         self._leases[key] = record
         self._lease_records[record.lease_id] = record
@@ -526,9 +518,8 @@ class FakeControlPlane:
         parsed = parse_model(LeaseRenewRequest, body)
         if isinstance(parsed, PlaneResponse):
             return parsed
-        if parsed.model is not None:
-            _validate_magic_model(parsed.model)
-        for fallback_model in parsed.fallback_models:
+        renewal_pairs = self._renewal_declared_pairs(parsed)
+        for _, fallback_model in renewal_pairs:
             _validate_magic_model(fallback_model)
 
         self.lease_renewals.append(parsed)
@@ -541,8 +532,12 @@ class FakeControlPlane:
             return self._lease_error(404, "lease_not_found", "Budget lease not found")
         if record.last_renewal_request == parsed:
             return self._replay_lease_response(record)
-        if record.terminal:
-            return self._lease_error(404, "lease_not_found", "Budget lease not found")
+        if record.terminal_successor:
+            return self._lease_error(
+                409,
+                "lease_generation_conflict",
+                "Budget lease generation conflict",
+            )
         if parsed.generation != record.generation:
             return self._lease_error(
                 409,
@@ -550,7 +545,7 @@ class FakeControlPlane:
                 "Budget lease generation conflict",
             )
 
-        effective_model = parsed.model if parsed.model is not None else record.declaration.model
+        effective_model = renewal_pairs[0][1] if renewal_pairs else record.declared_pairs[0][1]
         denied_by_period = self._denial_period(record.agent_run_id, effective_model)
         if denied_by_period is not None:
             response = self._lease_verdict_response(
@@ -563,11 +558,12 @@ class FakeControlPlane:
                     else self.mode
                 ),
             )
+            record.generation += 1
             return self._store_lease_response(
                 record,
                 response,
                 renewal_request=parsed,
-                terminal=True,
+                terminal_successor=True,
             )
         if not self.lease_eligible or effective_model == "solwyn-test/lease-ineligible":
             response = self._lease_verdict_response(
@@ -575,13 +571,18 @@ class FakeControlPlane:
                 allowed=True,
                 ineligible_reason="zero_rate_model",
             )
+            record.generation += 1
             return self._store_lease_response(
                 record,
                 response,
                 renewal_request=parsed,
-                terminal=True,
+                terminal_successor=True,
             )
 
+        record.declared_pairs = self._union_declared_pairs(
+            record.declared_pairs,
+            renewal_pairs,
+        )
         record.generation += 1
         return self._store_lease_response(
             record,
@@ -595,7 +596,7 @@ class FakeControlPlane:
             return parsed
         self.lease_surrenders.append(parsed)
         record = self._find_lease(parsed.lease_id, parsed.holder_id)
-        if record is None or record.lease_id in self._expired_leases or record.terminal:
+        if record is None:
             return self._lease_error(404, "lease_not_found", "Budget lease not found")
         if parsed.generation != record.generation:
             return self._lease_error(
@@ -603,7 +604,7 @@ class FakeControlPlane:
                 "lease_generation_conflict",
                 "Budget lease generation conflict",
             )
-        if record.lease_id in self._released_leases:
+        if record.lease_id in self._expired_leases or record.lease_id in self._released_leases:
             return PlaneResponse(200, {"released_tokens": 0})
         self._released_leases.add(record.lease_id)
         return PlaneResponse(200, {"released_tokens": record.granted_tokens})
@@ -616,10 +617,40 @@ class FakeControlPlane:
 
     def _lease_is_active(self, record: _LeaseRecord) -> bool:
         return (
-            not record.terminal
-            and record.lease_id not in self._expired_leases
+            record.lease_id not in self._expired_leases
             and record.lease_id not in self._released_leases
         )
+
+    @staticmethod
+    def _grant_declared_pairs(
+        request: LeaseGrantRequest,
+    ) -> tuple[tuple[ProviderName, str], ...]:
+        return (
+            (request.provider, request.model),
+            *zip(request.fallback_providers, request.fallback_models, strict=True),
+        )
+
+    @staticmethod
+    def _renewal_declared_pairs(
+        request: LeaseRenewRequest,
+    ) -> tuple[tuple[ProviderName, str], ...]:
+        if request.model is None or request.provider is None:
+            return ()
+        return (
+            (request.provider, request.model),
+            *zip(request.fallback_providers, request.fallback_models, strict=True),
+        )
+
+    @staticmethod
+    def _union_declared_pairs(
+        current: tuple[tuple[ProviderName, str], ...],
+        additions: tuple[tuple[ProviderName, str], ...],
+    ) -> tuple[tuple[ProviderName, str], ...]:
+        widened = list(current)
+        for pair in additions:
+            if pair not in widened:
+                widened.append(pair)
+        return tuple(widened)
 
     @staticmethod
     def _lease_error(status: int, code: str, message: str) -> PlaneResponse:
@@ -640,7 +671,7 @@ class FakeControlPlane:
             headroom_share_tokens=record.granted_tokens,
             posture=LeasePosture(
                 mode=self.mode,
-                on_unreachable=("fail_open" if record.declaration.fail_open else "local_enforce"),
+                on_unreachable=("fail_open" if record.fail_open else "local_enforce"),
             ),
             final_grant=False,
             project_id=self.project_id,
@@ -656,13 +687,13 @@ class FakeControlPlane:
         response: LeaseGrantResponse,
         *,
         renewal_request: LeaseRenewRequest | None = None,
-        terminal: bool = False,
+        terminal_successor: bool = False,
     ) -> PlaneResponse:
         record.last_response_json = response.model_dump_json(exclude_none=True)
         record.last_renewal_request = (
             renewal_request.model_copy(deep=True) if renewal_request is not None else None
         )
-        record.terminal = terminal
+        record.terminal_successor = terminal_successor
         return PlaneResponse(200, response, model_only=True)
 
     @staticmethod
