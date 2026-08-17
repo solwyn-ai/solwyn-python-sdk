@@ -49,6 +49,7 @@ MAGIC_MODELS = frozenset(
 )
 
 _DENIAL_PERIODS = frozenset({"monthly", "agent_run", "run_stopped", "tag"})
+_LIVE_CONTRACT_UNPRICED_LEASE_MODEL = "no-such-model-for-leases"
 _LEASE_PATHS = frozenset(
     {
         "/api/v1/budgets/lease",
@@ -490,7 +491,10 @@ class FakeControlPlane:
                 ),
                 model_only=True,
             )
-        if not self.lease_eligible or parsed.model == "solwyn-test/lease-ineligible":
+        if not self.lease_eligible or parsed.model in {
+            "solwyn-test/lease-ineligible",
+            _LIVE_CONTRACT_UNPRICED_LEASE_MODEL,
+        }:
             return PlaneResponse(
                 200,
                 self._lease_verdict_response(
@@ -565,7 +569,10 @@ class FakeControlPlane:
                 renewal_request=parsed,
                 terminal_successor=True,
             )
-        if not self.lease_eligible or effective_model == "solwyn-test/lease-ineligible":
+        if not self.lease_eligible or effective_model in {
+            "solwyn-test/lease-ineligible",
+            _LIVE_CONTRACT_UNPRICED_LEASE_MODEL,
+        }:
             response = self._lease_verdict_response(
                 eligible=False,
                 allowed=True,
