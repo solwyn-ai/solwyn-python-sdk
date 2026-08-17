@@ -125,7 +125,12 @@ derived from git tags (hatch-vcs).
   only, with 128×64 detailed history and fixed-memory conservative suppression.
 - **Denied-call receipts carry structural attribution.** `deny_source`,
   `deny_reason`, `denied_by_period`, `estimated_output_bound`, `velocity_flags`,
-  and `receipt_aggregate_count` are optional, content-free metadata fields.
+  `receipt_aggregate_count`, and `receipt_pricing_input_tokens` are optional,
+  content-free metadata fields. Unavoidable receipt losses fold by
+  pricing-compatible identity and replay in per-field 100-million-unit-safe
+  aggregates after delivery recovers. Aggregates preserve exact token/media
+  totals, optional media quantity presence, and the original per-call
+  input-token pricing basis.
 
 ### Changed
 

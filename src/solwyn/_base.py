@@ -1711,9 +1711,8 @@ class _SolwynBase:
             deny_reason=deny_reason,
             denied_by_period=denied_by_period,
             estimated_output_bound=estimated_output_bound,
-            velocity_flags=cast(
-                "list[VelocityFlag] | None",
-                list(velocity_flags) if velocity_flags else None,
+            velocity_flags=(
+                cast("list[VelocityFlag]", list(velocity_flags)) if velocity_flags else None
             ),
             receipt_aggregate_count=receipt_aggregate_count,
         )

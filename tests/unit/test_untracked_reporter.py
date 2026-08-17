@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, foreground_records
+from conftest import VALID_API_KEY, call_uuid, foreground_records
 from pydantic import ValidationError
 
 from solwyn import _base, _types
@@ -1179,9 +1179,10 @@ def test_sync_close_waits_for_an_active_untracked_worker() -> None:
 
     original_seal = reporter._seal_delivery
 
-    def seal_delivery() -> None:
-        original_seal()
+    def seal_delivery(*, emit: bool = True) -> bool:
+        sealed = original_seal(emit=emit)
         close_reached_advisory_join.set()
+        return sealed
 
     closer = threading.Thread(target=close_reporter, daemon=True)
     try:
@@ -1208,6 +1209,251 @@ def test_sync_close_waits_for_an_active_untracked_worker() -> None:
             closer.join(timeout=1.0)
         reporter._shutdown.set()
         reporter._http.close()
+
+
+@pytest.mark.unit
+def test_sync_close_refreshes_joined_untracked_worker_before_final_due_cycle() -> None:
+    reporter = _quiet_sync_reporter()
+    _observe(reporter, surface="responses.create")
+    first_send_started = threading.Event()
+    release_first_send = threading.Event()
+    close_joining_worker = threading.Event()
+    worker_wrapper_finished = threading.Event()
+    release_close_refresh = threading.Event()
+    close_completed = threading.Event()
+    sent_surfaces: list[str] = []
+    real_close = reporter._http.close
+    original_join = reporter._join_until_close_deadline
+
+    def send(_url: str, **kwargs: object) -> MagicMock:
+        payload = kwargs["json"]
+        assert isinstance(payload, list)
+        sent_surfaces.extend(str(item["surface"]) for item in payload)
+        if sent_surfaces == ["responses.create"]:
+            first_send_started.set()
+            assert release_first_send.wait(timeout=2.0)
+        return _ok_response()
+
+    worker: threading.Thread | None = None
+
+    def join_worker(candidate: threading.Thread, deadline: float | None) -> bool:
+        if candidate is worker:
+            close_joining_worker.set()
+            joined = original_join(candidate, deadline)
+            worker_wrapper_finished.set()
+            assert release_close_refresh.wait(timeout=2.0)
+            return joined
+        return original_join(candidate, deadline)
+
+    def close_reporter() -> None:
+        reporter.close(timeout=1.0)
+        close_completed.set()
+
+    closer = threading.Thread(target=close_reporter, daemon=True)
+    try:
+        with (
+            patch.object(reporter._http, "post", side_effect=send),
+            patch.object(reporter._http, "close") as http_close,
+            patch.object(reporter, "_join_until_close_deadline", side_effect=join_worker),
+        ):
+            worker = reporter._start_untracked_cycle()
+            assert worker is not None
+            assert first_send_started.wait(timeout=1.0)
+
+            closer.start()
+            assert close_joining_worker.wait(timeout=1.0)
+            # This key misses the active worker's already-taken snapshot. Its
+            # shutdown wrapper cannot reschedule, so close owns the final wake.
+            _observe(reporter, surface="embeddings.create")
+            release_first_send.set()
+            assert worker_wrapper_finished.wait(timeout=1.0)
+            # A key arriving after the wrapper cleared its slot must be in the
+            # same final snapshot close takes after refreshing liveness.
+            _observe(reporter, surface="chat.completions.create")
+            release_close_refresh.set()
+            assert close_completed.wait(timeout=2.0)
+            closer.join(timeout=2.0)
+
+            assert sent_surfaces[0] == "responses.create"
+            assert set(sent_surfaces[1:]) == {
+                "embeddings.create",
+                "chat.completions.create",
+            }
+            assert reporter._untracked_reports_due() is False
+            assert reporter._close_is_completed() is True
+            http_close.assert_called_once_with()
+    finally:
+        release_first_send.set()
+        release_close_refresh.set()
+        closer.join(timeout=2.0)
+        if worker is not None:
+            worker.join(timeout=2.0)
+        real_close()
+
+
+@pytest.mark.unit
+def test_competing_close_cannot_complete_under_final_untracked_owner() -> None:
+    reporter = _quiet_sync_reporter()
+    _observe(reporter, surface="responses.create")
+    original_due = reporter._untracked_reports_due
+    owner_reached_advisory = threading.Event()
+    release_owner = threading.Event()
+    first_finished = threading.Event()
+    racer_finished = threading.Event()
+    transport_closed = threading.Event()
+    sent_surfaces: list[str] = []
+    close_errors: list[BaseException] = []
+    real_close = reporter._http.close
+
+    def due() -> bool:
+        if not owner_reached_advisory.is_set():
+            owner_reached_advisory.set()
+            assert release_owner.wait(timeout=2.0)
+        return original_due()
+
+    def send(_url: str, **kwargs: object) -> MagicMock:
+        assert not transport_closed.is_set(), "final advisory POST ran on a closed transport"
+        payload = kwargs["json"]
+        assert isinstance(payload, list)
+        sent_surfaces.extend(str(item["surface"]) for item in payload)
+        return _ok_response()
+
+    def close_reporter(finished: threading.Event) -> None:
+        try:
+            reporter.close(timeout=1.0)
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            finished.set()
+
+    first = threading.Thread(target=close_reporter, args=(first_finished,), daemon=True)
+    racer = threading.Thread(target=close_reporter, args=(racer_finished,), daemon=True)
+    try:
+        with (
+            patch.object(reporter, "_untracked_reports_due", side_effect=due),
+            patch.object(reporter._http, "post", side_effect=send),
+            patch.object(reporter._http, "close", side_effect=transport_closed.set) as http_close,
+        ):
+            first.start()
+            assert owner_reached_advisory.wait(timeout=1.0)
+            racer.start()
+
+            assert not racer_finished.wait(timeout=0.05), (
+                "a competing close must not publish completion beneath the advisory owner"
+            )
+            assert reporter._close_is_completed() is False
+            http_close.assert_not_called()
+
+            release_owner.set()
+            assert first_finished.wait(timeout=2.0)
+            assert racer_finished.wait(timeout=2.0)
+            first.join(timeout=2.0)
+            racer.join(timeout=2.0)
+
+            assert close_errors == []
+            assert sent_surfaces == ["responses.create"]
+            assert reporter._untracked_reports_due() is False
+            assert reporter._close_is_completed() is True
+            http_close.assert_called_once_with()
+    finally:
+        release_owner.set()
+        first.join(timeout=2.0)
+        racer.join(timeout=2.0)
+        real_close()
+
+
+@pytest.mark.unit
+def test_untracked_worker_warning_can_reenter_close_without_self_join() -> None:
+    reporter = _quiet_sync_reporter()
+    _observe(reporter)
+    queued = _types.MetadataEvent(
+        model="gpt-5.5",
+        provider=_types.ProviderName.OPENAI,
+        input_tokens=3,
+        output_tokens=2,
+        latency_ms=1.0,
+        status=_types.CallStatus.SUCCESS,
+        is_model_fallback=False,
+        sdk_instance_id=SDK_INSTANCE_ID,
+        timestamp=datetime.now(UTC),
+        call_id=call_uuid("untracked-worker-reentrant-close"),
+    )
+    reporter.report(queued)
+    close_finished = threading.Event()
+    close_started = threading.Event()
+    close_errors: list[BaseException] = []
+    delivered: list[str] = []
+    real_close = reporter._http.close
+
+    def warning(message: str, *_args: object, **_kwargs: object) -> None:
+        if message != "host.untracked_worker_reentrant_close" or close_started.is_set():
+            return
+        close_started.set()
+        try:
+            reporter.close(timeout=0.2)
+        except BaseException as exc:
+            close_errors.append(exc)
+        finally:
+            close_finished.set()
+
+    def post(url: str, **kwargs: object) -> MagicMock:
+        if url.endswith("/untracked-surfaces"):
+            logging.getLogger("solwyn.reporter").warning("host.untracked_worker_reentrant_close")
+            return _ok_response()
+        payload = kwargs["json"]
+        assert isinstance(payload, list)
+        delivered.extend(str(item["call_id"]) for item in payload)
+        response = _ok_response()
+        response.json.return_value = {"ingested": len(payload), "rejected": []}
+        return response
+
+    worker: threading.Thread | None = None
+    try:
+        with (
+            patch.object(reporter._http, "post", side_effect=post),
+            patch.object(reporter._http, "close") as http_close,
+            patch("solwyn.reporter.logger.warning", side_effect=warning),
+        ):
+            worker = reporter._start_untracked_cycle()
+            assert worker is not None
+            assert close_finished.wait(timeout=2.0)
+            worker.join(timeout=2.0)
+
+            assert close_errors == []
+            assert not worker.is_alive()
+            assert delivered == [str(queued.call_id)]
+            assert not reporter._queue
+            assert reporter.dropped_counts == {}
+            assert reporter._delivery_completed is True
+            assert reporter._close_is_completed() is True
+            http_close.assert_called_once_with()
+    finally:
+        if worker is not None:
+            worker.join(timeout=2.0)
+        real_close()
+
+
+@pytest.mark.unit
+def test_ordinary_untracked_send_uses_newly_published_close_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 400.0}
+    monkeypatch.setattr("solwyn.reporter._monotonic", lambda: clock["now"])
+    reporter = _quiet_sync_reporter()
+    _observe(reporter)
+    timeouts: list[float] = []
+
+    def post(_url: str, **kwargs: object) -> MagicMock:
+        timeouts.append(float(kwargs["timeout"]))
+        return _ok_response()
+
+    reporter._tighten_close_deadline(400.02)
+    with patch.object(reporter._http, "post", side_effect=post):
+        reporter._flush_untracked_reports(deadline=None)
+
+    assert timeouts == [0.05]
+    reporter._shutdown.set()
+    reporter._http.close()
 
 
 @pytest.mark.unit
@@ -1260,9 +1506,10 @@ async def test_async_close_waits_for_an_active_untracked_task() -> None:
 
     original_seal = reporter._seal_delivery
 
-    def seal_delivery() -> None:
-        original_seal()
+    def seal_delivery(*, emit: bool = True) -> bool:
+        sealed = original_seal(emit=emit)
         close_reached_advisory_join.set()
+        return sealed
 
     with (
         patch.object(reporter._http, "post", new=AsyncMock(side_effect=send)) as post,

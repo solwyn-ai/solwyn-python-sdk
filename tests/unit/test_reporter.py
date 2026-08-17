@@ -139,32 +139,6 @@ class TestReporterBase:
         base._enqueue(event)
         assert len(base._queue) == 1
 
-    def test_drain_batch_returns_up_to_batch_size(self) -> None:
-        base = _ReporterBase(
-            api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
-            batch_size=3,
-        )
-        for _ in range(5):
-            base._enqueue(_make_event())
-
-        batch = base._drain_batch()
-        assert len(batch) == 3
-        assert len(base._queue) == 2
-
-    def test_drain_batch_returns_all_when_less_than_batch_size(self) -> None:
-        base = _ReporterBase(
-            api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
-            batch_size=10,
-        )
-        for _ in range(3):
-            base._enqueue(_make_event())
-
-        batch = base._drain_batch()
-        assert len(batch) == 3
-        assert len(base._queue) == 0
-
     def test_queue_overflow_drops_oldest(self) -> None:
         base = _ReporterBase(
             api_url="https://api.test.solwyn.ai",
@@ -534,8 +508,11 @@ class TestIngestRejectionLogging:
             patch.object(reporter._http, "post", return_value=_accepted_response(body)),
             caplog.at_level("WARNING"),
         ):
-            reporter._send_batch([_make_event() for _ in range(5)])
+            result = reporter._send_batch([_make_event() for _ in range(5)])
 
+        assert result.outcome.value == "sent"
+        assert result.rejections.indexes == frozenset({0, 2, 4})
+        assert reporter.dropped_counts == {}  # the queue owner publishes dispositions
         rejection_logs = [
             record.getMessage()
             for record in caplog.records

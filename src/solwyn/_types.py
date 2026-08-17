@@ -490,6 +490,22 @@ class MetadataEvent(BaseModel):
         le=ORDINARY_TOKEN_COUNT_MAX,
         description="Number of receipts represented by an aggregate replay event.",
     )
+    receipt_pricing_input_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        le=ORDINARY_TOKEN_COUNT_MAX,
+        description=(
+            "Original per-call input-token count used only to select the pricing "
+            "card for a homogeneous aggregate receipt. Requires receipt_aggregate_count."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _pricing_basis_requires_aggregate(self) -> MetadataEvent:
+        """Keep the pricing-basis hint scoped to homogeneous aggregate replays."""
+        if self.receipt_pricing_input_tokens is not None and self.receipt_aggregate_count is None:
+            raise ValueError("receipt_pricing_input_tokens requires receipt_aggregate_count")
+        return self
 
 
 class FailoverDirective(BaseModel):

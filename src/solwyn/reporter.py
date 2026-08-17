@@ -6,9 +6,10 @@ snapshots to the Solwyn cloud API. Neither blocks the LLM call path.
 
 Delivery is at-least-once: confirms, settlements, and metadata batches are
 retried with bounded backoff, a control-plane-breaker-open flush HOLDS work
-instead of dropping it, and every unavoidable drop is counted (``dropped_counts``)
-and logged at a bounded rate. The server dedups duplicate sends via an
-idempotency ledger, so retries (and fork/shutdown races) are safe.
+instead of dropping it. Unavoidable denial-receipt losses fold into bounded
+content-free aggregates for recovery replay; every other drop is counted
+(``dropped_counts``) and logged at a bounded rate. The server dedups duplicate
+sends via an idempotency ledger, so retries (and fork/shutdown races) are safe.
 
 Events contain cost/latency metadata only -- never prompts or responses.
 """
@@ -19,20 +20,22 @@ import asyncio
 import collections
 import dataclasses
 import enum
-import functools
 import logging
+import math
 import re
 import threading
 import time
 import uuid
 import weakref
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime
-from typing import Literal, TypeVar
+from typing import Literal, NamedTuple, TypeVar
 
 import httpx
 
 from solwyn import _base
+from solwyn._constants import ORDINARY_TOKEN_COUNT_MAX
 from solwyn._lifecycle import (
     _drain_count,
     _is_retryable_exc,
@@ -45,14 +48,34 @@ from solwyn._surfaces import SurfaceContext
 from solwyn._types import (
     BreakerStateReport,
     BudgetConfirmRequest,
+    CallStatus,
     CircuitState,
+    MediaUsage,
     MetadataEvent,
+    Modality,
     ProviderName,
     UntrackedSurfaceReport,
 )
 from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
 
 logger = logging.getLogger(__name__)
+
+
+def _log_warning(message: str, *args: object) -> None:
+    """Invoke host logging without allowing a handler to break delivery."""
+    with suppress(Exception):
+        logger.warning(message, *args)
+
+
+def _log_error(message: str, *args: object) -> None:
+    with suppress(Exception):
+        logger.error(message, *args)
+
+
+def _log_debug(message: str, *args: object) -> None:
+    with suppress(Exception):
+        logger.debug(message, *args)
+
 
 # Patchable clock seam: all backoff/deadline arithmetic reads through this so
 # tests can drive time deterministically.
@@ -73,6 +96,12 @@ _UNTRACKED_REPORT_INTERVAL = 15 * 60.0
 _UNTRACKED_REPORT_BATCH_SIZE = 100
 _UNTRACKED_OCCURRENCES_MAX = 1_000_000_000
 _UNTRACKED_REPORT_KEY_LIMIT = 512
+
+# A denial receipt that cannot be delivered is compressed into this many
+# per-(run, source) aggregates. Existing keys always remain writable at the
+# bound; a new key is observably refused rather than evicting another run's
+# durable trace.
+_RECEIPT_FOLD_LIMIT = 256
 
 _T = TypeVar("_T")
 
@@ -102,6 +131,42 @@ class _SendOutcome(enum.Enum):
     DROPPED = "dropped"  # terminal status / poison item — never retry
 
 
+class _IngestRejectionKind(enum.Enum):
+    """How precisely a successful ingest response identifies rejections."""
+
+    CLEAN = "clean"
+    EXACT = "exact"
+    LEGACY = "legacy"
+    MALFORMED = "malformed"
+
+
+class _CloseFinalizationClaim(enum.Enum):
+    """Why one sync close caller did or did not acquire whole-close ownership."""
+
+    ACQUIRED = "acquired"
+    COMPLETED = "completed"
+    REENTRANT = "reentrant"
+    BUSY = "busy"
+    EXPIRED = "expired"
+
+
+@dataclasses.dataclass(frozen=True)
+class _IngestRejections:
+    """Side-effect-free parsing result for one successful ingest response."""
+
+    kind: _IngestRejectionKind
+    indexes: frozenset[int] = frozenset()
+    count: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class _BatchSendResult:
+    """Transport result plus any terminal members in an accepted batch."""
+
+    outcome: _SendOutcome
+    rejections: _IngestRejections
+
+
 @dataclasses.dataclass
 class _PendingConfirm:
     """A standalone confirm awaiting delivery, with retry bookkeeping."""
@@ -120,12 +185,380 @@ class _PendingEvent:
     next_attempt_at: float = 0.0
 
 
+@dataclasses.dataclass(frozen=True)
+class _EventBatchToken:
+    """Opaque identity for one sync drain's claimed event prefix."""
+
+    value: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _ClaimedEventBatch:
+    """A sync event prefix whose ownership is registered by token."""
+
+    token: _EventBatchToken
+    pending: tuple[_PendingEvent, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class _SettlementToken:
+    """Opaque identity for one sync drain's claimed settlement pair."""
+
+    value: int
+
+
 @dataclasses.dataclass
 class _PendingSettlement:
     """A reservation settlement: its confirm (retryable) paired with its event."""
 
     confirm: _PendingConfirm
     event: MetadataEvent
+
+
+@dataclasses.dataclass(frozen=True)
+class _ClaimedSettlement:
+    """A sync settlement pair whose ownership is registered by token."""
+
+    token: _SettlementToken
+    pending: _PendingSettlement
+
+
+class _ReceiptFoldKey(NamedTuple):
+    """Pricing-compatible, content-free identity for one receipt aggregate."""
+
+    run_id: str
+    original_source: str
+    model: str
+    provider: ProviderName
+    provider_region: str | None
+    service_tier: str | None
+    modality: Modality
+    receipt_pricing_input_tokens: int | None
+    has_media_usage: bool
+    has_image_count: bool
+    has_generation_count: bool
+    has_video_seconds: bool
+    has_audio_seconds: bool
+    has_input_characters: bool
+    media_resolution: str | None
+    media_quality: str | None
+    media_is_estimated: bool
+
+
+@dataclasses.dataclass
+class _ReceiptFold:
+    """Content-free structural aggregate for denied events lost in transit.
+
+    Model/provider are first-writer-wins for deterministic replay. Source
+    timestamps are retained for local diagnostics even though replay events use
+    a fresh timestamp as required by the wire contract.
+    """
+
+    count: int
+    input_tokens: int
+    output_tokens: int
+    estimated_output_bound: int
+    image_count: int | None
+    generation_count: int | None
+    video_seconds: float | None
+    audio_seconds: float | None
+    input_characters: int | None
+    first_timestamp: datetime
+    last_timestamp: datetime
+    model: str
+    provider: ProviderName
+
+
+class _ReceiptFoldState:
+    """Bounded, fork-repairable fold table independent of reporter transport."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.folds: dict[_ReceiptFoldKey, _ReceiptFold] = {}
+        self.previous_cycle_succeeded = False
+        self.terminal = False
+
+    def reset_after_fork_in_child(self) -> None:
+        """Replace the inherited lock and avoid replaying a parent's aggregate.
+
+        Unlike queued events, folds have no stable per-original call ids for
+        server deduplication: parent and child mint distinct replay ids. Keeping
+        the inherited table would therefore double-count every pre-fork fold.
+        """
+        terminal = self.terminal
+        self.lock = threading.Lock()
+        self.folds = {}
+        self.previous_cycle_succeeded = False
+        # Terminal ownership is one-way. A child of an already closing/closed
+        # reporter has no sender either and must count late receipts instead of
+        # reopening an ownerless fold table.
+        self.terminal = terminal
+
+    @staticmethod
+    def _timestamp(value: datetime) -> datetime:
+        return value.replace(tzinfo=UTC) if value.utcoffset() is None else value
+
+    def fold(self, event: MetadataEvent) -> Literal["not_denied", "folded", "overflow", "terminal"]:
+        """Fold one denied event; preserve aggregate replay totals exactly."""
+        if event.status != CallStatus.BUDGET_DENIED:
+            return "not_denied"
+        media = event.media_usage
+        input_tokens = max(0, int(event.input_tokens))
+        key = _ReceiptFoldKey(
+            run_id=event.agent_run_id or "",
+            original_source=event.deny_source or "",
+            model=event.model,
+            provider=event.provider,
+            provider_region=event.provider_region,
+            service_tier=event.service_tier,
+            modality=event.modality,
+            receipt_pricing_input_tokens=(
+                event.receipt_pricing_input_tokens
+                if event.receipt_aggregate_count is not None
+                else input_tokens
+            ),
+            has_media_usage=media is not None,
+            has_image_count=media is not None and media.image_count is not None,
+            has_generation_count=media is not None and media.generation_count is not None,
+            has_video_seconds=media is not None and media.video_seconds is not None,
+            has_audio_seconds=media is not None and media.audio_seconds is not None,
+            has_input_characters=media is not None and media.input_characters is not None,
+            media_resolution=media.resolution if media is not None else None,
+            media_quality=media.quality if media is not None else None,
+            media_is_estimated=media.is_estimated if media is not None else False,
+        )
+        count = event.receipt_aggregate_count or 1
+        output_tokens = max(0, int(event.output_tokens))
+        output_bound = max(0, int(event.estimated_output_bound or 0))
+        timestamp = self._timestamp(event.timestamp)
+        with self.lock:
+            if self.terminal:
+                return "terminal"
+            existing = self.folds.get(key)
+            if existing is None:
+                if len(self.folds) >= _RECEIPT_FOLD_LIMIT:
+                    return "overflow"
+                self.folds[key] = _ReceiptFold(
+                    count=count,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    estimated_output_bound=output_bound,
+                    image_count=media.image_count if media is not None else None,
+                    generation_count=media.generation_count if media is not None else None,
+                    video_seconds=media.video_seconds if media is not None else None,
+                    audio_seconds=media.audio_seconds if media is not None else None,
+                    input_characters=media.input_characters if media is not None else None,
+                    first_timestamp=timestamp,
+                    last_timestamp=timestamp,
+                    model=event.model,
+                    provider=event.provider,
+                )
+            else:
+                existing.count += count
+                existing.input_tokens += input_tokens
+                existing.output_tokens += output_tokens
+                existing.estimated_output_bound += output_bound
+                if media is not None:
+                    if media.image_count is not None:
+                        existing.image_count = (existing.image_count or 0) + media.image_count
+                    if media.generation_count is not None:
+                        existing.generation_count = (
+                            existing.generation_count or 0
+                        ) + media.generation_count
+                    if media.video_seconds is not None:
+                        existing.video_seconds = (
+                            existing.video_seconds or 0.0
+                        ) + media.video_seconds
+                    if media.audio_seconds is not None:
+                        existing.audio_seconds = (
+                            existing.audio_seconds or 0.0
+                        ) + media.audio_seconds
+                    if media.input_characters is not None:
+                        existing.input_characters = (
+                            existing.input_characters or 0
+                        ) + media.input_characters
+                existing.first_timestamp = min(existing.first_timestamp, timestamp)
+                existing.last_timestamp = max(existing.last_timestamp, timestamp)
+        return "folded"
+
+    def snapshot(self) -> dict[_ReceiptFoldKey, _ReceiptFold]:
+        with self.lock:
+            return {key: dataclasses.replace(fold) for key, fold in self.folds.items()}
+
+    def take_for_cycle(self, *, final: bool) -> list[tuple[_ReceiptFoldKey, _ReceiptFold]]:
+        """Atomically consume folds when recovery was proven, or once at close."""
+        with self.lock:
+            if final:
+                # Final ownership is a one-way transition. Any replay that is
+                # later lost is counted immediately; retaining it here would
+                # create state with no future sender after close/GC/atexit.
+                self.terminal = True
+            should_drain = final or self.previous_cycle_succeeded
+            self.previous_cycle_succeeded = False
+            if not should_drain or not self.folds:
+                return []
+            folds = [(key, dataclasses.replace(fold)) for key, fold in self.folds.items()]
+            self.folds.clear()
+            return folds
+
+    def note_cycle_success(self) -> None:
+        with self.lock:
+            if not self.terminal:
+                self.previous_cycle_succeeded = True
+
+
+def _build_receipt_replay_event(
+    key: _ReceiptFoldKey, fold: _ReceiptFold, sdk_instance_id: str | None
+) -> MetadataEvent:
+    """Build a fresh, content-free aggregate for the normal ingest path."""
+    media_usage = None
+    if key.has_media_usage:
+        media_usage = MediaUsage(
+            image_count=fold.image_count,
+            generation_count=fold.generation_count,
+            video_seconds=fold.video_seconds,
+            audio_seconds=fold.audio_seconds,
+            input_characters=fold.input_characters,
+            resolution=key.media_resolution,
+            quality=key.media_quality,
+            is_estimated=key.media_is_estimated,
+        )
+    return MetadataEvent(
+        model=key.model,
+        provider=key.provider,
+        provider_region=key.provider_region,
+        service_tier=key.service_tier,
+        modality=key.modality,
+        input_tokens=fold.input_tokens,
+        output_tokens=fold.output_tokens,
+        token_details=None,
+        media_usage=media_usage,
+        latency_ms=0.0,
+        status=CallStatus.BUDGET_DENIED,
+        is_model_fallback=False,
+        call_id=str(uuid.uuid4()),
+        sdk_instance_id=sdk_instance_id or "receipt-fold",
+        timestamp=datetime.now(UTC),
+        agent_run_id=key.run_id or None,
+        deny_source="aggregate_replay",
+        estimated_output_bound=fold.estimated_output_bound,
+        receipt_aggregate_count=fold.count,
+        receipt_pricing_input_tokens=key.receipt_pricing_input_tokens,
+    )
+
+
+def _split_receipt_fold(fold: _ReceiptFold) -> list[_ReceiptFold]:
+    """Partition one unbounded in-memory sum into 100M wire-safe folds."""
+
+    def chunks_needed(value: int | float | None) -> int:
+        if value is None:
+            return 1
+        if isinstance(value, int):
+            return max(
+                1,
+                (value + ORDINARY_TOKEN_COUNT_MAX - 1) // ORDINARY_TOKEN_COUNT_MAX,
+            )
+        return max(1, math.ceil(value / ORDINARY_TOKEN_COUNT_MAX))
+
+    chunk_count = max(
+        chunks_needed(fold.count),
+        chunks_needed(fold.input_tokens),
+        chunks_needed(fold.output_tokens),
+        chunks_needed(fold.estimated_output_bound),
+        chunks_needed(fold.image_count),
+        chunks_needed(fold.generation_count),
+        chunks_needed(fold.video_seconds),
+        chunks_needed(fold.audio_seconds),
+        chunks_needed(fold.input_characters),
+    )
+    if chunk_count == 1:
+        return [dataclasses.replace(fold)]
+
+    remaining_count = fold.count
+    remaining_input = fold.input_tokens
+    remaining_output = fold.output_tokens
+    remaining_bound = fold.estimated_output_bound
+    remaining_image_count = fold.image_count
+    remaining_generation_count = fold.generation_count
+    remaining_video_seconds = fold.video_seconds
+    remaining_audio_seconds = fold.audio_seconds
+    remaining_input_characters = fold.input_characters
+    chunks: list[_ReceiptFold] = []
+    for index in range(chunk_count):
+        chunks_left = chunk_count - index
+        count = min(
+            ORDINARY_TOKEN_COUNT_MAX,
+            remaining_count - (chunks_left - 1),
+        )
+        input_tokens = min(ORDINARY_TOKEN_COUNT_MAX, remaining_input)
+        output_tokens = min(ORDINARY_TOKEN_COUNT_MAX, remaining_output)
+        output_bound = min(ORDINARY_TOKEN_COUNT_MAX, remaining_bound)
+        image_count = (
+            None
+            if remaining_image_count is None
+            else min(ORDINARY_TOKEN_COUNT_MAX, remaining_image_count)
+        )
+        generation_count = (
+            None
+            if remaining_generation_count is None
+            else min(ORDINARY_TOKEN_COUNT_MAX, remaining_generation_count)
+        )
+        video_seconds = (
+            None
+            if remaining_video_seconds is None
+            else min(float(ORDINARY_TOKEN_COUNT_MAX), remaining_video_seconds)
+        )
+        audio_seconds = (
+            None
+            if remaining_audio_seconds is None
+            else min(float(ORDINARY_TOKEN_COUNT_MAX), remaining_audio_seconds)
+        )
+        input_characters = (
+            None
+            if remaining_input_characters is None
+            else min(ORDINARY_TOKEN_COUNT_MAX, remaining_input_characters)
+        )
+        chunks.append(
+            dataclasses.replace(
+                fold,
+                count=count,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                estimated_output_bound=output_bound,
+                image_count=image_count,
+                generation_count=generation_count,
+                video_seconds=video_seconds,
+                audio_seconds=audio_seconds,
+                input_characters=input_characters,
+            )
+        )
+        remaining_count -= count
+        remaining_input -= input_tokens
+        remaining_output -= output_tokens
+        remaining_bound -= output_bound
+        if remaining_image_count is not None and image_count is not None:
+            remaining_image_count -= image_count
+        if remaining_generation_count is not None and generation_count is not None:
+            remaining_generation_count -= generation_count
+        if remaining_video_seconds is not None and video_seconds is not None:
+            remaining_video_seconds -= video_seconds
+        if remaining_audio_seconds is not None and audio_seconds is not None:
+            remaining_audio_seconds -= audio_seconds
+        if remaining_input_characters is not None and input_characters is not None:
+            remaining_input_characters -= input_characters
+    return chunks
+
+
+def _build_receipt_replay_events(
+    key: _ReceiptFoldKey,
+    fold: _ReceiptFold,
+    sdk_instance_id: str | None,
+) -> list[MetadataEvent]:
+    """Build fresh replay identities for every 100M-safe partition."""
+    return [
+        _build_receipt_replay_event(key, chunk, sdk_instance_id)
+        for chunk in _split_receipt_fold(fold)
+    ]
 
 
 _UntrackedSurfaceKey = tuple[str, str, str, str]
@@ -378,17 +811,35 @@ class _ReporterBase:
         self._last_drop_log_at: float | None = None
         self._logged_first_drop = False
 
+        # Denial-only durability tail. Its own lock lets lifecycle finalizers
+        # retain the content-free state without retaining this reporter, and
+        # keeps folding bounded even when producer threads race a flush.
+        self._receipt_fold_state = _ReceiptFoldState()
+
         # Shutdown ownership. Every enqueue and (on the sync path) every
         # popped-but-unresolved ("in hand") drain item is tracked under this
         # lock so a completed close() can take final ownership of ALL
         # undelivered spend — a stuck flush thread must not requeue into, and a
         # racing producer must not append into, a queue nothing will ever drain.
-        # See _seal_delivery. The async reporter never populates _in_hand (its
-        # in-hand accounting rides the drains' CancelledError handlers) but
-        # shares the enqueue gate and the seal's straggler sweep.
+        # See _seal_delivery. The async reporter never populates the token
+        # maps or _in_hand (its in-hand accounting rides the drains'
+        # CancelledError handlers) but shares the enqueue gate and the seal's
+        # straggler sweep.
         self._ownership_lock = threading.Lock()
+        # Standalone confirms are fungible for accounting, so a count is
+        # sufficient. Event batches and settlement pairs have exact identities:
+        # concurrent background/final drains may resolve out of order, and each
+        # response must publish against its own opaque-token-owned prefix/pair.
         self._in_hand: dict[str, int] = {}
+        self._next_event_batch_token = 0
+        self._event_batches_in_hand: dict[_EventBatchToken, tuple[_PendingEvent, ...]] = {}
+        self._next_settlement_token = 0
+        self._settlements_in_hand: dict[_SettlementToken, _PendingSettlement] = {}
         self._delivery_closed = False
+        # Final replay is bounded by _RECEIPT_FOLD_LIMIT, but can legitimately
+        # exceed the ordinary queue capacity. Once final ownership begins the
+        # event path bypasses its normal producer bound until seal.
+        self._final_delivery_started = False
 
     def observe_project_id(self, project_id: str | None) -> None:
         """Remember the non-empty project resolved by a real/cached budget check."""
@@ -420,7 +871,7 @@ class _ReporterBase:
             snapshots = self._breaker_snapshots()
             reported_at = datetime.now(UTC)
         except Exception as exc:
-            logger.warning(
+            _log_warning(
                 "reporter.breaker_snapshot_failed: exc_type=%s",
                 type(exc).__name__,
             )
@@ -450,7 +901,7 @@ class _ReporterBase:
                     ),
                 )
             except Exception as exc:
-                logger.warning(
+                _log_warning(
                     "reporter.breaker_snapshot_invalid: provider=%s exc_type=%s",
                     provider.value,
                     type(exc).__name__,
@@ -528,12 +979,151 @@ class _ReporterBase:
     # Queueing + bounds
     # ------------------------------------------------------------------
 
+    def _receipt_fold_snapshot(self) -> dict[_ReceiptFoldKey, _ReceiptFold]:
+        """Return an isolated diagnostic snapshot for tests and observability."""
+        return self._receipt_fold_state.snapshot()
+
+    @staticmethod
+    def _event_drop_weight(event: MetadataEvent) -> int:
+        """Underlying receipt count represented by a terminal event loss."""
+        if event.status == CallStatus.BUDGET_DENIED:
+            return event.receipt_aggregate_count or 1
+        return 1
+
+    def _fold_or_record_event_drop(self, event: MetadataEvent, reason: str) -> None:
+        """Mutate fold/drop state without invoking logging callbacks."""
+        outcome = self._receipt_fold_state.fold(event)
+        if outcome == "not_denied":
+            self._record_drop("event", reason)
+        elif outcome == "overflow":
+            self._record_drop(
+                "event",
+                "receipt_fold_overflow",
+                n=self._event_drop_weight(event),
+            )
+        elif outcome == "terminal":
+            self._record_drop("event", reason, n=self._event_drop_weight(event))
+
+    def _fold_or_count_event_drop(self, event: MetadataEvent, reason: str) -> None:
+        """Fold denied receipts; preserve ordinary event drop accounting."""
+        self._fold_or_record_event_drop(event, reason)
+        self._maybe_log_drops()
+
+    def _dispose_pending_events(
+        self, pending: list[_PendingEvent], reason: str, *, emit: bool = True
+    ) -> None:
+        for item in pending:
+            self._fold_or_record_event_drop(item.event, reason)
+        if emit:
+            self._maybe_log_drops()
+
+    def _publish_ingest_rejections(
+        self,
+        events: list[MetadataEvent],
+        rejections: _IngestRejections,
+        *,
+        emit: bool = True,
+    ) -> None:
+        """Publish terminal 202 members after their transport owner resolves.
+
+        Exact identities take the normal denial-aware disposition. A partial
+        legacy response preserves only its proven count because selecting an
+        event would guess at identity; a full-batch legacy rejection proves
+        every identity and can use the same denial-aware disposition.
+        Malformed bodies retain the existing fail-open behavior.
+        """
+        if rejections.kind is _IngestRejectionKind.EXACT:
+            for index in sorted(rejections.indexes):
+                if 0 <= index < len(events):
+                    self._fold_or_record_event_drop(events[index], "ingest_rejected")
+        elif rejections.kind is _IngestRejectionKind.LEGACY:
+            if rejections.count == len(events):
+                # Index-less responses normally prove only a count. When the
+                # server rejected the ENTIRE batch, however, every identity is
+                # proven terminal: dispose each event so an aggregate replay
+                # preserves its represented receipt cardinality and sums.
+                for event in events:
+                    self._fold_or_record_event_drop(event, "ingest_rejected")
+            else:
+                self._record_drop("event", "ingest_rejected", n=min(rejections.count, len(events)))
+        if emit:
+            self._maybe_log_drops()
+
+    def _dispose_settlements(
+        self, pending: list[_PendingSettlement], reason: str, *, emit: bool = True
+    ) -> None:
+        if not pending:
+            return
+        self._record_drop("settlement_confirm", reason, n=len(pending))
+        for item in pending:
+            self._fold_or_record_event_drop(item.event, reason)
+        if emit:
+            self._maybe_log_drops()
+
+    def _enqueue_event_locked(self, event: MetadataEvent) -> None:
+        """Append one event and own any bound eviction without reacquiring.
+
+        The caller holds ``_ownership_lock`` and has already established that
+        delivery is open. Publishing an overflow disposition before releasing
+        that lock keeps a settlement's token-to-event transition indivisible
+        from close/seal.
+        """
+        self._queue.append(_PendingEvent(event))
+        if self._final_delivery_started or len(self._queue) <= self.max_queue_size:
+            return
+        try:
+            evicted = self._queue.popleft()
+        except IndexError:
+            return
+        self._fold_or_record_event_drop(evicted.event, "overflow")
+
+    def _enqueue_event_owned(self, event: MetadataEvent) -> bool:
+        with self._ownership_lock:
+            if self._delivery_closed:
+                return False
+            self._enqueue_event_locked(event)
+        self._maybe_log_drops()
+        return True
+
+    def _replay_event(self, key: _ReceiptFoldKey, fold: _ReceiptFold) -> MetadataEvent:
+        """Build one fresh normal-wire aggregate from content-free fold state."""
+        return _build_receipt_replay_event(key, fold, self._sdk_instance_id)
+
+    def _drain_receipt_folds_to_queue(self, *, final: bool) -> None:
+        """Move one eligible fold snapshot through the ordinary event queue."""
+        with self._ownership_lock:
+            folds = self._receipt_fold_state.take_for_cycle(final=final)
+            replay_events = [
+                self._replay_event(key, chunk)
+                for key, fold in folds
+                for chunk in _split_receipt_fold(fold)
+            ]
+            if final:
+                self._final_delivery_started = True
+            # The terminal snapshot is strictly bounded to 256 entries. Move
+            # the whole snapshot under one ownership transaction and bypass
+            # the ordinary producer capacity so a healthy close can deliver
+            # every aggregate even when max_queue_size is tiny.
+            if self._delivery_closed:
+                for event in replay_events:
+                    self._fold_or_record_event_drop(event, "shutdown_deadline")
+            elif final:
+                self._queue.extend(_PendingEvent(event) for event in replay_events)
+            else:
+                for event in replay_events:
+                    # Non-final recovery remains subject to the ordinary
+                    # capacity bound. Any eviction re-folds under this same
+                    # ownership transaction, so seal can never observe a
+                    # take-before-enqueue gap.
+                    self._enqueue_event_locked(event)
+        self._maybe_log_drops()
+
     def _enqueue(self, event: MetadataEvent) -> bool:
         """Add an event to the queue.  Counted drop-oldest on overflow.
 
         Returns False (the caller counts the refusal) once delivery has sealed.
         """
-        return self._enqueue_owned(self._queue, _PendingEvent(event), self.max_queue_size, "event")
+        return self._enqueue_event_owned(event)
 
     def _enqueue_owned(
         self,
@@ -541,33 +1131,28 @@ class _ReporterBase:
         item: _T,
         maxlen: int,
         kind: str,
-        on_evict: Callable[[_T], None] | None = None,
     ) -> bool:
         """Append under the ownership lock; refuse once delivery has sealed.
 
         Returns False when ``_seal_delivery`` already ran — the caller counts
         the refusal. Without this gate an enqueue could pass the shutdown
         check, lose the race with close()'s final drain, and append into a
-        queue nothing will ever drain. The drop-oldest bound is enforced
-        OUTSIDE the lock (the bound is approximate by design; deque ops are
-        individually thread-safe) so eviction accounting never logs while
-        holding the ownership lock. ``on_evict`` sees the evicted item so a
-        compound item can salvage or account its other half (a settlement
-        pair's metadata event).
+        queue nothing will ever drain. The drop-oldest mutation and its counter
+        publication share the ownership transaction; warning emission happens
+        only after the lock is released.
         """
         with self._ownership_lock:
             if self._delivery_closed:
                 return False
             queue.append(item)
-        if len(queue) > maxlen:
-            try:
-                evicted = queue.popleft()
-            except IndexError:
-                pass
-            else:
-                self._count_drop(kind, "overflow")
-                if on_evict is not None:
-                    on_evict(evicted)
+            if len(queue) > maxlen:
+                try:
+                    queue.popleft()
+                except IndexError:
+                    pass
+                else:
+                    self._record_drop(kind, "overflow")
+        self._maybe_log_drops()
         return True
 
     def _move_event_to_queue(self, event: MetadataEvent) -> None:
@@ -578,13 +1163,33 @@ class _ReporterBase:
         Once delivery has sealed nothing will drain the event queue: count the
         loss instead of appending it stranded.
         """
-        enqueued = self._enqueue_owned(
-            self._queue, _PendingEvent(event), self.max_queue_size, "event"
-        )
+        enqueued = self._enqueue_event_owned(event)
         if not enqueued:
-            self._count_drop("event", "shutdown_deadline")
+            self._fold_or_count_event_drop(event, "shutdown_deadline")
 
-    def _seal_delivery(self) -> None:
+    def _enqueue_settlement_owned(self, pending: _PendingSettlement) -> bool:
+        """Append a pair and atomically transfer any control-queue eviction."""
+        enqueued = False
+        with self._ownership_lock:
+            if self._delivery_closed:
+                return False
+            self._settlement_queue.append(pending)
+            enqueued = True
+            if len(self._settlement_queue) > _MAX_PENDING_CONTROL:
+                try:
+                    evicted = self._settlement_queue.popleft()
+                except IndexError:
+                    pass
+                else:
+                    self._record_drop("settlement_confirm", "overflow")
+                    self._enqueue_event_locked(evicted.event)
+        self._maybe_log_drops()
+        return enqueued
+
+    def _mark_delivery_completed_locked(self) -> None:
+        """Concrete sync reporters mark seal completion under ownership."""
+
+    def _seal_delivery(self, *, emit: bool = True) -> bool:
         """Take final ownership of every queued or in-hand item at close().
 
         Runs after close()'s final flush. A join-timeout-stranded sync flush
@@ -597,19 +1202,59 @@ class _ReporterBase:
         within the deadline. A stuck send that later succeeds leaves a
         conservative overcount for that one item; drops are never UNDERstated.
         """
+        sealed = False
         with self._ownership_lock:
+            # A second sealer cannot observe this flag until the first releases
+            # the same lock, by which point every mutation and disposition below
+            # (including the concrete completion marker) is already published.
+            if self._delivery_closed:
+                return False
             self._delivery_closed = True
             in_hand = dict(self._in_hand)
             self._in_hand.clear()
+            event_batches = list(self._event_batches_in_hand.values())
+            self._event_batches_in_hand.clear()
+            settlement_tokens = list(self._settlements_in_hand.values())
+            self._settlements_in_hand.clear()
             n_confirm = _drain_count(self._confirm_queue)
-            n_settlement = _drain_count(self._settlement_queue)
-            n_event = _drain_count(self._queue)
-        self._count_drop("confirm", "shutdown_deadline", n=n_confirm + in_hand.get("confirm", 0))
-        self._count_settlement_drop(
-            "shutdown_deadline", n=n_settlement + in_hand.get("settlement", 0)
-        )
-        self._count_drop("event", "shutdown_deadline", n=n_event + in_hand.get("event", 0))
-        self._maybe_log_drops(force=True)
+            settlements: list[_PendingSettlement] = []
+            while self._settlement_queue:
+                settlements.append(self._settlement_queue.popleft())
+            events: list[_PendingEvent] = []
+            while self._queue:
+                events.append(self._queue.popleft())
+            # Settlement pairs keep exact token/queue ownership until both
+            # halves have a published shutdown disposition. A seal racing a
+            # late response can therefore never observe or create a gap.
+            self._dispose_settlements(
+                [*settlements, *settlement_tokens], "shutdown_deadline", emit=False
+            )
+            # Direct seals (tests, timeout races, lifecycle edges) are final
+            # owners too. Consume and terminalize any folds not already moved
+            # into the normal event path by the final flush.
+            residual_folds = self._receipt_fold_state.take_for_cycle(final=True)
+            for key, fold in residual_folds:
+                for chunk in _split_receipt_fold(fold):
+                    self._fold_or_record_event_drop(
+                        self._replay_event(key, chunk),
+                        "shutdown_deadline",
+                    )
+            # Claim and mutation are indivisible. In particular, an expired
+            # daemon drain must never make an event disappear from both the
+            # queue/token maps and the published terminal accounting while a
+            # concurrent close returns. These helpers mutate only; warning
+            # handlers run after ownership is released.
+            self._record_drop(
+                "confirm", "shutdown_deadline", n=n_confirm + in_hand.get("confirm", 0)
+            )
+            self._dispose_pending_events(events, "shutdown_deadline", emit=False)
+            for batch in event_batches:
+                self._dispose_pending_events(list(batch), "shutdown_deadline", emit=False)
+            self._mark_delivery_completed_locked()
+            sealed = True
+        if emit:
+            self._maybe_log_drops(force=True)
+        return sealed
 
     def _requeue_cancelled(self, queue: collections.deque[_T], items: list[_T]) -> bool:
         """Return a cancelled drain's in-hand items to the head of their queue.
@@ -627,16 +1272,6 @@ class _ReporterBase:
                 return False
             queue.extendleft(reversed(items))
             return True
-
-    def _drain_batch(self) -> list[MetadataEvent]:
-        """Drain up to batch_size events from the front of the queue."""
-        batch: list[MetadataEvent] = []
-        for _ in range(min(self.batch_size, len(self._queue))):
-            try:
-                batch.append(self._queue.popleft().event)
-            except IndexError:
-                break
-        return batch
 
     # ------------------------------------------------------------------
     # Retry / backoff / deadline arithmetic
@@ -677,12 +1312,11 @@ class _ReporterBase:
     # Drop accounting
     # ------------------------------------------------------------------
 
-    def _count_drop(self, kind: str, reason: str, n: int = 1) -> None:
-        """Record ``n`` dropped spend items keyed ``"{kind}.{reason}"``.
+    def _record_drop(self, kind: str, reason: str, n: int = 1) -> None:
+        """Record drops without invoking logging callbacks.
 
-        Logging is driven from HERE (rate-limited by ``_maybe_log_drops``), not
-        only from flush cycles: the first drop ever must warn immediately, and
-        a post-close drop has no later flush cycle to surface it.
+        This mutation-only primitive is safe inside ``_ownership_lock``. Drop
+        warnings are emitted only after the ownership transaction completes.
         """
         if n <= 0:
             return
@@ -690,15 +1324,16 @@ class _ReporterBase:
             key = f"{kind}.{reason}"
             self._drop_counts[key] = self._drop_counts.get(key, 0) + n
             self._drops_since_last_log += n
-        self._maybe_log_drops()
 
-    def _count_settlement_drop(self, reason: str, n: int = 1) -> None:
-        """Count a lost settlement PAIR: its confirm AND its metadata event.
+    def _count_drop(self, kind: str, reason: str, n: int = 1) -> None:
+        """Record ``n`` dropped spend items keyed ``"{kind}.{reason}"``.
 
-        Counting only the confirm half understates real event loss.
+        Logging is driven from HERE (rate-limited by ``_maybe_log_drops``), not
+        only from flush cycles: the first drop ever must warn immediately, and
+        a post-close drop has no later flush cycle to surface it.
         """
-        self._count_drop("settlement_confirm", reason, n)
-        self._count_drop("event", reason, n)
+        self._record_drop(kind, reason, n)
+        self._maybe_log_drops()
 
     def _maybe_log_drops(self, *, force: bool = False) -> None:
         """Emit an aggregated drop WARNING, rate-limited to one per interval.
@@ -725,7 +1360,10 @@ class _ReporterBase:
             self._drops_since_last_log = 0
             self._last_drop_log_at = now
             self._logged_first_drop = True
-        logger.warning("reporter.spend_events_dropped: new=%d totals=%s", since, totals)
+        # Host applications may install arbitrary logging handlers. Spend
+        # ownership/disposition is already complete; logging must never roll
+        # it back, strand a token, or deadlock through reentrancy.
+        _log_warning("reporter.spend_events_dropped: new=%d totals=%s", since, totals)
 
     @property
     def dropped_counts(self) -> dict[str, int]:
@@ -750,7 +1388,7 @@ class _ReporterBase:
             return _SendOutcome.RETRY
         if isinstance(exc, httpx.HTTPStatusError):
             # Status code only — never a body (privacy).
-            logger.warning(
+            _log_warning(
                 "reporter.confirm_terminal_status: status=%d",
                 exc.response.status_code,
             )
@@ -769,13 +1407,13 @@ class _ReporterBase:
         self._consecutive_confirm_failures += 1
         count = self._consecutive_confirm_failures
         if count >= self._confirm_failure_threshold:
-            logger.error(
+            _log_error(
                 "reporter.confirm_send_persistent_failure: exc_type=%s consecutive_failures=%d",
                 type(exc).__name__,
                 count,
             )
         else:
-            logger.warning(
+            _log_warning(
                 "reporter.confirm_send_failed: exc_type=%s",
                 type(exc).__name__,
             )
@@ -789,33 +1427,37 @@ class _ReporterBase:
         self._consecutive_unparseable_responses += 1
         count = self._consecutive_unparseable_responses
         if count >= self._unparseable_response_threshold:
-            logger.error(
+            _log_error(
                 "reporter.ingest_response_unparseable_persistent: "
                 "exc_type=%s consecutive_failures=%d",
                 type(exc).__name__,
                 count,
             )
         else:
-            logger.warning(
+            _log_warning(
                 "reporter.ingest_response_unparseable: exc_type=%s",
                 type(exc).__name__,
             )
 
-    def _log_ingest_rejections(self, response: httpx.Response, batch_size: int) -> None:
-        """Surface per-event rejection dispositions from the 202 ingest body.
+    def _parse_ingest_rejections(
+        self, response: httpx.Response, batch_size: int
+    ) -> _IngestRejections:
+        """Parse and log a 202 body without publishing any disposition.
 
         The API returns 202 for every well-formed request; accepted events are
         already durable and rejected events are terminal — they reject
-        identically on every resubmission until a pricing entry lands
-        server-side — so rejections are COUNTED (``event.ingest_rejected``) and
-        dropped, never re-queued: a rejected member is lost spend telemetry,
-        and ``_send_batch`` reports SENT for the batch as a whole.
+        identically on every resubmission until a pricing entry lands. Exact
+        indexes let the drain dispose the selected owned events; a partial
+        legacy index-less body preserves only its bounded loss count, while a
+        full-batch legacy rejection proves every identity. Disposition is
+        deliberately deferred to the drain so sync ownership release and
+        publication can be one atomic operation with respect to close/seal.
         One WARNING per distinct (code, model) per batch keeps a fleet stuck
         on a single unpriced model from flooding logs. The server's message is
         logged verbatim (repr-escaped server-side) and never parsed.
 
         Fail-open: a malformed body must never raise into the flush loop —
-        fall back to the pre-v0.1.7 count-only acknowledgment and log once.
+        acknowledge the successful transport without guessing a disposition.
         """
         try:
             rejected = response.json()["rejected"]
@@ -825,7 +1467,7 @@ class _ReporterBase:
                 raise TypeError(f"rejected is {type(rejected).__name__}, expected list")
             if not rejected:
                 self._record_parseable_response()
-                return
+                return _IngestRejections(_IngestRejectionKind.CLEAN)
             if len(rejected) > batch_size:
                 # Contract violation — and a cap: a compromised/misrouted
                 # server cannot flood logs or the groups dict with more
@@ -835,6 +1477,8 @@ class _ReporterBase:
             # half-logged flush behind. First message per group wins (the
             # server's message is keyed by the same (code, model) inputs).
             groups: dict[tuple[str, str], tuple[int, str]] = {}
+            rejected_indexes: list[int] = []
+            indexes_complete = True
             for rejection in rejected:
                 key = (
                     _escape_control(str(rejection["code"])),
@@ -842,16 +1486,38 @@ class _ReporterBase:
                 )
                 count, message = groups.get(key, (0, _escape_control(str(rejection["message"]))))
                 groups[key] = (count + 1, message)
+                try:
+                    raw_index = rejection["index"]
+                    if type(raw_index) is not int:
+                        raise TypeError("rejection index is not a JSON integer")
+                    index = raw_index
+                    if index < 0 or index >= batch_size:
+                        raise ValueError("rejection index outside submitted batch")
+                except KeyError:
+                    # Compatibility with pre-index response fixtures/servers:
+                    # retain the established count-only accounting when the
+                    # exact rejected event cannot be identified safely.
+                    indexes_complete = False
+                else:
+                    rejected_indexes.append(index)
+            if indexes_complete and len(set(rejected_indexes)) != len(rejected_indexes):
+                raise ValueError("duplicate rejection index")
             self._record_parseable_response()
         except Exception as exc:
             self._record_unparseable_response(exc)
-            return
-        # Rejected members are terminal spend loss, not just a log line —
-        # dropped_counts must not understate real event loss (#9 review pin).
-        self._count_drop("event", "ingest_rejected", n=len(rejected))
+            return _IngestRejections(_IngestRejectionKind.MALFORMED)
+        result = (
+            _IngestRejections(
+                _IngestRejectionKind.EXACT,
+                indexes=frozenset(rejected_indexes),
+                count=len(rejected),
+            )
+            if indexes_complete
+            else _IngestRejections(_IngestRejectionKind.LEGACY, count=len(rejected))
+        )
         try:
             for (code, model), (count, message) in groups.items():
-                logger.warning(
+                _log_warning(
                     "reporter.ingest_events_rejected: code=%s model=%s count=%d message=%s",
                     code,
                     model,
@@ -864,7 +1530,8 @@ class _ReporterBase:
             # A fallback log would raise again; rejection detail is
             # best-effort, but letting this propagate would mislabel the batch
             # as a send failure in _send_batch's accounting.
-            return
+            pass
+        return result
 
 
 class MetadataReporter(_ReporterBase):
@@ -922,6 +1589,24 @@ class MetadataReporter(_ReporterBase):
             retry_backoff_cap=retry_backoff_cap,
             shutdown_deadline=shutdown_deadline,
         )
+        # ``_delivery_closed`` (base) is the early enqueue-refusal gate.
+        # Completion is distinct and becomes true only at the END of seal's
+        # ownership transaction. The close lock selects one final-drain sender
+        # when worker-reentrant, external, and exit closes race.
+        self._delivery_completed = False
+        # Whole-close completion is later than spend sealing: lifecycle rescue
+        # stays armed until the transport has also closed successfully.
+        self._close_completed = False
+        self._close_finalization_owner: threading.Thread | None = None
+        self._transport_close_started = False
+        self._transport_close_owner: threading.Thread | None = None
+        # Every close request contributes one absolute deadline. Nested and
+        # competing callers may only tighten this process-local minimum.
+        self._close_state_lock = threading.Lock()
+        self._close_state_changed = threading.Condition(self._close_state_lock)
+        self._earliest_close_deadline: float | None = None
+        self._close_lock = threading.RLock()
+        self._worker_finalize_deadline: float | None = None
         self._http = httpx.Client(timeout=10.0)
         self._shutdown = threading.Event()
         self._in_flight_lock = threading.Lock()
@@ -981,23 +1666,56 @@ class MetadataReporter(_ReporterBase):
         client is abandoned (never closed — the parent owns those sockets).
         Queued spend items duplicated into the child by fork are deliberately
         KEPT: the server dedups them. Inherited advisory observations are
-        discarded because parent and child mint different report IDs. A closed
-        reporter stays closed (fresh shutdown Event kept set — see below).
+        discarded because parent and child mint different report IDs. A
+        completed reporter stays terminal; an interrupted seal reopens only
+        the internal delivery gate so the child's close/atexit owner can finish
+        the retained queues (the public shutdown request remains set).
         """
+        # Read the inherited flag pair without its old ownership lock: at-fork
+        # child repair runs single-threaded, and that lock may be held forever
+        # by a vanished parent thread. `_delivery_closed` is published at the
+        # START of seal while `_delivery_completed` is published at its END.
+        # The mismatched pair therefore means no surviving owner can finish the
+        # inherited transition unless the child reopens the internal gate.
+        interrupted_seal = self._delivery_closed and not self._delivery_completed
         self._breaker_project_lock = threading.Lock()
         self._breaker_report_lock = threading.Lock()
         if self._untracked_state is not None:
             self._untracked_state.reset_after_fork_in_child()
+        self._receipt_fold_state.reset_after_fork_in_child()
         self._drop_lock = threading.Lock()
         self._in_flight_lock = threading.Lock()
         self._breaker_worker_lock = threading.Lock()
         self._untracked_worker_lock = threading.Lock()
         self._thread_lock = threading.Lock()
+        self._close_lock = threading.RLock()
+        self._close_state_lock = threading.Lock()
+        self._close_state_changed = threading.Condition(self._close_state_lock)
         self._ownership_lock = threading.Lock()
+        if interrupted_seal:
+            self._delivery_closed = False
+        # The inherited client belongs to the parent, and any inherited close
+        # deadline belonged to a vanished thread. The fresh child transport
+        # gets a fresh completion attempt even when spend delivery was already
+        # terminal in the parent snapshot.
+        self._close_completed = False
+        self._close_finalization_owner = None
+        self._transport_close_started = False
+        self._transport_close_owner = None
+        self._earliest_close_deadline = None
         # In-hand items live on the parent's (now-absent) flush thread stack;
         # the parent delivers them. The child's view starts clean.
         self._in_hand = {}
+        self._next_event_batch_token = 0
+        self._event_batches_in_hand = {}
+        self._next_settlement_token = 0
+        self._settlements_in_hand = {}
         self._in_flight = 0
+        self._final_delivery_started = False
+        # The parent's worker cannot continue its close request in the child.
+        # Leave incomplete delivery for the child's atexit rescue instead of
+        # inheriting a deadline no live thread owns.
+        self._worker_finalize_deadline = None
         self._breaker_worker = None
         self._untracked_worker = None
         self._http = httpx.Client(timeout=10.0)
@@ -1025,11 +1743,177 @@ class MetadataReporter(_ReporterBase):
             # Nothing will ever drain a post-close enqueue — count it like
             # report_confirm/report_settlement do instead of retaining it
             # silently (a late streaming on_complete can land here).
-            self._count_drop("event", "closed_enqueue")
+            self._fold_or_count_event_drop(event, "closed_enqueue")
             return
         self._ensure_thread()
         if not self._enqueue(event):
-            self._count_drop("event", "closed_enqueue")
+            self._fold_or_count_event_drop(event, "closed_enqueue")
+
+    def _mark_delivery_completed_locked(self) -> None:
+        """Publish sync seal completion at the end of its ownership transaction."""
+        self._delivery_completed = True
+
+    def _delivery_is_completed(self) -> bool:
+        """Read sync completion through the same lock that publishes it."""
+        with self._ownership_lock:
+            return self._delivery_completed
+
+    def _close_is_completed(self) -> bool:
+        """Whether spend sealing and sync transport cleanup both finished."""
+        with self._close_state_lock:
+            return self._close_completed
+
+    def _tighten_close_deadline(self, deadline: float) -> float:
+        """Publish and return the earliest absolute sync close deadline."""
+        with self._close_state_changed:
+            current = self._earliest_close_deadline
+            if current is None or deadline < current:
+                current = deadline
+                self._earliest_close_deadline = current
+                self._close_state_changed.notify_all()
+            return current
+
+    def _effective_close_deadline(self, deadline: float | None) -> float | None:
+        """Combine a call-local bound with every nested/competing close."""
+        with self._close_state_lock:
+            close_deadline = self._earliest_close_deadline
+        if deadline is None:
+            return close_deadline
+        if close_deadline is None:
+            return deadline
+        return min(deadline, close_deadline)
+
+    def _deadline_expired(self, deadline: float | None) -> bool:
+        """Apply a newly tightened close deadline to already-running drains."""
+        return super()._deadline_expired(self._effective_close_deadline(deadline))
+
+    def _send_timeout(self, deadline: float | None) -> float:
+        """Clamp sends to the latest view of the earliest close deadline."""
+        return super()._send_timeout(self._effective_close_deadline(deadline))
+
+    def _join_until_close_deadline(self, worker: threading.Thread, deadline: float | None) -> bool:
+        """Join without self-deadlock and notice a competing tighter deadline."""
+        if worker is threading.current_thread():
+            return False
+        while worker.is_alive():
+            effective = self._effective_close_deadline(deadline)
+            if effective is None:
+                worker.join()
+                continue
+            remaining = effective - _monotonic()
+            if remaining <= 0:
+                return False
+            # Thread.join cannot be interrupted when another caller tightens
+            # the deadline, so poll briefly and re-read the shared minimum.
+            worker.join(timeout=min(remaining, 0.01))
+        return True
+
+    def _acquire_close_until_deadline(self, deadline: float) -> bool:
+        """Acquire the close RLock while observing a dynamically tighter bound."""
+        while True:
+            effective = self._effective_close_deadline(deadline)
+            if effective is None:
+                self._close_lock.acquire()
+                return True
+            remaining = effective - _monotonic()
+            if remaining <= 0:
+                return self._close_lock.acquire(blocking=False)
+            if self._close_lock.acquire(timeout=min(remaining, 0.01)):
+                return True
+
+    def _close_transport(self) -> None:
+        """Idempotently close the sync transport, leaving rescue armed on failure."""
+        current = threading.current_thread()
+        with self._close_state_changed:
+            while self._transport_close_started and self._transport_close_owner is not current:
+                deadline = self._earliest_close_deadline
+                if deadline is None:
+                    self._close_state_changed.wait()
+                    continue
+                remaining = deadline - _monotonic()
+                if remaining <= 0:
+                    return
+                self._close_state_changed.wait(timeout=min(remaining, 0.01))
+            if self._close_completed or self._transport_close_owner is current:
+                return
+            self._transport_close_started = True
+            self._transport_close_owner = current
+        closed = False
+        try:
+            self._http.close()
+            closed = True
+        except Exception as exc:
+            _log_warning("reporter.transport_close_failed: exc_type=%s", type(exc).__name__)
+        finally:
+            with self._close_state_changed:
+                self._transport_close_started = False
+                self._transport_close_owner = None
+                if closed:
+                    self._close_completed = True
+                self._close_state_changed.notify_all()
+
+    def _claim_close_finalization(self, deadline: float, *, wait: bool) -> _CloseFinalizationClaim:
+        """Own spend finalization through advisory work and transport close."""
+        current = threading.current_thread()
+        with self._close_state_changed:
+            while True:
+                if self._close_completed:
+                    return _CloseFinalizationClaim.COMPLETED
+                owner = self._close_finalization_owner
+                if owner is None:
+                    self._close_finalization_owner = current
+                    return _CloseFinalizationClaim.ACQUIRED
+                if owner is current:
+                    return _CloseFinalizationClaim.REENTRANT
+                if not wait:
+                    return _CloseFinalizationClaim.BUSY
+                close_deadline = self._earliest_close_deadline
+                remaining = (
+                    deadline if close_deadline is None else min(deadline, close_deadline)
+                ) - _monotonic()
+                if remaining <= 0:
+                    return _CloseFinalizationClaim.EXPIRED
+                self._close_state_changed.wait(timeout=min(remaining, 0.01))
+
+    def _release_close_finalization(self) -> None:
+        """Release whole-close ownership after completion or a retryable failure."""
+        current = threading.current_thread()
+        with self._close_state_changed:
+            if self._close_finalization_owner is current:
+                self._close_finalization_owner = None
+                self._close_state_changed.notify_all()
+
+    def _request_worker_finalize(self, deadline: float) -> None:
+        """Ask the flush worker to finalize after its current owned batch."""
+        with self._close_state_lock:
+            if self._close_completed:
+                return
+            current = self._worker_finalize_deadline
+            self._worker_finalize_deadline = deadline if current is None else min(current, deadline)
+
+    def _take_worker_finalize_deadline(self) -> float | None:
+        with self._close_state_lock:
+            deadline = self._worker_finalize_deadline
+            self._worker_finalize_deadline = None
+            return deadline
+
+    def _finish_worker_requested_close(self) -> None:
+        """Let whichever reporter-owned worker exits first finish close."""
+        deadline = self._take_worker_finalize_deadline()
+        if deadline is None:
+            return
+        try:
+            # If an external closer already owns finalization it may be joining
+            # this worker. Waiting here would create a join/ownership cycle;
+            # that owner already carries the same globally-tightened deadline.
+            self._finish_close(deadline, wait_for_owner=False)
+        except Exception as exc:
+            # _finish_close seals spend before propagating. Worker teardown and
+            # arbitrary host logging callbacks remain fail-soft.
+            _log_warning(
+                "reporter.worker_finalization_failed: exc_type=%s",
+                type(exc).__name__,
+            )
 
     def close(self, timeout: float | None = None) -> None:
         """Flush remaining events and shut down within a single deadline.
@@ -1041,49 +1925,138 @@ class MetadataReporter(_ReporterBase):
         per-request timeout chain against a black-holed control plane.
         """
         budget = self.shutdown_deadline if timeout is None else timeout
-        deadline = _monotonic() + budget
-        # Serialize shutdown with cadence-triggered breaker launches. An active
-        # cycle is drained first; shutdown then takes a distinct forced snapshot
-        # so a state-change-only cycle cannot stand in for the final full view.
+        deadline = self._tighten_close_deadline(_monotonic() + budget)
+        # Serialize the stop request with cadence-triggered breaker launches.
+        # The finalization owner snapshots advisory workers after ingest stops.
         with self._breaker_worker_lock:
-            active_breaker_worker = self._breaker_worker
-            if active_breaker_worker is not None and not active_breaker_worker.is_alive():
-                active_breaker_worker = None
             self._shutdown.set()
+
+        # A host logging handler can reenter close() from this reporter's own
+        # flush thread. Joining ourselves is forbidden, and continuing into a
+        # recursive final drain while the current batch is still in hand would
+        # make close's ownership topology needlessly reentrant. The worker keeps
+        # the reporter alive, finishes that disposition, then runs the shared
+        # finalizer itself before its bound-method reference can disappear.
+        current = threading.current_thread()
+        if current in (self._thread, self._breaker_worker, self._untracked_worker):
+            self._request_worker_finalize(deadline)
+            return
 
         # Join the ingest loop within the remaining budget. If the join times
         # out, the final flush below STILL runs: deque ops are thread-safe and a
         # duplicate send is server-deduped via the idempotency ledger.
-        self._thread.join(timeout=max(0.0, deadline - _monotonic()))
-        self._final_flush_bounded(deadline)
-        self._seal_delivery()
+        self._join_until_close_deadline(self._thread, deadline)
+        self._finish_close(deadline)
 
-        with self._untracked_worker_lock:
-            active_untracked_worker = self._untracked_worker
-            if active_untracked_worker is not None and not active_untracked_worker.is_alive():
-                active_untracked_worker = None
-        if active_untracked_worker is not None:
-            active_untracked_worker.join(timeout=max(0.0, deadline - _monotonic()))
-        if not self._deadline_expired(deadline) and self._untracked_reports_due():
-            final_untracked_worker = self._start_untracked_cycle(
-                during_shutdown=True,
-                deadline=deadline,
-            )
-            if final_untracked_worker is not None:
-                final_untracked_worker.join(timeout=max(0.0, deadline - _monotonic()))
+    def _finish_close(self, deadline: float, *, wait_for_owner: bool = True) -> None:
+        """Run the one-owner final drain, or force-seal at a raced deadline.
 
-        if active_breaker_worker is not None:
-            active_breaker_worker.join(timeout=max(0.0, deadline - _monotonic()))
-        if active_breaker_worker is None or not self._deadline_expired(deadline):
-            final_breaker_worker = self._start_breaker_cycle(
-                during_shutdown=True, deadline=deadline, force=True
-            )
-            if final_breaker_worker is not None:
-                final_breaker_worker.join(timeout=max(0.0, deadline - _monotonic()))
-        # A worker still alive here consumed the absolute deadline. Preserve
-        # bounded shutdown by tearing down its stuck transport, as close() did
-        # before breaker state-change gating.
-        self._http.close()
+        Whole-close ownership selects the ONLY final sender through spend seal,
+        advisory cycles, and transport cleanup. A competing caller contributes
+        its tighter deadline and waits only within that bound; it never closes
+        the transport underneath the owner. Drop callbacks run after spend
+        ownership locks are released.
+        """
+        deadline = self._tighten_close_deadline(deadline)
+        claim = self._claim_close_finalization(deadline, wait=wait_for_owner)
+        if claim is _CloseFinalizationClaim.EXPIRED:
+            # The whole-close owner alone may run advisory work or close the
+            # transport. The expired waiter still atomically terminalizes spend
+            # so a paused daemon owner can never be the sole remaining record.
+            self._seal_delivery()
+            return
+        if claim is not _CloseFinalizationClaim.ACQUIRED:
+            return
+        try:
+            self._finish_close_owned(deadline)
+        finally:
+            self._release_close_finalization()
+
+    def _finish_close_owned(self, deadline: float) -> None:
+        """Complete the final drain while holding whole-close ownership."""
+        acquired = self._acquire_close_until_deadline(deadline)
+        if not acquired:
+            self._seal_delivery()
+            self._close_transport()
+            return
+
+        already_completed = False
+        sealed_here = False
+        close_error: Exception | None = None
+        active_breaker_worker: threading.Thread | None = None
+        try:
+            deadline = self._effective_close_deadline(deadline) or deadline
+            already_completed = self._delivery_is_completed()
+            if not already_completed:
+                with self._breaker_worker_lock:
+                    active_breaker_worker = self._breaker_worker
+                    if active_breaker_worker is not None and not active_breaker_worker.is_alive():
+                        active_breaker_worker = None
+                try:
+                    # Terminal fold ownership precedes the final worker. Even a
+                    # zero deadline leaves no aggregate without a disposition.
+                    self._drain_receipt_folds_to_queue(final=True)
+                    if not self._delivery_is_completed():
+                        self._final_flush_bounded(
+                            self._effective_close_deadline(deadline) or deadline
+                        )
+                except Exception as exc:
+                    close_error = exc
+                # Success, exception, or deadline race all end in the same
+                # ownership mutation before completion becomes observable.
+                sealed_here = self._seal_delivery(emit=False)
+        finally:
+            self._close_lock.release()
+
+        if sealed_here:
+            self._maybe_log_drops(force=True)
+        if already_completed or not sealed_here:
+            self._close_transport()
+            return
+        if close_error is not None:
+            self._close_transport()
+            raise close_error
+        try:
+            with self._untracked_worker_lock:
+                active_untracked_worker = self._untracked_worker
+                if active_untracked_worker is not None and not active_untracked_worker.is_alive():
+                    active_untracked_worker = None
+            if active_untracked_worker is not None:
+                self._join_until_close_deadline(active_untracked_worker, deadline)
+                # The worker clears its coalescing slot before it exits. Re-read
+                # that slot after the join: the pre-join local must not suppress
+                # one final cycle for observations that missed its snapshot.
+                with self._untracked_worker_lock:
+                    active_untracked_worker = self._untracked_worker
+                    if (
+                        active_untracked_worker is not None
+                        and not active_untracked_worker.is_alive()
+                    ):
+                        active_untracked_worker = None
+            if (
+                active_untracked_worker is None
+                and not self._deadline_expired(deadline)
+                and self._untracked_reports_due()
+            ):
+                final_untracked_worker = self._start_untracked_cycle(
+                    during_shutdown=True,
+                    deadline=self._effective_close_deadline(deadline),
+                )
+                if final_untracked_worker is not None:
+                    self._join_until_close_deadline(final_untracked_worker, deadline)
+
+            if active_breaker_worker is not None:
+                self._join_until_close_deadline(active_breaker_worker, deadline)
+            if active_breaker_worker is None or not self._deadline_expired(deadline):
+                final_breaker_worker = self._start_breaker_cycle(
+                    during_shutdown=True,
+                    deadline=self._effective_close_deadline(deadline),
+                    force=True,
+                )
+                if final_breaker_worker is not None:
+                    self._join_until_close_deadline(final_breaker_worker, deadline)
+        finally:
+            self._close_transport()
 
     def _final_flush_bounded(self, deadline: float) -> None:
         """Run close()'s final drain on a worker joined at ``deadline``.
@@ -1104,7 +2077,7 @@ class MetadataReporter(_ReporterBase):
             except Exception as exc:
                 # A raise on the worker would otherwise vanish into the thread
                 # excepthook; the seal still accounts whatever it left behind.
-                logger.warning("reporter.final_flush_failed: exc_type=%s", type(exc).__name__)
+                _log_warning("reporter.final_flush_failed: exc_type=%s", type(exc).__name__)
 
         try:
             worker = threading.Thread(target=_run, daemon=True, name="solwyn-final-flush")
@@ -1112,7 +2085,7 @@ class MetadataReporter(_ReporterBase):
         except RuntimeError:
             _run()
             return
-        worker.join(timeout=max(0.0, deadline - _monotonic()))
+        self._join_until_close_deadline(worker, deadline)
 
     def __enter__(self) -> MetadataReporter:
         return self
@@ -1122,20 +2095,22 @@ class MetadataReporter(_ReporterBase):
 
     def _flush_loop(self) -> None:
         """Background thread: periodically flush batches to the cloud."""
-        while not self._shutdown.is_set():
-            if self._shutdown.wait(timeout=self.flush_interval):
-                break
-            try:
-                self._flush_remaining()
-            except Exception as exc:
-                # The flush loop must survive anything a drain raises (a
-                # transport edge, a concurrent-close artifact): a dead flush
-                # thread strands ALL queued spend until overflow, silently.
-                logger.warning("reporter.flush_cycle_failed: exc_type=%s", type(exc).__name__)
-            if self._breaker_reports_due():
-                self._start_breaker_cycle()
-            if self._untracked_reports_due():
-                self._start_untracked_cycle()
+        try:
+            while not self._shutdown.is_set():
+                if self._shutdown.wait(timeout=self.flush_interval):
+                    break
+                try:
+                    self._flush_remaining()
+                except Exception as exc:
+                    # The flush loop must survive anything a drain raises: a
+                    # dead worker strands ALL queued spend until overflow.
+                    _log_warning("reporter.flush_cycle_failed: exc_type=%s", type(exc).__name__)
+                if self._breaker_reports_due():
+                    self._start_breaker_cycle()
+                if self._untracked_reports_due():
+                    self._start_untracked_cycle()
+        finally:
+            self._finish_worker_requested_close()
 
     def _flush_remaining(self, *, deadline: float | None = None, final: bool = False) -> None:
         """Flush queued confirms, settlements, then metadata events in batches.
@@ -1146,9 +2121,14 @@ class MetadataReporter(_ReporterBase):
         ``deadline`` (a monotonic instant) caps the whole chain; work still
         queued when it is reached is counted ``shutdown_deadline`` and dropped.
         """
+        # A prior successful metadata send is the recovery proof. Consume that
+        # one-shot gate before ordinary drains; final close gets exactly one
+        # unconditional attempt inside the same deadline.
+        self._drain_receipt_folds_to_queue(final=final)
         self._drain_confirms(deadline=deadline, final=final)
         self._drain_settlements(deadline=deadline, final=final)
-        self._drain_event_batches(deadline=deadline, final=final)
+        if self._drain_event_batches(deadline=deadline, final=final):
+            self._receipt_fold_state.note_cycle_success()
         self._maybe_log_drops(force=final)
 
     # ------------------------------------------------------------------
@@ -1175,16 +2155,90 @@ class MetadataReporter(_ReporterBase):
             self._in_hand[kind] = self._in_hand.get(kind, 0) + 1
             return item
 
-    def _pop_batch_in_hand(self, *, now: float, final: bool) -> list[_PendingEvent]:
-        """Atomically pop a due event-batch prefix and mark it all in hand.
+    def _pop_settlement_in_hand(self) -> _ClaimedSettlement | None:
+        """Atomically pop and token-register one exact settlement pair."""
+        with self._ownership_lock:
+            if self._delivery_closed:
+                return None
+            try:
+                pending = self._settlement_queue.popleft()
+            except IndexError:
+                return None
+            self._next_settlement_token += 1
+            token = _SettlementToken(self._next_settlement_token)
+            self._settlements_in_hand[token] = pending
+            return _ClaimedSettlement(token, pending)
+
+    def _resolve_settlement_to_event_queue(
+        self,
+        claim: _ClaimedSettlement,
+        *,
+        confirm_drop_reason: str | None = None,
+    ) -> bool:
+        """Atomically transfer one exact pair from token to event ownership."""
+        resolved = False
+        with self._ownership_lock:
+            pending = self._settlements_in_hand.pop(claim.token, None)
+            if pending is not None:
+                if confirm_drop_reason is not None:
+                    self._record_drop("settlement_confirm", confirm_drop_reason)
+                self._enqueue_event_locked(pending.event)
+                resolved = True
+        self._maybe_log_drops()
+        return resolved
+
+    def _resolve_settlement_bulk_to_event_queue(
+        self, claim: _ClaimedSettlement, *, confirm_drop_reason: str
+    ) -> bool:
+        """Atomically transfer one token and every queued pair to events."""
+        resolved = False
+        with self._ownership_lock:
+            pending = self._settlements_in_hand.pop(claim.token, None)
+            if pending is not None:
+                settlements = [pending, *self._settlement_queue]
+                self._settlement_queue.clear()
+                self._record_drop("settlement_confirm", confirm_drop_reason, n=len(settlements))
+                for item in settlements:
+                    self._enqueue_event_locked(item.event)
+                resolved = True
+        self._maybe_log_drops()
+        return resolved
+
+    def _dispose_queued_settlements(self, reason: str) -> None:
+        """Atomically terminally dispose every pair still in the queue."""
+        with self._ownership_lock:
+            settlements = list(self._settlement_queue)
+            self._settlement_queue.clear()
+            self._dispose_settlements(settlements, reason, emit=False)
+        self._maybe_log_drops()
+
+    def _dispose_queued_events(self, reason: str) -> None:
+        """Atomically claim and terminally dispose every queued event.
+
+        A final drain may run concurrently with close's seal after its bounded
+        join expires. Queue removal and the fold/drop mutation must therefore
+        be one ownership transaction: a local list alone is not an owner the
+        seal can observe, and the daemon worker is not guaranteed to resume.
+        Warning emission remains outside the ownership lock.
+        """
+        with self._ownership_lock:
+            events = list(self._queue)
+            self._queue.clear()
+            self._dispose_pending_events(events, reason, emit=False)
+        self._maybe_log_drops()
+
+    def _pop_batch_in_hand(self, *, now: float, final: bool) -> _ClaimedEventBatch | None:
+        """Atomically pop and token-register one due event-batch prefix.
 
         Same seal-gap rationale as ``_pop_in_hand``, for the batched event
-        drain. The inner IndexError guards stay: a concurrent drain's
-        deadline-expired sweep pops the queue outside this lock.
+        drain. A distinct token owns each prefix because concurrent background
+        and close/final drains can complete out of order. The inner IndexError
+        guards are defensive against an unexpectedly empty deque; every sync
+        production removal is serialized by this same ownership lock.
         """
         with self._ownership_lock:
             if self._delivery_closed:
-                return []
+                return None
             prefix: list[_PendingEvent] = []
             while len(prefix) < self.batch_size:
                 try:
@@ -1197,64 +2251,136 @@ class MetadataReporter(_ReporterBase):
                     prefix.append(self._queue.popleft())
                 except IndexError:
                     break
-            if prefix:
-                self._in_hand["event"] = self._in_hand.get("event", 0) + len(prefix)
-            return prefix
+            if not prefix:
+                return None
+            self._next_event_batch_token += 1
+            token = _EventBatchToken(self._next_event_batch_token)
+            pending = tuple(prefix)
+            self._event_batches_in_hand[token] = pending
+            return _ClaimedEventBatch(token, pending)
 
-    def _resolve_in_hand(
+    def _resolve_confirm(
         self,
-        kind: str,
-        n: int = 1,
+        *,
+        drop_reason: str | None = None,
         requeue: Callable[[], None] | None = None,
-    ) -> tuple[int, bool]:
-        """Release ``n`` in-hand items with a terminal disposition.
+    ) -> None:
+        """Release one in-hand confirm with its terminal disposition.
 
-        Returns ``(owned, requeued)``. ``owned`` is how many of the items
-        close()'s seal has NOT already claimed-and-counted — the caller
-        counts any drop for ``owned`` items only, so a seal never double
-        counts. ``requeue`` runs under the ownership lock and only while
-        delivery is open; once sealed, requeueing would strand the items in a
-        queue with no owner, so the caller counts them instead.
+        Confirm identities are fungible, so a count is sufficient. Loss
+        accounting nevertheless belongs in the SAME ownership transaction as
+        release: close may seal after its bounded worker join and the daemon is
+        not guaranteed to resume. ``requeue`` runs only while delivery is open;
+        if seal already claimed the confirm, ``owned`` is zero and this is a
+        no-op. Warning emission happens after ownership is released.
         """
+        recorded = False
         with self._ownership_lock:
-            held = self._in_hand.get(kind, 0)
-            owned = min(held, n)
+            held = self._in_hand.get("confirm", 0)
+            owned = min(held, 1)
             if owned:
-                self._in_hand[kind] = held - owned
+                self._in_hand["confirm"] = held - owned
             if requeue is not None and not self._delivery_closed:
                 requeue()
-                return owned, True
-            return owned, False
+                return
+            if owned and drop_reason is not None:
+                self._record_drop("confirm", drop_reason, n=owned)
+                recorded = True
+        if recorded:
+            self._maybe_log_drops()
+
+    def _dispose_queued_confirms(self, reason: str) -> None:
+        """Atomically claim and count every standalone queued confirm."""
+        with self._ownership_lock:
+            count = _drain_count(self._confirm_queue)
+            self._record_drop("confirm", reason, n=count)
+        self._maybe_log_drops()
+
+    def _resolve_confirm_and_queue(self, reason: str) -> None:
+        """Atomically dispose the in-hand confirm and its queued FIFO tail."""
+        with self._ownership_lock:
+            held = self._in_hand.get("confirm", 0)
+            owned = min(held, 1)
+            if owned:
+                self._in_hand["confirm"] = held - owned
+            count = owned + _drain_count(self._confirm_queue)
+            self._record_drop("confirm", reason, n=count)
+        self._maybe_log_drops()
+
+    def _resolve_sent_event_batch(
+        self, claim: _ClaimedEventBatch, result: _BatchSendResult
+    ) -> bool:
+        """Atomically release a sent sync batch and publish its rejections.
+
+        If close/seal already claimed the batch, ``owned`` is zero and the
+        response publishes nothing. A recovery proof requires an actual clean
+        response and full ownership of the sent prefix.
+        """
+        clean = False
+        with self._ownership_lock:
+            owned = self._event_batches_in_hand.pop(claim.token, None)
+            if owned is not None:
+                self._publish_ingest_rejections(
+                    [pending.event for pending in owned], result.rejections, emit=False
+                )
+                clean = result.rejections.kind is _IngestRejectionKind.CLEAN
+        self._maybe_log_drops()
+        return clean
+
+    def _resolve_retry_event_batch(
+        self,
+        claim: _ClaimedEventBatch,
+        *,
+        keep: list[_PendingEvent],
+    ) -> bool:
+        """Resolve a retry result by token, atomically requeueing its survivors."""
+        resolved = False
+        with self._ownership_lock:
+            owned = self._event_batches_in_hand.pop(claim.token, None)
+            if owned is not None:
+                keep_ids = {id(pending) for pending in keep}
+                owned_keep = [pending for pending in owned if id(pending) in keep_ids]
+                owned_dropped = [pending for pending in owned if id(pending) not in keep_ids]
+                if not self._delivery_closed:
+                    self._queue.extendleft(reversed(owned_keep))
+                    self._dispose_pending_events(owned_dropped, "retry_exhausted", emit=False)
+                    resolved = True
+                else:
+                    # Defensive invariant: seal normally clears every token
+                    # while it marks delivery closed.
+                    self._dispose_pending_events(list(owned), "shutdown_deadline", emit=False)
+        self._maybe_log_drops()
+        return resolved
+
+    def _resolve_dropped_event_batch(self, claim: _ClaimedEventBatch, reason: str) -> bool:
+        """Resolve one terminal batch by token and publish each owned identity."""
+        resolved = False
+        with self._ownership_lock:
+            owned = self._event_batches_in_hand.pop(claim.token, None)
+            if owned is not None:
+                self._dispose_pending_events(list(owned), reason, emit=False)
+                resolved = True
+        self._maybe_log_drops()
+        return resolved
 
     def _park_confirm(self, pending: _PendingConfirm) -> None:
         """Requeue a still-retryable confirm head — or count it once sealed."""
-        owned, requeued = self._resolve_in_hand(
-            "confirm", requeue=lambda: self._confirm_queue.appendleft(pending)
+        self._resolve_confirm(
+            drop_reason="shutdown_deadline",
+            requeue=lambda: self._confirm_queue.appendleft(pending),
         )
-        if not requeued and owned:
-            self._count_drop("confirm", "shutdown_deadline", n=owned)
 
-    def _park_settlement(self, pending: _PendingSettlement) -> None:
+    def _park_settlement(self, claim: _ClaimedSettlement) -> None:
         """Requeue a still-retryable settlement head — or count the pair."""
-        owned, requeued = self._resolve_in_hand(
-            "settlement", requeue=lambda: self._settlement_queue.appendleft(pending)
-        )
-        if not requeued and owned:
-            self._count_settlement_drop("shutdown_deadline", n=owned)
-
-    def _ship_settlement_event(self, event: MetadataEvent, owned: int = 1) -> None:
-        """Hand a resolved settlement's event to the event queue.
-
-        cost_events ingest is the durable spend truth, so the event must never
-        be lost because its confirm failed. Once delivery has sealed nothing
-        will drain the event queue — count the loss instead, unless close()'s
-        seal already claimed and counted the pair (``owned == 0``).
-        """
-        enqueued = self._enqueue_owned(
-            self._queue, _PendingEvent(event), self.max_queue_size, "event"
-        )
-        if not enqueued and owned:
-            self._count_drop("event", "shutdown_deadline", n=owned)
+        with self._ownership_lock:
+            pending = self._settlements_in_hand.pop(claim.token, None)
+            if pending is None:
+                return
+            if not self._delivery_closed:
+                self._settlement_queue.appendleft(pending)
+                return
+            self._dispose_settlements([pending], "shutdown_deadline", emit=False)
+        self._maybe_log_drops()
 
     # ------------------------------------------------------------------
     # Drains
@@ -1264,9 +2390,7 @@ class MetadataReporter(_ReporterBase):
         """Send due confirms in FIFO order; a retrying head parks the queue."""
         while self._confirm_queue:
             if self._deadline_expired(deadline):
-                self._count_drop(
-                    "confirm", "shutdown_deadline", n=_drain_count(self._confirm_queue)
-                )
+                self._dispose_queued_confirms("shutdown_deadline")
                 break
             # Atomic pop-and-claim, never peek-then-pop: once close()'s bounded
             # join times out, close/atexit drains CONCURRENTLY with the flush
@@ -1281,14 +2405,11 @@ class MetadataReporter(_ReporterBase):
                 break  # head still backing off — nothing behind is due earlier
             outcome = self._send_confirm(pending.request, timeout=self._send_timeout(deadline))
             if outcome is _SendOutcome.SENT:
-                self._resolve_in_hand("confirm")
+                self._resolve_confirm()
                 continue
             if outcome is _SendOutcome.HELD:
                 if final:
-                    owned, _ = self._resolve_in_hand("confirm")
-                    self._count_drop(
-                        "confirm", "exit_breaker_open", n=owned + _drain_count(self._confirm_queue)
-                    )
+                    self._resolve_confirm_and_queue("exit_breaker_open")
                 else:
                     self._park_confirm(pending)
                 break
@@ -1296,14 +2417,12 @@ class MetadataReporter(_ReporterBase):
                 pending.attempts += 1
                 finished, next_at = self._resolve_retryable(attempts=pending.attempts)
                 if finished or final:
-                    owned, _ = self._resolve_in_hand("confirm")
-                    self._count_drop("confirm", "retry_exhausted", n=owned)
+                    self._resolve_confirm(drop_reason="retry_exhausted")
                     continue
                 pending.next_attempt_at = next_at
                 self._park_confirm(pending)
                 break  # FIFO: nothing behind a backing-off head may jump it
-            owned, _ = self._resolve_in_hand("confirm")
-            self._count_drop("confirm", "terminal_status", n=owned)
+            self._resolve_confirm(drop_reason="terminal_status")
 
     def _drain_settlements(self, *, deadline: float | None = None, final: bool = False) -> None:
         """Resolve each settlement's confirm first, then hand its event to the
@@ -1311,23 +2430,21 @@ class MetadataReporter(_ReporterBase):
         A retrying head parks the queue behind it (FIFO)."""
         while self._settlement_queue:
             if self._deadline_expired(deadline):
-                self._count_settlement_drop(
-                    "shutdown_deadline", n=_drain_count(self._settlement_queue)
-                )
+                self._dispose_queued_settlements("shutdown_deadline")
                 break
             # Atomic pop-and-claim — see _drain_confirms for the rationale.
-            pending = self._pop_in_hand(self._settlement_queue, "settlement")
-            if pending is None:
+            claim = self._pop_settlement_in_hand()
+            if claim is None:
                 break
+            pending = claim.pending
             if not final and pending.confirm.next_attempt_at > _monotonic():
-                self._park_settlement(pending)
+                self._park_settlement(claim)
                 break
             outcome = self._send_confirm(
                 pending.confirm.request, timeout=self._send_timeout(deadline)
             )
             if outcome is _SendOutcome.SENT:
-                owned, _ = self._resolve_in_hand("settlement")
-                self._ship_settlement_event(pending.event, owned)
+                self._resolve_settlement_to_event_queue(claim)
                 continue
             if outcome is _SendOutcome.HELD:
                 if final:
@@ -1335,81 +2452,64 @@ class MetadataReporter(_ReporterBase):
                     # but ingest is NOT breaker-gated: hand every event to the
                     # event drain so the durable spend truth still gets its
                     # deadline-bounded exit attempt.
-                    owned, _ = self._resolve_in_hand("settlement")
-                    stranded: list[_PendingSettlement] = []
-                    while True:
-                        try:
-                            stranded.append(self._settlement_queue.popleft())
-                        except IndexError:
-                            break
-                    self._count_drop(
-                        "settlement_confirm", "exit_breaker_open", n=owned + len(stranded)
+                    self._resolve_settlement_bulk_to_event_queue(
+                        claim, confirm_drop_reason="exit_breaker_open"
                     )
-                    self._ship_settlement_event(pending.event, owned)
-                    for orphan in stranded:
-                        self._ship_settlement_event(orphan.event)
                 else:
-                    self._park_settlement(pending)
+                    self._park_settlement(claim)
                 break
             if outcome is _SendOutcome.RETRY:
                 pending.confirm.attempts += 1
                 finished, next_at = self._resolve_retryable(attempts=pending.confirm.attempts)
                 if finished or final:
-                    owned, _ = self._resolve_in_hand("settlement")
-                    self._count_drop("settlement_confirm", "retry_exhausted", n=owned)
-                    self._ship_settlement_event(pending.event, owned)
+                    self._resolve_settlement_to_event_queue(
+                        claim, confirm_drop_reason="retry_exhausted"
+                    )
                     continue
                 pending.confirm.next_attempt_at = next_at
-                self._park_settlement(pending)
+                self._park_settlement(claim)
                 break
             # Terminal confirm: the event is still the durable spend truth.
-            owned, _ = self._resolve_in_hand("settlement")
-            self._count_drop("settlement_confirm", "terminal_status", n=owned)
-            self._ship_settlement_event(pending.event, owned)
+            self._resolve_settlement_to_event_queue(claim, confirm_drop_reason="terminal_status")
 
-    def _drain_event_batches(self, *, deadline: float | None = None, final: bool = False) -> None:
+    def _drain_event_batches(self, *, deadline: float | None = None, final: bool = False) -> bool:
         """Send due metadata events in batches; requeue a failed batch to front."""
+        sent_clean_batch = False
+        cycle_clean = True
         while self._queue:
             if self._deadline_expired(deadline):
-                self._count_drop("event", "shutdown_deadline", n=_drain_count(self._queue))
+                cycle_clean = False
+                self._dispose_queued_events("shutdown_deadline")
                 break
             with self._in_flight_lock:
                 if self._in_flight >= self.max_in_flight:
                     break
             # Atomic pop-and-claim of the whole due prefix — see
             # _drain_confirms for the seal-gap rationale.
-            prefix = self._pop_batch_in_hand(now=_monotonic(), final=final)
-            if not prefix:
+            claim = self._pop_batch_in_hand(now=_monotonic(), final=final)
+            if claim is None:
                 break
-            outcome = self._send_batch([p.event for p in prefix], deadline=deadline)
-            if outcome is _SendOutcome.SENT:
-                self._resolve_in_hand("event", n=len(prefix))
+            prefix = list(claim.pending)
+            result = self._send_batch([p.event for p in prefix], deadline=deadline)
+            if result.outcome is _SendOutcome.SENT:
+                clean = self._resolve_sent_event_batch(claim, result)
+                sent_clean_batch = clean or sent_clean_batch
+                cycle_clean = clean and cycle_clean
                 continue
-            if outcome is _SendOutcome.RETRY:
+            if result.outcome is _SendOutcome.RETRY:
+                cycle_clean = False
                 keep: list[_PendingEvent] = []
-                dropped = 0
                 for p in prefix:
                     p.attempts += 1
                     finished, next_at = self._resolve_retryable(attempts=p.attempts)
-                    if finished or final:
-                        dropped += 1
-                    else:
+                    if not (finished or final):
                         p.next_attempt_at = next_at
                         keep.append(p)
-                owned, requeued = self._resolve_in_hand(
-                    "event",
-                    n=len(prefix),
-                    requeue=functools.partial(self._queue.extendleft, tuple(reversed(keep))),
-                )
-                if requeued:
-                    self._count_drop("event", "retry_exhausted", n=dropped)
-                else:
-                    # Sealed while in hand: whatever the seal did not claim is
-                    # abandoned here.
-                    self._count_drop("event", "shutdown_deadline", n=owned)
+                self._resolve_retry_event_batch(claim, keep=keep)
                 break
-            owned, _ = self._resolve_in_hand("event", n=len(prefix))
-            self._count_drop("event", "terminal_status", n=owned)
+            cycle_clean = False
+            self._resolve_dropped_event_batch(claim, "terminal_status")
+        return sent_clean_batch and cycle_clean
 
     def _start_breaker_cycle(
         self,
@@ -1425,9 +2525,18 @@ class MetadataReporter(_ReporterBase):
             worker = self._breaker_worker
             if worker is not None and worker.is_alive():
                 return worker
+
+            def _run() -> None:
+                try:
+                    self._flush_breaker_reports(deadline=deadline, force=force)
+                finally:
+                    with self._breaker_worker_lock:
+                        if self._breaker_worker is threading.current_thread():
+                            self._breaker_worker = None
+                    self._finish_worker_requested_close()
+
             worker = threading.Thread(
-                target=self._flush_breaker_reports,
-                kwargs={"deadline": deadline, "force": force},
+                target=_run,
                 daemon=True,
                 name="solwyn-breaker-reporter",
             )
@@ -1464,7 +2573,7 @@ class MetadataReporter(_ReporterBase):
                     # A read-only key denies every write: end the cycle instead
                     # of posting the remaining doomed snapshots.
                     return
-                logger.warning(
+                _log_warning(
                     "reporter.breaker_send_failed: provider=%s exc_type=%s",
                     report.provider.value,
                     type(exc).__name__,
@@ -1500,6 +2609,7 @@ class MetadataReporter(_ReporterBase):
                     # the coalescing slot.
                     if not self._shutdown.is_set() and self._untracked_reports_due():
                         self._start_untracked_cycle()
+                    self._finish_worker_requested_close()
 
             worker = threading.Thread(
                 target=_run,
@@ -1521,11 +2631,16 @@ class MetadataReporter(_ReporterBase):
                 continue
             self._mark_untracked_reports_attempted(batch)
             try:
+                effective_deadline = self._effective_close_deadline(deadline)
                 response = self._http.post(
                     f"{self.api_url}/api/v1/untracked-surfaces",
                     json=[built.report.model_dump(mode="json") for built in batch],
                     headers=self._auth_headers(),
-                    timeout=10.0 if deadline is None else self._send_timeout(deadline),
+                    timeout=(
+                        10.0
+                        if effective_deadline is None
+                        else super()._send_timeout(effective_deadline)
+                    ),
                 )
                 response.raise_for_status()
             except Exception:
@@ -1548,7 +2663,7 @@ class MetadataReporter(_ReporterBase):
             # Control plane known-down: hold this confirm for a later cycle
             # without paying the timeout. Does not touch the confirm-failure
             # counter or the breaker.
-            logger.debug("reporter.confirm_held_breaker_open")
+            _log_debug("reporter.confirm_held_breaker_open")
             return _SendOutcome.HELD
         try:
             resp = self._http.post(
@@ -1581,8 +2696,8 @@ class MetadataReporter(_ReporterBase):
 
     def _send_batch(
         self, batch: list[MetadataEvent], *, deadline: float | None = None
-    ) -> _SendOutcome:
-        """Send a batch of events to the cloud API and return its outcome.
+    ) -> _BatchSendResult:
+        """Send a batch and return transport plus parsed member dispositions.
 
         Ingest is deliberately NOT control-plane-breaker-guarded: opening the
         enforcement breaker (which flips budget checks to their fail-open
@@ -1593,7 +2708,8 @@ class MetadataReporter(_ReporterBase):
         black-holed control plane made close() overrun its budget by the full
         10s client timeout (P0 review finding).
         """
-        timeout = 10.0 if deadline is None else self._send_timeout(deadline)
+        effective_deadline = self._effective_close_deadline(deadline)
+        timeout = 10.0 if effective_deadline is None else super()._send_timeout(effective_deadline)
         with self._in_flight_lock:
             self._in_flight += 1
         try:
@@ -1605,20 +2721,25 @@ class MetadataReporter(_ReporterBase):
                 timeout=timeout,
             )
             resp.raise_for_status()
-            self._log_ingest_rejections(resp, len(batch))
-            return _SendOutcome.SENT
+            rejections = self._parse_ingest_rejections(resp, len(batch))
+            return _BatchSendResult(_SendOutcome.SENT, rejections)
         except Exception as exc:
             if handle_read_only_key_error(exc):
-                return _SendOutcome.SENT
+                return _BatchSendResult(
+                    _SendOutcome.SENT, _IngestRejections(_IngestRejectionKind.MALFORMED)
+                )
             # Log only the exception's class name — the type-name-only
             # convention every other except-block follows. Safe here even though
             # the batch is content-free; keeps the privacy contract uniform.
-            logger.warning(
+            _log_warning(
                 "Failed to send metadata batch (%d events): %s",
                 len(batch),
                 type(exc).__name__,
             )
-            return self._batch_failure_outcome(exc)
+            return _BatchSendResult(
+                self._batch_failure_outcome(exc),
+                _IngestRejections(_IngestRejectionKind.MALFORMED),
+            )
         finally:
             with self._in_flight_lock:
                 self._in_flight -= 1
@@ -1643,20 +2764,16 @@ class MetadataReporter(_ReporterBase):
     def report_settlement(self, request: BudgetConfirmRequest, event: MetadataEvent) -> None:
         """Fire-and-forget a stream settlement as one ordered queue item."""
         if self._shutdown.is_set():
-            self._count_settlement_drop("closed_enqueue")
+            self._count_drop("settlement_confirm", "closed_enqueue")
+            self._fold_or_count_event_drop(event, "closed_enqueue")
             return
         self._ensure_thread()
-        enqueued = self._enqueue_owned(
-            self._settlement_queue,
-            _PendingSettlement(_PendingConfirm(request), event),
-            _MAX_PENDING_CONTROL,
-            "settlement_confirm",
-            # An overflow-evicted pair drops only its confirm; the event is
-            # the durable spend truth and still rides the event queue.
-            on_evict=lambda evicted: self._ship_settlement_event(evicted.event),
+        enqueued = self._enqueue_settlement_owned(
+            _PendingSettlement(_PendingConfirm(request), event)
         )
         if not enqueued:
-            self._count_settlement_drop("closed_enqueue")
+            self._count_drop("settlement_confirm", "closed_enqueue")
+            self._fold_or_count_event_drop(event, "closed_enqueue")
 
 
 class AsyncMetadataReporter(_ReporterBase):
@@ -1747,9 +2864,16 @@ class AsyncMetadataReporter(_ReporterBase):
         self._breaker_report_lock = threading.Lock()
         if self._untracked_state is not None:
             self._untracked_state.reset_after_fork_in_child()
+        self._receipt_fold_state.reset_after_fork_in_child()
         self._drop_lock = threading.Lock()
         self._ownership_lock = threading.Lock()
+        self._in_hand = {}
+        self._next_event_batch_token = 0
+        self._event_batches_in_hand = {}
+        self._next_settlement_token = 0
+        self._settlements_in_hand = {}
         self._in_flight = 0
+        self._final_delivery_started = False
         self._flush_task = None
         self._breaker_task = None
         self._untracked_task = None
@@ -1816,7 +2940,7 @@ class AsyncMetadataReporter(_ReporterBase):
         except RuntimeError:
             if not self._warned_no_loop:
                 self._warned_no_loop = True
-                logger.warning(
+                _log_warning(
                     "reporter.enqueue_without_event_loop: no running event loop; "
                     "events stay queued until start() or close() runs inside a loop"
                 )
@@ -1826,14 +2950,14 @@ class AsyncMetadataReporter(_ReporterBase):
     def report(self, event: MetadataEvent) -> None:
         """Enqueue a metadata event for async reporting.  Non-blocking."""
         if self._closed:
-            self._count_drop("event", "closed_enqueue")
+            self._fold_or_count_event_drop(event, "closed_enqueue")
             return
         self._ensure_started()
         # Ownership-gated: a producer thread that passed the _closed check and
         # then lost the race with close()'s seal must be refused-and-counted,
         # never appended into a queue nothing will ever drain (#10 review pin).
         if not self._enqueue(event):
-            self._count_drop("event", "closed_enqueue")
+            self._fold_or_count_event_drop(event, "closed_enqueue")
 
     def report_confirm(self, request: BudgetConfirmRequest) -> None:
         """Fire-and-forget a confirm request onto the async flush queue."""
@@ -1851,20 +2975,29 @@ class AsyncMetadataReporter(_ReporterBase):
         """Fire-and-forget a stream settlement as one ordered queue item."""
         if self._closed:
             # The pair loses its confirm AND its event — count both halves.
-            self._count_settlement_drop("closed_enqueue")
+            self._count_drop("settlement_confirm", "closed_enqueue")
+            self._fold_or_count_event_drop(event, "closed_enqueue")
             return
         self._ensure_started()
-        enqueued = self._enqueue_owned(
-            self._settlement_queue,
-            _PendingSettlement(_PendingConfirm(request), event),
-            _MAX_PENDING_CONTROL,
-            "settlement_confirm",
-            # An overflow-evicted pair drops only its confirm; the event is
-            # the durable spend truth and still rides the event queue.
-            on_evict=lambda evicted: self._move_event_to_queue(evicted.event),
+        enqueued = self._enqueue_settlement_owned(
+            _PendingSettlement(_PendingConfirm(request), event)
         )
         if not enqueued:
-            self._count_settlement_drop("closed_enqueue")
+            self._count_drop("settlement_confirm", "closed_enqueue")
+            self._fold_or_count_event_drop(event, "closed_enqueue")
+
+    def _begin_blocking_exit(self) -> None:
+        """Refuse public work while lifecycle drains existing queues.
+
+        The blocking atexit path invokes user logging callbacks after its last
+        queue sweep. A callback may reenter ``report*``; closing both public
+        and ownership enqueue gates before the drain ensures that work gets a
+        terminal disposition instead of landing in an ownerless post-exit
+        queue. Lifecycle still consumes the already-queued items directly.
+        """
+        with self._ownership_lock:
+            self._closed = True
+            self._delivery_closed = True
 
     async def close(self, timeout: float | None = None) -> None:
         """Flush remaining events and shut down within a single deadline.
@@ -1891,6 +3024,10 @@ class AsyncMetadataReporter(_ReporterBase):
             self._shutdown_event.set()
         if self._flush_task is not None:
             await self._await_within(self._flush_task, deadline)
+        # Take terminal fold ownership before scheduling the final task. A
+        # zero remaining deadline can cancel that task before its coroutine
+        # body starts; folds must still have an owner and counted disposition.
+        self._drain_receipt_folds_to_queue(final=True)
         # The final flush rides its own task so the shared deadline can CANCEL
         # a slow-drip send: httpx timeouts bound individual socket operations,
         # not total response time, so an inline await could outlive the
@@ -1994,7 +3131,7 @@ class AsyncMetadataReporter(_ReporterBase):
                 except Exception as exc:
                     # The flush task must survive anything a drain raises: a
                     # dead flush task strands ALL queued spend until overflow.
-                    logger.warning("reporter.flush_cycle_failed: exc_type=%s", type(exc).__name__)
+                    _log_warning("reporter.flush_cycle_failed: exc_type=%s", type(exc).__name__)
                 if self._breaker_reports_due():
                     self._start_breaker_cycle()
                 if self._untracked_reports_due():
@@ -2008,9 +3145,11 @@ class AsyncMetadataReporter(_ReporterBase):
         See ``MetadataReporter._flush_remaining`` for the ``final`` / ``deadline``
         semantics.
         """
+        self._drain_receipt_folds_to_queue(final=final)
         await self._drain_confirms(deadline=deadline, final=final)
         await self._drain_settlements(deadline=deadline, final=final)
-        await self._drain_event_batches(deadline=deadline, final=final)
+        if await self._drain_event_batches(deadline=deadline, final=final):
+            self._receipt_fold_state.note_cycle_success()
         self._maybe_log_drops(force=final)
 
     async def _drain_confirms(self, *, deadline: float | None = None, final: bool = False) -> None:
@@ -2072,9 +3211,10 @@ class AsyncMetadataReporter(_ReporterBase):
         A retrying head parks the queue behind it (FIFO)."""
         while self._settlement_queue:
             if self._deadline_expired(deadline):
-                self._count_settlement_drop(
-                    "shutdown_deadline", n=_drain_count(self._settlement_queue)
-                )
+                stranded: list[_PendingSettlement] = []
+                while self._settlement_queue:
+                    stranded.append(self._settlement_queue.popleft())
+                self._dispose_settlements(stranded, "shutdown_deadline")
                 break
             try:
                 # Atomic pop — see _drain_confirms for the interleaving
@@ -2093,7 +3233,8 @@ class AsyncMetadataReporter(_ReporterBase):
                 # Same rescue-requeue as _drain_confirms; a seal-refused pair
                 # loses its confirm AND its event — count both.
                 if not self._requeue_cancelled(self._settlement_queue, [pending]):
-                    self._count_settlement_drop("shutdown_deadline")
+                    self._count_drop("settlement_confirm", "shutdown_deadline")
+                    self._fold_or_count_event_drop(pending.event, "shutdown_deadline")
                 raise
             if outcome is _SendOutcome.SENT:
                 self._move_event_to_queue(pending.event)
@@ -2127,11 +3268,17 @@ class AsyncMetadataReporter(_ReporterBase):
 
     async def _drain_event_batches(
         self, *, deadline: float | None = None, final: bool = False
-    ) -> None:
+    ) -> bool:
         """Send due metadata events in batches; requeue a failed batch to front."""
+        sent_clean_batch = False
+        cycle_clean = True
         while self._queue:
             if self._deadline_expired(deadline):
-                self._count_drop("event", "shutdown_deadline", n=_drain_count(self._queue))
+                cycle_clean = False
+                stranded: list[_PendingEvent] = []
+                while self._queue:
+                    stranded.append(self._queue.popleft())
+                self._dispose_pending_events(stranded, "shutdown_deadline")
                 break
             if self._in_flight >= self.max_in_flight:
                 break
@@ -2145,31 +3292,39 @@ class AsyncMetadataReporter(_ReporterBase):
             if not prefix:
                 break
             try:
-                outcome = await self._send_batch([p.event for p in prefix], deadline=deadline)
+                result = await self._send_batch([p.event for p in prefix], deadline=deadline)
             except asyncio.CancelledError:
                 # Same rescue-requeue as _drain_confirms, for the whole batch.
                 if not self._requeue_cancelled(self._queue, prefix):
-                    self._count_drop("event", "shutdown_deadline", n=len(prefix))
+                    self._dispose_pending_events(prefix, "shutdown_deadline")
                 raise
-            if outcome is _SendOutcome.SENT:
+            if result.outcome is _SendOutcome.SENT:
+                self._publish_ingest_rejections(
+                    [pending.event for pending in prefix], result.rejections
+                )
+                clean = result.rejections.kind is _IngestRejectionKind.CLEAN
+                sent_clean_batch = clean or sent_clean_batch
+                cycle_clean = clean and cycle_clean
                 continue
-            if outcome is _SendOutcome.RETRY:
+            if result.outcome is _SendOutcome.RETRY:
+                cycle_clean = False
                 keep: list[_PendingEvent] = []
-                dropped = 0
+                dropped: list[_PendingEvent] = []
                 for p in prefix:
                     p.attempts += 1
                     finished, next_at = self._resolve_retryable(attempts=p.attempts)
                     if finished or final:
-                        dropped += 1
+                        dropped.append(p)
                     else:
                         p.next_attempt_at = next_at
                         keep.append(p)
-                if dropped:
-                    self._count_drop("event", "retry_exhausted", n=dropped)
+                self._dispose_pending_events(dropped, "retry_exhausted")
                 if keep:
                     self._queue.extendleft(reversed(keep))
                 break
-            self._count_drop("event", "terminal_status", n=len(prefix))
+            cycle_clean = False
+            self._dispose_pending_events(prefix, "terminal_status")
+        return sent_clean_batch and cycle_clean
 
     def _start_breaker_cycle(
         self,
@@ -2225,7 +3380,7 @@ class AsyncMetadataReporter(_ReporterBase):
                     # A read-only key denies every write: end the cycle instead
                     # of posting the remaining doomed snapshots.
                     return
-                logger.warning(
+                _log_warning(
                     "reporter.breaker_send_failed: provider=%s exc_type=%s",
                     report.provider.value,
                     type(exc).__name__,
@@ -2299,7 +3454,7 @@ class AsyncMetadataReporter(_ReporterBase):
         breaker = self._control_plane_breaker
         admission = breaker.admit() if breaker is not None else None
         if admission is not None and not admission.allowed:
-            logger.debug("reporter.confirm_held_breaker_open")
+            _log_debug("reporter.confirm_held_breaker_open")
             return _SendOutcome.HELD
         try:
             resp = await self._http.post(
@@ -2332,8 +3487,8 @@ class AsyncMetadataReporter(_ReporterBase):
 
     async def _send_batch(
         self, batch: list[MetadataEvent], *, deadline: float | None = None
-    ) -> _SendOutcome:
-        """Send a batch of events to the cloud API and return its outcome.
+    ) -> _BatchSendResult:
+        """Send a batch and return transport plus parsed member dispositions.
 
         Ingest is deliberately NOT control-plane-breaker-guarded: opening the
         enforcement breaker (which flips budget checks to their fail-open
@@ -2356,19 +3511,24 @@ class AsyncMetadataReporter(_ReporterBase):
             )
             resp.raise_for_status()
             # httpx.Response.json() is sync on both clients — shared helper.
-            self._log_ingest_rejections(resp, len(batch))
-            return _SendOutcome.SENT
+            rejections = self._parse_ingest_rejections(resp, len(batch))
+            return _BatchSendResult(_SendOutcome.SENT, rejections)
         except Exception as exc:
             if handle_read_only_key_error(exc):
-                return _SendOutcome.SENT
+                return _BatchSendResult(
+                    _SendOutcome.SENT, _IngestRejections(_IngestRejectionKind.MALFORMED)
+                )
             # Log only the exception's class name — the type-name-only
             # convention every other except-block follows. Safe here even though
             # the batch is content-free; keeps the privacy contract uniform.
-            logger.warning(
+            _log_warning(
                 "Failed to send metadata batch (%d events): %s",
                 len(batch),
                 type(exc).__name__,
             )
-            return self._batch_failure_outcome(exc)
+            return _BatchSendResult(
+                self._batch_failure_outcome(exc),
+                _IngestRejections(_IngestRejectionKind.MALFORMED),
+            )
         finally:
             self._in_flight -= 1

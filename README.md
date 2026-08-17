@@ -728,13 +728,12 @@ answers and fixed memory under unbounded identity churn.
 Cooperative run code can call `current_run_terminated()` for the ambient run,
 inspect `run_termination(run_id)`, or explicitly clear stored stop state with
 `clear_run_termination(run_id)`. `run_termination` returns an immutable
-`RunTermination` (`reason`, `source`, and `at_monotonic`) or `None`. Active stream
-handles retain their immutable first stop independently of registry eviction until
-the stream settles, closes, or is abandoned. A non-streaming request already in
-flight is not preempted. A metered stream already returned is stopped cooperatively
-at its next raw provider-chunk boundary: that chunk is pulled and discarded,
-previously observed usage is settled exactly once as a partial success, the
-provider stream is closed, and the original `RunStoppedError` remains terminal.
+`RunTermination` (`reason`, `source`, and `at_monotonic`) or `None`. A non-streaming
+request already in flight is not preempted. A metered stream already returned is
+stopped cooperatively at its next raw provider-chunk boundary: that chunk is
+pulled and discarded, previously observed usage is settled exactly once as a
+partial success, the provider stream is closed, and the original
+`RunStoppedError` remains terminal for later iterator calls.
 
 Provider errors (e.g., `openai.RateLimitError`) pass through unmodified.
 
@@ -766,6 +765,12 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `estimated_output_bound` | `int \| None` | Output-token bound used for the denied pre-flight |
 | `velocity_flags` | `list[str] \| None` | Content-free v1 rule names: `repeat_size`, `monotonic_growth`, and `rate_acceleration` |
 | `receipt_aggregate_count` | `int \| None` | Number of denied receipts represented by a content-free aggregate replay |
+| `receipt_pricing_input_tokens` | `int \| None` | Original per-call input-token count used to select the pricing card for a homogeneous aggregate replay; omitted for ordinary and legacy events |
+
+Token, output-bound, aggregate-count, pricing-basis, and non-token media
+quantities are each capped at 100,000,000 per event. Larger folded receipt
+totals replay as multiple pricing-compatible events without changing their
+exact totals or turning an unknown media quantity into zero.
 
 **The SDK never captures, logs, or transmits prompts or responses.** Explicit customer-supplied tags are outside this zero-content guarantee and are transmitted as provided. Prompt and response privacy is enforced by [structural tests](tests/unit/test_privacy_firewall.py) and the [privacy module](src/solwyn/_privacy.py).
 

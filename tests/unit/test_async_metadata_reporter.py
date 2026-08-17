@@ -341,8 +341,11 @@ class TestAsyncReporterSendBatch:
             ),
             caplog.at_level("WARNING"),
         ):
-            await reporter._send_batch([_make_event() for _ in range(3)])
+            result = await reporter._send_batch([_make_event() for _ in range(3)])
 
+        assert result.outcome.value == "sent"
+        assert result.rejections.indexes == frozenset({0, 1, 2})
+        assert reporter.dropped_counts == {}  # the queue owner publishes dispositions
         rejection_logs = [
             record.getMessage()
             for record in caplog.records

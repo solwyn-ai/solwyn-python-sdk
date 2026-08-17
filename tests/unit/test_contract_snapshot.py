@@ -303,6 +303,7 @@ EXPECTED_METADATA_FIELDS = {
     "estimated_output_bound",
     "velocity_flags",
     "receipt_aggregate_count",
+    "receipt_pricing_input_tokens",
 }
 
 
@@ -729,6 +730,7 @@ class TestWireModelDumpSnapshots:
                 "estimated_output_bound",
                 "velocity_flags",
                 "receipt_aggregate_count",
+                "receipt_pricing_input_tokens",
             }
             & legacy.keys()
         )
@@ -741,6 +743,7 @@ class TestWireModelDumpSnapshots:
             estimated_output_bound=512,
             velocity_flags=["repeat_size", "monotonic_growth", "rate_acceleration"],
             receipt_aggregate_count=3,
+            receipt_pricing_input_tokens=150_000,
         )
         dumped = populated.model_dump(mode="json")
 
@@ -754,6 +757,7 @@ class TestWireModelDumpSnapshots:
             "rate_acceleration",
         ]
         assert dumped["receipt_aggregate_count"] == 3
+        assert dumped["receipt_pricing_input_tokens"] == 150_000
         assert MetadataEvent.model_validate(dumped) == populated
 
     def test_public_docs_enumerate_all_denial_receipt_fields(self) -> None:
@@ -771,6 +775,7 @@ class TestWireModelDumpSnapshots:
             "estimated_output_bound",
             "velocity_flags",
             "receipt_aggregate_count",
+            "receipt_pricing_input_tokens",
         ):
             assert f"`{field}`" in transparency
             assert f"`{field}`" in unreleased
@@ -788,6 +793,8 @@ class TestWireModelDumpSnapshots:
             ("velocity_flags", [str(index) for index in range(9)]),
             ("receipt_aggregate_count", 0),
             ("receipt_aggregate_count", 100_000_001),
+            ("receipt_pricing_input_tokens", -1),
+            ("receipt_pricing_input_tokens", 100_000_001),
         ],
     )
     def test_metadata_denial_receipt_constraints(self, field: str, value: object) -> None:
@@ -813,6 +820,7 @@ class TestWireModelDumpSnapshots:
             estimated_output_bound=0,
             velocity_flags=["repeat_size", "monotonic_growth", "rate_acceleration"],
             receipt_aggregate_count=100_000_000,
+            receipt_pricing_input_tokens=100_000_000,
         )
         assert len(boundary.deny_reason or "") == 64
         assert len(boundary.denied_by_period or "") == 32
@@ -823,6 +831,21 @@ class TestWireModelDumpSnapshots:
             "rate_acceleration",
         ]
         assert boundary.receipt_aggregate_count == 100_000_000
+        assert boundary.receipt_pricing_input_tokens == 100_000_000
+
+    def test_receipt_pricing_input_tokens_requires_an_aggregate_marker(self) -> None:
+        with pytest.raises(ValidationError, match="receipt_pricing_input_tokens requires"):
+            _metadata_event(receipt_pricing_input_tokens=150_000)
+        legacy = _metadata_event(receipt_aggregate_count=2)
+        assert legacy.receipt_pricing_input_tokens is None
+        assert "receipt_pricing_input_tokens" not in legacy.model_dump(mode="json")
+
+        schema = MetadataEvent.model_json_schema()["properties"]
+        assert schema["receipt_pricing_input_tokens"]["anyOf"][0] == {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100_000_000,
+        }
 
     @pytest.mark.parametrize(
         "field",
@@ -831,14 +854,32 @@ class TestWireModelDumpSnapshots:
             "output_tokens",
             "estimated_output_bound",
             "receipt_aggregate_count",
+            "receipt_pricing_input_tokens",
         ],
     )
     def test_metadata_receipt_quantities_share_the_100m_wire_ceiling(self, field: str) -> None:
-        kwargs: dict[str, object] = {field: 100_000_000}
-        event = _metadata_event(**kwargs)
-        assert getattr(event, field) == 100_000_000
+        value = 100_000_000
+        kwargs: dict[str, object] = {
+            "receipt_aggregate_count": 1,
+            field: value,
+        }
+        assert getattr(_metadata_event(**kwargs), field) == value
+        schema = MetadataEvent.model_json_schema()["properties"][field]
+        constrained_schema = schema["anyOf"][0] if "anyOf" in schema else schema
+        assert constrained_schema["maximum"] == value
         with pytest.raises(ValidationError):
-            _metadata_event(**{field: 100_000_001})
+            _metadata_event(**{**kwargs, field: value + 1})
+
+    def test_aggregate_marker_does_not_widen_the_per_event_token_ceiling(self) -> None:
+        assert _metadata_event(input_tokens=100_000_000).input_tokens == 100_000_000
+        with pytest.raises(ValidationError):
+            _metadata_event(input_tokens=100_000_001)
+        with pytest.raises(ValidationError):
+            _metadata_event(
+                input_tokens=100_000_001,
+                output_tokens=100_000_001,
+                receipt_aggregate_count=2,
+            )
 
     def test_token_details_default_dump_omits_is_estimated(self) -> None:
         # Provider-reported (non-estimated) counts: is_estimated stays OFF the

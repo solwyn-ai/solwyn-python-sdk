@@ -17,12 +17,15 @@ from __future__ import annotations
 
 import atexit
 import collections
+import dataclasses
+import enum
 import logging
 import os
 import threading
 import time
 import weakref
 from collections.abc import Callable
+from contextlib import suppress
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
 import httpx
@@ -38,16 +41,50 @@ if TYPE_CHECKING:
         _PendingConfirm,
         _PendingEvent,
         _PendingSettlement,
+        _ReceiptFoldState,
         _UntrackedReportState,
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _log_warning(message: str, *args: object) -> None:
+    """Invoke host logging without allowing teardown handlers to abort work."""
+    with suppress(Exception):
+        logger.warning(message, *args)
+
+
+def _log_error(message: str, *args: object) -> None:
+    with suppress(Exception):
+        logger.error(message, *args)
+
+
+def _log_debug(message: str, *args: object) -> None:
+    with suppress(Exception):
+        logger.debug(message, *args)
+
 
 _T = TypeVar("_T")
 
 # Patchable clock seam (mirrors reporter._monotonic): the exit-drain deadline
 # arithmetic reads through this so tests can drive time deterministically.
 _monotonic = time.monotonic
+
+
+class _ExitIngestRejectionKind(enum.Enum):
+    """Identity precision available from a successful exit ingest response."""
+
+    CLEAN = "clean"
+    EXACT = "exact"
+    LEGACY = "legacy"
+    MALFORMED = "malformed"
+
+
+@dataclasses.dataclass(frozen=True)
+class _ExitIngestRejections:
+    kind: _ExitIngestRejectionKind
+    indexes: frozenset[int] = frozenset()
+    count: int = 0
 
 
 def _is_retryable_exc(exc: Exception) -> bool:
@@ -149,7 +186,7 @@ def _run_fork_resets() -> None:
         try:
             obj._reset_after_fork_in_child()
         except Exception as exc:
-            logger.warning("lifecycle.fork_reset_failed: exc_type=%s", type(exc).__name__)
+            _log_warning("lifecycle.fork_reset_failed: exc_type=%s", type(exc).__name__)
 
 
 def _ensure_atexit_registered() -> None:
@@ -201,6 +238,8 @@ def register_async_reporter(reporter: AsyncMetadataReporter) -> None:
         reporter.shutdown_deadline,
         _gc_drop_counter,
         reporter._untracked_state,
+        reporter._receipt_fold_state,
+        reporter._sdk_instance_id,
     )
     # Documented writable property; typeshed models finalize with __slots__
     # only, so mypy rejects the assignment it cannot see.
@@ -245,13 +284,11 @@ def _exit_surrender_all() -> None:
                 try:
                     payloads = holder.lease_surrender_payloads()
                 except Exception as exc:
-                    logger.warning(
-                        "lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__
-                    )
+                    _log_warning("lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__)
                     continue
                 for request in payloads:
                     if _monotonic() >= deadline:
-                        logger.debug("lifecycle.exit_surrender_expired")
+                        _log_debug("lifecycle.exit_surrender_expired")
                         return
                     if client is None:
                         client = httpx.Client(timeout=5.0)
@@ -264,7 +301,7 @@ def _exit_surrender_all() -> None:
                         deadline,
                     )
         except Exception as exc:  # the exit hook must never raise
-            logger.warning("lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__)
+            _log_warning("lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__)
         finally:
             if client is not None:
                 # Best-effort transport teardown (NOT the bound — the join is).
@@ -287,7 +324,61 @@ def _gc_drop_counter(kind: str, reason: str, n: int = 1) -> None:
     A collected reporter's ``dropped_counts`` no longer exists, so a loss on
     this path is reported the only way left: a WARNING per counted drop.
     """
-    logger.warning("lifecycle.gc_flush_dropped: kind=%s reason=%s n=%d", kind, reason, n)
+    # Finalizers must continue accounting the remaining items even when a
+    # host-installed logging handler raises during interpreter teardown.
+    _log_warning("lifecycle.gc_flush_dropped: kind=%s reason=%s n=%d", kind, reason, n)
+
+
+class _ExitDropState:
+    """Mutation-only exit accounting, emitted outside ownership locks."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counts: dict[tuple[str, str], int] = {}
+
+    def record(self, kind: str, reason: str, n: int = 1) -> None:
+        if n <= 0:
+            return
+        with self._lock:
+            key = (kind, reason)
+            self._counts[key] = self._counts.get(key, 0) + n
+
+    def emit(self, drop_counter: Callable[[str, str, int], None]) -> None:
+        with self._lock:
+            counts = self._counts
+            self._counts = {}
+        for (kind, reason), n in counts.items():
+            try:
+                drop_counter(kind, reason, n)
+            except Exception:
+                # The durable disposition has already been recorded here and
+                # ownership released. A hostile logger/callback cannot abort
+                # emission of the remaining kinds.
+                continue
+
+
+def _dispose_exit_event(
+    event: object,
+    reason: str,
+    drop_counter: Callable[[str, str, int], None],
+    receipt_fold_state: _ReceiptFoldState | None,
+) -> None:
+    """Fold one denied exit event, or retain ordinary counted-drop behavior."""
+    if receipt_fold_state is not None:
+        outcome = receipt_fold_state.fold(event)  # type: ignore[arg-type]
+        if outcome == "folded":
+            return
+        if outcome == "overflow":
+            drop_counter(
+                "event",
+                "receipt_fold_overflow",
+                getattr(event, "receipt_aggregate_count", None) or 1,
+            )
+            return
+        if outcome == "terminal":
+            drop_counter("event", reason, getattr(event, "receipt_aggregate_count", None) or 1)
+            return
+    drop_counter("event", reason, 1)
 
 
 def blocking_exit_flush(base: AsyncMetadataReporter) -> None:
@@ -297,6 +388,7 @@ def blocking_exit_flush(base: AsyncMetadataReporter) -> None:
     synchronous ``httpx.Client`` posts the same sans-I/O spend and due advisory
     payloads the async path would, using the reporter's own URL and auth.
     """
+    base._begin_blocking_exit()
     _drain_queues_blocking(
         base._confirm_queue,
         base._settlement_queue,
@@ -305,8 +397,11 @@ def blocking_exit_flush(base: AsyncMetadataReporter) -> None:
         base.api_key,
         base._control_plane_breaker,
         base.shutdown_deadline,
-        base._count_drop,
+        base._record_drop,
         base._untracked_state,
+        base._receipt_fold_state,
+        base._sdk_instance_id,
+        base._maybe_log_drops,
     )
 
 
@@ -331,6 +426,7 @@ class _ExitOwnership:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._counts: dict[str, int] = {}
+        self._items: dict[str, collections.deque[object]] = {}
         self._sealed = False
 
     def pop_in_hand(self, queue: collections.deque[_T], *kinds: str) -> _T | None:
@@ -344,6 +440,7 @@ class _ExitOwnership:
                 return None
             for kind in kinds:
                 self._counts[kind] = self._counts.get(kind, 0) + 1
+                self._items.setdefault(kind, collections.deque()).append(item)
             return item
 
     def pop_batch_in_hand(self, queue: collections.deque[_T], kind: str, limit: int) -> list[_T]:
@@ -359,7 +456,15 @@ class _ExitOwnership:
                     break
             if batch:
                 self._counts[kind] = self._counts.get(kind, 0) + len(batch)
+                self._items.setdefault(kind, collections.deque()).extend(batch)
             return batch
+
+    def _release_items(self, kind: str, n: int) -> list[object]:
+        items = self._items.setdefault(kind, collections.deque())
+        released: list[object] = []
+        for _ in range(min(n, len(items))):
+            released.append(items.popleft())
+        return released
 
     def resolve(self, kind: str, n: int = 1) -> int:
         """Release up to ``n`` in-hand items WITHOUT a drop publication.
@@ -372,6 +477,7 @@ class _ExitOwnership:
             held = self._counts.get(kind, 0)
             owned = min(n, held)
             self._counts[kind] = held - owned
+            self._release_items(kind, owned)
             return owned
 
     def resolve_counted(
@@ -385,7 +491,8 @@ class _ExitOwnership:
     ) -> int:
         """Atomically release up to ``n`` in-hand items AND publish their drop.
 
-        The publication runs while the ownership lock is held: if the seal
+        The mutation-only publication runs while the ownership lock is held:
+        if the seal
         could land between the release and the ``drop_counter`` call, the
         drain would return with the item accounted NOWHERE — and at
         interpreter exit the daemon worker may never run again to record it
@@ -393,18 +500,37 @@ class _ExitOwnership:
         later seal finds nothing in hand), or the seal already claimed the
         items as ``shutdown_deadline`` (owned=0, nothing published here).
         ``cap`` bounds the published count below ``owned`` (per-event 202
-        rejections inside an otherwise-sent batch). Only the in-process drop
-        counter runs under the lock — a guarded dict increment plus a
-        rate-limited log line, never network I/O — so the seal's wait on it
-        is bounded. Returns owned.
+        rejections inside an otherwise-sent batch). Callers pass the local
+        ``_ExitDropState.record`` primitive here; logging/user callbacks are
+        emitted only after the seal. Returns owned.
         """
         with self._lock:
             held = self._counts.get(kind, 0)
             owned = min(n, held)
             self._counts[kind] = held - owned
+            self._release_items(kind, owned)
             publish_n = owned if cap is None else min(owned, cap)
             if publish_n > 0:
                 drop_counter(publish_kind, reason, publish_n)
+            return owned
+
+    def resolve_disposed(
+        self,
+        kind: str,
+        disposer: Callable[[object], None],
+        n: int = 1,
+        indexes: set[int] | None = None,
+    ) -> int:
+        """Release items and publish selected event dispositions atomically."""
+        with self._lock:
+            held = self._counts.get(kind, 0)
+            owned = min(n, held)
+            self._counts[kind] = held - owned
+            items = self._release_items(kind, owned)
+            selected = range(len(items)) if indexes is None else sorted(indexes)
+            for index in selected:
+                if 0 <= index < len(items):
+                    disposer(items[index])
             return owned
 
     def requeue(self, queue: collections.deque[_T], items: list[_T], kinds: dict[str, int]) -> bool:
@@ -416,16 +542,18 @@ class _ExitOwnership:
                 return False
             for kind, n in kinds.items():
                 self._counts[kind] = max(0, self._counts.get(kind, 0) - n)
+                self._release_items(kind, n)
             queue.extendleft(reversed(items))
             return True
 
-    def seal(self) -> dict[str, int]:
+    def seal(self) -> dict[str, list[object]]:
         """Claim every in-hand item; further pops/resolves/requeues refuse."""
         with self._lock:
             self._sealed = True
-            counts = {kind: n for kind, n in self._counts.items() if n}
+            items = {kind: list(values) for kind, values in self._items.items() if values}
             self._counts.clear()
-            return counts
+            self._items.clear()
+            return items
 
 
 def _drain_queues_blocking(
@@ -438,6 +566,9 @@ def _drain_queues_blocking(
     budget: float,
     drop_counter: Callable[[str, str, int], None],
     untracked_state: _UntrackedReportState | None = None,
+    receipt_fold_state: _ReceiptFoldState | None = None,
+    sdk_instance_id: str | None = None,
+    drop_emitter: Callable[[], None] | None = None,
 ) -> None:
     """Best-effort, single-attempt, deadline-bounded exit flush of the queues.
 
@@ -464,6 +595,19 @@ def _drain_queues_blocking(
     deadline but remain fire-and-forget: their failures never enter spend-drop
     accounting. Never raises out of the exit hook.
     """
+    drop_state = _ExitDropState()
+
+    # Final/GC/atexit gets one unconditional aggregate attempt. Local imports
+    # avoid the reporter -> lifecycle import cycle during module initialization.
+    if receipt_fold_state is not None:
+        from solwyn.reporter import _build_receipt_replay_events, _PendingEvent
+
+        for key, fold in receipt_fold_state.take_for_cycle(final=True):
+            event_q.extend(
+                _PendingEvent(event)
+                for event in _build_receipt_replay_events(key, fold, sdk_instance_id)
+            )
+
     if not (
         confirm_q
         or settlement_q
@@ -483,6 +627,20 @@ def _drain_queues_blocking(
     untracked_url = f"{base_url}/api/v1/untracked-surfaces"
     own = _ExitOwnership()
     client = httpx.Client(timeout=5.0)
+
+    def _dispose_pending(item: object, reason: str) -> None:
+        _dispose_exit_event(
+            item.event,  # type: ignore[attr-defined]
+            reason,
+            drop_state.record,
+            receipt_fold_state,
+        )
+
+    def _dispose_for(reason: str) -> Callable[[object], None]:
+        def dispose(item: object) -> None:
+            _dispose_pending(item, reason)
+
+        return dispose
 
     def _run() -> None:
         held_drops = 0
@@ -509,11 +667,11 @@ def _drain_queues_blocking(
                     # refused per item (admit() short-circuits, no HTTP) so
                     # every pop stays ownership-tracked.
                     held_drops += own.resolve_counted(
-                        "confirm", drop_counter, "confirm", "exit_breaker_open"
+                        "confirm", drop_state.record, "confirm", "exit_breaker_open"
                     )
                     continue
                 if outcome != "sent":
-                    own.resolve_counted("confirm", drop_counter, "confirm", outcome)
+                    own.resolve_counted("confirm", drop_state.record, "confirm", outcome)
                 else:
                     own.resolve("confirm")
             while True:
@@ -539,13 +697,13 @@ def _drain_queues_blocking(
                 if outcome == "held":
                     held_drops += own.resolve_counted(
                         "settlement_confirm",
-                        drop_counter,
+                        drop_state.record,
                         "settlement_confirm",
                         "exit_breaker_open",
                     )
                 elif outcome != "sent":
                     own.resolve_counted(
-                        "settlement_confirm", drop_counter, "settlement_confirm", outcome
+                        "settlement_confirm", drop_state.record, "settlement_confirm", outcome
                     )
                 else:
                     own.resolve("settlement_confirm")
@@ -559,21 +717,41 @@ def _drain_queues_blocking(
                     deadline,
                 )
                 if ev_outcome == "expired":
-                    own.resolve_counted(
-                        "settlement_event", drop_counter, "event", "shutdown_deadline"
+                    own.resolve_disposed(
+                        "settlement_event",
+                        lambda item: _dispose_pending(item, "shutdown_deadline"),
                     )
                     break
                 if ev_outcome != "sent":
-                    own.resolve_counted("settlement_event", drop_counter, "event", ev_outcome)
+                    own.resolve_disposed(
+                        "settlement_event",
+                        _dispose_for(ev_outcome),
+                    )
                 elif ev_response is not None:
                     # A 202 can still reject the event terminally (#9 pin).
-                    own.resolve_counted(
-                        "settlement_event",
-                        drop_counter,
-                        "event",
-                        "ingest_rejected",
-                        cap=_ingest_rejected_count(ev_response, 1),
-                    )
+                    rejections = _parse_exit_ingest_rejections(ev_response, 1)
+                    if rejections.kind is _ExitIngestRejectionKind.EXACT:
+                        own.resolve_disposed(
+                            "settlement_event",
+                            lambda item: _dispose_pending(item, "ingest_rejected"),
+                            indexes=set(rejections.indexes),
+                        )
+                    elif rejections.kind is _ExitIngestRejectionKind.LEGACY:
+                        if rejections.count == 1:
+                            own.resolve_disposed(
+                                "settlement_event",
+                                lambda item: _dispose_pending(item, "ingest_rejected"),
+                            )
+                        else:
+                            own.resolve_counted(
+                                "settlement_event",
+                                drop_state.record,
+                                "event",
+                                "ingest_rejected",
+                                cap=rejections.count,
+                            )
+                    else:
+                        own.resolve("settlement_event")
                 else:
                     own.resolve("settlement_event")
             while True:
@@ -591,17 +769,39 @@ def _drain_queues_blocking(
                     own.requeue(event_q, batch, {"event": len(batch)})
                     break
                 if outcome != "sent":
-                    own.resolve_counted("event", drop_counter, "event", outcome, n=len(batch))
+                    own.resolve_disposed(
+                        "event",
+                        _dispose_for(outcome),
+                        n=len(batch),
+                    )
                 elif response is not None:
                     # A 202 can still reject individual events terminally (#9).
-                    own.resolve_counted(
-                        "event",
-                        drop_counter,
-                        "event",
-                        "ingest_rejected",
-                        n=len(batch),
-                        cap=_ingest_rejected_count(response, len(batch)),
-                    )
+                    rejections = _parse_exit_ingest_rejections(response, len(batch))
+                    if rejections.kind is _ExitIngestRejectionKind.EXACT:
+                        own.resolve_disposed(
+                            "event",
+                            lambda item: _dispose_pending(item, "ingest_rejected"),
+                            n=len(batch),
+                            indexes=set(rejections.indexes),
+                        )
+                    elif rejections.kind is _ExitIngestRejectionKind.LEGACY:
+                        if rejections.count == len(batch):
+                            own.resolve_disposed(
+                                "event",
+                                lambda item: _dispose_pending(item, "ingest_rejected"),
+                                n=len(batch),
+                            )
+                        else:
+                            own.resolve_counted(
+                                "event",
+                                drop_state.record,
+                                "event",
+                                "ingest_rejected",
+                                n=len(batch),
+                                cap=rejections.count,
+                            )
+                    else:
+                        own.resolve("event", len(batch))
                 else:
                     own.resolve("event", len(batch))
             if untracked_state is not None:
@@ -625,9 +825,9 @@ def _drain_queues_blocking(
                         continue
                     untracked_state.mark_sent(advisory_batch)
         except Exception as exc:
-            logger.warning("lifecycle.exit_flush_failed: exc_type=%s", type(exc).__name__)
+            _log_warning("lifecycle.exit_flush_failed: exc_type=%s", type(exc).__name__)
         if held_drops:
-            logger.error("lifecycle.exit_flush_skipped_breaker_open: dropped=%d", held_drops)
+            _log_error("lifecycle.exit_flush_skipped_breaker_open: dropped=%d", held_drops)
 
     # The join below is the wall-clock bound (#2 re-review pin). At
     # interpreter shutdown new threads can be refused; the inline fallback
@@ -641,21 +841,33 @@ def _drain_queues_blocking(
         worker.join(timeout=max(0.0, deadline - _monotonic()))
     # Seal: claim a stuck worker's in-hand items, then sweep the queues.
     in_hand = own.seal()
-    _count(drop_counter, "confirm", "shutdown_deadline", in_hand.get("confirm", 0))
+    _count(drop_state.record, "confirm", "shutdown_deadline", len(in_hand.get("confirm", [])))
     _count(
-        drop_counter,
+        drop_state.record,
         "settlement_confirm",
         "shutdown_deadline",
-        in_hand.get("settlement_confirm", 0),
+        len(in_hand.get("settlement_confirm", [])),
     )
-    _count(
-        drop_counter,
-        "event",
-        "shutdown_deadline",
-        in_hand.get("settlement_event", 0) + in_hand.get("event", 0),
-    )
+    for item in in_hand.get("settlement_event", []):
+        _dispose_pending(item, "shutdown_deadline")
+    for item in in_hand.get("event", []):
+        _dispose_pending(item, "shutdown_deadline")
     # Whatever the deadline left behind is abandoned — count it.
-    _drop_all(confirm_q, settlement_q, event_q, drop_counter, "shutdown_deadline")
+    _drop_all(
+        confirm_q,
+        settlement_q,
+        event_q,
+        drop_state.record,
+        "shutdown_deadline",
+        receipt_fold_state,
+    )
+    # No logger or user callback has run under _ExitOwnership. Flush the
+    # mutation-only ledger after seal/sweep, then let a live reporter emit its
+    # rate-limited aggregate warning outside all lifecycle ownership locks.
+    drop_state.emit(drop_counter)
+    if drop_emitter is not None:
+        with suppress(Exception):
+            drop_emitter()
     # Best-effort transport teardown for a still-stuck worker (NOT the bound).
     client.close()
 
@@ -740,27 +952,55 @@ def _post_json_response(
             return "expired", None
         # The server dedups a later duplicate, and an exit hook must never
         # raise. Log the type name only.
-        logger.warning("lifecycle.exit_post_failed: exc_type=%s", type(exc).__name__)
+        _log_warning("lifecycle.exit_post_failed: exc_type=%s", type(exc).__name__)
         return "retry_exhausted" if _is_retryable_exc(exc) else "terminal_status", None
     return "sent", response
 
 
-def _ingest_rejected_count(response: httpx.Response, batch_size: int) -> int:
-    """Best-effort count of per-event rejections in a 202 ingest body.
+def _parse_exit_ingest_rejections(
+    response: httpx.Response, batch_size: int
+) -> _ExitIngestRejections:
+    """Distinguish clean, exact, legacy count-only, and malformed 202 bodies.
 
     A 202 can still reject individual events (terminal — they reject
     identically on every resubmission), and the whole-batch ``"sent"`` outcome
-    would silently understate that loss. Capped at ``batch_size`` so a
-    compromised/misrouted server cannot inflate drop counts. Fail-open: an
-    unparseable body counts nothing (the exit hook must never raise).
+    would silently understate that loss. A partial legacy index-less list
+    proves only the count and must never guess which event to fold; a full
+    legacy rejection proves every identity. Malformed responses retain the
+    exit hook's fail-open behavior.
     """
     try:
         rejected = response.json()["rejected"]
         if not isinstance(rejected, list):
-            return 0
-        return min(len(rejected), batch_size)
+            return _ExitIngestRejections(_ExitIngestRejectionKind.MALFORMED)
+        if not rejected:
+            return _ExitIngestRejections(_ExitIngestRejectionKind.CLEAN)
+        if len(rejected) > batch_size:
+            return _ExitIngestRejections(_ExitIngestRejectionKind.MALFORMED)
+        indexes: list[int] = []
+        indexes_complete = True
+        for item in rejected:
+            try:
+                raw_index = item["index"]
+                if type(raw_index) is not int:
+                    return _ExitIngestRejections(_ExitIngestRejectionKind.MALFORMED)
+                indexes.append(raw_index)
+            except KeyError:
+                indexes_complete = False
+        if not indexes_complete:
+            return _ExitIngestRejections(_ExitIngestRejectionKind.LEGACY, count=len(rejected))
+        unique_indexes = frozenset(indexes)
+        if len(unique_indexes) != len(rejected) or any(
+            index < 0 or index >= batch_size for index in indexes
+        ):
+            return _ExitIngestRejections(_ExitIngestRejectionKind.MALFORMED)
+        return _ExitIngestRejections(
+            _ExitIngestRejectionKind.EXACT,
+            indexes=unique_indexes,
+            count=len(rejected),
+        )
     except Exception:
-        return 0
+        return _ExitIngestRejections(_ExitIngestRejectionKind.MALFORMED)
 
 
 def _count(
@@ -780,6 +1020,7 @@ def _drop_all(
     event_q: collections.deque[_PendingEvent],
     drop_counter: Callable[[str, str, int], None],
     reason: str,
+    receipt_fold_state: _ReceiptFoldState | None = None,
 ) -> None:
     """Clear every queue, counting the loss by kind.
 
@@ -787,21 +1028,33 @@ def _drop_all(
     ``dropped_counts`` understates real event loss.
     """
     n_confirm = _drain_count(confirm_q)
-    n_settlement = _drain_count(settlement_q)
-    n_event = _drain_count(event_q)
+    settlements: list[_PendingSettlement] = []
+    while settlement_q:
+        settlements.append(settlement_q.popleft())
+    events: list[_PendingEvent] = []
+    while event_q:
+        events.append(event_q.popleft())
     _count(drop_counter, "confirm", reason, n_confirm)
-    _count(drop_counter, "settlement_confirm", reason, n_settlement)
-    _count(drop_counter, "event", reason, n_settlement + n_event)
+    _count(drop_counter, "settlement_confirm", reason, len(settlements))
+    for settlement in settlements:
+        _dispose_exit_event(settlement.event, reason, drop_counter, receipt_fold_state)
+    for pending in events:
+        _dispose_exit_event(pending.event, reason, drop_counter, receipt_fold_state)
 
 
 def _exit_flush_all() -> None:
     """The single atexit hook: flush every still-open live reporter."""
     for sync_reporter in list(_LIVE_SYNC_REPORTERS):
         try:
-            if not sync_reporter._shutdown.is_set():
+            # _shutdown means stop REQUESTED, _delivery_closed is the EARLY
+            # enqueue-refusal gate, and _delivery_completed covers only spend
+            # sealing. Lifecycle rescue stays armed until transport cleanup is
+            # also complete, so a false synchronized read joins/retries the
+            # close path instead of skipping a partial transition.
+            if not sync_reporter._close_is_completed():
                 sync_reporter.close()
         except Exception as exc:
-            logger.warning("lifecycle.exit_flush_failed: exc_type=%s", type(exc).__name__)
+            _log_warning("lifecycle.exit_flush_failed: exc_type=%s", type(exc).__name__)
     for async_reporter in list(_LIVE_ASYNC_REPORTERS):
         try:
             # _close_completed (NOT _closed): a cancelled or partial close()
@@ -810,8 +1063,8 @@ def _exit_flush_all() -> None:
             if not async_reporter._close_completed:
                 blocking_exit_flush(async_reporter)
         except Exception as exc:
-            logger.warning("lifecycle.exit_flush_failed: exc_type=%s", type(exc).__name__)
+            _log_warning("lifecycle.exit_flush_failed: exc_type=%s", type(exc).__name__)
     try:
         _exit_surrender_all()
     except Exception as exc:
-        logger.warning("lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__)
+        _log_warning("lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__)
