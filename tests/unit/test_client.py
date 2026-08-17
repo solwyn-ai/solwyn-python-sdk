@@ -1373,6 +1373,7 @@ class TestSyncStreamingInterception:
             )
 
         assert isinstance(result, SyncStreamWrapper)
+        assert result._abort_check is None
         solwyn._solwyn_reporter._http.close()
         solwyn._solwyn_budget._http.close()
 
@@ -2357,7 +2358,9 @@ class TestVelocityWiring:
             return _allow_budget_result()
 
         solwyn._solwyn_budget.check_budget = MagicMock(side_effect=live_allow)
-        solwyn._solwyn_budget.release_reservation = MagicMock(wraps=solwyn._solwyn_budget.release_reservation)
+        solwyn._solwyn_budget.release_reservation = MagicMock(
+            wraps=solwyn._solwyn_budget.release_reservation
+        )
         solwyn._solwyn_reporter.report = MagicMock()
         solwyn._solwyn_velocity.observe = MagicMock(return_value=("repeat_size",))
 
@@ -2756,7 +2759,9 @@ async def test_async_server_entry_with_velocity_flag_checks_then_denies_locally(
         return _allow_budget_result()
 
     solwyn._solwyn_budget.check_budget = AsyncMockFn(side_effect=live_allow)
-    solwyn._solwyn_budget.release_reservation = MagicMock(wraps=solwyn._solwyn_budget.release_reservation)
+    solwyn._solwyn_budget.release_reservation = MagicMock(
+        wraps=solwyn._solwyn_budget.release_reservation
+    )
     solwyn._solwyn_reporter.report = MagicMock()
     solwyn._solwyn_velocity.observe = MagicMock(return_value=("repeat_size",))
 

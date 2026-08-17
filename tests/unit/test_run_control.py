@@ -416,3 +416,13 @@ def test_public_docs_describe_run_stop_hierarchy_and_cooperative_api() -> None:
     ):
         assert bounded_registry_contract in normalized_error_handling
         assert bounded_registry_contract in normalized_unreleased
+
+    for stream_contract in (
+        "Active stream handles retain",
+        "next raw provider-chunk boundary",
+        "pulled and discarded",
+        "partial success",
+        "exactly once",
+    ):
+        assert stream_contract in normalized_error_handling
+        assert stream_contract in normalized_unreleased

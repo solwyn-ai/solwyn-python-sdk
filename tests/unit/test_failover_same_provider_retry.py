@@ -17,6 +17,7 @@ with no real wait.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 from types import SimpleNamespace
@@ -194,6 +195,28 @@ class TestSameProviderRetryOn429:
         assert success_events[0].agent_run_id == run_id
         assert success_events[0].agent_run_name == "retry-agent"
 
+        _close(solwyn)
+
+    def test_stream_retry_sleep_base_exception_releases_watcher(self) -> None:
+        from solwyn import _run_control
+
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = _Status429RetryAfter("0")
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-5.5",
+            same_provider_retries=1,
+        )
+
+        with (
+            patch("solwyn.client.time.sleep", side_effect=KeyboardInterrupt()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
+            run("sync-retry-sleep-base-exception") as run_id,
+            pytest.raises(KeyboardInterrupt),
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST, stream=True)
+
+        assert run_id not in _run_control._STATE.active_handles
         _close(solwyn)
 
     def test_retry_exhausted_falls_over(self) -> None:
@@ -703,6 +726,46 @@ class TestAsyncSameProviderRetryOn429:
         assert openai_cb.failure_count == 0
         assert openai_cb.state == CircuitState.CLOSED
 
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_stream_retry_sleep_cancellation_releases_unique_run_watchers(
+        self,
+    ) -> None:
+        from solwyn import _run_control
+
+        openai = _openai_client()
+        openai.chat.completions.create = AsyncMock(side_effect=_Status429RetryAfter("0"))
+        solwyn = AsyncSolwyn(
+            openai,
+            api_key=VALID_API_KEY,
+            model="gpt-5.5",
+            same_provider_retries=1,
+        )
+        solwyn._solwyn_reporter.report = MagicMock()
+        baseline = set(_run_control._STATE.active_handles)
+
+        with (
+            patch(
+                "solwyn.client.asyncio.sleep",
+                new=AsyncMock(side_effect=asyncio.CancelledError()),
+            ),
+            patch.object(
+                solwyn._solwyn_budget,
+                "check_budget",
+                new=AsyncMock(return_value=_allow_budget()),
+            ),
+        ):
+            for index in range(24):
+                async with run(f"async-retry-sleep-cancel-{index}"):
+                    with pytest.raises(asyncio.CancelledError):
+                        await solwyn.chat.completions.create(
+                            **_PLAIN_REQUEST,
+                            stream=True,
+                        )
+
+        assert set(_run_control._STATE.active_handles) == baseline
         await solwyn._solwyn_reporter._http.aclose()
         await solwyn._solwyn_budget._http.aclose()
 

@@ -110,9 +110,13 @@ derived from git tags (hatch-vcs).
   Exact reasons remain a 256-entry LRU that never guesses from fingerprints, so
   churn cannot false-stop an unrelated or new run. A stopped run may be
   forgotten after LRU eviction if the control plane does not reaffirm it—the
-  fixed-memory tradeoff required to preserve exact answers. These controls
-  govern future dispatch and do not interrupt requests already in flight or
-  streams already returned.
+  fixed-memory tradeoff required to preserve exact answers. Active stream handles
+  retain their immutable first stop independently of registry eviction until
+  release. These controls govern future dispatch and do not preempt a
+  non-streaming request already in flight. Streams stop at the next raw
+  provider-chunk boundary: that chunk is pulled and discarded, prior usage is
+  settled exactly once as a partial success, the provider stream is closed, and
+  the original error remains terminal.
 - **Content-free run velocity detection is configurable and bounded.** Seven
   `velocity_*` / `SOLWYN_VELOCITY_*` settings control mode, repeat-size,
   monotonic-growth, and rate-acceleration thresholds. Only repeat-size and

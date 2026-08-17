@@ -718,16 +718,23 @@ structural `agent_run_id`, `reason`, and `source`; server/operator stops use the
 `server` source and eligible local `velocity_mode="deny"` decisions use
 `local_velocity`. Exact first-writer reasons and structural run IDs live only in
 a 256-entry LRU. The registry never guesses from fingerprints, so churn cannot
-false-stop an unrelated or new run. A stopped run may be forgotten after LRU
-eviction; a later call can proceed if the control plane is unavailable or does
-not reaffirm the stop. This is the unavoidable tradeoff between exact answers
-and fixed memory under unbounded identity churn.
+false-stop an unrelated or new run. Active stream handles retain their immutable
+first stop independently of registry eviction until the stream settles, closes,
+or is abandoned. A stopped run with no active stream handle may be forgotten
+after LRU eviction; a later call can proceed if the control plane is unavailable
+or does not reaffirm the stop. This is the unavoidable tradeoff between exact
+answers and fixed memory under unbounded identity churn.
 
 Cooperative run code can call `current_run_terminated()` for the ambient run,
 inspect `run_termination(run_id)`, or explicitly clear stored stop state with
 `clear_run_termination(run_id)`. `run_termination` returns an immutable
-`RunTermination` (`reason`, `source`, and `at_monotonic`) or `None`. These controls
-do not interrupt requests already in flight or streams already returned.
+`RunTermination` (`reason`, `source`, and `at_monotonic`) or `None`. Active stream
+handles retain their immutable first stop independently of registry eviction until
+the stream settles, closes, or is abandoned. A non-streaming request already in
+flight is not preempted. A metered stream already returned is stopped cooperatively
+at its next raw provider-chunk boundary: that chunk is pulled and discarded,
+previously observed usage is settled exactly once as a partial success, the
+provider stream is closed, and the original `RunStoppedError` remains terminal.
 
 Provider errors (e.g., `openai.RateLimitError`) pass through unmodified.
 
