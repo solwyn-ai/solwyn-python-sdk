@@ -29,9 +29,19 @@ class _SyncChat:
         self.completions = _SyncCompletions()
 
 
+class _SyncEmbeddings:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def create(self, **_kwargs: object) -> SimpleNamespace:
+        self.calls += 1
+        return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1))
+
+
 class _OpenAIStub:
     def __init__(self) -> None:
         self.chat = _SyncChat()
+        self.embeddings = _SyncEmbeddings()
 
     def with_options(self, **_kwargs: object) -> _OpenAIStub:
         return self
@@ -42,7 +52,11 @@ _OpenAIStub.__name__ = "OpenAI"
 
 
 class _AsyncCompletions:
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def create(self, **_kwargs: object) -> SimpleNamespace:
+        self.calls += 1
         return SimpleNamespace(
             usage=SimpleNamespace(prompt_tokens=2, completion_tokens=1),
         )
@@ -53,9 +67,19 @@ class _AsyncChat:
         self.completions = _AsyncCompletions()
 
 
+class _AsyncEmbeddings:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def create(self, **_kwargs: object) -> SimpleNamespace:
+        self.calls += 1
+        return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=1))
+
+
 class _AsyncOpenAIStub:
     def __init__(self) -> None:
         self.chat = _AsyncChat()
+        self.embeddings = _AsyncEmbeddings()
 
     def with_options(self, **_kwargs: object) -> _AsyncOpenAIStub:
         return self
@@ -134,6 +158,78 @@ def test_magic_deny_blocks_real_wrapper_before_provider_dispatch() -> None:
     assert captured.value.budget_period == "monthly"
     assert provider.chat.completions.calls == 0
     assert plane.checks[0].model == "solwyn-test/deny"
+
+
+@pytest.mark.unit
+def test_unknown_magic_model_fails_loudly_through_wrap_before_provider_dispatch() -> None:
+    plane = FakeControlPlane()
+    provider = _OpenAIStub()
+    wrapped = plane.wrap(provider)
+
+    try:
+        with pytest.raises(RuntimeError, match="unknown solwyn testing magic model"):
+            wrapped.chat.completions.create(
+                model="solwyn-test/not-real",
+                messages=[],
+            )
+    finally:
+        wrapped.close()
+
+    assert provider.chat.completions.calls == 0
+
+
+@pytest.mark.unit
+async def test_unknown_magic_model_fails_loudly_through_async_wrap_before_dispatch() -> None:
+    plane = FakeControlPlane()
+    provider = _AsyncOpenAIStub()
+    wrapped = plane.wrap_async(provider)
+
+    try:
+        with pytest.raises(RuntimeError, match="unknown solwyn testing magic model"):
+            await wrapped.chat.completions.create(
+                model="solwyn-test/not-real",
+                messages=[],
+            )
+    finally:
+        await wrapped.close()
+
+    assert provider.chat.completions.calls == 0
+
+
+@pytest.mark.unit
+def test_unknown_magic_model_fails_before_sync_media_dispatch() -> None:
+    plane = FakeControlPlane()
+    provider = _OpenAIStub()
+    wrapped = plane.wrap(provider)
+
+    try:
+        with pytest.raises(RuntimeError, match="unknown solwyn testing magic model"):
+            wrapped.embeddings.create(
+                model="solwyn-test/not-real",
+                input=[],
+            )
+    finally:
+        wrapped.close()
+
+    assert provider.embeddings.calls == 0
+
+
+@pytest.mark.unit
+async def test_unknown_magic_model_fails_before_async_media_dispatch() -> None:
+    plane = FakeControlPlane()
+    provider = _AsyncOpenAIStub()
+    wrapped = plane.wrap_async(provider)
+
+    try:
+        with pytest.raises(RuntimeError, match="unknown solwyn testing magic model"):
+            await wrapped.embeddings.create(
+                model="solwyn-test/not-real",
+                input=[],
+            )
+    finally:
+        await wrapped.close()
+
+    assert provider.embeddings.calls == 0
 
 
 @pytest.mark.unit

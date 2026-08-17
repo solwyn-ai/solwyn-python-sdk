@@ -23,11 +23,12 @@ from solwyn._types import (
     ProviderName,
     UntrackedSurfaceReport,
 )
+from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.testing._transport import FakeControlPlaneTransport
 from solwyn.testing._wire import PlaneResponse, parse_model, parse_model_list
 
 if TYPE_CHECKING:
-    from solwyn.client import AsyncSolwyn, Solwyn
+    from solwyn._base import MediaSurfaceSpec
 
 MAGIC_MODELS = frozenset(
     {
@@ -48,6 +49,55 @@ _LEASE_PATHS = frozenset(
         "/api/v1/budgets/lease/surrender",
     }
 )
+
+
+def _validate_magic_model(model: object) -> None:
+    if isinstance(model, str) and model.startswith("solwyn-test/") and model not in MAGIC_MODELS:
+        raise RuntimeError(f"unknown solwyn testing magic model: {model!r}")
+
+
+class _TestingSolwyn(Solwyn):
+    def _intercepted_call(
+        self,
+        *,
+        _force_stream: bool = False,
+        _surface: str = "chat",
+        _responses_leaf: str = "create",
+        **kwargs: object,
+    ) -> Any:
+        _validate_magic_model(kwargs.get("model"))
+        return super()._intercepted_call(
+            _force_stream=_force_stream,
+            _surface=_surface,
+            _responses_leaf=_responses_leaf,
+            **kwargs,
+        )
+
+    def _media_call(self, spec: MediaSurfaceSpec, **kwargs: object) -> Any:
+        _validate_magic_model(kwargs.get("model"))
+        return super()._media_call(spec, **kwargs)
+
+
+class _TestingAsyncSolwyn(AsyncSolwyn):
+    async def _intercepted_call(
+        self,
+        *,
+        _force_stream: bool = False,
+        _surface: str = "chat",
+        _responses_leaf: str = "create",
+        **kwargs: object,
+    ) -> Any:
+        _validate_magic_model(kwargs.get("model"))
+        return await super()._intercepted_call(
+            _force_stream=_force_stream,
+            _surface=_surface,
+            _responses_leaf=_responses_leaf,
+            **kwargs,
+        )
+
+    async def _media_call(self, spec: MediaSurfaceSpec, **kwargs: object) -> Any:
+        _validate_magic_model(kwargs.get("model"))
+        return await super()._media_call(spec, **kwargs)
 
 
 @dataclass(slots=True)
@@ -169,8 +219,6 @@ class FakeControlPlane:
 
     def wrap(self, provider_client: object, **solwyn_kwargs: Any) -> Solwyn:
         """Wrap a synchronous provider client on this in-process plane."""
-        from solwyn.client import Solwyn
-
         options: dict[str, Any] = {
             "api_key": self.api_key,
             "api_url": self.api_url,
@@ -179,12 +227,10 @@ class FakeControlPlane:
             "lease_enabled": False,
         }
         options.update(solwyn_kwargs)
-        return Solwyn(provider_client, **options)
+        return _TestingSolwyn(provider_client, **options)
 
     def wrap_async(self, provider_client: object, **solwyn_kwargs: Any) -> AsyncSolwyn:
         """Wrap an asynchronous provider client on this in-process plane."""
-        from solwyn.client import AsyncSolwyn
-
         options: dict[str, Any] = {
             "api_key": self.api_key,
             "api_url": self.api_url,
@@ -193,7 +239,7 @@ class FakeControlPlane:
             "lease_enabled": False,
         }
         options.update(solwyn_kwargs)
-        return AsyncSolwyn(provider_client, **options)
+        return _TestingAsyncSolwyn(provider_client, **options)
 
     @contextmanager
     def outage(self, *, requests: int | None = None) -> Iterator[None]:
@@ -372,8 +418,7 @@ class FakeControlPlane:
         parsed = parse_model(BudgetCheckRequest, body)
         if isinstance(parsed, PlaneResponse):
             return parsed
-        if parsed.model.startswith("solwyn-test/") and parsed.model not in MAGIC_MODELS:
-            raise RuntimeError(f"unknown solwyn testing magic model: {parsed.model!r}")
+        _validate_magic_model(parsed.model)
 
         with self._lock:
             self.checks.append(parsed)
