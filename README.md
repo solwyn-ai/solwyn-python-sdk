@@ -633,30 +633,45 @@ the normal verdict.
 
 ### 2. Test fail-open posture
 
-Mock the provider separately—here with `respx`—and assert both that dispatch
-proceeded and that the control-plane warning surfaced.
+Mock the provider separately with the HTTP dialect used by the installed
+OpenAI SDK, and assert both that dispatch proceeded and that the control-plane
+warning surfaced.
 
 <!-- test-double-snippet:fail-open -->
 ```python
 import logging
-import httpx
-import respx
 from openai import OpenAI
 from solwyn.testing import FakeControlPlane
 
+try:
+    import httpx2 as provider_httpx
+except ImportError:
+    import httpx as provider_httpx
+
 def test_fail_open_provider_proceeds(caplog):
     plane = FakeControlPlane()
-    with respx.mock:
-        route = respx.post("https://provider.test/v1/chat/completions").mock(
-            return_value=httpx.Response(200, json={
+    provider_requests = []
+
+    def handle_provider(request):
+        provider_requests.append(request)
+        return provider_httpx.Response(
+            200,
+            json={
                 "id": "chatcmpl-test", "object": "chat.completion", "created": 0,
                 "model": "gpt-5.5", "choices": [{"index": 0,
                     "message": {"role": "assistant", "content": "served"},
                     "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
-            })
+            },
         )
-        with OpenAI(base_url="https://provider.test/v1", api_key="test") as provider:
+
+    transport = provider_httpx.MockTransport(handle_provider)
+    with provider_httpx.Client(transport=transport) as provider_http_client:
+        with OpenAI(
+            base_url="https://provider.test/v1",
+            api_key="test",
+            http_client=provider_http_client,
+        ) as provider:
             with (
                 plane.wrap(provider, fail_open=True, lease_enabled=False) as client,
                 caplog.at_level(logging.WARNING),
@@ -665,7 +680,8 @@ def test_fail_open_provider_proceeds(caplog):
                 response = client.chat.completions.create(model="gpt-5.5", messages=[])
             assert not provider.is_closed()
     assert provider.is_closed()
-    assert route.called and response.choices[0].message.content == "served"
+    assert len(provider_requests) == 1
+    assert response.choices[0].message.content == "served"
     assert "budget check failed" in caplog.text.lower()
 ```
 
@@ -676,26 +692,40 @@ is preserved during an outage and cleared only by a recovered allow verdict.
 
 <!-- test-double-snippet:game-day -->
 ```python
-import httpx
 import pytest
-import respx
 from openai import OpenAI
 from solwyn import BudgetExceededError
 from solwyn.testing import FakeControlPlane
 
+try:
+    import httpx2 as provider_httpx
+except ImportError:
+    import httpx as provider_httpx
+
 def test_deny_outage_recovery():
     plane = FakeControlPlane()
-    with respx.mock:
-        route = respx.post("https://provider.test/v1/chat/completions").mock(
-            return_value=httpx.Response(200, json={
+    provider_requests = []
+
+    def handle_provider(request):
+        provider_requests.append(request)
+        return provider_httpx.Response(
+            200,
+            json={
                 "id": "chatcmpl-test", "object": "chat.completion", "created": 0,
                 "model": "gpt-5.5", "choices": [{"index": 0,
                     "message": {"role": "assistant", "content": "served"},
                     "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
-            })
+            },
         )
-        with OpenAI(base_url="https://provider.test/v1", api_key="test") as provider:
+
+    transport = provider_httpx.MockTransport(handle_provider)
+    with provider_httpx.Client(transport=transport) as provider_http_client:
+        with OpenAI(
+            base_url="https://provider.test/v1",
+            api_key="test",
+            http_client=provider_http_client,
+        ) as provider:
             with plane.wrap(provider, fail_open=True, lease_enabled=False) as client:
                 with pytest.raises(BudgetExceededError):
                     client.chat.completions.create(model="solwyn-test/deny", messages=[])
@@ -704,7 +734,7 @@ def test_deny_outage_recovery():
                 recovered = client.chat.completions.create(model="gpt-5.5", messages=[])
             assert not provider.is_closed()
     assert provider.is_closed()
-    assert route.call_count == 1
+    assert len(provider_requests) == 1
     assert recovered.choices[0].message.content == "served"
 ```
 

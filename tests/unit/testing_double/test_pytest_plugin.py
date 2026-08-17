@@ -225,6 +225,14 @@ def test_readme_provider_recipes_own_and_close_real_provider_clients() -> None:
         assert "assert not provider.is_closed()" in recipe
         assert "assert provider.is_closed()" in recipe
 
+    for name in ("fail-open", "game-day"):
+        recipe = snippets[name]
+        assert "import httpx2 as provider_httpx" in recipe
+        assert "import httpx as provider_httpx" in recipe
+        assert "provider_httpx.MockTransport" in recipe
+        assert "http_client=provider_http_client" in recipe
+        assert "respx" not in recipe
+
 
 @pytest.mark.unit
 def test_changelog_distinguishes_migrated_sdk_behavior_from_live_state() -> None:
