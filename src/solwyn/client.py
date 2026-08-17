@@ -1268,6 +1268,7 @@ class Solwyn(_SolwynBase):
         on_unmetered: Literal["warn", "raise", "allow"] | None = None,
         acknowledge_untracked: Collection[str] | None = None,
         selection_policy: SelectionPolicy | None = None,
+        control_plane_transport: httpx.BaseTransport | None = None,
         **config_kwargs: object,
     ) -> None:
         # self._client is typed Any because each provider SDK has a different
@@ -1325,6 +1326,7 @@ class Solwyn(_SolwynBase):
             fail_open=config.fail_open,
             cache_ttl=config.budget_check_cache_ttl,
             control_plane_breaker=self._control_plane_breaker,
+            transport=control_plane_transport,
             # PJ-2: the SDK instance id IS the lease holder identity.
             holder_id=self._sdk_instance_id,
             lease_enabled=config.lease_enabled,
@@ -1345,6 +1347,7 @@ class Solwyn(_SolwynBase):
             report_untracked_surfaces=config.report_untracked_surfaces,
             breaker_report_heartbeat=config.breaker_report_heartbeat,
             control_plane_breaker=self._control_plane_breaker,
+            transport=control_plane_transport,
             max_send_attempts=config.reporter_max_send_attempts,
             retry_backoff_base=config.reporter_retry_backoff_base,
             retry_backoff_cap=config.reporter_retry_backoff_cap,
@@ -2657,6 +2660,7 @@ class AsyncSolwyn(_SolwynBase):
         on_unmetered: Literal["warn", "raise", "allow"] | None = None,
         acknowledge_untracked: Collection[str] | None = None,
         selection_policy: SelectionPolicy | None = None,
+        control_plane_transport: httpx.BaseTransport | None = None,
         **config_kwargs: object,
     ) -> None:
         # See sync Solwyn.__init__ for why _client is typed Any.
@@ -2707,6 +2711,7 @@ class AsyncSolwyn(_SolwynBase):
             fail_open=config.fail_open,
             cache_ttl=config.budget_check_cache_ttl,
             control_plane_breaker=self._control_plane_breaker,
+            transport=control_plane_transport,
             # PJ-2: the SDK instance id IS the lease holder identity.
             holder_id=self._sdk_instance_id,
             lease_enabled=config.lease_enabled,
@@ -2726,6 +2731,7 @@ class AsyncSolwyn(_SolwynBase):
             report_untracked_surfaces=config.report_untracked_surfaces,
             breaker_report_heartbeat=config.breaker_report_heartbeat,
             control_plane_breaker=self._control_plane_breaker,
+            transport=control_plane_transport,
             max_send_attempts=config.reporter_max_send_attempts,
             retry_backoff_base=config.reporter_retry_backoff_base,
             retry_backoff_cap=config.reporter_retry_backoff_cap,

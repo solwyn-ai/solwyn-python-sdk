@@ -1240,6 +1240,8 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         fail_open: bool = True,
         cache_ttl: int = 5,
         control_plane_breaker: CircuitBreaker | None = None,
+        *,
+        transport: httpx.BaseTransport | None = None,
         holder_id: str | None = None,
         lease_enabled: bool = True,
         lease_output_bound_default: int = DEFAULT_OUTPUT_BOUND,
@@ -1255,13 +1257,22 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             lease_enabled=lease_enabled,
             lease_output_bound_default=lease_output_bound_default,
         )
-        self._http = httpx.Client(timeout=5.0)
+        self._transport = transport
+        self._http = self._new_http_client()
         # Daemon renewal workers, tracked so close() can let an in-flight
         # renewal finish before the transport goes away.
         self._renewal_threads: set[threading.Thread] = set()
         self._renewal_slots = threading.BoundedSemaphore(_MAX_RENEWAL_WORKERS)
         register_fork_reset(self)
         register_lease_holder(self)
+
+    def _new_http_client(self, timeout: float = 5.0) -> httpx.Client:
+        """Build a sync control-plane client on the configured transport."""
+        return httpx.Client(timeout=timeout, transport=self._transport)
+
+    def _new_exit_http_client(self) -> httpx.Client:
+        """Build the sync client used by the interpreter-exit lease drain."""
+        return self._new_http_client(timeout=5.0)
 
     def _reset_after_fork_in_child(self) -> None:
         """Fresh state lock AND a fresh sync client for the forked child.
@@ -1270,7 +1281,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         still owns those sockets.
         """
         super()._reset_after_fork_in_child()
-        self._http = httpx.Client(timeout=5.0)
+        self._http = self._new_http_client()
         # Only the forking thread survives in the child: the parent's renewal
         # workers do not exist here.
         self._renewal_threads = set()
@@ -1766,7 +1777,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         deadline: float,
     ) -> None:
         """Send releases over a temporary client until one global deadline."""
-        client = httpx.Client(timeout=_SURRENDER_TIMEOUT_S)
+        client = self._new_http_client(timeout=_SURRENDER_TIMEOUT_S)
         try:
             for request in payloads:
                 remaining = deadline - time.monotonic()
@@ -1857,6 +1868,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         fail_open: bool = True,
         cache_ttl: int = 5,
         control_plane_breaker: CircuitBreaker | None = None,
+        *,
+        transport: httpx.BaseTransport | httpx.AsyncBaseTransport | None = None,
         holder_id: str | None = None,
         lease_enabled: bool = True,
         lease_output_bound_default: int = DEFAULT_OUTPUT_BOUND,
@@ -1872,12 +1885,26 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             lease_enabled=lease_enabled,
             lease_output_bound_default=lease_output_bound_default,
         )
-        self._http = httpx.AsyncClient(timeout=5.0)
+        # Async components also use a sync client during interpreter-exit
+        # drains, so an injected transport must implement both httpx transport
+        # interfaces (as MockTransport does).
+        self._transport = transport
+        self._http = self._new_async_http_client()
         # Renewal tasks, held strongly so the loop cannot collect them mid-flight.
         self._renewal_tasks: set[asyncio.Task[None]] = set()
         self._renewal_slots_in_use = 0
         register_fork_reset(self)
         register_lease_holder(self)
+
+    def _new_async_http_client(self, timeout: float = 5.0) -> httpx.AsyncClient:
+        """Build an async control-plane client on the configured transport."""
+        transport = cast("httpx.AsyncBaseTransport | None", self._transport)
+        return httpx.AsyncClient(timeout=timeout, transport=transport)
+
+    def _new_exit_http_client(self) -> httpx.Client:
+        """Build the sync client used by the interpreter-exit lease drain."""
+        transport = cast("httpx.BaseTransport | None", self._transport)
+        return httpx.Client(timeout=5.0, transport=transport)
 
     def _reset_after_fork_in_child(self) -> None:
         """Fresh state lock AND a fresh async client for the forked child.
@@ -1886,7 +1913,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         parent still owns those sockets, and the child's event loop is new.
         """
         super()._reset_after_fork_in_child()
-        self._http = httpx.AsyncClient(timeout=5.0)
+        self._http = self._new_async_http_client()
         # The parent's tasks belong to a loop that does not exist here.
         self._renewal_tasks = set()
         self._renewal_slots_in_use = 0
@@ -2341,7 +2368,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         deadline: float,
     ) -> None:
         """Async release drain bounded by one monotonic deadline."""
-        async with httpx.AsyncClient(timeout=_SURRENDER_TIMEOUT_S) as client:
+        async with self._new_async_http_client(timeout=_SURRENDER_TIMEOUT_S) as client:
             for request in payloads:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:

@@ -23,7 +23,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Protocol, TypeVar
+from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 import httpx
 
@@ -88,6 +88,12 @@ class _ForkResettable(Protocol):
     """An object that repairs its cross-fork-unsafe state in a forked child."""
 
     def _reset_after_fork_in_child(self) -> None: ...
+
+
+class _ExitHttpClientFactory(Protocol):
+    """Component capable of building its configured blocking exit client."""
+
+    def _new_exit_http_client(self) -> httpx.Client: ...
 
 
 # Live reporters, held weakly. A running sync reporter is kept alive by its flush
@@ -201,6 +207,7 @@ def register_async_reporter(reporter: AsyncMetadataReporter) -> None:
         reporter.shutdown_deadline,
         _gc_drop_counter,
         reporter._untracked_state,
+        reporter._exit_http_client_factory._new_exit_http_client,
     )
     # Documented writable property; typeshed models finalize with __slots__
     # only, so mypy rejects the assignment it cannot see.
@@ -239,36 +246,43 @@ def _exit_surrender_all() -> None:
     deadline = _monotonic() + _EXIT_SURRENDER_BUDGET_S
 
     def _run() -> None:
-        client: httpx.Client | None = None
         try:
             for holder in holders:
+                client: httpx.Client | None = None
                 try:
                     payloads = holder.lease_surrender_payloads()
+                    if payloads:
+                        client = cast(_ExitHttpClientFactory, holder)._new_exit_http_client()
+                    for request in payloads:
+                        if _monotonic() >= deadline:
+                            logger.debug("lifecycle.exit_surrender_expired")
+                            return
+                        if client is None:
+                            raise RuntimeError("exit surrender client is required")
+                        _post_confirm_blocking(
+                            client,
+                            f"{holder.api_url}/api/v1/budgets/lease/surrender",
+                            request.model_dump(mode="json"),
+                            holder._auth_headers(),
+                            holder._control_plane_breaker,
+                            deadline,
+                        )
                 except Exception as exc:
                     logger.warning(
                         "lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__
                     )
-                    continue
-                for request in payloads:
-                    if _monotonic() >= deadline:
-                        logger.debug("lifecycle.exit_surrender_expired")
-                        return
-                    if client is None:
-                        client = httpx.Client(timeout=5.0)
-                    _post_confirm_blocking(
-                        client,
-                        f"{holder.api_url}/api/v1/budgets/lease/surrender",
-                        request.model_dump(mode="json"),
-                        holder._auth_headers(),
-                        holder._control_plane_breaker,
-                        deadline,
-                    )
+                finally:
+                    if client is not None:
+                        # Best-effort transport teardown (NOT the bound — the join is).
+                        try:
+                            client.close()
+                        except Exception as exc:
+                            logger.warning(
+                                "lifecycle.exit_surrender_failed: exc_type=%s",
+                                type(exc).__name__,
+                            )
         except Exception as exc:  # the exit hook must never raise
             logger.warning("lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__)
-        finally:
-            if client is not None:
-                # Best-effort transport teardown (NOT the bound — the join is).
-                client.close()
 
     # At interpreter shutdown new threads can be refused; the inline fallback
     # keeps the per-request deadline clamps as the only bound there.
@@ -307,6 +321,7 @@ def blocking_exit_flush(base: AsyncMetadataReporter) -> None:
         base.shutdown_deadline,
         base._count_drop,
         base._untracked_state,
+        base._new_exit_http_client,
     )
 
 
@@ -438,6 +453,7 @@ def _drain_queues_blocking(
     budget: float,
     drop_counter: Callable[[str, str, int], None],
     untracked_state: _UntrackedReportState | None = None,
+    new_exit_http_client: Callable[[], httpx.Client] | None = None,
 ) -> None:
     """Best-effort, single-attempt, deadline-bounded exit flush of the queues.
 
@@ -472,6 +488,17 @@ def _drain_queues_blocking(
     ):
         return
 
+    # Backward compatibility for callers using the earlier queue-only
+    # signature. Normal lifecycle paths pass the reporter-owned factory;
+    # matching by queue identity keeps the legacy form on the same seam.
+    if new_exit_http_client is None:
+        for reporter in list(_LIVE_ASYNC_REPORTERS):
+            if reporter._queue is event_q:
+                new_exit_http_client = reporter._new_exit_http_client
+                break
+    if new_exit_http_client is None:
+        raise RuntimeError("exit HTTP client factory is required")
+
     deadline = _monotonic() + budget
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -482,7 +509,7 @@ def _drain_queues_blocking(
     ingest_url = f"{base_url}/api/v1/metadata/ingest"
     untracked_url = f"{base_url}/api/v1/untracked-surfaces"
     own = _ExitOwnership()
-    client = httpx.Client(timeout=5.0)
+    client = new_exit_http_client()
 
     def _run() -> None:
         held_drops = 0

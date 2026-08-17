@@ -28,7 +28,7 @@ import uuid
 import weakref
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Literal, TypeVar
+from typing import Literal, TypeVar, cast
 
 import httpx
 
@@ -75,6 +75,27 @@ _UNTRACKED_OCCURRENCES_MAX = 1_000_000_000
 _UNTRACKED_REPORT_KEY_LIMIT = 512
 
 _T = TypeVar("_T")
+
+
+class _ExitHttpClientFactory:
+    """Detached sync transport factory for an async reporter's GC drain.
+
+    A weakref finalizer cannot capture the reporter's bound factory method:
+    doing so would retain the reporter forever and prevent the finalizer from
+    running. This small transport-only owner preserves the injected seam
+    without retaining any reporter state.
+    """
+
+    def __init__(
+        self,
+        transport: httpx.BaseTransport | httpx.AsyncBaseTransport | None,
+    ) -> None:
+        self._transport = transport
+
+    def _new_exit_http_client(self) -> httpx.Client:
+        transport = cast("httpx.BaseTransport | None", self._transport)
+        return httpx.Client(timeout=5.0, transport=transport)
+
 
 # Raw C0/DEL/C1 control bytes. A compliant server repr-escapes these before
 # they reach the wire, so the substitution below is a no-op on compliant
@@ -899,6 +920,7 @@ class MetadataReporter(_ReporterBase):
         report_untracked_surfaces: bool = True,
         breaker_report_heartbeat: float = 60.0,
         control_plane_breaker: CircuitBreaker | None = None,
+        transport: httpx.BaseTransport | None = None,
         max_send_attempts: int = 5,
         retry_backoff_base: float = 1.0,
         retry_backoff_cap: float = 60.0,
@@ -922,7 +944,8 @@ class MetadataReporter(_ReporterBase):
             retry_backoff_cap=retry_backoff_cap,
             shutdown_deadline=shutdown_deadline,
         )
-        self._http = httpx.Client(timeout=10.0)
+        self._transport = transport
+        self._http = self._new_http_client(timeout=10.0)
         self._shutdown = threading.Event()
         self._in_flight_lock = threading.Lock()
         self._breaker_worker_lock = threading.Lock()
@@ -941,6 +964,14 @@ class MetadataReporter(_ReporterBase):
         # needed on the sync path — close() is the whole story.
         register_sync_reporter(self)
         register_fork_reset(self)
+
+    def _new_http_client(self, timeout: float = 5.0) -> httpx.Client:
+        """Build a sync control-plane client on the configured transport."""
+        return httpx.Client(timeout=timeout, transport=self._transport)
+
+    def _new_exit_http_client(self) -> httpx.Client:
+        """Build the sync client used by interpreter-exit delivery."""
+        return self._new_http_client(timeout=5.0)
 
     def _launch_thread(self) -> threading.Thread:
         """Create and start a fresh flush thread."""
@@ -1000,7 +1031,7 @@ class MetadataReporter(_ReporterBase):
         self._in_flight = 0
         self._breaker_worker = None
         self._untracked_worker = None
-        self._http = httpx.Client(timeout=10.0)
+        self._http = self._new_http_client(timeout=10.0)
         if not self._shutdown.is_set():
             # Replace the inherited Event and arm the lazy relaunch; a closed
             # reporter keeps its set Event and never relaunches.
@@ -1684,6 +1715,7 @@ class AsyncMetadataReporter(_ReporterBase):
         report_untracked_surfaces: bool = True,
         breaker_report_heartbeat: float = 60.0,
         control_plane_breaker: CircuitBreaker | None = None,
+        transport: httpx.BaseTransport | httpx.AsyncBaseTransport | None = None,
         max_send_attempts: int = 5,
         retry_backoff_base: float = 1.0,
         retry_backoff_cap: float = 60.0,
@@ -1707,7 +1739,11 @@ class AsyncMetadataReporter(_ReporterBase):
             retry_backoff_cap=retry_backoff_cap,
             shutdown_deadline=shutdown_deadline,
         )
-        self._http = httpx.AsyncClient(timeout=10.0)
+        # Async reporters need both transport interfaces: normal delivery is
+        # async, while GC/interpreter-exit delivery uses a sync client.
+        self._transport = transport
+        self._exit_http_client_factory = _ExitHttpClientFactory(transport)
+        self._http = self._new_async_http_client(timeout=10.0)
         self._shutdown_event: asyncio.Event | None = None
         self._flush_task: asyncio.Task[None] | None = None
         self._breaker_task: asyncio.Task[None] | None = None
@@ -1732,6 +1768,15 @@ class AsyncMetadataReporter(_ReporterBase):
         register_async_reporter(self)
         register_fork_reset(self)
 
+    def _new_async_http_client(self, timeout: float = 5.0) -> httpx.AsyncClient:
+        """Build an async control-plane client on the configured transport."""
+        transport = cast("httpx.AsyncBaseTransport | None", self._transport)
+        return httpx.AsyncClient(timeout=timeout, transport=transport)
+
+    def _new_exit_http_client(self) -> httpx.Client:
+        """Build the sync client used by GC/interpreter-exit delivery."""
+        return self._exit_http_client_factory._new_exit_http_client()
+
     def _reset_after_fork_in_child(self) -> None:
         """Repair a forked child: fresh locks/client and cleared loop state.
 
@@ -1754,7 +1799,7 @@ class AsyncMetadataReporter(_ReporterBase):
         self._breaker_task = None
         self._untracked_task = None
         self._shutdown_event = None
-        self._http = httpx.AsyncClient(timeout=10.0)
+        self._http = self._new_async_http_client(timeout=10.0)
 
     def start(self) -> None:
         """Start the background flush loop.  Must be called within an event loop.

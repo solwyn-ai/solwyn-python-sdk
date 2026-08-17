@@ -82,8 +82,8 @@ def _make_enforcer(
         VALID_API_KEY,
         fail_open=fail_open,
         control_plane_breaker=breaker,
+        transport=httpx.MockTransport(transport.handler),
     )
-    enforcer._http = transport.client()
     return enforcer
 
 
