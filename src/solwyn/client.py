@@ -40,7 +40,7 @@ from solwyn._base import (
     _responses_output_bound,
     _SolwynBase,
 )
-from solwyn._control_plane_transport import require_dual_transport
+from solwyn._control_plane_transport import ControlPlaneTransport, require_dual_transport
 from solwyn._privacy import (
     estimate_content_length,
     estimate_responses_content_length,
@@ -2661,7 +2661,7 @@ class AsyncSolwyn(_SolwynBase):
         on_unmetered: Literal["warn", "raise", "allow"] | None = None,
         acknowledge_untracked: Collection[str] | None = None,
         selection_policy: SelectionPolicy | None = None,
-        control_plane_transport: httpx.BaseTransport | None = None,
+        control_plane_transport: ControlPlaneTransport | None = None,
         **config_kwargs: object,
     ) -> None:
         require_dual_transport(control_plane_transport)

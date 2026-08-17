@@ -25,7 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from solwyn._constants import CALL_ID_MAX_LENGTH, CALL_ID_PATTERN
 from solwyn._control_plane_transport import (
-    _DualTransport,
+    ControlPlaneTransport,
     non_closing_async_transport,
     non_closing_sync_transport,
     require_dual_transport,
@@ -1876,7 +1876,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         cache_ttl: int = 5,
         control_plane_breaker: CircuitBreaker | None = None,
         *,
-        transport: httpx.BaseTransport | httpx.AsyncBaseTransport | None = None,
+        transport: ControlPlaneTransport | None = None,
         holder_id: str | None = None,
         lease_enabled: bool = True,
         lease_output_bound_default: int = DEFAULT_OUTPUT_BOUND,
@@ -1896,7 +1896,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         # Async components also use a sync client during interpreter-exit
         # drains, so an injected transport must implement both httpx transport
         # interfaces (as MockTransport does). The caller retains ownership.
-        self._transport: _DualTransport | None = validated_transport
+        self._transport: ControlPlaneTransport | None = validated_transport
         self._http = self._new_async_http_client()
         # Renewal tasks, held strongly so the loop cannot collect them mid-flight.
         self._renewal_tasks: set[asyncio.Task[None]] = set()

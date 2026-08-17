@@ -21,8 +21,14 @@ class _SyncTransport(Protocol):
     def handle_request(self, request: httpx.Request) -> httpx.Response: ...
 
 
-class _DualTransport(_SyncTransport, Protocol):
+class ControlPlaneTransport(_SyncTransport, Protocol):
+    """Transport contract required by async control-plane components."""
+
+    def close(self) -> None: ...
+
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response: ...
+
+    async def aclose(self) -> None: ...
 
 
 class _NonClosingSyncTransport(httpx.BaseTransport):
@@ -41,7 +47,7 @@ class _NonClosingSyncTransport(httpx.BaseTransport):
 class _NonClosingAsyncTransport(httpx.AsyncBaseTransport):
     """Forward async requests without taking ownership of the backing transport."""
 
-    def __init__(self, transport: _DualTransport) -> None:
+    def __init__(self, transport: ControlPlaneTransport) -> None:
         self._transport = transport
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
@@ -52,8 +58,8 @@ class _NonClosingAsyncTransport(httpx.AsyncBaseTransport):
 
 
 def require_dual_transport(
-    transport: httpx.BaseTransport | httpx.AsyncBaseTransport | None,
-) -> _DualTransport | None:
+    transport: object | None,
+) -> ControlPlaneTransport | None:
     """Reject a one-sided transport before any async control-plane request.
 
     The same injected instance is reused when a component repairs itself after
@@ -62,14 +68,25 @@ def require_dual_transport(
     """
     if transport is None:
         return None
-    if not isinstance(transport, httpx.BaseTransport) or not isinstance(
-        transport, httpx.AsyncBaseTransport
-    ):
+    required_methods = ("handle_request", "close", "handle_async_request", "aclose")
+    has_both_interfaces = all(
+        callable(getattr(transport, method_name, None)) for method_name in required_methods
+    )
+    sync_handler = getattr(transport, "handle_request", None)
+    async_handler = getattr(transport, "handle_async_request", None)
+    uses_sync_stub = (
+        getattr(sync_handler, "__func__", sync_handler) is httpx.BaseTransport.handle_request
+    )
+    uses_async_stub = (
+        getattr(async_handler, "__func__", async_handler)
+        is httpx.AsyncBaseTransport.handle_async_request
+    )
+    if not has_both_interfaces or uses_sync_stub or uses_async_stub:
         raise TypeError(
             "async control-plane transport must implement both sync and async "
             "httpx transport interfaces"
         )
-    return cast("_DualTransport", transport)
+    return cast("ControlPlaneTransport", transport)
 
 
 def non_closing_sync_transport(
@@ -82,7 +99,7 @@ def non_closing_sync_transport(
 
 
 def non_closing_async_transport(
-    transport: _DualTransport | None,
+    transport: ControlPlaneTransport | None,
 ) -> httpx.AsyncBaseTransport | None:
     """Return an httpx async transport without transferring caller ownership."""
     if transport is None:

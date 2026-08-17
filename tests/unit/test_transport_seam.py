@@ -9,7 +9,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Protocol
+from typing import Protocol, get_args, get_type_hints
 
 import httpx
 import pytest
@@ -119,6 +119,33 @@ class _AsyncOnlyTransport(httpx.AsyncBaseTransport):
         return None
 
 
+class _DualWithoutSyncHandler(httpx.BaseTransport, httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, json=ALLOW_BUDGET_RESPONSE)
+
+
+class _DualWithoutAsyncHandler(httpx.BaseTransport, httpx.AsyncBaseTransport):
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, json=ALLOW_BUDGET_RESPONSE)
+
+
+class _StructuralDualTransport:
+    def __init__(self, recorder: _Recorder) -> None:
+        self._recorder = recorder
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return self._recorder.handler(request)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return self._recorder.handler(request)
+
+    def close(self) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        return None
+
+
 class _CloseSensitiveDualTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
     def __init__(self, recorder: _Recorder) -> None:
         self._recorder = recorder
@@ -201,6 +228,22 @@ def test_control_plane_component_transport_is_keyword_only() -> None:
 
 
 @pytest.mark.unit
+def test_async_control_plane_parameters_require_one_combined_transport_protocol() -> None:
+    parameters = (
+        (AsyncBudgetEnforcer.__init__, "transport"),
+        (AsyncMetadataReporter.__init__, "transport"),
+        (AsyncSolwyn.__init__, "control_plane_transport"),
+    )
+
+    for constructor, parameter_name in parameters:
+        annotation = get_type_hints(constructor)[parameter_name]
+        members = set(get_args(annotation)) - {type(None)}
+        assert len(members) == 1
+        protocol = members.pop()
+        assert getattr(protocol, "_is_protocol", False) is True
+
+
+@pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "component_factory",
@@ -210,7 +253,15 @@ def test_control_plane_component_transport_is_keyword_only() -> None:
         _new_async_solwyn_with_transport,
     ],
 )
-@pytest.mark.parametrize("transport_factory", [_SyncOnlyTransport, _AsyncOnlyTransport])
+@pytest.mark.parametrize(
+    "transport_factory",
+    [
+        _SyncOnlyTransport,
+        _AsyncOnlyTransport,
+        _DualWithoutSyncHandler,
+        _DualWithoutAsyncHandler,
+    ],
+)
 async def test_async_components_reject_one_sided_transports(
     component_factory: Callable[[object], _AsyncClosableComponent],
     transport_factory: Callable[[], object],
@@ -223,6 +274,24 @@ async def test_async_components_reject_one_sided_transports(
         if component is not None:
             with suppress(Exception):
                 await component.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_enforcer_accepts_a_structural_dual_transport() -> None:
+    recorder = _Recorder()
+    enforcer = AsyncBudgetEnforcer(
+        _API_URL,
+        VALID_API_KEY,
+        transport=_StructuralDualTransport(recorder),
+    )
+
+    try:
+        await _acheck(enforcer)
+    finally:
+        await enforcer.close()
+
+    assert recorder.paths == ["/api/v1/budgets/check"]
 
 
 @pytest.mark.unit
@@ -345,10 +414,11 @@ async def test_async_reporter_exit_client_uses_injected_transport() -> None:
 @pytest.mark.unit
 def test_async_reporter_gc_exit_flush_retains_transport_without_retaining_reporter() -> None:
     recorder = _Recorder()
+    transport = _CloseSensitiveDualTransport(recorder)
     reporter = AsyncMetadataReporter(
         _API_URL,
         VALID_API_KEY,
-        transport=httpx.MockTransport(recorder.handler),
+        transport=transport,
     )
     reporter.report_confirm(
         BudgetConfirmRequest(
@@ -364,6 +434,16 @@ def test_async_reporter_gc_exit_flush_retains_transport_without_retaining_report
     gc.collect()
 
     assert recorder.paths.count("/api/v1/budgets/confirm") == 1
+    assert transport.close_calls == 0
+    assert transport.aclose_calls == 0
+    assert transport.closed is False
+
+    response = transport.handle_request(httpx.Request("POST", f"{_API_URL}/api/v1/budgets/check"))
+    assert response.status_code == 200
+
+    transport.close()
+    assert transport.close_calls == 1
+    assert transport.closed is True
 
 
 @pytest.mark.unit

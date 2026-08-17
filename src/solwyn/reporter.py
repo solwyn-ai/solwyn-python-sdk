@@ -34,7 +34,7 @@ import httpx
 
 from solwyn import _base
 from solwyn._control_plane_transport import (
-    _DualTransport,
+    ControlPlaneTransport,
     non_closing_async_transport,
     non_closing_sync_transport,
     require_dual_transport,
@@ -94,7 +94,7 @@ class _ExitHttpClientFactory:
 
     def __init__(
         self,
-        transport: _DualTransport | None,
+        transport: ControlPlaneTransport | None,
     ) -> None:
         self._transport = transport
 
@@ -1722,7 +1722,7 @@ class AsyncMetadataReporter(_ReporterBase):
         report_untracked_surfaces: bool = True,
         breaker_report_heartbeat: float = 60.0,
         control_plane_breaker: CircuitBreaker | None = None,
-        transport: httpx.BaseTransport | httpx.AsyncBaseTransport | None = None,
+        transport: ControlPlaneTransport | None = None,
         max_send_attempts: int = 5,
         retry_backoff_base: float = 1.0,
         retry_backoff_cap: float = 60.0,
@@ -1750,7 +1750,7 @@ class AsyncMetadataReporter(_ReporterBase):
         # Async reporters need both transport interfaces: normal delivery is
         # async, while GC/interpreter-exit delivery uses a sync client. The
         # caller retains ownership of an injected transport.
-        self._transport: _DualTransport | None = validated_transport
+        self._transport: ControlPlaneTransport | None = validated_transport
         self._exit_http_client_factory = _ExitHttpClientFactory(self._transport)
         self._http = self._new_async_http_client(timeout=10.0)
         self._shutdown_event: asyncio.Event | None = None
