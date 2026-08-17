@@ -138,7 +138,29 @@ class _LeaseRecord:
     lease_id: str
     generation: int
     granted_tokens: int
+    declaration: _LeaseDeclaration
+    last_response_json: str = ""
+    last_renewal_request: LeaseRenewRequest | None = None
+    terminal: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _LeaseDeclaration:
+    model: str
+    provider: ProviderName
+    fallback_providers: tuple[ProviderName, ...]
+    fallback_models: tuple[str, ...]
     fail_open: bool
+
+    @classmethod
+    def from_request(cls, request: LeaseGrantRequest) -> _LeaseDeclaration:
+        return cls(
+            model=request.model,
+            provider=request.provider,
+            fallback_providers=tuple(request.fallback_providers),
+            fallback_models=tuple(request.fallback_models),
+            fail_open=request.fail_open,
+        )
 
 
 class FakeControlPlane:
@@ -199,6 +221,7 @@ class FakeControlPlane:
         self._settled_reservations: set[str] = set()
         self._seen_call_ids: set[str] = set()
         self._leases: dict[tuple[str, str], _LeaseRecord] = {}
+        self._lease_records: dict[str, _LeaseRecord] = {}
         self._expired_leases: set[str] = set()
         self._released_leases: set[str] = set()
         self._reservation_counter = 0
@@ -448,6 +471,18 @@ class FakeControlPlane:
             _validate_magic_model(fallback_model)
 
         self.lease_grants.append(parsed)
+        key = (parsed.agent_run_id, parsed.holder_id)
+        current = self._leases.get(key)
+        declaration = _LeaseDeclaration.from_request(parsed)
+        if current is not None and self._lease_is_active(current):
+            if current.declaration == declaration:
+                return self._replay_lease_response(current)
+            return self._lease_error(
+                409,
+                "lease_holder_cap_exceeded",
+                "Active lease holder limit exceeded",
+            )
+
         denied_by_period = self._denial_period(parsed.agent_run_id, parsed.model)
         if denied_by_period is not None:
             return PlaneResponse(
@@ -481,15 +516,21 @@ class FakeControlPlane:
             lease_id=f"lse_fake{self._lease_counter}",
             generation=1,
             granted_tokens=self.granted_tokens,
-            fail_open=parsed.fail_open,
+            declaration=declaration,
         )
-        self._leases[(parsed.agent_run_id, parsed.holder_id)] = record
-        return PlaneResponse(200, self._lease_response(record), model_only=True)
+        self._leases[key] = record
+        self._lease_records[record.lease_id] = record
+        return self._store_lease_response(record, self._lease_response(record))
 
     def _handle_lease_renew(self, body: object) -> PlaneResponse:
         parsed = parse_model(LeaseRenewRequest, body)
         if isinstance(parsed, PlaneResponse):
             return parsed
+        if parsed.model is not None:
+            _validate_magic_model(parsed.model)
+        for fallback_model in parsed.fallback_models:
+            _validate_magic_model(fallback_model)
+
         self.lease_renewals.append(parsed)
         record = self._find_lease(parsed.lease_id, parsed.holder_id)
         if (
@@ -498,14 +539,55 @@ class FakeControlPlane:
             or record.lease_id in self._released_leases
         ):
             return self._lease_error(404, "lease_not_found", "Budget lease not found")
+        if record.last_renewal_request == parsed:
+            return self._replay_lease_response(record)
+        if record.terminal:
+            return self._lease_error(404, "lease_not_found", "Budget lease not found")
         if parsed.generation != record.generation:
             return self._lease_error(
                 409,
                 "lease_generation_conflict",
                 "Budget lease generation conflict",
             )
+
+        effective_model = parsed.model if parsed.model is not None else record.declaration.model
+        denied_by_period = self._denial_period(record.agent_run_id, effective_model)
+        if denied_by_period is not None:
+            response = self._lease_verdict_response(
+                eligible=True,
+                allowed=False,
+                denied_by_period=denied_by_period,
+                mode=(
+                    BudgetMode.ALERT_ONLY
+                    if effective_model == "solwyn-test/deny-alert"
+                    else self.mode
+                ),
+            )
+            return self._store_lease_response(
+                record,
+                response,
+                renewal_request=parsed,
+                terminal=True,
+            )
+        if not self.lease_eligible or effective_model == "solwyn-test/lease-ineligible":
+            response = self._lease_verdict_response(
+                eligible=False,
+                allowed=True,
+                ineligible_reason="zero_rate_model",
+            )
+            return self._store_lease_response(
+                record,
+                response,
+                renewal_request=parsed,
+                terminal=True,
+            )
+
         record.generation += 1
-        return PlaneResponse(200, self._lease_response(record), model_only=True)
+        return self._store_lease_response(
+            record,
+            self._lease_response(record),
+            renewal_request=parsed,
+        )
 
     def _handle_lease_surrender(self, body: object) -> PlaneResponse:
         parsed = parse_model(LeaseSurrenderRequest, body)
@@ -513,20 +595,31 @@ class FakeControlPlane:
             return parsed
         self.lease_surrenders.append(parsed)
         record = self._find_lease(parsed.lease_id, parsed.holder_id)
-        if (
-            record is None
-            or record.lease_id in self._released_leases
-            or parsed.generation != record.generation
-        ):
+        if record is None or record.lease_id in self._expired_leases or record.terminal:
+            return self._lease_error(404, "lease_not_found", "Budget lease not found")
+        if parsed.generation != record.generation:
+            return self._lease_error(
+                409,
+                "lease_generation_conflict",
+                "Budget lease generation conflict",
+            )
+        if record.lease_id in self._released_leases:
             return PlaneResponse(200, {"released_tokens": 0})
         self._released_leases.add(record.lease_id)
         return PlaneResponse(200, {"released_tokens": record.granted_tokens})
 
     def _find_lease(self, lease_id: str, holder_id: str) -> _LeaseRecord | None:
-        for record in self._leases.values():
-            if record.lease_id == lease_id and record.holder_id == holder_id:
-                return record
-        return None
+        record = self._lease_records.get(lease_id)
+        if record is None or record.holder_id != holder_id:
+            return None
+        return record
+
+    def _lease_is_active(self, record: _LeaseRecord) -> bool:
+        return (
+            not record.terminal
+            and record.lease_id not in self._expired_leases
+            and record.lease_id not in self._released_leases
+        )
 
     @staticmethod
     def _lease_error(status: int, code: str, message: str) -> PlaneResponse:
@@ -547,7 +640,7 @@ class FakeControlPlane:
             headroom_share_tokens=record.granted_tokens,
             posture=LeasePosture(
                 mode=self.mode,
-                on_unreachable="fail_open" if record.fail_open else "local_enforce",
+                on_unreachable=("fail_open" if record.declaration.fail_open else "local_enforce"),
             ),
             final_grant=False,
             project_id=self.project_id,
@@ -556,6 +649,28 @@ class FakeControlPlane:
             current_usage=self.current_usage,
             remaining_budget=self.remaining_budget,
         )
+
+    def _store_lease_response(
+        self,
+        record: _LeaseRecord,
+        response: LeaseGrantResponse,
+        *,
+        renewal_request: LeaseRenewRequest | None = None,
+        terminal: bool = False,
+    ) -> PlaneResponse:
+        record.last_response_json = response.model_dump_json(exclude_none=True)
+        record.last_renewal_request = (
+            renewal_request.model_copy(deep=True) if renewal_request is not None else None
+        )
+        record.terminal = terminal
+        return PlaneResponse(200, response, model_only=True)
+
+    @staticmethod
+    def _replay_lease_response(record: _LeaseRecord) -> PlaneResponse:
+        if not record.last_response_json:
+            raise RuntimeError("solwyn.testing lease record has no frozen response")
+        response = LeaseGrantResponse.model_validate_json(record.last_response_json)
+        return PlaneResponse(200, response, model_only=True)
 
     def _lease_verdict_response(
         self,

@@ -228,7 +228,107 @@ def test_grant_returns_complete_real_lease_response_and_records_request() -> Non
 
 
 @pytest.mark.unit
-def test_renew_increments_generation_and_fences_stale_or_unknown_leases() -> None:
+def test_active_same_holder_grant_replays_current_lease_and_fences_declaration_changes() -> None:
+    plane = FakeControlPlane()
+    original = _grant_payload()
+    same_declaration = {**original, "estimated_input_tokens": 999}
+    changed_fail_open = {**original, "fail_open": False}
+    changed_model = {**original, "model": "gpt-4o"}
+
+    with httpx.Client(transport=plane.transport) as client:
+        first = client.post(f"{plane.api_url}/api/v1/budgets/lease", json=original)
+        replay = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease",
+            json=same_declaration,
+        )
+        fail_open_conflict = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease",
+            json=changed_fail_open,
+        )
+        model_conflict = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease",
+            json=changed_model,
+        )
+        renewed = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=LeaseRenewRequest(
+                lease_id=first.json()["lease_id"],
+                holder_id="holder-1",
+                generation=first.json()["generation"],
+            ).model_dump(mode="json"),
+        )
+        current_replay = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease",
+            json=original,
+        )
+        surrender = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/surrender",
+            json=LeaseSurrenderRequest(
+                lease_id=first.json()["lease_id"],
+                holder_id="holder-1",
+                generation=2,
+            ).model_dump(mode="json"),
+        )
+        successor = client.post(f"{plane.api_url}/api/v1/budgets/lease", json=original)
+
+    holder_conflict = {
+        "detail": {
+            "code": "lease_holder_cap_exceeded",
+            "message": "Active lease holder limit exceeded",
+        }
+    }
+    assert first.status_code == 200
+    assert replay.content == first.content
+    assert fail_open_conflict.status_code == 409
+    assert fail_open_conflict.json() == holder_conflict
+    assert model_conflict.status_code == 409
+    assert model_conflict.json() == holder_conflict
+    assert renewed.status_code == 200
+    assert renewed.json()["lease_id"] == "lse_fake1"
+    assert renewed.json()["generation"] == 2
+    assert current_replay.content == renewed.content
+    assert surrender.json()["released_tokens"] > 0
+    assert successor.json()["lease_id"] == "lse_fake2"
+    assert successor.json()["generation"] == 1
+
+
+@pytest.mark.unit
+def test_sync_enforcer_can_recover_a_lost_same_holder_grant_response() -> None:
+    plane = FakeControlPlane()
+    enforcer = _make_enforcer(plane)
+    holder_id = enforcer._lease.holder_id
+    with httpx.Client(transport=plane.transport) as client:
+        lost = _post_grant(client, plane, holder_id=holder_id)
+
+    recovered = _check(enforcer)
+    enforcer.close()
+
+    assert lost.json()["lease_id"] == "lse_fake1"
+    assert recovered.lease_id == "lse_fake1"  # type: ignore[attr-defined]
+    assert len(plane.lease_grants) == 2
+
+
+@pytest.mark.unit
+async def test_async_enforcer_can_recover_a_lost_same_holder_grant_response() -> None:
+    plane = FakeControlPlane()
+    enforcer = _make_async_enforcer(plane)
+    holder_id = enforcer._lease.holder_id
+    async with httpx.AsyncClient(transport=plane.transport) as client:
+        lost = await client.post(
+            f"{plane.api_url}/api/v1/budgets/lease",
+            json=_grant_payload(holder_id=holder_id),
+        )
+
+    recovered = await _acheck(enforcer)
+    await enforcer.close()
+
+    assert lost.json()["lease_id"] == "lse_fake1"
+    assert recovered.lease_id == "lse_fake1"  # type: ignore[attr-defined]
+    assert len(plane.lease_grants) == 2
+
+
+@pytest.mark.unit
+def test_renew_replays_identical_predecessor_and_fences_changed_or_unknown_requests() -> None:
     plane = FakeControlPlane()
 
     with httpx.Client(transport=plane.transport) as client:
@@ -243,9 +343,19 @@ def test_renew_increments_generation_and_fences_stale_or_unknown_leases() -> Non
             f"{plane.api_url}/api/v1/budgets/lease/renew",
             json=renewal_request.model_dump(mode="json"),
         )
-        stale = client.post(
+        replay = client.post(
             f"{plane.api_url}/api/v1/budgets/lease/renew",
             json=renewal_request.model_dump(mode="json"),
+        )
+        stale_request = renewal_request.model_copy(update={"spent_tokens": 101})
+        stale = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=stale_request.model_dump(mode="json"),
+        )
+        future_request = renewal_request.model_copy(update={"generation": 99})
+        future = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=future_request.model_dump(mode="json"),
         )
         unknown_request = LeaseRenewRequest(
             lease_id="lse_unknown",
@@ -263,6 +373,8 @@ def test_renew_increments_generation_and_fences_stale_or_unknown_leases() -> Non
     assert payload["generation"] == 2
     assert payload.keys() >= LEASE_BLOCK_KEYS
     assert LeaseGrantResponse.model_validate(payload).generation == 2
+    assert replay.status_code == 200
+    assert replay.content == renewed.content
     assert stale.status_code == 409
     assert stale.json() == {
         "detail": {
@@ -270,6 +382,8 @@ def test_renew_increments_generation_and_fences_stale_or_unknown_leases() -> Non
             "message": "Budget lease generation conflict",
         }
     }
+    assert future.status_code == 409
+    assert future.json() == stale.json()
     assert unknown.status_code == 404
     assert unknown.json() == {
         "detail": {
@@ -277,7 +391,44 @@ def test_renew_increments_generation_and_fences_stale_or_unknown_leases() -> Non
             "message": "Budget lease not found",
         }
     }
-    assert plane.lease_renewals == [renewal_request, renewal_request, unknown_request]
+    assert plane.lease_renewals == [
+        renewal_request,
+        renewal_request,
+        stale_request,
+        future_request,
+        unknown_request,
+    ]
+
+
+@pytest.mark.unit
+def test_sync_enforcer_can_apply_replayed_success_after_lost_renewal_response() -> None:
+    plane = FakeControlPlane()
+    enforcer = _make_enforcer(plane)
+    granted = _check(enforcer)
+    renewal = enforcer._build_renewal(
+        "run-lease",
+        model="gpt-5.5",
+        provider="openai",
+        fallback_providers=[],
+        fallback_models=[],
+    )
+    if renewal is None:
+        pytest.fail("held lease did not produce a renewal request")
+    with httpx.Client(transport=plane.transport) as client:
+        lost = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=renewal.model_dump(mode="json"),
+        )
+
+    enforcer._renew_lease("run-lease", renewal, ["gpt-5.5"])
+    state = enforcer._lease.state_for("run-lease")
+    enforcer.close()
+
+    assert granted.lease_id == "lse_fake1"  # type: ignore[attr-defined]
+    assert lost.json()["generation"] == 2
+    assert state is not None
+    assert state.lease_id == "lse_fake1"
+    assert state.generation == 2
 
 
 @pytest.mark.unit
@@ -300,12 +451,48 @@ def test_surrender_is_recorded_and_idempotently_releases_tokens() -> None:
             f"{plane.api_url}/api/v1/budgets/lease/surrender",
             json=request.model_dump(mode="json"),
         )
+        stale = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/surrender",
+            json=request.model_copy(update={"generation": 99}).model_dump(mode="json"),
+        )
+        wrong_holder = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/surrender",
+            json=request.model_copy(update={"holder_id": "holder-2"}).model_dump(mode="json"),
+        )
+        missing = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/surrender",
+            json=request.model_copy(update={"lease_id": "lse_missing"}).model_dump(mode="json"),
+        )
+        successor = _post_grant(client, plane)
+        replay_after_regrant = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/surrender",
+            json=request.model_dump(mode="json"),
+        )
 
     assert first.status_code == 200
     assert first.json() == {"released_tokens": 321}
     assert replay.status_code == 200
     assert replay.json() == {"released_tokens": 0}
-    assert plane.lease_surrenders == [request, request]
+    assert stale.status_code == 409
+    assert stale.json() == {
+        "detail": {
+            "code": "lease_generation_conflict",
+            "message": "Budget lease generation conflict",
+        }
+    }
+    assert wrong_holder.status_code == 404
+    assert wrong_holder.json() == {
+        "detail": {
+            "code": "lease_not_found",
+            "message": "Budget lease not found",
+        }
+    }
+    assert missing.status_code == 404
+    assert missing.json() == wrong_holder.json()
+    assert successor.json()["lease_id"] == "lse_fake2"
+    assert replay_after_regrant.status_code == 200
+    assert replay_after_regrant.json() == {"released_tokens": 0}
+    assert len(plane.lease_surrenders) == 6
 
 
 @pytest.mark.unit
@@ -365,6 +552,106 @@ def test_magic_lease_denials_match_check_verdicts(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("grant_model", "renew_model", "period", "mode"),
+    [
+        ("gpt-5.5", "solwyn-test/deny", "monthly", "hard_deny"),
+        ("gpt-5.5", "solwyn-test/deny-alert", "monthly", "alert_only"),
+        ("gpt-5.5", "solwyn-test/deny-tag", "tag", "hard_deny"),
+        ("gpt-5.5", "solwyn-test/deny-stopped", "run_stopped", "hard_deny"),
+        ("solwyn-test/runaway", None, "agent_run", "hard_deny"),
+    ],
+)
+def test_renewal_rechecks_magic_denials_and_replays_terminal_response(
+    grant_model: str,
+    renew_model: str | None,
+    period: str,
+    mode: str,
+) -> None:
+    plane = FakeControlPlane(mode=BudgetMode.HARD_DENY)
+    with httpx.Client(transport=plane.transport) as client:
+        grant = _post_grant(client, plane, model=grant_model).json()
+        renewal = LeaseRenewRequest(
+            lease_id=grant["lease_id"],
+            holder_id="holder-1",
+            generation=grant["generation"],
+            model=renew_model,
+            provider=ProviderName.OPENAI if renew_model is not None else None,
+        )
+        denied = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=renewal.model_dump(mode="json"),
+        )
+        replay = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=renewal.model_dump(mode="json"),
+        )
+
+    payload = denied.json()
+    assert payload["eligible"] is True
+    assert payload["allowed"] is False
+    assert payload["denied_by_period"] == period
+    assert payload["mode"] == mode
+    assert LEASE_BLOCK_KEYS.isdisjoint(payload)
+    assert replay.content == denied.content
+
+
+@pytest.mark.unit
+def test_renewal_consumes_deny_next_once_and_terminal_record_can_regrant() -> None:
+    plane = FakeControlPlane()
+    with httpx.Client(transport=plane.transport) as client:
+        grant = _post_grant(client, plane).json()
+        renewal = LeaseRenewRequest(
+            lease_id=grant["lease_id"],
+            holder_id="holder-1",
+            generation=grant["generation"],
+        )
+        plane.deny_next(period="agent_run")
+        denied = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=renewal.model_dump(mode="json"),
+        )
+        replay = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=renewal.model_dump(mode="json"),
+        )
+        successor = _post_grant(client, plane).json()
+
+    assert denied.json()["allowed"] is False
+    assert denied.json()["denied_by_period"] == "agent_run"
+    assert replay.content == denied.content
+    assert successor["lease_id"] == "lse_fake2"
+    assert successor["generation"] == 1
+
+
+@pytest.mark.unit
+def test_sync_enforcer_observes_mid_run_renewal_deny_as_sticky() -> None:
+    plane = FakeControlPlane(mode=BudgetMode.HARD_DENY)
+    enforcer = _make_enforcer(plane)
+    granted = _check(enforcer)
+    plane.deny_run("run-lease")
+    renewal = enforcer._build_renewal(
+        "run-lease",
+        model="gpt-5.5",
+        provider="openai",
+        fallback_providers=[],
+        fallback_models=[],
+    )
+    if renewal is None:
+        pytest.fail("held lease did not produce a renewal request")
+
+    enforcer._renew_lease("run-lease", renewal, ["gpt-5.5"])
+    with plane.outage():
+        sticky = _check(enforcer)
+    enforcer.close()
+
+    assert granted.lease_id == "lse_fake1"  # type: ignore[attr-defined]
+    assert sticky.allowed is False  # type: ignore[attr-defined]
+    assert sticky.denied_by_period == "agent_run"  # type: ignore[attr-defined]
+    assert plane.lease_renewals == [renewal]
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("model", ["gpt-5.5", "solwyn-test/lease-ineligible"])
 def test_ineligible_grant_omits_lease_block_and_falls_back_to_check(model: str) -> None:
     plane = FakeControlPlane(lease_eligible=model != "gpt-5.5")
@@ -391,6 +678,71 @@ def test_ineligible_grant_omits_lease_block_and_falls_back_to_check(model: str) 
     assert payload["ineligible_reason"] == "zero_rate_model"
     assert payload["allowed"] is True
     assert LEASE_BLOCK_KEYS.isdisjoint(payload)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("trigger", ["plane", "magic"])
+def test_renewal_rechecks_ineligibility_and_replays_terminal_response(trigger: str) -> None:
+    plane = FakeControlPlane()
+    with httpx.Client(transport=plane.transport) as client:
+        grant = _post_grant(client, plane).json()
+        if trigger == "plane":
+            plane.lease_eligible = False
+        renewal = LeaseRenewRequest(
+            lease_id=grant["lease_id"],
+            holder_id="holder-1",
+            generation=grant["generation"],
+            model="solwyn-test/lease-ineligible" if trigger == "magic" else None,
+            provider=ProviderName.OPENAI if trigger == "magic" else None,
+        )
+        ineligible = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=renewal.model_dump(mode="json"),
+        )
+        replay = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=renewal.model_dump(mode="json"),
+        )
+        plane.lease_eligible = True
+        successor = _post_grant(client, plane).json()
+
+    payload = ineligible.json()
+    assert payload["eligible"] is False
+    assert payload["ineligible_reason"] == "zero_rate_model"
+    assert payload["allowed"] is True
+    assert LEASE_BLOCK_KEYS.isdisjoint(payload)
+    assert replay.content == ineligible.content
+    assert successor["lease_id"] == "lse_fake2"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("trigger", ["plane", "magic"])
+async def test_async_enforcer_observes_mid_run_renewal_ineligibility(trigger: str) -> None:
+    plane = FakeControlPlane()
+    enforcer = _make_async_enforcer(plane)
+    granted = await _acheck(enforcer)
+    if trigger == "plane":
+        plane.lease_eligible = False
+    renewal_model = "solwyn-test/lease-ineligible" if trigger == "magic" else "gpt-5.5"
+    renewal = enforcer._build_renewal(
+        "run-lease",
+        model=renewal_model,
+        provider="openai",
+        fallback_providers=[],
+        fallback_models=[],
+    )
+    if renewal is None:
+        pytest.fail("held lease did not produce a renewal request")
+
+    await enforcer._renew_lease("run-lease", renewal, [renewal_model])
+    plane.lease_eligible = True
+    legacy = await _acheck(enforcer)
+    await enforcer.close()
+
+    assert granted.lease_id == "lse_fake1"  # type: ignore[attr-defined]
+    assert legacy.allowed is True  # type: ignore[attr-defined]
+    assert legacy.lease_id is None  # type: ignore[attr-defined]
+    assert len(plane.checks) == 1
 
 
 @pytest.mark.unit
