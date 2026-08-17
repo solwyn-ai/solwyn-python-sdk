@@ -46,6 +46,18 @@ def patch_wrapper_local(wrapper: object, name: str, replacement: Any) -> Iterato
             object.__setattr__(wrapper, name, previous)
 
 
+@pytest.fixture(autouse=True)
+def _reset_process_run_control() -> Iterator[None]:
+    """Keep exact and conservative process-wide stop state test-isolated."""
+    from solwyn import _run_control
+
+    with _run_control._STATE.lock:
+        _run_control._STATE._clear_for_test_locked()
+    yield
+    with _run_control._STATE.lock:
+        _run_control._STATE._clear_for_test_locked()
+
+
 @pytest.fixture
 def repo_tool_env() -> Callable[[Path], dict[str, str]]:
     """Build an isolated subprocess environment for checkout-owned tools."""

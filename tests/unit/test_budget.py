@@ -9,6 +9,11 @@ import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 from pydantic import BaseModel
 
+from solwyn._run_control import (
+    clear_run_termination,
+    mark_terminated,
+    run_termination,
+)
 from solwyn._types import BudgetCheckResponse, BudgetMode, LeaseGrantResponse
 from solwyn.budget import (
     BudgetCheckResult,
@@ -163,6 +168,58 @@ class TestBudgetEnforcerBase:
         response = BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE)
         base._cache_response(response)
         assert base._should_use_cache() is True
+
+    def test_live_allow_clears_matching_server_termination(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+        mark_terminated("run_server", reason="run_stopped", source="server")
+
+        base._cache_response(
+            BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE),
+            agent_run_id="run_server",
+        )
+
+        assert run_termination("run_server") is None
+
+    def test_live_allow_does_not_clear_local_velocity_termination(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+        mark_terminated(
+            "run_local",
+            reason="velocity:repeat_size",
+            source="local_velocity",
+        )
+
+        try:
+            base._cache_response(
+                BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE),
+                agent_run_id="run_local",
+            )
+
+            assert run_termination("run_local") is not None
+        finally:
+            clear_run_termination("run_local")
+
+    def test_live_allow_does_not_clear_different_server_run(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+        mark_terminated("run_other", reason="run_stopped", source="server")
+
+        try:
+            base._cache_response(
+                BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE),
+                agent_run_id="run_allowed",
+            )
+
+            assert run_termination("run_other") is not None
+        finally:
+            clear_run_termination("run_other")
 
     def test_never_cache_deny_decisions(self) -> None:
         base = _BudgetEnforcerBase(
