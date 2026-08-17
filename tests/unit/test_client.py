@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import logging
 import warnings
 from collections.abc import Iterator
@@ -83,6 +85,54 @@ def _mock_anthropic_client():
     )
     client.messages.create.return_value = mock_response
     return client, mock_response
+
+
+class _CloseableSyncUsageStream:
+    def __init__(self, chunks: list[object]) -> None:
+        self._chunks = chunks
+        self.pulled: list[object] = []
+        self.close_calls = 0
+
+    def __iter__(self):
+        for chunk in self._chunks:
+            self.pulled.append(chunk)
+            yield chunk
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _CloseableAsyncUsageStream:
+    def __init__(self, chunks: list[object]) -> None:
+        self._chunks = iter(chunks)
+        self.pulled: list[object] = []
+        self.aclose_calls = 0
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            chunk = next(self._chunks)
+        except StopIteration:
+            raise StopAsyncIteration from None
+        self.pulled.append(chunk)
+        return chunk
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+
+
+def _openai_usage_chunk(*, output_tokens: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        usage=SimpleNamespace(
+            prompt_tokens=10,
+            completion_tokens=output_tokens,
+            prompt_tokens_details=None,
+            completion_tokens_details=None,
+        ),
+        choices=[],
+    )
 
 
 def _make_solwyn(client, **overrides):
@@ -1361,6 +1411,7 @@ class TestSyncStreamingInterception:
             )
 
         assert isinstance(result, SyncStreamWrapper)
+        assert result._abort_check is None
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
@@ -1553,6 +1604,201 @@ class TestSyncStreamingInterception:
         # budget.confirm_cost must NOT have been called directly
         assert not hasattr(solwyn._budget, "_direct_confirm_calls")
 
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_run_termination_aborts_next_chunk_and_settles_partial_usage_once(self) -> None:
+        client, _ = _mock_openai_client()
+        chunks = [_openai_usage_chunk(output_tokens=count) for count in range(1, 6)]
+        inner = _CloseableSyncUsageStream(chunks)
+        client.chat.completions.create.return_value = inner
+        solwyn = _make_solwyn(client)
+        budget = _allow_budget_result()
+        budget.reservation_id = "res_stream_abort"
+        solwyn._budget.check_budget = MagicMock(return_value=budget)
+        solwyn._reporter.report_settlement = MagicMock()
+
+        with solwyn_pkg.run("sync-cooperative-stop") as run_id:
+            stream = solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                stream=True,
+            )
+            assert next(stream) is chunks[0]
+            assert next(stream) is chunks[1]
+            mark_terminated(run_id, reason="manual_kill", source="server")
+
+            with pytest.raises(RunStoppedError) as exc_info:
+                next(stream)
+
+        assert exc_info.value.agent_run_id == run_id
+        assert exc_info.value.reason == "manual_kill"
+        assert exc_info.value.source == "server"
+        assert inner.pulled == chunks[:3]
+        assert inner.close_calls == 1
+        solwyn._reporter.report_settlement.assert_called_once()
+        confirm, event = solwyn._reporter.report_settlement.call_args.args
+        assert confirm.reservation_id == "res_stream_abort"
+        assert confirm.token_details.input_tokens == 10
+        assert confirm.token_details.output_tokens == 2
+        assert event.input_tokens == 10
+        assert event.output_tokens == 2
+        assert event.agent_run_id == run_id
+        assert run_termination(run_id) is not None
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_stream_stop_survives_registry_lru_eviction_and_settles_once(self) -> None:
+        from solwyn import _run_control
+
+        client, _ = _mock_openai_client()
+        chunks = [_openai_usage_chunk(output_tokens=count) for count in range(1, 5)]
+        inner = _CloseableSyncUsageStream(chunks)
+        client.chat.completions.create.return_value = inner
+        solwyn = _make_solwyn(client)
+        budget = _allow_budget_result()
+        budget.reservation_id = "res_stream_evicted_stop"
+        solwyn._budget.check_budget = MagicMock(return_value=budget)
+        solwyn._reporter.report_settlement = MagicMock()
+
+        with solwyn_pkg.run("sync-evicted-stop") as run_id:
+            stream = solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                stream=True,
+            )
+            assert next(stream) is chunks[0]
+            mark_terminated(run_id, reason="original_manual_kill", source="server")
+            for index in range(257):
+                mark_terminated(f"other-{index}", reason="later_stop", source="server")
+            assert run_termination(run_id) is None
+
+            with pytest.raises(RunStoppedError) as exc_info:
+                next(stream)
+            with pytest.raises(RunStoppedError) as replay:
+                next(stream)
+
+        assert replay.value is exc_info.value
+        assert (exc_info.value.reason, exc_info.value.source) == (
+            "original_manual_kill",
+            "server",
+        )
+        assert inner.pulled == chunks[:2]
+        assert inner.close_calls == 1
+        solwyn._reporter.report_settlement.assert_called_once()
+        assert run_id not in _run_control._STATE.active_handles
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_concurrent_stream_handle_exists_before_dispatch_and_survives_eviction(
+        self,
+    ) -> None:
+        from solwyn import _run_control
+
+        client, _ = _mock_openai_client()
+        first_inner = _CloseableSyncUsageStream([_openai_usage_chunk(output_tokens=1)])
+        second_inner = _CloseableSyncUsageStream([_openai_usage_chunk(output_tokens=2)])
+        dispatches = 0
+
+        def dispatch(**_kwargs: object) -> object:
+            nonlocal dispatches
+            dispatches += 1
+            if dispatches == 1:
+                return first_inner
+            mark_terminated(run_id, reason="immutable_winner", source="server")
+            for index in range(257):
+                mark_terminated(f"sync-race-other-{index}", reason="later", source="server")
+            assert run_termination(run_id) is None
+            return second_inner
+
+        client.chat.completions.create.side_effect = dispatch
+        solwyn = _make_solwyn(client)
+        budget = _allow_budget_result()
+        budget.reservation_id = "res_stream_race"
+        solwyn._budget.check_budget = MagicMock(return_value=budget)
+        solwyn._reporter.report_settlement = MagicMock()
+
+        with solwyn_pkg.run("sync-stream-race") as run_id:
+            first = solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                stream=True,
+            )
+            second = solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                stream=True,
+            )
+            assert len(_run_control._STATE.active_handles[run_id]) == 2
+
+            for stream in (first, second):
+                with pytest.raises(RunStoppedError) as exc_info:
+                    next(stream)
+                assert (exc_info.value.reason, exc_info.value.source) == (
+                    "immutable_winner",
+                    "server",
+                )
+
+        assert first_inner.pulled == [_openai_usage_chunk(output_tokens=1)]
+        assert second_inner.pulled == [_openai_usage_chunk(output_tokens=2)]
+        assert solwyn._reporter.report_settlement.call_count == 2
+        assert run_id not in _run_control._STATE.active_handles
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_stream_dispatch_failure_and_gc_abandonment_release_watchers(self) -> None:
+        from solwyn import _run_control
+
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client)
+        solwyn._budget.check_budget = MagicMock(return_value=_allow_budget_result())
+
+        with solwyn_pkg.run("sync-stream-cleanup") as run_id:
+            client.chat.completions.create.side_effect = RuntimeError("dispatch failed")
+            with pytest.raises(RuntimeError, match="dispatch failed"):
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "Hello"}],
+                    stream=True,
+                )
+            assert run_id not in _run_control._STATE.active_handles
+
+            client.chat.completions.create.side_effect = None
+            client.chat.completions.create.return_value = _CloseableSyncUsageStream([])
+            stream = solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                stream=True,
+            )
+            assert run_id in _run_control._STATE.active_handles
+            del stream
+            gc.collect()
+            assert run_id not in _run_control._STATE.active_handles
+
+        solwyn._reporter._http.close()
+        solwyn._budget._http.close()
+
+    def test_stream_base_exception_during_dispatch_releases_watcher(self) -> None:
+        from solwyn import _run_control
+
+        client, _ = _mock_openai_client()
+        client.chat.completions.create.side_effect = KeyboardInterrupt()
+        solwyn = _make_solwyn(client)
+        solwyn._budget.check_budget = MagicMock(return_value=_allow_budget_result())
+
+        with (
+            solwyn_pkg.run("sync-stream-base-exception") as run_id,
+            pytest.raises(KeyboardInterrupt),
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                stream=True,
+            )
+
+        assert run_id not in _run_control._STATE.active_handles
         solwyn._reporter._http.close()
         solwyn._budget._http.close()
 
@@ -1763,6 +2009,7 @@ class TestAsyncStreamingInterception:
                 stream=True,
             )
             assert isinstance(stream, AsyncStreamWrapper)
+            assert stream._abort_check is None
 
             chunks = [c async for c in stream]
 
@@ -1773,6 +2020,261 @@ class TestAsyncStreamingInterception:
         assert event.input_tokens == 100
         assert event.output_tokens == 50
 
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_run_termination_aborts_next_chunk_and_settles_partial_usage_once(
+        self,
+    ) -> None:
+        client, _ = _mock_openai_client()
+        chunks = [_openai_usage_chunk(output_tokens=count) for count in range(1, 6)]
+        inner = _CloseableAsyncUsageStream(chunks)
+        client.chat.completions.create = AsyncMockFn(return_value=inner)
+        solwyn = _make_async_solwyn(client)
+        budget = _allow_budget_result()
+        budget.reservation_id = "res_stream_abort"
+        solwyn._budget.check_budget = AsyncMockFn(return_value=budget)
+        solwyn._reporter.report_settlement = MagicMock()
+
+        async with solwyn_pkg.run("async-cooperative-stop") as run_id:
+            stream = await solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                stream=True,
+            )
+            assert await anext(stream) is chunks[0]
+            assert await anext(stream) is chunks[1]
+            mark_terminated(run_id, reason="manual_kill", source="server")
+
+            with pytest.raises(RunStoppedError) as exc_info:
+                await anext(stream)
+
+        assert exc_info.value.agent_run_id == run_id
+        assert exc_info.value.reason == "manual_kill"
+        assert exc_info.value.source == "server"
+        assert inner.pulled == chunks[:3]
+        assert inner.aclose_calls == 1
+        solwyn._reporter.report_settlement.assert_called_once()
+        confirm, event = solwyn._reporter.report_settlement.call_args.args
+        assert confirm.reservation_id == "res_stream_abort"
+        assert confirm.token_details.input_tokens == 10
+        assert confirm.token_details.output_tokens == 2
+        assert event.input_tokens == 10
+        assert event.output_tokens == 2
+        assert event.agent_run_id == run_id
+        assert run_termination(run_id) is not None
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_stream_stop_survives_registry_lru_eviction_and_settles_once(
+        self,
+    ) -> None:
+        from solwyn import _run_control
+
+        client, _ = _mock_openai_client()
+        chunks = [_openai_usage_chunk(output_tokens=count) for count in range(1, 5)]
+        inner = _CloseableAsyncUsageStream(chunks)
+        client.chat.completions.create = AsyncMockFn(return_value=inner)
+        solwyn = _make_async_solwyn(client)
+        budget = _allow_budget_result()
+        budget.reservation_id = "res_async_stream_evicted_stop"
+        solwyn._budget.check_budget = AsyncMockFn(return_value=budget)
+        solwyn._reporter.report_settlement = MagicMock()
+
+        async with solwyn_pkg.run("async-evicted-stop") as run_id:
+            stream = await solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                stream=True,
+            )
+            assert await anext(stream) is chunks[0]
+            mark_terminated(run_id, reason="original_manual_kill", source="server")
+            for index in range(257):
+                mark_terminated(f"async-other-{index}", reason="later_stop", source="server")
+            assert run_termination(run_id) is None
+
+            with pytest.raises(RunStoppedError) as exc_info:
+                await anext(stream)
+            with pytest.raises(RunStoppedError) as replay:
+                await anext(stream)
+
+        assert replay.value is exc_info.value
+        assert (exc_info.value.reason, exc_info.value.source) == (
+            "original_manual_kill",
+            "server",
+        )
+        assert inner.pulled == chunks[:2]
+        assert inner.aclose_calls == 1
+        solwyn._reporter.report_settlement.assert_called_once()
+        assert run_id not in _run_control._STATE.active_handles
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_concurrent_stream_handle_exists_before_dispatch_and_survives_eviction(
+        self,
+    ) -> None:
+        from solwyn import _run_control
+
+        client, _ = _mock_openai_client()
+        first_chunk = _openai_usage_chunk(output_tokens=1)
+        second_chunk = _openai_usage_chunk(output_tokens=2)
+        first_inner = _CloseableAsyncUsageStream([first_chunk])
+        second_inner = _CloseableAsyncUsageStream([second_chunk])
+        dispatches = 0
+
+        async def dispatch(**_kwargs: object) -> object:
+            nonlocal dispatches
+            dispatches += 1
+            if dispatches == 1:
+                return first_inner
+            mark_terminated(run_id, reason="immutable_winner", source="server")
+            for index in range(257):
+                mark_terminated(f"async-race-other-{index}", reason="later", source="server")
+            assert run_termination(run_id) is None
+            return second_inner
+
+        client.chat.completions.create = AsyncMockFn(side_effect=dispatch)
+        solwyn = _make_async_solwyn(client)
+        budget = _allow_budget_result()
+        budget.reservation_id = "res_async_stream_race"
+        solwyn._budget.check_budget = AsyncMockFn(return_value=budget)
+        solwyn._reporter.report_settlement = MagicMock()
+
+        async with solwyn_pkg.run("async-stream-race") as run_id:
+            first = await solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                stream=True,
+            )
+            second = await solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                stream=True,
+            )
+            assert len(_run_control._STATE.active_handles[run_id]) == 2
+
+            for stream in (first, second):
+                with pytest.raises(RunStoppedError) as exc_info:
+                    await anext(stream)
+                assert (exc_info.value.reason, exc_info.value.source) == (
+                    "immutable_winner",
+                    "server",
+                )
+
+        assert first_inner.pulled == [first_chunk]
+        assert second_inner.pulled == [second_chunk]
+        assert solwyn._reporter.report_settlement.call_count == 2
+        assert run_id not in _run_control._STATE.active_handles
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_stream_dispatch_failure_and_gc_abandonment_release_watchers(
+        self,
+    ) -> None:
+        from solwyn import _run_control
+
+        client, _ = _mock_openai_client()
+        solwyn = _make_async_solwyn(client)
+        solwyn._budget.check_budget = AsyncMockFn(return_value=_allow_budget_result())
+
+        async with solwyn_pkg.run("async-stream-cleanup") as run_id:
+            client.chat.completions.create = AsyncMockFn(
+                side_effect=RuntimeError("dispatch failed")
+            )
+            with pytest.raises(RuntimeError, match="dispatch failed"):
+                await solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "Hello"}],
+                    stream=True,
+                )
+            assert run_id not in _run_control._STATE.active_handles
+
+            client.chat.completions.create = AsyncMockFn(
+                return_value=_CloseableAsyncUsageStream([])
+            )
+            stream = await solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                stream=True,
+            )
+            assert run_id in _run_control._STATE.active_handles
+            del stream
+            gc.collect()
+            assert run_id not in _run_control._STATE.active_handles
+
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_dispatch_cancellation_releases_every_unique_run_watcher(
+        self,
+    ) -> None:
+        from solwyn import _run_control
+
+        client, _ = _mock_openai_client()
+        client.chat.completions.create = AsyncMockFn(side_effect=asyncio.CancelledError())
+        solwyn = _make_async_solwyn(client)
+        solwyn._budget.check_budget = AsyncMockFn(return_value=_allow_budget_result())
+        baseline = set(_run_control._STATE.active_handles)
+        run_ids: set[str] = set()
+
+        for index in range(24):
+            async with solwyn_pkg.run(f"async-dispatch-cancel-{index}") as run_id:
+                run_ids.add(run_id)
+                with pytest.raises(asyncio.CancelledError):
+                    await solwyn.chat.completions.create(
+                        model="gpt-5.5",
+                        messages=[{"role": "user", "content": "Hello"}],
+                        stream=True,
+                    )
+
+        assert set(_run_control._STATE.active_handles) == baseline
+        assert run_ids.isdisjoint(_run_control._STATE.active_handles)
+        await solwyn._budget._http.aclose()
+        await solwyn._reporter._http.aclose()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_async_lazy_first_chunk_cancellation_releases_every_watcher(
+        self,
+    ) -> None:
+        from solwyn import _run_control
+
+        client = MagicMock()
+        client.__class__.__module__ = "google.genai._client"
+        client.with_options.return_value = client
+
+        async def cancelled_stream():
+            raise asyncio.CancelledError
+            yield  # pragma: no cover - makes this an async iterator
+
+        client.models.generate_content_stream = AsyncMockFn(
+            side_effect=lambda **_kwargs: cancelled_stream()
+        )
+        solwyn = _make_async_solwyn(client)
+        solwyn._budget.check_budget = AsyncMockFn(return_value=_allow_budget_result())
+        baseline = set(_run_control._STATE.active_handles)
+
+        for index in range(24):
+            async with solwyn_pkg.run(f"async-materialize-cancel-{index}"):
+                with pytest.raises(asyncio.CancelledError):
+                    await solwyn.models.generate_content_stream(
+                        model="gemini-3.5-flash",
+                        contents="Hello",
+                    )
+
+        assert set(_run_control._STATE.active_handles) == baseline
         await solwyn._budget._http.aclose()
         await solwyn._reporter._http.aclose()
 
