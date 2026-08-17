@@ -40,7 +40,11 @@ from solwyn._base import (
     _responses_output_bound,
     _SolwynBase,
 )
-from solwyn._control_plane_transport import ControlPlaneTransport, require_dual_transport
+from solwyn._control_plane_transport import (
+    ControlPlaneTransport,
+    require_dual_transport,
+    require_sync_transport,
+)
 from solwyn._privacy import (
     estimate_content_length,
     estimate_responses_content_length,
@@ -1272,6 +1276,8 @@ class Solwyn(_SolwynBase):
         control_plane_transport: httpx.BaseTransport | None = None,
         **config_kwargs: object,
     ) -> None:
+        require_sync_transport(control_plane_transport)
+
         # self._client is typed Any because each provider SDK has a different
         # public surface (chat/messages/models). A unified Protocol would not
         # match all three. Type safety stops at the _sync_dispatch boundary.

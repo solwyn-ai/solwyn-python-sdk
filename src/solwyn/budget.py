@@ -29,6 +29,7 @@ from solwyn._control_plane_transport import (
     non_closing_async_transport,
     non_closing_sync_transport,
     require_dual_transport,
+    require_sync_transport,
 )
 from solwyn._lease import (
     DEFAULT_OUTPUT_BOUND,
@@ -1252,6 +1253,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         lease_enabled: bool = True,
         lease_output_bound_default: int = DEFAULT_OUTPUT_BOUND,
     ) -> None:
+        require_sync_transport(transport)
         super().__init__(
             api_url=api_url,
             api_key=api_key,

@@ -21,6 +21,7 @@ from solwyn._types import BudgetConfirmRequest, ProviderName
 from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
+from solwyn.testing import FakeControlPlane
 
 _API_URL = "http://control-plane.test"
 
@@ -119,6 +120,13 @@ class _AsyncOnlyTransport(httpx.AsyncBaseTransport):
         return None
 
 
+class _CoroutineHandleRequestTransport:
+    """A transport whose ``handle_request`` is itself a coroutine function."""
+
+    async def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, json=ALLOW_BUDGET_RESPONSE)
+
+
 class _DualWithoutSyncHandler(httpx.BaseTransport, httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, request=request, json=ALLOW_BUDGET_RESPONSE)
@@ -196,6 +204,10 @@ class _AsyncClosableComponent(Protocol):
     async def close(self) -> None: ...
 
 
+class _SyncClosableComponent(Protocol):
+    def close(self) -> None: ...
+
+
 def _new_async_enforcer_with_transport(transport: object) -> AsyncBudgetEnforcer:
     return AsyncBudgetEnforcer(_API_URL, VALID_API_KEY, transport=transport)  # type: ignore[arg-type]
 
@@ -207,6 +219,23 @@ def _new_async_reporter_with_transport(transport: object) -> AsyncMetadataReport
 def _new_async_solwyn_with_transport(transport: object) -> AsyncSolwyn:
     return AsyncSolwyn(
         _AsyncOpenAIClientStub(),
+        api_key=VALID_API_KEY,
+        api_url=_API_URL,
+        control_plane_transport=transport,  # type: ignore[arg-type]
+    )
+
+
+def _new_sync_enforcer_with_transport(transport: object) -> BudgetEnforcer:
+    return BudgetEnforcer(_API_URL, VALID_API_KEY, transport=transport)  # type: ignore[arg-type]
+
+
+def _new_sync_reporter_with_transport(transport: object) -> MetadataReporter:
+    return MetadataReporter(_API_URL, VALID_API_KEY, transport=transport)  # type: ignore[arg-type]
+
+
+def _new_sync_solwyn_with_transport(transport: object) -> Solwyn:
+    return Solwyn(
+        _SyncOpenAIClientStub(),
         api_key=VALID_API_KEY,
         api_url=_API_URL,
         control_plane_transport=transport,  # type: ignore[arg-type]
@@ -325,6 +354,87 @@ async def test_async_components_reject_wrong_sync_async_method_shapes_at_constru
         component_factory(transport_factory(recorder))
 
     assert recorder.paths == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "component_factory",
+    [
+        _new_sync_enforcer_with_transport,
+        _new_sync_reporter_with_transport,
+        _new_sync_solwyn_with_transport,
+    ],
+)
+@pytest.mark.parametrize(
+    "transport_factory",
+    [
+        _AsyncOnlyTransport,
+        object,
+        _CoroutineHandleRequestTransport,
+        httpx.BaseTransport,
+    ],
+)
+def test_sync_components_reject_one_sided_transports(
+    component_factory: Callable[[object], _SyncClosableComponent],
+    transport_factory: Callable[[], object],
+) -> None:
+    with pytest.raises(TypeError, match="httpx sync transport interface"):
+        component_factory(transport_factory())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "component_factory",
+    [
+        _new_sync_enforcer_with_transport,
+        _new_sync_reporter_with_transport,
+        _new_sync_solwyn_with_transport,
+    ],
+)
+def test_sync_components_reject_fake_control_plane_instance(
+    component_factory: Callable[[object], _SyncClosableComponent],
+) -> None:
+    # The most likely real-world mistake: passing the FakeControlPlane
+    # instance itself instead of its `.transport` attribute.
+    plane = FakeControlPlane()
+
+    with pytest.raises(TypeError, match="httpx sync transport interface"):
+        component_factory(plane)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "component_factory",
+    [
+        _new_sync_enforcer_with_transport,
+        _new_sync_reporter_with_transport,
+        _new_sync_solwyn_with_transport,
+    ],
+)
+def test_sync_components_accept_mock_transport(
+    component_factory: Callable[[object], _SyncClosableComponent],
+) -> None:
+    recorder = _Recorder()
+    component = component_factory(httpx.MockTransport(recorder.handler))
+    component.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "component_factory",
+    [
+        _new_sync_enforcer_with_transport,
+        _new_sync_reporter_with_transport,
+        _new_sync_solwyn_with_transport,
+    ],
+)
+def test_sync_components_accept_fake_control_plane_transport(
+    component_factory: Callable[[object], _SyncClosableComponent],
+) -> None:
+    plane = FakeControlPlane()
+
+    component = component_factory(plane.transport)
+    component.close()
 
 
 @pytest.mark.unit

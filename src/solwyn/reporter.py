@@ -38,6 +38,7 @@ from solwyn._control_plane_transport import (
     non_closing_async_transport,
     non_closing_sync_transport,
     require_dual_transport,
+    require_sync_transport,
 )
 from solwyn._lifecycle import (
     _drain_count,
@@ -932,6 +933,7 @@ class MetadataReporter(_ReporterBase):
         retry_backoff_cap: float = 60.0,
         shutdown_deadline: float = 5.0,
     ) -> None:
+        require_sync_transport(transport)
         super().__init__(
             api_url,
             api_key,
