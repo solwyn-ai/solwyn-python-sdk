@@ -111,7 +111,7 @@ def _check_payload() -> dict[str, object]:
 
 
 @pytest.mark.unit
-def test_wrap_defaults_to_uncached_checks_and_disables_task_three_leases() -> None:
+def test_wrap_defaults_to_uncached_checks_and_production_lease_behavior() -> None:
     plane = FakeControlPlane()
 
     wrapped = plane.wrap(_OpenAIStub())
@@ -120,7 +120,7 @@ def test_wrap_defaults_to_uncached_checks_and_disables_task_three_leases() -> No
     assert wrapped._config.api_key == plane.api_key
     assert wrapped._config.api_url == plane.api_url
     assert wrapped._config.budget_check_cache_ttl == 0
-    assert wrapped._config.lease_enabled is False
+    assert wrapped._config.lease_enabled is True
     wrapped.close()
 
 
@@ -148,7 +148,7 @@ async def test_wrap_async_uses_the_dual_transport_and_same_defaults() -> None:
     assert isinstance(wrapped, AsyncSolwyn)
     assert wrapped._config.api_url == plane.api_url
     assert wrapped._config.budget_check_cache_ttl == 0
-    assert wrapped._config.lease_enabled is False
+    assert wrapped._config.lease_enabled is True
     await wrapped.close()
 
 

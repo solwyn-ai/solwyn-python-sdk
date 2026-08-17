@@ -17,6 +17,8 @@ from solwyn._types import (
     BudgetMode,
     FailoverDirective,
     LeaseGrantRequest,
+    LeaseGrantResponse,
+    LeasePosture,
     LeaseRenewRequest,
     LeaseSurrenderRequest,
     MetadataEvent,
@@ -116,6 +118,7 @@ class _ScenarioWindow:
     path: str | None = None
     seconds: float = 0.0
     status: int = 0
+    code: str = ""
     retry_after: int | None = None
 
     def consume_if_matching(self, path: str) -> bool:
@@ -126,6 +129,16 @@ class _ScenarioWindow:
         if self.remaining is not None:
             self.remaining -= 1
         return True
+
+
+@dataclass(slots=True)
+class _LeaseRecord:
+    agent_run_id: str
+    holder_id: str
+    lease_id: str
+    generation: int
+    granted_tokens: int
+    fail_open: bool
 
 
 class FakeControlPlane:
@@ -185,7 +198,11 @@ class FakeControlPlane:
         self._active_reservations: set[str] = set()
         self._settled_reservations: set[str] = set()
         self._seen_call_ids: set[str] = set()
+        self._leases: dict[tuple[str, str], _LeaseRecord] = {}
+        self._expired_leases: set[str] = set()
+        self._released_leases: set[str] = set()
         self._reservation_counter = 0
+        self._lease_counter = 0
         self._lock = Lock()
 
     def deny_next(self, n: int = 1, *, period: str = "monthly") -> None:
@@ -213,6 +230,15 @@ class FakeControlPlane:
         with self._lock:
             self._active_reservations.clear()
 
+    def expire_leases(self) -> None:
+        """Expire every currently held lease for its next renewal attempt."""
+        with self._lock:
+            self._expired_leases.update(
+                record.lease_id
+                for record in self._leases.values()
+                if record.lease_id not in self._released_leases
+            )
+
     def reset_recording(self) -> None:
         """Clear recorded requests without changing scripted scenario state."""
         with self._lock:
@@ -233,7 +259,6 @@ class FakeControlPlane:
             "api_url": self.api_url,
             "control_plane_transport": self.transport,
             "budget_check_cache_ttl": 0,
-            "lease_enabled": False,
         }
         options.update(solwyn_kwargs)
         return _TestingSolwyn(provider_client, **options)
@@ -245,7 +270,6 @@ class FakeControlPlane:
             "api_url": self.api_url,
             "control_plane_transport": self.transport,
             "budget_check_cache_ttl": 0,
-            "lease_enabled": False,
         }
         options.update(solwyn_kwargs)
         return _TestingAsyncSolwyn(provider_client, **options)
@@ -301,6 +325,32 @@ class FakeControlPlane:
             path="/api/v1/budgets/check",
             status=status,
             retry_after=retry_after,
+        )
+        with self._scenario(window):
+            yield
+
+    @contextmanager
+    def refuse_leases(
+        self,
+        *,
+        status: int = 503,
+        code: str = "lease_unavailable",
+        requests: int | None = None,
+    ) -> Iterator[None]:
+        """Return a counted public refusal from any lease endpoint."""
+        valid_pairs = {
+            (503, "lease_unavailable"),
+            (409, "lease_holder_cap_exceeded"),
+        }
+        if (status, code) not in valid_pairs:
+            raise ValueError(
+                "status/code must be 503/lease_unavailable or 409/lease_holder_cap_exceeded"
+            )
+        window = _ScenarioWindow(
+            "refuse_leases",
+            self._request_count(requests),
+            status=status,
+            code=code,
         )
         with self._scenario(window):
             yield
@@ -372,6 +422,12 @@ class FakeControlPlane:
             return self._handle_ingest(body)
         if method == "POST" and path == "/api/v1/untracked-surfaces":
             return self._handle_untracked(body)
+        if method == "POST" and path == "/api/v1/budgets/lease":
+            return self._handle_lease_grant(body)
+        if method == "POST" and path == "/api/v1/budgets/lease/renew":
+            return self._handle_lease_renew(body)
+        if method == "POST" and path == "/api/v1/budgets/lease/surrender":
+            return self._handle_lease_surrender(body)
         if (
             method == "POST"
             and path.startswith("/api/v1/projects/")
@@ -380,13 +436,147 @@ class FakeControlPlane:
             return self._handle_breaker_report(body)
         if method == "GET" and path == "/health":
             return PlaneResponse(200, {"status": "ok"})
-        if path in _LEASE_PATHS:
-            return PlaneResponse(
-                501,
-                {"detail": "solwyn.testing lease endpoints arrive in Task 3"},
-            )
         self.unmatched_requests.append((method, path))
         return PlaneResponse(404, {"detail": "not found"})
+
+    def _handle_lease_grant(self, body: object) -> PlaneResponse:
+        parsed = parse_model(LeaseGrantRequest, body)
+        if isinstance(parsed, PlaneResponse):
+            return parsed
+        _validate_magic_model(parsed.model)
+        for fallback_model in parsed.fallback_models:
+            _validate_magic_model(fallback_model)
+
+        self.lease_grants.append(parsed)
+        denied_by_period = self._denial_period(parsed.agent_run_id, parsed.model)
+        if denied_by_period is not None:
+            return PlaneResponse(
+                200,
+                self._lease_verdict_response(
+                    eligible=True,
+                    allowed=False,
+                    denied_by_period=denied_by_period,
+                    mode=(
+                        BudgetMode.ALERT_ONLY
+                        if parsed.model == "solwyn-test/deny-alert"
+                        else self.mode
+                    ),
+                ),
+                model_only=True,
+            )
+        if not self.lease_eligible or parsed.model == "solwyn-test/lease-ineligible":
+            return PlaneResponse(
+                200,
+                self._lease_verdict_response(
+                    eligible=False,
+                    allowed=True,
+                    ineligible_reason="zero_rate_model",
+                ),
+                model_only=True,
+            )
+        self._lease_counter += 1
+        record = _LeaseRecord(
+            agent_run_id=parsed.agent_run_id,
+            holder_id=parsed.holder_id,
+            lease_id=f"lse_fake{self._lease_counter}",
+            generation=1,
+            granted_tokens=self.granted_tokens,
+            fail_open=parsed.fail_open,
+        )
+        self._leases[(parsed.agent_run_id, parsed.holder_id)] = record
+        return PlaneResponse(200, self._lease_response(record), model_only=True)
+
+    def _handle_lease_renew(self, body: object) -> PlaneResponse:
+        parsed = parse_model(LeaseRenewRequest, body)
+        if isinstance(parsed, PlaneResponse):
+            return parsed
+        self.lease_renewals.append(parsed)
+        record = self._find_lease(parsed.lease_id, parsed.holder_id)
+        if (
+            record is None
+            or record.lease_id in self._expired_leases
+            or record.lease_id in self._released_leases
+        ):
+            return self._lease_error(404, "lease_not_found", "Budget lease not found")
+        if parsed.generation != record.generation:
+            return self._lease_error(
+                409,
+                "lease_generation_conflict",
+                "Budget lease generation conflict",
+            )
+        record.generation += 1
+        return PlaneResponse(200, self._lease_response(record), model_only=True)
+
+    def _handle_lease_surrender(self, body: object) -> PlaneResponse:
+        parsed = parse_model(LeaseSurrenderRequest, body)
+        if isinstance(parsed, PlaneResponse):
+            return parsed
+        self.lease_surrenders.append(parsed)
+        record = self._find_lease(parsed.lease_id, parsed.holder_id)
+        if (
+            record is None
+            or record.lease_id in self._released_leases
+            or parsed.generation != record.generation
+        ):
+            return PlaneResponse(200, {"released_tokens": 0})
+        self._released_leases.add(record.lease_id)
+        return PlaneResponse(200, {"released_tokens": record.granted_tokens})
+
+    def _find_lease(self, lease_id: str, holder_id: str) -> _LeaseRecord | None:
+        for record in self._leases.values():
+            if record.lease_id == lease_id and record.holder_id == holder_id:
+                return record
+        return None
+
+    @staticmethod
+    def _lease_error(status: int, code: str, message: str) -> PlaneResponse:
+        return PlaneResponse(
+            status,
+            {"detail": {"code": code, "message": message}},
+        )
+
+    def _lease_response(self, record: _LeaseRecord) -> LeaseGrantResponse:
+        return LeaseGrantResponse(
+            eligible=True,
+            allowed=True,
+            lease_id=record.lease_id,
+            generation=record.generation,
+            granted_tokens=record.granted_tokens,
+            refresh_interval_s=self.refresh_interval_s,
+            lease_length_s=self.lease_length_s,
+            headroom_share_tokens=record.granted_tokens,
+            posture=LeasePosture(
+                mode=self.mode,
+                on_unreachable="fail_open" if record.fail_open else "local_enforce",
+            ),
+            final_grant=False,
+            project_id=self.project_id,
+            mode=self.mode,
+            budget_limit=self.budget_limit,
+            current_usage=self.current_usage,
+            remaining_budget=self.remaining_budget,
+        )
+
+    def _lease_verdict_response(
+        self,
+        *,
+        eligible: bool,
+        allowed: bool,
+        ineligible_reason: str | None = None,
+        denied_by_period: str | None = None,
+        mode: BudgetMode | None = None,
+    ) -> LeaseGrantResponse:
+        return LeaseGrantResponse(
+            eligible=eligible,
+            ineligible_reason=ineligible_reason,
+            allowed=allowed,
+            denied_by_period=denied_by_period,
+            project_id=self.project_id,
+            mode=self.mode if mode is None else mode,
+            budget_limit=self.budget_limit,
+            current_usage=self.current_usage,
+            remaining_budget=self.remaining_budget,
+        )
 
     def _endpoint_refusal_locked(
         self,
@@ -430,6 +620,17 @@ class FakeControlPlane:
                     headers = None
                 return PlaneResponse(window.status, {"detail": detail}, headers=headers)
         for window in self._scenario_windows:
+            if (
+                window.kind == "refuse_leases"
+                and path in _LEASE_PATHS
+                and window.consume_if_matching(path)
+            ):
+                messages = {
+                    "lease_unavailable": ("Budget lease service temporarily unavailable; retry"),
+                    "lease_holder_cap_exceeded": "Active lease holder limit exceeded",
+                }
+                return self._lease_error(window.status, window.code, messages[window.code])
+        for window in self._scenario_windows:
             if window.kind == "read_only" and window.consume_if_matching(path):
                 return PlaneResponse(
                     403,
@@ -451,7 +652,7 @@ class FakeControlPlane:
             _validate_magic_model(fallback_model)
 
         self.checks.append(parsed)
-        denied_by_period = self._check_denial_period(parsed)
+        denied_by_period = self._denial_period(parsed.agent_run_id, parsed.model)
         response_mode = (
             BudgetMode.ALERT_ONLY if parsed.model == "solwyn-test/deny-alert" else self.mode
         )
@@ -538,10 +739,10 @@ class FakeControlPlane:
         self.breaker_reports.append(parsed.model_dump(mode="json"))
         return PlaneResponse(204)
 
-    def _check_denial_period(self, request: BudgetCheckRequest) -> str | None:
+    def _denial_period(self, agent_run_id: str | None, model: str) -> str | None:
         if self._pending_denials:
             return self._pending_denials.popleft()
-        if request.agent_run_id in self._denied_runs:
+        if agent_run_id in self._denied_runs:
             return "agent_run"
         magic_periods = {
             "solwyn-test/deny": "monthly",
@@ -549,11 +750,11 @@ class FakeControlPlane:
             "solwyn-test/deny-tag": "tag",
             "solwyn-test/deny-stopped": "run_stopped",
         }
-        magic_period = magic_periods.get(request.model)
+        magic_period = magic_periods.get(model)
         if magic_period is not None:
             return magic_period
-        if request.model == "solwyn-test/runaway":
-            run_id = request.agent_run_id
+        if model == "solwyn-test/runaway":
+            run_id = agent_run_id
             if run_id in self._runaway_seen:
                 return "agent_run"
             self._runaway_seen.add(run_id)

@@ -397,7 +397,7 @@ def test_three_scripted_outages_open_real_breaker_then_recover() -> None:
 
 
 @pytest.mark.unit
-def test_validation_failures_return_422_and_lease_paths_fail_loudly() -> None:
+def test_validation_failures_return_422_on_checks_and_lease_paths() -> None:
     plane = FakeControlPlane()
 
     with httpx.Client(transport=plane.transport) as client:
@@ -409,5 +409,5 @@ def test_validation_failures_return_422_and_lease_paths_fail_loudly() -> None:
 
     assert invalid.status_code == 422
     assert isinstance(invalid.json()["detail"], list)
-    assert lease.status_code == 501
-    assert "Task 3" in lease.json()["detail"]
+    assert lease.status_code == 422
+    assert isinstance(lease.json()["detail"], list)
