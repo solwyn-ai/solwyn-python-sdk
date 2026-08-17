@@ -9,6 +9,18 @@ derived from git tags (hatch-vcs).
 
 ### Added
 
+- **A first-class, zero-network control-plane test double now exercises budget
+  enforcement through production wire models.** The injected transport seam is
+  shared by normal operation, fork recovery, interpreter-exit delivery, and
+  lease surrender. `FakeControlPlane` scripts transport and endpoint failures,
+  magic-model verdicts, request recording, reservations, and the complete lease
+  lifecycle without pricing provider work. A reusable
+  `solwyn.testing.contract` pack is dogfooded against both the double and the
+  live API, while deterministic CI game-day recipes cover denial, outage,
+  breaker, reporter, and lease recovery ladders. The README adds copy/paste
+  enforcement recipes and `solwyn.testing.pytest_plugin` provides explicitly
+  opt-in, function-scoped plane and denial-client fixtures—never automatic
+  pytest registration.
 - **Native OpenAI and Azure OpenAI Responses calls are now budget-metered.**
   Sync and async `responses.create(...)`, `responses.parse(...)`, and new-response
   `responses.stream(...)` helper calls use one primary-only path with

@@ -1,4 +1,8 @@
-"""Deterministic, in-process test doubles for Solwyn's control plane."""
+"""The testing package uses zero network traffic.
+
+It preserves real wire shapes and Pydantic models. It performs no pricing; the
+API owns pricing.
+"""
 
 from solwyn.testing._plane import MAGIC_MODELS, FakeControlPlane
 

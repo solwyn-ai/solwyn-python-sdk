@@ -19,6 +19,7 @@
 - `_run.py` — `ContextVar`-backed agent-run scope; `run(name, tags=...)` public entry point; `current_run()` preserves the public `(id, name)` tuple while a private copied snapshot carries bounded tags through deferred reporting
 - `_types.py` — Pydantic models for API request/response contracts
 - `_validation.py` — API key + project ID format validation
+- `testing/` — zero-network control-plane double, shared live/double contract pack, and explicitly opt-in pytest fixtures; real wire models, never pricing
 - `providers/` — extraction adapters (OpenAI, OpenAI-compatible, Anthropic, Google, Bedrock); `_translation/` is content-privileged for request/response translation only
 
 ## Coverage Contract Ownership

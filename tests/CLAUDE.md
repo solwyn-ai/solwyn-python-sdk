@@ -28,6 +28,16 @@ clean skip, e.g. the wheel-only publish CI job), so the suite passes with no
 provider SDKs installed. `src/` still never imports a provider SDK; detection
 stays duck-typed. All OTHER unit tests must keep mocking.
 
+## Double vs Live Contract Tests
+
+`tests/unit/testing_double/` owns deterministic control-plane behavior: scripted
+verdicts and failures, recordings, reservation and lease state, wrapper fixture
+ergonomics, and the shared contract pack running with zero network. Provider
+dispatch remains separately mocked there. Real authentication, routing, storage,
+pricing-catalog behavior, and deployed API integration stay in `tests/integration/`.
+`tests/integration/test_live_contract.py` and `solwyn.testing.contract` are the
+paired fidelity specification; contract changes must keep both sides aligned.
+
 ## Markers
 
 Every test must have a category marker. Marker order on methods:

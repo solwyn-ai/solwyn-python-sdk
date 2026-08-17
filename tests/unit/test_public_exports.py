@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 import solwyn
-from solwyn import exceptions
+from solwyn import exceptions, testing
 
 
 @pytest.mark.unit
@@ -71,3 +71,37 @@ def test_run_context_and_tag_bounds_are_publicly_exported() -> None:
     assert solwyn.TAGS_MAX_KEYS == 10
     assert solwyn.TAG_KEY_MAX_LENGTH == 64
     assert solwyn.TAG_VALUE_MAX_LENGTH == 256
+
+
+@pytest.mark.unit
+def test_testing_package_exports_are_deliberately_pinned() -> None:
+    assert testing.__all__ == ["FakeControlPlane", "MAGIC_MODELS"]
+    assert testing.FakeControlPlane is not None
+    assert testing.MAGIC_MODELS
+
+
+@pytest.mark.unit
+def test_testing_package_import_does_not_activate_or_require_pytest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import builtins
+    import importlib
+    import sys
+
+    real_import = builtins.__import__
+
+    def import_without_pytest(
+        name: str,
+        globals: dict[str, object] | None = None,
+        locals: dict[str, object] | None = None,
+        fromlist: tuple[str, ...] = (),
+        level: int = 0,
+    ) -> object:
+        if name == "pytest" or name.startswith("pytest."):
+            raise ModuleNotFoundError("pytest intentionally unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_pytest)
+    importlib.reload(testing)
+
+    assert "solwyn.testing.pytest_plugin" not in sys.modules

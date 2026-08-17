@@ -221,7 +221,11 @@ class FakeControlPlane:
         self._lock = Lock()
 
     def deny_next(self, n: int = 1, *, period: str = "monthly") -> None:
-        """Deny the next ``n`` checks for the selected budget period."""
+        """Script the next ``n`` verdicts as denials for one budget period.
+
+        The wrapped SDK raises in ``hard_deny`` mode and warns before provider
+        dispatch in ``alert_only`` mode, matching the ``budget_mode`` knob.
+        """
         if n < 0:
             raise ValueError("n must be non-negative")
         if period not in _DENIAL_PERIODS:
@@ -230,23 +234,30 @@ class FakeControlPlane:
             self._pending_denials.extend(period for _ in range(n))
 
     def deny_run(self, agent_run_id: str) -> None:
-        """Deny checks made in one agent run."""
+        """Make budget checks for ``agent_run_id`` return an agent-run denial.
+
+        This exercises the SDK's run-scoped sticky-denial behavior without
+        affecting unrelated run ids.
+        """
         with self._lock:
             self._denied_runs.add(agent_run_id)
 
     def clear_denials(self) -> None:
-        """Clear pending and run-scoped scripted denials."""
+        """Clear queued and run-scoped scripts so later checks can recover."""
         with self._lock:
             self._pending_denials.clear()
             self._denied_runs.clear()
 
     def expire_reservations(self) -> None:
-        """Expire all currently outstanding reservation ids."""
+        """Invalidate open reservation ids to exercise late settlement handling."""
         with self._lock:
             self._active_reservations.clear()
 
     def expire_leases(self) -> None:
-        """Expire every currently held lease for its next renewal attempt."""
+        """Expire held leases so the SDK follows its renewal and outage ladder.
+
+        This is relevant only while ``lease_enabled`` is true on the wrapper.
+        """
         with self._lock:
             self._expired_leases.update(
                 record.lease_id
@@ -255,7 +266,11 @@ class FakeControlPlane:
             )
 
     def reset_recording(self) -> None:
-        """Clear recorded requests without changing scripted scenario state."""
+        """Clear every public request recording while preserving scenario state.
+
+        Use this between phases when assertions need to distinguish new control-
+        plane traffic without discarding denials, outages, or held leases.
+        """
         with self._lock:
             self.checks.clear()
             self.confirms.clear()
@@ -268,7 +283,11 @@ class FakeControlPlane:
             self.unmatched_requests.clear()
 
     def wrap(self, provider_client: object, **solwyn_kwargs: Any) -> Solwyn:
-        """Wrap a synchronous provider client on this in-process plane."""
+        """Return a synchronous ``Solwyn`` using this plane's zero-network transport.
+
+        Keyword arguments are normal ``Solwyn`` configuration overrides;
+        provider calls remain the caller's responsibility to mock or serve.
+        """
         options: dict[str, Any] = {
             "api_key": self.api_key,
             "api_url": self.api_url,
@@ -279,7 +298,11 @@ class FakeControlPlane:
         return _TestingSolwyn(provider_client, **options)
 
     def wrap_async(self, provider_client: object, **solwyn_kwargs: Any) -> AsyncSolwyn:
-        """Wrap an asynchronous provider client on this in-process plane."""
+        """Return an ``AsyncSolwyn`` using this plane's zero-network transport.
+
+        Keyword arguments are normal ``AsyncSolwyn`` configuration overrides;
+        provider calls remain the caller's responsibility to mock or serve.
+        """
         options: dict[str, Any] = {
             "api_key": self.api_key,
             "api_url": self.api_url,
@@ -291,7 +314,12 @@ class FakeControlPlane:
 
     @contextmanager
     def outage(self, *, requests: int | None = None) -> Iterator[None]:
-        """Raise a connection error for matching requests in this window."""
+        """Make matching control-plane requests fail at the transport boundary.
+
+        This drives the SDK's ``fail_open`` posture and the
+        ``control_plane_failure_threshold`` / ``control_plane_recovery_timeout``
+        breaker knobs. ``requests`` limits how many matching calls fail.
+        """
         with self._scenario(_ScenarioWindow("outage", self._request_count(requests))):
             yield
 
@@ -303,7 +331,12 @@ class FakeControlPlane:
         path: str = "/api/v1/budgets/confirm",
         requests: int | None = None,
     ) -> Iterator[None]:
-        """Delay matched requests without embedding wall-clock logic in verdicts."""
+        """Delay matched requests to exercise an SDK timeout boundary.
+
+        Budget preflights are bounded by ``budget_check_timeout``; reporter paths
+        are bounded at shutdown by ``reporter_shutdown_deadline``. ``path`` keeps
+        the delay scoped to the endpoint under test.
+        """
         if seconds < 0:
             raise ValueError("seconds must be non-negative")
         window = _ScenarioWindow(
@@ -317,7 +350,11 @@ class FakeControlPlane:
 
     @contextmanager
     def read_only(self, *, requests: int | None = None) -> Iterator[None]:
-        """Refuse write requests as a core read-only project key would."""
+        """Refuse writes with the real read-only-key response shape.
+
+        This proves the SDK treats an authorization refusal as a reachable
+        control plane rather than opening its outage circuit breaker.
+        """
         with self._scenario(_ScenarioWindow("read_only", self._request_count(requests))):
             yield
 
@@ -329,7 +366,11 @@ class FakeControlPlane:
         requests: int | None = None,
         retry_after: int | None = None,
     ) -> Iterator[None]:
-        """Return a scripted HTTP refusal from the budget-check endpoint."""
+        """Return a reachable 422, 429, or 503 budget-check refusal.
+
+        This exercises endpoint-refusal posture separately from ``fail_open``
+        transport failures; ``retry_after`` scripts the public 429 header.
+        """
         if status not in {422, 429, 503}:
             raise ValueError("status must be 422, 429, or 503")
         if retry_after is not None and retry_after < 0:
@@ -352,7 +393,11 @@ class FakeControlPlane:
         code: str = "lease_unavailable",
         requests: int | None = None,
     ) -> Iterator[None]:
-        """Return a counted public refusal from any lease endpoint."""
+        """Return a public lease-unavailable or holder-cap refusal.
+
+        With ``lease_enabled`` true, the SDK falls back to per-call checks rather
+        than treating this reachable lease response as a transport outage.
+        """
         valid_pairs = {
             (503, "lease_unavailable"),
             (409, "lease_holder_cap_exceeded"),
@@ -421,7 +466,11 @@ class FakeControlPlane:
         return delay, outage
 
     def handle(self, method: str, path: str, body: object) -> PlaneResponse:
-        """Handle one control-plane request without performing I/O."""
+        """Evaluate one real control-plane wire request without network I/O.
+
+        Most callers should use :meth:`wrap`; this lower-level seam supports
+        contract tests that need the raw status, headers, and response model.
+        """
         with self._lock:
             return self._handle_locked(method, path, body)
 
