@@ -116,6 +116,25 @@ def test_unknown_magic_model_fails_loud() -> None:
 
 
 @pytest.mark.unit
+def test_unknown_magic_fallback_model_fails_loud_on_the_raw_transport() -> None:
+    plane = FakeControlPlane()
+
+    with (
+        httpx.Client(transport=plane.transport) as client,
+        pytest.raises(RuntimeError, match="unknown solwyn testing magic model"),
+    ):
+        client.post(
+            f"{plane.api_url}/api/v1/budgets/check",
+            json=_check_payload(
+                fallback_providers=["openai"],
+                fallback_models=["solwyn-test/not-real"],
+            ),
+        )
+
+    assert plane.checks == []
+
+
+@pytest.mark.unit
 def test_unknown_path_is_recorded_and_returns_404() -> None:
     plane = FakeControlPlane(mode=BudgetMode.ALERT_ONLY)
 

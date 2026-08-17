@@ -9,13 +9,17 @@ from typing import Protocol
 
 import httpx
 
-from solwyn.testing._wire import PlaneResponse, serialize_response
+from solwyn.testing._wire import PlaneResponse, PreparedPlaneRequest, serialize_response
 
 
 class _Plane(Protocol):
-    def handle(self, method: str, path: str, body: object) -> PlaneResponse: ...
-
-    def _transport_effect(self, method: str, path: str) -> tuple[float, bool]: ...
+    def _prepare_request(
+        self,
+        method: str,
+        path: str,
+        body: object,
+        parse_error: PlaneResponse | None,
+    ) -> PreparedPlaneRequest: ...
 
 
 class FakeControlPlaneTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
@@ -24,16 +28,16 @@ class FakeControlPlaneTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
     def __init__(self, plane: _Plane) -> None:
         self._plane = plane
 
-    def _response_after_effect(self, request: httpx.Request) -> httpx.Response:
+    @staticmethod
+    def _decode_body(request: httpx.Request) -> tuple[object, PlaneResponse | None]:
         body: object = None
         if request.content:
             try:
                 body = json.loads(request.content)
             except (TypeError, ValueError):
-                return httpx.Response(
+                return None, PlaneResponse(
                     422,
-                    request=request,
-                    json={
+                    {
                         "detail": [
                             {
                                 "type": "json_invalid",
@@ -43,7 +47,19 @@ class FakeControlPlaneTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
                         ]
                     },
                 )
-        result = self._plane.handle(request.method, request.url.path, body)
+        return body, None
+
+    def _prepare(self, request: httpx.Request) -> PreparedPlaneRequest:
+        body, parse_error = self._decode_body(request)
+        return self._plane._prepare_request(
+            request.method,
+            request.url.path,
+            body,
+            parse_error,
+        )
+
+    @staticmethod
+    def _response(request: httpx.Request, result: PlaneResponse) -> httpx.Response:
         serialized = serialize_response(result)
         if serialized is None:
             return httpx.Response(
@@ -59,26 +75,30 @@ class FakeControlPlaneTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
         )
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
-        delay, outage = self._plane._transport_effect(request.method, request.url.path)
-        if delay:
-            time.sleep(delay)
-        if outage:
+        prepared = self._prepare(request)
+        if prepared.delay_seconds:
+            time.sleep(prepared.delay_seconds)
+        if prepared.outage:
             raise httpx.ConnectError(
                 "solwyn.testing: scripted outage",
                 request=request,
             )
-        return self._response_after_effect(request)
+        if prepared.response is None:
+            raise RuntimeError("solwyn.testing plane prepared no response")
+        return self._response(request, prepared.response)
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        delay, outage = self._plane._transport_effect(request.method, request.url.path)
-        if delay:
-            await asyncio.sleep(delay)
-        if outage:
+        prepared = self._prepare(request)
+        if prepared.delay_seconds:
+            await asyncio.sleep(prepared.delay_seconds)
+        if prepared.outage:
             raise httpx.ConnectError(
                 "solwyn.testing: scripted outage",
                 request=request,
             )
-        return self._response_after_effect(request)
+        if prepared.response is None:
+            raise RuntimeError("solwyn.testing plane prepared no response")
+        return self._response(request, prepared.response)
 
     def close(self) -> None:
         """The in-memory transport owns no resources."""

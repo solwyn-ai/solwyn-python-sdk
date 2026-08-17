@@ -25,7 +25,12 @@ from solwyn._types import (
 )
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.testing._transport import FakeControlPlaneTransport
-from solwyn.testing._wire import PlaneResponse, parse_model, parse_model_list
+from solwyn.testing._wire import (
+    PlaneResponse,
+    PreparedPlaneRequest,
+    parse_model,
+    parse_model_list,
+)
 
 if TYPE_CHECKING:
     from solwyn._base import MediaSurfaceSpec
@@ -66,6 +71,8 @@ class _TestingSolwyn(Solwyn):
         **kwargs: object,
     ) -> Any:
         _validate_magic_model(kwargs.get("model"))
+        for runtime in self._runtimes[1:]:
+            _validate_magic_model(runtime.entry.model)
         return super()._intercepted_call(
             _force_stream=_force_stream,
             _surface=_surface,
@@ -88,6 +95,8 @@ class _TestingAsyncSolwyn(AsyncSolwyn):
         **kwargs: object,
     ) -> Any:
         _validate_magic_model(kwargs.get("model"))
+        for runtime in self._runtimes[1:]:
+            _validate_magic_model(runtime.entry.model)
         return await super()._intercepted_call(
             _force_stream=_force_stream,
             _surface=_surface,
@@ -313,25 +322,46 @@ class FakeControlPlane:
                 if window in self._scenario_windows:
                     self._scenario_windows.remove(window)
 
-    def _transport_effect(self, _method: str, path: str) -> tuple[float, bool]:
-        """Consume transport scenarios and return delay/outage instructions."""
+    def _prepare_request(
+        self,
+        method: str,
+        path: str,
+        body: object,
+        parse_error: PlaneResponse | None,
+    ) -> PreparedPlaneRequest:
+        """Freeze all request effects before the transport performs I/O."""
+        with self._lock:
+            delay, outage = self._consume_transport_effects(path)
+            if outage:
+                response = None
+            elif parse_error is not None:
+                response = parse_error
+            else:
+                response = self._handle_locked(method, path, body)
+        return PreparedPlaneRequest(delay, outage, response)
+
+    def _consume_transport_effects(self, path: str) -> tuple[float, bool]:
+        """Consume matching delay/outage windows while the caller holds the lock."""
         delay = 0.0
         outage = False
-        with self._lock:
-            for window in self._scenario_windows:
-                if window.kind not in {"outage", "slow"}:
-                    continue
-                if not window.consume_if_matching(path):
-                    continue
-                if window.kind == "outage":
-                    outage = True
-                else:
-                    delay += window.seconds
+        for window in self._scenario_windows:
+            if window.kind not in {"outage", "slow"}:
+                continue
+            if not window.consume_if_matching(path):
+                continue
+            if window.kind == "outage":
+                outage = True
+            else:
+                delay += window.seconds
         return delay, outage
 
     def handle(self, method: str, path: str, body: object) -> PlaneResponse:
         """Handle one control-plane request without performing I/O."""
-        refusal = self._endpoint_refusal(method, path, body)
+        with self._lock:
+            return self._handle_locked(method, path, body)
+
+    def _handle_locked(self, method: str, path: str, body: object) -> PlaneResponse:
+        refusal = self._endpoint_refusal_locked(method, path, body)
         if refusal is not None:
             return refusal
         if method == "POST" and path == "/api/v1/budgets/check":
@@ -355,11 +385,10 @@ class FakeControlPlane:
                 501,
                 {"detail": "solwyn.testing lease endpoints arrive in Task 3"},
             )
-        with self._lock:
-            self.unmatched_requests.append((method, path))
+        self.unmatched_requests.append((method, path))
         return PlaneResponse(404, {"detail": "not found"})
 
-    def _endpoint_refusal(
+    def _endpoint_refusal_locked(
         self,
         method: str,
         path: str,
@@ -367,51 +396,50 @@ class FakeControlPlane:
     ) -> PlaneResponse | None:
         if method not in {"POST", "PUT", "PATCH", "DELETE"}:
             return None
-        with self._lock:
-            for window in self._scenario_windows:
-                if window.kind == "refuse_checks" and window.consume_if_matching(path):
-                    if window.status == 422:
-                        raw_model = body.get("model") if isinstance(body, dict) else None
-                        raw_provider = body.get("provider") if isinstance(body, dict) else None
-                        model = raw_model[:50] if isinstance(raw_model, str) else "unknown"
-                        provider = raw_provider if isinstance(raw_provider, str) else "unknown"
-                        detail: object = {
-                            "code": "unknown_model",
-                            "model": model,
-                            "provider": provider,
-                            "message": (
-                                f"Solwyn does not have pricing for model '{model}'. "
-                                "File an issue at "
-                                "https://github.com/solwyn-ai/solwyn-python-sdk/issues "
-                                "or contact support — we typically add new models within 24h."
-                            ),
-                        }
-                        headers = None
-                    elif window.status == 429:
-                        retry_after = window.retry_after if window.retry_after is not None else 60
-                        return PlaneResponse(
-                            429,
-                            {
-                                "detail": "Rate limit exceeded",
-                                "retry_after": retry_after,
-                            },
-                            headers={"Retry-After": str(retry_after)},
-                        )
-                    else:
-                        detail = "Budget backend temporarily unavailable; retry"
-                        headers = None
-                    return PlaneResponse(window.status, {"detail": detail}, headers=headers)
-            for window in self._scenario_windows:
-                if window.kind == "read_only" and window.consume_if_matching(path):
+        for window in self._scenario_windows:
+            if window.kind == "refuse_checks" and window.consume_if_matching(path):
+                if window.status == 422:
+                    raw_model = body.get("model") if isinstance(body, dict) else None
+                    raw_provider = body.get("provider") if isinstance(body, dict) else None
+                    model = raw_model[:50] if isinstance(raw_model, str) else "unknown"
+                    provider = raw_provider if isinstance(raw_provider, str) else "unknown"
+                    detail: object = {
+                        "code": "unknown_model",
+                        "model": model,
+                        "provider": provider,
+                        "message": (
+                            f"Solwyn does not have pricing for model '{model}'. "
+                            "File an issue at "
+                            "https://github.com/solwyn-ai/solwyn-python-sdk/issues "
+                            "or contact support — we typically add new models within 24h."
+                        ),
+                    }
+                    headers = None
+                elif window.status == 429:
+                    retry_after = window.retry_after if window.retry_after is not None else 60
                     return PlaneResponse(
-                        403,
+                        429,
                         {
-                            "detail": {
-                                "code": "read_only_key",
-                                "message": "read-only project key cannot write",
-                            }
+                            "detail": "Rate limit exceeded",
+                            "retry_after": retry_after,
                         },
+                        headers={"Retry-After": str(retry_after)},
                     )
+                else:
+                    detail = "Budget backend temporarily unavailable; retry"
+                    headers = None
+                return PlaneResponse(window.status, {"detail": detail}, headers=headers)
+        for window in self._scenario_windows:
+            if window.kind == "read_only" and window.consume_if_matching(path):
+                return PlaneResponse(
+                    403,
+                    {
+                        "detail": {
+                            "code": "read_only_key",
+                            "message": "read-only project key cannot write",
+                        }
+                    },
+                )
         return None
 
     def _handle_check(self, body: object) -> PlaneResponse:
@@ -419,17 +447,18 @@ class FakeControlPlane:
         if isinstance(parsed, PlaneResponse):
             return parsed
         _validate_magic_model(parsed.model)
+        for fallback_model in parsed.fallback_models:
+            _validate_magic_model(fallback_model)
 
-        with self._lock:
-            self.checks.append(parsed)
-            denied_by_period = self._check_denial_period(parsed)
-            response_mode = (
-                BudgetMode.ALERT_ONLY if parsed.model == "solwyn-test/deny-alert" else self.mode
-            )
-            self._reservation_counter += 1
-            reservation_id = f"res_fake_{self._reservation_counter:08d}"
-            if denied_by_period is None:
-                self._active_reservations.add(reservation_id)
+        self.checks.append(parsed)
+        denied_by_period = self._check_denial_period(parsed)
+        response_mode = (
+            BudgetMode.ALERT_ONLY if parsed.model == "solwyn-test/deny-alert" else self.mode
+        )
+        self._reservation_counter += 1
+        reservation_id = f"res_fake_{self._reservation_counter:08d}"
+        if denied_by_period is None:
+            self._active_reservations.add(reservation_id)
 
         opted_in = parsed.failover_directive_version == "1"
         response = BudgetCheckResponse(
@@ -466,30 +495,28 @@ class FakeControlPlane:
         parsed = parse_model(BudgetConfirmRequest, body)
         if isinstance(parsed, PlaneResponse):
             return parsed
-        with self._lock:
-            if parsed.call_id in self._seen_call_ids:
+        if parsed.call_id in self._seen_call_ids:
+            return PlaneResponse(204)
+        if parsed.reservation_id is not None:
+            reservation_id = parsed.reservation_id
+            if reservation_id in self._settled_reservations:
                 return PlaneResponse(204)
-            if parsed.reservation_id is not None:
-                reservation_id = parsed.reservation_id
-                if reservation_id in self._settled_reservations:
-                    return PlaneResponse(204)
-                if reservation_id not in self._active_reservations:
-                    return PlaneResponse(
-                        404,
-                        {"detail": "Reservation not found or expired"},
-                    )
-                self._active_reservations.remove(reservation_id)
-                self._settled_reservations.add(reservation_id)
-            self._seen_call_ids.add(parsed.call_id)
-            self.confirms.append(parsed)
+            if reservation_id not in self._active_reservations:
+                return PlaneResponse(
+                    404,
+                    {"detail": "Reservation not found or expired"},
+                )
+            self._active_reservations.remove(reservation_id)
+            self._settled_reservations.add(reservation_id)
+        self._seen_call_ids.add(parsed.call_id)
+        self.confirms.append(parsed)
         return PlaneResponse(204)
 
     def _handle_ingest(self, body: object) -> PlaneResponse:
         parsed = parse_model_list(MetadataEvent, body)
         if isinstance(parsed, PlaneResponse):
             return parsed
-        with self._lock:
-            self.ingested.extend(parsed)
+        self.ingested.extend(parsed)
         return PlaneResponse(202, {"ingested": len(parsed), "rejected": []})
 
     def _handle_untracked(self, body: object) -> PlaneResponse:
@@ -501,16 +528,14 @@ class FakeControlPlane:
         parsed = parse_model_list(UntrackedSurfaceReport, body)
         if isinstance(parsed, PlaneResponse):
             return parsed
-        with self._lock:
-            self.untracked_reports.extend(parsed)
+        self.untracked_reports.extend(parsed)
         return PlaneResponse(202, {"accepted": len(parsed)})
 
     def _handle_breaker_report(self, body: object) -> PlaneResponse:
         parsed = parse_model(BreakerStateReport, body)
         if isinstance(parsed, PlaneResponse):
             return parsed
-        with self._lock:
-            self.breaker_reports.append(parsed.model_dump(mode="json"))
+        self.breaker_reports.append(parsed.model_dump(mode="json"))
         return PlaneResponse(204)
 
     def _check_denial_period(self, request: BudgetCheckRequest) -> str | None:

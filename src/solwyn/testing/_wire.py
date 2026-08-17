@@ -21,6 +21,15 @@ class PlaneResponse:
     model_only: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedPlaneRequest:
+    """Frozen request effects captured before transport delay or failure."""
+
+    delay_seconds: float
+    outage: bool
+    response: PlaneResponse | None
+
+
 def parse_model(model: type[_ModelT], body: object) -> _ModelT | PlaneResponse:
     """Parse a request with the vendored wire model or return a 422 response."""
     try:

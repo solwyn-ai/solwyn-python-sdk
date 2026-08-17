@@ -14,19 +14,22 @@ from solwyn.testing import FakeControlPlane
 
 
 class _SyncCompletions:
-    def __init__(self) -> None:
+    def __init__(self, error: Exception | None = None) -> None:
         self.calls = 0
+        self._error = error
 
     def create(self, **_kwargs: object) -> SimpleNamespace:
         self.calls += 1
+        if self._error is not None:
+            raise self._error
         return SimpleNamespace(
             usage=SimpleNamespace(prompt_tokens=2, completion_tokens=1),
         )
 
 
 class _SyncChat:
-    def __init__(self) -> None:
-        self.completions = _SyncCompletions()
+    def __init__(self, error: Exception | None = None) -> None:
+        self.completions = _SyncCompletions(error)
 
 
 class _SyncEmbeddings:
@@ -39,8 +42,8 @@ class _SyncEmbeddings:
 
 
 class _OpenAIStub:
-    def __init__(self) -> None:
-        self.chat = _SyncChat()
+    def __init__(self, error: Exception | None = None) -> None:
+        self.chat = _SyncChat(error)
         self.embeddings = _SyncEmbeddings()
 
     def with_options(self, **_kwargs: object) -> _OpenAIStub:
@@ -52,19 +55,22 @@ _OpenAIStub.__name__ = "OpenAI"
 
 
 class _AsyncCompletions:
-    def __init__(self) -> None:
+    def __init__(self, error: Exception | None = None) -> None:
         self.calls = 0
+        self._error = error
 
     async def create(self, **_kwargs: object) -> SimpleNamespace:
         self.calls += 1
+        if self._error is not None:
+            raise self._error
         return SimpleNamespace(
             usage=SimpleNamespace(prompt_tokens=2, completion_tokens=1),
         )
 
 
 class _AsyncChat:
-    def __init__(self) -> None:
-        self.completions = _AsyncCompletions()
+    def __init__(self, error: Exception | None = None) -> None:
+        self.completions = _AsyncCompletions(error)
 
 
 class _AsyncEmbeddings:
@@ -77,8 +83,8 @@ class _AsyncEmbeddings:
 
 
 class _AsyncOpenAIStub:
-    def __init__(self) -> None:
-        self.chat = _AsyncChat()
+    def __init__(self, error: Exception | None = None) -> None:
+        self.chat = _AsyncChat(error)
         self.embeddings = _AsyncEmbeddings()
 
     def with_options(self, **_kwargs: object) -> _AsyncOpenAIStub:
@@ -87,6 +93,10 @@ class _AsyncOpenAIStub:
 
 _AsyncOpenAIStub.__module__ = "openai._client"
 _AsyncOpenAIStub.__name__ = "AsyncOpenAI"
+
+
+class _Status429(Exception):
+    status_code = 429
 
 
 def _check_payload() -> dict[str, object]:
@@ -230,6 +240,56 @@ async def test_unknown_magic_model_fails_before_async_media_dispatch() -> None:
         await wrapped.close()
 
     assert provider.embeddings.calls == 0
+
+
+@pytest.mark.unit
+def test_unknown_magic_fallback_fails_before_any_sync_provider_dispatch() -> None:
+    plane = FakeControlPlane()
+    primary = _OpenAIStub(_Status429("primary unavailable"))
+    fallback = _OpenAIStub()
+    wrapped = plane.wrap(
+        primary,
+        model="gpt-5.5",
+        fallback=[(fallback, "solwyn-test/not-real")],
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="unknown solwyn testing magic model"):
+            wrapped.chat.completions.create(
+                model="gpt-5.5",
+                messages=[],
+            )
+    finally:
+        wrapped.close()
+
+    assert primary.chat.completions.calls == 0
+    assert fallback.chat.completions.calls == 0
+    assert plane.checks == []
+
+
+@pytest.mark.unit
+async def test_unknown_magic_fallback_fails_before_any_async_provider_dispatch() -> None:
+    plane = FakeControlPlane()
+    primary = _AsyncOpenAIStub(_Status429("primary unavailable"))
+    fallback = _AsyncOpenAIStub()
+    wrapped = plane.wrap_async(
+        primary,
+        model="gpt-5.5",
+        fallback=[(fallback, "solwyn-test/not-real")],
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="unknown solwyn testing magic model"):
+            await wrapped.chat.completions.create(
+                model="gpt-5.5",
+                messages=[],
+            )
+    finally:
+        await wrapped.close()
+
+    assert primary.chat.completions.calls == 0
+    assert fallback.chat.completions.calls == 0
+    assert plane.checks == []
 
 
 @pytest.mark.unit

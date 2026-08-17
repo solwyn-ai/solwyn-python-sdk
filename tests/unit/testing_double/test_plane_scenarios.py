@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -173,6 +177,82 @@ async def test_slow_uses_async_sleep_for_async_requests() -> None:
             )
 
     assert time.monotonic() - started >= 0.025
+
+
+@pytest.mark.unit
+def test_slow_request_keeps_refusal_after_contexts_exit_during_sleep() -> None:
+    plane = FakeControlPlane()
+    sleep_entered = Event()
+    release_sleep = Event()
+
+    def blocked_sleep(_seconds: float) -> None:
+        sleep_entered.set()
+        if not release_sleep.wait(timeout=2):
+            raise RuntimeError("test did not release scripted sleep")
+
+    with (
+        httpx.Client(transport=plane.transport) as client,
+        ThreadPoolExecutor(max_workers=1) as pool,
+        patch("solwyn.testing._transport.time.sleep", side_effect=blocked_sleep),
+    ):
+        try:
+            with (
+                plane.slow(1, path="/api/v1/budgets/check", requests=1),
+                plane.refuse_checks(status=503, requests=1),
+            ):
+                pending = pool.submit(_post_check, client, plane)
+                assert sleep_entered.wait(timeout=1)
+        finally:
+            release_sleep.set()
+        refused = pending.result(timeout=1)
+        recorded_before_recovery = list(plane.checks)
+        recovered = _post_check(client, plane)
+
+    assert refused.status_code == 503
+    assert refused.json() == {"detail": "Budget backend temporarily unavailable; retry"}
+    assert recorded_before_recovery == []
+    assert recovered.status_code == 200
+    assert len(plane.checks) == 1
+
+
+@pytest.mark.unit
+async def test_slow_request_keeps_read_only_after_contexts_exit_during_sleep() -> None:
+    plane = FakeControlPlane()
+    sleep_entered = asyncio.Event()
+    release_sleep = asyncio.Event()
+
+    async def blocked_sleep(_seconds: float) -> None:
+        sleep_entered.set()
+        await release_sleep.wait()
+
+    async with httpx.AsyncClient(transport=plane.transport) as client:
+        with patch("solwyn.testing._transport.asyncio.sleep", new=blocked_sleep):
+            try:
+                with (
+                    plane.slow(1, path="/api/v1/budgets/check", requests=1),
+                    plane.read_only(requests=1),
+                ):
+                    pending = asyncio.create_task(
+                        client.post(
+                            f"{plane.api_url}/api/v1/budgets/check",
+                            json=_check_payload(),
+                        )
+                    )
+                    await asyncio.wait_for(sleep_entered.wait(), timeout=1)
+            finally:
+                release_sleep.set()
+            refused = await asyncio.wait_for(pending, timeout=1)
+            recorded_before_recovery = list(plane.checks)
+            recovered = await client.post(
+                f"{plane.api_url}/api/v1/budgets/check",
+                json=_check_payload(),
+            )
+
+    assert refused.status_code == 403
+    assert refused.json()["detail"]["code"] == "read_only_key"
+    assert recorded_before_recovery == []
+    assert recovered.status_code == 200
+    assert len(plane.checks) == 1
 
 
 @pytest.mark.unit
