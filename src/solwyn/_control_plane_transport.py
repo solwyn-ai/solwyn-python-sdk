@@ -1,16 +1,19 @@
 """Ownership and interface rules for injected control-plane transports.
 
 An injected transport belongs to the caller.  Each Solwyn-owned HTTP client
-therefore receives a forwarding adapter whose close operation is a no-op.  A
-default ``None`` transport is passed through unchanged so httpx continues to
-create and own its normal transport.  ``require_sync_transport`` validates a
-transport for sync-only components (``BudgetEnforcer``, ``MetadataReporter``,
-sync ``Solwyn``); ``require_dual_transport`` validates one for async
-components.
+therefore receives a forwarding adapter whose close operation is a no-op, and
+that adapter's close/aclose is never forwarded to the backing transport — so
+neither validator below requires the transport to implement close/aclose at
+all.  A default ``None`` transport is passed through unchanged so httpx
+continues to create and own its normal transport.  ``require_sync_transport``
+validates a transport for sync-only components (``BudgetEnforcer``,
+``MetadataReporter``, sync ``Solwyn``); ``require_dual_transport`` validates
+one for async components.
 
 Async control-plane components also perform blocking interpreter-exit drains.
-Their injected transport must consequently implement both the sync and async
-httpx transport interfaces.
+Their injected transport must consequently implement both methods the SDK
+actually calls: a callable, non-coroutine ``handle_request`` and a coroutine
+``handle_async_request``.
 """
 
 from __future__ import annotations
@@ -26,13 +29,17 @@ class _SyncTransport(Protocol):
 
 
 class ControlPlaneTransport(_SyncTransport, Protocol):
-    """Transport contract required by async control-plane components."""
+    """Transport contract required by async control-plane components.
 
-    def close(self) -> None: ...
+    Only the two methods the SDK actually calls: a callable, non-coroutine
+    ``handle_request`` (inherited from :class:`_SyncTransport`) and a
+    coroutine ``handle_async_request``. ``close``/``aclose`` are deliberately
+    absent — the non-closing wrappers never forward them to a caller-owned
+    transport, so requiring them would reject a functionally sufficient
+    transport with a misleading error.
+    """
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response: ...
-
-    async def aclose(self) -> None: ...
 
 
 class _NonClosingSyncTransport(httpx.BaseTransport):
@@ -64,7 +71,12 @@ class _NonClosingAsyncTransport(httpx.AsyncBaseTransport):
 def require_dual_transport(
     transport: object | None,
 ) -> ControlPlaneTransport | None:
-    """Reject a one-sided transport before any async control-plane request.
+    """Reject a transport missing either method an async control-plane request needs.
+
+    Only ``handle_request`` and ``handle_async_request`` are checked —
+    ``close``/``aclose`` are never called on a caller-owned transport (the
+    non-closing wrappers swallow them), so a transport lacking them is still
+    functionally sufficient and must not be rejected.
 
     The same injected instance is reused when a component repairs itself after
     ``fork()``.  Stateful transports supplied by callers must therefore be
@@ -72,12 +84,9 @@ def require_dual_transport(
     """
     if transport is None:
         return None
-    required_methods = ("handle_request", "close", "handle_async_request", "aclose")
-    has_both_interfaces = all(
-        callable(getattr(transport, method_name, None)) for method_name in required_methods
-    )
     sync_handler = getattr(transport, "handle_request", None)
     async_handler = getattr(transport, "handle_async_request", None)
+    has_both_interfaces = callable(sync_handler) and callable(async_handler)
     uses_sync_stub = (
         getattr(sync_handler, "__func__", sync_handler) is httpx.BaseTransport.handle_request
     )
@@ -85,12 +94,9 @@ def require_dual_transport(
         getattr(async_handler, "__func__", async_handler)
         is httpx.AsyncBaseTransport.handle_async_request
     )
-    has_correct_method_shapes = (
-        not inspect.iscoroutinefunction(sync_handler)
-        and not inspect.iscoroutinefunction(getattr(transport, "close", None))
-        and inspect.iscoroutinefunction(async_handler)
-        and inspect.iscoroutinefunction(getattr(transport, "aclose", None))
-    )
+    has_correct_method_shapes = not inspect.iscoroutinefunction(
+        sync_handler
+    ) and inspect.iscoroutinefunction(async_handler)
     if (
         not has_both_interfaces
         or uses_sync_stub
@@ -99,7 +105,9 @@ def require_dual_transport(
     ):
         raise TypeError(
             "async control-plane transport must implement both sync and async "
-            "httpx transport interfaces with the correct sync and async method shapes"
+            "httpx transport interfaces (a callable, non-coroutine handle_request "
+            "and a coroutine handle_async_request) with the correct sync and "
+            "async method shapes"
         )
     return cast("ControlPlaneTransport", transport)
 
@@ -110,11 +118,10 @@ def require_sync_transport(
     """Reject a transport that cannot serve a sync control-plane request.
 
     Sync control-plane components (``BudgetEnforcer``, ``MetadataReporter``,
-    sync ``Solwyn``) only ever call ``handle_request``.  Unlike
-    :func:`require_dual_transport`, this deliberately does NOT require
-    ``close``/``aclose`` — a transport implementing only the sync interface
-    (e.g. ``httpx.MockTransport``) is a normal, accepted caller-owned
-    transport.
+    sync ``Solwyn``) only ever call ``handle_request`` — unlike
+    :func:`require_dual_transport`, which additionally requires
+    ``handle_async_request``, this checks the sync method alone. Neither
+    validator requires ``close``/``aclose``.
     """
     if transport is None:
         return None

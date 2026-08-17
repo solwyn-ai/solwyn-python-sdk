@@ -1144,6 +1144,19 @@ class _BudgetEnforcerBase:
             "Content-Type": "application/json",
         }
 
+    def _new_exit_http_client(self) -> httpx.Client:
+        """Build the sync client used by the interpreter-exit lease drain.
+
+        Lease holders are tracked (and typed) as ``_BudgetEnforcerBase`` in
+        ``_lifecycle.py``'s exit-surrender path; declaring this here — rather
+        than only on the concrete sync/async subclasses — means that path can
+        call it directly instead of casting to a structural protocol a future
+        holder subclass might not actually implement (which would otherwise
+        degrade to a swallowed exit-time WARNING with leases never
+        surrendered).
+        """
+        raise RuntimeError("subclass must build its exit client")
+
     def build_confirm_request(
         self,
         *,
@@ -1287,7 +1300,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         """Fresh state lock AND a fresh sync client for the forked child.
 
         The inherited ``httpx.Client`` is abandoned, never closed — the parent
-        still owns those sockets.
+        still owns those sockets. A caller-injected transport (``self._transport``)
+        is NOT rebuilt here — it is reused as-is by the new client, so callers
+        supplying a stateful transport must ensure it is itself fork-safe.
         """
         super()._reset_after_fork_in_child()
         self._http = self._new_http_client()
@@ -1836,6 +1851,10 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         """Fence renewals, drain state, and surrender within one deadline."""
         payloads = self._begin_close()
         if payloads is None:
+            # Best-effort transport teardown, not a bound — nothing is still
+            # running here. A no-op when ``self._transport`` was injected by
+            # the caller: the client wraps it non-closing and the caller
+            # keeps it open by design.
             self._http.close()
             return
         drain_deadline = time.monotonic() + _SURRENDER_TIMEOUT_S
@@ -1860,6 +1879,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             thread.join(timeout=max(0.0, drain_deadline - time.monotonic()))
         if surrender_worker is not None:
             surrender_worker.join(timeout=max(0.0, drain_deadline - time.monotonic()))
+        # The joins above are the real bound; this is best-effort teardown of
+        # a still-stuck worker's transport, and a no-op when ``self._transport``
+        # was injected by the caller (wrapped non-closing, left open by design).
         self._http.close()
 
 
@@ -1920,7 +1942,10 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         """Fresh state lock AND a fresh async client for the forked child.
 
         The inherited ``httpx.AsyncClient`` is abandoned, never closed — the
-        parent still owns those sockets, and the child's event loop is new.
+        parent still owns those sockets, and the child's event loop is new. A
+        caller-injected transport (``self._transport``) is NOT rebuilt here —
+        it is reused as-is by the new client, so callers supplying a stateful
+        transport must ensure it is itself fork-safe.
         """
         super()._reset_after_fork_in_child()
         self._http = self._new_async_http_client()

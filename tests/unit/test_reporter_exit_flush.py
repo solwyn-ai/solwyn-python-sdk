@@ -789,6 +789,7 @@ def test_exit_drain_publishes_disposition_before_returning(
             reporter._control_plane_breaker,
             0.15,  # join deadline expires while the publication is gated
             gated_counter,
+            reporter._new_exit_http_client,
         )
     finally:
         releaser.cancel()

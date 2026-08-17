@@ -23,7 +23,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Protocol, TypeVar, cast
+from typing import TYPE_CHECKING, Protocol, TypeVar
 
 import httpx
 
@@ -88,12 +88,6 @@ class _ForkResettable(Protocol):
     """An object that repairs its cross-fork-unsafe state in a forked child."""
 
     def _reset_after_fork_in_child(self) -> None: ...
-
-
-class _ExitHttpClientFactory(Protocol):
-    """Component capable of building its configured blocking exit client."""
-
-    def _new_exit_http_client(self) -> httpx.Client: ...
 
 
 # Live reporters, held weakly. A running sync reporter is kept alive by its flush
@@ -206,8 +200,8 @@ def register_async_reporter(reporter: AsyncMetadataReporter) -> None:
         reporter._control_plane_breaker,
         reporter.shutdown_deadline,
         _gc_drop_counter,
-        reporter._untracked_state,
         reporter._exit_http_client_factory._new_exit_http_client,
+        reporter._untracked_state,
     )
     # Documented writable property; typeshed models finalize with __slots__
     # only, so mypy rejects the assignment it cannot see.
@@ -252,7 +246,7 @@ def _exit_surrender_all() -> None:
                 try:
                     payloads = holder.lease_surrender_payloads()
                     if payloads:
-                        client = cast(_ExitHttpClientFactory, holder)._new_exit_http_client()
+                        client = holder._new_exit_http_client()
                     for request in payloads:
                         if _monotonic() >= deadline:
                             logger.debug("lifecycle.exit_surrender_expired")
@@ -273,7 +267,11 @@ def _exit_surrender_all() -> None:
                     )
                 finally:
                     if client is not None:
-                        # Best-effort transport teardown (NOT the bound — the join is).
+                        # Best-effort transport teardown (NOT the bound — the
+                        # join is). A no-op when the holder was constructed
+                        # with a caller-injected transport: the client wraps
+                        # it non-closing, and the caller keeps it open by
+                        # design. Only an SDK-owned transport actually closes.
                         try:
                             client.close()
                         except Exception as exc:
@@ -320,8 +318,8 @@ def blocking_exit_flush(base: AsyncMetadataReporter) -> None:
         base._control_plane_breaker,
         base.shutdown_deadline,
         base._count_drop,
-        base._untracked_state,
         base._new_exit_http_client,
+        base._untracked_state,
     )
 
 
@@ -452,8 +450,8 @@ def _drain_queues_blocking(
     breaker: CircuitBreaker | None,
     budget: float,
     drop_counter: Callable[[str, str, int], None],
+    new_exit_http_client: Callable[[], httpx.Client],
     untracked_state: _UntrackedReportState | None = None,
-    new_exit_http_client: Callable[[], httpx.Client] | None = None,
 ) -> None:
     """Best-effort, single-attempt, deadline-bounded exit flush of the queues.
 
@@ -487,17 +485,6 @@ def _drain_queues_blocking(
         or (untracked_state is not None and untracked_state.reports_due(_monotonic()))
     ):
         return
-
-    # Backward compatibility for callers using the earlier queue-only
-    # signature. Normal lifecycle paths pass the reporter-owned factory;
-    # matching by queue identity keeps the legacy form on the same seam.
-    if new_exit_http_client is None:
-        for reporter in list(_LIVE_ASYNC_REPORTERS):
-            if reporter._queue is event_q:
-                new_exit_http_client = reporter._new_exit_http_client
-                break
-    if new_exit_http_client is None:
-        raise RuntimeError("exit HTTP client factory is required")
 
     deadline = _monotonic() + budget
     headers = {
@@ -683,7 +670,11 @@ def _drain_queues_blocking(
     )
     # Whatever the deadline left behind is abandoned — count it.
     _drop_all(confirm_q, settlement_q, event_q, drop_counter, "shutdown_deadline")
-    # Best-effort transport teardown for a still-stuck worker (NOT the bound).
+    # Best-effort transport teardown for a still-stuck worker (NOT the bound —
+    # the join above is). A no-op when ``new_exit_http_client`` wraps a
+    # caller-injected transport: the client's close() never forwards to it,
+    # and the caller keeps it open by design. Only an SDK-owned transport
+    # actually closes here.
     client.close()
 
 

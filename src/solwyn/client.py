@@ -1258,6 +1258,14 @@ class Solwyn(_SolwynBase):
             messages=[{"role": "user", "content": "Hello"}],
         )
         client.close()
+
+    Args:
+        control_plane_transport: An optional caller-owned ``httpx.BaseTransport``
+            (e.g. ``httpx.MockTransport``) routing budget-check, confirm, and
+            metadata-ingest requests instead of real network I/O. Any transport
+            implementing the sync httpx transport interface is accepted. The
+            caller retains ownership: it is never closed by the SDK, including
+            at ``close()`` and interpreter exit.
     """
 
     def __init__(
@@ -2652,6 +2660,17 @@ class AsyncSolwyn(_SolwynBase):
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
+
+    Args:
+        control_plane_transport: An optional caller-owned transport routing
+            budget-check, confirm, and metadata-ingest requests instead of
+            real network I/O. Async components also perform blocking
+            interpreter-exit drains, so this requires the dual sync+async
+            interface — see :class:`solwyn.ControlPlaneTransport` (only
+            ``handle_request`` and ``handle_async_request`` are called; a
+            transport satisfying ``httpx.MockTransport`` plus an async
+            handler qualifies). The caller retains ownership: it is never
+            closed by the SDK, including at ``close()`` and interpreter exit.
     """
 
     def __init__(

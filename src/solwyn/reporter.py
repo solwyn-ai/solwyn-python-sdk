@@ -84,7 +84,7 @@ _UNTRACKED_REPORT_KEY_LIMIT = 512
 _T = TypeVar("_T")
 
 
-class _ExitHttpClientFactory:
+class _DetachedExitClientFactory:
     """Detached sync transport factory for an async reporter's GC drain.
 
     A weakref finalizer cannot capture the reporter's bound factory method:
@@ -1018,7 +1018,10 @@ class MetadataReporter(_ReporterBase):
         (the child is in a delicate post-fork state), so the thread is instead
         relaunched lazily by ``_ensure_thread`` on the next enqueue. Locks
         possibly held by a now-absent thread are replaced, and the inherited
-        client is abandoned (never closed — the parent owns those sockets).
+        client is abandoned (never closed — the parent owns those sockets). A
+        caller-injected transport (``self._transport``) is NOT rebuilt here —
+        it is reused as-is by the new client, so callers supplying a stateful
+        transport must ensure it is itself fork-safe.
         Queued spend items duplicated into the child by fork are deliberately
         KEPT: the server dedups them. Inherited advisory observations are
         discarded because parent and child mint different report IDs. A closed
@@ -1120,9 +1123,11 @@ class MetadataReporter(_ReporterBase):
             )
             if final_breaker_worker is not None:
                 final_breaker_worker.join(timeout=max(0.0, deadline - _monotonic()))
-        # A worker still alive here consumed the absolute deadline. Preserve
-        # bounded shutdown by tearing down its stuck transport, as close() did
-        # before breaker state-change gating.
+        # A worker still alive here consumed the absolute deadline; the joins
+        # above are the real bound, not this close(). It is a best-effort
+        # attempt to interrupt a blocked socket on an SDK-owned transport — a
+        # caller-injected transport is wrapped non-closing and stays open,
+        # left for the caller to manage.
         self._http.close()
 
     def _final_flush_bounded(self, deadline: float) -> None:
@@ -1132,10 +1137,12 @@ class MetadataReporter(_ReporterBase):
         time, so a slow-drip response could hold an INLINE final flush past the
         deadline indefinitely. The worker is a daemon: if it is still stuck at
         the deadline, close() proceeds — ``_seal_delivery`` claims and counts
-        the worker's in-hand items, and ``_http.close()`` tears down the stuck
-        transport under it. At interpreter shutdown new threads can be refused;
-        fall back to the inline flush there (per-request clamps are then the
-        only bound).
+        the worker's in-hand items, and the join/deadline (not
+        ``_http.close()``) is what bounds shutdown. ``_http.close()`` is only
+        a best-effort attempt to unstick a still-blocked socket on an
+        SDK-owned transport; a caller-injected transport is deliberately left
+        open. At interpreter shutdown new threads can be refused; fall back to
+        the inline flush there (per-request clamps are then the only bound).
         """
 
         def _run() -> None:
@@ -1753,7 +1760,7 @@ class AsyncMetadataReporter(_ReporterBase):
         # async, while GC/interpreter-exit delivery uses a sync client. The
         # caller retains ownership of an injected transport.
         self._transport: ControlPlaneTransport | None = validated_transport
-        self._exit_http_client_factory = _ExitHttpClientFactory(self._transport)
+        self._exit_http_client_factory = _DetachedExitClientFactory(self._transport)
         self._http = self._new_async_http_client(timeout=10.0)
         self._shutdown_event: asyncio.Event | None = None
         self._flush_task: asyncio.Task[None] | None = None
@@ -1794,10 +1801,13 @@ class AsyncMetadataReporter(_ReporterBase):
         The parent's event loop, flush task, and breaker task do not exist in the
         child; clear them so ``_ensure_started`` relaunches the flush loop in the
         child's own loop on the next enqueue. The inherited client is abandoned
-        (never closed — the parent owns those sockets). Queued spend items
-        duplicated into the child by fork are deliberately KEPT: the server
-        dedups them. Inherited advisory observations are discarded because
-        parent and child mint different report IDs.
+        (never closed — the parent owns those sockets). A caller-injected
+        transport (``self._transport``) is NOT rebuilt here — it is reused
+        as-is by the new client, so callers supplying a stateful transport
+        must ensure it is itself fork-safe. Queued spend items duplicated into
+        the child by fork are deliberately KEPT: the server dedups them.
+        Inherited advisory observations are discarded because parent and
+        child mint different report IDs.
         """
         self._breaker_project_lock = threading.Lock()
         self._breaker_report_lock = threading.Lock()

@@ -47,6 +47,16 @@ def test_untracked_spend_surface_error_is_publicly_exported() -> None:
 
 
 @pytest.mark.unit
+def test_control_plane_transport_is_publicly_exported() -> None:
+    # The injected-transport seam (Solwyn/AsyncSolwyn's control_plane_transport=)
+    # is only usable by external callers if its protocol is importable from the
+    # package root, not just from the private _control_plane_transport module.
+    assert "ControlPlaneTransport" in solwyn.__all__
+    assert solwyn.ControlPlaneTransport is not None
+    assert getattr(solwyn.ControlPlaneTransport, "_is_protocol", False) is True
+
+
+@pytest.mark.unit
 def test_run_stopped_error_is_publicly_exported() -> None:
     assert "RunStoppedError" in solwyn.__all__
     assert solwyn.RunStoppedError is exceptions.RunStoppedError

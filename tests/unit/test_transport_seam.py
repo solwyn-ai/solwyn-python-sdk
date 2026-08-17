@@ -155,23 +155,52 @@ class _StructuralDualTransport:
 
 
 class _SyncAsyncHandlerTransport(_StructuralDualTransport):
+    """``handle_async_request`` has the WRONG (sync) shape — a real rejection:
+    the SDK calls it with ``await`` and a non-coroutine breaks that call."""
+
     def handle_async_request(self, request: httpx.Request) -> httpx.Response:  # type: ignore[override]
         return self._recorder.handler(request)
 
 
 class _SyncAsyncCloseTransport(_StructuralDualTransport):
+    """``aclose`` has the wrong (sync) shape — irrelevant: the SDK never calls
+    close/aclose on a caller-owned transport, so this must be ACCEPTED."""
+
     def aclose(self) -> None:  # type: ignore[override]
         return None
 
 
 class _AsyncSyncHandlerTransport(_StructuralDualTransport):
+    """``handle_request`` has the WRONG (async) shape — a real rejection: the
+    SDK calls it synchronously and a coroutine function breaks that call."""
+
     async def handle_request(self, request: httpx.Request) -> httpx.Response:  # type: ignore[override]
         return self._recorder.handler(request)
 
 
 class _AsyncSyncCloseTransport(_StructuralDualTransport):
+    """``close`` has the wrong (async) shape — irrelevant: the SDK never calls
+    close/aclose on a caller-owned transport, so this must be ACCEPTED."""
+
     async def close(self) -> None:  # type: ignore[override]
         return None
+
+
+class _MinimalDualTransport:
+    """The two methods the SDK actually calls — no close, no aclose at all.
+
+    Functionally sufficient: the non-closing wrappers never forward close or
+    aclose to a caller-owned transport, so a transport that never implements
+    them must still be accepted."""
+
+    def __init__(self, recorder: _Recorder) -> None:
+        self._recorder = recorder
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return self._recorder.handler(request)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return self._recorder.handler(request)
 
 
 class _CloseSensitiveDualTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
@@ -339,9 +368,7 @@ async def test_async_components_reject_one_sided_transports(
     "transport_factory",
     [
         _SyncAsyncHandlerTransport,
-        _SyncAsyncCloseTransport,
         _AsyncSyncHandlerTransport,
-        _AsyncSyncCloseTransport,
     ],
 )
 async def test_async_components_reject_wrong_sync_async_method_shapes_at_construction(
@@ -354,6 +381,40 @@ async def test_async_components_reject_wrong_sync_async_method_shapes_at_constru
         component_factory(transport_factory(recorder))
 
     assert recorder.paths == []
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "component_factory",
+    [
+        _new_async_enforcer_with_transport,
+        _new_async_reporter_with_transport,
+        _new_async_solwyn_with_transport,
+    ],
+)
+@pytest.mark.parametrize(
+    "transport_factory",
+    [
+        _MinimalDualTransport,
+        _SyncAsyncCloseTransport,
+        _AsyncSyncCloseTransport,
+    ],
+)
+async def test_async_components_accept_transports_regardless_of_close_aclose_shape(
+    component_factory: Callable[[object], _AsyncClosableComponent],
+    transport_factory: Callable[[_Recorder], object],
+) -> None:
+    """A dual transport is accepted based on ``handle_request``/
+    ``handle_async_request`` alone. A missing, wrongly-shaped, or altogether
+    absent ``close``/``aclose`` must NOT be rejected: the non-closing wrappers
+    never forward either to a caller-owned transport, so requiring them would
+    reject a transport the SDK can already serve every request through."""
+    recorder = _Recorder()
+
+    component = component_factory(transport_factory(recorder))
+
+    await component.close()
 
 
 @pytest.mark.unit
@@ -760,6 +821,16 @@ async def test_async_injected_transport_is_caller_owned_through_settlement_and_s
 
 @pytest.mark.unit
 def test_http_clients_are_only_constructed_in_component_factories() -> None:
+    """Direct ``httpx.Client``/``AsyncClient`` construction is confined to the
+    three component factories. Also flags two evasions of the plain
+    ``httpx.Client(...)`` attribute-call pattern the walk below looks for:
+    ``from httpx import Client``/``AsyncClient`` (an unqualified name a caller
+    could construct without ever writing ``httpx.Client``, so it is flagged
+    outright rather than allowlisted) and ``import httpx as <alias>`` followed
+    by ``<alias>.Client(...)``/``<alias>.AsyncClient(...)`` (checked through
+    the SAME allowlist as the direct form, since it's the same call shape
+    under a different name).
+    """
     source_root = Path(__file__).parents[2] / "src" / "solwyn"
     hits: list[str] = []
     violations: list[str] = []
@@ -771,10 +842,25 @@ def test_http_clients_are_only_constructed_in_component_factories() -> None:
         for parent in ast.walk(tree):
             for child in ast.iter_child_nodes(parent):
                 parents[child] = parent
+
+        httpx_aliases = {"httpx"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "httpx" and alias.asname:
+                        httpx_aliases.add(alias.asname)
+            elif isinstance(node, ast.ImportFrom) and node.module == "httpx":
+                for alias in node.names:
+                    if alias.name in {"Client", "AsyncClient"}:
+                        violations.append(
+                            f"{path.relative_to(source_root)}:{node.lineno}:"
+                            f"<import {alias.name} from httpx>"
+                        )
+
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
                 continue
-            if not isinstance(node.func.value, ast.Name) or node.func.value.id != "httpx":
+            if not isinstance(node.func.value, ast.Name) or node.func.value.id not in httpx_aliases:
                 continue
             if node.func.attr not in {"Client", "AsyncClient"}:
                 continue
