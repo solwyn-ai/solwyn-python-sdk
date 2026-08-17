@@ -104,7 +104,7 @@ def test_sync_enforcer_constructor_uses_injected_transport() -> None:
     finally:
         enforcer.close()
 
-    assert "/api/v1/budgets/check" in recorder.paths
+    assert recorder.paths == ["/api/v1/budgets/check"]
 
 
 @pytest.mark.unit
@@ -116,13 +116,15 @@ def test_sync_enforcer_fork_reset_reuses_injected_transport() -> None:
         transport=httpx.MockTransport(recorder.handler),
     )
 
+    pre_reset_http = enforcer._http
     enforcer._reset_after_fork_in_child()
     try:
+        assert enforcer._http is not pre_reset_http
         _check(enforcer)
     finally:
         enforcer.close()
 
-    assert "/api/v1/budgets/check" in recorder.paths
+    assert recorder.paths == ["/api/v1/budgets/check"]
 
 
 @pytest.mark.unit
@@ -160,7 +162,7 @@ async def test_async_enforcer_constructor_uses_injected_transport() -> None:
     finally:
         await enforcer.close()
 
-    assert "/api/v1/budgets/check" in recorder.paths
+    assert recorder.paths == ["/api/v1/budgets/check"]
 
 
 @pytest.mark.unit
@@ -173,13 +175,15 @@ async def test_async_enforcer_fork_reset_reuses_injected_transport() -> None:
         transport=httpx.MockTransport(recorder.handler),
     )
 
+    pre_reset_http = enforcer._http
     enforcer._reset_after_fork_in_child()
     try:
+        assert enforcer._http is not pre_reset_http
         await _acheck(enforcer)
     finally:
         await enforcer.close()
 
-    assert "/api/v1/budgets/check" in recorder.paths
+    assert recorder.paths == ["/api/v1/budgets/check"]
 
 
 @pytest.mark.unit
