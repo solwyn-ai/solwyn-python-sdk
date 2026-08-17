@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -28,6 +28,18 @@ DEFAULT_PROVIDER_CHAIN = [ProviderEntry(provider=ProviderName.OPENAI, model="gpt
 # Namespace for call_uuid below. Arbitrary but FIXED: the ids it derives are
 # stable across runs, so a queue-order assertion can name them.
 _CALL_ID_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_run_control() -> Iterator[None]:
+    """Keep exact and conservative process-wide stop state test-isolated."""
+    from solwyn import _run_control
+
+    with _run_control._STATE.lock:
+        _run_control._STATE._clear_for_test_locked()
+    yield
+    with _run_control._STATE.lock:
+        _run_control._STATE._clear_for_test_locked()
 
 
 @pytest.fixture

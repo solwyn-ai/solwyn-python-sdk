@@ -26,7 +26,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator, Mapping
-from typing import Any, Literal, NamedTuple, cast
+from typing import Any, Literal, NamedTuple, NoReturn, cast
 
 import httpx
 from pydantic import ValidationError
@@ -73,9 +73,11 @@ from solwyn._proxies import (
 from solwyn._registry import ProviderRuntime, build_runtimes
 from solwyn._routing import RoutingRequest, SelectionPolicy
 from solwyn._run import _capture_run_context, _RunContextSnapshot
+from solwyn._run_control import RunTermination, mark_terminated, run_termination
 from solwyn._surfaces import SurfaceSource
 from solwyn._token_details import TokenDetails
-from solwyn._types import CallStatus, FailoverReason, ProviderName
+from solwyn._types import CallStatus, FailoverReason, Modality, ProviderName
+from solwyn._velocity import DENY_ELIGIBLE_RULES
 from solwyn.budget import (
     DEFAULT_COST_PER_TOKEN,
     AsyncBudgetEnforcer,
@@ -110,7 +112,7 @@ def _budget_denial_error(
     budget: BudgetCheckResult,
     agent_run_id: str | None,
     estimated_cost: float,
-) -> BudgetExceededError:
+) -> BudgetExceededError | RunStoppedError:
     """Build the public typed error for one denied pre-flight."""
     budget_period = getattr(budget, "denied_by_period", None)
     if budget_period is None:
@@ -118,11 +120,8 @@ def _budget_denial_error(
     if budget_period == "run_stopped" and agent_run_id is not None:
         return RunStoppedError(
             agent_run_id=agent_run_id,
-            project_id=budget.project_id,
-            budget_limit=budget.budget_limit,
-            current_usage=budget.current_usage,
-            estimated_cost=estimated_cost,
-            mode=budget.mode.value,
+            reason="run_stopped",
+            source="server",
         )
     return BudgetExceededError(
         project_id=budget.project_id,
@@ -131,6 +130,168 @@ def _budget_denial_error(
         estimated_cost=estimated_cost,
         budget_period=budget_period,
         mode=budget.mode.value,
+    )
+
+
+_DENY_ELIGIBLE_RULE_ORDER = tuple(sorted(DENY_ELIGIBLE_RULES))
+
+
+def _raise_run_stopped(
+    client: Solwyn | AsyncSolwyn,
+    *,
+    termination: RunTermination,
+    agent_run: _RunContextSnapshot,
+    model: str,
+    provider: str,
+    input_tokens: int,
+    call_id: str,
+    provider_region: str | None,
+    modality: Modality = "text",
+) -> NoReturn:
+    """Report one content-free denied event, then raise the stored stop."""
+    run_id = agent_run[0]
+    if run_id is None:
+        raise RuntimeError("run termination gate requires an active run")
+    try:
+        client._reporter.report(
+            client._build_metadata_event(
+                model=model,
+                provider=provider,
+                input_tokens=input_tokens,
+                output_tokens=0,
+                token_details=None,
+                latency_ms=0.0,
+                status=CallStatus.BUDGET_DENIED,
+                is_model_fallback=False,
+                call_id=call_id,
+                agent_run=agent_run,
+                provider_region=provider_region,
+                modality=modality,
+            )
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to report budget_denied metadata event: %s",
+            type(exc).__name__,
+        )
+    raise RunStoppedError(
+        agent_run_id=run_id,
+        reason=termination.reason,
+        source=termination.source,
+    )
+
+
+def _observe_run_control(
+    client: Solwyn | AsyncSolwyn,
+    *,
+    agent_run: _RunContextSnapshot,
+    model: str,
+    provider: str,
+    input_tokens: int,
+    call_id: str,
+    provider_region: str | None,
+    modality: Modality = "text",
+) -> str | None:
+    """Apply local pre-gates, returning a rule deferred behind a server stop."""
+    run_id = agent_run[0]
+    if run_id is None:
+        return None
+
+    termination = run_termination(run_id)
+    if termination is not None and termination.source == "local_velocity":
+        _raise_run_stopped(
+            client,
+            termination=termination,
+            agent_run=agent_run,
+            model=model,
+            provider=provider,
+            input_tokens=input_tokens,
+            call_id=call_id,
+            provider_region=provider_region,
+            modality=modality,
+        )
+
+    if client._config.velocity_mode == "off":
+        return None
+    flags = client._velocity.observe(
+        run_id=run_id,
+        estimated_input_tokens=input_tokens,
+        model=model,
+        now=time.monotonic(),
+    )
+    client._warn_velocity(run_id, flags)
+    if client._config.velocity_mode != "deny":
+        return None
+
+    eligible_rule = next(
+        (rule for rule in _DENY_ELIGIBLE_RULE_ORDER if rule in flags),
+        None,
+    )
+    if eligible_rule is None:
+        return None
+    mark_terminated(
+        run_id,
+        reason=f"velocity:{eligible_rule}",
+        source="local_velocity",
+    )
+    termination = run_termination(run_id)
+    if termination is None:
+        raise RuntimeError("marked run termination is missing")
+    if termination.source == "server":
+        return eligible_rule
+    _raise_run_stopped(
+        client,
+        termination=termination,
+        agent_run=agent_run,
+        model=model,
+        provider=provider,
+        input_tokens=input_tokens,
+        call_id=call_id,
+        provider_region=provider_region,
+        modality=modality,
+    )
+
+
+def _postcheck_run_control(
+    client: Solwyn | AsyncSolwyn,
+    *,
+    budget: BudgetCheckResult,
+    agent_run: _RunContextSnapshot,
+    model: str,
+    provider: str,
+    input_tokens: int,
+    call_id: str,
+    provider_region: str | None,
+    pending_velocity_rule: str | None,
+    modality: Modality = "text",
+) -> None:
+    """Let a live check clear server state, then gate either remaining source."""
+    run_id = agent_run[0]
+    if run_id is None:
+        return
+    if pending_velocity_rule is not None:
+        mark_terminated(
+            run_id,
+            reason=f"velocity:{pending_velocity_rule}",
+            source="local_velocity",
+        )
+    termination = run_termination(run_id)
+    if termination is None:
+        return
+    client._budget.release_reservation(
+        call_id,
+        lease_claim_token=_lease_claim_token(budget),
+    )
+    _raise_run_stopped(
+        client,
+        termination=termination,
+        agent_run=agent_run,
+        model=model,
+        provider=provider,
+        input_tokens=input_tokens,
+        call_id=call_id,
+        provider_region=provider_region,
+        modality=modality,
     )
 
 
@@ -1662,15 +1823,17 @@ class Solwyn(_SolwynBase):
         char_count = estimate_content_length(kwargs)
         est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
         estimated_media = spec.estimate_media(kwargs) if spec.estimate_media is not None else None
-        flags: tuple[str, ...] = ()
-        if agent_run[0] is not None and self._config.velocity_mode != "off":
-            flags = self._velocity.observe(
-                run_id=agent_run[0],
-                estimated_input_tokens=est_in,
-                model=requested_model,
-                now=time.monotonic(),
-            )
-            self._warn_velocity(agent_run[0], flags)
+        provider_region = _safe_extract_region(runtime)
+        pending_velocity_rule = _observe_run_control(
+            self,
+            agent_run=agent_run,
+            model=requested_model,
+            provider=provider,
+            input_tokens=est_in,
+            call_id=call_id,
+            provider_region=provider_region,
+            modality=spec.modality,
+        )
 
         # 2. Budget check against the primary (no failover chain to hint). The
         #    surface's estimated_media rides the check so the server prices a
@@ -1695,6 +1858,18 @@ class Solwyn(_SolwynBase):
             tags=agent_run[2],
             call_id=call_id,
         )
+        _postcheck_run_control(
+            self,
+            budget=budget,
+            agent_run=agent_run,
+            model=requested_model,
+            provider=provider,
+            input_tokens=est_in,
+            call_id=call_id,
+            provider_region=provider_region,
+            pending_velocity_rule=pending_velocity_rule,
+            modality=spec.modality,
+        )
         # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
         # must never re-read self._config (the directive writer mutates it
         # under a lock; unlocked re-reads can tear).
@@ -1706,7 +1881,6 @@ class Solwyn(_SolwynBase):
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
 
-        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
         if not budget.allowed:
             try:
                 self._reporter.report(
@@ -1951,15 +2125,16 @@ class Solwyn(_SolwynBase):
             if char_count
             else 0
         )
-        flags: tuple[str, ...] = ()
-        if agent_run[0] is not None and self._config.velocity_mode != "off":
-            flags = self._velocity.observe(
-                run_id=agent_run[0],
-                estimated_input_tokens=est_in,
-                model=requested_model,
-                now=time.monotonic(),
-            )
-            self._warn_velocity(agent_run[0], flags)
+        provider_region = _safe_extract_region(primary)
+        pending_velocity_rule = _observe_run_control(
+            self,
+            agent_run=agent_run,
+            model=requested_model,
+            provider=primary.adapter.name,
+            input_tokens=est_in,
+            call_id=call_id,
+            provider_region=provider_region,
+        )
 
         # 2. Check budget against the PRIMARY (we don't yet know who serves).
         if _surface == "responses":
@@ -2016,6 +2191,17 @@ class Solwyn(_SolwynBase):
                 call_id=call_id,
                 estimated_output_bound=estimated_output_bound,
             )
+        _postcheck_run_control(
+            self,
+            budget=budget,
+            agent_run=agent_run,
+            model=requested_model,
+            provider=primary.adapter.name,
+            input_tokens=est_in,
+            call_id=call_id,
+            provider_region=provider_region,
+            pending_velocity_rule=pending_velocity_rule,
+        )
         # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
         # must never re-read self._config (the directive writer mutates it
         # under a lock; unlocked re-reads can tear).
@@ -2049,7 +2235,7 @@ class Solwyn(_SolwynBase):
                     is_model_fallback=False,
                     call_id=call_id,
                     agent_run=agent_run,
-                    provider_region=primary.adapter.extract_region(primary.sdk_client),
+                    provider_region=provider_region,
                 )
                 self._reporter.report(event)
             except Exception as exc:
@@ -3017,15 +3203,17 @@ class AsyncSolwyn(_SolwynBase):
         char_count = estimate_content_length(kwargs)
         est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
         estimated_media = spec.estimate_media(kwargs) if spec.estimate_media is not None else None
-        flags: tuple[str, ...] = ()
-        if agent_run[0] is not None and self._config.velocity_mode != "off":
-            flags = self._velocity.observe(
-                run_id=agent_run[0],
-                estimated_input_tokens=est_in,
-                model=requested_model,
-                now=time.monotonic(),
-            )
-            self._warn_velocity(agent_run[0], flags)
+        provider_region = _safe_extract_region(runtime)
+        pending_velocity_rule = _observe_run_control(
+            self,
+            agent_run=agent_run,
+            model=requested_model,
+            provider=provider,
+            input_tokens=est_in,
+            call_id=call_id,
+            provider_region=provider_region,
+            modality=spec.modality,
+        )
 
         budget = await self._budget.check_budget(
             estimated_input_tokens=est_in,
@@ -3038,6 +3226,18 @@ class AsyncSolwyn(_SolwynBase):
             tags=agent_run[2],
             call_id=call_id,
         )
+        _postcheck_run_control(
+            self,
+            budget=budget,
+            agent_run=agent_run,
+            model=requested_model,
+            provider=provider,
+            input_tokens=est_in,
+            call_id=call_id,
+            provider_region=provider_region,
+            pending_velocity_rule=pending_velocity_rule,
+            modality=spec.modality,
+        )
         # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
         # must never re-read self._config (the directive writer mutates it
         # under a lock; unlocked re-reads can tear).
@@ -3049,7 +3249,6 @@ class AsyncSolwyn(_SolwynBase):
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
 
-        provider_region = runtime.adapter.extract_region(runtime.sdk_client)
         if not budget.allowed:
             try:
                 self._reporter.report(
@@ -3261,15 +3460,16 @@ class AsyncSolwyn(_SolwynBase):
             if char_count
             else 0
         )
-        flags: tuple[str, ...] = ()
-        if agent_run[0] is not None and self._config.velocity_mode != "off":
-            flags = self._velocity.observe(
-                run_id=agent_run[0],
-                estimated_input_tokens=est_in,
-                model=requested_model,
-                now=time.monotonic(),
-            )
-            self._warn_velocity(agent_run[0], flags)
+        provider_region = _safe_extract_region(primary)
+        pending_velocity_rule = _observe_run_control(
+            self,
+            agent_run=agent_run,
+            model=requested_model,
+            provider=primary.adapter.name,
+            input_tokens=est_in,
+            call_id=call_id,
+            provider_region=provider_region,
+        )
 
         if _surface == "responses":
             fallback_providers: list[str] = []
@@ -3315,6 +3515,17 @@ class AsyncSolwyn(_SolwynBase):
                 call_id=call_id,
                 estimated_output_bound=estimated_output_bound,
             )
+        _postcheck_run_control(
+            self,
+            budget=budget,
+            agent_run=agent_run,
+            model=requested_model,
+            provider=primary.adapter.name,
+            input_tokens=est_in,
+            call_id=call_id,
+            provider_region=provider_region,
+            pending_velocity_rule=pending_velocity_rule,
+        )
         # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
         # must never re-read self._config (the directive writer mutates it
         # under a lock; unlocked re-reads can tear).
@@ -3343,7 +3554,7 @@ class AsyncSolwyn(_SolwynBase):
                     is_model_fallback=False,
                     call_id=call_id,
                     agent_run=agent_run,
-                    provider_region=primary.adapter.extract_region(primary.sdk_client),
+                    provider_region=provider_region,
                 )
                 self._reporter.report(event)
             except Exception as exc:

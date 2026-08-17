@@ -657,7 +657,7 @@ All SDK errors inherit from `SolwynError`:
 | Exception | Raised when |
 |-----------|-------------|
 | `BudgetExceededError` | Cloud denies a budget check in `hard_deny` mode, or local enforcement denies while Cloud is unreachable and `fail_open=False` |
-| `RunStoppedError` | A dashboard stop is learned for an agent run — on the next budget check for per-call traffic, or after lease renewal or re-grant for leased traffic |
+| `RunStoppedError` | A server/operator stop or a deny-eligible local velocity rule prevents provider dispatch for an agent run |
 | `ProviderUnavailableError` | Circuit breaker is open, or the failover chain is exhausted |
 | `ConfigurationError` | Invalid API key format, invalid `provider=` pin/client pairing, or an untracked call surface (e.g. Bedrock `invoke_model`) |
 | `UntrackedSpendSurfaceError` | Strict coverage posture refuses an unacknowledged untracked or unknown capability before provider I/O |
@@ -665,9 +665,23 @@ All SDK errors inherit from `SolwynError`:
 | `UntranslatableRequestError` | A cross-provider failover hop cannot represent the request (structural labels only — never content) |
 | `UntranslatableModelError` | No model mapping exists for a cross-provider failover hop |
 
-`RunStoppedError` is a `BudgetExceededError` subclass, so existing
-`except BudgetExceededError` handlers continue to catch dashboard stops. A stop
-does not interrupt requests already in flight or streams already returned.
+`RunStoppedError` inherits directly from `SolwynError`, not `BudgetExceededError`.
+This deliberate separation prevents an agent loop's `except BudgetExceededError`
+handler from swallowing and retrying an explicit stop. The exception carries the
+structural `agent_run_id`, `reason`, and `source`; server/operator stops use the
+`server` source and eligible local `velocity_mode="deny"` decisions use
+`local_velocity`. Exact first-writer reasons and structural run IDs live only in
+a 256-entry LRU. The registry never guesses from fingerprints, so churn cannot
+false-stop an unrelated or new run. A stopped run may be forgotten after LRU
+eviction; a later call can proceed if the control plane is unavailable or does
+not reaffirm the stop. This is the unavoidable tradeoff between exact answers
+and fixed memory under unbounded identity churn.
+
+Cooperative run code can call `current_run_terminated()` for the ambient run,
+inspect `run_termination(run_id)`, or explicitly clear stored stop state with
+`clear_run_termination(run_id)`. `run_termination` returns an immutable
+`RunTermination` (`reason`, `source`, and `at_monotonic`) or `None`. These controls
+do not interrupt requests already in flight or streams already returned.
 
 Provider errors (e.g., `openai.RateLimitError`) pass through unmodified.
 

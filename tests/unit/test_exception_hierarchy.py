@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import pickle
 from collections.abc import Callable
+from typing import TypeVar, cast
 
 import pytest
 
@@ -59,34 +60,30 @@ def test_untracked_spend_error_carries_structural_policy_context() -> None:
 
 
 @pytest.mark.unit
-def test_run_stopped_error_is_public_and_preserves_budget_compatibility() -> None:
+def test_run_stopped_error_is_public_and_separate_from_budget_errors() -> None:
     assert RunStoppedError is solwyn.exceptions.RunStoppedError
-    assert issubclass(RunStoppedError, BudgetExceededError)
+    assert issubclass(RunStoppedError, SolwynError)
+    assert not issubclass(RunStoppedError, BudgetExceededError)
 
     exc = RunStoppedError(
         agent_run_id="run_abc",
-        project_id="proj_" + "a" * 24,
-        budget_limit=100.0,
-        current_usage=25.0,
-        estimated_cost=1.5,
-        mode="hard_deny",
+        reason="run_stopped",
+        source="server",
     )
 
-    assert isinstance(exc, BudgetExceededError)
-    assert str(exc) == "Run run_abc was stopped from the Solwyn dashboard"
+    assert isinstance(exc, SolwynError)
+    assert not isinstance(exc, BudgetExceededError)
+    assert str(exc) == "Agent run run_abc was stopped (server: run_stopped)"
     assert exc.agent_run_id == "run_abc"
-    assert exc.project_id == "proj_" + "a" * 24
-    assert exc.budget_limit == 100.0
-    assert exc.current_usage == 25.0
-    assert exc.estimated_cost == 1.5
-    assert exc.budget_period == "run_stopped"
-    assert exc.mode == "hard_deny"
+    assert exc.reason == "run_stopped"
+    assert exc.source == "server"
 
 
-def _pickle_round_trip(exc: BudgetExceededError) -> BudgetExceededError:
-    restored = pickle.loads(pickle.dumps(exc))
-    assert isinstance(restored, BudgetExceededError)
-    return restored
+_E = TypeVar("_E", bound=BaseException)
+
+
+def _pickle_round_trip(exc: _E) -> _E:
+    return cast("_E", pickle.loads(pickle.dumps(exc)))
 
 
 @pytest.mark.unit
@@ -128,15 +125,12 @@ def test_budget_exceeded_error_supports_exception_round_trips(
     ids=["copy", "pickle"],
 )
 def test_run_stopped_error_supports_exception_round_trips(
-    round_trip: Callable[[BudgetExceededError], BudgetExceededError],
+    round_trip: Callable[[RunStoppedError], RunStoppedError],
 ) -> None:
     exc = RunStoppedError(
         agent_run_id="run_abc",
-        project_id="proj_" + "a" * 24,
-        budget_limit=100.0,
-        current_usage=120.0,
-        estimated_cost=5.0,
-        mode="hard_deny",
+        reason="velocity:repeat_size",
+        source="local_velocity",
     )
     exc.add_note("diagnostic note")
 
@@ -146,12 +140,8 @@ def test_run_stopped_error_supports_exception_round_trips(
     assert restored.args == exc.args
     assert isinstance(restored, RunStoppedError)
     assert restored.agent_run_id == exc.agent_run_id
-    assert restored.project_id == exc.project_id
-    assert restored.budget_limit == exc.budget_limit
-    assert restored.current_usage == exc.current_usage
-    assert restored.estimated_cost == exc.estimated_cost
-    assert restored.budget_period == exc.budget_period
-    assert restored.mode == exc.mode
+    assert restored.reason == exc.reason
+    assert restored.source == exc.source
     assert restored.__notes__ == exc.__notes__
 
 
@@ -313,11 +303,10 @@ def test_budget_exceeded_error_repr_remains_compatible() -> None:
 def test_run_stopped_error_repr_names_its_public_type() -> None:
     exc = RunStoppedError(
         agent_run_id="run_abc",
-        project_id="proj_" + "a" * 24,
-        budget_limit=100.0,
-        current_usage=120.0,
-        estimated_cost=5.0,
-        mode="hard_deny",
+        reason="run_stopped",
+        source="server",
     )
 
-    assert repr(exc) == "RunStoppedError(budget_limit=100.0, current_usage=120.0)"
+    assert repr(exc) == (
+        "RunStoppedError(agent_run_id='run_abc', reason='run_stopped', source='server')"
+    )

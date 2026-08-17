@@ -407,14 +407,11 @@ class TestMediaCallSync:
 
         error = exc_info.value
         assert type(error) is RunStoppedError
-        assert isinstance(error, BudgetExceededError)
-        assert str(error) == f"Run {run_id} was stopped from the Solwyn dashboard"
-        assert error.project_id == VALID_PROJECT_ID
-        assert error.budget_limit == 10.0
-        assert error.current_usage == 10.0
-        assert error.estimated_cost == 0.0
-        assert error.budget_period == "run_stopped"
-        assert error.mode == "hard_deny"
+        assert not isinstance(error, BudgetExceededError)
+        assert str(error) == f"Agent run {run_id} was stopped (server: run_stopped)"
+        assert error.agent_run_id == run_id
+        assert error.reason == "run_stopped"
+        assert error.source == "server"
 
     def test_unsupported_surface_reports_error_then_raises(self) -> None:
         client, _ = _sync_client()
@@ -770,11 +767,8 @@ class TestMediaCallAsync:
 
         error = exc_info.value
         assert type(error) is RunStoppedError
-        assert isinstance(error, BudgetExceededError)
-        assert str(error) == f"Run {run_id} was stopped from the Solwyn dashboard"
-        assert error.project_id == VALID_PROJECT_ID
-        assert error.budget_limit == 10.0
-        assert error.current_usage == 10.0
-        assert error.estimated_cost == 0.0
-        assert error.budget_period == "run_stopped"
-        assert error.mode == "hard_deny"
+        assert not isinstance(error, BudgetExceededError)
+        assert str(error) == f"Agent run {run_id} was stopped (server: run_stopped)"
+        assert error.agent_run_id == run_id
+        assert error.reason == "run_stopped"
+        assert error.source == "server"

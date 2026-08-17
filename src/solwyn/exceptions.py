@@ -1,7 +1,7 @@
 """Solwyn SDK exceptions.
 
 BudgetExceededError -- raised when budget enforcement blocks a request.
-RunStoppedError -- raised when a dashboard stop blocks an agent run.
+RunStoppedError -- raised when an operator or local safety rule stops an agent run.
 ProviderUnavailableError -- raised when all providers are circuit-broken.
 ConfigurationError -- raised when configuration is invalid.
 UntranslatableRequestError -- raised when a cross-provider hop cannot translate a request.
@@ -105,46 +105,35 @@ class BudgetExceededError(SolwynError):
         )
 
 
-class RunStoppedError(BudgetExceededError):
-    """Raised when an operator stopped an agent run from the dashboard.
-
-    This is a ``BudgetExceededError`` subclass so existing hard-deny handlers
-    keep catching it. It carries the same budget snapshot fields plus the
-    stopped run id; no prompt or response content is retained.
-    """
+class RunStoppedError(SolwynError):
+    """Raised when an operator or local safety rule stops an agent run."""
 
     def __init__(
         self,
         *,
-        agent_run_id: str | None,
-        project_id: str | None,
-        budget_limit: float,
-        current_usage: float,
-        estimated_cost: float,
-        mode: str,
+        agent_run_id: str,
+        reason: str,
+        source: str,
     ) -> None:
-        super().__init__(
-            project_id=project_id,
-            budget_limit=budget_limit,
-            current_usage=current_usage,
-            estimated_cost=estimated_cost,
-            budget_period="run_stopped",
-            mode=mode,
-        )
+        super().__init__(f"Agent run {agent_run_id} was stopped ({source}: {reason})")
         self.agent_run_id = agent_run_id
-        self.args = (f"Run {agent_run_id} was stopped from the Solwyn dashboard",)
+        self.reason = reason
+        self.source = source
+
+    def __repr__(self) -> str:
+        return (
+            f"RunStoppedError(agent_run_id={self.agent_run_id!r}, "
+            f"reason={self.reason!r}, source={self.source!r})"
+        )
 
     def __reduce__(self) -> tuple[object, tuple[object, ...], dict[str, object]]:
-        """Preserve the stopped run id when copying or pickling."""
+        """Preserve keyword-only state when copying or pickling."""
         return (
             partial(
                 type(self),
                 agent_run_id=self.agent_run_id,
-                project_id=self.project_id,
-                budget_limit=self.budget_limit,
-                current_usage=self.current_usage,
-                estimated_cost=self.estimated_cost,
-                mode=self.mode,
+                reason=self.reason,
+                source=self.source,
             ),
             (),
             dict(self.__dict__),

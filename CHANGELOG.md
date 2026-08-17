@@ -71,20 +71,26 @@ derived from git tags (hatch-vcs).
   `SOLWYN_REPORT_UNTRACKED_SURFACES=false` to disable optional external
   advisory egress without changing local `on_unmetered`
   `warn`/`allow`/`raise` behavior.
+- **Agent-run stops raise `RunStoppedError`.** The public exception inherits
+  directly from `SolwynError`, not `BudgetExceededError`, so an agent loop's
+  budget-denial handler cannot swallow and retry an explicit stop. It carries
+  only the structural `agent_run_id`, `reason`, and `source`; server/operator
+  stops use `server`, while deny-eligible local velocity rules use
+  `local_velocity`. The bounded process-wide registry is exposed cooperatively
+  through `current_run_terminated()`, `run_termination(run_id)`,
+  `clear_run_termination(run_id)`, and immutable `RunTermination` values.
+  Exact reasons remain a 256-entry LRU that never guesses from fingerprints, so
+  churn cannot false-stop an unrelated or new run. A stopped run may be
+  forgotten after LRU eviction if the control plane does not reaffirm it—the
+  fixed-memory tradeoff required to preserve exact answers. These controls
+  govern future dispatch and do not interrupt requests already in flight or
+  streams already returned.
 - **Content-free run velocity detection is configurable and bounded.** Seven
   `velocity_*` / `SOLWYN_VELOCITY_*` settings control mode, repeat-size,
   monotonic-growth, and rate-acceleration thresholds. Only repeat-size and
   monotonic-growth are deny-eligible; rate acceleration remains advisory.
   State contains scalar token counts, timestamps, and structural identifiers
   only, with 128×64 detailed history and fixed-memory conservative suppression.
-- **Dashboard-stopped runs raise `RunStoppedError`.** The public exception is
-  a `BudgetExceededError` subclass, so existing hard-deny handlers remain
-  compatible. It identifies the stopped run, preserves the budget snapshot
-  fields, and per-call traffic raises it on the next budget check. Leased
-  traffic raises only after a lease renewal or re-grant learns the stop.
-  Requests already in flight and streams already returned are not interrupted,
-  and control-plane connectivity failures retain the configured fail-open
-  posture.
 
 ### Changed
 

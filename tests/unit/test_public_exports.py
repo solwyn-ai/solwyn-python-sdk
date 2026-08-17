@@ -47,7 +47,8 @@ def test_untracked_spend_surface_error_is_publicly_exported() -> None:
 def test_run_stopped_error_is_publicly_exported() -> None:
     assert "RunStoppedError" in solwyn.__all__
     assert solwyn.RunStoppedError is exceptions.RunStoppedError
-    assert issubclass(solwyn.RunStoppedError, solwyn.BudgetExceededError)
+    assert issubclass(solwyn.RunStoppedError, solwyn.SolwynError)
+    assert not issubclass(solwyn.RunStoppedError, solwyn.BudgetExceededError)
 
 
 @pytest.mark.unit
