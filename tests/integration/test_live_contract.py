@@ -30,6 +30,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -136,6 +137,50 @@ def test_metadata_ingest_accepts_parent_agent_run_id(
             "/api/v1/metadata/ingest",
             json=[event.model_dump(mode="json")],
             headers={"Authorization": f"Bearer {test_credentials.api_key}"},
+        )
+
+    response.raise_for_status()
+    assert response.status_code == 202
+    assert response.json() == {"ingested": 1, "rejected": []}
+
+
+@pytest.mark.integration
+def test_local_metadata_ingest_accepts_complete_denial_receipt(api_url: str) -> None:
+    """Pin C-1 without ever writing receipt fixtures to a remote control plane."""
+    host = urlparse(api_url).hostname
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        pytest.skip("denial-receipt live contract requires an explicitly local Core C-1 API")
+    credentials = provision_project(
+        api_url,
+        name="sdk-denial-receipt-contract",
+        budget_limit=100.0,
+        budget_mode="alert_only",
+    )
+    event = MetadataEvent(
+        model="gpt-5.5",
+        provider=ProviderName.OPENAI,
+        input_tokens=10,
+        output_tokens=0,
+        latency_ms=0.0,
+        status="budget_denied",
+        is_model_fallback=False,
+        sdk_instance_id=uuid.uuid4().hex,
+        timestamp=datetime.now(UTC),
+        agent_run_id=f"run-{uuid.uuid4().hex[:12]}",
+        call_id=str(uuid.uuid4()),
+        deny_source="sticky_replay",
+        deny_reason="monthly",
+        denied_by_period="monthly",
+        estimated_output_bound=512,
+        velocity_flags=["repeat_size", "monotonic_growth"],
+        receipt_aggregate_count=3,
+    )
+
+    with httpx.Client(base_url=credentials.api_url, timeout=10) as http:
+        response = http.post(
+            "/api/v1/metadata/ingest",
+            json=[event.model_dump(mode="json")],
+            headers={"Authorization": f"Bearer {credentials.api_key}"},
         )
 
     response.raise_for_status()

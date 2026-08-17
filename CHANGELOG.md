@@ -123,6 +123,9 @@ derived from git tags (hatch-vcs).
   monotonic-growth are deny-eligible; rate acceleration remains advisory.
   State contains scalar token counts, timestamps, and structural identifiers
   only, with 128×64 detailed history and fixed-memory conservative suppression.
+- **Denied-call receipts carry structural attribution.** `deny_source`,
+  `deny_reason`, `denied_by_period`, `estimated_output_bound`, `velocity_flags`,
+  and `receipt_aggregate_count` are optional, content-free metadata fields.
 
 ### Changed
 

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 from types import NoneType, SimpleNamespace
 from typing import Any, get_args
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -60,6 +61,7 @@ from solwyn.client import AsyncSolwyn, Solwyn
 
 # The name of THIS contract-snapshot test module, surfaced in the report.
 CONTRACT_SNAPSHOT_TEST = "tests/unit/test_contract_snapshot.py"
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 # ── EXACT expected field sets (the pinned contract) ──────────────────────────
@@ -240,6 +242,12 @@ EXPECTED_METADATA_FIELDS = {
     "possibly_succeeded",
     "provider_region",
     "tags",
+    "deny_source",
+    "deny_reason",
+    "denied_by_period",
+    "estimated_output_bound",
+    "velocity_flags",
+    "receipt_aggregate_count",
 }
 
 
@@ -333,6 +341,39 @@ class TestWireModelFieldSets:
 
     def test_media_usage_field_set(self) -> None:
         assert set(MediaUsage.model_fields) == EXPECTED_MEDIA_USAGE_FIELDS
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "image_count",
+            "generation_count",
+            "video_seconds",
+            "audio_seconds",
+            "input_characters",
+        ],
+    )
+    def test_media_usage_quantities_share_the_100m_wire_ceiling(self, field: str) -> None:
+        boundary = 100_000_000.0 if field.endswith("seconds") else 100_000_000
+        above = 100_000_000.5 if field.endswith("seconds") else 100_000_001
+
+        usage = MediaUsage(**{field: boundary})
+        dumped = usage.model_dump(mode="json", exclude_none=True)
+        assert dumped[field] == boundary
+        assert MediaUsage.model_validate(dumped) == usage
+        assert MediaUsage.model_json_schema()["properties"][field]["anyOf"][0]["maximum"] == (
+            100_000_000
+        )
+
+        with pytest.raises(ValidationError):
+            MediaUsage(**{field: above})
+
+    @pytest.mark.parametrize("field", ["video_seconds", "audio_seconds"])
+    @pytest.mark.parametrize("value", [float("inf"), float("nan")])
+    def test_media_usage_duration_rejects_non_finite_quantity(
+        self, field: str, value: float
+    ) -> None:
+        with pytest.raises(ValidationError):
+            MediaUsage(**{field: value})
 
     def test_breaker_state_report_field_set(self) -> None:
         assert set(BreakerStateReport.model_fields) == EXPECTED_BREAKER_STATE_REPORT_FIELDS
@@ -614,6 +655,127 @@ class TestWireModelDumpSnapshots:
         assert "tags" not in _metadata_event().model_dump(mode="json")
         dumped = _metadata_event(tags={"team": "research"}).model_dump(mode="json")
         assert dumped["tags"] == {"team": "research"}
+
+    def test_metadata_denial_receipts_are_none_skipped_and_round_trip(self) -> None:
+        legacy = _metadata_event().model_dump(mode="json")
+        assert (
+            not {
+                "deny_source",
+                "deny_reason",
+                "denied_by_period",
+                "estimated_output_bound",
+                "velocity_flags",
+                "receipt_aggregate_count",
+            }
+            & legacy.keys()
+        )
+
+        populated = _metadata_event(
+            status=CallStatus.BUDGET_DENIED,
+            deny_source="local_velocity",
+            deny_reason="velocity:repeat_size",
+            denied_by_period="agent_run",
+            estimated_output_bound=512,
+            velocity_flags=["repeat_size", "monotonic_growth", "rate_acceleration"],
+            receipt_aggregate_count=3,
+        )
+        dumped = populated.model_dump(mode="json")
+
+        assert dumped["deny_source"] == "local_velocity"
+        assert dumped["deny_reason"] == "velocity:repeat_size"
+        assert dumped["denied_by_period"] == "agent_run"
+        assert dumped["estimated_output_bound"] == 512
+        assert dumped["velocity_flags"] == [
+            "repeat_size",
+            "monotonic_growth",
+            "rate_acceleration",
+        ]
+        assert dumped["receipt_aggregate_count"] == 3
+        assert MetadataEvent.model_validate(dumped) == populated
+
+    def test_public_docs_enumerate_all_denial_receipt_fields(self) -> None:
+        readme = (_PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        transparency = readme.split("## Data Transparency", 1)[1].split(
+            "## Release Compatibility", 1
+        )[0]
+        changelog = (_PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+
+        for field in (
+            "deny_source",
+            "deny_reason",
+            "denied_by_period",
+            "estimated_output_bound",
+            "velocity_flags",
+            "receipt_aggregate_count",
+        ):
+            assert f"`{field}`" in transparency
+            assert f"`{field}`" in unreleased
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("deny_source", "not-a-source"),
+            ("deny_reason", "x" * 65),
+            ("denied_by_period", "x" * 33),
+            ("estimated_output_bound", -1),
+            ("estimated_output_bound", 100_000_001),
+            ("velocity_flags", ["growth_rate"]),
+            ("velocity_flags", ["x" * 33]),
+            ("velocity_flags", [str(index) for index in range(9)]),
+            ("receipt_aggregate_count", 0),
+            ("receipt_aggregate_count", 100_000_001),
+        ],
+    )
+    def test_metadata_denial_receipt_constraints(self, field: str, value: object) -> None:
+        with pytest.raises(ValidationError):
+            _metadata_event(**{field: value})
+
+    def test_metadata_denial_receipt_boundary_values_and_sources(self) -> None:
+        sources = (
+            "server",
+            "sticky_replay",
+            "local_enforcement",
+            "lease_exhausted",
+            "local_velocity",
+            "run_terminated",
+            "aggregate_replay",
+        )
+
+        for source in sources:
+            assert _metadata_event(deny_source=source).deny_source == source
+        boundary = _metadata_event(
+            deny_reason="r" * 64,
+            denied_by_period="p" * 32,
+            estimated_output_bound=0,
+            velocity_flags=["repeat_size", "monotonic_growth", "rate_acceleration"],
+            receipt_aggregate_count=100_000_000,
+        )
+        assert len(boundary.deny_reason or "") == 64
+        assert len(boundary.denied_by_period or "") == 32
+        assert boundary.estimated_output_bound == 0
+        assert boundary.velocity_flags == [
+            "repeat_size",
+            "monotonic_growth",
+            "rate_acceleration",
+        ]
+        assert boundary.receipt_aggregate_count == 100_000_000
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "input_tokens",
+            "output_tokens",
+            "estimated_output_bound",
+            "receipt_aggregate_count",
+        ],
+    )
+    def test_metadata_receipt_quantities_share_the_100m_wire_ceiling(self, field: str) -> None:
+        kwargs: dict[str, object] = {field: 100_000_000}
+        event = _metadata_event(**kwargs)
+        assert getattr(event, field) == 100_000_000
+        with pytest.raises(ValidationError):
+            _metadata_event(**{field: 100_000_001})
 
     def test_token_details_default_dump_omits_is_estimated(self) -> None:
         # Provider-reported (non-estimated) counts: is_estimated stays OFF the

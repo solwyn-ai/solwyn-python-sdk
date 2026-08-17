@@ -114,10 +114,18 @@ def _allow_budget_result() -> SimpleNamespace:
         reservation_id=None,
         project_id=VALID_PROJECT_ID,
         price_hints=None,
+        deny_source=None,
+        deny_reason=None,
+        denied_by_period=None,
     )
 
 
-def _deny_budget_result(denied_by_period: str | None) -> SimpleNamespace:
+def _deny_budget_result(
+    denied_by_period: str | None,
+    *,
+    deny_source: str = "server",
+    deny_reason: str | None = None,
+) -> SimpleNamespace:
     """Minimal hard-deny result for client exception-plumbing tests."""
     return SimpleNamespace(
         allowed=False,
@@ -128,6 +136,8 @@ def _deny_budget_result(denied_by_period: str | None) -> SimpleNamespace:
         budget_limit=10.0,
         current_usage=10.0,
         denied_by_period=denied_by_period,
+        deny_source=deny_source,
+        deny_reason=deny_reason if deny_reason is not None else denied_by_period,
         mode=BudgetMode.HARD_DENY,
     )
 
@@ -530,7 +540,10 @@ class TestBudgetCheckBeforeCall:
         assert solwyn._solwyn_budget.check_budget.call_count == 2
         assert client.chat.completions.create.call_count == 1
         assert run_termination(run_id) is None
-        assert len(_budget_denied_events(solwyn._solwyn_reporter)) == 1
+        denied = _budget_denied_events(solwyn._solwyn_reporter)
+        assert len(denied) == 1
+        assert denied[0].deny_source == "run_terminated"
+        assert denied[0].deny_reason == "run_stopped"
         solwyn.close()
 
     @pytest.mark.parametrize(
@@ -646,6 +659,46 @@ class TestBudgetCheckBeforeCall:
         solwyn._solwyn_reporter._http.close()
         solwyn._solwyn_budget._http.close()
 
+    @pytest.mark.parametrize(
+        ("deny_source", "deny_reason", "denied_by_period"),
+        [
+            ("sticky_replay", "monthly", "monthly"),
+            ("local_enforcement", "no_prior_budget_limit", None),
+            ("lease_exhausted", "lease_share_exhausted", "agent_run"),
+        ],
+    )
+    def test_budget_result_receipt_attribution_reaches_denied_event(
+        self,
+        deny_source: str,
+        deny_reason: str,
+        denied_by_period: str | None,
+    ) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
+        result = _deny_budget_result(
+            denied_by_period,
+            deny_source=deny_source,
+            deny_reason=deny_reason,
+        )
+
+        with (
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=result) as check,
+            patch.object(solwyn._solwyn_reporter, "report") as report,
+            pytest.raises(BudgetExceededError),
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+
+        event = report.call_args.args[0]
+        assert event.deny_source == deny_source
+        assert event.deny_reason == deny_reason
+        assert event.denied_by_period == denied_by_period
+        assert event.estimated_output_bound == check.call_args.kwargs["estimated_output_bound"]
+        client.chat.completions.create.assert_not_called()
+        solwyn.close()
+
     def test_budget_denied_event_tags_agent_run_id(self) -> None:
         client, _ = _mock_openai_client()
         solwyn = _make_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
@@ -687,6 +740,10 @@ class TestBudgetCheckBeforeCall:
         assert event.status == "budget_denied"
         assert event.agent_run_id == run_id
         assert event.agent_run_name == "expensive-job"
+        assert event.deny_source == "server"
+        assert event.deny_reason == "agent_run"
+        assert event.denied_by_period == "agent_run"
+        assert event.estimated_output_bound == solwyn._solwyn_config.lease_output_bound_default
         assert mock_post.call_args.kwargs["json"]["agent_run_id"] == run_id
         client.chat.completions.create.assert_not_called()
 
@@ -2099,6 +2156,9 @@ class TestAsyncNonStreamingInterception:
             mode=BudgetMode.HARD_DENY,
             reservation_id=None,
             price_hints=None,
+            deny_source="server",
+            deny_reason="monthly",
+            denied_by_period="monthly",
         )
 
         with patch.object(
@@ -2119,6 +2179,13 @@ class TestAsyncNonStreamingInterception:
         assert reported_events[0].status == "budget_denied"
         assert reported_events[0].agent_run_id == run_id
         assert reported_events[0].agent_run_name == "async-expensive-job"
+        assert reported_events[0].deny_source == "server"
+        assert reported_events[0].deny_reason == "monthly"
+        assert reported_events[0].denied_by_period == "monthly"
+        assert (
+            reported_events[0].estimated_output_bound
+            == check.call_args.kwargs["estimated_output_bound"]
+        )
 
         await solwyn._solwyn_budget._http.aclose()
         await solwyn._solwyn_reporter._http.aclose()
@@ -2384,6 +2451,10 @@ class TestVelocityWiring:
         client.chat.completions.create.assert_not_called()
         denied = _budget_denied_events(solwyn._solwyn_reporter)
         assert len(denied) == 1
+        assert denied[0].deny_source == "local_velocity"
+        assert denied[0].deny_reason == "velocity:repeat_size"
+        assert denied[0].velocity_flags == ["repeat_size"]
+        assert denied[0].estimated_output_bound == solwyn._solwyn_config.lease_output_bound_default
         assert denied[0].requested_provider is None
         assert denied[0].requested_model is None
         solwyn.close()
@@ -2424,6 +2495,17 @@ class TestVelocityWiring:
         assert client.chat.completions.create.call_count == provider_calls_after_fifth == 4
         denied_events = _budget_denied_events(solwyn._solwyn_reporter)
         assert len(denied_events) == 2
+        assert [event.deny_source for event in denied_events] == [
+            "local_velocity",
+            "run_terminated",
+        ]
+        assert denied_events[0].velocity_flags == ["repeat_size"]
+        assert denied_events[1].velocity_flags is None
+        assert all(event.deny_reason == "velocity:repeat_size" for event in denied_events)
+        assert all(
+            event.estimated_output_bound == solwyn._solwyn_config.lease_output_bound_default
+            for event in denied_events
+        )
         assert all(event.agent_run_id == run_id for event in denied_events)
         assert all(event.model == "gpt-5.5" for event in denied_events)
         assert all(event.provider == "openai" for event in denied_events)
@@ -2496,6 +2578,13 @@ class TestVelocityWiring:
         assert run_termination(run_id) is None
         solwyn._solwyn_budget.check_budget.assert_called_once()
         client.chat.completions.create.assert_called_once()
+        success = [
+            call.args[0]
+            for call in solwyn._solwyn_reporter.report.call_args_list
+            if call.args[0].status == "success"
+        ]
+        assert len(success) == 1
+        assert success[0].velocity_flags == ["rate_acceleration"]
         solwyn.close()
 
     def test_sync_media_velocity_deny_and_subsequent_pre_gate(self) -> None:
@@ -2697,6 +2786,17 @@ async def test_async_deny_mode_stops_fifth_repeat_and_pre_gates_subsequent_call(
     assert client.chat.completions.create.call_count == provider_calls_after_fifth == 4
     denied_events = _budget_denied_events(solwyn._solwyn_reporter)
     assert len(denied_events) == 2
+    assert [event.deny_source for event in denied_events] == [
+        "local_velocity",
+        "run_terminated",
+    ]
+    assert denied_events[0].velocity_flags == ["repeat_size"]
+    assert denied_events[1].velocity_flags is None
+    assert all(event.deny_reason == "velocity:repeat_size" for event in denied_events)
+    assert all(
+        event.estimated_output_bound == solwyn._solwyn_config.lease_output_bound_default
+        for event in denied_events
+    )
     assert all(event.requested_provider is None for event in denied_events)
     assert all(event.requested_model is None for event in denied_events)
     await solwyn._solwyn_budget._http.aclose()
@@ -2785,6 +2885,10 @@ async def test_async_server_entry_with_velocity_flag_checks_then_denies_locally(
     client.chat.completions.create.assert_not_awaited()
     denied = _budget_denied_events(solwyn._solwyn_reporter)
     assert len(denied) == 1
+    assert denied[0].deny_source == "local_velocity"
+    assert denied[0].deny_reason == "velocity:repeat_size"
+    assert denied[0].velocity_flags == ["repeat_size"]
+    assert denied[0].estimated_output_bound == solwyn._solwyn_config.lease_output_bound_default
     assert denied[0].requested_provider is None
     assert denied[0].requested_model is None
     await solwyn._solwyn_budget._http.aclose()
