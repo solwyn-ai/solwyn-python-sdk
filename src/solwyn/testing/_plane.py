@@ -6,6 +6,7 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
@@ -57,11 +58,29 @@ _LEASE_PATHS = frozenset(
         "/api/v1/budgets/lease/surrender",
     }
 )
+_RESERVED_WRAP_KWARGS = ("api_key", "api_url", "control_plane_transport")
 
 
 def _validate_magic_model(model: object) -> None:
     if isinstance(model, str) and model.startswith("solwyn-test/") and model not in MAGIC_MODELS:
         raise RuntimeError(f"unknown solwyn testing magic model: {model!r}")
+
+
+def _reject_reserved_wrap_kwargs(kwargs: dict[str, Any]) -> None:
+    supplied = [key for key in _RESERVED_WRAP_KWARGS if key in kwargs]
+    if supplied:
+        joined = ", ".join(supplied)
+        raise TypeError(f"reserved control-plane wiring cannot be overridden: {joined}")
+
+
+def _metadata_legacy_identity(event: MetadataEvent) -> tuple[datetime, str]:
+    timestamp = event.timestamp
+    normalized = (
+        timestamp.replace(tzinfo=UTC)
+        if timestamp.utcoffset() is None
+        else timestamp.astimezone(UTC)
+    )
+    return normalized, event.sdk_instance_id
 
 
 class _TestingSolwyn(Solwyn):
@@ -212,6 +231,9 @@ class FakeControlPlane:
         self._active_reservations: set[str] = set()
         self._settled_reservations: set[str] = set()
         self._seen_call_ids: set[str] = set()
+        self._seen_ingest_identities: set[tuple[str, int]] = set()
+        self._seen_ingest_legacy_identities: set[tuple[datetime, str]] = set()
+        self._last_untracked_report_ids: dict[tuple[str, str, str, str], str] = {}
         self._leases: dict[tuple[str, str], _LeaseRecord] = {}
         self._lease_records: dict[str, _LeaseRecord] = {}
         self._expired_leases: set[str] = set()
@@ -285,9 +307,11 @@ class FakeControlPlane:
     def wrap(self, provider_client: object, **solwyn_kwargs: Any) -> Solwyn:
         """Return a synchronous ``Solwyn`` using this plane's zero-network transport.
 
-        Keyword arguments are normal ``Solwyn`` configuration overrides;
-        provider calls remain the caller's responsibility to mock or serve.
+        Ordinary ``Solwyn`` configuration keyword arguments override testing
+        defaults. ``api_key``, ``api_url``, and ``control_plane_transport`` are
+        reserved so the returned client cannot bypass this plane.
         """
+        _reject_reserved_wrap_kwargs(solwyn_kwargs)
         options: dict[str, Any] = {
             "api_key": self.api_key,
             "api_url": self.api_url,
@@ -300,9 +324,12 @@ class FakeControlPlane:
     def wrap_async(self, provider_client: object, **solwyn_kwargs: Any) -> AsyncSolwyn:
         """Return an ``AsyncSolwyn`` using this plane's zero-network transport.
 
-        Keyword arguments are normal ``AsyncSolwyn`` configuration overrides;
-        provider calls remain the caller's responsibility to mock or serve.
+        Ordinary ``AsyncSolwyn`` configuration keyword arguments override
+        testing defaults. ``api_key``, ``api_url``, and
+        ``control_plane_transport`` are reserved so the returned client cannot
+        bypass this plane.
         """
+        _reject_reserved_wrap_kwargs(solwyn_kwargs)
         options: dict[str, Any] = {
             "api_key": self.api_key,
             "api_url": self.api_url,
@@ -524,7 +551,11 @@ class FakeControlPlane:
                 "Active lease holder limit exceeded",
             )
 
-        denied_by_period = self._denial_period(parsed.agent_run_id, parsed.model)
+        denied_by_period, trigger_model, ineligible = self._evaluate_chain(
+            parsed.agent_run_id,
+            (parsed.model, *parsed.fallback_models),
+            lease=True,
+        )
         if denied_by_period is not None:
             return PlaneResponse(
                 200,
@@ -534,16 +565,13 @@ class FakeControlPlane:
                     denied_by_period=denied_by_period,
                     mode=(
                         BudgetMode.ALERT_ONLY
-                        if parsed.model == "solwyn-test/deny-alert"
+                        if trigger_model == "solwyn-test/deny-alert"
                         else self.mode
                     ),
                 ),
                 model_only=True,
             )
-        if not self.lease_eligible or parsed.model in {
-            "solwyn-test/lease-ineligible",
-            _LIVE_CONTRACT_UNPRICED_LEASE_MODEL,
-        }:
+        if ineligible:
             return PlaneResponse(
                 200,
                 self._lease_verdict_response(
@@ -572,6 +600,7 @@ class FakeControlPlane:
         if isinstance(parsed, PlaneResponse):
             return parsed
         renewal_pairs = self._renewal_declared_pairs(parsed)
+        normalized_request = self._normalized_renewal_request(parsed, renewal_pairs)
         for _, fallback_model in renewal_pairs:
             _validate_magic_model(fallback_model)
 
@@ -583,7 +612,7 @@ class FakeControlPlane:
             or record.lease_id in self._released_leases
         ):
             return self._lease_error(404, "lease_not_found", "Budget lease not found")
-        if record.last_renewal_request == parsed:
+        if record.last_renewal_request == normalized_request:
             return self._replay_lease_response(record)
         if record.terminal_successor:
             return self._lease_error(
@@ -598,8 +627,12 @@ class FakeControlPlane:
                 "Budget lease generation conflict",
             )
 
-        effective_model = renewal_pairs[0][1] if renewal_pairs else record.declared_pairs[0][1]
-        denied_by_period = self._denial_period(record.agent_run_id, effective_model)
+        effective_pairs = renewal_pairs if renewal_pairs else record.declared_pairs
+        denied_by_period, trigger_model, ineligible = self._evaluate_chain(
+            record.agent_run_id,
+            tuple(model for _, model in effective_pairs),
+            lease=True,
+        )
         if denied_by_period is not None:
             response = self._lease_verdict_response(
                 eligible=True,
@@ -607,7 +640,7 @@ class FakeControlPlane:
                 denied_by_period=denied_by_period,
                 mode=(
                     BudgetMode.ALERT_ONLY
-                    if effective_model == "solwyn-test/deny-alert"
+                    if trigger_model == "solwyn-test/deny-alert"
                     else self.mode
                 ),
             )
@@ -615,13 +648,10 @@ class FakeControlPlane:
             return self._store_lease_response(
                 record,
                 response,
-                renewal_request=parsed,
+                renewal_request=normalized_request,
                 terminal_successor=True,
             )
-        if not self.lease_eligible or effective_model in {
-            "solwyn-test/lease-ineligible",
-            _LIVE_CONTRACT_UNPRICED_LEASE_MODEL,
-        }:
+        if ineligible:
             response = self._lease_verdict_response(
                 eligible=False,
                 allowed=True,
@@ -631,7 +661,7 @@ class FakeControlPlane:
             return self._store_lease_response(
                 record,
                 response,
-                renewal_request=parsed,
+                renewal_request=normalized_request,
                 terminal_successor=True,
             )
 
@@ -643,7 +673,7 @@ class FakeControlPlane:
         return self._store_lease_response(
             record,
             self._lease_response(record),
-            renewal_request=parsed,
+            renewal_request=normalized_request,
         )
 
     def _handle_lease_surrender(self, body: object) -> PlaneResponse:
@@ -681,9 +711,11 @@ class FakeControlPlane:
     def _grant_declared_pairs(
         request: LeaseGrantRequest,
     ) -> tuple[tuple[ProviderName, str], ...]:
-        return (
-            (request.provider, request.model),
-            *zip(request.fallback_providers, request.fallback_models, strict=True),
+        return FakeControlPlane._normalize_declared_pairs(
+            (
+                (request.provider, request.model),
+                *zip(request.fallback_providers, request.fallback_models, strict=True),
+            )
         )
 
     @staticmethod
@@ -692,9 +724,35 @@ class FakeControlPlane:
     ) -> tuple[tuple[ProviderName, str], ...]:
         if request.model is None or request.provider is None:
             return ()
-        return (
-            (request.provider, request.model),
-            *zip(request.fallback_providers, request.fallback_models, strict=True),
+        return FakeControlPlane._normalize_declared_pairs(
+            (
+                (request.provider, request.model),
+                *zip(request.fallback_providers, request.fallback_models, strict=True),
+            )
+        )
+
+    @staticmethod
+    def _normalize_declared_pairs(
+        pairs: tuple[tuple[ProviderName, str], ...],
+    ) -> tuple[tuple[ProviderName, str], ...]:
+        return tuple(dict.fromkeys(pairs))
+
+    @staticmethod
+    def _normalized_renewal_request(
+        request: LeaseRenewRequest,
+        declared_pairs: tuple[tuple[ProviderName, str], ...],
+    ) -> LeaseRenewRequest:
+        if not declared_pairs:
+            return request.model_copy(deep=True)
+        primary, *fallbacks = declared_pairs
+        return request.model_copy(
+            update={
+                "provider": primary[0],
+                "model": primary[1],
+                "fallback_providers": [provider for provider, _ in fallbacks],
+                "fallback_models": [model for _, model in fallbacks],
+            },
+            deep=True,
         )
 
     @staticmethod
@@ -702,11 +760,7 @@ class FakeControlPlane:
         current: tuple[tuple[ProviderName, str], ...],
         additions: tuple[tuple[ProviderName, str], ...],
     ) -> tuple[tuple[ProviderName, str], ...]:
-        widened = list(current)
-        for pair in additions:
-            if pair not in widened:
-                widened.append(pair)
-        return tuple(widened)
+        return FakeControlPlane._normalize_declared_pairs((*current, *additions))
 
     @staticmethod
     def _lease_error(status: int, code: str, message: str) -> PlaneResponse:
@@ -854,9 +908,13 @@ class FakeControlPlane:
             _validate_magic_model(fallback_model)
 
         self.checks.append(parsed)
-        denied_by_period = self._denial_period(parsed.agent_run_id, parsed.model)
+        denied_by_period, trigger_model, _ = self._evaluate_chain(
+            parsed.agent_run_id,
+            (parsed.model, *parsed.fallback_models),
+            lease=False,
+        )
         response_mode = (
-            BudgetMode.ALERT_ONLY if parsed.model == "solwyn-test/deny-alert" else self.mode
+            BudgetMode.ALERT_ONLY if trigger_model == "solwyn-test/deny-alert" else self.mode
         )
         self._reservation_counter += 1
         reservation_id = f"res_fake_{self._reservation_counter:08d}"
@@ -919,8 +977,20 @@ class FakeControlPlane:
         parsed = parse_model_list(MetadataEvent, body)
         if isinstance(parsed, PlaneResponse):
             return parsed
-        self.ingested.extend(parsed)
-        return PlaneResponse(202, {"ingested": len(parsed), "rejected": []})
+        newly_ingested: list[MetadataEvent] = []
+        for event in parsed:
+            identity = (event.call_id, event.attempt_index)
+            legacy_identity = _metadata_legacy_identity(event)
+            if (
+                identity in self._seen_ingest_identities
+                or legacy_identity in self._seen_ingest_legacy_identities
+            ):
+                continue
+            self._seen_ingest_identities.add(identity)
+            self._seen_ingest_legacy_identities.add(legacy_identity)
+            newly_ingested.append(event)
+        self.ingested.extend(newly_ingested)
+        return PlaneResponse(202, {"ingested": len(newly_ingested), "rejected": []})
 
     def _handle_untracked(self, body: object) -> PlaneResponse:
         if isinstance(body, list) and len(body) > 100:
@@ -931,7 +1001,17 @@ class FakeControlPlane:
         parsed = parse_model_list(UntrackedSurfaceReport, body)
         if isinstance(parsed, PlaneResponse):
             return parsed
-        self.untracked_reports.extend(parsed)
+        for report in parsed:
+            observation_key = (
+                report.provider.value,
+                report.client_shape,
+                report.mode,
+                report.surface,
+            )
+            if self._last_untracked_report_ids.get(observation_key) == report.report_id:
+                continue
+            self._last_untracked_report_ids[observation_key] = report.report_id
+            self.untracked_reports.append(report)
         return PlaneResponse(202, {"accepted": len(parsed)})
 
     def _handle_breaker_report(self, body: object) -> PlaneResponse:
@@ -941,23 +1021,41 @@ class FakeControlPlane:
         self.breaker_reports.append(parsed.model_dump(mode="json"))
         return PlaneResponse(204)
 
-    def _denial_period(self, agent_run_id: str | None, model: str) -> str | None:
+    def _evaluate_chain(
+        self,
+        agent_run_id: str | None,
+        models: tuple[str, ...],
+        *,
+        lease: bool,
+    ) -> tuple[str | None, str | None, bool]:
+        """Evaluate one request's ordered model chain exactly once.
+
+        Programmatic request/run denials take precedence. After that, the first
+        applicable magic trigger wins; lease-only ineligibility triggers are
+        transparent to legacy per-call checks.
+        """
         if self._pending_denials:
-            return self._pending_denials.popleft()
+            return self._pending_denials.popleft(), None, False
         if agent_run_id in self._denied_runs:
-            return "agent_run"
+            return "agent_run", None, False
         magic_periods = {
             "solwyn-test/deny": "monthly",
             "solwyn-test/deny-alert": "monthly",
             "solwyn-test/deny-tag": "tag",
             "solwyn-test/deny-stopped": "run_stopped",
         }
-        magic_period = magic_periods.get(model)
-        if magic_period is not None:
-            return magic_period
-        if model == "solwyn-test/runaway":
-            run_id = agent_run_id
-            if run_id in self._runaway_seen:
-                return "agent_run"
-            self._runaway_seen.add(run_id)
-        return None
+        for model in models:
+            magic_period = magic_periods.get(model)
+            if magic_period is not None:
+                return magic_period, model, False
+            if model == "solwyn-test/runaway":
+                if agent_run_id in self._runaway_seen:
+                    return "agent_run", model, False
+                self._runaway_seen.add(agent_run_id)
+                return None, model, False
+            if lease and model in {
+                "solwyn-test/lease-ineligible",
+                _LIVE_CONTRACT_UNPRICED_LEASE_MODEL,
+            }:
+                return None, model, True
+        return None, None, lease and not self.lease_eligible

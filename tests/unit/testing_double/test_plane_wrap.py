@@ -140,6 +140,32 @@ def test_wrap_allows_callers_to_override_wrapper_defaults() -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("reserved_key", "reserved_value"),
+    [
+        ("api_key", None),
+        ("api_url", "http://alternate-control-plane.invalid"),
+        (
+            "control_plane_transport",
+            httpx.MockTransport(lambda _request: pytest.fail("alternate transport called")),
+        ),
+    ],
+)
+def test_wrap_rejects_reserved_control_plane_wiring_before_construction(
+    reserved_key: str,
+    reserved_value: object,
+) -> None:
+    plane = FakeControlPlane()
+    provider = _OpenAIStub()
+
+    with pytest.raises(TypeError, match="reserved control-plane wiring"):
+        plane.wrap(provider, **{reserved_key: reserved_value})
+
+    assert provider.chat.completions.calls == 0
+    assert plane.checks == []
+
+
+@pytest.mark.unit
 async def test_wrap_async_uses_the_dual_transport_and_same_defaults() -> None:
     plane = FakeControlPlane()
 
@@ -150,6 +176,32 @@ async def test_wrap_async_uses_the_dual_transport_and_same_defaults() -> None:
     assert wrapped._config.budget_check_cache_ttl == 0
     assert wrapped._config.lease_enabled is True
     await wrapped.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("reserved_key", "reserved_value"),
+    [
+        ("api_key", None),
+        ("api_url", "http://alternate-control-plane.invalid"),
+        (
+            "control_plane_transport",
+            httpx.MockTransport(lambda _request: pytest.fail("alternate transport called")),
+        ),
+    ],
+)
+async def test_wrap_async_rejects_reserved_control_plane_wiring_before_construction(
+    reserved_key: str,
+    reserved_value: object,
+) -> None:
+    plane = FakeControlPlane()
+    provider = _AsyncOpenAIStub()
+
+    with pytest.raises(TypeError, match="reserved control-plane wiring"):
+        plane.wrap_async(provider, **{reserved_key: reserved_value})
+
+    assert provider.chat.completions.calls == 0
+    assert plane.checks == []
 
 
 @pytest.mark.unit
@@ -290,6 +342,52 @@ async def test_unknown_magic_fallback_fails_before_any_async_provider_dispatch()
     assert primary.chat.completions.calls == 0
     assert fallback.chat.completions.calls == 0
     assert plane.checks == []
+
+
+@pytest.mark.unit
+def test_magic_fallback_denies_sync_wrapper_before_any_provider_dispatch() -> None:
+    plane = FakeControlPlane()
+    primary = _OpenAIStub(_Status429("primary unavailable"))
+    fallback = _OpenAIStub()
+    wrapped = plane.wrap(
+        primary,
+        model="gpt-5.5",
+        fallback=[(fallback, "solwyn-test/deny-tag")],
+        lease_enabled=False,
+    )
+
+    try:
+        with pytest.raises(BudgetExceededError) as captured:
+            wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+    finally:
+        wrapped.close()
+
+    assert captured.value.budget_period == "tag"
+    assert primary.chat.completions.calls == 0
+    assert fallback.chat.completions.calls == 0
+
+
+@pytest.mark.unit
+async def test_magic_fallback_denies_async_wrapper_before_any_provider_dispatch() -> None:
+    plane = FakeControlPlane()
+    primary = _AsyncOpenAIStub(_Status429("primary unavailable"))
+    fallback = _AsyncOpenAIStub()
+    wrapped = plane.wrap_async(
+        primary,
+        model="gpt-5.5",
+        fallback=[(fallback, "solwyn-test/deny-stopped")],
+        lease_enabled=False,
+    )
+
+    try:
+        with pytest.raises(BudgetExceededError) as captured:
+            await wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+    finally:
+        await wrapped.close()
+
+    assert captured.value.budget_period == "run_stopped"
+    assert primary.chat.completions.calls == 0
+    assert fallback.chat.completions.calls == 0
 
 
 @pytest.mark.unit

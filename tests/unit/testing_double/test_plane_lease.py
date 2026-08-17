@@ -347,6 +347,84 @@ def test_active_same_holder_grant_replays_current_lease_and_fences_declaration_c
 
 
 @pytest.mark.unit
+def test_duplicate_grant_pairs_replay_as_the_same_ordered_declaration() -> None:
+    plane = FakeControlPlane()
+    duplicated = _grant_payload(
+        fallback_providers=[
+            ProviderName.OPENAI,
+            ProviderName.ANTHROPIC,
+            ProviderName.ANTHROPIC,
+            ProviderName.GOOGLE,
+        ],
+        fallback_models=[
+            "gpt-5.5",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4-5",
+            "gemini-2.5-pro",
+        ],
+    )
+    normalized = _grant_payload(
+        fallback_providers=[ProviderName.ANTHROPIC, ProviderName.GOOGLE],
+        fallback_models=["claude-sonnet-4-5", "gemini-2.5-pro"],
+    )
+    reordered = _grant_payload(
+        fallback_providers=[ProviderName.GOOGLE, ProviderName.ANTHROPIC],
+        fallback_models=["gemini-2.5-pro", "claude-sonnet-4-5"],
+    )
+
+    with httpx.Client(transport=plane.transport) as client:
+        first = client.post(f"{plane.api_url}/api/v1/budgets/lease", json=duplicated)
+        replay = client.post(f"{plane.api_url}/api/v1/budgets/lease", json=normalized)
+        conflict = client.post(f"{plane.api_url}/api/v1/budgets/lease", json=reordered)
+
+    assert replay.content == first.content
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "lease_holder_cap_exceeded"
+
+
+@pytest.mark.unit
+def test_duplicate_renewal_pairs_replay_as_the_same_request() -> None:
+    plane = FakeControlPlane()
+    with httpx.Client(transport=plane.transport) as client:
+        grant = _post_grant(client, plane).json()
+        duplicated = LeaseRenewRequest(
+            lease_id=grant["lease_id"],
+            holder_id="holder-1",
+            generation=grant["generation"],
+            model="gpt-5.5",
+            provider=ProviderName.OPENAI,
+            fallback_providers=[
+                ProviderName.OPENAI,
+                ProviderName.ANTHROPIC,
+                ProviderName.ANTHROPIC,
+            ],
+            fallback_models=[
+                "gpt-5.5",
+                "claude-sonnet-4-5",
+                "claude-sonnet-4-5",
+            ],
+        )
+        normalized = duplicated.model_copy(
+            update={
+                "fallback_providers": [ProviderName.ANTHROPIC],
+                "fallback_models": ["claude-sonnet-4-5"],
+            }
+        )
+        renewed = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=duplicated.model_dump(mode="json"),
+        )
+        replay = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=normalized.model_dump(mode="json"),
+        )
+
+    assert renewed.status_code == 200
+    assert renewed.json()["generation"] == 2
+    assert replay.content == renewed.content
+
+
+@pytest.mark.unit
 def test_successful_renewal_widens_ordered_declaration_for_grant_replay() -> None:
     plane = FakeControlPlane()
     narrow = _grant_payload()
@@ -765,6 +843,105 @@ def test_magic_lease_denials_match_check_verdicts(
     assert payload["denied_by_period"] == period
     assert payload["mode"] == mode
     assert LEASE_BLOCK_KEYS.isdisjoint(payload)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("fallback_model", "period", "mode"),
+    [
+        ("solwyn-test/deny", "monthly", "hard_deny"),
+        ("solwyn-test/deny-alert", "monthly", "alert_only"),
+        ("solwyn-test/deny-tag", "tag", "hard_deny"),
+        ("solwyn-test/deny-stopped", "run_stopped", "hard_deny"),
+    ],
+)
+def test_magic_fallback_drives_raw_lease_denial(
+    fallback_model: str,
+    period: str,
+    mode: str,
+) -> None:
+    plane = FakeControlPlane()
+
+    with httpx.Client(transport=plane.transport) as client:
+        response = _post_grant(
+            client,
+            plane,
+            fallback_providers=[ProviderName.OPENAI],
+            fallback_models=[fallback_model],
+        )
+
+    assert response.json()["allowed"] is False
+    assert response.json()["denied_by_period"] == period
+    assert response.json()["mode"] == mode
+    assert LEASE_BLOCK_KEYS.isdisjoint(response.json())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "fallback_model",
+    ["solwyn-test/lease-ineligible", "no-such-model-for-leases"],
+)
+def test_fallback_ineligibility_omits_raw_lease_block_and_real_enforcer_uses_legacy(
+    fallback_model: str,
+) -> None:
+    plane = FakeControlPlane()
+    enforcer = _make_enforcer(plane)
+
+    result = enforcer.check_budget(
+        estimated_input_tokens=10,
+        estimated_output_bound=20,
+        model="gpt-5.5",
+        provider="openai",
+        fallback_providers=["openai"],
+        fallback_models=[fallback_model],
+        agent_run_id="run-fallback-ineligible",
+        call_id=str(uuid4()),
+    )
+    enforcer.close()
+
+    assert result.allowed is True
+    assert result.lease_id is None
+    assert len(plane.lease_grants) == 1
+    assert len(plane.checks) == 1
+
+    with httpx.Client(transport=plane.transport) as client:
+        raw = _post_grant(
+            client,
+            plane,
+            run_id=f"raw-{fallback_model}",
+            holder_id=f"raw-{fallback_model}",
+            fallback_providers=[ProviderName.OPENAI],
+            fallback_models=[fallback_model],
+        )
+
+    assert raw.json()["eligible"] is False
+    assert raw.json()["allowed"] is True
+    assert raw.json()["ineligible_reason"] == "zero_rate_model"
+    assert LEASE_BLOCK_KEYS.isdisjoint(raw.json())
+
+
+@pytest.mark.unit
+def test_renewal_fallback_magic_drives_terminal_denial() -> None:
+    plane = FakeControlPlane()
+    with httpx.Client(transport=plane.transport) as client:
+        grant = _post_grant(client, plane).json()
+        renewal = LeaseRenewRequest(
+            lease_id=grant["lease_id"],
+            holder_id="holder-1",
+            generation=grant["generation"],
+            model="gpt-5.5",
+            provider=ProviderName.OPENAI,
+            fallback_providers=[ProviderName.OPENAI],
+            fallback_models=["solwyn-test/deny-tag"],
+        )
+        response = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=renewal.model_dump(mode="json"),
+        )
+
+    assert response.json()["allowed"] is False
+    assert response.json()["denied_by_period"] == "tag"
+    assert LEASE_BLOCK_KEYS.isdisjoint(response.json())
 
 
 @pytest.mark.unit

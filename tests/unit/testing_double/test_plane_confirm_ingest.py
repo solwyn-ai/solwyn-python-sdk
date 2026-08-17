@@ -52,7 +52,7 @@ def _confirm(reservation_id: str, *, label: str = "confirm") -> BudgetConfirmReq
     )
 
 
-def _event(*, label: str = "event") -> MetadataEvent:
+def _event(*, label: str = "event", attempt_index: int = 0) -> MetadataEvent:
     return MetadataEvent(
         model="gpt-5.5",
         provider="openai",
@@ -64,6 +64,7 @@ def _event(*, label: str = "event") -> MetadataEvent:
         sdk_instance_id="sdk-fake",
         timestamp=datetime.now(UTC),
         call_id=_call_id(label),
+        attempt_index=attempt_index,
     )
 
 
@@ -183,6 +184,76 @@ def test_ingest_flattens_validated_events_and_returns_accurate_count() -> None:
 
 
 @pytest.mark.unit
+def test_ingest_replays_and_partial_overlap_skip_existing_call_attempt_identities() -> None:
+    plane = FakeControlPlane()
+    first_batch = [_event(label="dedup-a"), _event(label="dedup-b")]
+    overlapping_batch = [_event(label="dedup-b"), _event(label="dedup-c")]
+
+    with httpx.Client(transport=plane.transport) as client:
+        first = client.post(
+            f"{plane.api_url}/api/v1/metadata/ingest",
+            json=[event.model_dump(mode="json") for event in first_batch],
+        )
+        overlap = client.post(
+            f"{plane.api_url}/api/v1/metadata/ingest",
+            json=[event.model_dump(mode="json") for event in overlapping_batch],
+        )
+        replay = client.post(
+            f"{plane.api_url}/api/v1/metadata/ingest",
+            json=[event.model_dump(mode="json") for event in overlapping_batch],
+        )
+
+    assert first.json() == {"ingested": 2, "rejected": []}
+    assert overlap.json() == {"ingested": 1, "rejected": []}
+    assert replay.json() == {"ingested": 0, "rejected": []}
+    assert [event.call_id for event in plane.ingested] == [
+        _call_id("dedup-a"),
+        _call_id("dedup-b"),
+        _call_id("dedup-c"),
+    ]
+
+
+@pytest.mark.unit
+def test_ingest_attempt_index_is_part_of_the_production_idempotency_key() -> None:
+    plane = FakeControlPlane()
+    attempts = [
+        _event(label="same-call", attempt_index=0),
+        _event(label="same-call", attempt_index=1),
+    ]
+
+    response = plane.handle(
+        "POST",
+        "/api/v1/metadata/ingest",
+        [event.model_dump(mode="json") for event in attempts],
+    )
+
+    assert response.body == {"ingested": 2, "rejected": []}
+    assert plane.ingested == attempts
+
+
+@pytest.mark.unit
+def test_ingest_preserves_core_legacy_timestamp_instance_dedup_surface() -> None:
+    plane = FakeControlPlane()
+    original = _event(label="legacy-original")
+    legacy_collision = original.model_copy(update={"call_id": _call_id("legacy-distinct-call")})
+
+    first = plane.handle(
+        "POST",
+        "/api/v1/metadata/ingest",
+        [original.model_dump(mode="json")],
+    )
+    replay = plane.handle(
+        "POST",
+        "/api/v1/metadata/ingest",
+        [legacy_collision.model_dump(mode="json")],
+    )
+
+    assert first.body == {"ingested": 1, "rejected": []}
+    assert replay.body == {"ingested": 0, "rejected": []}
+    assert plane.ingested == [original]
+
+
+@pytest.mark.unit
 def test_invalid_ingest_event_returns_422_without_partial_recording() -> None:
     plane = FakeControlPlane()
     invalid = _event().model_dump(mode="json")
@@ -219,6 +290,74 @@ def test_untracked_accepts_up_to_100_and_rejects_larger_batches() -> None:
     assert response.json() == {"accepted": 2}
     assert rejected.status_code == 400
     assert plane.untracked_reports == accepted
+
+
+@pytest.mark.unit
+def test_untracked_immediate_report_id_replay_is_not_recorded_twice() -> None:
+    plane = FakeControlPlane()
+    first = _untracked(index=1)
+    newer = _untracked(index=2)
+
+    with httpx.Client(transport=plane.transport) as client:
+        accepted = client.post(
+            f"{plane.api_url}/api/v1/untracked-surfaces",
+            json=[first.model_dump(mode="json")],
+        )
+        replay = client.post(
+            f"{plane.api_url}/api/v1/untracked-surfaces",
+            json=[first.model_dump(mode="json")],
+        )
+        client.post(
+            f"{plane.api_url}/api/v1/untracked-surfaces",
+            json=[newer.model_dump(mode="json")],
+        )
+        older_after_newer = client.post(
+            f"{plane.api_url}/api/v1/untracked-surfaces",
+            json=[first.model_dump(mode="json")],
+        )
+
+    assert accepted.json() == {"accepted": 1}
+    assert replay.json() == {"accepted": 1}
+    assert older_after_newer.json() == {"accepted": 1}
+    assert [report.report_id for report in plane.untracked_reports] == [
+        first.report_id,
+        newer.report_id,
+        first.report_id,
+    ]
+
+
+@pytest.mark.unit
+def test_reset_recording_preserves_ingest_and_untracked_replay_state() -> None:
+    plane = FakeControlPlane()
+    event = _event(label="reset-idempotency")
+    report = _untracked(index=7)
+
+    plane.handle(
+        "POST",
+        "/api/v1/metadata/ingest",
+        [event.model_dump(mode="json")],
+    )
+    plane.handle(
+        "POST",
+        "/api/v1/untracked-surfaces",
+        [report.model_dump(mode="json")],
+    )
+    plane.reset_recording()
+    ingest_replay = plane.handle(
+        "POST",
+        "/api/v1/metadata/ingest",
+        [event.model_dump(mode="json")],
+    )
+    untracked_replay = plane.handle(
+        "POST",
+        "/api/v1/untracked-surfaces",
+        [report.model_dump(mode="json")],
+    )
+
+    assert ingest_replay.body == {"ingested": 0, "rejected": []}
+    assert untracked_replay.body == {"accepted": 1}
+    assert plane.ingested == []
+    assert plane.untracked_reports == []
 
 
 @pytest.mark.unit
@@ -295,6 +434,21 @@ async def test_async_confirm_and_ingest_use_the_same_recording_state() -> None:
 
 
 @pytest.mark.unit
+async def test_async_ingest_retry_returns_zero_without_duplicate_recording() -> None:
+    plane = FakeControlPlane()
+    event = _event(label="async-retry")
+    payload = [event.model_dump(mode="json")]
+
+    async with httpx.AsyncClient(transport=plane.transport) as client:
+        first = await client.post(f"{plane.api_url}/api/v1/metadata/ingest", json=payload)
+        replay = await client.post(f"{plane.api_url}/api/v1/metadata/ingest", json=payload)
+
+    assert first.json() == {"ingested": 1, "rejected": []}
+    assert replay.json() == {"ingested": 0, "rejected": []}
+    assert plane.ingested == [event]
+
+
+@pytest.mark.unit
 def test_recording_is_safe_under_concurrent_check_requests() -> None:
     plane = FakeControlPlane()
 
@@ -311,3 +465,24 @@ def test_recording_is_safe_under_concurrent_check_requests() -> None:
     assert statuses == [200] * 40
     assert len(plane.checks) == 40
     assert len({check.model for check in plane.checks}) == 40
+
+
+@pytest.mark.unit
+def test_concurrent_duplicate_ingest_batches_are_claimed_atomically() -> None:
+    plane = FakeControlPlane()
+    events = [_event(label="concurrent-a"), _event(label="concurrent-b")]
+    payload = [event.model_dump(mode="json") for event in events]
+
+    def send(_index: int) -> int:
+        with httpx.Client(transport=plane.transport) as client:
+            response = client.post(
+                f"{plane.api_url}/api/v1/metadata/ingest",
+                json=payload,
+            )
+        return response.json()["ingested"]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        ingested_counts = list(executor.map(send, range(40)))
+
+    assert sum(ingested_counts) == 2
+    assert plane.ingested == events

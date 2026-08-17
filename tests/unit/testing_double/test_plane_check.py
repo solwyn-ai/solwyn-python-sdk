@@ -135,6 +135,78 @@ def test_unknown_magic_fallback_model_fails_loud_on_the_raw_transport() -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("fallback_models", "expected_period", "expected_mode"),
+    [
+        (["solwyn-test/deny"], "monthly", "hard_deny"),
+        (["solwyn-test/deny-alert"], "monthly", "alert_only"),
+        (["solwyn-test/deny-tag"], "tag", "hard_deny"),
+        (["solwyn-test/deny-stopped"], "run_stopped", "hard_deny"),
+        (
+            ["solwyn-test/deny-alert", "solwyn-test/deny-tag"],
+            "monthly",
+            "alert_only",
+        ),
+    ],
+)
+def test_first_magic_fallback_drives_raw_check_verdict(
+    fallback_models: list[str],
+    expected_period: str,
+    expected_mode: str,
+) -> None:
+    plane = FakeControlPlane()
+
+    response = plane.handle(
+        "POST",
+        "/api/v1/budgets/check",
+        _check_payload(
+            fallback_providers=["openai"] * len(fallback_models),
+            fallback_models=fallback_models,
+        ),
+    )
+
+    assert response.status_code == 200
+    assert response.body.allowed is False
+    assert response.body.denied_by_period == expected_period
+    assert response.body.mode == expected_mode
+
+
+@pytest.mark.unit
+def test_programmatic_denial_precedes_fallback_magic_and_is_consumed_once() -> None:
+    plane = FakeControlPlane()
+    plane.deny_next(period="tag")
+    payload = _check_payload(
+        fallback_providers=["openai"],
+        fallback_models=["solwyn-test/deny-alert"],
+    )
+
+    first = plane.handle("POST", "/api/v1/budgets/check", payload)
+    second = plane.handle("POST", "/api/v1/budgets/check", payload)
+
+    assert first.body.denied_by_period == "tag"
+    assert first.body.mode == "hard_deny"
+    assert second.body.denied_by_period == "monthly"
+    assert second.body.mode == "alert_only"
+
+
+@pytest.mark.unit
+def test_fallback_runaway_memory_is_ordered_and_deterministic() -> None:
+    plane = FakeControlPlane()
+    payload = _check_payload(
+        agent_run_id="run-fallback-runaway",
+        fallback_providers=["openai"],
+        fallback_models=["solwyn-test/runaway"],
+    )
+
+    first = plane.handle("POST", "/api/v1/budgets/check", payload)
+    second = plane.handle("POST", "/api/v1/budgets/check", payload)
+
+    assert first.body.allowed is True
+    assert second.body.allowed is False
+    assert second.body.denied_by_period == "agent_run"
+
+
+@pytest.mark.unit
 def test_unknown_path_is_recorded_and_returns_404() -> None:
     plane = FakeControlPlane(mode=BudgetMode.ALERT_ONLY)
 

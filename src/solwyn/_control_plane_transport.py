@@ -12,6 +12,7 @@ httpx transport interfaces.
 
 from __future__ import annotations
 
+import inspect
 from typing import Protocol, cast
 
 import httpx
@@ -81,10 +82,21 @@ def require_dual_transport(
         getattr(async_handler, "__func__", async_handler)
         is httpx.AsyncBaseTransport.handle_async_request
     )
-    if not has_both_interfaces or uses_sync_stub or uses_async_stub:
+    has_correct_method_shapes = (
+        not inspect.iscoroutinefunction(sync_handler)
+        and not inspect.iscoroutinefunction(getattr(transport, "close", None))
+        and inspect.iscoroutinefunction(async_handler)
+        and inspect.iscoroutinefunction(getattr(transport, "aclose", None))
+    )
+    if (
+        not has_both_interfaces
+        or uses_sync_stub
+        or uses_async_stub
+        or not has_correct_method_shapes
+    ):
         raise TypeError(
             "async control-plane transport must implement both sync and async "
-            "httpx transport interfaces"
+            "httpx transport interfaces with the correct sync and async method shapes"
         )
     return cast("ControlPlaneTransport", transport)
 

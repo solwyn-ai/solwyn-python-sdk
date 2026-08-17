@@ -146,6 +146,26 @@ class _StructuralDualTransport:
         return None
 
 
+class _SyncAsyncHandlerTransport(_StructuralDualTransport):
+    def handle_async_request(self, request: httpx.Request) -> httpx.Response:  # type: ignore[override]
+        return self._recorder.handler(request)
+
+
+class _SyncAsyncCloseTransport(_StructuralDualTransport):
+    def aclose(self) -> None:  # type: ignore[override]
+        return None
+
+
+class _AsyncSyncHandlerTransport(_StructuralDualTransport):
+    async def handle_request(self, request: httpx.Request) -> httpx.Response:  # type: ignore[override]
+        return self._recorder.handler(request)
+
+
+class _AsyncSyncCloseTransport(_StructuralDualTransport):
+    async def close(self) -> None:  # type: ignore[override]
+        return None
+
+
 class _CloseSensitiveDualTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
     def __init__(self, recorder: _Recorder) -> None:
         self._recorder = recorder
@@ -274,6 +294,37 @@ async def test_async_components_reject_one_sided_transports(
         if component is not None:
             with suppress(Exception):
                 await component.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "component_factory",
+    [
+        _new_async_enforcer_with_transport,
+        _new_async_reporter_with_transport,
+        _new_async_solwyn_with_transport,
+    ],
+)
+@pytest.mark.parametrize(
+    "transport_factory",
+    [
+        _SyncAsyncHandlerTransport,
+        _SyncAsyncCloseTransport,
+        _AsyncSyncHandlerTransport,
+        _AsyncSyncCloseTransport,
+    ],
+)
+async def test_async_components_reject_wrong_sync_async_method_shapes_at_construction(
+    component_factory: Callable[[object], _AsyncClosableComponent],
+    transport_factory: Callable[[_Recorder], object],
+) -> None:
+    recorder = _Recorder()
+
+    with pytest.raises(TypeError, match="sync and async method shapes"):
+        component_factory(transport_factory(recorder))
+
+    assert recorder.paths == []
 
 
 @pytest.mark.unit
