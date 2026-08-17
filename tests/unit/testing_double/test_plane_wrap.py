@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+import solwyn as solwyn_pkg
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import BudgetExceededError
 from solwyn.testing import FakeControlPlane
@@ -380,14 +381,81 @@ async def test_magic_fallback_denies_async_wrapper_before_any_provider_dispatch(
     )
 
     try:
-        with pytest.raises(BudgetExceededError) as captured:
-            await wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+        async with solwyn_pkg.run("wrap-stopped-fallback"):
+            with pytest.raises(BudgetExceededError) as captured:
+                await wrapped.chat.completions.create(model="gpt-5.5", messages=[])
     finally:
         await wrapped.close()
 
     assert captured.value.budget_period == "run_stopped"
     assert primary.chat.completions.calls == 0
     assert fallback.chat.completions.calls == 0
+
+
+@pytest.mark.unit
+def test_stopped_run_hard_denies_a_wrapped_call_on_an_alert_only_plane() -> None:
+    plane = FakeControlPlane(mode="alert_only")
+    provider = _OpenAIStub()
+    wrapped = plane.wrap(provider)
+
+    try:
+        with (
+            solwyn_pkg.run("probe") as run_id,
+            pytest.raises(solwyn_pkg.RunStoppedError) as captured,
+        ):
+            wrapped.chat.completions.create(
+                model="solwyn-test/deny-stopped",
+                messages=[],
+            )
+    finally:
+        wrapped.close()
+
+    assert captured.value.agent_run_id == run_id
+    assert captured.value.budget_period == "run_stopped"
+    assert captured.value.mode == "hard_deny"
+    assert provider.chat.completions.calls == 0
+
+
+@pytest.mark.unit
+def test_run_scoped_magic_models_require_an_open_run_before_dispatch() -> None:
+    plane = FakeControlPlane()
+    provider = _OpenAIStub()
+    wrapped = plane.wrap(provider)
+
+    try:
+        with pytest.raises(RuntimeError, match="requires an agent_run_id"):
+            wrapped.chat.completions.create(
+                model="solwyn-test/runaway",
+                messages=[],
+            )
+    finally:
+        wrapped.close()
+
+    assert provider.chat.completions.calls == 0
+    assert plane.checks == []
+    assert plane.lease_grants == []
+
+
+@pytest.mark.unit
+async def test_run_scoped_magic_fallback_requires_an_open_run_before_dispatch() -> None:
+    plane = FakeControlPlane()
+    primary = _AsyncOpenAIStub(_Status429("primary unavailable"))
+    fallback = _AsyncOpenAIStub()
+    wrapped = plane.wrap_async(
+        primary,
+        model="gpt-5.5",
+        fallback=[(fallback, "solwyn-test/deny-stopped")],
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="requires an agent_run_id"):
+            await wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+    finally:
+        await wrapped.close()
+
+    assert primary.chat.completions.calls == 0
+    assert fallback.chat.completions.calls == 0
+    assert plane.checks == []
 
 
 @pytest.mark.unit

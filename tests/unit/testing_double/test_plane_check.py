@@ -71,6 +71,91 @@ def test_deny_next_is_consumed_once_and_v1_allow_omits_denied_period() -> None:
 
 
 @pytest.mark.unit
+def test_stopped_run_check_denial_is_hard_deny_with_no_remaining_budget() -> None:
+    plane = FakeControlPlane(
+        mode=BudgetMode.ALERT_ONLY,
+        budget_limit=100.0,
+        current_usage=25.0,
+        remaining_budget=75.0,
+    )
+    plane.deny_next(period="run_stopped")
+
+    with httpx.Client(transport=plane.transport) as client:
+        response = client.post(
+            f"{plane.api_url}/api/v1/budgets/check",
+            json=_check_payload(agent_run_id="run-stopped", failover_directive_version="1"),
+        )
+
+    payload = response.json()
+    assert payload["allowed"] is False
+    assert payload["denied_by_period"] == "run_stopped"
+    assert payload["mode"] == "hard_deny"
+    assert payload["remaining_budget"] == 0.0
+
+
+@pytest.mark.unit
+def test_denied_check_floors_remaining_budget_while_allows_keep_the_script() -> None:
+    plane = FakeControlPlane(budget_limit=5.0, current_usage=6.0, remaining_budget=-1.0)
+    plane.deny_next(period="monthly")
+
+    with httpx.Client(transport=plane.transport) as client:
+        denied = client.post(
+            f"{plane.api_url}/api/v1/budgets/check",
+            json=_check_payload(failover_directive_version="1"),
+        )
+        allowed = client.post(
+            f"{plane.api_url}/api/v1/budgets/check",
+            json=_check_payload(failover_directive_version="1"),
+        )
+
+    assert denied.json()["allowed"] is False
+    assert denied.json()["remaining_budget"] == 0.0
+    assert allowed.json()["allowed"] is True
+    assert allowed.json()["remaining_budget"] == -1.0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("model", "period"),
+    [
+        ("solwyn-test/deny-stopped", "run_stopped"),
+        ("solwyn-test/runaway", "agent_run"),
+    ],
+)
+def test_run_scoped_verdicts_fail_loud_without_an_agent_run_id(
+    model: str,
+    period: str,
+) -> None:
+    plane = FakeControlPlane()
+
+    with (
+        httpx.Client(transport=plane.transport) as client,
+        pytest.raises(RuntimeError, match=f"run-scoped denial '{period}'"),
+    ):
+        client.post(
+            f"{plane.api_url}/api/v1/budgets/check",
+            json=_check_payload(model=model),
+        )
+
+    assert plane._runaway_seen == set()
+
+
+@pytest.mark.unit
+def test_scripted_run_scoped_denial_fails_loud_without_an_agent_run_id() -> None:
+    plane = FakeControlPlane()
+    plane.deny_next(period="agent_run")
+
+    with (
+        httpx.Client(transport=plane.transport) as client,
+        pytest.raises(RuntimeError, match="run-scoped denial 'agent_run'"),
+    ):
+        client.post(
+            f"{plane.api_url}/api/v1/budgets/check",
+            json=_check_payload(),
+        )
+
+
+@pytest.mark.unit
 def test_check_serialization_is_legacy_nullable_until_directive_v1_opt_in() -> None:
     plane = FakeControlPlane()
 
@@ -160,6 +245,7 @@ def test_first_magic_fallback_drives_raw_check_verdict(
         "POST",
         "/api/v1/budgets/check",
         _check_payload(
+            agent_run_id="run-fallback-magic",
             fallback_providers=["openai"] * len(fallback_models),
             fallback_models=fallback_models,
         ),

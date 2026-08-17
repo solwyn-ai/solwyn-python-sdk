@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from threading import Event
 from unittest.mock import patch
 
 import httpx
 import pytest
 
+from solwyn._types import MetadataEvent
 from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.testing import FakeControlPlane
 
@@ -37,6 +40,22 @@ def _post_check(
         f"{plane.api_url}/api/v1/budgets/check",
         json=_check_payload(**overrides),
     )
+
+
+def _event_payload() -> dict[str, object]:
+    return MetadataEvent(
+        model="gpt-5.5",
+        provider="openai",
+        input_tokens=3,
+        output_tokens=2,
+        latency_ms=12.5,
+        status="success",
+        is_model_fallback=False,
+        sdk_instance_id="sdk-fake",
+        timestamp=datetime.now(UTC),
+        call_id=str(uuid.uuid4()),
+        attempt_index=0,
+    ).model_dump(mode="json")
 
 
 @pytest.mark.unit
@@ -79,7 +98,7 @@ def test_magic_models_have_deterministic_check_verdicts(
     plane = FakeControlPlane()
 
     with httpx.Client(transport=plane.transport) as client:
-        response = _post_check(client, plane, model=model)
+        response = _post_check(client, plane, model=model, agent_run_id="run-magic-verdict")
 
     assert response.json()["allowed"] is allowed
     assert response.json()["mode"] == mode
@@ -113,6 +132,64 @@ def test_runaway_allows_first_check_per_run_then_denies_later_checks() -> None:
     assert first_a.json()["allowed"] is True
     assert second_a.json()["denied_by_period"] == "agent_run"
     assert first_b.json()["allowed"] is True
+
+
+@pytest.mark.unit
+def test_outage_can_be_scoped_to_one_endpoint_so_ingest_keeps_its_budget() -> None:
+    plane = FakeControlPlane()
+
+    with (
+        httpx.Client(transport=plane.transport) as client,
+        plane.outage(requests=1, path="/api/v1/budgets/check"),
+    ):
+        ingested = client.post(
+            f"{plane.api_url}/api/v1/metadata/ingest",
+            json=[_event_payload()],
+        )
+        with pytest.raises(httpx.ConnectError, match="scripted outage"):
+            _post_check(client, plane)
+
+    assert ingested.status_code == 202
+    assert len(plane.ingested) == 1
+    assert plane.checks == []
+
+
+@pytest.mark.unit
+def test_read_only_can_be_scoped_to_one_endpoint_so_ingest_keeps_its_budget() -> None:
+    plane = FakeControlPlane()
+
+    with (
+        httpx.Client(transport=plane.transport) as client,
+        plane.read_only(requests=1, path="/api/v1/budgets/check"),
+    ):
+        ingested = client.post(
+            f"{plane.api_url}/api/v1/metadata/ingest",
+            json=[_event_payload()],
+        )
+        refused = _post_check(client, plane)
+
+    assert ingested.status_code == 202
+    assert len(plane.ingested) == 1
+    assert refused.status_code == 403
+    assert refused.json()["detail"]["code"] == "read_only_key"
+
+
+@pytest.mark.unit
+def test_refusal_windows_never_swallow_an_unknown_path() -> None:
+    plane = FakeControlPlane()
+
+    with httpx.Client(transport=plane.transport) as client, plane.read_only():
+        unknown = client.post(f"{plane.api_url}/api/v1/nonexistent", json={})
+        known = client.post(
+            f"{plane.api_url}/api/v1/metadata/ingest",
+            json=[_event_payload()],
+        )
+
+    assert unknown.status_code == 404
+    assert plane.unmatched_requests == [("POST", "/api/v1/nonexistent")]
+    assert known.status_code == 403
+    assert known.json()["detail"]["code"] == "read_only_key"
+    assert plane.ingested == []
 
 
 @pytest.mark.unit

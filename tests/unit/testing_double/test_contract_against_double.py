@@ -52,7 +52,7 @@ def _json_response(
 
 def _lease_contract_plane() -> FakeControlPlane:
     plane = FakeControlPlane()
-    plane.deny_next(period="monthly")
+    plane.deny_next(period="monthly", scope="lease")
     return plane
 
 
