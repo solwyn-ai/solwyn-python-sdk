@@ -174,6 +174,56 @@ def test_client_fixture_closes_when_a_dependent_fixture_fails_during_setup(
 
 
 @pytest.mark.unit
+def test_unmatched_control_plane_request_fails_teardown(pytester: pytest.Pytester) -> None:
+    pytester.makepyfile(
+        """
+        import httpx
+
+        pytest_plugins = ["solwyn.testing.pytest_plugin"]
+
+
+        def test_hits_unknown_path(solwyn_control_plane):
+            with httpx.Client(transport=solwyn_control_plane.transport) as client:
+                client.post(
+                    f"{solwyn_control_plane.api_url}/api/v1/not-a-real-endpoint",
+                    json={},
+                )
+        """
+    )
+
+    result = pytester.runpytest("-q", "-p", "no:asyncio")
+
+    result.assert_outcomes(passed=1, errors=1)
+    result.stdout.fnmatch_lines(["*POST /api/v1/not-a-real-endpoint*"])
+
+
+@pytest.mark.unit
+def test_clearing_unmatched_requests_before_teardown_opts_out(
+    pytester: pytest.Pytester,
+) -> None:
+    pytester.makepyfile(
+        """
+        import httpx
+
+        pytest_plugins = ["solwyn.testing.pytest_plugin"]
+
+
+        def test_hits_unknown_path_and_clears(solwyn_control_plane):
+            with httpx.Client(transport=solwyn_control_plane.transport) as client:
+                client.post(
+                    f"{solwyn_control_plane.api_url}/api/v1/not-a-real-endpoint",
+                    json={},
+                )
+            solwyn_control_plane.unmatched_requests.clear()
+        """
+    )
+
+    result = pytester.runpytest("-q", "-p", "no:asyncio")
+
+    result.assert_outcomes(passed=1)
+
+
+@pytest.mark.unit
 def test_readme_testing_guide_has_complete_boundary_and_magic_table() -> None:
     section = _read_testing_section()
     normalized = " ".join(section.split())
@@ -205,10 +255,22 @@ def test_readme_magic_table_distinguishes_configured_and_forced_modes() -> None:
         for cells in [line.split("|")]
     }
 
-    for model in ("deny", "deny-tag", "deny-stopped", "runaway"):
+    for model in ("deny", "deny-tag"):
         description = rows[f"solwyn-test/{model}"].lower()
         assert "configured mode" in description
         assert "hard_deny" in description
+
+    runaway_description = rows["solwyn-test/runaway"].lower()
+    assert "configured mode" in runaway_description
+    assert "hard_deny" in runaway_description
+
+    stopped_description = rows["solwyn-test/deny-stopped"].lower()
+    assert "configured mode" not in stopped_description
+    assert "hard_deny" in stopped_description
+
+    for model in ("deny-stopped", "runaway"):
+        assert "solwyn.run(" in rows[f"solwyn-test/{model}"].lower()
+
     assert "forces" in rows["solwyn-test/deny-alert"].lower()
     assert "alert_only" in rows["solwyn-test/deny-alert"].lower()
 

@@ -42,9 +42,27 @@ _DenialOnlyOpenAI.__name__ = "OpenAI"
 
 
 @pytest.fixture
-def solwyn_control_plane() -> FakeControlPlane:
-    """Return an independent in-process control plane for each test."""
-    return FakeControlPlane()
+def solwyn_control_plane() -> Iterator[FakeControlPlane]:
+    """Yield an independent in-process control plane for each test.
+
+    Teardown fails the test if the plane recorded any request against a path
+    it does not speak (``plane.unmatched_requests``): a fire-and-forget SDK
+    sender swallows its own failures, so this teardown is the only loud
+    signal that a caller drifted from the real wire contract. A test that
+    intentionally exercises unknown paths opts out by clearing
+    ``plane.unmatched_requests`` before teardown.
+    """
+    plane = FakeControlPlane()
+    yield plane
+    if plane.unmatched_requests:
+        endpoints = ", ".join(f"{method} {path}" for method, path in plane.unmatched_requests)
+        raise AssertionError(
+            "solwyn_control_plane recorded requests to endpoints the double "
+            f"does not speak: {endpoints}. A fire-and-forget SDK sender "
+            "swallows its own failures, so this teardown is the only loud "
+            "signal; if this test intentionally exercises unknown paths, "
+            "clear plane.unmatched_requests before returning."
+        )
 
 
 @pytest.fixture

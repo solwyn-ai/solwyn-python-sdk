@@ -35,8 +35,9 @@ verdicts and failures, recordings, reservation and lease state, wrapper fixture
 ergonomics, and the shared contract pack running with zero network. Provider
 dispatch remains separately mocked there. Real authentication, routing, storage,
 pricing-catalog behavior, and deployed API integration stay in `tests/integration/`.
-`tests/integration/test_live_contract.py` and `solwyn.testing.contract` are the
-paired fidelity specification; contract changes must keep both sides aligned.
+`tests/integration/test_live_contract.py` remains the live fidelity specification, and
+`tests/integration/test_contract_against_live.py` is the file that runs `solwyn.testing.contract`
+against the live API — that's the file to edit when the pack changes.
 
 ## Markers
 

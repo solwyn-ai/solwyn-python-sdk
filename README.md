@@ -620,10 +620,10 @@ Magic models are reserved, deterministic verdict scripts:
 | Model | Scripted control-plane behavior |
 |-------|---------------------------------|
 | `solwyn-test/deny` | Monthly denial using the plane's configured mode (`hard_deny` by default) |
-| `solwyn-test/deny-alert` | Monthly denial that forces `alert_only`, regardless of configured mode |
-| `solwyn-test/deny-tag` | `tag`-period denial using the plane's configured mode (`hard_deny` by default) |
-| `solwyn-test/deny-stopped` | `run_stopped` denial using the plane's configured mode (`hard_deny` by default) |
-| `solwyn-test/runaway` | First check per run is allowed; later `agent_run` denials use the configured mode (`hard_deny` by default) |
+| `solwyn-test/deny-alert` | Monthly denial that forces `alert_only` on per-call checks, regardless of configured mode; lease-path denials are always `hard_deny` |
+| `solwyn-test/deny-tag` | `tag`-period denial using the plane's configured mode (`hard_deny` by default) on the check path; the lease path treats tag-scoped rules as lease ineligibility instead of a denial |
+| `solwyn-test/deny-stopped` | Always a `hard_deny` `run_stopped` denial with zero remaining budget — dashboard stops override alert-only projects and raise `RunStoppedError` through the wrapper. Requires an active `solwyn.run(...)` scope |
+| `solwyn-test/runaway` | First check per run is allowed; later `agent_run` denials use the plane's configured mode (`hard_deny` by default). Requires an active `solwyn.run(...)` scope |
 | `solwyn-test/lease-ineligible` | Allow the call but make its run ineligible for a token lease |
 
 For overlapping scripts, precedence is transport failure → endpoint refusal → verdict → allow.
