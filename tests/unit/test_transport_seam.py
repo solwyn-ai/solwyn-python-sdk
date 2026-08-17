@@ -5,18 +5,21 @@ from __future__ import annotations
 import ast
 import gc
 import inspect
+from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from typing import Protocol
 
 import httpx
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID, call_uuid
 
+from solwyn import run
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, ProviderName
 from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer
-from solwyn.client import Solwyn
+from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 
 _API_URL = "http://control-plane.test"
@@ -56,6 +59,113 @@ class _Recorder:
         return httpx.Response(202, json={"ingested": 1, "rejected": []})
 
 
+class _SyncCompletionsStub:
+    def create(self, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5))
+
+
+class _SyncChatStub:
+    def __init__(self) -> None:
+        self.completions = _SyncCompletionsStub()
+
+
+class _SyncOpenAIClientStub:
+    def __init__(self) -> None:
+        self.chat = _SyncChatStub()
+
+    def with_options(self, **_kwargs: object) -> _SyncOpenAIClientStub:
+        return self
+
+
+_SyncOpenAIClientStub.__module__ = "openai._client"
+_SyncOpenAIClientStub.__name__ = "OpenAI"
+
+
+class _AsyncCompletionsStub:
+    async def create(self, **_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5))
+
+
+class _AsyncChatStub:
+    def __init__(self) -> None:
+        self.completions = _AsyncCompletionsStub()
+
+
+class _AsyncOpenAIClientStub:
+    def __init__(self) -> None:
+        self.chat = _AsyncChatStub()
+
+    def with_options(self, **_kwargs: object) -> _AsyncOpenAIClientStub:
+        return self
+
+
+_AsyncOpenAIClientStub.__module__ = "openai._client"
+_AsyncOpenAIClientStub.__name__ = "AsyncOpenAI"
+
+
+class _SyncOnlyTransport(httpx.BaseTransport):
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, json=ALLOW_BUDGET_RESPONSE)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _AsyncOnlyTransport(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, json=ALLOW_BUDGET_RESPONSE)
+
+    def close(self) -> None:
+        return None
+
+
+class _CloseSensitiveDualTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
+    def __init__(self, recorder: _Recorder) -> None:
+        self._recorder = recorder
+        self.closed = False
+        self.close_calls = 0
+        self.aclose_calls = 0
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if self.closed:
+            raise RuntimeError("transport already closed")
+        return self._recorder.handler(request)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self.closed:
+            raise RuntimeError("transport already closed")
+        return self._recorder.handler(request)
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.closed = True
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        self.closed = True
+
+
+class _AsyncClosableComponent(Protocol):
+    async def close(self) -> None: ...
+
+
+def _new_async_enforcer_with_transport(transport: object) -> AsyncBudgetEnforcer:
+    return AsyncBudgetEnforcer(_API_URL, VALID_API_KEY, transport=transport)  # type: ignore[arg-type]
+
+
+def _new_async_reporter_with_transport(transport: object) -> AsyncMetadataReporter:
+    return AsyncMetadataReporter(_API_URL, VALID_API_KEY, transport=transport)  # type: ignore[arg-type]
+
+
+def _new_async_solwyn_with_transport(transport: object) -> AsyncSolwyn:
+    return AsyncSolwyn(
+        _AsyncOpenAIClientStub(),
+        api_key=VALID_API_KEY,
+        api_url=_API_URL,
+        control_plane_transport=transport,  # type: ignore[arg-type]
+    )
+
+
 def _check(enforcer: BudgetEnforcer) -> None:
     result = enforcer.check_budget(
         estimated_input_tokens=10,
@@ -88,6 +198,31 @@ def test_control_plane_component_transport_is_keyword_only() -> None:
     for component in (BudgetEnforcer, AsyncBudgetEnforcer):
         parameter = inspect.signature(component).parameters["control_plane_breaker"]
         assert parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "component_factory",
+    [
+        _new_async_enforcer_with_transport,
+        _new_async_reporter_with_transport,
+        _new_async_solwyn_with_transport,
+    ],
+)
+@pytest.mark.parametrize("transport_factory", [_SyncOnlyTransport, _AsyncOnlyTransport])
+async def test_async_components_reject_one_sided_transports(
+    component_factory: Callable[[object], _AsyncClosableComponent],
+    transport_factory: Callable[[], object],
+) -> None:
+    component: _AsyncClosableComponent | None = None
+    try:
+        with pytest.raises(TypeError, match="both sync and async"):
+            component = component_factory(transport_factory())
+    finally:
+        if component is not None:
+            with suppress(Exception):
+                await component.close()
 
 
 @pytest.mark.unit
@@ -286,15 +421,8 @@ async def test_async_enforcer_surrender_drain_uses_injected_transport() -> None:
 def test_solwyn_threads_transport_to_budget_and_reporter() -> None:
     recorder = _Recorder()
     transport = httpx.MockTransport(recorder.handler)
-    provider_client = MagicMock()
-    provider_client.__class__.__module__ = "openai._client"
-    provider_client.__class__.__name__ = "OpenAI"
-    provider_client.with_options.return_value = provider_client
-    provider_client.chat.completions.create.return_value = SimpleNamespace(
-        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5)
-    )
     solwyn = Solwyn(
-        provider_client,
+        _SyncOpenAIClientStub(),
         api_key=VALID_API_KEY,
         api_url=_API_URL,
         control_plane_transport=transport,
@@ -310,6 +438,83 @@ def test_solwyn_threads_transport_to_budget_and_reporter() -> None:
     assert recorder.paths.count("/api/v1/budgets/check") == 1
     assert recorder.paths.count("/api/v1/budgets/confirm") == 1
     assert recorder.paths.count("/api/v1/metadata/ingest") == 1
+
+
+@pytest.mark.unit
+def test_sync_injected_transport_is_caller_owned_through_settlement_and_surrender() -> None:
+    recorder = _Recorder()
+    transport = _CloseSensitiveDualTransport(recorder)
+    solwyn = Solwyn(
+        _SyncOpenAIClientStub(),
+        api_key=VALID_API_KEY,
+        api_url=_API_URL,
+        control_plane_transport=transport,
+        reporter_flush_interval=3600.0,
+    )
+
+    try:
+        with run("sync-transport-ownership"):
+            solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+        solwyn.close()
+
+        confirm_index = recorder.paths.index("/api/v1/budgets/confirm")
+        surrender_index = recorder.paths.index("/api/v1/budgets/lease/surrender")
+        assert confirm_index < surrender_index
+        assert transport.close_calls == 0
+        assert transport.aclose_calls == 0
+        assert transport.closed is False
+        response = transport.handle_request(
+            httpx.Request("POST", f"{_API_URL}/api/v1/budgets/check")
+        )
+        assert response.status_code == 200
+    finally:
+        if not transport.closed:
+            transport.close()
+
+    assert transport.close_calls == 1
+    assert transport.closed is True
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_injected_transport_is_caller_owned_through_settlement_and_surrender() -> None:
+    recorder = _Recorder()
+    transport = _CloseSensitiveDualTransport(recorder)
+    solwyn = AsyncSolwyn(
+        _AsyncOpenAIClientStub(),
+        api_key=VALID_API_KEY,
+        api_url=_API_URL,
+        control_plane_transport=transport,
+        reporter_flush_interval=3600.0,
+    )
+
+    try:
+        async with run("async-transport-ownership"):
+            await solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+        await solwyn.close()
+
+        confirm_index = recorder.paths.index("/api/v1/budgets/confirm")
+        surrender_index = recorder.paths.index("/api/v1/budgets/lease/surrender")
+        assert confirm_index < surrender_index
+        assert transport.close_calls == 0
+        assert transport.aclose_calls == 0
+        assert transport.closed is False
+        response = await transport.handle_async_request(
+            httpx.Request("POST", f"{_API_URL}/api/v1/budgets/check")
+        )
+        assert response.status_code == 200
+    finally:
+        if not transport.closed:
+            await transport.aclose()
+
+    assert transport.aclose_calls == 1
+    assert transport.closed is True
 
 
 @pytest.mark.unit

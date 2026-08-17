@@ -24,6 +24,12 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from solwyn._constants import CALL_ID_MAX_LENGTH, CALL_ID_PATTERN
+from solwyn._control_plane_transport import (
+    _DualTransport,
+    non_closing_async_transport,
+    non_closing_sync_transport,
+    require_dual_transport,
+)
 from solwyn._lease import (
     DEFAULT_OUTPUT_BOUND,
     INELIGIBLE_RETRY_AFTER_S,
@@ -1268,7 +1274,8 @@ class BudgetEnforcer(_BudgetEnforcerBase):
 
     def _new_http_client(self, timeout: float = 5.0) -> httpx.Client:
         """Build a sync control-plane client on the configured transport."""
-        return httpx.Client(timeout=timeout, transport=self._transport)
+        transport = non_closing_sync_transport(self._transport)
+        return httpx.Client(timeout=timeout, transport=transport)
 
     def _new_exit_http_client(self) -> httpx.Client:
         """Build the sync client used by the interpreter-exit lease drain."""
@@ -1874,6 +1881,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         lease_enabled: bool = True,
         lease_output_bound_default: int = DEFAULT_OUTPUT_BOUND,
     ) -> None:
+        validated_transport = require_dual_transport(transport)
         super().__init__(
             api_url=api_url,
             api_key=api_key,
@@ -1887,8 +1895,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         )
         # Async components also use a sync client during interpreter-exit
         # drains, so an injected transport must implement both httpx transport
-        # interfaces (as MockTransport does).
-        self._transport = transport
+        # interfaces (as MockTransport does). The caller retains ownership.
+        self._transport: _DualTransport | None = validated_transport
         self._http = self._new_async_http_client()
         # Renewal tasks, held strongly so the loop cannot collect them mid-flight.
         self._renewal_tasks: set[asyncio.Task[None]] = set()
@@ -1898,12 +1906,12 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
 
     def _new_async_http_client(self, timeout: float = 5.0) -> httpx.AsyncClient:
         """Build an async control-plane client on the configured transport."""
-        transport = cast("httpx.AsyncBaseTransport | None", self._transport)
+        transport = non_closing_async_transport(self._transport)
         return httpx.AsyncClient(timeout=timeout, transport=transport)
 
     def _new_exit_http_client(self) -> httpx.Client:
         """Build the sync client used by the interpreter-exit lease drain."""
-        transport = cast("httpx.BaseTransport | None", self._transport)
+        transport = non_closing_sync_transport(self._transport)
         return httpx.Client(timeout=5.0, transport=transport)
 
     def _reset_after_fork_in_child(self) -> None:

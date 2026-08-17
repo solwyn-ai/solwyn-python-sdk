@@ -28,11 +28,17 @@ import uuid
 import weakref
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Literal, TypeVar, cast
+from typing import Literal, TypeVar
 
 import httpx
 
 from solwyn import _base
+from solwyn._control_plane_transport import (
+    _DualTransport,
+    non_closing_async_transport,
+    non_closing_sync_transport,
+    require_dual_transport,
+)
 from solwyn._lifecycle import (
     _drain_count,
     _is_retryable_exc,
@@ -88,12 +94,12 @@ class _ExitHttpClientFactory:
 
     def __init__(
         self,
-        transport: httpx.BaseTransport | httpx.AsyncBaseTransport | None,
+        transport: _DualTransport | None,
     ) -> None:
         self._transport = transport
 
     def _new_exit_http_client(self) -> httpx.Client:
-        transport = cast("httpx.BaseTransport | None", self._transport)
+        transport = non_closing_sync_transport(self._transport)
         return httpx.Client(timeout=5.0, transport=transport)
 
 
@@ -967,7 +973,8 @@ class MetadataReporter(_ReporterBase):
 
     def _new_http_client(self, timeout: float = 5.0) -> httpx.Client:
         """Build a sync control-plane client on the configured transport."""
-        return httpx.Client(timeout=timeout, transport=self._transport)
+        transport = non_closing_sync_transport(self._transport)
+        return httpx.Client(timeout=timeout, transport=transport)
 
     def _new_exit_http_client(self) -> httpx.Client:
         """Build the sync client used by interpreter-exit delivery."""
@@ -1721,6 +1728,7 @@ class AsyncMetadataReporter(_ReporterBase):
         retry_backoff_cap: float = 60.0,
         shutdown_deadline: float = 5.0,
     ) -> None:
+        validated_transport = require_dual_transport(transport)
         super().__init__(
             api_url,
             api_key,
@@ -1740,9 +1748,10 @@ class AsyncMetadataReporter(_ReporterBase):
             shutdown_deadline=shutdown_deadline,
         )
         # Async reporters need both transport interfaces: normal delivery is
-        # async, while GC/interpreter-exit delivery uses a sync client.
-        self._transport = transport
-        self._exit_http_client_factory = _ExitHttpClientFactory(transport)
+        # async, while GC/interpreter-exit delivery uses a sync client. The
+        # caller retains ownership of an injected transport.
+        self._transport: _DualTransport | None = validated_transport
+        self._exit_http_client_factory = _ExitHttpClientFactory(self._transport)
         self._http = self._new_async_http_client(timeout=10.0)
         self._shutdown_event: asyncio.Event | None = None
         self._flush_task: asyncio.Task[None] | None = None
@@ -1770,7 +1779,7 @@ class AsyncMetadataReporter(_ReporterBase):
 
     def _new_async_http_client(self, timeout: float = 5.0) -> httpx.AsyncClient:
         """Build an async control-plane client on the configured transport."""
-        transport = cast("httpx.AsyncBaseTransport | None", self._transport)
+        transport = non_closing_async_transport(self._transport)
         return httpx.AsyncClient(timeout=timeout, transport=transport)
 
     def _new_exit_http_client(self) -> httpx.Client:

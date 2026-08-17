@@ -40,6 +40,7 @@ from solwyn._base import (
     _responses_output_bound,
     _SolwynBase,
 )
+from solwyn._control_plane_transport import require_dual_transport
 from solwyn._privacy import (
     estimate_content_length,
     estimate_responses_content_length,
@@ -2663,6 +2664,8 @@ class AsyncSolwyn(_SolwynBase):
         control_plane_transport: httpx.BaseTransport | None = None,
         **config_kwargs: object,
     ) -> None:
+        require_dual_transport(control_plane_transport)
+
         # See sync Solwyn.__init__ for why _client is typed Any.
         self._client: Any = client
 
