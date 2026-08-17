@@ -28,6 +28,7 @@ bug — fix the drift, don't loosen the assertion.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlparse
@@ -77,6 +78,7 @@ def _check_payload(
         agent_run_id=agent_run_id,
         tags=tags,
         failover_directive_version="1",
+        run_directive_version="1",
     )
     return request.model_dump(mode="json")
 
@@ -284,9 +286,30 @@ def tag_capped_credentials(api_url: str) -> Credentials:
     return Credentials(api_url=api_url, api_key=key)
 
 
+@dataclass(frozen=True)
+class StoppableRun:
+    credentials: Credentials
+    raw_run_id: str
+    api_url: str
+    project_id: str
+    stored_run_id: str
+    jwt_headers: dict[str, str]
+
+    def stop(self) -> None:
+        with httpx.Client(base_url=self.api_url, timeout=10) as http:
+            response = http.post(
+                f"/api/v1/projects/{self.project_id}/agent-runs/{self.stored_run_id}/stop",
+                headers=self.jwt_headers,
+            )
+        response.raise_for_status()
+
+
 @pytest.fixture
-def stopped_run_credentials(api_url: str) -> tuple[Credentials, str]:
-    """An alert-only project with one dashboard-stopped explicit run."""
+def stoppable_run(api_url: str) -> StoppableRun:
+    """Provision one local run, but leave stop timing under the test's control."""
+    host = urlparse(api_url).hostname
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        pytest.skip("run-control live contract refuses all non-loopback control planes")
     session_id = uuid.uuid4().hex[:12]
     raw_run_id = f"run-{uuid.uuid4().hex[:12]}"
     run_name = f"stopped-contract-{session_id}"
@@ -336,13 +359,23 @@ def stopped_run_credentials(api_url: str) -> tuple[Credentials, str]:
         runs = runs_response.json()["runs"]
         matching_runs = [run for run in runs if run["name"] == run_name]
         assert len(matching_runs) == 1, runs
-        stop = http.post(
-            f"/api/v1/projects/{project_id}/agent-runs/{matching_runs[0]['id']}/stop",
-            headers=jwt_headers,
-        )
-        stop.raise_for_status()
 
-    return credentials, raw_run_id
+    return StoppableRun(
+        credentials=credentials,
+        raw_run_id=raw_run_id,
+        api_url=api_url,
+        project_id=project_id,
+        stored_run_id=matching_runs[0]["id"],
+        jwt_headers=jwt_headers,
+    )
+
+
+@pytest.fixture
+def stopped_run_credentials(stoppable_run: StoppableRun) -> tuple[Credentials, str]:
+    """An alert-only local project with one dashboard-stopped explicit run."""
+    stoppable_run.stop()
+
+    return stoppable_run.credentials, stoppable_run.raw_run_id
 
 
 @pytest.mark.integration
@@ -446,6 +479,14 @@ class TestLiveDeniedByPeriodContract:
         parsed = BudgetCheckResponse.model_validate(denied)
         assert parsed.mode is BudgetMode.HARD_DENY
         assert parsed.denied_by_period == "run_stopped"
+        assert denied.get("run_control") == {
+            "version": "1",
+            "action": "terminate",
+            "agent_run_id": raw_run_id,
+            "reason": "manual_kill",
+        }
+        assert parsed.run_control is not None
+        assert parsed.run_control.reason == "manual_kill"
 
     @pytest.mark.integration
     def test_tag_cap_denial_reports_tag_and_remains_selector_scoped(
@@ -521,6 +562,7 @@ def _grant_payload(
         fallback_models=[],
         fail_open=fail_open,
         estimated_input_tokens=1000,
+        run_directive_version="1",
     ).model_dump(mode="json")
 
 
@@ -537,7 +579,10 @@ def _renew(
     credentials: Credentials, lease_id: str, holder_id: str, generation: int
 ) -> httpx.Response:
     payload = LeaseRenewRequest(
-        lease_id=lease_id, holder_id=holder_id, generation=generation
+        lease_id=lease_id,
+        holder_id=holder_id,
+        generation=generation,
+        run_directive_version="1",
     ).model_dump(mode="json")
     return _post_lease(credentials, _LEASE_RENEW_PATH, payload)
 
@@ -698,6 +743,63 @@ class TestLiveLeaseGrantContract:
         assert parsed.allowed is False
         assert parsed.denied_by_period == "monthly"
         assert parsed.lease_id is None
+
+
+@pytest.mark.integration
+class TestLiveRunControlLeaseContract:
+    """C-2 directive parity on both lease response channels, loopback only."""
+
+    @pytest.mark.integration
+    def test_stopped_grant_carries_exact_run_control_directive(
+        self, stopped_run_credentials: tuple[Credentials, str]
+    ) -> None:
+        credentials, raw_run_id = stopped_run_credentials
+
+        payload = _grant(credentials, raw_run_id, _holder_id())
+
+        assert payload["allowed"] is False
+        assert payload["denied_by_period"] == "run_stopped"
+        assert payload["run_control"] == {
+            "version": "1",
+            "action": "terminate",
+            "agent_run_id": raw_run_id,
+            "reason": "manual_kill",
+        }
+        parsed = LeaseGrantResponse.model_validate(payload)
+        assert parsed.run_control is not None
+        assert parsed.run_control.agent_run_id == raw_run_id
+
+    @pytest.mark.integration
+    def test_current_renewal_after_stop_carries_exact_run_control_directive(
+        self, stoppable_run: StoppableRun
+    ) -> None:
+        holder = _holder_id()
+        grant = _grant(
+            stoppable_run.credentials,
+            stoppable_run.raw_run_id,
+            holder,
+        )
+        assert grant["allowed"] is True
+        stoppable_run.stop()
+
+        response = _renew(
+            stoppable_run.credentials,
+            grant["lease_id"],
+            holder,
+            grant["generation"],
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        assert payload["allowed"] is False
+        assert payload["denied_by_period"] == "run_stopped"
+        assert payload["run_control"] == {
+            "version": "1",
+            "action": "terminate",
+            "agent_run_id": stoppable_run.raw_run_id,
+            "reason": "manual_kill",
+        }
+        assert LeaseGrantResponse.model_validate(payload).run_control is not None
 
 
 @pytest.mark.integration

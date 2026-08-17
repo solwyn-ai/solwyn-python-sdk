@@ -115,7 +115,9 @@ class TestBudgetEnforcerBase:
         assert req.model == "gpt-5.5"
         assert req.provider == "openai"
         assert req.failover_directive_version == "1"
+        assert req.run_directive_version == "1"
         assert req.model_dump(mode="json")["failover_directive_version"] == "1"
+        assert req.model_dump(mode="json")["run_directive_version"] == "1"
 
     def test_build_check_request_carries_agent_run_id(self) -> None:
         base = _BudgetEnforcerBase(
@@ -378,6 +380,98 @@ class TestCloudAllow:
         assert result.warning is None
         assert result.failover_tuning_allowed is True
 
+    def test_ordered_live_allow_keeps_old_handle_stopped_but_new_handle_clean(self) -> None:
+        from solwyn._run_control import _acquire_termination_handle
+
+        enforcer = _make_legacy_enforcer()
+        old = _acquire_termination_handle("run_server_allow")
+        mark_terminated("run_server_allow", reason="old_stop", source="server")
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            return_value=_response(ALLOW_BUDGET_RESPONSE),
+        ):
+            result = enforcer.check_budget(
+                estimated_input_tokens=500,
+                estimated_output_bound=100,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_server_allow",
+                call_id="3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b",
+            )
+        new = _acquire_termination_handle("run_server_allow")
+
+        assert result.allowed is True
+        assert old.termination is not None
+        assert old.termination.reason == "old_stop"
+        assert new.termination is None
+        new.release()
+        old.release()
+        enforcer.close()
+
+    @pytest.mark.parametrize("first_stop_before_request", [False, True])
+    def test_newer_stop_observation_survives_registry_eviction_during_check(
+        self,
+        first_stop_before_request: bool,
+    ) -> None:
+        from solwyn._run_control import _acquire_termination_handle
+
+        run_id = f"run_ordered_lru_sync_{first_stop_before_request}"
+        churn_prefix = f"ordered_lru_sync_{first_stop_before_request}"
+        enforcer = _make_legacy_enforcer()
+        old = _acquire_termination_handle(run_id)
+        new = None
+        if first_stop_before_request:
+            with patch("solwyn._run_control.time.monotonic", return_value=1.0):
+                mark_terminated(run_id, reason="first_stop", source="server")
+
+        def allow_after_newer_stop(*_args: object, **_kwargs: object) -> MagicMock:
+            with patch("solwyn._run_control.time.monotonic", return_value=3.0):
+                mark_terminated(run_id, reason="newer_stop", source="server")
+                for index in range(300):
+                    mark_terminated(
+                        f"{churn_prefix}_{index}",
+                        reason="unrelated",
+                        source="server",
+                    )
+            return _response(ALLOW_BUDGET_RESPONSE)
+
+        try:
+            with (
+                patch("solwyn.budget.time.monotonic", return_value=2.0),
+                patch.object(
+                    enforcer._http,
+                    "post",
+                    side_effect=allow_after_newer_stop,
+                ),
+            ):
+                result = enforcer.check_budget(
+                    estimated_input_tokens=500,
+                    estimated_output_bound=100,
+                    model="gpt-5.5",
+                    provider="openai",
+                    agent_run_id=run_id,
+                    call_id="3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b",
+                )
+            new = _acquire_termination_handle(run_id)
+
+            assert (result.allowed, result.denied_by_period, result.deny_reason) == (
+                False,
+                "run_stopped",
+                "first_stop" if first_stop_before_request else "newer_stop",
+            )
+            assert old.termination is not None
+            assert new.termination is old.termination
+        finally:
+            if new is not None:
+                new.release()
+            old.release()
+            clear_run_termination(run_id)
+            for index in range(300):
+                clear_run_termination(f"{churn_prefix}_{index}")
+            enforcer.close()
+
     def test_tagged_run_uses_per_call_check_and_sends_tags(self) -> None:
         enforcer = _make_enforcer()
         mock_response = MagicMock()
@@ -399,6 +493,7 @@ class TestCloudAllow:
         post.assert_called_once()
         assert post.call_args.args[0].endswith("/api/v1/budgets/check")
         assert post.call_args.kwargs["json"]["tags"] == {"team": "research"}
+        assert post.call_args.kwargs["json"]["run_directive_version"] == "1"
 
     def test_shared_allow_fixture_propagates_non_none_price_hints(self) -> None:
         enforcer = _make_enforcer()

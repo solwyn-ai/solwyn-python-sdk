@@ -874,6 +874,7 @@ class LeaseLedger:
             provider=provider,
             fallback_providers=list(fallback_providers),
             fallback_models=list(fallback_models),
+            run_directive_version="1",
         )
 
     def claim_renewal_request(

@@ -23,6 +23,7 @@ from typing import Annotated, Literal, cast, get_args
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
+from solwyn import _run_control
 from solwyn._constants import CALL_ID_MAX_LENGTH, CALL_ID_PATTERN
 from solwyn._lease import (
     DEFAULT_OUTPUT_BOUND,
@@ -50,6 +51,7 @@ from solwyn._types import (
     MediaUsage,
     Modality,
     ProviderName,
+    RunControlDirective,
     ServiceTier,
 )
 from solwyn.circuit_breaker import CircuitBreaker
@@ -111,6 +113,10 @@ _CallId = Annotated[
 _CALL_ID_ADAPTER = TypeAdapter(_CallId)
 
 logger = logging.getLogger(__name__)
+
+
+class _MisroutedControlDenial(Exception):
+    """Internal semantic failure for a run-stop verdict addressed elsewhere."""
 
 
 def _validated_call_id(call_id: str | None) -> str:
@@ -198,6 +204,7 @@ class _BudgetEnforcerBase:
         # outage after a hard deny must not reopen spending.
         self._last_hard_deny_response: BudgetCheckResponse | None = None
         self._run_hard_deny_responses: OrderedDict[str, BudgetCheckResponse] = OrderedDict()
+        self._run_hard_deny_observed_at: OrderedDict[str, float] = OrderedDict()
 
         # PJ-2 budget leases. The ledger is sans-I/O and takes no locks: every
         # call into it happens under ``_state_lock`` (the async subclass is
@@ -281,6 +288,7 @@ class _BudgetEnforcerBase:
             agent_run_id=agent_run_id,
             tags=dict(tags) if tags is not None else None,
             failover_directive_version="1",
+            run_directive_version="1",
         )
 
     def _should_use_cache(self) -> bool:
@@ -298,7 +306,9 @@ class _BudgetEnforcerBase:
         *,
         agent_run_id: str | None = None,
         cache_allowed_response: bool = True,
-    ) -> None:
+        request_epoch: float | None = None,
+        observed_at: float | None = None,
+    ) -> BudgetCheckResponse:
         """Cache an allow response. Never cache deny responses.
 
         Always updates the last-known budget limit (from both allow and deny)
@@ -309,75 +319,315 @@ class _BudgetEnforcerBase:
         denials stay selector-local: they clear stale project state without
         creating or erasing run sticky state.
         """
+        if response.allowed and agent_run_id is not None and request_epoch is not None:
+            with _run_control._locked_registry():
+                newer_server_stop = _run_control._clear_server_termination_before_request_locked(
+                    agent_run_id,
+                    request_epoch=request_epoch,
+                )
+                with self._state_lock:
+                    return self._resolve_ordered_allow_locked(
+                        response,
+                        agent_run_id=agent_run_id,
+                        request_epoch=request_epoch,
+                        newer_server_stop=newer_server_stop,
+                        cache_allowed_response=cache_allowed_response,
+                    )
         if response.allowed and agent_run_id is not None:
             clear_termination_if(agent_run_id, source="server")
         with self._state_lock:
-            # Always remember the limit for local enforcement fallback
-            self._last_known_budget_limit = response.budget_limit
-            self._last_known_current_usage = response.current_usage
+            self._cache_response_locked(
+                response,
+                agent_run_id=agent_run_id,
+                cache_allowed_response=cache_allowed_response,
+                observed_at=observed_at,
+            )
+        return response
 
-            if response.allowed:
-                self._last_hard_deny_response = None
-                if agent_run_id is not None:
-                    self._run_hard_deny_responses.pop(agent_run_id, None)
-                elif cache_allowed_response:
-                    self._cached_response = response
-                    self._cache_expires_at = time.monotonic() + self.cache_ttl
-                return
+    def _resolve_ordered_allow_locked(
+        self,
+        response: BudgetCheckResponse,
+        *,
+        agent_run_id: str,
+        request_epoch: float,
+        newer_server_stop: _run_control.RunTermination | None,
+        cache_allowed_response: bool,
+    ) -> BudgetCheckResponse:
+        """Resolve one live ALLOW while registry and enforcer locks are held."""
+        sticky = self._run_hard_deny_responses.get(agent_run_id)
+        sticky_observed_at = self._run_hard_deny_observed_at.get(agent_run_id)
+        if (
+            sticky is not None
+            and sticky_observed_at is not None
+            and sticky_observed_at >= request_epoch
+        ):
+            self._run_hard_deny_responses.move_to_end(agent_run_id)
+            self._run_hard_deny_observed_at.move_to_end(agent_run_id)
+            return sticky
+        if newer_server_stop is not None:
+            effective = response.model_copy(
+                update={
+                    "allowed": False,
+                    "reservation_id": None,
+                    "mode": BudgetMode.HARD_DENY,
+                    "denied_by_period": "run_stopped",
+                    "run_control": RunControlDirective(
+                        version="1",
+                        action="terminate",
+                        agent_run_id=agent_run_id,
+                        reason=newer_server_stop.reason,
+                    ),
+                }
+            )
+            self._cache_response_locked(
+                effective,
+                agent_run_id=agent_run_id,
+                observed_at=newer_server_stop.at_monotonic,
+            )
+            return effective
+        self._cache_response_locked(
+            response,
+            agent_run_id=agent_run_id,
+            cache_allowed_response=cache_allowed_response,
+        )
+        return response
 
-            if response.mode != BudgetMode.HARD_DENY:
-                self._last_hard_deny_response = None
-                if agent_run_id is not None:
-                    self._run_hard_deny_responses.pop(agent_run_id, None)
-                self._cached_response = None
-                self._cache_expires_at = 0.0
-                return
+    def _cache_response_locked(
+        self,
+        response: BudgetCheckResponse,
+        *,
+        agent_run_id: str | None,
+        cache_allowed_response: bool = True,
+        observed_at: float | None = None,
+    ) -> None:
+        """Mutate cache state while the caller holds ``_state_lock``."""
+        # Always remember the limit for local enforcement fallback
+        self._last_known_budget_limit = response.budget_limit
+        self._last_known_current_usage = response.current_usage
 
-            if response.denied_by_period == "tag":
-                self._last_hard_deny_response = None
-                return
-
-            if response.denied_by_period in _RUN_SCOPED_DENIAL_PERIODS:
-                # A run-cap denial proves every project period passed. A
-                # dashboard stop does not: Core short-circuits stopped runs
-                # before evaluating project periods, so preserve any older
-                # project-period sticky denial in that case.
-                if response.denied_by_period == "agent_run":
-                    self._last_hard_deny_response = None
-                if agent_run_id is None:
-                    # Contract drift left no run identity to scope by. Fall
-                    # back to the safe global posture used before run-scoped
-                    # labels existed: invalidate a cached allow and retain the
-                    # denial unless stronger project-period state already does.
-                    self._cached_response = None
-                    self._cache_expires_at = 0.0
-                    if self._last_hard_deny_response is None:
-                        self._last_hard_deny_response = response
-                    return
+        if response.allowed:
+            self._last_hard_deny_response = None
+            if agent_run_id is not None:
                 self._run_hard_deny_responses.pop(agent_run_id, None)
-                self._run_hard_deny_responses[agent_run_id] = response
-                if len(self._run_hard_deny_responses) > _MAX_STICKY_RUN_DENIALS:
-                    self._run_hard_deny_responses.popitem(last=False)
-                return
+                self._run_hard_deny_observed_at.pop(agent_run_id, None)
+            elif cache_allowed_response:
+                self._cached_response = response
+                self._cache_expires_at = time.monotonic() + self.cache_ttl
+            return
 
+        if response.mode != BudgetMode.HARD_DENY:
+            self._last_hard_deny_response = None
+            if agent_run_id is not None:
+                self._run_hard_deny_responses.pop(agent_run_id, None)
+                self._run_hard_deny_observed_at.pop(agent_run_id, None)
             self._cached_response = None
             self._cache_expires_at = 0.0
-            self._last_hard_deny_response = response
-            # Deny responses are never cached as freshness-skipping allows/denies.
+            return
+
+        if response.denied_by_period == "tag":
+            self._last_hard_deny_response = None
+            return
+
+        if response.denied_by_period in _RUN_SCOPED_DENIAL_PERIODS:
+            # A run-cap denial proves every project period passed. A dashboard
+            # stop does not, so preserve an older project-period sticky denial.
+            if response.denied_by_period == "agent_run":
+                self._last_hard_deny_response = None
+            if agent_run_id is None:
+                # Contract drift left no run identity to scope by. Fall back to
+                # the safe global posture used before run-scoped labels existed.
+                self._cached_response = None
+                self._cache_expires_at = 0.0
+                if self._last_hard_deny_response is None:
+                    self._last_hard_deny_response = response
+                return
+            self._run_hard_deny_responses.pop(agent_run_id, None)
+            self._run_hard_deny_observed_at.pop(agent_run_id, None)
+            self._run_hard_deny_responses[agent_run_id] = response
+            self._run_hard_deny_observed_at[agent_run_id] = (
+                time.monotonic() if observed_at is None else observed_at
+            )
+            if len(self._run_hard_deny_responses) > _MAX_STICKY_RUN_DENIALS:
+                evicted_run_id, _ = self._run_hard_deny_responses.popitem(last=False)
+                self._run_hard_deny_observed_at.pop(evicted_run_id, None)
+            return
+
+        self._cached_response = None
+        self._cache_expires_at = 0.0
+        self._last_hard_deny_response = response
+        # Deny responses are never cached as freshness-skipping allows/denies.
+
+    def _directive_matches_run(
+        self,
+        directive_run_id: str,
+        agent_run_id: str | None,
+    ) -> bool:
+        """Validate an echoed structural run id without applying side effects."""
+        if directive_run_id == agent_run_id:
+            return True
+        logger.warning(
+            "run_control.directive_run_mismatch: request_agent_run_id=%s directive_agent_run_id=%s",
+            agent_run_id,
+            directive_run_id,
+        )
+        return False
+
+    @staticmethod
+    def _run_stopped_lease_response(
+        response: LeaseGrantResponse,
+    ) -> LeaseGrantResponse:
+        """Normalize any directive-bearing lease shape into a hard denial."""
+        return response.model_copy(
+            update={
+                "allowed": False,
+                "denied_by_period": "run_stopped",
+                "lease_id": None,
+                "generation": None,
+                "granted_tokens": None,
+                "refresh_interval_s": None,
+                "lease_length_s": None,
+                "headroom_share_tokens": None,
+                "posture": None,
+                "final_grant": None,
+                "mode": BudgetMode.HARD_DENY,
+            }
+        )
+
+    def _lease_response_for_run(
+        self,
+        response: LeaseGrantResponse,
+        agent_run_id: str,
+        *,
+        warn_on_mismatch: bool,
+    ) -> LeaseGrantResponse:
+        """Strip a misrouted directive while preserving the budget verdict."""
+        directive = response.run_control
+        if directive is None or directive.agent_run_id == agent_run_id:
+            return response
+        if warn_on_mismatch:
+            self._directive_matches_run(directive.agent_run_id, agent_run_id)
+        return response.model_copy(update={"run_control": None})
+
+    @staticmethod
+    def _is_misrouted_control_denial(
+        response: BudgetCheckResponse | LeaseGrantResponse,
+        agent_run_id: str | None,
+    ) -> bool:
+        """Return whether a run-stop verdict belongs to a different run."""
+        directive = response.run_control
+        return (
+            directive is not None
+            and directive.agent_run_id != agent_run_id
+            and response.denied_by_period == "run_stopped"
+        )
+
+    @staticmethod
+    def _first_writer_directive(
+        directive: RunControlDirective,
+        termination: _run_control.RunTermination,
+    ) -> RunControlDirective:
+        """Keep a server directive aligned with the immutable registry winner."""
+        if termination.source != "server" or directive.reason == termination.reason:
+            return directive
+        return directive.model_copy(update={"reason": termination.reason})
+
+    def _apply_check_run_control(
+        self,
+        response: BudgetCheckResponse,
+        agent_run_id: str | None,
+    ) -> tuple[BudgetCheckResponse, bool]:
+        """Return the safe verdict and whether ordinary cache mutation may run."""
+        directive = response.run_control
+        if directive is None:
+            return response, True
+        if not self._directive_matches_run(
+            directive.agent_run_id,
+            agent_run_id,
+        ):
+            if response.denied_by_period == "run_stopped":
+                raise _MisroutedControlDenial
+            # Enforce the budget verdict, but a structurally mismatched echo is
+            # forbidden from mutating any registry/cache/lease state. Strip it
+            # so its reason cannot leak into result attribution either.
+            return response.model_copy(update={"run_control": None}), False
+        agent_run_id = cast(str, agent_run_id)
+
+        # A terminate directive is authoritative even if a drifted server body
+        # says ALLOW (or retains alert_only). Normalize it before caching so it
+        # can neither clear the registry entry nor leave spend authority live.
+        effective = response.model_copy(
+            update={
+                "allowed": False,
+                "reservation_id": None,
+                "mode": BudgetMode.HARD_DENY,
+                "denied_by_period": "run_stopped",
+            }
+        )
+        # Publish the sticky denial before dropping local authority. Once the
+        # drop is visible, another caller cannot race through NEED_GRANT and
+        # reinstall authority in the gap before the sticky response is filed.
+        with _run_control._locked_registry():
+            termination = _run_control._mark_terminated_locked(
+                agent_run_id,
+                reason=directive.reason,
+                source="server",
+            )
+            effective.run_control = self._first_writer_directive(
+                directive,
+                termination,
+            )
+            observed_at = time.monotonic()
+            with self._state_lock:
+                self._cache_response_locked(
+                    effective,
+                    agent_run_id=agent_run_id,
+                    observed_at=observed_at,
+                )
+                state = self._lease.state_for(agent_run_id)
+                if state is not None and state.lease_id is not None:
+                    self._lease.drop_if_current(
+                        agent_run_id,
+                        lease_id=state.lease_id,
+                        generation=state.generation,
+                    )
+        return effective, False
 
     def _build_prior_hard_deny_unavailable_result(
         self,
         agent_run_id: str | None = None,
     ) -> BudgetCheckResult | None:
         """Return a denial if cloud is down after an authoritative hard deny."""
-        with self._state_lock:
-            response = self._last_hard_deny_response
-            if response is None and agent_run_id is not None:
-                response = self._run_hard_deny_responses.get(agent_run_id)
-                if response is not None:
-                    self._run_hard_deny_responses.move_to_end(agent_run_id)
+        with _run_control._locked_registry():
+            retained_termination = (
+                _run_control._outage_termination_locked(agent_run_id)
+                if agent_run_id is not None
+                else None
+            )
+            with self._state_lock:
+                response = self._last_hard_deny_response
+                if response is None and agent_run_id is not None:
+                    response = self._run_hard_deny_responses.get(agent_run_id)
+                    if response is not None:
+                        self._run_hard_deny_responses.move_to_end(agent_run_id)
+                        if agent_run_id in self._run_hard_deny_observed_at:
+                            self._run_hard_deny_observed_at.move_to_end(agent_run_id)
+                budget_limit = self._last_known_budget_limit or 0.0
+                current_usage = self._last_known_current_usage
         if response is None:
-            return None
+            if retained_termination is None:
+                return None
+            logger.warning("Cloud API unreachable; preserving retained run stop")
+            return BudgetCheckResult(
+                allowed=False,
+                remaining_budget=max(0.0, budget_limit - current_usage),
+                mode=BudgetMode.HARD_DENY,
+                warning="Cloud API unreachable; preserving retained run stop",
+                budget_limit=budget_limit,
+                current_usage=current_usage,
+                denied_by_period="run_stopped",
+                deny_source="sticky_replay",
+                deny_reason=retained_termination.reason,
+            )
         # Surfaced on both the sync and async check_budget paths, which both
         # return the preserved denial through this builder. The `warning` field
         # below carries the same text for programmatic callers.
@@ -399,7 +649,13 @@ class _BudgetEnforcerBase:
             current_usage=response.current_usage,
             denied_by_period=response.denied_by_period,
             deny_source="sticky_replay",
-            deny_reason=response.denied_by_period,
+            deny_reason=(
+                response.run_control.reason
+                if response.run_control is not None
+                and agent_run_id is not None
+                and response.run_control.agent_run_id == agent_run_id
+                else response.denied_by_period
+            ),
         )
 
     def _build_unreachable_result(
@@ -505,7 +761,11 @@ class _BudgetEnforcerBase:
             current_usage=response.current_usage,
             denied_by_period=response.denied_by_period,
             deny_source="server",
-            deny_reason=response.denied_by_period,
+            deny_reason=(
+                response.run_control.reason
+                if response.run_control is not None
+                else response.denied_by_period
+            ),
             failover_tuning_allowed=failover_tuning_allowed,
         )
 
@@ -585,12 +845,15 @@ class _BudgetEnforcerBase:
         """
         if agent_run_id is None or not self._lease.enabled:
             return False
-        with self._state_lock:
-            if self._closed:
+        with _run_control._locked_registry():
+            if _run_control._outage_termination_locked(agent_run_id) is not None:
                 return False
-            if self._last_hard_deny_response is not None:
-                return False
-            return agent_run_id not in self._run_hard_deny_responses
+            with self._state_lock:
+                if self._closed:
+                    return False
+                if self._last_hard_deny_response is not None:
+                    return False
+                return agent_run_id not in self._run_hard_deny_responses
 
     def _lease_breaker_open(self) -> bool:
         """Is the control plane BELIEVED unreachable? (inspection, never consumption).
@@ -682,6 +945,7 @@ class _BudgetEnforcerBase:
             fallback_models=list(fallback_models),
             fail_open=self.fail_open,
             estimated_input_tokens=max(0, estimated_input_tokens),
+            run_directive_version="1",
         )
 
     def _claim_grant_work(self, agent_run_id: str) -> int | None:
@@ -706,26 +970,88 @@ class _BudgetEnforcerBase:
         close_epoch: int | None = None,
     ) -> tuple[GrantOutcome, LeaseSurrenderRequest | None]:
         """Install a grant/renew response under the ledger's serialization."""
+        if response.run_control is not None:
+            with _run_control._locked_registry(), self._state_lock:
+                if close_epoch is not None and (self._closed or close_epoch != self._close_epoch):
+                    return GrantOutcome.STALE, self._late_lease_surrender_request(response)
+                if self._is_misrouted_control_denial(response, agent_run_id):
+                    self._directive_matches_run(
+                        response.run_control.agent_run_id,
+                        agent_run_id,
+                    )
+                    return GrantOutcome.MALFORMED, None
+                effective = self._lease_response_for_run(
+                    response,
+                    agent_run_id,
+                    warn_on_mismatch=True,
+                )
+                directive = effective.run_control
+                if directive is not None:
+                    termination = _run_control._mark_terminated_locked(
+                        agent_run_id,
+                        reason=directive.reason,
+                        source="server",
+                    )
+                    effective.run_control = self._first_writer_directive(
+                        directive,
+                        termination,
+                    )
+                    directed_denial = self._run_stopped_lease_response(effective)
+                    self._cache_response_locked(
+                        self._lease_denial_response(directed_denial),
+                        agent_run_id=agent_run_id,
+                        observed_at=time.monotonic(),
+                    )
+                    state = self._lease.state_for(agent_run_id)
+                    if state is not None and state.lease_id is not None:
+                        self._lease.drop_if_current(
+                            agent_run_id,
+                            lease_id=state.lease_id,
+                            generation=state.generation,
+                        )
+                    return GrantOutcome.DENIED, None
+                return self._apply_ordinary_lease_response_locked(
+                    agent_run_id,
+                    effective,
+                    declared_models,
+                    renewal_request=renewal_request,
+                ), None
+
         with self._state_lock:
             if close_epoch is not None and (self._closed or close_epoch != self._close_epoch):
                 return GrantOutcome.STALE, self._late_lease_surrender_request(response)
-            outcome = self._lease.apply_grant_response(
+            outcome = self._apply_ordinary_lease_response_locked(
                 agent_run_id,
                 response,
-                now=time.monotonic(),
-                declared_models=declared_models,
-                expected_lease_id=(
-                    renewal_request.lease_id if renewal_request is not None else None
-                ),
-                expected_generation=(
-                    renewal_request.generation if renewal_request is not None else None
-                ),
+                declared_models,
+                renewal_request=renewal_request,
             )
-            if outcome is GrantOutcome.APPLIED:
-                # Live authority again: the uncounted episode is over, so the
-                # next lease death warns on entry as loudly as this one did.
-                self._uncounted_episodes.pop(agent_run_id, None)
-            return outcome, None
+        return outcome, None
+
+    def _apply_ordinary_lease_response_locked(
+        self,
+        agent_run_id: str,
+        response: LeaseGrantResponse,
+        declared_models: Sequence[str],
+        *,
+        renewal_request: LeaseRenewRequest | None,
+    ) -> GrantOutcome:
+        """Apply a directive-free response while ``_state_lock`` is held."""
+        outcome = self._lease.apply_grant_response(
+            agent_run_id,
+            response,
+            now=time.monotonic(),
+            declared_models=declared_models,
+            expected_lease_id=(renewal_request.lease_id if renewal_request is not None else None),
+            expected_generation=(
+                renewal_request.generation if renewal_request is not None else None
+            ),
+        )
+        if outcome is GrantOutcome.APPLIED:
+            # Live authority again: the uncounted episode is over, so the next
+            # lease death warns on entry as loudly as this one did.
+            self._uncounted_episodes.pop(agent_run_id, None)
+        return outcome
 
     def _classify_lease_failure(
         self,
@@ -804,7 +1130,14 @@ class _BudgetEnforcerBase:
         self, agent_run_id: str, response: LeaseGrantResponse
     ) -> BudgetCheckResult:
         """Feed a lease denial through the shared run/global sticky classification."""
-        denial = BudgetCheckResponse(
+        denial = self._lease_denial_response(response)
+        self._cache_response(denial, agent_run_id=agent_run_id)
+        return self._build_result_from_response(denial)
+
+    @staticmethod
+    def _lease_denial_response(response: LeaseGrantResponse) -> BudgetCheckResponse:
+        """Project a lease denial onto the shared check-response cache shape."""
+        return BudgetCheckResponse(
             allowed=False,
             remaining_budget=response.remaining_budget,
             reservation_id=None,
@@ -813,9 +1146,8 @@ class _BudgetEnforcerBase:
             current_usage=response.current_usage,
             denied_by_period=response.denied_by_period,
             project_id=response.project_id,
+            run_control=response.run_control,
         )
-        self._cache_response(denial, agent_run_id=agent_run_id)
-        return self._build_result_from_response(denial)
 
     def _result_from_admission(
         self, agent_run_id: str, admission: LeaseAdmission
@@ -1072,6 +1404,92 @@ class _BudgetEnforcerBase:
         close_epoch: int | None = None,
     ) -> LeaseSurrenderRequest | None:
         """Apply a fenced renewal or return a successor that close must release."""
+        if response.run_control is not None:
+            with _run_control._locked_registry(), self._state_lock:
+                if close_epoch is not None and (self._closed or close_epoch != self._close_epoch):
+                    spent_tokens = self._late_renewal_spend.pop(
+                        (agent_run_id, request.lease_id, request.generation),
+                        0,
+                    )
+                    return self._late_lease_surrender_request(
+                        response,
+                        spent_tokens=spent_tokens,
+                    )
+
+                state = self._lease.state_for(agent_run_id)
+                if (
+                    state is None
+                    or state.lease_id != request.lease_id
+                    or state.generation != request.generation
+                ):
+                    return None
+
+                if self._is_misrouted_control_denial(response, agent_run_id):
+                    self._directive_matches_run(
+                        response.run_control.agent_run_id,
+                        agent_run_id,
+                    )
+                    self._lease.renewal_failed(
+                        agent_run_id,
+                        time.monotonic(),
+                        expected_lease_id=request.lease_id,
+                        expected_generation=request.generation,
+                    )
+                    breaker = self._control_plane_breaker
+                    if breaker is not None:
+                        breaker.record_failure()
+                    return None
+
+                effective = self._lease_response_for_run(
+                    response,
+                    agent_run_id,
+                    warn_on_mismatch=True,
+                )
+                directive = effective.run_control
+                if directive is not None:
+                    termination = _run_control._mark_terminated_locked(
+                        agent_run_id,
+                        reason=directive.reason,
+                        source="server",
+                    )
+                    effective.run_control = self._first_writer_directive(
+                        directive,
+                        termination,
+                    )
+                    directed_denial = self._run_stopped_lease_response(effective)
+                    self._cache_response_locked(
+                        self._lease_denial_response(directed_denial),
+                        agent_run_id=agent_run_id,
+                        observed_at=time.monotonic(),
+                    )
+                    self._lease.drop_if_current(
+                        agent_run_id,
+                        lease_id=request.lease_id,
+                        generation=request.generation,
+                    )
+                    return None
+
+                outcome = self._apply_ordinary_lease_response_locked(
+                    agent_run_id,
+                    effective,
+                    declared_models,
+                    renewal_request=request,
+                )
+                if outcome is GrantOutcome.STALE:
+                    self._lease.renewal_failed(
+                        agent_run_id,
+                        time.monotonic(),
+                        expected_lease_id=request.lease_id,
+                        expected_generation=request.generation,
+                    )
+                elif outcome is GrantOutcome.DENIED:
+                    self._cache_response_locked(
+                        self._lease_denial_response(effective),
+                        agent_run_id=agent_run_id,
+                        observed_at=time.monotonic(),
+                    )
+                return None
+
         with self._state_lock:
             if close_epoch is not None and (self._closed or close_epoch != self._close_epoch):
                 spent_tokens = self._late_renewal_spend.pop(
@@ -1083,17 +1501,24 @@ class _BudgetEnforcerBase:
                     spent_tokens=spent_tokens,
                 )
 
-            outcome = self._lease.apply_grant_response(
+            # Fence the response BEFORE observing its directive. A late reply
+            # from lease A must not be able to terminate a run now operating
+            # under replacement B.
+            state = self._lease.state_for(agent_run_id)
+            if (
+                state is None
+                or state.lease_id != request.lease_id
+                or state.generation != request.generation
+            ):
+                return None
+
+            outcome = self._apply_ordinary_lease_response_locked(
                 agent_run_id,
                 response,
-                now=time.monotonic(),
-                declared_models=declared_models,
-                expected_lease_id=request.lease_id,
-                expected_generation=request.generation,
+                declared_models,
+                renewal_request=request,
             )
-            if outcome is GrantOutcome.APPLIED:
-                self._uncounted_episodes.pop(agent_run_id, None)
-            elif outcome is GrantOutcome.STALE:
+            if outcome is GrantOutcome.STALE:
                 # A duplicate-generation response for the still-current lease
                 # needs a backoff; an origin-stale response no-ops by fence.
                 self._lease.renewal_failed(
@@ -1138,13 +1563,24 @@ class _BudgetEnforcerBase:
             declared_models,
             close_epoch=close_epoch,
         )
+        effective = self._lease_response_for_run(
+            response,
+            agent_run_id,
+            warn_on_mismatch=False,
+        )
         if late_surrender is not None:
-            return "legacy", response, late_surrender
+            return "legacy", effective, late_surrender
         if outcome is GrantOutcome.APPLIED:
-            return "applied", response, None
+            return "applied", effective, None
         if outcome is GrantOutcome.DENIED:
-            return "denied", response, None
-        return "legacy", response, None
+            if effective.run_control is not None:
+                effective = self._run_stopped_lease_response(effective)
+            return "denied", effective, None
+        if outcome is GrantOutcome.MALFORMED and self._is_misrouted_control_denial(
+            response, agent_run_id
+        ):
+            return "unreachable", None, None
+        return "legacy", effective, None
 
     def _auth_headers(self) -> dict[str, str]:
         """Return authorization headers for cloud API requests."""
@@ -1422,6 +1858,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             # ── Phase 1: transport + HTTP status. Failures here are OUTAGE
             # semantics — unchanged from before the split.
             try:
+                request_epoch = time.monotonic()
                 if timeout is not None:
                     resp = self._http.post(
                         f"{self.api_url}/api/v1/budgets/check",
@@ -1466,11 +1903,25 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 )
                 return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
 
-            self._cache_response(
-                cloud_response,
-                agent_run_id=agent_run_id,
-                cache_allowed_response=tags is None,
-            )
+            try:
+                cloud_response, cache_response = self._apply_check_run_control(
+                    cloud_response,
+                    agent_run_id,
+                )
+            except _MisroutedControlDenial:
+                if breaker is not None:
+                    breaker.record_failure()
+                return self._build_unreachable_result(
+                    estimated_input_tokens,
+                    agent_run_id,
+                )
+            if cache_response:
+                cloud_response = self._cache_response(
+                    cloud_response,
+                    agent_run_id=agent_run_id,
+                    cache_allowed_response=tags is None,
+                    request_epoch=request_epoch,
+                )
             if breaker is not None:
                 breaker.record_success()
             return self._build_result_from_response(cloud_response)
@@ -1629,8 +2080,6 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             except Exception as exc:
                 return self._classify_lease_failure(exc, agent_run_id), None
 
-            if breaker is not None:
-                breaker.record_success()
             verdict, response, late_surrender = self._install_grant(
                 agent_run_id,
                 resp,
@@ -1639,6 +2088,11 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             )
             if late_surrender is not None:
                 self._surrender_late_renewal(late_surrender)
+            if breaker is not None:
+                if verdict == "unreachable":
+                    breaker.record_failure()
+                else:
+                    breaker.record_success()
             return verdict, response
         finally:
             if breaker is not None:
@@ -2005,6 +2459,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             # ── Phase 1: transport + HTTP status. Failures here are OUTAGE
             # semantics — unchanged from before the split.
             try:
+                request_epoch = time.monotonic()
                 if timeout is not None:
                     resp = await self._http.post(
                         f"{self.api_url}/api/v1/budgets/check",
@@ -2049,11 +2504,25 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 )
                 return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
 
-            self._cache_response(
-                cloud_response,
-                agent_run_id=agent_run_id,
-                cache_allowed_response=tags is None,
-            )
+            try:
+                cloud_response, cache_response = self._apply_check_run_control(
+                    cloud_response,
+                    agent_run_id,
+                )
+            except _MisroutedControlDenial:
+                if breaker is not None:
+                    breaker.record_failure()
+                return self._build_unreachable_result(
+                    estimated_input_tokens,
+                    agent_run_id,
+                )
+            if cache_response:
+                cloud_response = self._cache_response(
+                    cloud_response,
+                    agent_run_id=agent_run_id,
+                    cache_allowed_response=tags is None,
+                    request_epoch=request_epoch,
+                )
             if breaker is not None:
                 breaker.record_success()
             return self._build_result_from_response(cloud_response)
@@ -2202,8 +2671,6 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             except Exception as exc:
                 return self._classify_lease_failure(exc, agent_run_id), None
 
-            if breaker is not None:
-                breaker.record_success()
             verdict, response, late_surrender = self._install_grant(
                 agent_run_id,
                 resp,
@@ -2212,6 +2679,11 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             )
             if late_surrender is not None:
                 await self._surrender_late_renewal(late_surrender)
+            if breaker is not None:
+                if verdict == "unreachable":
+                    breaker.record_failure()
+                else:
+                    breaker.record_success()
             return verdict, response
         finally:
             if breaker is not None:
