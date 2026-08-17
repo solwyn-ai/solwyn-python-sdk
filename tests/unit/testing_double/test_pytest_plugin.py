@@ -14,6 +14,7 @@ from solwyn.testing import FakeControlPlane
 pytest_plugins = ["pytester"]
 
 _README = Path(__file__).parents[3] / "README.md"
+_CHANGELOG = Path(__file__).parents[3] / "CHANGELOG.md"
 _README_SECTION = "## Testing your budget enforcement"
 _SNIPPET_PATTERN = re.compile(
     r"<!-- test-double-snippet:(?P<name>[a-z-]+) -->\n"
@@ -151,6 +152,16 @@ def test_readme_testing_guide_has_complete_boundary_and_magic_table() -> None:
         "solwyn-test/lease-ineligible",
     ):
         assert f"`{magic_model}`" in section
+
+
+@pytest.mark.unit
+def test_changelog_distinguishes_migrated_sdk_behavior_from_live_state() -> None:
+    unreleased = _CHANGELOG.read_text().partition("## [Unreleased]")[2].partition("\n## [")[0]
+
+    assert "SDK-behavior integration" in unreleased
+    assert "zero-network CI lane" in unreleased
+    assert "live integration retains" in unreleased
+    assert "deployed server-state coverage" in unreleased
 
 
 @pytest.mark.unit
