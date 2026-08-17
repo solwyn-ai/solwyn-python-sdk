@@ -714,6 +714,12 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `agent_run_name` | `str \| None` | Run name passed to `solwyn.run(...)`, if any |
 | `provider_region` | `str \| None` | Cloud region of the serving endpoint (Bedrock — pricing is per model and region); omitted for other providers |
 | `tags` | `object \| None` | Optional explicit customer-supplied tags from `solwyn.run(..., tags=...)` and `solwyn_tags=`. Never inferred from prompts or responses; omitted when empty or unset |
+| `deny_source` | `str \| None` | Structural denial source (`server`, sticky/local enforcement sources, or `aggregate_replay`) |
+| `deny_reason` | `str \| None` | Bounded structural reason for a denied call; never derived from content |
+| `denied_by_period` | `str \| None` | Budget period that denied the call, when supplied by the control plane |
+| `estimated_output_bound` | `int \| None` | Output-token bound used for the denied pre-flight |
+| `velocity_flags` | `list[str] \| None` | Content-free v1 rule names: `repeat_size`, `monotonic_growth`, and `rate_acceleration` |
+| `receipt_aggregate_count` | `int \| None` | Number of denied receipts represented by a content-free aggregate replay |
 
 **The SDK never captures, logs, or transmits prompts or responses.** Explicit customer-supplied tags are outside this zero-content guarantee and are transmitted as provided. Prompt and response privacy is enforced by [structural tests](tests/unit/test_privacy_firewall.py) and the [privacy module](src/solwyn/_privacy.py).
 

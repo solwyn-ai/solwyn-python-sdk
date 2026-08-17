@@ -54,6 +54,29 @@ class TestEmitWithActiveRun:
         assert event.agent_run_name is None
         assert event.tags is None
 
+    def test_denial_receipt_velocity_flags_are_defensively_copied(self) -> None:
+        base = _make_base()
+        flags = ["repeat_size"]
+
+        event = base._build_metadata_event(
+            model="gpt-5.5",
+            provider="openai",
+            input_tokens=10,
+            output_tokens=0,
+            token_details=None,
+            latency_ms=0.0,
+            status=CallStatus.BUDGET_DENIED,
+            is_model_fallback=False,
+            call_id=call_uuid("call_receipt_copy"),
+            deny_source="local_velocity",
+            deny_reason="velocity:repeat_size",
+            estimated_output_bound=512,
+            velocity_flags=flags,
+        )
+        flags.append("monotonic_growth")
+
+        assert event.velocity_flags == ["repeat_size"]
+
     def test_inside_scope_fields_are_set(self) -> None:
         base = _make_base()
         with solwyn.run("nightly-batch", tags={"team": "research"}) as run_id:

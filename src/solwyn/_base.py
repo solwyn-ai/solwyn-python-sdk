@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn, TypedDict, cast
@@ -55,11 +55,13 @@ from solwyn._surfaces import (
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
     CallStatus,
+    DenySource,
     FailoverReason,
     MediaUsage,
     MetadataEvent,
     Modality,
     ProviderName,
+    VelocityFlag,
 )
 from solwyn._velocity import VelocityConfig, VelocityMonitor
 from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
@@ -1653,6 +1655,12 @@ class _SolwynBase:
         provider_region: str | None = None,
         modality: Modality = "text",
         media_usage: MediaUsage | None = None,
+        deny_source: DenySource | None = None,
+        deny_reason: str | None = None,
+        denied_by_period: str | None = None,
+        estimated_output_bound: int | None = None,
+        velocity_flags: Collection[str] | None = None,
+        receipt_aggregate_count: int | None = None,
     ) -> MetadataEvent:
         """Build a MetadataEvent for reporting to the cloud API.
 
@@ -1697,6 +1705,15 @@ class _SolwynBase:
             call_id=call_id,
             provider_region=provider_region,
             tags=tags,
+            deny_source=deny_source,
+            deny_reason=deny_reason,
+            denied_by_period=denied_by_period,
+            estimated_output_bound=estimated_output_bound,
+            velocity_flags=cast(
+                "list[VelocityFlag] | None",
+                list(velocity_flags) if velocity_flags else None,
+            ),
+            receipt_aggregate_count=receipt_aggregate_count,
         )
 
     def _build_error_event(

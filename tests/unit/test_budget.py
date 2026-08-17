@@ -9,6 +9,7 @@ import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 from pydantic import BaseModel
 
+from solwyn._lease import LeaseAdmission, LeaseDecision
 from solwyn._run_control import (
     clear_run_termination,
     mark_terminated,
@@ -1337,6 +1338,8 @@ class TestBudgetCheckResult:
         assert result.mode == BudgetMode.ALERT_ONLY
         assert result.warning is None
         assert result.denied_by_period is None
+        assert result.deny_source is None
+        assert result.deny_reason is None
         assert result.failover_tuning_allowed is None
 
     def test_all_fields(self) -> None:
@@ -1352,6 +1355,103 @@ class TestBudgetCheckResult:
         assert result.reservation_id == "res_456"
         assert result.mode == BudgetMode.HARD_DENY
         assert result.denied_by_period == "run_stopped"
+
+
+@pytest.mark.unit
+class TestDenialReceiptAttribution:
+    """Every sans-I/O denial builder stamps its structural source."""
+
+    def test_live_hard_deny_is_server_attributed_with_exact_period(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+
+        result = base._build_result_from_response(
+            BudgetCheckResponse.model_validate(_STOPPED_RUN_DENY_RESPONSE)
+        )
+
+        assert (result.deny_source, result.deny_reason, result.denied_by_period) == (
+            "server",
+            "run_stopped",
+            "run_stopped",
+        )
+
+    @pytest.mark.parametrize("payload", [ALLOW_BUDGET_RESPONSE, _ALERT_ONLY_DENY_RESPONSE])
+    def test_allowed_result_has_no_denial_attribution(self, payload: dict[str, object]) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+
+        result = base._build_result_from_response(BudgetCheckResponse.model_validate(payload))
+
+        assert result.allowed is True
+        assert result.deny_source is None
+        assert result.deny_reason is None
+
+    def test_sticky_replay_preserves_exact_period_and_reason(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+        response = BudgetCheckResponse.model_validate(_STOPPED_RUN_DENY_RESPONSE)
+        base._cache_response(response, agent_run_id="run_a")
+
+        result = base._build_prior_hard_deny_unavailable_result("run_a")
+
+        assert result is not None
+        assert (result.deny_source, result.deny_reason, result.denied_by_period) == (
+            "sticky_replay",
+            "run_stopped",
+            "run_stopped",
+        )
+
+    def test_fail_closed_local_builders_use_structural_reasons(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+            fail_open=False,
+        )
+
+        cold = base._build_local_enforcement_result(estimated_input_tokens=10)
+        base._last_known_budget_limit = 1.0
+        base._track_local_cost(1.0)
+        exhausted = base._build_local_enforcement_result(estimated_input_tokens=10)
+
+        assert (cold.allowed, cold.deny_source, cold.deny_reason) == (
+            False,
+            "local_enforcement",
+            "no_prior_budget_limit",
+        )
+        assert (exhausted.allowed, exhausted.deny_source, exhausted.deny_reason) == (
+            False,
+            "local_enforcement",
+            "local_budget_exceeded",
+        )
+        assert cold.denied_by_period is None
+        assert exhausted.denied_by_period is None
+
+    def test_lease_ladder_terminal_deny_preserves_reason_and_period(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+
+        result = base._result_from_admission(
+            "run_a",
+            LeaseAdmission(
+                LeaseDecision.DENY,
+                mode=BudgetMode.HARD_DENY,
+                reason="lease_share_exhausted",
+            ),
+        )
+
+        assert (result.deny_source, result.deny_reason, result.denied_by_period) == (
+            "lease_exhausted",
+            "lease_share_exhausted",
+            "agent_run",
+        )
 
 
 # ---------------------------------------------------------------------------

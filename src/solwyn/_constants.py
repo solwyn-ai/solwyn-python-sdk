@@ -29,3 +29,6 @@ CALL_ID_MAX_LENGTH = 36
 TAGS_MAX_KEYS = 10
 TAG_KEY_MAX_LENGTH = 64
 TAG_VALUE_MAX_LENGTH = 256
+# Vendored lock-step with Core's durable receipt columns and per-event
+# anti-abuse ceiling. Larger receipt folds are split into multiple wire events.
+ORDINARY_TOKEN_COUNT_MAX = 100_000_000

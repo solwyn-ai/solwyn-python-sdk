@@ -42,6 +42,7 @@ from solwyn._types import (
     BudgetConfirmRequest,
     BudgetMode,
     CircuitState,
+    DenySource,
     LeaseGrantRequest,
     LeaseGrantResponse,
     LeaseRenewRequest,
@@ -132,6 +133,8 @@ class BudgetCheckResult(BaseModel):
     budget_limit: float = 0.0
     current_usage: float = 0.0
     denied_by_period: str | None = None
+    deny_source: DenySource | None = None
+    deny_reason: str | None = None
     # PJ-2: set when the call drew on LEASE authority instead of a per-call
     # reservation. Exactly one of reservation_id / lease_id ever settles a call.
     lease_id: str | None = None
@@ -395,6 +398,8 @@ class _BudgetEnforcerBase:
             budget_limit=response.budget_limit,
             current_usage=response.current_usage,
             denied_by_period=response.denied_by_period,
+            deny_source="sticky_replay",
+            deny_reason=response.denied_by_period,
         )
 
     def _build_unreachable_result(
@@ -499,6 +504,8 @@ class _BudgetEnforcerBase:
             budget_limit=response.budget_limit,
             current_usage=response.current_usage,
             denied_by_period=response.denied_by_period,
+            deny_source="server",
+            deny_reason=response.denied_by_period,
             failover_tuning_allowed=failover_tuning_allowed,
         )
 
@@ -532,6 +539,8 @@ class _BudgetEnforcerBase:
                     "Cloud unreachable and no prior budget limit known; "
                     "denying request (fail-closed)"
                 ),
+                deny_source="local_enforcement",
+                deny_reason="no_prior_budget_limit",
             )
 
         limit = self._last_known_budget_limit
@@ -550,6 +559,8 @@ class _BudgetEnforcerBase:
                 ),
                 budget_limit=limit,
                 current_usage=current,
+                deny_source="local_enforcement",
+                deny_reason="local_budget_exceeded",
             )
 
         # Within local limit
@@ -833,6 +844,8 @@ class _BudgetEnforcerBase:
             budget_limit=snapshot.budget_limit if snapshot is not None else 0.0,
             current_usage=snapshot.current_usage if snapshot is not None else 0.0,
             denied_by_period=("agent_run" if admission.decision is LeaseDecision.DENY else None),
+            deny_source=("lease_exhausted" if admission.decision is LeaseDecision.DENY else None),
+            deny_reason=(admission.reason if admission.decision is LeaseDecision.DENY else None),
         )
 
     def _lease_result_when_breaker_refuses(

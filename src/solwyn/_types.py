@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, TypeAlias, cast
 
 from pydantic import (
     BaseModel,
@@ -33,6 +33,7 @@ from solwyn._constants import (
     HOLDER_ID_MAX_LENGTH,
     LEASE_ID_MAX_LENGTH,
     MODEL_NAME_MAX_LENGTH,
+    ORDINARY_TOKEN_COUNT_MAX,
     PROVIDER_REGION_MAX_LENGTH,
     SERVICE_TIER_MAX_LENGTH,
     TAG_KEY_MAX_LENGTH,
@@ -42,6 +43,21 @@ from solwyn._constants import (
 from solwyn._token_details import TokenDetails
 
 # ── Enums ────────────────────────────────────────────────────────────────
+
+DenySource: TypeAlias = Literal[
+    "server",
+    "sticky_replay",
+    "local_enforcement",
+    "lease_exhausted",
+    "local_velocity",
+    "run_terminated",
+    "aggregate_replay",
+]
+VelocityFlag: TypeAlias = Literal[
+    "repeat_size",
+    "monotonic_growth",
+    "rate_acceleration",
+]
 
 
 class BudgetMode(StrEnum):
@@ -257,19 +273,27 @@ class MediaUsage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     image_count: int | None = Field(
-        default=None, ge=0, description="Images generated/edited (per_image unit)"
+        default=None,
+        ge=0,
+        le=100_000_000,
+        description="Images generated/edited (per_image unit)",
     )
     generation_count: int | None = Field(
         default=None,
         ge=0,
+        le=100_000_000,
         description="Discrete generations for per_video / per_generation / per_song units",
     )
     video_seconds: float | None = Field(
-        default=None, ge=0, description="Video duration in seconds (per_second / per_minute units)"
+        default=None,
+        ge=0,
+        le=100_000_000,
+        description="Video duration in seconds (per_second / per_minute units)",
     )
     audio_seconds: float | None = Field(
         default=None,
         ge=0,
+        le=100_000_000,
         description=(
             "Audio duration in seconds (fractional; e.g. whisper verbose_json usage.seconds)"
         ),
@@ -277,6 +301,7 @@ class MediaUsage(BaseModel):
     input_characters: int | None = Field(
         default=None,
         ge=0,
+        le=100_000_000,
         description=(
             "TTS input character count (per_*_chars units; length measured in the firewall)"
         ),
@@ -337,8 +362,12 @@ class MetadataEvent(BaseModel):
             "per-modality cards land."
         ),
     )
-    input_tokens: int = Field(..., ge=0, description="Input token count")
-    output_tokens: int = Field(..., ge=0, description="Output token count")
+    input_tokens: int = Field(
+        ..., ge=0, le=ORDINARY_TOKEN_COUNT_MAX, description="Input token count"
+    )
+    output_tokens: int = Field(
+        ..., ge=0, le=ORDINARY_TOKEN_COUNT_MAX, description="Output token count"
+    )
     token_details: TokenDetails | None = Field(
         None, description="Full token breakdown from provider adapter"
     )
@@ -429,6 +458,37 @@ class MetadataEvent(BaseModel):
             "Explicit customer-supplied metadata for grouping and export. "
             "Never derived from prompts or responses."
         ),
+    )
+    deny_source: DenySource | None = Field(
+        default=None,
+        description="Structural source of a denied-call receipt.",
+    )
+    deny_reason: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Bounded structural denial reason; never derived from content.",
+    )
+    denied_by_period: str | None = Field(
+        default=None,
+        max_length=32,
+        description="Budget period responsible for a denial, when available.",
+    )
+    estimated_output_bound: int | None = Field(
+        default=None,
+        ge=0,
+        le=ORDINARY_TOKEN_COUNT_MAX,
+        description="Exact output-token bound used by the corresponding pre-flight.",
+    )
+    velocity_flags: list[VelocityFlag] | None = Field(
+        default=None,
+        max_length=8,
+        description="Content-free velocity rule names observed for this call.",
+    )
+    receipt_aggregate_count: int | None = Field(
+        default=None,
+        ge=1,
+        le=ORDINARY_TOKEN_COUNT_MAX,
+        description="Number of receipts represented by an aggregate replay event.",
     )
 
 
