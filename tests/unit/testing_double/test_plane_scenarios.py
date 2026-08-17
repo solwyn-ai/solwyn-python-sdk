@@ -333,6 +333,45 @@ async def test_slow_request_keeps_read_only_after_contexts_exit_during_sleep() -
 
 
 @pytest.mark.unit
+def test_outage_short_circuits_a_slow_window_without_spending_its_budget() -> None:
+    plane = FakeControlPlane()
+    slept: list[float] = []
+
+    with (
+        httpx.Client(transport=plane.transport) as client,
+        patch("solwyn.testing._transport.time.sleep", side_effect=slept.append),
+        plane.slow(0.5, path="/api/v1/budgets/check", requests=1),
+    ):
+        with plane.outage(requests=1):
+            started = time.monotonic()
+            with pytest.raises(httpx.ConnectError, match="scripted outage"):
+                _post_check(client, plane)
+            outage_elapsed = time.monotonic() - started
+        delayed = _post_check(client, plane)
+
+    assert outage_elapsed < 0.25
+    assert slept == [0.5]
+    assert delayed.status_code == 200
+    assert len(plane.checks) == 1
+
+
+@pytest.mark.unit
+def test_nested_identical_scenarios_remove_their_own_window_on_exit() -> None:
+    """Window removal is identity-based, so equal-valued windows never swap."""
+    plane = FakeControlPlane()
+
+    with plane.outage(requests=1):
+        outer_windows = list(plane._scenario_windows)
+        with plane.outage(requests=1):
+            nested_depth = len(plane._scenario_windows)
+        surviving = list(plane._scenario_windows)
+
+    assert nested_depth == 2
+    assert [id(window) for window in surviving] == [id(window) for window in outer_windows]
+    assert plane._scenario_windows == []
+
+
+@pytest.mark.unit
 def test_read_only_returns_the_sdk_recognized_403_shape() -> None:
     plane = FakeControlPlane()
 

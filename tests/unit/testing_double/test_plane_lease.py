@@ -189,10 +189,15 @@ _AsyncOpenAIStub.__name__ = "AsyncOpenAI"
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("granted_tokens", [0, -1])
-def test_plane_rejects_non_positive_lease_grants(granted_tokens: int) -> None:
-    with pytest.raises(ValueError, match="granted_tokens must be greater than zero"):
-        FakeControlPlane(granted_tokens=granted_tokens)
+def test_plane_rejects_negative_lease_grants() -> None:
+    with pytest.raises(ValueError, match="granted_tokens must not be negative"):
+        FakeControlPlane(granted_tokens=-1)
+
+
+@pytest.mark.unit
+def test_plane_rejects_a_negative_headroom_share() -> None:
+    with pytest.raises(ValueError, match="headroom_share_tokens must not be negative"):
+        FakeControlPlane(headroom_share_tokens=-1)
 
 
 @pytest.mark.unit
@@ -237,6 +242,82 @@ def test_plane_accepts_positive_lease_configuration_boundaries() -> None:
     assert response.json()["granted_tokens"] == 1
     assert response.json()["refresh_interval_s"] == 0.5
     assert response.json()["lease_length_s"] == 1.0
+
+
+@pytest.mark.unit
+def test_zero_token_grant_keeps_the_full_wire_shape_for_an_alert_only_cap() -> None:
+    plane = FakeControlPlane(granted_tokens=0)
+
+    with httpx.Client(transport=plane.transport) as client:
+        response = _post_grant(client, plane)
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload.keys() >= LEASE_BLOCK_KEYS
+    assert payload["eligible"] is True
+    assert payload["allowed"] is True
+    assert payload["granted_tokens"] == 0
+    assert payload["headroom_share_tokens"] == 0
+    assert LeaseGrantResponse.model_validate(payload).granted_tokens == 0
+
+
+@pytest.mark.unit
+def test_zero_token_grant_routes_the_real_enforcer_to_the_per_call_check() -> None:
+    plane = FakeControlPlane(granted_tokens=0)
+    enforcer = _make_enforcer(plane)
+
+    result = _check(enforcer)
+    enforcer.close()
+
+    assert result.allowed is True  # type: ignore[attr-defined]
+    assert result.lease_id is None  # type: ignore[attr-defined]
+    assert len(plane.lease_grants) == 1
+    assert len(plane.checks) == 1
+
+
+@pytest.mark.unit
+def test_headroom_share_tokens_is_sized_independently_of_the_grant() -> None:
+    plane = FakeControlPlane(granted_tokens=1_000, headroom_share_tokens=250)
+
+    with httpx.Client(transport=plane.transport) as client:
+        response = _post_grant(client, plane)
+
+    payload = response.json()
+    assert payload["granted_tokens"] == 1_000
+    assert payload["headroom_share_tokens"] == 250
+
+
+@pytest.mark.unit
+def test_final_grant_is_emitted_on_grant_and_renewal_for_the_ledger_wind_down() -> None:
+    plane = FakeControlPlane(final_grant=True)
+
+    with httpx.Client(transport=plane.transport) as client:
+        grant = _post_grant(client, plane).json()
+        renewed = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=LeaseRenewRequest(
+                lease_id=grant["lease_id"],
+                holder_id="holder-1",
+                generation=grant["generation"],
+            ).model_dump(mode="json"),
+        ).json()
+
+    assert grant["final_grant"] is True
+    assert renewed["generation"] == 2
+    assert renewed["final_grant"] is True
+
+
+@pytest.mark.unit
+def test_final_grant_reaches_the_real_lease_ledger_state() -> None:
+    plane = FakeControlPlane(final_grant=True)
+    enforcer = _make_enforcer(plane)
+
+    _check(enforcer)
+    state = enforcer._lease.state_for("run-lease")
+    enforcer.close()
+
+    assert state is not None
+    assert state.final_grant is True
 
 
 @pytest.mark.unit
@@ -509,6 +590,34 @@ def test_incomplete_renewal_redeclaration_is_ignored(
     assert narrow_replay.content == renewed.content
     assert widened_conflict.status_code == 409
     assert widened_conflict.json()["detail"]["code"] == "lease_holder_cap_exceeded"
+
+
+@pytest.mark.unit
+def test_renewal_verdict_covers_the_union_of_declared_and_redeclared_models() -> None:
+    plane = FakeControlPlane()
+
+    with httpx.Client(transport=plane.transport) as client:
+        grant = _post_grant(
+            client,
+            plane,
+            run_id="run-union",
+            model="solwyn-test/runaway",
+        ).json()
+        renewed = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=LeaseRenewRequest(
+                lease_id=grant["lease_id"],
+                holder_id="holder-1",
+                generation=grant["generation"],
+                model="gpt-5.5",
+                provider=ProviderName.OPENAI,
+            ).model_dump(mode="json"),
+        ).json()
+
+    assert grant["allowed"] is True
+    assert renewed["allowed"] is False
+    assert renewed["denied_by_period"] == "agent_run"
+    assert LEASE_BLOCK_KEYS.isdisjoint(renewed)
 
 
 @pytest.mark.unit
@@ -1442,6 +1551,75 @@ def test_lease_refusal_has_core_shape_and_real_enforcer_uses_legacy_check(
     assert refused.status_code == status
     assert refused.json() == {"detail": {"code": code, "message": message}}
     assert recovered.status_code == 200
+
+
+@pytest.mark.unit
+def test_holder_cap_refusal_matches_grants_only_and_spends_no_other_budget() -> None:
+    plane = FakeControlPlane()
+
+    with httpx.Client(transport=plane.transport) as client:
+        grant = _post_grant(client, plane).json()
+        with plane.refuse_leases(status=409, code="lease_holder_cap_exceeded", requests=1):
+            renewed = client.post(
+                f"{plane.api_url}/api/v1/budgets/lease/renew",
+                json=LeaseRenewRequest(
+                    lease_id=grant["lease_id"],
+                    holder_id="holder-1",
+                    generation=grant["generation"],
+                ).model_dump(mode="json"),
+            )
+            surrendered = client.post(
+                f"{plane.api_url}/api/v1/budgets/lease/surrender",
+                json=LeaseSurrenderRequest(
+                    lease_id=grant["lease_id"],
+                    holder_id="holder-1",
+                    generation=renewed.json()["generation"],
+                ).model_dump(mode="json"),
+            )
+            refused = _post_grant(client, plane, run_id="run-capped")
+            recovered = _post_grant(client, plane, run_id="run-after-cap")
+
+    assert renewed.status_code == 200
+    assert surrendered.status_code == 200
+    assert surrendered.json()["released_tokens"] > 0
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "lease_holder_cap_exceeded"
+    assert recovered.status_code == 200
+
+
+@pytest.mark.unit
+def test_lease_unavailable_refusal_still_matches_every_lease_path() -> None:
+    plane = FakeControlPlane()
+
+    with httpx.Client(transport=plane.transport) as client:
+        grant = _post_grant(client, plane).json()
+        with plane.refuse_leases(requests=3):
+            refused_renew = client.post(
+                f"{plane.api_url}/api/v1/budgets/lease/renew",
+                json=LeaseRenewRequest(
+                    lease_id=grant["lease_id"],
+                    holder_id="holder-1",
+                    generation=grant["generation"],
+                ).model_dump(mode="json"),
+            )
+            refused_surrender = client.post(
+                f"{plane.api_url}/api/v1/budgets/lease/surrender",
+                json=LeaseSurrenderRequest(
+                    lease_id=grant["lease_id"],
+                    holder_id="holder-1",
+                    generation=grant["generation"],
+                ).model_dump(mode="json"),
+            )
+            refused_grant = _post_grant(client, plane, run_id="run-unavailable")
+
+    statuses = [
+        refused_renew.status_code,
+        refused_surrender.status_code,
+        refused_grant.status_code,
+    ]
+    assert statuses == [503, 503, 503]
+    assert plane.lease_renewals == []
+    assert plane.lease_surrenders == []
 
 
 @pytest.mark.unit

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -9,6 +10,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from threading import Lock
 from typing import TYPE_CHECKING, Any
+
+from pydantic_core import PydanticUndefined
 
 from solwyn._run import current_run
 from solwyn._types import (
@@ -28,6 +31,7 @@ from solwyn._types import (
     UntrackedSurfaceReport,
 )
 from solwyn.client import AsyncSolwyn, Solwyn
+from solwyn.config import SolwynConfig
 from solwyn.testing._transport import FakeControlPlaneTransport
 from solwyn.testing._wire import (
     PlaneResponse,
@@ -67,6 +71,11 @@ _LEASE_PATHS = frozenset(
     }
 )
 _RESERVED_WRAP_KWARGS = ("api_key", "api_url", "control_plane_transport")
+_ENV_PREFIX = "SOLWYN_"
+# api_key/api_url are pinned by the wrapper itself; providers/default_params are
+# derived by the client constructor from its own arguments.
+_WRAPPER_OWNED_CONFIG_FIELDS = frozenset({"api_key", "api_url", "providers", "default_params"})
+_GRANT_ONLY_LEASE_PATH = "/api/v1/budgets/lease"
 
 
 def _validate_magic_model(model: object) -> None:
@@ -100,6 +109,32 @@ def _validate_testing_model(model: object) -> None:
     """Validate one caller-supplied model against the testing magic-model rules."""
     _validate_magic_model(model)
     _validate_run_scoped_model(model)
+
+
+def _hermetic_config_options() -> dict[str, Any]:
+    """Pin every ambient ``SOLWYN_*`` setting back to its declared default.
+
+    ``SolwynConfig`` fills each unset field from ``SOLWYN_<FIELD>``, so an
+    exported variable would silently reconfigure a double-backed test — the
+    exact process-global input this tool exists to exclude. Passing the declared
+    default explicitly keeps the environment loader out of the wrapped client;
+    the caller's own keyword arguments are applied afterwards and always win.
+
+    A field whose default is required, or is ``None`` (the loader reads the
+    environment for a ``None`` value too), cannot be pinned this way and is left
+    alone.
+    """
+    options: dict[str, Any] = {}
+    for name, field in SolwynConfig.model_fields.items():
+        if name in _WRAPPER_OWNED_CONFIG_FIELDS:
+            continue
+        if f"{_ENV_PREFIX}{name.upper()}" not in os.environ:
+            continue
+        default = field.get_default(call_default_factory=True)
+        if default is PydanticUndefined or default is None:
+            continue
+        options[name] = default
+    return options
 
 
 def _reject_reserved_wrap_kwargs(kwargs: dict[str, Any]) -> None:
@@ -167,8 +202,14 @@ class _TestingAsyncSolwyn(AsyncSolwyn):
         return await super()._media_call(spec, **kwargs)
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, eq=False)
 class _ScenarioWindow:
+    """One scripted transport or endpoint window.
+
+    Identity-compared (``eq=False``) so a scenario's exit-time removal can never
+    drop a different window that happens to hold the same counter values.
+    """
+
     kind: str
     remaining: int | None
     path: str | None = None
@@ -206,6 +247,24 @@ class FakeControlPlane:
     Simulates wire behavior only: denials are scripted, never priced —
     the real API owns all pricing. Thread-safe because reporter flush threads
     and lease renewal workers may hit it concurrently.
+
+    Plane state is per-process: a forked child works on a copy, and the parent's
+    recordings never see the child's traffic. Stateful use across a fork is
+    unsupported.
+
+    Lease population knobs mirror real server populations: ``granted_tokens=0``
+    is the zero grant an ``alert_only`` project past its cap receives, so
+    admission falls straight back to the per-call check path;
+    ``headroom_share_tokens`` sizes the holder's share of run headroom
+    independently of the grant, which is what the outage ladder spends;
+    ``final_grant=True`` marks every grant and renewal terminal, driving the
+    ledger's wind-down (the SDK suppresses further renewals).
+
+    Scenario errors raised inside the transport (an unknown magic model, a
+    run-scoped verdict on a request carrying no run) are guaranteed loud only
+    through :meth:`wrap`, :meth:`wrap_async`, or a raw ``httpx`` client. A
+    directly constructed ``BudgetEnforcer`` converts transport exceptions into
+    its fail-open outage posture instead.
     """
 
     def __init__(
@@ -220,11 +279,15 @@ class FakeControlPlane:
         price_hints: dict[str, float] | None = None,
         lease_eligible: bool = True,
         granted_tokens: int = 200_000,
+        headroom_share_tokens: int | None = None,
+        final_grant: bool = False,
         refresh_interval_s: float = 30.0,
         lease_length_s: float = 90.0,
     ) -> None:
-        if not granted_tokens > 0:
-            raise ValueError("granted_tokens must be greater than zero")
+        if granted_tokens < 0:
+            raise ValueError("granted_tokens must not be negative")
+        if headroom_share_tokens is not None and headroom_share_tokens < 0:
+            raise ValueError("headroom_share_tokens must not be negative")
         if not lease_length_s > 0:
             raise ValueError("lease_length_s must be greater than zero")
         if not refresh_interval_s > 0:
@@ -243,6 +306,8 @@ class FakeControlPlane:
         self.price_hints = price_hints
         self.lease_eligible = lease_eligible
         self.granted_tokens = granted_tokens
+        self.headroom_share_tokens = headroom_share_tokens
+        self.final_grant = final_grant
         self.refresh_interval_s = refresh_interval_s
         self.lease_length_s = lease_length_s
 
@@ -351,22 +416,35 @@ class FakeControlPlane:
             self.breaker_reports.clear()
             self.unmatched_requests.clear()
 
+    def _wrap_options(self, solwyn_kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Build the wrapper options: hermetic defaults, wiring, caller kwargs."""
+        _reject_reserved_wrap_kwargs(solwyn_kwargs)
+        options: dict[str, Any] = _hermetic_config_options()
+        options.update(
+            {
+                "api_key": self.api_key,
+                "api_url": self.api_url,
+                "control_plane_transport": self.transport,
+                "budget_check_cache_ttl": 0,
+            }
+        )
+        options.update(solwyn_kwargs)
+        return options
+
     def wrap(self, provider_client: object, **solwyn_kwargs: Any) -> Solwyn:
         """Return a synchronous ``Solwyn`` using this plane's zero-network transport.
 
         Ordinary ``Solwyn`` configuration keyword arguments override testing
         defaults. ``api_key``, ``api_url``, and ``control_plane_transport`` are
         reserved so the returned client cannot bypass this plane.
+
+        Ambient ``SOLWYN_*`` configuration is neutralized: every environment-
+        mapped setting with a declared default falls back to that default
+        instead of the process environment, so an exported variable cannot flip
+        what a double-backed test asserts. Configure the wrapper through
+        explicit keyword arguments.
         """
-        _reject_reserved_wrap_kwargs(solwyn_kwargs)
-        options: dict[str, Any] = {
-            "api_key": self.api_key,
-            "api_url": self.api_url,
-            "control_plane_transport": self.transport,
-            "budget_check_cache_ttl": 0,
-        }
-        options.update(solwyn_kwargs)
-        return _TestingSolwyn(provider_client, **options)
+        return _TestingSolwyn(provider_client, **self._wrap_options(solwyn_kwargs))
 
     def wrap_async(self, provider_client: object, **solwyn_kwargs: Any) -> AsyncSolwyn:
         """Return an ``AsyncSolwyn`` using this plane's zero-network transport.
@@ -375,16 +453,14 @@ class FakeControlPlane:
         testing defaults. ``api_key``, ``api_url``, and
         ``control_plane_transport`` are reserved so the returned client cannot
         bypass this plane.
+
+        Ambient ``SOLWYN_*`` configuration is neutralized: every environment-
+        mapped setting with a declared default falls back to that default
+        instead of the process environment, so an exported variable cannot flip
+        what a double-backed test asserts. Configure the wrapper through
+        explicit keyword arguments.
         """
-        _reject_reserved_wrap_kwargs(solwyn_kwargs)
-        options: dict[str, Any] = {
-            "api_key": self.api_key,
-            "api_url": self.api_url,
-            "control_plane_transport": self.transport,
-            "budget_check_cache_ttl": 0,
-        }
-        options.update(solwyn_kwargs)
-        return _TestingAsyncSolwyn(provider_client, **options)
+        return _TestingAsyncSolwyn(provider_client, **self._wrap_options(solwyn_kwargs))
 
     @contextmanager
     def outage(self, *, requests: int | None = None, path: str | None = None) -> Iterator[None]:
@@ -480,7 +556,12 @@ class FakeControlPlane:
         """Return a public lease-unavailable or holder-cap refusal.
 
         With ``lease_enabled`` true, the SDK falls back to per-call checks rather
-        than treating this reachable lease response as a transport outage.
+        than treating this reachable lease response as a transport outage. The
+        503 ``lease_unavailable`` form refuses grants, renewals, and surrenders
+        alike; the 409 ``lease_holder_cap_exceeded`` form refuses ONLY grants,
+        because the live plane raises the holder cap inside grant alone —
+        renewal and surrender can never emit that code. A request the window
+        does not match consumes none of its scripted budget.
         """
         valid_pairs = {
             (503, "lease_unavailable"),
@@ -535,19 +616,20 @@ class FakeControlPlane:
         return PreparedPlaneRequest(delay, outage, response)
 
     def _consume_transport_effects(self, path: str) -> tuple[float, bool]:
-        """Consume matching delay/outage windows while the caller holds the lock."""
-        delay = 0.0
-        outage = False
+        """Consume matching delay/outage windows while the caller holds the lock.
+
+        An outage wins outright and short-circuits: the scripted connection
+        error never reaches the server, so it must neither wait out nor consume
+        a server-latency window's scripted budget.
+        """
         for window in self._scenario_windows:
-            if window.kind not in {"outage", "slow"}:
-                continue
-            if not window.consume_if_matching(path):
-                continue
-            if window.kind == "outage":
-                outage = True
-            else:
+            if window.kind == "outage" and window.consume_if_matching(path):
+                return 0.0, True
+        delay = 0.0
+        for window in self._scenario_windows:
+            if window.kind == "slow" and window.consume_if_matching(path):
                 delay += window.seconds
-        return delay, outage
+        return delay, False
 
     def handle(self, method: str, path: str, body: object) -> PlaneResponse:
         """Evaluate one real control-plane wire request without network I/O.
@@ -673,7 +755,11 @@ class FakeControlPlane:
                 "Budget lease generation conflict",
             )
 
-        effective_pairs = renewal_pairs if renewal_pairs else record.declared_pairs
+        # The live plane evaluates a renewal over the UNION of the lease's
+        # declared pairs and this request's re-declaration — never the
+        # re-declared pairs alone — so a trigger already in the declared set
+        # keeps denying after a narrower re-declaration.
+        effective_pairs = self._union_declared_pairs(record.declared_pairs, renewal_pairs)
         verdict = self._lease_chain_verdict(
             record.agent_run_id,
             tuple(model for _, model in effective_pairs),
@@ -767,6 +853,7 @@ class FakeControlPlane:
         )
 
     def _lease_response(self, record: _LeaseRecord) -> LeaseGrantResponse:
+        """Build the grant/renew success body from the plane's populations."""
         return LeaseGrantResponse(
             eligible=True,
             allowed=True,
@@ -775,12 +862,16 @@ class FakeControlPlane:
             granted_tokens=record.granted_tokens,
             refresh_interval_s=self.refresh_interval_s,
             lease_length_s=self.lease_length_s,
-            headroom_share_tokens=record.granted_tokens,
+            headroom_share_tokens=(
+                record.granted_tokens
+                if self.headroom_share_tokens is None
+                else self.headroom_share_tokens
+            ),
             posture=LeasePosture(
                 mode=self.mode,
                 on_unreachable=("fail_open" if record.fail_open else "local_enforce"),
             ),
-            final_grant=False,
+            final_grant=self.final_grant,
             project_id=self.project_id,
             mode=self.mode,
             budget_limit=self.budget_limit,
@@ -895,6 +986,13 @@ class FakeControlPlane:
             ),
         )
 
+    @staticmethod
+    def _refusable_lease_paths(code: str) -> frozenset[str]:
+        """Scope a lease refusal to the paths the live plane can emit it on."""
+        if code == "lease_holder_cap_exceeded":
+            return frozenset({_GRANT_ONLY_LEASE_PATH})
+        return _LEASE_PATHS
+
     def _endpoint_refusal_locked(
         self,
         method: str,
@@ -939,14 +1037,18 @@ class FakeControlPlane:
         for window in self._scenario_windows:
             if (
                 window.kind == "refuse_leases"
-                and path in _LEASE_PATHS
+                and path in self._refusable_lease_paths(window.code)
                 and window.consume_if_matching(path)
             ):
-                messages = {
+                refusal_messages = {
                     "lease_unavailable": ("Budget lease service temporarily unavailable; retry"),
                     "lease_holder_cap_exceeded": "Active lease holder limit exceeded",
                 }
-                return self._lease_error(window.status, window.code, messages[window.code])
+                return self._lease_error(
+                    window.status,
+                    window.code,
+                    refusal_messages[window.code],
+                )
         for window in self._scenario_windows:
             if window.kind == "read_only" and window.consume_if_matching(path):
                 return PlaneResponse(

@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 import solwyn as solwyn_pkg
+from solwyn._types import BudgetMode
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import BudgetExceededError
 from solwyn.testing import FakeControlPlane
@@ -456,6 +457,83 @@ async def test_run_scoped_magic_fallback_requires_an_open_run_before_dispatch() 
     assert primary.chat.completions.calls == 0
     assert fallback.chat.completions.calls == 0
     assert plane.checks == []
+
+
+@pytest.mark.unit
+def test_wrap_neutralizes_ambient_solwyn_environment_variables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SOLWYN_FAIL_OPEN", "false")
+    monkeypatch.setenv("SOLWYN_BUDGET_MODE", "hard_deny")
+    monkeypatch.setenv("SOLWYN_LEASE_ENABLED", "false")
+    monkeypatch.setenv("SOLWYN_REPORTER_BATCH_SIZE", "7")
+    monkeypatch.setenv("SOLWYN_ACKNOWLEDGE_UNTRACKED", "chat.completions.create")
+    monkeypatch.setenv("SOLWYN_BUDGET_CHECK_CACHE_TTL", "99")
+    plane = FakeControlPlane()
+
+    wrapped = plane.wrap(_OpenAIStub())
+
+    assert wrapped._config.fail_open is True
+    assert wrapped._config.budget_mode == BudgetMode.ALERT_ONLY
+    assert wrapped._config.lease_enabled is True
+    assert wrapped._config.reporter_batch_size == 50
+    assert wrapped._config.acknowledge_untracked == frozenset()
+    assert wrapped._config.budget_check_cache_ttl == 0
+    wrapped.close()
+
+
+@pytest.mark.unit
+def test_wrap_kwargs_win_over_both_the_environment_and_the_declared_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SOLWYN_REPORTER_BATCH_SIZE", "7")
+    monkeypatch.setenv("SOLWYN_BUDGET_MODE", "hard_deny")
+    plane = FakeControlPlane()
+
+    wrapped = plane.wrap(
+        _OpenAIStub(),
+        reporter_batch_size=13,
+        budget_mode="hard_deny",
+    )
+
+    assert wrapped._config.reporter_batch_size == 13
+    assert wrapped._config.budget_mode == BudgetMode.HARD_DENY
+    wrapped.close()
+
+
+@pytest.mark.unit
+async def test_wrap_async_neutralizes_ambient_solwyn_environment_variables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SOLWYN_FAIL_OPEN", "false")
+    monkeypatch.setenv("SOLWYN_LEASE_ENABLED", "false")
+    plane = FakeControlPlane()
+
+    wrapped = plane.wrap_async(_AsyncOpenAIStub())
+
+    assert wrapped._config.fail_open is True
+    assert wrapped._config.lease_enabled is True
+    await wrapped.close()
+
+
+@pytest.mark.unit
+def test_direct_client_construction_still_honors_ambient_environment_variables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SOLWYN_FAIL_OPEN", "false")
+    monkeypatch.setenv("SOLWYN_REPORTER_BATCH_SIZE", "7")
+    plane = FakeControlPlane()
+
+    client = Solwyn(
+        _OpenAIStub(),
+        api_key=plane.api_key,
+        api_url=plane.api_url,
+        control_plane_transport=plane.transport,
+    )
+
+    assert client._config.fail_open is False
+    assert client._config.reporter_batch_size == 7
+    client.close()
 
 
 @pytest.mark.unit
