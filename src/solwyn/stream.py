@@ -50,7 +50,9 @@ class SyncStreamWrapper:
     A keyword-only ``abort_check`` may cooperatively stop a run at a raw provider
     chunk boundary. The next chunk is pulled first, then the check runs before
     that chunk is observed or yielded. A returned exception closes and partially
-    settles the stream before that exact exception is raised.
+    settles the stream before that exact exception is raised. A failing provider
+    close is logged structurally and suppressed, while a BaseException raised by
+    that close propagates — the latched stop still ends every later pull.
     """
 
     def __init__(
@@ -150,8 +152,17 @@ class SyncStreamWrapper:
                         abort_exc = self._latch_abort(abort_exc)
                         try:
                             self.close()
-                        finally:
-                            raise abort_exc
+                        except Exception as close_exc:
+                            # Structural-only log of the provider-close failure;
+                            # never a traceback (fix [D]). A BaseException here
+                            # (KeyboardInterrupt) propagates instead of being
+                            # replaced by the latched stop; the abort is already
+                            # latched, so the wrapper stays terminal.
+                            logger.warning(
+                                "provider close raised during run-stop abort; suppressing (%s)",
+                                type(close_exc).__name__,
+                            )
+                        raise abort_exc
                 self._accumulator.observe(chunk)
                 if self._chunk_translator is None:
                     return chunk
@@ -311,8 +322,17 @@ class AsyncStreamWrapper:
                         abort_exc = self._abort_exc
                         try:
                             await self.close()
-                        finally:
-                            raise abort_exc
+                        except Exception as close_exc:
+                            # Structural-only log of the provider-close failure;
+                            # never a traceback (fix [D]). A BaseException here
+                            # (CancelledError) propagates instead of being
+                            # replaced by the latched stop; the abort is already
+                            # latched, so the wrapper stays terminal.
+                            logger.warning(
+                                "provider close raised during run-stop abort; suppressing (%s)",
+                                type(close_exc).__name__,
+                            )
+                        raise abort_exc
                 self._accumulator.observe(chunk)
                 if self._chunk_translator is None:
                     return chunk

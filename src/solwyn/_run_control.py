@@ -157,6 +157,10 @@ def _mark_terminated_locked(
     termination = _STATE.terminations.get(run_id)
     if termination is not None:
         _STATE.observed_at[run_id] = observed_at
+        # A repeated stop is also a fresh reference to a live run; both maps
+        # must reach the MRU end so the bounded cap evicts an older run first.
+        _STATE.terminations.move_to_end(run_id)
+        _STATE.observed_at.move_to_end(run_id)
     else:
         termination = _active_group_termination_locked(run_id)
         if termination is None:
@@ -228,10 +232,10 @@ def mark_terminated(
     *,
     reason: str,
     source: TerminationSource,
-) -> None:
-    """Preserve the first winner while recording the latest stop observation."""
+) -> RunTermination:
+    """Return the preserved first winner while recording the latest stop."""
     with _STATE.lock:
-        _mark_terminated_locked(run_id, reason=reason, source=source)
+        return _mark_terminated_locked(run_id, reason=reason, source=source)
 
 
 def _acquire_termination_handle(run_id: str) -> _TerminationHandle:

@@ -324,14 +324,11 @@ def _observe_run_control(
     )
     if eligible_rule is None:
         return None, flags
-    mark_terminated(
+    termination = mark_terminated(
         run_id,
         reason=f"velocity:{eligible_rule}",
         source="local_velocity",
     )
-    termination = run_termination(run_id)
-    if termination is None:
-        raise RuntimeError("marked run termination is missing")
     if termination.source == "server":
         return eligible_rule, flags
     _raise_run_stopped(
@@ -371,18 +368,21 @@ def _postcheck_run_control(
     run_id = agent_run[0]
     if run_id is None:
         return
+    termination: RunTermination | None
+    retained_only = False
     if pending_velocity_rule is not None:
-        mark_terminated(
+        termination = mark_terminated(
             run_id,
             reason=f"velocity:{pending_velocity_rule}",
             source="local_velocity",
         )
-    termination = run_termination(run_id)
-    retained_only = termination is None
-    if retained_only:
-        termination = _postcheck_termination(run_id)
-    if termination is None:
-        return
+    else:
+        termination = run_termination(run_id)
+        retained_only = termination is None
+        if retained_only:
+            termination = _postcheck_termination(run_id)
+        if termination is None:
+            return
     # A same-call server directive is already represented by the exact budget
     # denial. If only active-stream state survived registry eviction, a server
     # run-stop denial carries more precise attribution than that sibling's

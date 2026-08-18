@@ -23,10 +23,12 @@ from conftest import (
 )
 
 import solwyn as solwyn_pkg
+from solwyn import client as solwyn_client
 from solwyn import exceptions as solwyn_exceptions
 from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn._privacy import estimate_content_length
 from solwyn._run_control import (
+    clear_run_termination,
     mark_terminated,
     run_termination,
 )
@@ -3584,6 +3586,42 @@ class TestVelocityWiring:
         ]
         assert len(success) == 1
         assert success[0].velocity_flags == ["rate_acceleration"]
+        solwyn.close()
+
+    def test_local_deny_survives_an_operator_clear_racing_the_mark(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A concurrent public clear must still stop the run, never raise RuntimeError."""
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, velocity_mode="deny")
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+        solwyn._solwyn_velocity.observe = MagicMock(return_value=("repeat_size",))
+
+        real_mark_terminated = solwyn_client.mark_terminated
+
+        def clearing_mark_terminated(run_id: str, **kwargs: str):
+            termination = real_mark_terminated(run_id, **kwargs)
+            clear_run_termination(run_id)
+            return termination
+
+        monkeypatch.setattr(solwyn_client, "mark_terminated", clearing_mark_terminated)
+
+        with (
+            solwyn_pkg.run("clear-races-local-deny") as run_id,
+            pytest.raises(RunStoppedError) as exc_info,
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+
+        assert exc_info.value.agent_run_id == run_id
+        assert exc_info.value.reason == "velocity:repeat_size"
+        assert exc_info.value.source == "local_velocity"
+        solwyn._solwyn_budget.check_budget.assert_not_called()
+        client.chat.completions.create.assert_not_called()
         solwyn.close()
 
     def test_sync_media_velocity_deny_and_subsequent_pre_gate(self) -> None:
