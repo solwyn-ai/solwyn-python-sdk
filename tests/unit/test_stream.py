@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import logging
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -93,6 +94,26 @@ class _TrackedAsyncStream:
 
     async def aclose(self) -> None:
         self.aclose_calls += 1
+
+
+class _CloseFailingSyncStream(_TrackedSyncStream):
+    def __init__(self, items: list[object], close_exc: BaseException) -> None:
+        super().__init__(items)
+        self._close_exc = close_exc
+
+    def close(self) -> None:
+        super().close()
+        raise self._close_exc
+
+
+class _AcloseFailingAsyncStream(_TrackedAsyncStream):
+    def __init__(self, items: list[object], close_exc: BaseException) -> None:
+        super().__init__(items)
+        self._close_exc = close_exc
+
+    async def aclose(self) -> None:
+        await super().aclose()
+        raise self._close_exc
 
 
 class _BlockingAsyncCleanup:
@@ -546,6 +567,80 @@ class TestSyncStreamWrapperAbort:
         on_complete.assert_called_once()
         on_error.assert_not_called()
 
+    def test_abort_propagates_base_exception_raised_by_provider_close(self) -> None:
+        from solwyn.stream import SyncStreamWrapper
+
+        chunks = [object() for _ in range(4)]
+        interrupt = KeyboardInterrupt()
+        inner = _CloseFailingSyncStream(chunks, interrupt)
+        accumulator = FakeAccumulator()
+        on_complete = MagicMock()
+        on_error = MagicMock()
+        stopped = RuntimeError("run stopped")
+
+        wrapper = SyncStreamWrapper(
+            stream=inner,
+            accumulator=accumulator,
+            on_complete=on_complete,
+            on_error=on_error,
+            abort_check=lambda: stopped if len(accumulator.observed) == 1 else None,
+        )
+
+        assert next(wrapper) is chunks[0]
+        with pytest.raises(KeyboardInterrupt) as interrupted:
+            next(wrapper)
+
+        assert interrupted.value is interrupt
+        assert inner.close_calls == 1
+        on_complete.assert_called_once()
+        on_error.assert_not_called()
+
+        with pytest.raises(RuntimeError) as reentry:
+            next(wrapper)
+        assert reentry.value is stopped
+        assert inner.close_calls == 1
+        on_complete.assert_called_once()
+
+    def test_abort_suppresses_ordinary_provider_close_failure(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from solwyn.stream import SyncStreamWrapper
+
+        chunks = [SimpleNamespace(content="chunk-body-never-logged") for _ in range(3)]
+        inner = _CloseFailingSyncStream(chunks, ConnectionResetError("provider socket gone"))
+        accumulator = FakeAccumulator()
+        on_complete = MagicMock()
+        on_error = MagicMock()
+        stopped = RuntimeError("run stopped")
+
+        wrapper = SyncStreamWrapper(
+            stream=inner,
+            accumulator=accumulator,
+            on_complete=on_complete,
+            on_error=on_error,
+            abort_check=lambda: stopped if len(accumulator.observed) == 1 else None,
+        )
+
+        assert next(wrapper) is chunks[0]
+        with (
+            caplog.at_level(logging.WARNING, logger="solwyn.stream"),
+            pytest.raises(RuntimeError) as exc_info,
+        ):
+            next(wrapper)
+
+        assert exc_info.value is stopped
+        assert inner.close_calls == 1
+        on_complete.assert_called_once()
+        on_error.assert_not_called()
+
+        records = [record for record in caplog.records if record.name == "solwyn.stream"]
+        assert len(records) == 1
+        assert records[0].args == ("ConnectionResetError",)
+        message = records[0].getMessage()
+        assert "ConnectionResetError" in message
+        assert "chunk-body-never-logged" not in message
+        assert "provider socket gone" not in message
+
     @pytest.mark.parametrize("abort_mode", ["default", "explicit_none", "always_none"])
     def test_no_abort_check_preserves_legacy_iteration(self, abort_mode: str) -> None:
         from solwyn.stream import SyncStreamWrapper
@@ -928,6 +1023,41 @@ class TestAsyncStreamWrapperAbort:
         assert inner.aclose_calls == 1
         on_complete.assert_awaited_once()
         on_error.assert_not_awaited()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_abort_propagates_cancellation_raised_by_provider_aclose(self) -> None:
+        from solwyn.stream import AsyncStreamWrapper
+
+        chunks = [object() for _ in range(4)]
+        cancelled = asyncio.CancelledError()
+        inner = _AcloseFailingAsyncStream(chunks, cancelled)
+        accumulator = FakeAccumulator()
+        on_complete = AsyncMock()
+        on_error = AsyncMock()
+        stopped = RuntimeError("run stopped")
+
+        wrapper = AsyncStreamWrapper(
+            stream=inner,
+            accumulator=accumulator,
+            on_complete=on_complete,
+            on_error=on_error,
+            abort_check=lambda: stopped if len(accumulator.observed) == 1 else None,
+        )
+
+        assert await anext(wrapper) is chunks[0]
+        with pytest.raises(asyncio.CancelledError) as interrupted:
+            await anext(wrapper)
+
+        assert interrupted.value is cancelled
+        assert inner.aclose_calls == 1
+        on_complete.assert_awaited_once()
+        on_error.assert_not_awaited()
+
+        with pytest.raises(RuntimeError) as reentry:
+            await anext(wrapper)
+        assert reentry.value is stopped
+        on_complete.assert_awaited_once()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
