@@ -253,6 +253,10 @@ def _raise_run_stopped(
                 media_usage=media_usage,
                 deny_source=deny_source,
                 deny_reason=termination.reason,
+                # Every receipt this path emits denies for the run stop it is
+                # about to raise, whatever else the same call's budget verdict
+                # said — dashboards filter denials by this period.
+                denied_by_period="run_stopped",
                 estimated_output_bound=estimated_output_bound,
                 velocity_flags=velocity_flags,
             )
@@ -387,6 +391,8 @@ def _postcheck_run_control(
     # denial. If only active-stream state survived registry eviction, a server
     # run-stop denial carries more precise attribution than that sibling's
     # immutable winner. This post-check gate is for a stop behind an ALLOW.
+    # "sticky_replay" is the enforcer's purpose-built outage attribution for
+    # this very stop; re-reporting it as "run_terminated" would erase it.
     if (
         termination.source == "server"
         and not budget.allowed
@@ -394,7 +400,7 @@ def _postcheck_run_control(
         and (
             retained_only
             or (
-                getattr(budget, "deny_source", None) == "server"
+                getattr(budget, "deny_source", None) in ("server", "sticky_replay")
                 and getattr(budget, "deny_reason", None) == termination.reason
             )
         )
@@ -639,6 +645,23 @@ def _lease_claim_token(budget: Any) -> int | None:
     """Return the exact local reservation capability, never a mock sentinel."""
     token = getattr(budget, "lease_claim_token", None)
     return token if isinstance(token, int) and not isinstance(token, bool) else None
+
+
+def _safe_estimate_media(spec: MediaSurfaceSpec, kwargs: dict[str, Any]) -> MediaUsage | None:
+    """Fail-soft pre-flight media estimate, mirroring the settlement measures.
+
+    A request-derived quantity outside the wire model's validated range (a
+    pathological ``n=``) would otherwise raise out of the pre-flight and kill
+    the call before any provider I/O. Solwyn never blocks a call over a
+    quantity it cannot express, so the estimate degrades to None instead.
+    """
+    if spec.estimate_media is None:
+        return None
+    try:
+        return spec.estimate_media(kwargs)
+    except Exception as exc:
+        logger.warning("preflight.media_estimate_failed_fail_soft: %s", type(exc).__name__)
+        return None
 
 
 def _safe_extract_region(runtime: ProviderRuntime) -> str | None:
@@ -1956,7 +1979,7 @@ class Solwyn(_SolwynBase):
         #    quantities like image count) from the spec's request-derived hook.
         char_count = estimate_content_length(kwargs)
         est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
-        estimated_media = spec.estimate_media(kwargs) if spec.estimate_media is not None else None
+        estimated_media = _safe_estimate_media(spec, kwargs)
         estimated_output_bound = None
         provider_region = _safe_extract_region(runtime)
         pending_velocity_rule, velocity_flags = _observe_run_control(
@@ -2075,7 +2098,8 @@ class Solwyn(_SolwynBase):
             )
         except Exception as exc:
             # Nothing will settle this call: hand any lease reservation back
-            # rather than stranding it until the 900s sweep.
+            # rather than stranding the local draw until the ledger's 900s
+            # age-out (the server's hold expires separately on its own TTL).
             self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
@@ -3435,7 +3459,7 @@ class AsyncSolwyn(_SolwynBase):
 
         char_count = estimate_content_length(kwargs)
         est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
-        estimated_media = spec.estimate_media(kwargs) if spec.estimate_media is not None else None
+        estimated_media = _safe_estimate_media(spec, kwargs)
         estimated_output_bound = None
         provider_region = _safe_extract_region(runtime)
         pending_velocity_rule, velocity_flags = _observe_run_control(
@@ -3536,7 +3560,8 @@ class AsyncSolwyn(_SolwynBase):
             )
         except Exception as exc:
             # Nothing will settle this call: hand any lease reservation back
-            # rather than stranding it until the 900s sweep.
+            # rather than stranding the local draw until the ledger's 900s
+            # age-out (the server's hold expires separately on its own TTL).
             self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),

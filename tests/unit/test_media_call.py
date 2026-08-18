@@ -343,6 +343,30 @@ class TestMediaCallSync:
         solwyn._solwyn_reporter._http.close()
         solwyn._solwyn_budget._http.close()
 
+    def test_unexpressible_media_estimate_degrades_instead_of_killing_the_call(self) -> None:
+        # A request-derived quantity past the wire model's bound must not raise
+        # out of the pre-flight: the call proceeds with no media estimate.
+        client, _ = _sync_client()
+        client.images.generate.return_value = SimpleNamespace(service_tier=None)
+        solwyn = _build_sync(client)
+        spec = _media_spec(
+            estimate_media=lambda _kwargs: MediaUsage(image_count=200_000_001),
+        )
+        with (
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow()) as check,
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_images
+            ),
+        ):
+            solwyn._media_call(spec, model="gpt-image-2", prompt="a cat", n=200_000_001)
+
+        client.images.generate.assert_called_once()
+        assert check.call_args.kwargs["estimated_media"] is None
+
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
+
     def test_media_only_quantity_confirms_with_zeroed_token_details(self) -> None:
         # Compat image (Together FLUX): usage: null, so no TOKEN basis — but the
         # request-derived per-image MediaUsage IS observable. Confirm still fires
@@ -486,6 +510,11 @@ class TestMediaCallSync:
         denied = report.call_args.args[0]
         assert denied.modality == "audio"
         assert denied.media_usage.input_characters == 321
+        assert (denied.deny_source, denied.deny_reason, denied.denied_by_period) == (
+            "run_terminated",
+            "velocity:repeat_size",
+            "run_stopped",
+        )
         client.audio.speech.create.assert_not_called()
         solwyn._solwyn_reporter._http.close()
         solwyn._solwyn_budget._http.close()
@@ -895,3 +924,42 @@ class TestMediaCallAsync:
         assert error.agent_run_id == run_id
         assert error.reason == "run_stopped"
         assert error.source == "server"
+
+    @pytest.mark.asyncio
+    async def test_pre_gate_media_stop_receipt_carries_deny_attribution(self) -> None:
+        from solwyn._run_control import mark_terminated
+
+        client, _ = _async_client()
+        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, budget_mode=BudgetMode.HARD_DENY)
+
+        with (
+            patch.object(solwyn._solwyn_budget, "check_budget", new=AsyncMock()) as check,
+            patch.object(solwyn._solwyn_reporter, "report") as report,
+        ):
+            async with solwyn_pkg.run("async-pre-gated-audio") as run_id:
+                mark_terminated(run_id, reason="velocity:repeat_size", source="local_velocity")
+                with pytest.raises(RunStoppedError):
+                    await solwyn._media_call(
+                        MediaSurfaceSpec(
+                            surface="audio.speech",
+                            modality="audio",
+                            extract_usage=lambda _response: None,
+                            measure_request=lambda _kwargs: None,
+                            estimate_media=lambda _kwargs: MediaUsage(input_characters=321),
+                        ),
+                        model="gpt-4o-mini-tts",
+                        input="hi",
+                    )
+
+        check.assert_not_awaited()
+        denied = report.call_args.args[0]
+        assert denied.modality == "audio"
+        assert denied.media_usage.input_characters == 321
+        assert (denied.deny_source, denied.deny_reason, denied.denied_by_period) == (
+            "run_terminated",
+            "velocity:repeat_size",
+            "run_stopped",
+        )
+        client.audio.speech.create.assert_not_called()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()

@@ -544,3 +544,51 @@ def test_public_docs_describe_run_stop_hierarchy_and_cooperative_api() -> None:
     ):
         assert stream_contract in normalized_error_handling
         assert stream_contract in normalized_unreleased
+
+
+@pytest.mark.unit
+def test_mark_returns_the_stamp_it_recorded_for_sticky_ordering() -> None:
+    from solwyn._run_control import _STATE, _mark_terminated_locked, run_observed_at
+
+    with _STATE.lock, patch("solwyn._run_control.time.monotonic", return_value=42.0):
+        termination, observed_at = _mark_terminated_locked(
+            "run_a",
+            reason="manual_kill",
+            source="server",
+        )
+
+    # The enforcer files its sticky denial from THIS value; a second clock
+    # read would order the two maps against different observations.
+    assert observed_at == 42.0
+    assert termination.at_monotonic == 42.0
+    assert run_observed_at("run_a") == 42.0
+    assert run_observed_at("run_never_seen") is None
+
+
+@pytest.mark.unit
+def test_clear_run_termination_leaves_a_latched_stream_aborting() -> None:
+    from solwyn._run_control import (
+        _acquire_termination_handle,
+        clear_run_termination,
+        mark_terminated,
+    )
+    from solwyn.client import _stream_abort_exception
+
+    handle = _acquire_termination_handle("run_stream")
+    mark_terminated("run_stream", reason="manual_kill", source="server")
+    assert _stream_abort_exception(handle) is not None
+
+    clear_run_termination("run_stream")
+
+    # Forward-looking only: a stream opened after the clear runs free...
+    fresh = _acquire_termination_handle("run_stream")
+    assert _stream_abort_exception(fresh) is None
+    # ...while a stream that already latched the stop keeps aborting.
+    aborted = _stream_abort_exception(handle)
+    assert isinstance(aborted, solwyn.RunStoppedError)
+
+    docstring = clear_run_termination.__doc__ or ""
+    assert "keeps aborting" in docstring
+    assert "Restart the stream" in docstring
+    fresh.release()
+    handle.release()

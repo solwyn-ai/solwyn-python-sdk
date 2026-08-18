@@ -26,13 +26,19 @@ import pytest
 from conftest import VALID_API_KEY, call_uuid
 
 import solwyn._lifecycle as lifecycle
-from solwyn._lifecycle import _drain_queues_blocking, _gc_drop_counter, blocking_exit_flush
+from solwyn._lifecycle import (
+    _drain_queues_blocking,
+    _ExitIngestRejectionKind,
+    _gc_drop_counter,
+    _parse_exit_ingest_rejections,
+    blocking_exit_flush,
+)
 from solwyn._surfaces import SurfaceContext
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
 from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.client import AsyncSolwyn
-from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
+from solwyn.reporter import AsyncMetadataReporter, MetadataReporter, _IngestRejectionKind
 
 _URL = "https://api.test.solwyn.ai"
 
@@ -544,6 +550,114 @@ def test_gc_finalizer_full_legacy_rejection_logs_aggregate_cardinality(
 
 
 @pytest.mark.unit
+def test_gc_finalizer_exact_index_rejection_disposes_only_the_named_event(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The GC/atexit parser resolves EXACT indexes against its own batch: only
+    the named member is terminal, and it is counted at full receipt weight."""
+
+    class _ExactRejectResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "ingested": 1,
+                "rejected": [
+                    {
+                        "index": 1,
+                        "code": "unknown_model",
+                        "model": "gpt-5.5",
+                        "message": "structural",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        httpx, "Client", _make_recording_client([], lambda _url: _ExactRejectResponse())
+    )
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter.report(_make_event(call_id=call_uuid("gc-exact-accepted")))
+    reporter.report(
+        _make_event(
+            call_id=call_uuid("gc-exact-rejected"),
+            status="budget_denied",
+            output_tokens=0,
+            agent_run_id="gc-exact-run",
+            deny_source="aggregate_replay",
+            deny_reason=None,
+            estimated_output_bound=20,
+            receipt_aggregate_count=4,
+        )
+    )
+
+    with caplog.at_level("WARNING", logger="solwyn._lifecycle"):
+        del reporter
+        gc.collect()
+
+    drops = [
+        record.getMessage()
+        for record in caplog.records
+        if "lifecycle.gc_flush_dropped" in record.getMessage()
+    ]
+    assert len(drops) == 1
+    assert "kind=event" in drops[0]
+    assert "reason=ingest_rejected" in drops[0]
+    assert "n=4" in drops[0]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("rejected", "expected_kind", "expected_count"),
+    [
+        # Exact indexes agree.
+        ([{"index": 0, "code": "c", "model": "m", "message": "x"}], "exact", 1),
+        # Missing (code, model, message) costs the WARNING, never the identity.
+        ([{"index": 0}], "exact", 1),
+        # Index-shape violations degrade to the count the legacy parser proved.
+        (
+            [
+                {"index": 0, "code": "c", "model": "m", "message": "x"},
+                {"index": 0, "code": "c", "model": "m", "message": "x"},
+            ],
+            "legacy",
+            2,
+        ),
+        ([{"index": 5, "code": "c", "model": "m", "message": "x"}], "legacy", 1),
+        ([{"index": -1, "code": "c", "model": "m", "message": "x"}], "legacy", 1),
+        ([{"index": 0.5, "code": "c", "model": "m", "message": "x"}], "legacy", 1),
+        ([{"code": "c", "model": "m", "message": "x"}], "legacy", 1),
+        # Only an untrustworthy COUNT stays malformed.
+        (["not-a-dict"], "malformed", 0),
+    ],
+)
+def test_both_ingest_rejection_parsers_reach_the_same_disposition(
+    rejected: list[object], expected_kind: str, expected_count: int
+) -> None:
+    """Same server body, same accounting: the in-process reporter and the exit
+    twin must never disagree about how much loss a 202 proves."""
+    response = MagicMock(spec=httpx.Response)
+    response.json.return_value = {"ingested": 0, "rejected": rejected}
+    reporter = MetadataReporter(
+        _URL,
+        VALID_API_KEY,
+        flush_interval=60.0,
+        breaker_reporting_enabled=False,
+        report_untracked_surfaces=False,
+    )
+    try:
+        in_process = reporter._parse_ingest_rejections(response, 2)
+    finally:
+        reporter.close(timeout=1.0)
+    at_exit = _parse_exit_ingest_rejections(response, 2)
+
+    assert in_process.kind is _IngestRejectionKind(expected_kind)
+    assert at_exit.kind is _ExitIngestRejectionKind(expected_kind)
+    assert in_process.count == at_exit.count == expected_count
+    assert set(in_process.indexes) == set(at_exit.indexes)
+
+
+@pytest.mark.unit
 def test_gc_drop_logging_exceptions_do_not_abort_remaining_exit_dispositions() -> None:
     reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
     reporter.report_confirm(_make_confirm_request())
@@ -877,7 +991,7 @@ def test_exit_flush_full_legacy_rejection_counts_aggregate_cardinality(
 
 
 @pytest.mark.unit
-def test_exit_flush_partial_legacy_rejection_remains_count_only(
+def test_exit_flush_partial_legacy_rejection_charges_the_heaviest_receipt_weight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _LegacyRejectResponse:
@@ -916,7 +1030,9 @@ def test_exit_flush_partial_legacy_rejection_remains_count_only(
 
     blocking_exit_flush(reporter)
 
-    assert reporter.dropped_counts == {"event.ingest_rejected": 1}
+    # One proven rejection, no proven identity: the heaviest candidate in the
+    # batch is charged so an aggregate receipt can never be understated.
+    assert reporter.dropped_counts == {"event.ingest_rejected": 100}
     assert reporter._receipt_fold_snapshot() == {}
     assert not reporter._queue
     if reporter._finalizer is not None:
@@ -925,7 +1041,7 @@ def test_exit_flush_partial_legacy_rejection_remains_count_only(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("invalid_index", [0.9, True])
-def test_exit_flush_non_integer_rejection_index_fails_open(
+def test_exit_flush_non_integer_rejection_index_degrades_to_legacy_count_only(
     monkeypatch: pytest.MonkeyPatch, invalid_index: object
 ) -> None:
     class _MalformedIndexResponse:
@@ -954,7 +1070,9 @@ def test_exit_flush_non_integer_rejection_index_fails_open(
 
     blocking_exit_flush(reporter)
 
-    assert reporter.dropped_counts == {}
+    # Same rule as the in-process parser: an unusable index costs identity,
+    # never the count. The denied event stays unfolded (identity unproven).
+    assert reporter.dropped_counts == {"event.ingest_rejected": 1}
     assert reporter._receipt_fold_snapshot() == {}
     assert not reporter._queue
     if reporter._finalizer is not None:
@@ -1193,6 +1311,71 @@ def test_worker_reentrant_close_finalizes_before_last_sync_reporter_reference_dr
             live._shutdown.set()
             live._seal_delivery()
             live._http.close()
+
+
+@pytest.mark.unit
+def test_reentrant_close_from_final_flush_worker_sends_instead_of_sealing() -> None:
+    """A close-calling log handler on close()'s OWN final-flush worker must not
+    deadlock into the expired force-seal: the worker is reporter-owned, so it
+    takes the same finalize-request path as the flush/breaker/advisory threads
+    and keeps draining."""
+    reporter = MetadataReporter(
+        _URL,
+        VALID_API_KEY,
+        batch_size=10,
+        flush_interval=60.0,
+        max_send_attempts=1,
+        shutdown_deadline=1.0,
+        breaker_reporting_enabled=False,
+        report_untracked_surfaces=False,
+    )
+    request = httpx.Request("POST", f"{_URL}/api/v1/budgets/confirm")
+    healthy = MagicMock(spec=httpx.Response)
+    healthy.raise_for_status.return_value = None
+    healthy.json.return_value = {"ingested": 1, "rejected": []}
+    delivered: list[dict[str, object]] = []
+
+    def post(url: str, *, json: object, headers: object, timeout: object) -> httpx.Response:
+        if url.endswith("/budgets/confirm"):
+            raise httpx.ConnectError("control plane unavailable", request=request)
+        assert isinstance(json, list)
+        delivered.extend(json)
+        return healthy
+
+    reentrant_thread: list[str] = []
+    close_errors: list[BaseException] = []
+
+    def warning(message: str, *_args: object, **_kwargs: object) -> None:
+        if not message.startswith("reporter.confirm_send_failed") or reentrant_thread:
+            return
+        reentrant_thread.append(threading.current_thread().name)
+        try:
+            reporter.close(timeout=1.0)
+        except BaseException as exc:  # pragma: no cover - failure detail only
+            close_errors.append(exc)
+
+    reporter.report_confirm(_make_confirm_request())
+    reporter.report(_make_event(call_id=call_uuid("final-flush-reentrant")))
+    try:
+        with (
+            patch.object(reporter._http, "post", side_effect=post),
+            patch("solwyn.reporter.logger.warning", side_effect=warning),
+        ):
+            reporter.close(timeout=2.0)
+
+        assert close_errors == []
+        assert reentrant_thread == ["solwyn-final-flush"]
+        # The queued event was DELIVERED, not force-sealed at a burnt deadline.
+        assert [str(item["call_id"]) for item in delivered] == [
+            str(call_uuid("final-flush-reentrant"))
+        ]
+        assert reporter.dropped_counts == {"confirm.retry_exhausted": 1}
+        assert reporter._delivery_completed is True
+    finally:
+        if not getattr(reporter, "_delivery_completed", False):
+            reporter._shutdown.set()
+            reporter._seal_delivery()
+            reporter._http.close()
 
 
 @pytest.mark.unit

@@ -28,8 +28,10 @@ from solwyn._types import (
 from solwyn.reporter import (
     AsyncMetadataReporter,
     MetadataReporter,
+    _build_receipt_replay_events,
     _PendingEvent,
     _SendOutcome,
+    _split_receipt_fold,
 )
 
 _URL = "https://api.test.solwyn.ai"
@@ -182,6 +184,125 @@ class TestReceiptFoldState:
             reporter._shutdown.set()
             reporter._http.close()
 
+    def test_growing_prompt_runaway_folds_coarsely_instead_of_starving_the_table(
+        self,
+    ) -> None:
+        # The flagship runaway: every call grows the prompt, so every receipt
+        # has a distinct pricing basis. Before the per-run exact budget those
+        # 300 receipts minted 256 single-receipt keys and refused the rest —
+        # for this run AND every other run on the client.
+        reporter = _quiet_sync()
+        try:
+            for index in range(300):
+                reporter._fold_or_count_event_drop(
+                    _event(
+                        call_id=call_uuid(f"runaway-{index}"),
+                        agent_run_id="runaway",
+                        input_tokens=1_000 + index,
+                    ),
+                    "retry_exhausted",
+                )
+
+            snapshot = reporter._receipt_fold_snapshot()
+            runaway = {key: fold for key, fold in snapshot.items() if key.run_id == "runaway"}
+            exact = {
+                key: fold
+                for key, fold in runaway.items()
+                if key.receipt_pricing_input_tokens is not None
+            }
+            coarse = {
+                key: fold
+                for key, fold in runaway.items()
+                if key.receipt_pricing_input_tokens is None
+            }
+            # 32 exact keys, then ONE coarse aggregate for the remainder.
+            assert len(exact) == 32
+            assert len(coarse) == 1
+            assert sum(fold.count for fold in runaway.values()) == 300
+            assert next(iter(coarse.values())).count == 268
+            # Nothing was refused, and the shared table stays mostly free.
+            assert reporter.dropped_counts == {}
+            assert len(snapshot) == 33
+
+            # A second run still gets its own EXACT pricing basis.
+            reporter._fold_or_count_event_drop(
+                _event(
+                    call_id=call_uuid("bystander"),
+                    agent_run_id="bystander",
+                    input_tokens=4_242,
+                ),
+                "retry_exhausted",
+            )
+            bystander = [
+                key for key in reporter._receipt_fold_snapshot() if key.run_id == "bystander"
+            ]
+            assert len(bystander) == 1
+            assert bystander[0].receipt_pricing_input_tokens == 4_242
+
+            reporter._drain_receipt_folds_to_queue(final=True)
+            replays = [pending.event for pending in reporter._queue]
+            runaway_replays = [event for event in replays if event.agent_run_id == "runaway"]
+            assert sum(event.receipt_aggregate_count or 0 for event in runaway_replays) == 300
+            coarse_replays = [
+                event for event in runaway_replays if event.receipt_pricing_input_tokens is None
+            ]
+            # A null pricing basis is how the server tells a coarse aggregate
+            # (unpriceable per card) from an exactly priceable one.
+            assert len(coarse_replays) == 1
+            assert coarse_replays[0].receipt_aggregate_count == 268
+        finally:
+            reporter._shutdown.set()
+            reporter._http.close()
+
+    def test_denial_reason_and_period_partition_folds_and_survive_replay(self) -> None:
+        reporter = _quiet_sync()
+        try:
+            reporter._fold_or_count_event_drop(
+                _event(
+                    call_id=call_uuid("reason-stop"),
+                    deny_reason="run_stopped",
+                    denied_by_period="agent_run",
+                    velocity_flags=["monotonic_growth"],
+                ),
+                "retry_exhausted",
+            )
+            reporter._fold_or_count_event_drop(
+                _event(
+                    call_id=call_uuid("reason-stop-2"),
+                    deny_reason="run_stopped",
+                    denied_by_period="agent_run",
+                    velocity_flags=["repeat_size"],
+                ),
+                "retry_exhausted",
+            )
+            reporter._fold_or_count_event_drop(
+                _event(
+                    call_id=call_uuid("reason-monthly"),
+                    deny_reason="budget_exceeded",
+                    denied_by_period="monthly",
+                ),
+                "retry_exhausted",
+            )
+
+            # Same run, same model, same size — the denial evidence differs, so
+            # the aggregates must not merge.
+            assert len(reporter._receipt_fold_snapshot()) == 2
+
+            reporter._drain_receipt_folds_to_queue(final=True)
+            replays = {
+                (event.deny_reason, event.denied_by_period): event
+                for event in (pending.event for pending in reporter._queue)
+            }
+            assert set(replays) == {("run_stopped", "agent_run"), ("budget_exceeded", "monthly")}
+            stopped = replays[("run_stopped", "agent_run")]
+            assert stopped.receipt_aggregate_count == 2
+            # Flags are unioned, not keyed: they name rules, not pricing.
+            assert stopped.velocity_flags == ["monotonic_growth", "repeat_size"]
+            assert replays[("budget_exceeded", "monthly")].velocity_flags is None
+        finally:
+            reporter._shutdown.set()
+            reporter._http.close()
+
     def test_sources_stay_distinct_and_empty_key_is_supported(self) -> None:
         reporter = _quiet_sync()
         try:
@@ -274,6 +395,32 @@ class TestReceiptFoldState:
                 resolution="1024x1024",
                 quality="hd",
             )
+        finally:
+            reporter._shutdown.set()
+            reporter._http.close()
+
+    def test_split_of_an_invariant_violating_fold_overcounts_instead_of_raising(
+        self,
+    ) -> None:
+        # take_for_cycle is a DESTRUCTIVE take: the snapshot is already gone by
+        # the time these events are built, so a wire-validation raise here
+        # would erase every folded receipt with zero drop accounting. The
+        # invariant (chunk_count <= count, because each source receipt carries
+        # at most one wire-max quantity) is what keeps counts >= 1; if it ever
+        # broke, the clamp must keep the failure a conservative OVERcount.
+        reporter = _quiet_sync()
+        try:
+            reporter._fold_or_count_event_drop(_event(input_tokens=1), "retry_exhausted")
+            key, fold = next(iter(reporter._receipt_fold_snapshot().items()))
+            violating = dataclasses.replace(fold, count=1, input_tokens=2 * _WIRE_QUANTITY_MAX)
+
+            chunks = _split_receipt_fold(violating)
+            assert len(chunks) == 2
+            assert [chunk.count for chunk in chunks] == [1, 1]
+
+            events = _build_receipt_replay_events(key, violating, "split-clamp")
+            assert sum(event.receipt_aggregate_count or 0 for event in events) >= violating.count
+            assert sum(event.input_tokens for event in events) == 2 * _WIRE_QUANTITY_MAX
         finally:
             reporter._shutdown.set()
             reporter._http.close()
@@ -457,6 +604,37 @@ class TestReceiptFoldState:
             finally:
                 refolded._shutdown.set()
                 refolded._http.close()
+        finally:
+            reporter._shutdown.set()
+            reporter._http.close()
+
+    def test_split_reserves_one_count_per_chunk_when_totals_are_not_proportional(
+        self,
+    ) -> None:
+        reporter = _quiet_sync()
+        try:
+            for suffix in ("a", "b", "c"):
+                reporter._fold_or_count_event_drop(
+                    _event(
+                        call_id=call_uuid(f"non-proportional-{suffix}"),
+                        input_tokens=_WIRE_QUANTITY_MAX,
+                        output_tokens=1,
+                        estimated_output_bound=1,
+                    ),
+                    "retry_exhausted",
+                )
+
+            reporter._drain_receipt_folds_to_queue(final=True)
+            replays = [pending.event for pending in reporter._queue]
+            # Input alone forces three chunks while every other total fits in
+            # one. Each chunk must still RESERVE a receipt count for the chunks
+            # after it — take the whole count first and the tail chunks would
+            # carry 0 and fail the wire model's ge=1 bound.
+            assert len(replays) == 3
+            assert [event.receipt_aggregate_count for event in replays] == [1, 1, 1]
+            assert [event.input_tokens for event in replays] == [_WIRE_QUANTITY_MAX] * 3
+            assert [event.output_tokens for event in replays] == [3, 0, 0]
+            assert [event.estimated_output_bound for event in replays] == [3, 0, 0]
         finally:
             reporter._shutdown.set()
             reporter._http.close()
@@ -857,7 +1035,7 @@ class TestSyncReceiptFolding:
             reporter._shutdown.set()
             reporter._http.close()
 
-    def test_partial_legacy_rejection_remains_count_only(self) -> None:
+    def test_partial_legacy_rejection_charges_the_heaviest_receipt_weights(self) -> None:
         reporter = _quiet_sync(batch_size=2)
         reporter._queue.extend(
             (
@@ -894,13 +1072,16 @@ class TestSyncReceiptFolding:
             with patch.object(reporter._http, "post", return_value=response):
                 reporter._drain_event_batches()
             assert reporter._receipt_fold_snapshot() == {}
-            assert reporter.dropped_counts == {"event.ingest_rejected": 1}
+            # An index-less body proves ONE rejection but not which event: the
+            # heaviest candidate (the 100-receipt aggregate) is charged, never
+            # the single raw event that would understate the loss by 99.
+            assert reporter.dropped_counts == {"event.ingest_rejected": 100}
         finally:
             reporter._shutdown.set()
             reporter._http.close()
 
     @pytest.mark.parametrize("invalid_index", [0.9, True])
-    def test_non_integer_rejection_index_is_malformed_and_fails_open(
+    def test_non_integer_rejection_index_degrades_to_legacy_count_only(
         self, invalid_index: object
     ) -> None:
         reporter = _quiet_sync(batch_size=2)
@@ -933,8 +1114,10 @@ class TestSyncReceiptFolding:
         try:
             with patch.object(reporter._http, "post", return_value=response):
                 reporter._drain_event_batches()
+            # A server-side index bug must not zero the loss the pre-index
+            # parser counted: identity is unusable, the count still stands.
             assert reporter._receipt_fold_snapshot() == {}
-            assert reporter.dropped_counts == {}
+            assert reporter.dropped_counts == {"event.ingest_rejected": 1}
             assert not reporter._queue
         finally:
             reporter._shutdown.set()

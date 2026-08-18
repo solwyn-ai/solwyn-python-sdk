@@ -38,6 +38,9 @@ from solwyn.exceptions import BudgetExceededError, ProviderUnavailableError, Run
 from solwyn.providers import get_adapter_for_client
 from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
 
+# The wire model's validated maximum for a single token quantity.
+_WIRE_QUANTITY_MAX = 100_000_000
+
 
 @pytest.fixture(autouse=True)
 def _reset_spend_surface_latch() -> None:
@@ -605,10 +608,14 @@ class TestBudgetCheckBeforeCall:
             denied[0].deny_reason,
             denied[0].denied_by_period,
         ) == ("server", "manual_kill", "run_stopped")
-        assert (denied[1].deny_source, denied[1].deny_reason) == (
-            "run_terminated",
-            "manual_kill",
-        )
+        # The outage replay keeps the enforcer's own attribution: the registry
+        # entry is still resident, but the receipt names WHY this call was
+        # denied — a sticky replay of the server stop, not a bare re-report.
+        assert (
+            denied[1].deny_source,
+            denied[1].deny_reason,
+            denied[1].denied_by_period,
+        ) == ("sticky_replay", "manual_kill", "run_stopped")
         assert denied[0].agent_run_id == run_id
         assert denied[0].estimated_output_bound == solwyn._solwyn_config.lease_output_bound_default
         solwyn.close()
@@ -857,6 +864,62 @@ class TestBudgetCheckBeforeCall:
         )
         solwyn.close()
 
+    def test_outage_replay_of_a_live_registry_stop_keeps_sticky_attribution(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(
+            client,
+            budget_mode=BudgetMode.HARD_DENY,
+            lease_enabled=False,
+        )
+        solwyn._solwyn_reporter.report = MagicMock()
+        stopped = MagicMock(spec=httpx.Response)
+        stopped.raise_for_status = MagicMock()
+        stopped.json.return_value = {
+            **ALLOW_BUDGET_RESPONSE,
+            "allowed": False,
+            "reservation_id": None,
+            "mode": "hard_deny",
+            "denied_by_period": "run_stopped",
+            "run_control": {
+                "version": "1",
+                "action": "terminate",
+                "agent_run_id": "placeholder",
+                "reason": "manual_kill",
+            },
+        }
+
+        with solwyn_pkg.run("registry-resident-outage-replay") as run_id:
+            stopped.json.return_value["run_control"]["agent_run_id"] = run_id
+            with patch.object(
+                solwyn._solwyn_budget._http,
+                "post",
+                side_effect=[stopped, httpx.ConnectError("control plane unavailable")],
+            ):
+                with pytest.raises(RunStoppedError):
+                    solwyn.chat.completions.create(
+                        model="gpt-5.5",
+                        messages=[{"role": "user", "content": "Hello"}],
+                    )
+                # The registry entry SURVIVES here — that is what used to make
+                # the post-check gate miss the enforcer's outage attribution.
+                assert run_termination(run_id) is not None
+                with pytest.raises(RunStoppedError) as replay_error:
+                    solwyn.chat.completions.create(
+                        model="gpt-5.5",
+                        messages=[{"role": "user", "content": "Hello again"}],
+                    )
+
+        assert (replay_error.value.reason, replay_error.value.source) == ("manual_kill", "server")
+        assert client.chat.completions.create.call_count == 0
+        denied = _budget_denied_events(solwyn._solwyn_reporter)
+        assert len(denied) == 2
+        assert (
+            denied[1].deny_source,
+            denied[1].deny_reason,
+            denied[1].denied_by_period,
+        ) == ("sticky_replay", "manual_kill", "run_stopped")
+        solwyn.close()
+
     def test_run_stopped_label_without_active_run_raises_plain_budget_error(self) -> None:
         client, _ = _mock_openai_client()
         solwyn = _make_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
@@ -1081,6 +1144,66 @@ class TestBudgetCheckBeforeCall:
         assert event.denied_by_period == denied_by_period
         assert event.estimated_output_bound == check.call_args.kwargs["estimated_output_bound"]
         client.chat.completions.create.assert_not_called()
+        solwyn.close()
+
+    def test_denial_receipt_survives_an_output_bound_past_the_wire_maximum(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
+
+        with (
+            patch.object(
+                solwyn._solwyn_budget,
+                "check_budget",
+                return_value=_deny_budget_result("monthly"),
+            ) as check,
+            patch.object(solwyn._solwyn_reporter, "report") as report,
+            pytest.raises(BudgetExceededError),
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+                max_tokens=2 * _WIRE_QUANTITY_MAX,
+            )
+
+        # Enforcement sees the caller's real bound; only the receipt is clamped,
+        # so a pathological cap can never silently destroy its own denial audit.
+        assert check.call_args.kwargs["estimated_output_bound"] == 2 * _WIRE_QUANTITY_MAX
+        event = report.call_args.args[0]
+        assert event.status == "budget_denied"
+        assert event.estimated_output_bound == _WIRE_QUANTITY_MAX
+        client.chat.completions.create.assert_not_called()
+        solwyn.close()
+
+    def test_success_event_clamps_provider_tokens_past_the_wire_maximum(self) -> None:
+        client, mock_response = _mock_openai_client()
+        mock_response.usage = SimpleNamespace(
+            prompt_tokens=_WIRE_QUANTITY_MAX + 1,
+            completion_tokens=_WIRE_QUANTITY_MAX + 2,
+        )
+        solwyn = _make_solwyn(client)
+
+        with (
+            patch.object(
+                solwyn._solwyn_budget,
+                "check_budget",
+                return_value=_allow_budget_result(),
+            ),
+            patch.object(solwyn._solwyn_reporter, "report") as report,
+        ):
+            result = solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+
+        assert result is mock_response
+        event = report.call_args.args[0]
+        assert event.status == "success"
+        assert (event.input_tokens, event.output_tokens) == (
+            _WIRE_QUANTITY_MAX,
+            _WIRE_QUANTITY_MAX,
+        )
+        # The uncapped breakdown keeps what the provider actually reported.
+        assert event.token_details.input_tokens == _WIRE_QUANTITY_MAX + 1
         solwyn.close()
 
     def test_budget_denied_event_tags_agent_run_id(self) -> None:
@@ -3171,10 +3294,14 @@ class TestAsyncNonStreamingInterception:
             denied[0].deny_reason,
             denied[0].denied_by_period,
         ) == ("server", "manual_kill", "run_stopped")
-        assert (denied[1].deny_source, denied[1].deny_reason) == (
-            "run_terminated",
-            "manual_kill",
-        )
+        # The outage replay keeps the enforcer's own attribution: the registry
+        # entry is still resident, but the receipt names WHY this call was
+        # denied — a sticky replay of the server stop, not a bare re-report.
+        assert (
+            denied[1].deny_source,
+            denied[1].deny_reason,
+            denied[1].denied_by_period,
+        ) == ("sticky_replay", "manual_kill", "run_stopped")
         assert denied[0].agent_run_id == run_id
         assert denied[0].estimated_output_bound == solwyn._solwyn_config.lease_output_bound_default
         await solwyn.close()

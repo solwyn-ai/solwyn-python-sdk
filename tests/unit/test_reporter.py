@@ -618,7 +618,6 @@ class TestIngestRejectionLogging:
             ({"ingested": 3}, "KeyError"),  # rejected key missing
             ({"ingested": 1, "rejected": None}, "TypeError"),  # falsy non-list is not clean
             ({"ingested": 1, "rejected": ["not-a-dict"]}, "TypeError"),
-            ({"ingested": 1, "rejected": [{"index": 0}]}, "KeyError"),  # entry missing fields
         ],
     )
     def test_malformed_202_body_fails_open_and_logs_once(
@@ -644,6 +643,60 @@ class TestIngestRejectionLogging:
         ]
         assert len(unparseable) == 1
         assert f"exc_type={expected_exc_type}" in unparseable[0]
+        reporter._http.close()
+
+    def test_missing_rejection_metadata_still_disposes_by_index(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Only the per-(code, model) WARNING depends on those fields. The exit
+        # parser reads `index` alone and both must dispose the same body the
+        # same way, so a metadata-less entry keeps its EXACT identity.
+        reporter = _quiet_sync_reporter(batch_size=2)
+        body = {"ingested": 1, "rejected": [{"index": 1}]}
+        reporter.report(_make_event(call_id=call_uuid("meta-kept")))
+        reporter.report(_make_event(call_id=call_uuid("meta-rejected")))
+
+        with (
+            patch.object(reporter._http, "post", return_value=_accepted_response(body)),
+            caplog.at_level("WARNING"),
+        ):
+            reporter._drain_event_batches()
+
+        assert reporter.dropped_counts == {"event.ingest_rejected": 1}
+        assert "reporter.ingest_response_unparseable" not in caplog.text
+        assert "reporter.ingest_events_rejected" not in caplog.text
+        assert reporter._consecutive_unparseable_responses == 0
+        reporter._http.close()
+
+    @pytest.mark.parametrize(
+        ("rejected", "expected_drops"),
+        [
+            ([_rejection(0), _rejection(0)], 2),  # duplicate index
+            ([_rejection(7)], 1),  # index outside the submitted batch
+            ([_rejection(-1)], 1),  # negative index
+        ],
+    )
+    def test_index_shape_violation_degrades_to_legacy_count_only(
+        self,
+        rejected: list[dict[str, Any]],
+        expected_drops: int,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        # A server-side index bug costs identity, never the loss accounting the
+        # pre-index parser proved: count-only, and the drift is still logged.
+        reporter = _quiet_sync_reporter(batch_size=2)
+        body = {"ingested": 0, "rejected": rejected}
+        reporter.report(_make_event(call_id=call_uuid("shape-a")))
+        reporter.report(_make_event(call_id=call_uuid("shape-b")))
+
+        with (
+            patch.object(reporter._http, "post", return_value=_accepted_response(body)),
+            caplog.at_level("WARNING"),
+        ):
+            reporter._drain_event_batches()
+
+        assert reporter.dropped_counts == {"event.ingest_rejected": expected_drops}
+        assert "reporter.ingest_response_unparseable" in caplog.text
         reporter._http.close()
 
     def test_invalid_json_202_body_fails_open(self, caplog: pytest.LogCaptureFixture) -> None:

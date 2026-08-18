@@ -127,10 +127,21 @@ derived from git tags (hatch-vcs).
   `deny_reason`, `denied_by_period`, `estimated_output_bound`, `velocity_flags`,
   `receipt_aggregate_count`, and `receipt_pricing_input_tokens` are optional,
   content-free metadata fields. Unavoidable receipt losses fold by
-  pricing-compatible identity and replay in per-field 100-million-unit-safe
-  aggregates after delivery recovers. Aggregates preserve exact token/media
-  totals, optional media quantity presence, and the original per-call
-  input-token pricing basis.
+  pricing-compatible identity — which includes the denial reason and period,
+  so a run's `run_stopped` and `monthly` evidence never merge — and replay in
+  per-field 100-million-unit-safe aggregates after delivery recovers,
+  carrying reason, period, and the union of velocity flags. Aggregates
+  preserve exact token/media totals, optional media quantity presence, and
+  the original per-call input-token pricing basis. Each run holds a bounded
+  budget of exact-pricing fold keys; past it (or with the shared table full)
+  receipts fold into one coarse per-run aggregate whose null pricing basis
+  marks it unpriceable — counts and attribution survive instead of the
+  receipt being refused. Terminal receipt losses are counted at receipt
+  weight, never per event, so an aggregate can never understate its
+  cardinality. A run-stop directive echoed for the wrong run is treated as
+  server contract drift on every channel: it credits the shared
+  control-plane breaker, logs a distinct ERROR, and degrades that one call
+  to the outage posture instead of opening the breaker fleet-wide.
 
 ### Changed
 

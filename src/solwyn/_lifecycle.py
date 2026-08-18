@@ -357,6 +357,17 @@ class _ExitDropState:
                 continue
 
 
+def _exit_event_drop_weight(pending: object) -> int:
+    """Receipt count one queued event's terminal loss represents.
+
+    Mirrors ``_ReporterBase._event_drop_weight``: only an aggregate replay
+    stands for more than one receipt, and only denied receipts ever carry
+    ``receipt_aggregate_count``.
+    """
+    event = getattr(pending, "event", pending)
+    return getattr(event, "receipt_aggregate_count", None) or 1
+
+
 def _dispose_exit_event(
     event: object,
     reason: str,
@@ -488,6 +499,7 @@ class _ExitOwnership:
         reason: str,
         n: int = 1,
         cap: int | None = None,
+        weigher: Callable[[object], int] | None = None,
     ) -> int:
         """Atomically release up to ``n`` in-hand items AND publish their drop.
 
@@ -500,16 +512,24 @@ class _ExitOwnership:
         later seal finds nothing in hand), or the seal already claimed the
         items as ``shutdown_deadline`` (owned=0, nothing published here).
         ``cap`` bounds the published count below ``owned`` (per-event 202
-        rejections inside an otherwise-sent batch). Callers pass the local
-        ``_ExitDropState.record`` primitive here; logging/user callbacks are
-        emitted only after the seal. Returns owned.
+        rejections inside an otherwise-sent batch). ``weigher`` turns that item
+        count into RECEIPT weight: an index-less body proves how many events
+        were rejected but not which, so the ``cap`` HEAVIEST released items are
+        charged — a bounded overcount instead of understating an aggregate
+        receipt's cardinality. Callers pass the local ``_ExitDropState.record``
+        primitive here; logging/user callbacks are emitted only after the seal.
+        Returns owned.
         """
         with self._lock:
             held = self._counts.get(kind, 0)
             owned = min(n, held)
             self._counts[kind] = held - owned
-            self._release_items(kind, owned)
-            publish_n = owned if cap is None else min(owned, cap)
+            released = self._release_items(kind, owned)
+            if weigher is None:
+                publish_n = owned if cap is None else min(owned, cap)
+            else:
+                weights = sorted((weigher(item) for item in released), reverse=True)
+                publish_n = sum(weights if cap is None else weights[:cap])
             if publish_n > 0:
                 drop_counter(publish_kind, reason, publish_n)
             return owned
@@ -749,6 +769,7 @@ def _drain_queues_blocking(
                                 "event",
                                 "ingest_rejected",
                                 cap=rejections.count,
+                                weigher=_exit_event_drop_weight,
                             )
                     else:
                         own.resolve("settlement_event")
@@ -799,6 +820,7 @@ def _drain_queues_blocking(
                                 "ingest_rejected",
                                 n=len(batch),
                                 cap=rejections.count,
+                                weigher=_exit_event_drop_weight,
                             )
                     else:
                         own.resolve("event", len(batch))
@@ -967,7 +989,12 @@ def _parse_exit_ingest_rejections(
     would silently understate that loss. A partial legacy index-less list
     proves only the count and must never guess which event to fold; a full
     legacy rejection proves every identity. Malformed responses retain the
-    exit hook's fail-open behavior.
+    exit hook's fail-open behavior — but only bodies whose rejection COUNT is
+    untrustworthy qualify: an index-shape violation (non-integer, duplicate,
+    out-of-range) still proves the count, so it degrades to LEGACY rather than
+    zeroing the loss accounting. Mirrors
+    ``_ReporterBase._parse_ingest_rejections`` rule for rule: the two parsers
+    must reach the SAME disposition for the same body.
     """
     try:
         rejected = response.json()["rejected"]
@@ -979,21 +1006,22 @@ def _parse_exit_ingest_rejections(
             return _ExitIngestRejections(_ExitIngestRejectionKind.MALFORMED)
         indexes: list[int] = []
         indexes_complete = True
+        shape_violation = False
         for item in rejected:
             try:
                 raw_index = item["index"]
-                if type(raw_index) is not int:
-                    return _ExitIngestRejections(_ExitIngestRejectionKind.MALFORMED)
-                indexes.append(raw_index)
             except KeyError:
                 indexes_complete = False
-        if not indexes_complete:
-            return _ExitIngestRejections(_ExitIngestRejectionKind.LEGACY, count=len(rejected))
+                continue
+            if type(raw_index) is not int or raw_index < 0 or raw_index >= batch_size:
+                shape_violation = True
+                continue
+            indexes.append(raw_index)
         unique_indexes = frozenset(indexes)
-        if len(unique_indexes) != len(rejected) or any(
-            index < 0 or index >= batch_size for index in indexes
-        ):
-            return _ExitIngestRejections(_ExitIngestRejectionKind.MALFORMED)
+        if len(unique_indexes) != len(indexes):
+            shape_violation = True
+        if shape_violation or not indexes_complete:
+            return _ExitIngestRejections(_ExitIngestRejectionKind.LEGACY, count=len(rejected))
         return _ExitIngestRejections(
             _ExitIngestRejectionKind.EXACT,
             indexes=unique_indexes,

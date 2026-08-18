@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn, TypedDict,
 
 from pydantic import BaseModel, ConfigDict
 
+from solwyn._constants import ORDINARY_TOKEN_COUNT_MAX
 from solwyn._lifecycle import register_fork_reset
 from solwyn._routing import (
     CostPolicy,
@@ -153,6 +154,19 @@ def _bedrock_read_timeout_is_unbounded(sdk_client: object) -> bool:
         return False
     sentinel = object()
     return getattr(config, "read_timeout", sentinel) is None
+
+
+def _wire_token_quantity(value: int) -> int:
+    """Clamp one token quantity into the wire model's validated range.
+
+    Enforcement and lease math stay UNCLAMPED — only the reported artifact is
+    bounded. A quantity outside ``[0, ORDINARY_TOKEN_COUNT_MAX]`` raises
+    ValidationError at event construction, and every construction site is
+    either a denial receipt whose loss is swallowed or a settlement build that
+    runs AFTER the provider was paid. A clamped count is always better
+    accounting than a destroyed receipt or a crashed paid call.
+    """
+    return min(max(value, 0), ORDINARY_TOKEN_COUNT_MAX)
 
 
 # CostPolicy is inert until the server sends a relative price hint: with no hint
@@ -1684,8 +1698,8 @@ class _SolwynBase:
             model=model,
             provider=ProviderName(provider),
             modality=modality,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            input_tokens=_wire_token_quantity(input_tokens),
+            output_tokens=_wire_token_quantity(output_tokens),
             token_details=token_details,
             media_usage=media_usage,
             latency_ms=latency_ms,
@@ -1710,7 +1724,11 @@ class _SolwynBase:
             deny_source=deny_source,
             deny_reason=deny_reason,
             denied_by_period=denied_by_period,
-            estimated_output_bound=estimated_output_bound,
+            estimated_output_bound=(
+                None
+                if estimated_output_bound is None
+                else _wire_token_quantity(estimated_output_bound)
+            ),
             velocity_flags=(
                 cast("list[VelocityFlag]", list(velocity_flags)) if velocity_flags else None
             ),

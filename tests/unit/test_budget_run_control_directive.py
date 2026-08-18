@@ -23,9 +23,40 @@ from solwyn.budget import (
     BudgetEnforcer,
     _BudgetEnforcerBase,
 )
+from solwyn.circuit_breaker import CircuitBreaker, CircuitState
 
 RUN_ID = "run-directed"
 OTHER_RUN_ID = "run-other"
+
+
+class _StepClock:
+    """A monotonic clock that advances one fixed step per READ.
+
+    Two reads that ought to be ONE observation therefore land on different
+    stamps — exactly the split a single-stamp directive path must not create.
+    """
+
+    def __init__(self, start: float = 1_000.0, step: float = 1.0) -> None:
+        self._now = start
+        self._step = step
+
+    def monotonic(self) -> float:
+        now = self._now
+        self._now += self._step
+        return now
+
+
+def _alert_only_denial(period: str | None = "daily") -> BudgetCheckResponse:
+    """A non-hard denial: allowed=False but the call still proceeds."""
+    return BudgetCheckResponse.model_validate(
+        {
+            **ALLOW_BUDGET_RESPONSE,
+            "allowed": False,
+            "reservation_id": None,
+            "mode": "alert_only",
+            "denied_by_period": period,
+        }
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -948,7 +979,21 @@ class TestCheckRunControl:
             "velocity:repeat_size",
             "local_velocity",
         )
-        assert result.allowed is False
+        # Cross-source split, same as the grant channel: the LOCAL first
+        # writer keeps the registry, and the server directive keeps its own
+        # reason on this response and its sticky. Relabelling only happens
+        # when the registry winner is itself a server stop.
+        assert (result.allowed, result.deny_source, result.deny_reason) == (
+            False,
+            "server",
+            "manual_kill",
+        )
+        sticky = enforcer._run_hard_deny_responses[RUN_ID]
+        assert sticky.run_control is not None
+        assert sticky.run_control.reason == "manual_kill"
+        replay = enforcer._build_prior_hard_deny_unavailable_result(RUN_ID)
+        assert replay is not None
+        assert (replay.deny_source, replay.deny_reason) == ("sticky_replay", "manual_kill")
 
     @pytest.mark.asyncio
     async def test_async_matching_directive_applies_on_same_response(self) -> None:
@@ -1010,10 +1055,17 @@ class TestLeaseRunControl:
                 call_id=call_uuid("directed-grant-sync"),
             )
 
-        assert (result.allowed, result.mode, result.denied_by_period, result.deny_reason) == (
+        assert (
+            result.allowed,
+            result.mode,
+            result.denied_by_period,
+            result.deny_source,
+            result.deny_reason,
+        ) == (
             False,
             BudgetMode.HARD_DENY,
             "run_stopped",
+            "server",
             "manual_kill",
         )
         assert enforcer._lease.lease_id_for(RUN_ID) is None
@@ -1037,10 +1089,17 @@ class TestLeaseRunControl:
             call_id=call_uuid("directed-grant-async"),
         )
 
-        assert (result.allowed, result.mode, result.denied_by_period, result.deny_reason) == (
+        assert (
+            result.allowed,
+            result.mode,
+            result.denied_by_period,
+            result.deny_source,
+            result.deny_reason,
+        ) == (
             False,
             BudgetMode.HARD_DENY,
             "run_stopped",
+            "server",
             "manual_kill",
         )
         assert enforcer._lease.lease_id_for(RUN_ID) is None
@@ -1391,9 +1450,21 @@ class TestLeaseRunControl:
         replacement = LeaseGrantResponse.model_validate(
             _grant_payload(lease_id="lse_b", generation=1)
         )
-        assert (
-            base._apply_lease_response(RUN_ID, replacement, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
-        )
+        # The run is stopped now, so the ordinary install path REFUSES a
+        # replacement (see the racing-grant test below). Seat it straight into
+        # the ledger: this test is about first-writer reason preservation
+        # across two renewal directives, not about the install guard.
+        with base._state_lock:
+            base._lease.drop(RUN_ID)
+            assert (
+                base._lease.apply_grant_response(
+                    RUN_ID,
+                    replacement,
+                    now=budget_module.time.monotonic(),
+                    declared_models=["gpt-5.5"],
+                )
+                is GrantOutcome.APPLIED
+            )
         second_request = base._build_renewal(
             RUN_ID,
             model="gpt-5.5",
@@ -1432,9 +1503,53 @@ class TestLeaseRunControl:
         assert replay is not None
         assert replay.deny_reason == "first_reason"
 
-    def test_renewal_directive_cannot_drop_a_replacement_installed_after_its_fence(
+    def test_renewal_directive_for_a_replaced_lease_cannot_drop_the_replacement(
         self,
     ) -> None:
+        """A late reply for lease A must not stop a run now running under B."""
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        first = LeaseGrantResponse.model_validate(_grant_payload())
+        assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
+        request = base._build_renewal(
+            RUN_ID,
+            model="gpt-5.5",
+            provider="openai",
+            fallback_providers=[],
+            fallback_models=[],
+        )
+        assert request is not None
+        # Replacement B lands while A's renewal is still on the wire.
+        with base._state_lock:
+            base._lease.drop(RUN_ID)
+            assert (
+                base._lease.apply_grant_response(
+                    RUN_ID,
+                    LeaseGrantResponse.model_validate(
+                        _grant_payload(lease_id="lse_b", generation=1)
+                    ),
+                    now=budget_module.time.monotonic(),
+                    declared_models=["gpt-5.5"],
+                )
+                is GrantOutcome.APPLIED
+            )
+        directed = LeaseGrantResponse.model_validate(
+            _grant_payload(generation=2, directive_run_id=RUN_ID)
+        )
+
+        assert base._finish_renewal(RUN_ID, request, directed, ["gpt-5.5"]) is None
+
+        state = base._lease.state_for(RUN_ID)
+        assert state is not None
+        assert (state.lease_id, state.generation) == ("lse_b", 1)
+        # The identity fence runs BEFORE the directive is observed, so the
+        # stale reply never reaches the registry either.
+        assert run_termination(RUN_ID) is None
+        assert RUN_ID not in base._run_hard_deny_responses
+
+    def test_racing_grant_is_serialized_then_refused_and_surrendered_on_a_stopped_run(
+        self,
+    ) -> None:
+        """A grant landing on a stopped run installs nothing and hands the float back."""
         base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
         first = LeaseGrantResponse.model_validate(_grant_payload())
         assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
@@ -1455,6 +1570,7 @@ class TestLeaseRunControl:
         mark_entered = threading.Event()
         release_mark = threading.Event()
         replacement_done = threading.Event()
+        installed: list[tuple[GrantOutcome, object]] = []
         real_mark = _run_control._mark_terminated_locked
 
         def blocked_mark(run_id: str, *, reason: str, source: str) -> object:
@@ -1466,10 +1582,7 @@ class TestLeaseRunControl:
             base._finish_renewal(RUN_ID, request, directed, ["gpt-5.5"])
 
         def install_replacement() -> None:
-            with base._state_lock:
-                base._lease.drop(RUN_ID)
-            outcome, _ = base._apply_lease_response(RUN_ID, replacement, ["gpt-5.5"])
-            assert outcome is GrantOutcome.APPLIED
+            installed.append(base._apply_lease_response(RUN_ID, replacement, ["gpt-5.5"]))
             replacement_done.set()
 
         with patch.object(
@@ -1482,7 +1595,10 @@ class TestLeaseRunControl:
             assert mark_entered.wait(timeout=2)
             installer = threading.Thread(target=install_replacement)
             installer.start()
-            replacement_done.wait(timeout=0.2)
+            # No install may land in the window between the registry mark and
+            # the lease drop: the installer takes the SAME registry lock the
+            # finisher holds, so it cannot complete until the stop is filed.
+            assert replacement_done.wait(timeout=0.2) is False
             release_mark.set()
             finisher.join(timeout=2)
             installer.join(timeout=2)
@@ -1490,7 +1606,14 @@ class TestLeaseRunControl:
         assert not finisher.is_alive()
         assert not installer.is_alive()
         assert replacement_done.is_set()
-        assert base._lease.lease_id_for(RUN_ID) == "lse_b"
+        outcome, surrender = installed[0]
+        assert outcome is GrantOutcome.STALE
+        assert surrender is not None
+        assert surrender.lease_id == "lse_b"  # type: ignore[attr-defined]
+        # Without the registry consult this grant would have APPLIED — the
+        # directive already dropped lease A, leaving the ledger empty.
+        assert base._lease.lease_id_for(RUN_ID) is None
+        assert run_termination(RUN_ID) is not None
 
     def test_current_wrong_run_renewal_warns_but_installs_normally(
         self, caplog: pytest.LogCaptureFixture
@@ -1642,3 +1765,388 @@ class TestLeaseRunControl:
         assert (state.lease_id, state.generation) == ("lse_b", 1)
         assert run_termination(RUN_ID) is None
         assert not any("run_control.directive_run_mismatch" in r.message for r in caplog.records)
+
+
+@pytest.mark.unit
+class TestDirectiveEpochCoherence:
+    """Registry stop and sticky denial must order against ONE observation."""
+
+    @pytest.mark.parametrize("epoch_offset", [-1.5, -0.5, 0.0, 0.5, 1.5])
+    def test_no_request_epoch_can_split_a_run_stop_from_its_sticky_denial(
+        self, epoch_offset: float
+    ) -> None:
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        directive = BudgetCheckResponse.model_validate(_check_payload(allowed=False))
+        clock = _StepClock()
+
+        with patch.object(budget_module.time, "monotonic", clock.monotonic):
+            denied, cache_response = base._apply_check_run_control(directive, RUN_ID)
+            assert (denied.allowed, cache_response) == (False, False)
+            marked_at = _run_control._STATE.observed_at[RUN_ID]
+            assert base._run_hard_deny_observed_at[RUN_ID] == marked_at
+            # An ALLOW whose epoch lands anywhere around that observation —
+            # including inside the window a second clock read used to open.
+            effective = base._cache_response(
+                BudgetCheckResponse.model_validate(dict(ALLOW_BUDGET_RESPONSE)),
+                agent_run_id=RUN_ID,
+                request_epoch=marked_at + epoch_offset,
+            )
+
+        stop = run_termination(RUN_ID)
+        if effective.allowed:
+            assert stop is None
+            assert RUN_ID not in base._run_hard_deny_responses
+            assert base._build_prior_hard_deny_unavailable_result(RUN_ID) is None
+        else:
+            # A surviving denial keeps its RunStoppedError identity: the
+            # client's post-check gate reads the REGISTRY, not the sticky.
+            assert stop is not None
+            assert effective.denied_by_period == "run_stopped"
+            assert effective.run_control is not None
+            assert effective.run_control.reason == "manual_kill"
+            assert RUN_ID in base._run_hard_deny_responses
+
+    def test_grant_directive_stamps_registry_and_sticky_from_one_observation(self) -> None:
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        directed = LeaseGrantResponse.model_validate(_grant_payload(directive_run_id=RUN_ID))
+        clock = _StepClock()
+
+        with patch.object(budget_module.time, "monotonic", clock.monotonic):
+            outcome, surrender = base._apply_lease_response(RUN_ID, directed, ["gpt-5.5"])
+
+        assert (outcome, surrender) == (GrantOutcome.DENIED, None)
+        assert base._run_hard_deny_observed_at[RUN_ID] == _run_control._STATE.observed_at[RUN_ID]
+
+    def test_renewal_directive_stamps_registry_and_sticky_from_one_observation(self) -> None:
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        first = LeaseGrantResponse.model_validate(_grant_payload())
+        assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
+        request = base._build_renewal(
+            RUN_ID,
+            model="gpt-5.5",
+            provider="openai",
+            fallback_providers=[],
+            fallback_models=[],
+        )
+        assert request is not None
+        directed = LeaseGrantResponse.model_validate(
+            _grant_payload(generation=2, directive_run_id=RUN_ID)
+        )
+        clock = _StepClock()
+
+        with patch.object(budget_module.time, "monotonic", clock.monotonic):
+            assert base._finish_renewal(RUN_ID, request, directed, ["gpt-5.5"]) is None
+
+        assert base._run_hard_deny_observed_at[RUN_ID] == _run_control._STATE.observed_at[RUN_ID]
+
+    def test_full_grant_denial_keeps_one_stamp_and_reports_the_server_source(self) -> None:
+        enforcer = BudgetEnforcer(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+        clock = _StepClock(step=0.25)
+
+        with (
+            patch.object(budget_module.time, "monotonic", clock.monotonic),
+            patch.object(
+                enforcer._http,
+                "post",
+                return_value=_response(_grant_payload(directive_run_id=RUN_ID)),
+            ),
+        ):
+            result = enforcer.check_budget(
+                estimated_input_tokens=10,
+                estimated_output_bound=100,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id=RUN_ID,
+                call_id=call_uuid("directed-grant-one-stamp"),
+            )
+
+        # The denial is re-filed once more on the way out of the admission
+        # path; that re-file must NOT advance the sticky past the registry.
+        assert (result.allowed, result.deny_source, result.deny_reason) == (
+            False,
+            "server",
+            "manual_kill",
+        )
+        registry_stamp = _run_control._STATE.observed_at[RUN_ID]
+        assert enforcer._run_hard_deny_observed_at[RUN_ID] == registry_stamp
+
+    def test_delayed_alert_only_denial_cannot_erase_a_newer_run_stop(self) -> None:
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        directive = BudgetCheckResponse.model_validate(_check_payload(allowed=False))
+        base._apply_check_run_control(directive, RUN_ID)
+        marked_at = _run_control._STATE.observed_at[RUN_ID]
+
+        # Delayed: requested BEFORE the stop was observed.
+        base._cache_response(
+            _alert_only_denial(),
+            agent_run_id=RUN_ID,
+            request_epoch=marked_at - 1.0,
+        )
+        assert RUN_ID in base._run_hard_deny_responses
+        # Unordered: no epoch at all proves nothing about arrival order.
+        base._cache_response(_alert_only_denial(), agent_run_id=RUN_ID)
+        assert RUN_ID in base._run_hard_deny_responses
+        replay = base._build_prior_hard_deny_unavailable_result(RUN_ID)
+        assert replay is not None
+        assert replay.deny_reason == "manual_kill"
+
+        # A provably newer alert-only response still lifts the stop.
+        base._cache_response(
+            _alert_only_denial(),
+            agent_run_id=RUN_ID,
+            request_epoch=marked_at + 1.0,
+        )
+        assert RUN_ID not in base._run_hard_deny_responses
+        assert RUN_ID not in base._run_hard_deny_observed_at
+
+    def test_suppressed_allow_still_refreshes_the_local_budget_snapshot(self) -> None:
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base._apply_check_run_control(
+            BudgetCheckResponse.model_validate(_check_payload(allowed=False)),
+            RUN_ID,
+        )
+        marked_at = _run_control._STATE.observed_at[RUN_ID]
+        fresher = BudgetCheckResponse.model_validate(
+            {**ALLOW_BUDGET_RESPONSE, "budget_limit": 250.0, "current_usage": 77.0}
+        )
+
+        effective = base._cache_response(
+            fresher,
+            agent_run_id=RUN_ID,
+            request_epoch=marked_at - 1.0,
+        )
+
+        # The sticky wins the VERDICT, but the snapshot local enforcement
+        # falls back on is response-shaped and must still advance.
+        assert effective.allowed is False
+        assert (base._last_known_budget_limit, base._last_known_current_usage) == (250.0, 77.0)
+
+
+@pytest.mark.unit
+class TestMisroutedDirectiveIsDriftNotOutage:
+    """A directive for another run credits the plane and logs at ERROR."""
+
+    @staticmethod
+    def _breaker() -> CircuitBreaker:
+        # One failure would open it, so a credited call is unambiguous.
+        return CircuitBreaker(failure_threshold=1, recovery_timeout=600, name="control-plane")
+
+    @staticmethod
+    def _denied_grant_payload(run_id: str) -> dict[str, object]:
+        payload = _grant_payload(directive_run_id=run_id)
+        payload.update(
+            {
+                "allowed": False,
+                "denied_by_period": "run_stopped",
+                "lease_id": None,
+                "generation": None,
+                "granted_tokens": None,
+                "refresh_interval_s": None,
+                "lease_length_s": None,
+                "headroom_share_tokens": None,
+                "posture": None,
+                "final_grant": None,
+            }
+        )
+        return payload
+
+    def test_check_channel_credits_the_breaker_and_keeps_the_outage_posture(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        breaker = self._breaker()
+        enforcer = BudgetEnforcer(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+            lease_enabled=False,
+            control_plane_breaker=breaker,
+        )
+
+        with (
+            caplog.at_level(logging.ERROR, logger="solwyn.budget"),
+            patch.object(
+                enforcer._http,
+                "post",
+                return_value=_response(_check_payload(allowed=False, run_id=OTHER_RUN_ID)),
+            ),
+        ):
+            result = enforcer.check_budget(
+                estimated_input_tokens=10,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id=RUN_ID,
+            )
+
+        # Posture is unchanged: this ONE call still degrades to the ladder.
+        assert result.allowed is True
+        assert result.warning == "Cloud API unreachable; proceeding in fail-open mode"
+        assert run_termination(RUN_ID) is None
+        # ...but the plane answered, so the shared breaker stays closed.
+        assert breaker.get_state().state is CircuitState.CLOSED
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        assert "budget.check_directive_misrouted" in errors[0].message
+        assert OTHER_RUN_ID in errors[0].message
+
+    def test_grant_channel_credits_the_breaker_and_keeps_the_outage_posture(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        breaker = self._breaker()
+        enforcer = BudgetEnforcer(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+            control_plane_breaker=breaker,
+        )
+
+        with (
+            caplog.at_level(logging.ERROR, logger="solwyn.budget"),
+            patch.object(
+                enforcer._http,
+                "post",
+                return_value=_response(self._denied_grant_payload(OTHER_RUN_ID)),
+            ),
+        ):
+            result = enforcer.check_budget(
+                estimated_input_tokens=10,
+                estimated_output_bound=100,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id=RUN_ID,
+                call_id=call_uuid("misrouted-grant-breaker"),
+            )
+
+        assert result.allowed is True
+        assert result.denied_by_period is None
+        assert enforcer._lease.lease_id_for(RUN_ID) is None
+        assert run_termination(RUN_ID) is None
+        assert breaker.get_state().state is CircuitState.CLOSED
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        assert "lease.grant_directive_misrouted" in errors[0].message
+
+    def test_renewal_channel_credits_the_breaker_and_keeps_its_backoff(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        breaker = self._breaker()
+        enforcer = BudgetEnforcer(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+            control_plane_breaker=breaker,
+        )
+        first = LeaseGrantResponse.model_validate(_grant_payload())
+        assert enforcer._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
+        request = enforcer._build_renewal(
+            RUN_ID,
+            model="gpt-5.5",
+            provider="openai",
+            fallback_providers=[],
+            fallback_models=[],
+        )
+        assert request is not None
+        payload = self._denied_grant_payload(OTHER_RUN_ID)
+
+        with (
+            caplog.at_level(logging.ERROR, logger="solwyn.budget"),
+            patch.object(enforcer._http, "post", return_value=_response(payload)),
+        ):
+            enforcer._renew_lease(RUN_ID, request, ["gpt-5.5"])
+
+        assert breaker.get_state().state is CircuitState.CLOSED
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        assert "lease.renew_directive_misrouted" in errors[0].message
+        # The lease keeps its own deadline; only the in-flight flag clears.
+        state = enforcer._lease.state_for(RUN_ID)
+        assert state is not None
+        assert (state.lease_id, state.generation) == ("lse_a", 1)
+        assert state.renewal_in_flight is False
+        assert run_termination(RUN_ID) is None
+
+
+@pytest.mark.unit
+class TestStoppedRunRefusesLateAuthority:
+    def test_renewal_landing_on_a_stopped_run_surrenders_instead_of_installing(self) -> None:
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        first = LeaseGrantResponse.model_validate(_grant_payload())
+        assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
+        request = base._build_renewal(
+            RUN_ID,
+            model="gpt-5.5",
+            provider="openai",
+            fallback_providers=[],
+            fallback_models=[],
+        )
+        assert request is not None
+        mark_terminated(RUN_ID, reason="velocity:repeat_size", source="local_velocity")
+        ordinary = LeaseGrantResponse.model_validate(_grant_payload(generation=2))
+
+        surrender = base._finish_renewal(RUN_ID, request, ordinary, ["gpt-5.5"])
+
+        assert surrender is not None
+        assert (surrender.lease_id, surrender.generation) == ("lse_a", 2)
+        assert base._lease.lease_id_for(RUN_ID) is None
+
+    def test_close_fenced_directive_renewal_surrenders_without_marking(self) -> None:
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        first = LeaseGrantResponse.model_validate(_grant_payload())
+        assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
+        request = base._build_renewal(
+            RUN_ID,
+            model="gpt-5.5",
+            provider="openai",
+            fallback_providers=[],
+            fallback_models=[],
+        )
+        assert request is not None
+        directed = LeaseGrantResponse.model_validate(
+            _grant_payload(generation=2, directive_run_id=RUN_ID)
+        )
+        base._closed = True
+        base._close_epoch = 1
+
+        surrender = base._finish_renewal(
+            RUN_ID,
+            request,
+            directed,
+            ["gpt-5.5"],
+            close_epoch=0,
+        )
+
+        # Fenced BEFORE the directive is observed: close owns the release,
+        # and this client records no stop it can no longer act on.
+        assert surrender is not None
+        assert (surrender.lease_id, surrender.generation) == ("lse_a", 2)
+        assert run_termination(RUN_ID) is None
+        assert RUN_ID not in base._run_hard_deny_responses
+
+    def test_outage_replays_a_retained_stop_that_has_no_sticky_response(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        # Registry-only: a local velocity stop files no sticky denial.
+        mark_terminated(RUN_ID, reason="velocity:repeat_size", source="local_velocity")
+
+        with caplog.at_level(logging.WARNING, logger="solwyn.budget"):
+            result = base._build_prior_hard_deny_unavailable_result(RUN_ID)
+
+        assert result is not None
+        assert (
+            result.allowed,
+            result.mode,
+            result.denied_by_period,
+            result.deny_source,
+            result.deny_reason,
+        ) == (
+            False,
+            BudgetMode.HARD_DENY,
+            "run_stopped",
+            "sticky_replay",
+            "velocity:repeat_size",
+        )
+        assert result.warning == "Cloud API unreachable; preserving retained run stop"
+        assert any(
+            "Cloud API unreachable; preserving retained run stop" in r.message
+            for r in caplog.records
+        )

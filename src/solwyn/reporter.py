@@ -55,6 +55,7 @@ from solwyn._types import (
     Modality,
     ProviderName,
     UntrackedSurfaceReport,
+    VelocityFlag,
 )
 from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
 
@@ -102,6 +103,14 @@ _UNTRACKED_REPORT_KEY_LIMIT = 512
 # bound; a new key is observably refused rather than evicting another run's
 # durable trace.
 _RECEIPT_FOLD_LIMIT = 256
+
+# Per-run ceiling on EXACT keys — the ones carrying a per-call pricing basis.
+# A growing-prompt runaway mints a distinct input size per call, so without
+# this a single run would fill the process-global table with single-receipt
+# entries and every other run's receipts would be refused. At 1/8 of the table
+# at least eight concurrent runs keep their full exact budget, while a run past
+# it keeps its evidence through the coarse fallback key below.
+_RECEIPT_FOLD_RUN_EXACT_LIMIT = 32
 
 _T = TypeVar("_T")
 
@@ -224,10 +233,19 @@ class _ClaimedSettlement:
 
 
 class _ReceiptFoldKey(NamedTuple):
-    """Pricing-compatible, content-free identity for one receipt aggregate."""
+    """Pricing-compatible, content-free identity for one receipt aggregate.
+
+    ``receipt_pricing_input_tokens`` is None on a COARSE key: the aggregate
+    then spans calls of differing input size, so the server can no longer
+    select one pricing card for it. Every other dimension — run, denial
+    source/reason/period, model, provider, tier, modality, media shape —
+    still partitions exactly, so counts and attribution survive.
+    """
 
     run_id: str
     original_source: str
+    deny_reason: str
+    denied_by_period: str
     model: str
     provider: ProviderName
     provider_region: str | None
@@ -258,6 +276,7 @@ class _ReceiptFold:
     input_tokens: int
     output_tokens: int
     estimated_output_bound: int
+    velocity_flags: frozenset[VelocityFlag]
     image_count: int | None
     generation_count: int | None
     video_seconds: float | None
@@ -275,6 +294,9 @@ class _ReceiptFoldState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.folds: dict[_ReceiptFoldKey, _ReceiptFold] = {}
+        # Exact (per-input-size) key count per run; the coarse fallback below
+        # is keyed off it. Mutated only where ``folds`` itself is.
+        self.run_exact_keys: dict[str, int] = {}
         self.previous_cycle_succeeded = False
         self.terminal = False
 
@@ -288,6 +310,7 @@ class _ReceiptFoldState:
         terminal = self.terminal
         self.lock = threading.Lock()
         self.folds = {}
+        self.run_exact_keys = {}
         self.previous_cycle_succeeded = False
         # Terminal ownership is one-way. A child of an already closing/closed
         # reporter has no sender either and must count late receipts instead of
@@ -304,9 +327,15 @@ class _ReceiptFoldState:
             return "not_denied"
         media = event.media_usage
         input_tokens = max(0, int(event.input_tokens))
-        key = _ReceiptFoldKey(
+        exact_key = _ReceiptFoldKey(
             run_id=event.agent_run_id or "",
             original_source=event.deny_source or "",
+            # Reason and period partition the aggregate: a run's run_stopped
+            # and monthly receipts are different denial evidence and must
+            # never merge into one indistinguishable replay. Both are bounded
+            # structural strings, so the added cardinality is bounded too.
+            deny_reason=event.deny_reason or "",
+            denied_by_period=event.denied_by_period or "",
             model=event.model,
             provider=event.provider,
             provider_region=event.provider_region,
@@ -330,19 +359,37 @@ class _ReceiptFoldState:
         count = event.receipt_aggregate_count or 1
         output_tokens = max(0, int(event.output_tokens))
         output_bound = max(0, int(event.estimated_output_bound or 0))
+        velocity_flags = frozenset(event.velocity_flags or ())
         timestamp = self._timestamp(event.timestamp)
         with self.lock:
             if self.terminal:
                 return "terminal"
+            key = exact_key
             existing = self.folds.get(key)
+            if existing is None and key.receipt_pricing_input_tokens is not None:
+                run_exact = self.run_exact_keys.get(key.run_id, 0)
+                if run_exact >= _RECEIPT_FOLD_RUN_EXACT_LIMIT or (
+                    len(self.folds) >= _RECEIPT_FOLD_LIMIT
+                ):
+                    # The run has spent its exact-key budget (or the shared
+                    # table is full): drop ONLY the per-call pricing basis and
+                    # keep every other dimension. Exact pricing is forfeited
+                    # for this aggregate — the SDK never computes cost — but
+                    # the denial evidence, receipt counts, and attribution
+                    # survive instead of being refused outright.
+                    key = key._replace(receipt_pricing_input_tokens=None)
+                    existing = self.folds.get(key)
             if existing is None:
                 if len(self.folds) >= _RECEIPT_FOLD_LIMIT:
                     return "overflow"
+                if key.receipt_pricing_input_tokens is not None:
+                    self.run_exact_keys[key.run_id] = self.run_exact_keys.get(key.run_id, 0) + 1
                 self.folds[key] = _ReceiptFold(
                     count=count,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     estimated_output_bound=output_bound,
+                    velocity_flags=velocity_flags,
                     image_count=media.image_count if media is not None else None,
                     generation_count=media.generation_count if media is not None else None,
                     video_seconds=media.video_seconds if media is not None else None,
@@ -358,6 +405,11 @@ class _ReceiptFoldState:
                 existing.input_tokens += input_tokens
                 existing.output_tokens += output_tokens
                 existing.estimated_output_bound += output_bound
+                # Velocity flags are UNION-ed rather than keyed: they name the
+                # rules that fired, not a pricing dimension, and keying them
+                # would multiply fold identities for evidence the aggregate can
+                # carry losslessly as a set (three literals, bounded).
+                existing.velocity_flags |= velocity_flags
                 if media is not None:
                     if media.image_count is not None:
                         existing.image_count = (existing.image_count or 0) + media.image_count
@@ -399,6 +451,7 @@ class _ReceiptFoldState:
                 return []
             folds = [(key, dataclasses.replace(fold)) for key, fold in self.folds.items()]
             self.folds.clear()
+            self.run_exact_keys.clear()
             return folds
 
     def note_cycle_success(self) -> None:
@@ -441,8 +494,13 @@ def _build_receipt_replay_event(
         timestamp=datetime.now(UTC),
         agent_run_id=key.run_id or None,
         deny_source="aggregate_replay",
+        deny_reason=key.deny_reason or None,
+        denied_by_period=key.denied_by_period or None,
+        velocity_flags=sorted(fold.velocity_flags) or None,
         estimated_output_bound=fold.estimated_output_bound,
         receipt_aggregate_count=fold.count,
+        # None here marks a COARSE aggregate: the folded receipts had
+        # differing per-call input sizes, so no single pricing card applies.
         receipt_pricing_input_tokens=key.receipt_pricing_input_tokens,
     )
 
@@ -486,9 +544,20 @@ def _split_receipt_fold(fold: _ReceiptFold) -> list[_ReceiptFold]:
     chunks: list[_ReceiptFold] = []
     for index in range(chunk_count):
         chunks_left = chunk_count - index
-        count = min(
-            ORDINARY_TOKEN_COUNT_MAX,
-            remaining_count - (chunks_left - 1),
+        # Every folded receipt contributes at most one wire-max quantity, so
+        # chunk_count can never exceed fold.count and this stays >= 1. The
+        # clamp is the defense if that invariant ever breaks: a count of 0
+        # would fail wire validation (ge=1) inside the caller's ownership
+        # transaction, and the snapshot it is splitting has ALREADY been taken
+        # destructively — a raise there would destroy every folded receipt
+        # with zero drop accounting. A conservative overcount is the only
+        # acceptable failure direction.
+        count = max(
+            1,
+            min(
+                ORDINARY_TOKEN_COUNT_MAX,
+                remaining_count - (chunks_left - 1),
+            ),
         )
         input_tokens = min(ORDINARY_TOKEN_COUNT_MAX, remaining_input)
         output_tokens = min(ORDINARY_TOKEN_COUNT_MAX, remaining_output)
@@ -1031,6 +1100,13 @@ class _ReporterBase:
         event would guess at identity; a full-batch legacy rejection proves
         every identity and can use the same denial-aware disposition.
         Malformed bodies retain the existing fail-open behavior.
+
+        A partial legacy body still cannot understate the loss: an aggregate
+        replay represents many receipts, so its k rejections are charged the k
+        LARGEST receipt weights in the batch. That is a bounded overcount when
+        the server actually rejected lighter events — the documented safe
+        direction — instead of the up-to-(weight - 1) undercount that counting
+        raw events would produce.
         """
         if rejections.kind is _IngestRejectionKind.EXACT:
             for index in sorted(rejections.indexes):
@@ -1045,7 +1121,9 @@ class _ReporterBase:
                 for event in events:
                     self._fold_or_record_event_drop(event, "ingest_rejected")
             else:
-                self._record_drop("event", "ingest_rejected", n=min(rejections.count, len(events)))
+                weights = sorted((self._event_drop_weight(event) for event in events), reverse=True)
+                rejected_n = min(rejections.count, len(events))
+                self._record_drop("event", "ingest_rejected", n=sum(weights[:rejected_n]))
         if emit:
             self._maybe_log_drops()
 
@@ -1458,7 +1536,16 @@ class _ReporterBase:
 
         Fail-open: a malformed body must never raise into the flush loop —
         acknowledge the successful transport without guessing a disposition.
+        MALFORMED means "no disposition at all", so it is reserved for bodies
+        whose rejection COUNT cannot be trusted either. An index-shape
+        violation (duplicate, non-integer, out-of-range) and missing
+        ``code``/``model``/``message`` both still prove a bounded count, so
+        they degrade to the LEGACY count-only disposition the pre-index parser
+        recorded — a server-side index bug must never zero loss accounting.
+        ``_lifecycle._parse_exit_ingest_rejections`` mirrors every rule here:
+        the two parsers must reach the SAME disposition for the same body.
         """
+        shape_error: Exception | None = None
         try:
             rejected = response.json()["rejected"]
             if not isinstance(rejected, list):
@@ -1480,12 +1567,20 @@ class _ReporterBase:
             rejected_indexes: list[int] = []
             indexes_complete = True
             for rejection in rejected:
-                key = (
-                    _escape_control(str(rejection["code"])),
-                    _escape_control(str(rejection["model"])),
-                )
-                count, message = groups.get(key, (0, _escape_control(str(rejection["message"]))))
-                groups[key] = (count + 1, message)
+                try:
+                    key = (
+                        _escape_control(str(rejection["code"])),
+                        _escape_control(str(rejection["model"])),
+                    )
+                    message = _escape_control(str(rejection["message"]))
+                except KeyError:
+                    # Absent rejection metadata costs only this entry's
+                    # WARNING. The exit parser reads `index` alone and both
+                    # must dispose the same body identically.
+                    pass
+                else:
+                    count, first_message = groups.get(key, (0, message))
+                    groups[key] = (count + 1, first_message)
                 try:
                     raw_index = rejection["index"]
                     if type(raw_index) is not int:
@@ -1498,21 +1593,27 @@ class _ReporterBase:
                     # retain the established count-only accounting when the
                     # exact rejected event cannot be identified safely.
                     indexes_complete = False
+                except (TypeError, ValueError) as exc:
+                    shape_error = exc
                 else:
                     rejected_indexes.append(index)
             if indexes_complete and len(set(rejected_indexes)) != len(rejected_indexes):
-                raise ValueError("duplicate rejection index")
-            self._record_parseable_response()
+                shape_error = ValueError("duplicate rejection index")
+            if shape_error is None:
+                self._record_parseable_response()
         except Exception as exc:
             self._record_unparseable_response(exc)
             return _IngestRejections(_IngestRejectionKind.MALFORMED)
+        if shape_error is not None:
+            # Still contract drift worth escalating — but the count stands.
+            self._record_unparseable_response(shape_error)
         result = (
             _IngestRejections(
                 _IngestRejectionKind.EXACT,
                 indexes=frozenset(rejected_indexes),
                 count=len(rejected),
             )
-            if indexes_complete
+            if indexes_complete and shape_error is None
             else _IngestRejections(_IngestRejectionKind.LEGACY, count=len(rejected))
         )
         try:
@@ -1619,6 +1720,10 @@ class MetadataReporter(_ReporterBase):
         self._needs_thread_restart = False
         self._breaker_worker: threading.Thread | None = None
         self._untracked_worker: threading.Thread | None = None
+        # close()'s final drain runs on its own daemon worker; it is tracked
+        # exactly like the other reporter-owned threads so a host log handler
+        # firing on it can reenter close() without a join/ownership cycle.
+        self._final_flush_worker: threading.Thread | None = None
         self._thread = self._launch_thread()
         # Exit flush: if the process exits without close(), the atexit hook runs
         # close() so queued spend is still delivered. The live flush thread keeps
@@ -1718,6 +1823,7 @@ class MetadataReporter(_ReporterBase):
         self._worker_finalize_deadline = None
         self._breaker_worker = None
         self._untracked_worker = None
+        self._final_flush_worker = None
         self._http = httpx.Client(timeout=10.0)
         if not self._shutdown.is_set():
             # Replace the inherited Event and arm the lazy relaunch; a closed
@@ -1938,7 +2044,12 @@ class MetadataReporter(_ReporterBase):
         # the reporter alive, finishes that disposition, then runs the shared
         # finalizer itself before its bound-method reference can disappear.
         current = threading.current_thread()
-        if current in (self._thread, self._breaker_worker, self._untracked_worker):
+        if current in (
+            self._thread,
+            self._breaker_worker,
+            self._untracked_worker,
+            self._final_flush_worker,
+        ):
             self._request_worker_finalize(deadline)
             return
 
@@ -2078,11 +2189,21 @@ class MetadataReporter(_ReporterBase):
                 # A raise on the worker would otherwise vanish into the thread
                 # excepthook; the seal still accounts whatever it left behind.
                 _log_warning("reporter.final_flush_failed: exc_type=%s", type(exc).__name__)
+            finally:
+                if self._final_flush_worker is threading.current_thread():
+                    self._final_flush_worker = None
+                self._finish_worker_requested_close()
 
         try:
             worker = threading.Thread(target=_run, daemon=True, name="solwyn-final-flush")
+            # Published BEFORE the worker can emit a log line: a handler that
+            # reenters close() from this worker must find it in the guard, or
+            # it would block on the closer that is joining it below and burn
+            # the whole close budget into an EXPIRED force-seal.
+            self._final_flush_worker = worker
             worker.start()
         except RuntimeError:
+            self._final_flush_worker = None
             _run()
             return
         self._join_until_close_deadline(worker, deadline)

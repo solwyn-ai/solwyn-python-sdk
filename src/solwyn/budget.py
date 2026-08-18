@@ -79,7 +79,11 @@ _MAX_RENEWAL_WORKERS = 4
 
 # What a grant round-trip resolved to, from the admission path's point of view.
 # "legacy" means "the plane answered, but this run takes the per-call path".
-_GrantVerdict = Literal["applied", "legacy", "denied", "unreachable"]
+# "misrouted" is an INTERNAL verdict `_install_grant` returns so the grant
+# channel can split the breaker verdict from the call posture — the plane
+# answered (credit it) but this call still degrades down the unreachable
+# ladder. `_grant_lease` converts it before returning, so no caller sees it.
+_GrantVerdict = Literal["applied", "legacy", "denied", "unreachable", "misrouted"]
 
 # Sticky run denials protect brief Cloud outages but must not retain an
 # unbounded stream of run UUIDs in a long-lived SDK process.
@@ -335,11 +339,23 @@ class _BudgetEnforcerBase:
                     )
         if response.allowed and agent_run_id is not None:
             clear_termination_if(agent_run_id, source="server")
+        if (
+            observed_at is None
+            and agent_run_id is not None
+            and not response.allowed
+            and response.denied_by_period == "run_stopped"
+        ):
+            # This denial IS the registry's stop, re-filed. Adopt the stamp the
+            # registry already ordered it against; a second clock read would
+            # sort the sticky later and let one ALLOW between the two stamps
+            # clear the registry while the sticky survives and denies.
+            observed_at = _run_control.run_observed_at(agent_run_id)
         with self._state_lock:
             self._cache_response_locked(
                 response,
                 agent_run_id=agent_run_id,
                 cache_allowed_response=cache_allowed_response,
+                request_epoch=request_epoch,
                 observed_at=observed_at,
             )
         return response
@@ -361,6 +377,22 @@ class _BudgetEnforcerBase:
             and sticky_observed_at is not None
             and sticky_observed_at >= request_epoch
         ):
+            # RECORDED DECISION: the suppressed ALLOW's reservation is
+            # abandoned, not released. The API exposes no release route
+            # (checked against Core: only check/confirm/lease*), so the hold
+            # expires on the server's 300s reservation TTL — which frees the
+            # record but NOT the counter it already incremented; the budget
+            # reconcile loop trims that later. The SDK's own 900s
+            # `RESERVATION_MAX_AGE_S` is the LOCAL lease ledger's age-out and
+            # reclaims nothing server-side. Accepted because suppression is
+            # bounded by the run's own stop and the only alternative is a
+            # synthetic zero-cost confirm — a new blocking wire call on a
+            # call the customer has already lost.
+            # The budget snapshot is response-shaped, not verdict-shaped: a
+            # suppressed ALLOW still carries the freshest limit/usage the
+            # server has, and local enforcement entering an outage needs it.
+            self._last_known_budget_limit = response.budget_limit
+            self._last_known_current_usage = response.current_usage
             self._run_hard_deny_responses.move_to_end(agent_run_id)
             self._run_hard_deny_observed_at.move_to_end(agent_run_id)
             return sticky
@@ -379,6 +411,9 @@ class _BudgetEnforcerBase:
                     ),
                 }
             )
+            # Same recorded decision as the sticky-wins branch above: the
+            # nulled `reservation_id` is never released — no release route
+            # exists — and its hold expires on the server's 300s TTL.
             self._cache_response_locked(
                 effective,
                 agent_run_id=agent_run_id,
@@ -392,12 +427,42 @@ class _BudgetEnforcerBase:
         )
         return response
 
+    def _may_clear_run_sticky_locked(
+        self,
+        agent_run_id: str,
+        request_epoch: float | None,
+    ) -> bool:
+        """Whether this response is provably newer than the run's sticky stop.
+
+        Erasing run-scoped stop state is only safe for a response the server
+        answered AFTER the stop was observed. An unordered response (no epoch)
+        may be arbitrarily delayed, so it never erases a stop.
+        """
+        observed_at = self._run_hard_deny_observed_at.get(agent_run_id)
+        if observed_at is None:
+            return True
+        return request_epoch is not None and request_epoch > observed_at
+
+    def _clear_run_sticky_locked(
+        self,
+        agent_run_id: str | None,
+        request_epoch: float | None,
+    ) -> None:
+        """Drop a run's sticky stop only when ordering proves it obsolete."""
+        if agent_run_id is None:
+            return
+        if not self._may_clear_run_sticky_locked(agent_run_id, request_epoch):
+            return
+        self._run_hard_deny_responses.pop(agent_run_id, None)
+        self._run_hard_deny_observed_at.pop(agent_run_id, None)
+
     def _cache_response_locked(
         self,
         response: BudgetCheckResponse,
         *,
         agent_run_id: str | None,
         cache_allowed_response: bool = True,
+        request_epoch: float | None = None,
         observed_at: float | None = None,
     ) -> None:
         """Mutate cache state while the caller holds ``_state_lock``."""
@@ -408,6 +473,12 @@ class _BudgetEnforcerBase:
         if response.allowed:
             self._last_hard_deny_response = None
             if agent_run_id is not None:
+                # Deliberately unguarded: every production ALLOW carrying a run
+                # id arrives through `_resolve_ordered_allow_locked`, which has
+                # already proven it newer than the stop. The one un-epoch'd
+                # entry point clears the REGISTRY in the same breath
+                # (`clear_termination_if`), so guarding only this half would
+                # create the very registry/sticky split the epoch work closes.
                 self._run_hard_deny_responses.pop(agent_run_id, None)
                 self._run_hard_deny_observed_at.pop(agent_run_id, None)
             elif cache_allowed_response:
@@ -417,9 +488,7 @@ class _BudgetEnforcerBase:
 
         if response.mode != BudgetMode.HARD_DENY:
             self._last_hard_deny_response = None
-            if agent_run_id is not None:
-                self._run_hard_deny_responses.pop(agent_run_id, None)
-                self._run_hard_deny_observed_at.pop(agent_run_id, None)
+            self._clear_run_sticky_locked(agent_run_id, request_epoch)
             self._cached_response = None
             self._cache_expires_at = 0.0
             return
@@ -545,6 +614,14 @@ class _BudgetEnforcerBase:
             agent_run_id,
         ):
             if response.denied_by_period == "run_stopped":
+                logger.error(
+                    "budget.check_directive_misrouted: request_agent_run_id=%s "
+                    "directive_agent_run_id=%s — possible server contract "
+                    "drift; enforcement degraded (fail_open=%s)",
+                    agent_run_id,
+                    directive.agent_run_id,
+                    self.fail_open,
+                )
                 raise _MisroutedControlDenial
             # Enforce the budget verdict, but a structurally mismatched echo is
             # forbidden from mutating any registry/cache/lease state. Strip it
@@ -555,6 +632,9 @@ class _BudgetEnforcerBase:
         # A terminate directive is authoritative even if a drifted server body
         # says ALLOW (or retains alert_only). Normalize it before caching so it
         # can neither clear the registry entry nor leave spend authority live.
+        # Dropping `reservation_id` strands that hold by design: the API has no
+        # release route, so it expires on the server's 300s reservation TTL
+        # (see the recorded decision in `_resolve_ordered_allow_locked`).
         effective = response.model_copy(
             update={
                 "allowed": False,
@@ -567,7 +647,7 @@ class _BudgetEnforcerBase:
         # drop is visible, another caller cannot race through NEED_GRANT and
         # reinstall authority in the gap before the sticky response is filed.
         with _run_control._locked_registry():
-            termination = _run_control._mark_terminated_locked(
+            termination, observed_at = _run_control._mark_terminated_locked(
                 agent_run_id,
                 reason=directive.reason,
                 source="server",
@@ -576,7 +656,8 @@ class _BudgetEnforcerBase:
                 directive,
                 termination,
             )
-            observed_at = time.monotonic()
+            # ONE stamp for both orderings: the registry entry and the sticky
+            # denial must sort identically against a racing ALLOW's epoch.
             with self._state_lock:
                 self._cache_response_locked(
                     effective,
@@ -987,7 +1068,7 @@ class _BudgetEnforcerBase:
                 )
                 directive = effective.run_control
                 if directive is not None:
-                    termination = _run_control._mark_terminated_locked(
+                    termination, observed_at = _run_control._mark_terminated_locked(
                         agent_run_id,
                         reason=directive.reason,
                         source="server",
@@ -997,10 +1078,12 @@ class _BudgetEnforcerBase:
                         termination,
                     )
                     directed_denial = self._run_stopped_lease_response(effective)
+                    # ONE stamp: registry and sticky order against the same
+                    # observation, never two clock reads.
                     self._cache_response_locked(
                         self._lease_denial_response(directed_denial),
                         agent_run_id=agent_run_id,
-                        observed_at=time.monotonic(),
+                        observed_at=observed_at,
                     )
                     state = self._lease.state_for(agent_run_id)
                     if state is not None and state.lease_id is not None:
@@ -1017,8 +1100,16 @@ class _BudgetEnforcerBase:
                     renewal_request=renewal_request,
                 ), None
 
-        with self._state_lock:
+        # Canonical lock order (registry, then state) even with no directive in
+        # hand: a stop can land from ANOTHER channel while this grant is in
+        # flight, and installing authority onto a dead run would hand it a
+        # locally-admitting lease that outlives both bounded maps.
+        with _run_control._locked_registry(), self._state_lock:
             if close_epoch is not None and (self._closed or close_epoch != self._close_epoch):
+                return GrantOutcome.STALE, self._late_lease_surrender_request(response)
+            if _run_control._outage_termination_locked(agent_run_id) is not None:
+                # Refuse the install and hand the server-side float back; the
+                # call falls to the per-call path, which the stop then denies.
                 return GrantOutcome.STALE, self._late_lease_surrender_request(response)
             outcome = self._apply_ordinary_lease_response_locked(
                 agent_run_id,
@@ -1129,7 +1220,12 @@ class _BudgetEnforcerBase:
     def _lease_deny_result(
         self, agent_run_id: str, response: LeaseGrantResponse
     ) -> BudgetCheckResult:
-        """Feed a lease denial through the shared run/global sticky classification."""
+        """Feed a lease denial through the shared run/global sticky classification.
+
+        A run-stop denial reaching here has ALREADY marked the registry, so it
+        must not re-stamp its sticky from a second clock read — `_cache_response`
+        adopts the registry's observation for exactly this path.
+        """
         denial = self._lease_denial_response(response)
         self._cache_response(denial, agent_run_id=agent_run_id)
         return self._build_result_from_response(denial)
@@ -1429,15 +1525,24 @@ class _BudgetEnforcerBase:
                         response.run_control.agent_run_id,
                         agent_run_id,
                     )
+                    logger.error(
+                        "lease.renew_directive_misrouted: request_agent_run_id=%s "
+                        "directive_agent_run_id=%s — possible server contract "
+                        "drift; enforcement degraded (fail_open=%s)",
+                        agent_run_id,
+                        response.run_control.agent_run_id,
+                        self.fail_open,
+                    )
+                    # Drift, not an outage — the transport success this worker
+                    # already credited stands. The lease keeps its own deadline;
+                    # only the in-flight flag clears, under a backoff, or the
+                    # run never renews again.
                     self._lease.renewal_failed(
                         agent_run_id,
                         time.monotonic(),
                         expected_lease_id=request.lease_id,
                         expected_generation=request.generation,
                     )
-                    breaker = self._control_plane_breaker
-                    if breaker is not None:
-                        breaker.record_failure()
                     return None
 
                 effective = self._lease_response_for_run(
@@ -1447,7 +1552,7 @@ class _BudgetEnforcerBase:
                 )
                 directive = effective.run_control
                 if directive is not None:
-                    termination = _run_control._mark_terminated_locked(
+                    termination, observed_at = _run_control._mark_terminated_locked(
                         agent_run_id,
                         reason=directive.reason,
                         source="server",
@@ -1457,10 +1562,12 @@ class _BudgetEnforcerBase:
                         termination,
                     )
                     directed_denial = self._run_stopped_lease_response(effective)
+                    # ONE stamp: registry and sticky order against the same
+                    # observation, never two clock reads.
                     self._cache_response_locked(
                         self._lease_denial_response(directed_denial),
                         agent_run_id=agent_run_id,
-                        observed_at=time.monotonic(),
+                        observed_at=observed_at,
                     )
                     self._lease.drop_if_current(
                         agent_run_id,
@@ -1490,7 +1597,10 @@ class _BudgetEnforcerBase:
                     )
                 return None
 
-        with self._state_lock:
+        # Canonical lock order (registry, then state): a stop landing from
+        # another channel mid-renewal must not be overwritten by fresh
+        # authority for a run that may no longer dispatch.
+        with _run_control._locked_registry(), self._state_lock:
             if close_epoch is not None and (self._closed or close_epoch != self._close_epoch):
                 spent_tokens = self._late_renewal_spend.pop(
                     (agent_run_id, request.lease_id, request.generation),
@@ -1511,6 +1621,24 @@ class _BudgetEnforcerBase:
                 or state.generation != request.generation
             ):
                 return None
+
+            if _run_control._outage_termination_locked(agent_run_id) is not None:
+                # The run stopped while this renewal was in flight. Drop the
+                # lease it renews and surrender the successor's float instead
+                # of extending authority nothing may spend.
+                self._lease.drop_if_current(
+                    agent_run_id,
+                    lease_id=request.lease_id,
+                    generation=request.generation,
+                )
+                spent_tokens = self._late_renewal_spend.pop(
+                    (agent_run_id, request.lease_id, request.generation),
+                    0,
+                )
+                return self._late_lease_surrender_request(
+                    response,
+                    spent_tokens=spent_tokens,
+                )
 
             outcome = self._apply_ordinary_lease_response_locked(
                 agent_run_id,
@@ -1579,8 +1707,40 @@ class _BudgetEnforcerBase:
         if outcome is GrantOutcome.MALFORMED and self._is_misrouted_control_denial(
             response, agent_run_id
         ):
-            return "unreachable", None, None
+            directive = response.run_control
+            logger.error(
+                "lease.grant_directive_misrouted: request_agent_run_id=%s "
+                "directive_agent_run_id=%s — possible server contract drift; "
+                "enforcement degraded (fail_open=%s)",
+                agent_run_id,
+                directive.agent_run_id if directive is not None else None,
+                self.fail_open,
+            )
+            return "misrouted", None, None
         return "legacy", effective, None
+
+    def _grant_verdict_for_breaker(
+        self,
+        verdict: _GrantVerdict,
+        response: LeaseGrantResponse | None,
+        breaker: CircuitBreaker | None,
+    ) -> tuple[_GrantVerdict, LeaseGrantResponse | None]:
+        """Score one grant against the plane, then hand back the call posture.
+
+        The two verdicts are deliberately decoupled: a misrouted directive is
+        drift the plane ANSWERED, so it credits the breaker while the call
+        still degrades down the unreachable ladder.
+        """
+        if verdict == "misrouted":
+            if breaker is not None:
+                breaker.record_success()
+            return "unreachable", response
+        if breaker is not None:
+            if verdict == "unreachable":
+                breaker.record_failure()
+            else:
+                breaker.record_success()
+        return verdict, response
 
     def _auth_headers(self) -> dict[str, str]:
         """Return authorization headers for cloud API requests."""
@@ -1760,7 +1920,10 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         an ineligible run, the kill switch — falls through to the per-call
         path below, unchanged. A caller that omits ``call_id`` still admits,
         under a synthetic key: its reservation simply cannot be trued up or
-        released and comes back on the 900s abandoned-reservation sweep.
+        released, and its local lease draw comes back on the ledger's own
+        ``RESERVATION_MAX_AGE_S`` (900s) age-out. That constant is the SDK's,
+        not a server sweep — server-side holds are reclaimed by the control
+        plane's own expiry.
 
         Behaviour matrix:
         - Cloud reachable + allowed: return allowed=True
@@ -1909,8 +2072,15 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     agent_run_id,
                 )
             except _MisroutedControlDenial:
+                # A directive addressed to another run is server contract
+                # drift, not an outage: the plane answered. Credit it (the
+                # sibling unparseable-2xx path does the same) and degrade this
+                # ONE call to the unreachable ladder. Debiting here would open
+                # the shared control-plane breaker after three drifted bodies,
+                # which also HOLDs confirm delivery and, under fail_open,
+                # admits unmetered with no server contact at all.
                 if breaker is not None:
-                    breaker.record_failure()
+                    breaker.record_success()
                 return self._build_unreachable_result(
                     estimated_input_tokens,
                     agent_run_id,
@@ -2088,12 +2258,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             )
             if late_surrender is not None:
                 self._surrender_late_renewal(late_surrender)
-            if breaker is not None:
-                if verdict == "unreachable":
-                    breaker.record_failure()
-                else:
-                    breaker.record_success()
-            return verdict, response
+            return self._grant_verdict_for_breaker(verdict, response, breaker)
         finally:
             if breaker is not None:
                 breaker.release_probe(admission)
@@ -2510,8 +2675,15 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                     agent_run_id,
                 )
             except _MisroutedControlDenial:
+                # A directive addressed to another run is server contract
+                # drift, not an outage: the plane answered. Credit it (the
+                # sibling unparseable-2xx path does the same) and degrade this
+                # ONE call to the unreachable ladder. Debiting here would open
+                # the shared control-plane breaker after three drifted bodies,
+                # which also HOLDs confirm delivery and, under fail_open,
+                # admits unmetered with no server contact at all.
                 if breaker is not None:
-                    breaker.record_failure()
+                    breaker.record_success()
                 return self._build_unreachable_result(
                     estimated_input_tokens,
                     agent_run_id,
@@ -2679,12 +2851,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             )
             if late_surrender is not None:
                 await self._surrender_late_renewal(late_surrender)
-            if breaker is not None:
-                if verdict == "unreachable":
-                    breaker.record_failure()
-                else:
-                    breaker.record_success()
-            return verdict, response
+            return self._grant_verdict_for_breaker(verdict, response, breaker)
         finally:
             if breaker is not None:
                 breaker.release_probe(admission)

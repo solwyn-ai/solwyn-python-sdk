@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
+from solwyn._types import VelocityFlag
 from solwyn._velocity import (
     DENY_ELIGIBLE_RULES,
     VelocityConfig,
@@ -386,3 +389,21 @@ def test_public_docs_enumerate_all_velocity_settings_and_privacy_contract() -> N
     assert "`repeat_size` and\n`monotonic_growth` are eligible" in readme
     assert "`rate_acceleration` is advisory only" in readme
     assert "never prompts or responses" in readme
+
+
+@pytest.mark.unit
+def test_emitted_rule_names_stay_inside_the_wire_flag_literal() -> None:
+    """Every rule name the monitor can emit must be a `VelocityFlag` member.
+
+    The success settlement path builds `MetadataEvent` with the flags the
+    monitor emitted, AFTER the provider call was paid — a name outside the wire
+    literal would raise ValidationError there and crash the paid call. The
+    emitted vocabulary is pinned as a reviewed literal: extending the monitor
+    requires extending `VelocityFlag` in the same change.
+    """
+    source = (_PROJECT_ROOT / "src" / "solwyn" / "_velocity.py").read_text(encoding="utf-8")
+    emitted = set(re.findall(r'flags\.append\("([^"]+)"\)', source))
+    assert emitted == {"repeat_size", "monotonic_growth", "rate_acceleration"}
+    wire = set(get_args(VelocityFlag))
+    assert emitted <= wire
+    assert set(DENY_ELIGIBLE_RULES) <= wire
