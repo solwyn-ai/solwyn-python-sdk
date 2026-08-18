@@ -45,6 +45,40 @@ def test_mark_read_is_frozen_and_first_writer_wins() -> None:
 
 
 @pytest.mark.unit
+def test_mark_returns_first_winner_for_the_initial_and_repeated_stop() -> None:
+    from solwyn._run_control import mark_terminated, run_termination
+
+    with patch("solwyn._run_control.time.monotonic", return_value=7.5):
+        first = mark_terminated("run_a", reason="velocity:repeat_size", source="local_velocity")
+
+    assert first.reason == "velocity:repeat_size"
+    assert first.source == "local_velocity"
+    assert first.at_monotonic == 7.5
+    assert run_termination("run_a") is first
+
+    repeated = mark_terminated("run_a", reason="run_stopped", source="server")
+
+    assert repeated is first
+
+
+@pytest.mark.unit
+def test_mark_after_eviction_returns_the_live_sibling_first_winner() -> None:
+    from solwyn._run_control import _acquire_termination_handle, mark_terminated, run_termination
+
+    handle = _acquire_termination_handle("run_stream")
+    first = mark_terminated("run_stream", reason="first_winner", source="server")
+    for index in range(257):
+        mark_terminated(f"other_{index}", reason="later", source="server")
+    assert run_termination("run_stream") is None
+
+    restored = mark_terminated("run_stream", reason="later_loser", source="local_velocity")
+
+    assert restored is first
+    assert handle.termination is first
+    handle.release()
+
+
+@pytest.mark.unit
 def test_clear_termination_if_matches_source_and_public_clear_removes_any_source() -> None:
     from solwyn._run_control import (
         clear_run_termination,
@@ -80,6 +114,23 @@ def test_registry_evicts_least_recently_read_entry() -> None:
     assert run_termination("run_0") is not None
     assert run_termination("run_1") is None
     assert run_termination("run_256") is not None
+
+
+@pytest.mark.unit
+def test_repeated_mark_refreshes_recency_so_an_older_run_is_evicted_first() -> None:
+    from solwyn import _run_control
+    from solwyn._run_control import mark_terminated
+
+    for index in range(256):
+        mark_terminated(f"run_{index}", reason="run_stopped", source="server")
+
+    mark_terminated("run_0", reason="run_stopped", source="server")
+    mark_terminated("run_256", reason="run_stopped", source="server")
+
+    assert "run_0" in _run_control._STATE.terminations
+    assert "run_0" in _run_control._STATE.observed_at
+    assert "run_1" not in _run_control._STATE.terminations
+    assert "run_1" not in _run_control._STATE.observed_at
 
 
 @pytest.mark.unit

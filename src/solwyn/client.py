@@ -249,14 +249,11 @@ def _observe_run_control(
     )
     if eligible_rule is None:
         return None
-    mark_terminated(
+    termination = mark_terminated(
         run_id,
         reason=f"velocity:{eligible_rule}",
         source="local_velocity",
     )
-    termination = run_termination(run_id)
-    if termination is None:
-        raise RuntimeError("marked run termination is missing")
     if termination.source == "server":
         return eligible_rule
     _raise_run_stopped(
@@ -289,15 +286,17 @@ def _postcheck_run_control(
     run_id = agent_run[0]
     if run_id is None:
         return
+    termination: RunTermination | None
     if pending_velocity_rule is not None:
-        mark_terminated(
+        termination = mark_terminated(
             run_id,
             reason=f"velocity:{pending_velocity_rule}",
             source="local_velocity",
         )
-    termination = run_termination(run_id)
-    if termination is None:
-        return
+    else:
+        termination = run_termination(run_id)
+        if termination is None:
+            return
     client._solwyn_budget.release_reservation(
         call_id,
         lease_claim_token=_lease_claim_token(budget),
