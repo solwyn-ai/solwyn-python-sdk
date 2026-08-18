@@ -104,6 +104,8 @@ from solwyn.stream import (
 
 logger = logging.getLogger(__name__)
 
+_SOLWYN_INTERNAL_PREFIX = "_solwyn_"
+
 
 def _budget_denial_error(
     *,
@@ -379,11 +381,11 @@ def _settle_stream_failure(
     is_provider_fallback = ctx.is_provider_fallback
     if record_breaker_failure:
         owner._get_circuit_breaker(provider).record_failure()
-    owner._budget.release_reservation(
+    owner._solwyn_budget.release_reservation(
         call_id,
         lease_claim_token=_lease_claim_token(budget),
     )
-    owner._reporter.report(
+    owner._solwyn_reporter.report(
         owner._build_error_event(
             model=ctx.model,
             provider=provider,
@@ -506,7 +508,7 @@ def _make_reservation_release_handler(
     """
 
     def release() -> None:
-        owner._budget.release_reservation(
+        owner._solwyn_budget.release_reservation(
             call_id,
             lease_claim_token=_lease_claim_token(budget),
         )
@@ -1255,6 +1257,8 @@ class Solwyn(_SolwynBase):
         client.close()
     """
 
+    _solwyn_is_wrapper_type = True
+
     def __init__(
         self,
         client: object,
@@ -1270,10 +1274,10 @@ class Solwyn(_SolwynBase):
         selection_policy: SelectionPolicy | None = None,
         **config_kwargs: object,
     ) -> None:
-        # self._client is typed Any because each provider SDK has a different
+        # self._solwyn_client is typed Any because each provider SDK has a different
         # public surface (chat/messages/models). A unified Protocol would not
         # match all three. Type safety stops at the _sync_dispatch boundary.
-        self._client: Any = client
+        self._solwyn_client: Any = client
 
         if "project_id" in config_kwargs:
             raise TypeError("unexpected keyword argument 'project_id'")
@@ -1287,8 +1291,8 @@ class Solwyn(_SolwynBase):
 
         # The primary runtime's adapter is the detected (or explicitly pinned)
         # provider identity for usage extraction and proxy selection.
-        self._adapter = runtimes[0].adapter
-        self._dialect = runtimes[0].adapter.dialect
+        self._solwyn_adapter = runtimes[0].adapter
+        self._solwyn_dialect = runtimes[0].adapter.dialect
 
         # Build config — SolwynConfig._load_from_env fills missing
         # values from SOLWYN_API_KEY env var.
@@ -1318,21 +1322,21 @@ class Solwyn(_SolwynBase):
         super().__init__(config, runtimes, selection_policy=selection_policy, mode="sync")
 
         # Budget enforcer
-        self._budget = BudgetEnforcer(
+        self._solwyn_budget = BudgetEnforcer(
             api_url=config.api_url,
             api_key=config.api_key,
             budget_mode=config.budget_mode,
             fail_open=config.fail_open,
             cache_ttl=config.budget_check_cache_ttl,
-            control_plane_breaker=self._control_plane_breaker,
+            control_plane_breaker=self._solwyn_control_plane_breaker,
             # PJ-2: the SDK instance id IS the lease holder identity.
-            holder_id=self._sdk_instance_id,
+            holder_id=self._solwyn_sdk_instance_id,
             lease_enabled=config.lease_enabled,
             lease_output_bound_default=config.lease_output_bound_default,
         )
 
         # Metadata reporter
-        self._reporter = MetadataReporter(
+        self._solwyn_reporter = MetadataReporter(
             config.api_url,
             config.api_key,
             batch_size=config.reporter_batch_size,
@@ -1340,18 +1344,20 @@ class Solwyn(_SolwynBase):
             max_queue_size=config.reporter_max_queue_size,
             max_in_flight=config.reporter_max_in_flight,
             breaker_snapshots=self._get_breaker_snapshots,
-            sdk_instance_id=self._sdk_instance_id,
+            sdk_instance_id=self._solwyn_sdk_instance_id,
             breaker_reporting_enabled=config.breaker_reporting_enabled,
             report_untracked_surfaces=config.report_untracked_surfaces,
             breaker_report_heartbeat=config.breaker_report_heartbeat,
-            control_plane_breaker=self._control_plane_breaker,
+            control_plane_breaker=self._solwyn_control_plane_breaker,
             max_send_attempts=config.reporter_max_send_attempts,
             retry_backoff_base=config.reporter_retry_backoff_base,
             retry_backoff_cap=config.reporter_retry_backoff_cap,
             shutdown_deadline=config.reporter_shutdown_deadline,
         )
-        self._untracked_observation_notifier = (
-            self._reporter.observe_untracked_surface if config.report_untracked_surfaces else None
+        self._solwyn_untracked_observation_notifier = (
+            self._solwyn_reporter.observe_untracked_surface
+            if config.report_untracked_surfaces
+            else None
         )
 
     @functools.cached_property
@@ -1372,12 +1378,12 @@ class Solwyn(_SolwynBase):
         construction-time state.
         """
         if (
-            _responses_preparer(self._adapter) is not None
-            and self._inspect_static_attribute(self._client, "responses") is not None
+            _responses_preparer(self._solwyn_adapter) is not None
+            and self._inspect_static_attribute(self._solwyn_client, "responses") is not None
         ):
             return _SyncResponsesProxy(self)
         return self._resolve_public_attribute(
-            self._client,
+            self._solwyn_client,
             name="responses",
             path="responses",
             source=SurfaceSource.RAW,
@@ -1444,10 +1450,10 @@ class Solwyn(_SolwynBase):
         Cached: the dialect is fixed at construction, so the conditional
         result is stable for the lifetime of this client instance.
         """
-        if self._dialect == "anthropic":
+        if self._solwyn_dialect == "anthropic":
             return _SyncMessagesProxy(self)
         return self._resolve_public_attribute(
-            self._client,
+            self._solwyn_client,
             name="messages",
             path="messages",
             source=SurfaceSource.RAW,
@@ -1462,10 +1468,10 @@ class Solwyn(_SolwynBase):
         the client shape is fixed at construction, so the conditional
         result is stable for the lifetime of this client instance.
         """
-        if self._surface_context.client_shape == "google_genai":
+        if self._solwyn_surface_context.client_shape == "google_genai":
             return _SyncModelsProxy(self)
         return self._resolve_public_attribute(
-            self._client,
+            self._solwyn_client,
             name="models",
             path="models",
             source=SurfaceSource.RAW,
@@ -1473,9 +1479,9 @@ class Solwyn(_SolwynBase):
 
     def generate_content(self, *args: Any, **kwargs: Any) -> Any:
         """Intercept legacy ``google.generativeai`` root generation calls."""
-        if self._surface_context.client_shape != "google_generativeai":
+        if self._solwyn_surface_context.client_shape != "google_generativeai":
             method = self._resolve_public_attribute(
-                self._client,
+                self._solwyn_client,
                 name="generate_content",
                 path="generate_content",
                 source=SurfaceSource.RAW,
@@ -1488,9 +1494,9 @@ class Solwyn(_SolwynBase):
         )
         call_kwargs = normalize_legacy_google_generate_content_args(args, kwargs)
         if "model" not in call_kwargs:
-            requested_model = self._runtimes[0].entry.model
+            requested_model = self._solwyn_runtimes[0].entry.model
             if not requested_model:
-                structural_model = getattr(self._client, "model_name", None)
+                structural_model = getattr(self._solwyn_client, "model_name", None)
                 requested_model = (
                     structural_model.removeprefix("models/")
                     if isinstance(structural_model, str)
@@ -1507,16 +1513,16 @@ class Solwyn(_SolwynBase):
     def converse(self, **kwargs: Any) -> Any:
         """Bedrock-compatible: client.converse(modelId=...) goes through interception."""
         self._enforce_explicit_surface("converse", source=SurfaceSource.WRAPPER)
-        if self._dialect == "bedrock":
+        if self._solwyn_dialect == "bedrock":
             return self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
-        return self._client.converse(**kwargs)
+        return self._solwyn_client.converse(**kwargs)
 
     def converse_stream(self, **kwargs: Any) -> Any:
         """Bedrock-compatible streaming: returns the boto3 dict with a wrapped stream."""
         self._enforce_explicit_surface("converse_stream", source=SurfaceSource.WRAPPER)
-        if self._dialect == "bedrock":
+        if self._solwyn_dialect == "bedrock":
             return self._intercepted_call(_force_stream=True, **_bedrock_internal_kwargs(kwargs))
-        return self._client.converse_stream(**kwargs)
+        return self._solwyn_client.converse_stream(**kwargs)
 
     def invoke_model(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
@@ -1525,9 +1531,9 @@ class Solwyn(_SolwynBase):
             source=SurfaceSource.WRAPPER,
             blocked_reason=_INVOKE_MODEL_GUIDANCE,
         )
-        if self._dialect == "bedrock":
+        if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
-        return self._client.invoke_model(**kwargs)
+        return self._solwyn_client.invoke_model(**kwargs)
 
     def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
@@ -1536,9 +1542,9 @@ class Solwyn(_SolwynBase):
             source=SurfaceSource.WRAPPER,
             blocked_reason=_INVOKE_MODEL_GUIDANCE,
         )
-        if self._dialect == "bedrock":
+        if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
-        return self._client.invoke_model_with_response_stream(**kwargs)
+        return self._solwyn_client.invoke_model_with_response_stream(**kwargs)
 
     def start_async_invoke(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's async invocation surface (untracked video-scale spend)."""
@@ -1547,9 +1553,9 @@ class Solwyn(_SolwynBase):
             source=SurfaceSource.WRAPPER,
             blocked_reason=_START_ASYNC_INVOKE_GUIDANCE,
         )
-        if self._dialect == "bedrock":
+        if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
-        return self._client.start_async_invoke(**kwargs)
+        return self._solwyn_client.start_async_invoke(**kwargs)
 
     def _sync_dispatch(
         self,
@@ -1648,13 +1654,13 @@ class Solwyn(_SolwynBase):
         """
         agent_run = _capture_run_context(
             kwargs.pop("solwyn_tags", None),
-            default_tags=self._config.tags,
+            default_tags=self._solwyn_config.tags,
         )
         requested_model = cast(str, kwargs["model"])
         call_id = str(uuid.uuid4())
-        runtime = self._runtimes[0]
+        runtime = self._solwyn_runtimes[0]
         provider = runtime.adapter.name
-        deadline = Deadline(self._config.failover_total_timeout)
+        deadline = Deadline(self._solwyn_config.failover_total_timeout)
 
         # 1. Estimate quantities (length/config-only; never materializes content).
         #    Token estimate from request length; media estimate (non-token
@@ -1675,11 +1681,11 @@ class Solwyn(_SolwynBase):
         #    unbilled-model media call proceeds untracked rather than being denied;
         #    fail-open is intentional here — Solwyn never blocks a call just because
         #    it cannot yet price it.
-        budget = self._budget.check_budget(
+        budget = self._solwyn_budget.check_budget(
             estimated_input_tokens=est_in,
             model=requested_model,
             provider=provider,
-            timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
+            timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
             modality=spec.modality,
             estimated_media=estimated_media,
             agent_run_id=agent_run[0],
@@ -1687,20 +1693,20 @@ class Solwyn(_SolwynBase):
             call_id=call_id,
         )
         # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
-        # must never re-read self._config (the directive writer mutates it
+        # must never re-read self._solwyn_config (the directive writer mutates it
         # under a lock; unlocked re-reads can tear).
         tuning = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
         )
         deadline.replace_total(tuning.failover_total_timeout)
-        self._reporter.observe_project_id(budget.project_id)
+        self._solwyn_reporter.observe_project_id(budget.project_id)
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
 
         provider_region = runtime.adapter.extract_region(runtime.sdk_client)
         if not budget.allowed:
             try:
-                self._reporter.report(
+                self._solwyn_reporter.report(
                     self._build_metadata_event(
                         model=requested_model,
                         provider=provider,
@@ -1736,7 +1742,7 @@ class Solwyn(_SolwynBase):
         #    instead — chat rejects this exact state, and no provider I/O may
         #    start outside the window.
         if deadline.expired():
-            self._budget.release_reservation(
+            self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
@@ -1760,11 +1766,11 @@ class Solwyn(_SolwynBase):
         except Exception as exc:
             # Nothing will settle this call: hand any lease reservation back
             # rather than stranding it until the 900s sweep.
-            self._budget.release_reservation(
+            self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
-            self._reporter.report(
+            self._solwyn_reporter.report(
                 self._build_error_event(
                     model=requested_model,
                     provider=provider,
@@ -1825,7 +1831,7 @@ class Solwyn(_SolwynBase):
         confirm = None
         reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
         if (reservation_id or lease_id) and (token_details is not None or media_usage is not None):
-            confirm = self._budget.build_confirm_request(
+            confirm = self._solwyn_budget.build_confirm_request(
                 reservation_id=reservation_id,
                 lease_id=lease_id,
                 lease_claim_token=lease_claim_token,
@@ -1857,9 +1863,9 @@ class Solwyn(_SolwynBase):
             media_usage=media_usage,
         )
         if confirm is not None:
-            self._reporter.report_settlement(confirm, event)
+            self._solwyn_reporter.report_settlement(confirm, event)
         else:
-            self._reporter.report(event)
+            self._solwyn_reporter.report(event)
         return response
 
     def _intercepted_call(
@@ -1873,20 +1879,20 @@ class Solwyn(_SolwynBase):
         """Core interception logic: the classified candidate walk."""
         agent_run = _capture_run_context(
             kwargs.pop("solwyn_tags", None),
-            default_tags=self._config.tags,
+            default_tags=self._solwyn_config.tags,
         )
         requested_model = cast(str, kwargs["model"])
         # One reconciliation join key per intercepted call: threaded into
         # every served-provider metadata event AND its confirm so the Cloud API
         # can join them (and dedup cache-hit / abandoned-stream spend).
         call_id = str(uuid.uuid4())
-        primary = self._runtimes[0]
+        primary = self._solwyn_runtimes[0]
         if _surface == "responses" and _responses_preparer(primary.adapter) is None:
             raise UnsupportedSurfaceError(
                 surface=f"responses.{_responses_leaf}", provider=primary.adapter.name
             )
         # Deadline starts here — it encompasses the budget pre-flight.
-        deadline = Deadline(self._config.failover_total_timeout)
+        deadline = Deadline(self._solwyn_config.failover_total_timeout)
 
         request_semantics = kwargs
         responses_idempotent_override: bool | None = None
@@ -1898,7 +1904,7 @@ class Solwyn(_SolwynBase):
                 "bool | None", kwargs.pop("solwyn_idempotent", None)
             )
             request_semantics = _effective_responses_kwargs(
-                global_defaults=self._config.default_params,
+                global_defaults=self._solwyn_config.default_params,
                 primary_defaults=primary.entry.default_params,
                 kwargs=kwargs,
             )
@@ -1926,7 +1932,7 @@ class Solwyn(_SolwynBase):
         ):
             metering_kwargs = prepare_legacy_google_metering_kwargs(
                 primary.sdk_client,
-                self._config.default_params,
+                self._solwyn_config.default_params,
                 primary.entry.default_params,
                 kwargs,
             )
@@ -1949,36 +1955,36 @@ class Solwyn(_SolwynBase):
             fallback_models: list[str] = []
             estimated_output_bound = _responses_output_bound(
                 request_semantics,
-                self._config.lease_output_bound_default,
+                self._solwyn_config.lease_output_bound_default,
             )
         else:
-            fallback_providers = [r.entry.provider.value for r in self._runtimes[1:]]
-            fallback_models = [r.entry.model for r in self._runtimes[1:]]
+            fallback_providers = [r.entry.provider.value for r in self._solwyn_runtimes[1:]]
+            fallback_models = [r.entry.model for r in self._solwyn_runtimes[1:]]
             estimated_output_bound = max(
                 _legacy_google_candidate_output_bound(
                     primary=primary,
-                    runtimes=self._runtimes,
-                    global_defaults=self._config.default_params,
+                    runtimes=self._solwyn_runtimes,
+                    global_defaults=self._solwyn_config.default_params,
                     kwargs=kwargs,
                     is_streaming=is_streaming,
-                    default_bound=self._config.lease_output_bound_default,
+                    default_bound=self._solwyn_config.lease_output_bound_default,
                 ),
                 _effective_output_bound(
                     primary=primary,
-                    runtimes=self._runtimes,
-                    global_defaults=self._config.default_params,
+                    runtimes=self._solwyn_runtimes,
+                    global_defaults=self._solwyn_config.default_params,
                     kwargs=kwargs,
-                    default_bound=self._config.lease_output_bound_default,
+                    default_bound=self._solwyn_config.lease_output_bound_default,
                 ),
             )
         if _surface == "responses":
-            budget = self._budget.check_budget(
+            budget = self._solwyn_budget.check_budget(
                 estimated_input_tokens=est_in,
                 model=requested_model,
                 provider=primary.adapter.name,
                 fallback_providers=fallback_providers,
                 fallback_models=fallback_models,
-                timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
+                timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
                 modality="text",
                 agent_run_id=agent_run[0],
                 tags=agent_run[2],
@@ -1986,26 +1992,26 @@ class Solwyn(_SolwynBase):
                 estimated_output_bound=estimated_output_bound,
             )
         else:
-            budget = self._budget.check_budget(
+            budget = self._solwyn_budget.check_budget(
                 estimated_input_tokens=est_in,
                 model=requested_model,
                 provider=primary.adapter.name,
                 fallback_providers=fallback_providers,
                 fallback_models=fallback_models,
-                timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
+                timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
                 agent_run_id=agent_run[0],
                 tags=agent_run[2],
                 call_id=call_id,
                 estimated_output_bound=estimated_output_bound,
             )
         # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
-        # must never re-read self._config (the directive writer mutates it
+        # must never re-read self._solwyn_config (the directive writer mutates it
         # under a lock; unlocked re-reads can tear).
         tuning = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
         )
         deadline.replace_total(tuning.failover_total_timeout)
-        self._reporter.observe_project_id(budget.project_id)
+        self._solwyn_reporter.observe_project_id(budget.project_id)
         # Refresh the CostPolicy signal from the server. Price hints are advisory
         # and slow-moving, so they PERSIST across hint-less responses — a budget
         # cache hit (price_hints None) leaves the last-known hints in place; we
@@ -2033,7 +2039,7 @@ class Solwyn(_SolwynBase):
                     agent_run=agent_run,
                     provider_region=primary.adapter.extract_region(primary.sdk_client),
                 )
-                self._reporter.report(event)
+                self._solwyn_reporter.report(event)
             except Exception as exc:
                 logger.warning(
                     "Failed to report budget_denied metadata event: %s",
@@ -2077,13 +2083,13 @@ class Solwyn(_SolwynBase):
                 c for c in candidates if c is primary and _responses_preparer(c.adapter) is not None
             ]
         if not candidates:
-            self._budget.release_reservation(
+            self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
             raise ProviderUnavailableError("all providers unavailable", attempted=[])
         if deadline.remaining() <= 0.0:
-            self._budget.release_reservation(
+            self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
@@ -2119,7 +2125,7 @@ class Solwyn(_SolwynBase):
             # corrupt the dashboard chain-depth funnel. The per-hop timeout slice
             # still uses the candidate-walk ``idx`` (remaining candidates, not
             # chain depth).
-            chain_index = next(i for i, r in enumerate(self._runtimes) if r is rt)
+            chain_index = next(i for i, r in enumerate(self._solwyn_runtimes) if r is rt)
 
             # Build native kwargs for this hop. A cross-provider hop runs the
             # translation contract and may RAISE an Untranslatable* error here,
@@ -2139,7 +2145,7 @@ class Solwyn(_SolwynBase):
                         is_primary=is_primary,
                         is_provider_fallback=is_provider_fallback,
                         is_streaming=is_streaming,
-                        global_defaults=self._config.default_params,
+                        global_defaults=self._solwyn_config.default_params,
                         kwargs=kwargs,
                     )
                     served_model = requested_model if is_primary else rt.entry.model
@@ -2149,7 +2155,7 @@ class Solwyn(_SolwynBase):
                         )
             except Exception:
                 cb.release_probe(admission)
-                self._budget.release_reservation(
+                self._solwyn_budget.release_reservation(
                     call_id,
                     lease_claim_token=_lease_claim_token(budget),
                 )
@@ -2243,7 +2249,7 @@ class Solwyn(_SolwynBase):
                     possibly_succeeded = (
                         disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                     )
-                    self._reporter.report(
+                    self._solwyn_reporter.report(
                         self._build_error_event(
                             model=served_model,
                             provider=provider,
@@ -2263,7 +2269,7 @@ class Solwyn(_SolwynBase):
                         )
                     )
                     if disp is Disposition.FAIL_FAST:
-                        self._budget.release_reservation(
+                        self._solwyn_budget.release_reservation(
                             call_id,
                             lease_claim_token=_lease_claim_token(budget),
                         )
@@ -2272,7 +2278,7 @@ class Solwyn(_SolwynBase):
                         # The call MAY have landed, but no confirm will ever
                         # settle it here: the server reconciles the possibly-
                         # succeeded attempt from the error event.
-                        self._budget.release_reservation(
+                        self._solwyn_budget.release_reservation(
                             call_id,
                             lease_claim_token=_lease_claim_token(budget),
                         )
@@ -2402,7 +2408,7 @@ class Solwyn(_SolwynBase):
             confirm = None
             reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
             if reservation_id or lease_id:
-                confirm = self._budget.build_confirm_request(
+                confirm = self._solwyn_budget.build_confirm_request(
                     reservation_id=reservation_id,
                     lease_id=lease_id,
                     lease_claim_token=lease_claim_token,
@@ -2441,14 +2447,14 @@ class Solwyn(_SolwynBase):
                 provider_region=provider_region,
             )
             if confirm is not None:
-                self._reporter.report_settlement(confirm, event)
+                self._solwyn_reporter.report_settlement(confirm, event)
             else:
-                self._reporter.report(event)
+                self._solwyn_reporter.report(event)
             return result
 
         # Every candidate failed (or none was attempted): no settlement will
         # follow, so the lease reservation goes back now.
-        self._budget.release_reservation(
+        self._solwyn_budget.release_reservation(
             call_id,
             lease_claim_token=_lease_claim_token(budget),
         )
@@ -2523,7 +2529,7 @@ class Solwyn(_SolwynBase):
             confirm = None
             reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
             if reservation_id or lease_id:
-                confirm = self._budget.build_confirm_request(
+                confirm = self._solwyn_budget.build_confirm_request(
                     reservation_id=reservation_id,
                     lease_id=lease_id,
                     lease_claim_token=lease_claim_token,
@@ -2560,9 +2566,9 @@ class Solwyn(_SolwynBase):
                 provider_region=provider_region,
             )
             if confirm is not None:
-                self._reporter.report_settlement(confirm, event)
+                self._solwyn_reporter.report_settlement(confirm, event)
             else:
-                self._reporter.report(event)
+                self._solwyn_reporter.report(event)
 
         if on_error is None:
             on_error = _make_stream_error_handler(
@@ -2599,9 +2605,18 @@ class Solwyn(_SolwynBase):
         return primary.adapter.wrap_stream_result(wrapper, response)
 
     def close(self) -> None:
-        """Shut down the reporter and close HTTP clients."""
-        self._reporter.close()
-        self._budget.close()
+        """Shut down Solwyn state, then close the wrapped provider client."""
+        self._solwyn_reporter.close()
+        self._solwyn_budget.close()
+        provider_close = getattr(self._solwyn_client, "close", None)
+        if callable(provider_close):
+            try:
+                provider_close()
+            except AttributeError as exc:
+                # A type-only/duck-typed client can inherit ``close`` without
+                # initialized lifecycle state. Treat that as no usable seam.
+                if exc.obj is not self._solwyn_client:
+                    raise
 
     def __enter__(self) -> Solwyn:
         return self
@@ -2609,14 +2624,58 @@ class Solwyn(_SolwynBase):
     def __exit__(self, *args: object) -> None:
         self.close()
 
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        """Report wrapped class for isinstance admission; type(self) stays truthful."""
+        return type(self._solwyn_client)
+
     def __getattr__(self, name: str) -> Any:
         """Resolve public pass-throughs through the contextual capability guard."""
+        if name.startswith(_SOLWYN_INTERNAL_PREFIX):
+            raise AttributeError(name)
         return self._resolve_public_attribute(
-            self._client,
+            self._solwyn_client,
             name=name,
             path=name,
             source=SurfaceSource.RAW,
         )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Keep ``_solwyn_*`` state local and forward every other name."""
+        if name.startswith(_SOLWYN_INTERNAL_PREFIX):
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._solwyn_client, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        """Delete ``_solwyn_*`` state locally and every other name remotely."""
+        if name.startswith(_SOLWYN_INTERNAL_PREFIX):
+            object.__delattr__(self, name)
+            return
+        delattr(self._solwyn_client, name)
+
+    def __dir__(self) -> list[str]:
+        """Return the union of wrapper and provider client names."""
+        return sorted(set(object.__dir__(self)) | set(dir(self._solwyn_client)))
+
+    def __reduce_ex__(self, protocol: int) -> Any:  # type: ignore[override]
+        """Refuse to pickle live reporter and budget state."""
+        raise TypeError(
+            "Solwyn clients hold live reporter/budget state and cannot be pickled; "
+            "construct a fresh Solwyn(...) in the target process"
+        )
+
+    def __copy__(self) -> Solwyn:
+        """Share this stateful wrapper rather than cloning live resources."""
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Solwyn:
+        """Share this stateful wrapper rather than cloning live resources."""
+        return self
+
+    def __repr__(self) -> str:
+        """Show both the truthful wrapper type and wrapped client."""
+        return f"{type(self).__name__}({self._solwyn_client!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -2644,6 +2703,8 @@ class AsyncSolwyn(_SolwynBase):
             )
     """
 
+    _solwyn_is_wrapper_type = True
+
     def __init__(
         self,
         client: object,
@@ -2659,8 +2720,8 @@ class AsyncSolwyn(_SolwynBase):
         selection_policy: SelectionPolicy | None = None,
         **config_kwargs: object,
     ) -> None:
-        # See sync Solwyn.__init__ for why _client is typed Any.
-        self._client: Any = client
+        # See sync Solwyn.__init__ for why _solwyn_client is typed Any.
+        self._solwyn_client: Any = client
 
         if "project_id" in config_kwargs:
             raise TypeError("unexpected keyword argument 'project_id'")
@@ -2672,8 +2733,8 @@ class AsyncSolwyn(_SolwynBase):
 
         # The primary runtime's adapter is the detected (or explicitly pinned)
         # provider identity for usage extraction and proxy selection.
-        self._adapter = runtimes[0].adapter
-        self._dialect = runtimes[0].adapter.dialect
+        self._solwyn_adapter = runtimes[0].adapter
+        self._solwyn_dialect = runtimes[0].adapter.dialect
 
         # cfg_kwargs stays dict[str, Any]: mypy can't verify Pydantic's **kwargs
         # validation against SolwynConfig's typed fields, so tightening here
@@ -2700,20 +2761,20 @@ class AsyncSolwyn(_SolwynBase):
             ) from exc
         super().__init__(config, runtimes, selection_policy=selection_policy, mode="async")
 
-        self._budget = AsyncBudgetEnforcer(
+        self._solwyn_budget = AsyncBudgetEnforcer(
             api_url=config.api_url,
             api_key=config.api_key,
             budget_mode=config.budget_mode,
             fail_open=config.fail_open,
             cache_ttl=config.budget_check_cache_ttl,
-            control_plane_breaker=self._control_plane_breaker,
+            control_plane_breaker=self._solwyn_control_plane_breaker,
             # PJ-2: the SDK instance id IS the lease holder identity.
-            holder_id=self._sdk_instance_id,
+            holder_id=self._solwyn_sdk_instance_id,
             lease_enabled=config.lease_enabled,
             lease_output_bound_default=config.lease_output_bound_default,
         )
 
-        self._reporter = AsyncMetadataReporter(
+        self._solwyn_reporter = AsyncMetadataReporter(
             config.api_url,
             config.api_key,
             batch_size=config.reporter_batch_size,
@@ -2721,18 +2782,20 @@ class AsyncSolwyn(_SolwynBase):
             max_queue_size=config.reporter_max_queue_size,
             max_in_flight=config.reporter_max_in_flight,
             breaker_snapshots=self._get_breaker_snapshots,
-            sdk_instance_id=self._sdk_instance_id,
+            sdk_instance_id=self._solwyn_sdk_instance_id,
             breaker_reporting_enabled=config.breaker_reporting_enabled,
             report_untracked_surfaces=config.report_untracked_surfaces,
             breaker_report_heartbeat=config.breaker_report_heartbeat,
-            control_plane_breaker=self._control_plane_breaker,
+            control_plane_breaker=self._solwyn_control_plane_breaker,
             max_send_attempts=config.reporter_max_send_attempts,
             retry_backoff_base=config.reporter_retry_backoff_base,
             retry_backoff_cap=config.reporter_retry_backoff_cap,
             shutdown_deadline=config.reporter_shutdown_deadline,
         )
-        self._untracked_observation_notifier = (
-            self._reporter.observe_untracked_surface if config.report_untracked_surfaces else None
+        self._solwyn_untracked_observation_notifier = (
+            self._solwyn_reporter.observe_untracked_surface
+            if config.report_untracked_surfaces
+            else None
         )
 
     @functools.cached_property
@@ -2753,12 +2816,12 @@ class AsyncSolwyn(_SolwynBase):
         operations. Cached because provider identity is construction-time state.
         """
         if (
-            _responses_preparer(self._adapter) is not None
-            and self._inspect_static_attribute(self._client, "responses") is not None
+            _responses_preparer(self._solwyn_adapter) is not None
+            and self._inspect_static_attribute(self._solwyn_client, "responses") is not None
         ):
             return _AsyncResponsesProxy(self)
         return self._resolve_public_attribute(
-            self._client,
+            self._solwyn_client,
             name="responses",
             path="responses",
             source=SurfaceSource.RAW,
@@ -2821,10 +2884,10 @@ class AsyncSolwyn(_SolwynBase):
         Cached: the dialect is fixed at construction, so the conditional
         result is stable for the lifetime of this client instance.
         """
-        if self._dialect == "anthropic":
+        if self._solwyn_dialect == "anthropic":
             return _AsyncMessagesProxy(self)
         return self._resolve_public_attribute(
-            self._client,
+            self._solwyn_client,
             name="messages",
             path="messages",
             source=SurfaceSource.RAW,
@@ -2837,10 +2900,10 @@ class AsyncSolwyn(_SolwynBase):
         Cached: the client shape is fixed at construction, so the conditional
         result is stable for the lifetime of this client instance.
         """
-        if self._surface_context.client_shape == "google_genai":
+        if self._solwyn_surface_context.client_shape == "google_genai":
             return _AsyncModelsProxy(self)
         return self._resolve_public_attribute(
-            self._client,
+            self._solwyn_client,
             name="models",
             path="models",
             source=SurfaceSource.RAW,
@@ -2849,18 +2912,18 @@ class AsyncSolwyn(_SolwynBase):
     async def converse(self, **kwargs: Any) -> Any:
         """Bedrock-compatible: client.converse(modelId=...) goes through interception."""
         self._enforce_explicit_surface("converse", source=SurfaceSource.WRAPPER)
-        if self._dialect == "bedrock":
+        if self._solwyn_dialect == "bedrock":
             return await self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
-        return await self._client.converse(**kwargs)
+        return await self._solwyn_client.converse(**kwargs)
 
     async def converse_stream(self, **kwargs: Any) -> Any:
         """Bedrock-compatible streaming: returns the boto3 dict with a wrapped stream."""
         self._enforce_explicit_surface("converse_stream", source=SurfaceSource.WRAPPER)
-        if self._dialect == "bedrock":
+        if self._solwyn_dialect == "bedrock":
             return await self._intercepted_call(
                 _force_stream=True, **_bedrock_internal_kwargs(kwargs)
             )
-        return await self._client.converse_stream(**kwargs)
+        return await self._solwyn_client.converse_stream(**kwargs)
 
     async def invoke_model(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
@@ -2869,9 +2932,9 @@ class AsyncSolwyn(_SolwynBase):
             source=SurfaceSource.WRAPPER,
             blocked_reason=_INVOKE_MODEL_GUIDANCE,
         )
-        if self._dialect == "bedrock":
+        if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
-        return await self._client.invoke_model(**kwargs)
+        return await self._solwyn_client.invoke_model(**kwargs)
 
     async def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's legacy per-model surface (budget bypass risk)."""
@@ -2880,9 +2943,9 @@ class AsyncSolwyn(_SolwynBase):
             source=SurfaceSource.WRAPPER,
             blocked_reason=_INVOKE_MODEL_GUIDANCE,
         )
-        if self._dialect == "bedrock":
+        if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
-        return await self._client.invoke_model_with_response_stream(**kwargs)
+        return await self._solwyn_client.invoke_model_with_response_stream(**kwargs)
 
     async def start_async_invoke(self, **kwargs: Any) -> Any:
         """Fail loud on Bedrock's async invocation surface (untracked video-scale spend)."""
@@ -2891,9 +2954,9 @@ class AsyncSolwyn(_SolwynBase):
             source=SurfaceSource.WRAPPER,
             blocked_reason=_START_ASYNC_INVOKE_GUIDANCE,
         )
-        if self._dialect == "bedrock":
+        if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
-        return await self._client.start_async_invoke(**kwargs)
+        return await self._solwyn_client.start_async_invoke(**kwargs)
 
     async def _async_dispatch(
         self,
@@ -2988,23 +3051,23 @@ class AsyncSolwyn(_SolwynBase):
         """
         agent_run = _capture_run_context(
             kwargs.pop("solwyn_tags", None),
-            default_tags=self._config.tags,
+            default_tags=self._solwyn_config.tags,
         )
         requested_model = cast(str, kwargs["model"])
         call_id = str(uuid.uuid4())
-        runtime = self._runtimes[0]
+        runtime = self._solwyn_runtimes[0]
         provider = runtime.adapter.name
-        deadline = Deadline(self._config.failover_total_timeout)
+        deadline = Deadline(self._solwyn_config.failover_total_timeout)
 
         char_count = estimate_content_length(kwargs)
         est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
         estimated_media = spec.estimate_media(kwargs) if spec.estimate_media is not None else None
 
-        budget = await self._budget.check_budget(
+        budget = await self._solwyn_budget.check_budget(
             estimated_input_tokens=est_in,
             model=requested_model,
             provider=provider,
-            timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
+            timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
             modality=spec.modality,
             estimated_media=estimated_media,
             agent_run_id=agent_run[0],
@@ -3012,20 +3075,20 @@ class AsyncSolwyn(_SolwynBase):
             call_id=call_id,
         )
         # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
-        # must never re-read self._config (the directive writer mutates it
+        # must never re-read self._solwyn_config (the directive writer mutates it
         # under a lock; unlocked re-reads can tear).
         tuning = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
         )
         deadline.replace_total(tuning.failover_total_timeout)
-        self._reporter.observe_project_id(budget.project_id)
+        self._solwyn_reporter.observe_project_id(budget.project_id)
         if budget.price_hints is not None:
             self.update_price_hints(budget.price_hints)
 
         provider_region = runtime.adapter.extract_region(runtime.sdk_client)
         if not budget.allowed:
             try:
-                self._reporter.report(
+                self._solwyn_reporter.report(
                     self._build_metadata_event(
                         model=requested_model,
                         provider=provider,
@@ -3057,7 +3120,7 @@ class AsyncSolwyn(_SolwynBase):
         # otherwise let a warm pooled connection clear the 0.001s connect floor
         # and read for the full hop bound. See the sync mirror.
         if deadline.expired():
-            self._budget.release_reservation(
+            self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
@@ -3079,11 +3142,11 @@ class AsyncSolwyn(_SolwynBase):
         except Exception as exc:
             # Nothing will settle this call: hand any lease reservation back
             # rather than stranding it until the 900s sweep.
-            self._budget.release_reservation(
+            self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
-            self._reporter.report(
+            self._solwyn_reporter.report(
                 self._build_error_event(
                     model=requested_model,
                     provider=provider,
@@ -3137,7 +3200,7 @@ class AsyncSolwyn(_SolwynBase):
         confirm = None
         reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
         if (reservation_id or lease_id) and (token_details is not None or media_usage is not None):
-            confirm = self._budget.build_confirm_request(
+            confirm = self._solwyn_budget.build_confirm_request(
                 reservation_id=reservation_id,
                 lease_id=lease_id,
                 lease_claim_token=lease_claim_token,
@@ -3169,9 +3232,9 @@ class AsyncSolwyn(_SolwynBase):
             media_usage=media_usage,
         )
         if confirm is not None:
-            self._reporter.report_settlement(confirm, event)
+            self._solwyn_reporter.report_settlement(confirm, event)
         else:
-            self._reporter.report(event)
+            self._solwyn_reporter.report(event)
         return response
 
     async def _intercepted_call(
@@ -3185,18 +3248,18 @@ class AsyncSolwyn(_SolwynBase):
         """Async core interception logic: the classified candidate walk."""
         agent_run = _capture_run_context(
             kwargs.pop("solwyn_tags", None),
-            default_tags=self._config.tags,
+            default_tags=self._solwyn_config.tags,
         )
         requested_model = cast(str, kwargs["model"])
         # One reconciliation join key per intercepted call: see the sync
         # _intercepted_call for the join/dedup contract.
         call_id = str(uuid.uuid4())
-        primary = self._runtimes[0]
+        primary = self._solwyn_runtimes[0]
         if _surface == "responses" and _responses_preparer(primary.adapter) is None:
             raise UnsupportedSurfaceError(
                 surface=f"responses.{_responses_leaf}", provider=primary.adapter.name
             )
-        deadline = Deadline(self._config.failover_total_timeout)
+        deadline = Deadline(self._solwyn_config.failover_total_timeout)
 
         request_semantics = kwargs
         responses_idempotent_override: bool | None = None
@@ -3207,7 +3270,7 @@ class AsyncSolwyn(_SolwynBase):
                 "bool | None", kwargs.pop("solwyn_idempotent", None)
             )
             request_semantics = _effective_responses_kwargs(
-                global_defaults=self._config.default_params,
+                global_defaults=self._solwyn_config.default_params,
                 primary_defaults=primary.entry.default_params,
                 kwargs=kwargs,
             )
@@ -3240,26 +3303,26 @@ class AsyncSolwyn(_SolwynBase):
             fallback_models: list[str] = []
             estimated_output_bound = _responses_output_bound(
                 request_semantics,
-                self._config.lease_output_bound_default,
+                self._solwyn_config.lease_output_bound_default,
             )
         else:
-            fallback_providers = [r.entry.provider.value for r in self._runtimes[1:]]
-            fallback_models = [r.entry.model for r in self._runtimes[1:]]
+            fallback_providers = [r.entry.provider.value for r in self._solwyn_runtimes[1:]]
+            fallback_models = [r.entry.model for r in self._solwyn_runtimes[1:]]
             estimated_output_bound = _effective_output_bound(
                 primary=primary,
-                runtimes=self._runtimes,
-                global_defaults=self._config.default_params,
+                runtimes=self._solwyn_runtimes,
+                global_defaults=self._solwyn_config.default_params,
                 kwargs=kwargs,
-                default_bound=self._config.lease_output_bound_default,
+                default_bound=self._solwyn_config.lease_output_bound_default,
             )
         if _surface == "responses":
-            budget = await self._budget.check_budget(
+            budget = await self._solwyn_budget.check_budget(
                 estimated_input_tokens=est_in,
                 model=requested_model,
                 provider=primary.adapter.name,
                 fallback_providers=fallback_providers,
                 fallback_models=fallback_models,
-                timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
+                timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
                 modality="text",
                 agent_run_id=agent_run[0],
                 tags=agent_run[2],
@@ -3267,26 +3330,26 @@ class AsyncSolwyn(_SolwynBase):
                 estimated_output_bound=estimated_output_bound,
             )
         else:
-            budget = await self._budget.check_budget(
+            budget = await self._solwyn_budget.check_budget(
                 estimated_input_tokens=est_in,
                 model=requested_model,
                 provider=primary.adapter.name,
                 fallback_providers=fallback_providers,
                 fallback_models=fallback_models,
-                timeout=_budget_timeout(deadline, self._config.budget_check_timeout),
+                timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
                 agent_run_id=agent_run[0],
                 tags=agent_run[2],
                 call_id=call_id,
                 estimated_output_bound=estimated_output_bound,
             )
         # PJ-8/R12: ONE immutable tuning snapshot per call - the walk below
-        # must never re-read self._config (the directive writer mutates it
+        # must never re-read self._solwyn_config (the directive writer mutates it
         # under a lock; unlocked re-reads can tear).
         tuning = self._apply_failover_tuning_directive(
             getattr(budget, "failover_tuning_allowed", None)
         )
         deadline.replace_total(tuning.failover_total_timeout)
-        self._reporter.observe_project_id(budget.project_id)
+        self._solwyn_reporter.observe_project_id(budget.project_id)
         # Refresh the CostPolicy signal from the server. Hints PERSIST across
         # hint-less responses (cache hits) until the server sends new ones — see
         # the sync _intercepted_call for the rationale.
@@ -3309,7 +3372,7 @@ class AsyncSolwyn(_SolwynBase):
                     agent_run=agent_run,
                     provider_region=primary.adapter.extract_region(primary.sdk_client),
                 )
-                self._reporter.report(event)
+                self._solwyn_reporter.report(event)
             except Exception as exc:
                 logger.warning(
                     "Failed to report budget_denied metadata event: %s",
@@ -3350,13 +3413,13 @@ class AsyncSolwyn(_SolwynBase):
                 c for c in candidates if c is primary and _responses_preparer(c.adapter) is not None
             ]
         if not candidates:
-            self._budget.release_reservation(
+            self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
             raise ProviderUnavailableError("all providers unavailable", attempted=[])
         if deadline.remaining() <= 0.0:
-            self._budget.release_reservation(
+            self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
@@ -3391,7 +3454,7 @@ class AsyncSolwyn(_SolwynBase):
             # corrupt the dashboard chain-depth funnel. The per-hop timeout slice
             # still uses the candidate-walk ``idx`` (remaining candidates, not
             # chain depth).
-            chain_index = next(i for i, r in enumerate(self._runtimes) if r is rt)
+            chain_index = next(i for i, r in enumerate(self._solwyn_runtimes) if r is rt)
 
             # Build native kwargs for this hop. A cross-provider hop runs the
             # translation contract and may RAISE an Untranslatable* error here,
@@ -3411,7 +3474,7 @@ class AsyncSolwyn(_SolwynBase):
                         is_primary=is_primary,
                         is_provider_fallback=is_provider_fallback,
                         is_streaming=is_streaming,
-                        global_defaults=self._config.default_params,
+                        global_defaults=self._solwyn_config.default_params,
                         kwargs=kwargs,
                     )
                     served_model = requested_model if is_primary else rt.entry.model
@@ -3421,7 +3484,7 @@ class AsyncSolwyn(_SolwynBase):
                         )
             except Exception:
                 cb.release_probe(admission)
-                self._budget.release_reservation(
+                self._solwyn_budget.release_reservation(
                     call_id,
                     lease_claim_token=_lease_claim_token(budget),
                 )
@@ -3509,7 +3572,7 @@ class AsyncSolwyn(_SolwynBase):
                     possibly_succeeded = (
                         disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                     )
-                    self._reporter.report(
+                    self._solwyn_reporter.report(
                         self._build_error_event(
                             model=served_model,
                             provider=provider,
@@ -3529,13 +3592,13 @@ class AsyncSolwyn(_SolwynBase):
                         )
                     )
                     if disp is Disposition.FAIL_FAST:
-                        self._budget.release_reservation(
+                        self._solwyn_budget.release_reservation(
                             call_id,
                             lease_claim_token=_lease_claim_token(budget),
                         )
                         raise
                     if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
-                        self._budget.release_reservation(
+                        self._solwyn_budget.release_reservation(
                             call_id,
                             lease_claim_token=_lease_claim_token(budget),
                         )
@@ -3663,7 +3726,7 @@ class AsyncSolwyn(_SolwynBase):
             confirm = None
             reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
             if reservation_id or lease_id:
-                confirm = self._budget.build_confirm_request(
+                confirm = self._solwyn_budget.build_confirm_request(
                     reservation_id=reservation_id,
                     lease_id=lease_id,
                     lease_claim_token=lease_claim_token,
@@ -3702,14 +3765,14 @@ class AsyncSolwyn(_SolwynBase):
                 provider_region=provider_region,
             )
             if confirm is not None:
-                self._reporter.report_settlement(confirm, event)
+                self._solwyn_reporter.report_settlement(confirm, event)
             else:
-                self._reporter.report(event)
+                self._solwyn_reporter.report(event)
             return result
 
         # Every candidate failed (or none was attempted): no settlement will
         # follow, so the lease reservation goes back now.
-        self._budget.release_reservation(
+        self._solwyn_budget.release_reservation(
             call_id,
             lease_claim_token=_lease_claim_token(budget),
         )
@@ -3782,7 +3845,7 @@ class AsyncSolwyn(_SolwynBase):
             confirm = None
             reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
             if reservation_id or lease_id:
-                confirm = self._budget.build_confirm_request(
+                confirm = self._solwyn_budget.build_confirm_request(
                     reservation_id=reservation_id,
                     lease_id=lease_id,
                     lease_claim_token=lease_claim_token,
@@ -3819,9 +3882,9 @@ class AsyncSolwyn(_SolwynBase):
                 provider_region=provider_region,
             )
             if confirm is not None:
-                self._reporter.report_settlement(confirm, event)
+                self._solwyn_reporter.report_settlement(confirm, event)
             else:
-                self._reporter.report(event)
+                self._solwyn_reporter.report(event)
 
         if on_error is None:
             on_error = _make_async_stream_error_handler(
@@ -3855,22 +3918,79 @@ class AsyncSolwyn(_SolwynBase):
         return primary.adapter.wrap_stream_result(wrapper, response)
 
     async def close(self) -> None:
-        """Shut down the reporter and close HTTP clients."""
-        await self._reporter.close()
-        await self._budget.close()
+        """Shut down Solwyn state, then close the wrapped provider client."""
+        await self._solwyn_reporter.close()
+        await self._solwyn_budget.close()
+        provider_close = getattr(self._solwyn_client, "aclose", None)
+        if not callable(provider_close):
+            provider_close = getattr(self._solwyn_client, "close", None)
+        if callable(provider_close):
+            try:
+                close_result = provider_close()
+                if isinstance(close_result, Awaitable):
+                    await close_result
+            except AttributeError as exc:
+                # See the synchronous close path: an inherited method alone
+                # does not guarantee initialized provider lifecycle state.
+                if exc.obj is not self._solwyn_client:
+                    raise
 
     async def __aenter__(self) -> AsyncSolwyn:
-        self._reporter.start()
+        self._solwyn_reporter.start()
         return self
 
     async def __aexit__(self, *args: object) -> None:
         await self.close()
 
+    @property  # type: ignore[misc]
+    def __class__(self) -> type:
+        """Report wrapped class for isinstance admission; type(self) stays truthful."""
+        return type(self._solwyn_client)
+
     def __getattr__(self, name: str) -> Any:
         """Resolve public pass-throughs through the contextual capability guard."""
+        if name.startswith(_SOLWYN_INTERNAL_PREFIX):
+            raise AttributeError(name)
         return self._resolve_public_attribute(
-            self._client,
+            self._solwyn_client,
             name=name,
             path=name,
             source=SurfaceSource.RAW,
         )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Keep ``_solwyn_*`` state local and forward every other name."""
+        if name.startswith(_SOLWYN_INTERNAL_PREFIX):
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._solwyn_client, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        """Delete ``_solwyn_*`` state locally and every other name remotely."""
+        if name.startswith(_SOLWYN_INTERNAL_PREFIX):
+            object.__delattr__(self, name)
+            return
+        delattr(self._solwyn_client, name)
+
+    def __dir__(self) -> list[str]:
+        """Return the union of wrapper and provider client names."""
+        return sorted(set(object.__dir__(self)) | set(dir(self._solwyn_client)))
+
+    def __reduce_ex__(self, protocol: int) -> Any:  # type: ignore[override]
+        """Refuse to pickle live reporter and budget state."""
+        raise TypeError(
+            "Solwyn clients hold live reporter/budget state and cannot be pickled; "
+            "construct a fresh Solwyn(...) in the target process"
+        )
+
+    def __copy__(self) -> AsyncSolwyn:
+        """Share this stateful wrapper rather than cloning live resources."""
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> AsyncSolwyn:
+        """Share this stateful wrapper rather than cloning live resources."""
+        return self
+
+    def __repr__(self) -> str:
+        """Show both the truthful wrapper type and wrapped client."""
+        return f"{type(self).__name__}({self._solwyn_client!r})"

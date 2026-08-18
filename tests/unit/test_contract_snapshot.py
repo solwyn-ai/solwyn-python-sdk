@@ -1011,12 +1011,14 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
     defaults.update(overrides)
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
-    solwyn._reporter.report = MagicMock()
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter.report = MagicMock()
     # Non-streaming settlement now rides report_settlement(confirm, event); keep
     # _reported_events observable by forwarding the settled event to report().
-    solwyn._reporter.report_settlement = lambda _req, event: solwyn._reporter.report(event)
+    solwyn._solwyn_reporter.report_settlement = lambda _req, event: solwyn._solwyn_reporter.report(
+        event
+    )
     return solwyn
 
 
@@ -1024,8 +1026,10 @@ def _make_async_solwyn(client: object, **overrides: object) -> AsyncSolwyn:
     defaults: dict[str, object] = {"api_key": VALID_API_KEY}
     defaults.update(overrides)
     solwyn = AsyncSolwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter.report = MagicMock()
-    solwyn._reporter.report_settlement = lambda _req, event: solwyn._reporter.report(event)
+    solwyn._solwyn_reporter.report = MagicMock()
+    solwyn._solwyn_reporter.report_settlement = lambda _req, event: solwyn._solwyn_reporter.report(
+        event
+    )
     return solwyn
 
 
@@ -1037,17 +1041,17 @@ def _force_primary_open(solwyn: Solwyn | AsyncSolwyn, provider: str = "openai") 
 
 
 def _close(solwyn: Solwyn) -> None:
-    solwyn._reporter._http.close()
-    solwyn._budget._http.close()
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_budget._http.close()
 
 
 async def _aclose(solwyn: AsyncSolwyn) -> None:
-    await solwyn._reporter._http.aclose()
-    await solwyn._budget._http.aclose()
+    await solwyn._solwyn_reporter._http.aclose()
+    await solwyn._solwyn_budget._http.aclose()
 
 
 def _reported_events(solwyn: Solwyn | AsyncSolwyn) -> list[MetadataEvent]:
-    return [c.args[0] for c in solwyn._reporter.report.call_args_list]
+    return [c.args[0] for c in solwyn._solwyn_reporter.report.call_args_list]
 
 
 _PLAIN_REQUEST = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
@@ -1079,7 +1083,7 @@ class TestChainHintWiring:
         )
 
         check_spy = MagicMock(return_value=_allow_budget())
-        with patch.object(solwyn._budget, "check_budget", check_spy):
+        with patch.object(solwyn._solwyn_budget, "check_budget", check_spy):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         check_spy.assert_called_once()
@@ -1088,7 +1092,7 @@ class TestChainHintWiring:
         # runtimes[1:] in order, aligned element-for-element.
         assert kwargs["provider"] == "openai"
         assert kwargs["model"] == "gpt-5.5"
-        runtimes = solwyn._runtimes
+        runtimes = solwyn._solwyn_runtimes
         assert kwargs["fallback_providers"] == [r.entry.provider.value for r in runtimes[1:]]
         assert kwargs["fallback_models"] == [r.entry.model for r in runtimes[1:]]
         # Concretely: the two configured fallbacks, in order.
@@ -1121,10 +1125,10 @@ class TestCallIdConsistencyCrossProvider:
 
         def report_settlement(req: Any, event: Any) -> None:
             settlements.append((req, event))
-            solwyn._reporter.report(event)
+            solwyn._solwyn_reporter.report(event)
 
-        solwyn._reporter.report_settlement = report_settlement
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        solwyn._solwyn_reporter.report_settlement = report_settlement
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
@@ -1156,11 +1160,11 @@ class TestCallIdConsistencyCrossProvider:
 
         def report_settlement(req: Any, event: Any) -> None:
             settlements.append((req, event))
-            solwyn._reporter.report(event)
+            solwyn._solwyn_reporter.report(event)
 
-        solwyn._reporter.report_settlement = report_settlement
+        solwyn._solwyn_reporter.report_settlement = report_settlement
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             await solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -1178,7 +1182,7 @@ class TestCallIdConsistencyCrossProvider:
         openai.chat.completions.create.return_value = _openai_response()
         solwyn = _make_solwyn(openai, model="gpt-5.5")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -1212,12 +1216,14 @@ class TestCallIdConsistencyCrossProvider:
 
         def report_settlement(req: Any, event: Any) -> None:
             settlements.append((req, event))
-            solwyn._reporter.report(event)
+            solwyn._solwyn_reporter.report(event)
 
-        solwyn._reporter.report_settlement = report_settlement
+        solwyn._solwyn_reporter.report_settlement = report_settlement
 
         with patch.object(
-            solwyn._budget, "check_budget", return_value=_allow_budget(reservation_id="resv_s")
+            solwyn._solwyn_budget,
+            "check_budget",
+            return_value=_allow_budget(reservation_id="resv_s"),
         ):
             stream = solwyn.chat.completions.create(**_STREAM_REQUEST)
             list(stream)  # drain to fire on_complete
@@ -1250,8 +1256,8 @@ class TestNormalizeBeforeSettlement:
 
         settle_spy = MagicMock()
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
-            patch.object(solwyn._reporter, "report_settlement", settle_spy),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_reporter, "report_settlement", settle_spy),
             patch("solwyn.client._translation.normalize_response", side_effect=RuntimeError),
             pytest.raises(RuntimeError),
         ):
@@ -1278,9 +1284,9 @@ class TestNormalizeBeforeSettlement:
         settle_spy = MagicMock()
         with (
             patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
             ),
-            patch.object(solwyn._reporter, "report_settlement", settle_spy),
+            patch.object(solwyn._solwyn_reporter, "report_settlement", settle_spy),
             patch("solwyn.client._translation.normalize_response", side_effect=RuntimeError),
             pytest.raises(RuntimeError),
         ):
@@ -1313,7 +1319,7 @@ class TestPossiblySucceededMatrix:
         solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(_Status) as exc_info,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -1339,7 +1345,7 @@ class TestPossiblySucceededMatrix:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         events = _reported_events(solwyn)
@@ -1360,7 +1366,7 @@ class TestPossiblySucceededMatrix:
         openai.chat.completions.create.return_value = _openai_response()
         solwyn = _make_solwyn(openai, model="gpt-5.5")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
@@ -1386,7 +1392,7 @@ class TestIsModelFallbackNarrowed:
         openai.chat.completions.create.side_effect = [_Status(429), _openai_response()]
         solwyn = _make_solwyn(openai, model="gpt-5.5", fallback=[(openai, "gpt-5.4-mini")])
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
@@ -1408,7 +1414,7 @@ class TestIsModelFallbackNarrowed:
         )
         _force_primary_open(solwyn, "openai")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
@@ -1423,7 +1429,7 @@ class TestIsModelFallbackNarrowed:
         openai.chat.completions.create.return_value = _openai_response()
         solwyn = _make_solwyn(openai, model="gpt-5.5")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         success = [e for e in _reported_events(solwyn) if e.status is CallStatus.SUCCESS]
@@ -1460,7 +1466,7 @@ class TestFailoverErrorClassFirewall:
         solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(_LeakyError),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -1487,7 +1493,7 @@ class TestFailoverErrorClassFirewall:
 
         with (
             patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
             ),
             pytest.raises(_LeakyError),
         ):

@@ -28,7 +28,10 @@ jobs:
       - run: ruff check src/ tests/ scripts/
       - run: ruff format --check src/ tests/ scripts/
       - run: mypy src/solwyn/
-      - run: pytest tests/ -m unit -v --tb=short --ignore=tests/unit/test_surface_canary.py
+      - run: >-
+          pytest tests/ -m unit -v --tb=short
+          --ignore=tests/unit/test_surface_canary.py
+          --ignore=tests/integration/frameworks
 
   provider-surface-matrix:
     runs-on: ubuntu-latest

@@ -10,7 +10,8 @@ prompt CONTENT. The content-touching contract is non-negotiable:
     STRAIGHT to the destination provider SDK.
   * No I/O. This module imports neither the stdlib log module nor any HTTP
     client, and holds no log handle of any kind. It must never reach
-    ``_reporter``, ``_budget``, or any client pointed at ``config.api_url``.
+    ``_solwyn_reporter``, ``_solwyn_budget``, or any client pointed at
+    ``config.api_url``.
   * Fail loudly with ``UntranslatableRequestError(source, target, feature)``
     carrying STRUCTURAL labels only — NEVER the offending value or any prompt
     content. Re-raise across the boundary with ``... from None`` so a provider

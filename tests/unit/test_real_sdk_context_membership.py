@@ -78,7 +78,7 @@ def test_async_wrapper_rejects_a_sync_boto3_bedrock_client(monkeypatch, boto3_mo
 
     # The matched pairing still constructs and releases owned resources.
     with Solwyn(_bedrock_client(boto3_mod), api_key=VALID_API_KEY) as wrapper:
-        assert wrapper._surface_context.client_shape == "bedrock_boto3"
+        assert wrapper._solwyn_surface_context.client_shape == "bedrock_boto3"
 
 
 @pytest.mark.unit
@@ -278,7 +278,7 @@ def test_sync_anthropic_variant_pins_accept_primary_and_fallback_without_detecti
             ],
         ) as wrapper,
     ):
-        assert all(runtime.adapter.name == "anthropic" for runtime in wrapper._runtimes)
+        assert all(runtime.adapter.name == "anthropic" for runtime in wrapper._solwyn_runtimes)
 
     detector.assert_not_called()
 
@@ -307,7 +307,7 @@ async def test_async_anthropic_variant_pins_accept_primary_and_fallback_without_
             ],
         )
         try:
-            assert all(runtime.adapter.name == "anthropic" for runtime in wrapper._runtimes)
+            assert all(runtime.adapter.name == "anthropic" for runtime in wrapper._solwyn_runtimes)
         finally:
             await wrapper.close()
 
@@ -421,7 +421,7 @@ def test_sync_openai_module_client_pins_accept_primary_and_fallback_without_dete
             ],
         ) as wrapper,
     ):
-        assert all(runtime.adapter.name == "openai" for runtime in wrapper._runtimes)
+        assert all(runtime.adapter.name == "openai" for runtime in wrapper._solwyn_runtimes)
 
     detector.assert_not_called()
 

@@ -1782,10 +1782,10 @@ class TestStreamingSettlementAttribution:
         )
         with patch("solwyn.reporter.MetadataReporter._flush_loop"):
             solwyn = Solwyn(provider, api_key=VALID_API_KEY, model="gpt-5.5")
-        solwyn._reporter._shutdown.set()
-        solwyn._reporter._thread.join(timeout=2.0)
+        solwyn._solwyn_reporter._shutdown.set()
+        solwyn._solwyn_reporter._thread.join(timeout=2.0)
         settlements: list[tuple[object, object]] = []
-        solwyn._reporter.report_settlement = lambda confirm, event: settlements.append(
+        solwyn._solwyn_reporter.report_settlement = lambda confirm, event: settlements.append(
             (confirm, event)
         )
         budget = SimpleNamespace(
@@ -1799,7 +1799,7 @@ class TestStreamingSettlementAttribution:
         )
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=budget),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=budget),
             run("stream-agent", tags={"team": "research"}) as run_id,
         ):
             stream = solwyn.chat.completions.create(
@@ -1814,5 +1814,5 @@ class TestStreamingSettlementAttribution:
         assert event.tags == {"team": "research"}
         assert event.agent_run_id == run_id
         assert event.agent_run_name == "stream-agent"
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()

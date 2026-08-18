@@ -123,15 +123,15 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
     defaults.update(overrides)
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
-    solwyn._reporter.report = MagicMock()
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter.report = MagicMock()
     return solwyn
 
 
 def _close(solwyn: Solwyn) -> None:
-    solwyn._reporter._http.close()
-    solwyn._budget._http.close()
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_budget._http.close()
 
 
 _PLAIN_REQUEST = {
@@ -197,7 +197,7 @@ class TestToolExchangeFailover:
         )
 
         with patch.object(
-            solwyn._budget,
+            solwyn._solwyn_budget,
             "check_budget",
             return_value=_allow_budget(),
         ) as check:
@@ -234,7 +234,7 @@ class TestToolExchangeFailover:
             ],
         )
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         assert result.choices[0].message.content == "ok from claude"
@@ -258,7 +258,7 @@ class TestToolExchangeFailover:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_TOOL_REQUEST)
 
         anthropic.messages.create.assert_called_once()
@@ -345,7 +345,7 @@ class TestUntranslatableAbortsChain:
         }
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(UntranslatableRequestError) as exc_info,
         ):
             solwyn.chat.completions.create(**request)
@@ -404,7 +404,7 @@ class TestUntranslatableAbortsChain:
         }
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(UntranslatableRequestError) as exc_info,
         ):
             solwyn.chat.completions.create(**dangling)
@@ -434,7 +434,7 @@ class TestUntranslatableAbortsChain:
         }
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(UntranslatableRequestError) as exc_info,
         ):
             solwyn.chat.completions.create(**request)
@@ -471,7 +471,7 @@ class TestEmptyModelAbortsCrossProviderHop:
         before_state = anthropic_cb.get_state()
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(UntranslatableModelError) as exc_info,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -507,7 +507,7 @@ class TestResponseNormalization:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # The caller wrote OpenAI-dialect code; the normalized object exposes the
@@ -531,7 +531,7 @@ class TestResponseNormalization:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # Anthropic max_tokens -> canonical "length" -> OpenAI "length".
@@ -576,7 +576,7 @@ class TestCrossProviderStreamingFailsLoud:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(**request)
             chunks = list(stream)
 
@@ -622,7 +622,7 @@ class TestCrossProviderStreamingFailsLoud:
         }
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(UntranslatableRequestError) as exc_info,
         ):
             solwyn.chat.completions.create(**request)
@@ -652,7 +652,7 @@ class TestCrossProviderStreamingFailsLoud:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**request)
 
         # The swap served (second call used the fallback model) and returned a
@@ -673,7 +673,7 @@ class TestZeroTranslationOnNativePath:
         solwyn = _make_solwyn(client, model="gpt-5.5")
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             patch.object(_translation, "to_canonical", wraps=_translation.to_canonical) as to_canon,
             patch.object(
                 _translation, "normalize_response", wraps=_translation.normalize_response
@@ -699,7 +699,7 @@ class TestZeroTranslationOnNativePath:
         solwyn = _make_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             patch.object(_translation, "to_canonical", wraps=_translation.to_canonical) as to_canon,
             patch.object(
                 _translation, "normalize_response", wraps=_translation.normalize_response

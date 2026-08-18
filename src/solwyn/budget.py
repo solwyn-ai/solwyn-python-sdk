@@ -229,7 +229,7 @@ class _BudgetEnforcerBase:
         # A child inherits no lease authority: the parent's leases live in the
         # parent's process, and its in-flight renewal flags are lies here. The
         # child must also become a DIFFERENT holder — the client's
-        # ``_sdk_instance_id`` survives a fork unchanged, and the server
+        # ``_solwyn_sdk_instance_id`` survives a fork unchanged, and the server
         # releases a same-(project, run, holder) active lease as stale when a
         # grant lands. A child re-granting under the parent's id would kill the
         # parent's live lease, the parent's regrant would kill the child's, and

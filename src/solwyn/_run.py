@@ -1,4 +1,4 @@
-"""Agent-run scope: ``with solwyn.run("name"):``.
+"""Agent-run scopes for context managers and begin/end-shaped adapters.
 
 Binds an active run id/name plus optional explicit customer tags to a
 ``ContextVar`` for the duration of a scope. Cost events emitted inside the
@@ -15,6 +15,14 @@ Do not open a run scope inside an async generator; async generator yields
 share the consumer's context and would leak the generator's run into the
 consumer body.
 
+``start_run(...)`` exposes the same scope machinery to framework adapters
+whose boundaries arrive as separate callbacks. Its ``RunHandle.finish()``
+must run in the same context that called ``start_run(...)``.
+
+``create_run(...)`` instead snapshots a detached logical identity without
+changing the current context. Its handle can bind that identity repeatedly in
+different tasks or threads through short-lived ``activate()`` scopes.
+
 This module never touches prompt or response content.
 """
 
@@ -30,6 +38,7 @@ from concurrent.futures import Executor, Future
 from contextlib import AbstractAsyncContextManager, AbstractContextManager, suppress
 from contextvars import ContextVar, Token, copy_context
 from dataclasses import dataclass
+from threading import Lock
 from types import FrameType, TracebackType
 from typing import NamedTuple, ParamSpec, TypeVar
 
@@ -57,6 +66,21 @@ class RunContext(NamedTuple):
     id: str | None
     name: str | None
     tags: dict[str, str] | None
+
+
+@dataclass(frozen=True)
+class _RunIdentity:
+    """Immutable logical identity reused by detached run activations."""
+
+    run_id: str
+    name: str
+    tags: tuple[tuple[str, str], ...] | None
+    parent_run_id: str | None
+
+    def active_value(self) -> tuple[str, str, dict[str, str] | None]:
+        """Return a fresh ContextVar payload for one activation."""
+        tags = dict(self.tags) if self.tags is not None else None
+        return (self.run_id, self.name, tags)
 
 
 # Single contextvar holding either None or one run payload. Storing all values
@@ -189,6 +213,52 @@ def _name_has_disallowed_char(name: str) -> bool:
     return any(unicodedata.category(char) in _DISALLOWED_NAME_CATEGORIES for char in name)
 
 
+def _validate_run_definition(
+    name: object,
+    tags: object | None,
+    *,
+    api_name: str,
+) -> tuple[str, dict[str, str] | None]:
+    """Validate one run name/tag definition without reading active context."""
+    if not isinstance(name, str):
+        raise TypeError(f"{api_name}(name) requires str, got {type(name).__name__}")
+    if not name.strip():
+        raise ValueError(f"{api_name}(name) requires a non-empty name")
+    if _name_has_disallowed_char(name):
+        raise ValueError(
+            f"{api_name}(name) must not contain control characters, "
+            "format, or line-separator characters"
+        )
+    if len(name) > AGENT_RUN_NAME_MAX_LENGTH:
+        raise ValueError(
+            f"{api_name}(name) exceeds max length {AGENT_RUN_NAME_MAX_LENGTH} (got {len(name)})"
+        )
+    copied_tags = _copy_tags(tags, parameter=f"{api_name}(tags)")
+    return name, copied_tags
+
+
+def _snapshot_run_identity(
+    name: str,
+    tags: Mapping[str, str] | None,
+    *,
+    inherit_tags: bool,
+) -> _RunIdentity:
+    """Create one logical identity from the current parent and tag context."""
+    prior_active = _active_run.get()
+    frames = _run_frames.get()
+    parent_run_id = frames[-1].run_id if frames else None
+    scope_tags = dict(tags or {})
+    if inherit_tags and prior_active is not None and prior_active[2] is not None:
+        for key, value in prior_active[2].items():
+            scope_tags.setdefault(key, value)
+    return _RunIdentity(
+        run_id=_new_run_id(),
+        name=name,
+        tags=tuple(scope_tags.items()) or None,
+        parent_run_id=parent_run_id,
+    )
+
+
 def _called_from_async_generator() -> bool:
     """Return True when ``run()`` is being entered inside an async generator."""
     frame: FrameType | None = sys._getframe(2)
@@ -217,21 +287,11 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         *,
         inherit_tags: bool = True,
     ) -> None:
-        if not isinstance(name, str):
-            raise TypeError(f"solwyn.run(name) requires str, got {type(name).__name__}")
-        if not name.strip():
-            raise ValueError("solwyn.run(name) requires a non-empty name")
-        if _name_has_disallowed_char(name):
-            raise ValueError(
-                "solwyn.run(name) must not contain control characters, "
-                "format, or line-separator characters"
-            )
-        if len(name) > AGENT_RUN_NAME_MAX_LENGTH:
-            raise ValueError(
-                f"solwyn.run(name) exceeds max length {AGENT_RUN_NAME_MAX_LENGTH} (got {len(name)})"
-            )
-        self._name = name
-        self._tags = _copy_tags(tags, parameter="solwyn.run(tags)")
+        self._name, self._tags = _validate_run_definition(
+            name,
+            tags,
+            api_name="solwyn.run",
+        )
         self._inherit_tags = inherit_tags
         self._scope_id = id(self)
 
@@ -241,36 +301,50 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
                 "solwyn.run(...) inside async generators is not supported; "
                 "open the scope in the consumer or await the generator inside an outer scope"
             )
-        run_id = _new_run_id()
         prior_active = _active_run.get()
         frames = _run_frames.get()
-        parent_run_id = frames[-1].run_id if frames else None
-        scope_tags = dict(self._tags or {})
-        if self._inherit_tags and prior_active is not None and prior_active[2] is not None:
-            for key, value in prior_active[2].items():
-                scope_tags.setdefault(key, value)
-        token = _active_run.set((run_id, self._name, scope_tags or None))
+        identity = _snapshot_run_identity(
+            self._name,
+            self._tags,
+            inherit_tags=self._inherit_tags,
+        )
+        token = _active_run.set(identity.active_value())
         _run_frames.set(
             (
                 *frames,
                 _RunFrame(
                     scope_id=self._scope_id,
-                    run_id=run_id,
-                    parent_run_id=parent_run_id,
+                    run_id=identity.run_id,
+                    parent_run_id=identity.parent_run_id,
                     token=token,
                     prior_active=prior_active,
                 ),
             )
         )
-        return run_id
+        return identity.run_id
 
-    def _exit(self) -> None:
+    def _exit(self, *, require_same_context: bool = False) -> None:
         frames = _run_frames.get()
         if not frames:
+            if require_same_context:
+                raise RuntimeError(
+                    "RunHandle.finish() must be called in the same context where "
+                    "start_run() created it"
+                )
             return
         frame = frames[-1]
         if frame.scope_id != self._scope_id:
             raise RuntimeError("solwyn.run scopes must exit in LIFO order")
+        if require_same_context:
+            try:
+                _active_run.reset(frame.token)
+            except ValueError as exc:
+                raise RuntimeError(
+                    "RunHandle.finish() must be called in the same context where "
+                    "start_run() created it"
+                ) from exc
+            _run_frames.set(frames[:-1])
+            return
         try:
             _active_run.reset(frame.token)
         except ValueError:
@@ -304,6 +378,195 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         tb: TracebackType | None,
     ) -> None:
         self._exit()
+
+
+class RunHandle:
+    """Lifecycle handle for framework adapter run identities.
+
+    A handle from :func:`start_run` owns one ContextVar-backed scope and must
+    finish in its creating context. A handle from :func:`create_run` owns a
+    detached identity that can be bound through reusable :meth:`activate`
+    scopes in different contexts before it is finished.
+    """
+
+    def __init__(
+        self,
+        scope: _RunScope | None,
+        run_id: str,
+        *,
+        identity: _RunIdentity | None = None,
+    ) -> None:
+        if (scope is None) == (identity is None):
+            raise RuntimeError("run handle requires exactly one scope or detached identity")
+        self._scope = scope
+        self._run_id = run_id
+        self._identity = identity
+        self._finished = False
+        self._active_activations = 0
+        self._state_lock = Lock()
+
+    @property
+    def run_id(self) -> str:
+        """Return the stable id for this run scope."""
+        return self._run_id
+
+    def finish(self) -> None:
+        """Finish this logical run, restoring a started scope when applicable."""
+        with self._state_lock:
+            if self._finished:
+                raise RuntimeError(f"run handle {self._run_id!r} already finished")
+            if self._active_activations:
+                raise RuntimeError(
+                    f"run handle {self._run_id!r} cannot finish while activations are still active"
+                )
+            if self._scope is not None:
+                self._scope._exit(require_same_context=True)
+            self._finished = True
+
+    def activate(self) -> _RunActivation:
+        """Bind a detached logical identity in the caller's context."""
+        if self._identity is None:
+            raise RuntimeError("RunHandle.activate() requires a handle created by create_run()")
+        return _RunActivation(self)
+
+    def _reserve_activation(self) -> _RunIdentity:
+        with self._state_lock:
+            if self._finished:
+                raise RuntimeError(f"run handle {self._run_id!r} already finished")
+            if self._identity is None:
+                raise RuntimeError("RunHandle.activate() requires a handle created by create_run()")
+            self._active_activations += 1
+            return self._identity
+
+    def _release_activation(self) -> None:
+        with self._state_lock:
+            if self._active_activations <= 0:
+                raise RuntimeError("run handle activation count is inconsistent")
+            self._active_activations -= 1
+
+
+class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[str]):
+    """One strict ContextVar binding of a detached logical run identity."""
+
+    def __init__(self, handle: RunHandle) -> None:
+        self._handle = handle
+        self._scope_id = id(self)
+        self._entered = False
+
+    def _enter(self) -> str:
+        frames = _run_frames.get()
+        if any(frame.run_id == self._handle.run_id for frame in frames):
+            raise RuntimeError(
+                f"run handle {self._handle.run_id!r} is already active in this context"
+            )
+        identity = self._handle._reserve_activation()
+        prior_active = _active_run.get()
+        token: Token[tuple[str, str, dict[str, str] | None] | None] | None = None
+        try:
+            token = _active_run.set(identity.active_value())
+            _run_frames.set(
+                (
+                    *frames,
+                    _RunFrame(
+                        scope_id=self._scope_id,
+                        run_id=identity.run_id,
+                        parent_run_id=identity.parent_run_id,
+                        token=token,
+                        prior_active=prior_active,
+                    ),
+                )
+            )
+        except BaseException:
+            if token is not None:
+                _active_run.reset(token)
+            self._handle._release_activation()
+            raise
+        self._entered = True
+        return identity.run_id
+
+    def _exit(self) -> None:
+        frames = _run_frames.get()
+        matching_index = next(
+            (index for index, frame in enumerate(frames) if frame.scope_id == self._scope_id),
+            None,
+        )
+        if matching_index is None:
+            raise RuntimeError(
+                "RunHandle activation must exit in the same context where it was entered"
+            )
+        if matching_index != len(frames) - 1:
+            raise RuntimeError("solwyn.run scopes must exit in LIFO order")
+        frame = frames[-1]
+        try:
+            _active_run.reset(frame.token)
+        except ValueError as exc:
+            raise RuntimeError(
+                "RunHandle activation must exit in the same context where it was entered"
+            ) from exc
+        _run_frames.set(frames[:-1])
+        self._handle._release_activation()
+        self._entered = False
+
+    def __enter__(self) -> str:
+        if self._entered:
+            raise RuntimeError("RunHandle activation is already entered")
+        return self._enter()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._exit()
+
+    async def __aenter__(self) -> str:
+        return self.__enter__()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._exit()
+
+
+def start_run(
+    name: str,
+    tags: Mapping[str, str] | None = None,
+    *,
+    inherit_tags: bool = True,
+) -> RunHandle:
+    """Open a run scope for begin/end-shaped framework callbacks."""
+    scope = _RunScope(name, tags, inherit_tags=inherit_tags)
+    return RunHandle(scope, scope._enter())
+
+
+def create_run(
+    name: str,
+    tags: Mapping[str, str] | None = None,
+    *,
+    inherit_tags: bool = True,
+) -> RunHandle:
+    """Create a detached logical run without changing the current context.
+
+    The returned handle snapshots its id, name, inherited tags, and parent at
+    creation. Use ``with handle.activate():`` around work in any task or thread;
+    each activation binds that same logical identity with a fresh ContextVar
+    token. Call :meth:`RunHandle.finish` after every activation has exited.
+    """
+    validated_name, copied_tags = _validate_run_definition(
+        name,
+        tags,
+        api_name="solwyn.create_run",
+    )
+    identity = _snapshot_run_identity(
+        validated_name,
+        copied_tags,
+        inherit_tags=inherit_tags,
+    )
+    return RunHandle(None, identity.run_id, identity=identity)
 
 
 def run_in_executor(

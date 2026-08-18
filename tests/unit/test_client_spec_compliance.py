@@ -40,8 +40,8 @@ def _make_solwyn(client, **overrides):
     defaults.update(overrides)
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **defaults)
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
     return solwyn
 
 
@@ -77,7 +77,7 @@ class TestBudgetExceededErrorFieldCorrectness:
 
         # Act
         with (
-            patch.object(solwyn._budget._http, "post", return_value=mock_budget_response),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response),
             pytest.raises(BudgetExceededError) as exc_info,
         ):
             solwyn.chat.completions.create(
@@ -95,8 +95,8 @@ class TestBudgetExceededErrorFieldCorrectness:
         )
         assert exc.mode == "hard_deny"
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_error_budget_limit_is_not_remaining(self) -> None:
         """Regression: budget_limit must never equal remaining_budget."""
@@ -120,7 +120,7 @@ class TestBudgetExceededErrorFieldCorrectness:
 
         # Act
         with (
-            patch.object(solwyn._budget._http, "post", return_value=mock_budget_response),
+            patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response),
             pytest.raises(BudgetExceededError) as exc_info,
         ):
             solwyn.chat.completions.create(
@@ -133,5 +133,5 @@ class TestBudgetExceededErrorFieldCorrectness:
         assert exc.budget_limit == 1000.0
         assert exc.budget_limit != 50.0  # Must NOT be remaining_budget
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()

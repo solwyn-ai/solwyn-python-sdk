@@ -115,15 +115,15 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
     defaults.update(overrides)
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
-    solwyn._reporter.report = MagicMock()
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter.report = MagicMock()
     return solwyn
 
 
 def _close(solwyn: Solwyn) -> None:
-    solwyn._reporter._http.close()
-    solwyn._budget._http.close()
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_budget._http.close()
 
 
 _PLAIN_REQUEST = {
@@ -194,7 +194,7 @@ class TestWrappedConnectTimeoutAdvances:
         )
 
         # Act
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # Assert: the chain ADVANCED — a pre-send failure cannot double-spend.
@@ -219,7 +219,7 @@ class TestWrappedConnectTimeoutAdvances:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         anthropic.messages.create.assert_called_once()
@@ -244,7 +244,7 @@ class TestWrappedConnectTimeoutAdvances:
         )
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(APITimeoutError) as exc_info,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -271,18 +271,18 @@ class TestWrappedConnectTimeoutAdvances:
             model="gpt-5.5",
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
-        solwyn._reporter.report = MagicMock(spec=solwyn._reporter.report)
+        solwyn._solwyn_reporter.report = MagicMock(spec=solwyn._solwyn_reporter.report)
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             result = await solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         anthropic.messages.create.assert_awaited_once()
         assert result.choices[0].message.content == "ok from claude"
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
 
 # ── safe (default) ───────────────────────────────────────────────────────
@@ -304,7 +304,7 @@ class TestSafeDefault:
         )
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(APITimeoutError) as exc_info,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -329,7 +329,7 @@ class TestSafeDefault:
         )
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(httpx.ReadTimeout) as exc_info,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -352,7 +352,7 @@ class TestSafeDefault:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # A 429 is a provable pre-send rejection -> safe to cross providers.
@@ -383,7 +383,7 @@ class TestAlwaysMode:
             failover_idempotency="always",
         )
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # always = caller asserts idempotency -> ambiguous failures DO cross.
@@ -412,9 +412,9 @@ class TestAlwaysMode:
             failover_idempotency="always",
         )
         events: list = []
-        solwyn._reporter.report = lambda e: events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: events.append(e)
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # The PSA failure DID fail over: the fallback served.
@@ -444,9 +444,9 @@ class TestAlwaysMode:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list = []
-        solwyn._reporter.report = lambda e: events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: events.append(e)
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(solwyn_idempotent=True, **_PLAIN_REQUEST)
 
         anthropic.messages.create.assert_called_once()
@@ -477,7 +477,7 @@ class TestNeverMode:
         )
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(_Status, match="rate limited"),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -503,7 +503,7 @@ class TestSameProviderOpenAITokenKeyRewrite:
             failover_idempotency="never",
         )
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         assert result is success
@@ -528,7 +528,7 @@ class TestSameProviderOpenAITokenKeyRewrite:
             failover_idempotency="never",
         )
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         assert result is success
@@ -557,7 +557,7 @@ class TestPerCallOverride:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(
                 solwyn_idempotent=True,
                 **_PLAIN_REQUEST,
@@ -591,7 +591,7 @@ class TestSameProviderDoubleCountGuard:
         assert cb.failure_threshold == 3  # default
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(_Status),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -613,7 +613,7 @@ class TestSameProviderDoubleCountGuard:
         solwyn = _make_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
         cb = solwyn._get_circuit_breaker("openai")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             # Calls 1 and 2: breaker still CLOSED afterwards.
             for _ in range(2):
                 with pytest.raises(_Status):

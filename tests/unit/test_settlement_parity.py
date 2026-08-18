@@ -112,19 +112,19 @@ def _openai_stream_chunks() -> list[SimpleNamespace]:
 
 def _make_solwyn(client: object, recorder: _ControlPlaneRecorder) -> Solwyn:
     solwyn = Solwyn(client, api_key=VALID_API_KEY, model="gpt-5.5")
-    solwyn._budget._http.close()
-    solwyn._budget._http = recorder.client()
-    solwyn._reporter._http.close()
-    solwyn._reporter._http = recorder.client()
+    solwyn._solwyn_budget._http.close()
+    solwyn._solwyn_budget._http = recorder.client()
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_reporter._http = recorder.client()
     return solwyn
 
 
 async def _make_async_solwyn(client: object, recorder: _ControlPlaneRecorder) -> AsyncSolwyn:
     solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, model="gpt-5.5")
-    await solwyn._budget._http.aclose()
-    solwyn._budget._http = recorder.aclient()
-    await solwyn._reporter._http.aclose()
-    solwyn._reporter._http = recorder.aclient()
+    await solwyn._solwyn_budget._http.aclose()
+    solwyn._solwyn_budget._http = recorder.aclient()
+    await solwyn._solwyn_reporter._http.aclose()
+    solwyn._solwyn_reporter._http = recorder.aclient()
     return solwyn
 
 

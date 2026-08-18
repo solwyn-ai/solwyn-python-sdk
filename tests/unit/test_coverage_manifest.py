@@ -105,14 +105,14 @@ def _wrapper(
                 entry=SimpleNamespace(model=fallback_model),
             )
         )
-    wrapper._runtimes = runtimes
-    wrapper._surface_context = SurfaceContext(
+    wrapper._solwyn_runtimes = runtimes
+    wrapper._solwyn_surface_context = SurfaceContext(
         provider=provider,
         dialect=dialect,
         client_shape=client_shape,
         mode=mode,
     )
-    wrapper._config = SimpleNamespace(
+    wrapper._solwyn_config = SimpleNamespace(
         on_unmetered=posture,
         acknowledge_untracked=acknowledgments,
     )

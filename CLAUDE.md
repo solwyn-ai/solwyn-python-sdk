@@ -51,6 +51,7 @@ _SolwynBase          # Shared sans-I/O logic (config, token estimation, metadata
 - `check_budget(provider=...)` is required and keyword-only
 - ALL settlement (streaming AND non-streaming, chat AND media) rides `reporter.report_settlement(confirm, event)` off the caller's thread — the enforcers have no `confirm_cost`. The reporter tracks consecutive confirm-send failures; after 10, logs at ERROR level
 - A shared control-plane `CircuitBreaker` (name `"control-plane"`, one per client) guards both the `/budgets/check` POST (enforcer) and the `/budgets/confirm` POST (reporter): a streak of failures against Solwyn's own API short-circuits the network call so the SDK discovers an outage once, not once per call. It is never a provider breaker (excluded from breaker reports). The budget pre-flight timeout defaults to `budget_check_timeout=1.0`
+- Shipped framework integration modules are attribution-only, content-free, and privacy-firewall-enforced; budget enforcement comes only from explicitly admitted recipes whose provider call crosses a Solwyn-wrapped client (OpenAI Agents is docs/tests only, not a shipped module)
 
 ## Privacy
 

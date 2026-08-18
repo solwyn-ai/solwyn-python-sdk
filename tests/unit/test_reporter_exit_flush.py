@@ -354,15 +354,15 @@ def test_no_loop_advisory_access_is_silent_and_still_exit_flushes(
             operation = client.post
 
         assert callable(operation)
-        assert client._reporter._warned_no_loop is False
+        assert client._solwyn_reporter._warned_no_loop is False
         assert not any(
             record.name in {"solwyn._base", "solwyn.reporter"} for record in caplog.records
         )
-        state = client._reporter._untracked_state
+        state = client._solwyn_reporter._untracked_state
         assert state is not None
         assert ("openai", "openai_sdk", "async", "post") in state.observations
 
-        blocking_exit_flush(client._reporter)
+        blocking_exit_flush(client._solwyn_reporter)
 
         assert f"{_URL}/api/v1/untracked-surfaces" in sink
     finally:

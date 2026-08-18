@@ -112,14 +112,14 @@ def _deny() -> SimpleNamespace:
 def _build_sync(client: MagicMock, **overrides) -> Solwyn:
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, api_key=VALID_API_KEY, **overrides)
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
     return solwyn
 
 
 def _close_sync(solwyn: Solwyn) -> None:
-    solwyn._reporter._http.close()
-    solwyn._budget._http.close()
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_budget._http.close()
 
 
 @pytest.mark.unit
@@ -128,8 +128,8 @@ class TestAudioSpeechProxy:
         client = _mock_speech_client(b"raw-audio-bytes")
         solwyn = _build_sync(client)
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow()) as check,
-            patch.object(solwyn._reporter, "report_settlement") as settle,
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow()) as check,
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
         ):
             result = solwyn.audio.speech.create(model="tts-1", voice="alloy", input="hello world")
 
@@ -164,9 +164,9 @@ class TestAudioSpeechProxy:
         client = _mock_speech_client(b"raw-audio-bytes")
         solwyn = _build_sync(client)
         with (
-            patch.object(solwyn._budget, "check_budget") as check,
-            patch.object(solwyn._reporter, "report_settlement") as settle,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._solwyn_budget, "check_budget") as check,
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
+            patch.object(solwyn._solwyn_reporter, "report") as report,
             caplog.at_level(logging.WARNING, logger=_POSTURE_LOGGER),
         ):
             first = solwyn.audio.speech.create(model="gpt-4o-mini-tts", input="hi", voice="alloy")
@@ -201,8 +201,8 @@ class TestAudioSpeechProxy:
         client = _mock_speech_client(b"audio")
         solwyn = _build_sync(client)
         with (
-            patch.object(solwyn._budget, "check_budget") as check,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._solwyn_budget, "check_budget") as check,
+            patch.object(solwyn._solwyn_reporter, "report") as report,
             caplog.at_level(logging.WARNING, logger=_POSTURE_LOGGER),
         ):
             solwyn.audio.speech.create(model="gpt-4o-mini-tts-2026-01-01", input="hi")
@@ -256,8 +256,8 @@ class TestAudioSpeechProxy:
         client = _mock_speech_client(b"audio")
         solwyn = _build_sync(client, budget_mode=BudgetMode.HARD_DENY)
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_deny()),
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_deny()),
+            patch.object(solwyn._solwyn_reporter, "report") as report,
             pytest.raises(BudgetExceededError),
         ):
             solwyn.audio.speech.create(model="tts-1", input="blocked")
@@ -290,8 +290,10 @@ class TestAsyncAudioSpeechProxy:
         client = _mock_async_speech_client(b"raw-audio")
         solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY)
         with (
-            patch.object(solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow())),
-            patch.object(solwyn._reporter, "report_settlement") as settle,
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow())
+            ),
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
         ):
             await solwyn.audio.speech.create(model="tts-1-hd", input="hello world", voice="nova")
 
@@ -303,8 +305,8 @@ class TestAsyncAudioSpeechProxy:
         assert event.modality == "audio"
         assert event.media_usage.input_characters == len("hello world")
         assert event.token_details is None
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_untracked_model_warns_and_passes_through(
@@ -313,8 +315,8 @@ class TestAsyncAudioSpeechProxy:
         client = _mock_async_speech_client(b"raw-audio")
         solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY)
         with (
-            patch.object(solwyn._budget, "check_budget", new=AsyncMock()) as check,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._solwyn_budget, "check_budget", new=AsyncMock()) as check,
+            patch.object(solwyn._solwyn_reporter, "report") as report,
             caplog.at_level(logging.WARNING, logger=_POSTURE_LOGGER),
         ):
             result = await solwyn.audio.speech.create(model="gpt-4o-mini-tts", input="hi")
@@ -326,8 +328,8 @@ class TestAsyncAudioSpeechProxy:
         records = foreground_records(caplog)
         assert len(records) == 1
         assert "untracked" in records[0].getMessage().lower()
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_strict_untracked_model_refuses_before_dispatch(self) -> None:

@@ -114,9 +114,9 @@ _CONTEXT_MISMATCH_HINTS = {
 class FailoverTuning(NamedTuple):
     """One COHERENT per-call snapshot of the server-governed failover tuning.
 
-    The directive writer mutates self._config's tuning fields under
-    _breaker_lock (_apply_failover_tuning_directive); an unlocked mid-call
-    re-read of self._config can observe a torn mix of old and new tuning
+    The directive writer mutates self._solwyn_config's tuning fields under
+    _solwyn_breaker_lock (_apply_failover_tuning_directive); an unlocked mid-call
+    re-read of self._solwyn_config can observe a torn mix of old and new tuning
     (PJ-8/R12). The dispatch path therefore consumes tuning ONLY through this
     immutable snapshot, captured once per call under that same lock.
     """
@@ -890,47 +890,47 @@ class _SolwynBase:
                 pinned_client=runtime.sdk_client if runtime.provider_pinned else None,
             )
 
-        self._config = config
-        self._runtimes = runtimes
+        self._solwyn_config = config
+        self._solwyn_runtimes = runtimes
         primary = runtimes[0]
-        self._surface_context = runtime_contexts[0]
-        self._guard_lock = threading.Lock()
-        self._guarded_resources: dict[str, _GuardedResource] = {}
-        self._untracked_observation_notifier: _UntrackedObservationNotifier | None = None
+        self._solwyn_surface_context = runtime_contexts[0]
+        self._solwyn_guard_lock = threading.Lock()
+        self._solwyn_guarded_resources: dict[str, _GuardedResource] = {}
+        self._solwyn_untracked_observation_notifier: _UntrackedObservationNotifier | None = None
         self._validate_acknowledgments(primary.sdk_client)
-        self._requested_failover_tuning = {
+        self._solwyn_requested_failover_tuning = {
             name: getattr(config, name) for name in _FAILOVER_TUNING_FIELDS
         }
-        self._failover_tuning_suppression_logged = False
-        self._sdk_instance_id = str(uuid.uuid4())
+        self._solwyn_failover_tuning_suppression_logged = False
+        self._solwyn_sdk_instance_id = str(uuid.uuid4())
         # Injectable routing policy: defaults to the health-only policy.
         # Swapping in LatencyPolicy/CostPolicy reorders candidates with ZERO
         # changes to dispatch / translation / budget.
-        self._policy: SelectionPolicy = selection_policy or HealthBasedPolicy()
+        self._solwyn_policy: SelectionPolicy = selection_policy or HealthBasedPolicy()
 
         # Per-provider rolling window of recent SUCCESS latencies (ms) for the
         # LatencyPolicy signal. Lock-guarded because the sync client is
         # multi-threaded (the async client is event-loop-serialized; the lock is
         # then uncontended). Pure signal store — no I/O.
-        self._signal_lock = threading.Lock()
-        self._latency_windows: defaultdict[str, deque[float]] = defaultdict(
+        self._solwyn_signal_lock = threading.Lock()
+        self._solwyn_latency_windows: defaultdict[str, deque[float]] = defaultdict(
             lambda: deque(maxlen=_LATENCY_WINDOW)
         )
 
         # Last server-provided RELATIVE price hints per provider (CostPolicy
         # signal). The client refreshes this after each budget check. The SDK
         # never computes price — this only forwards the server signal.
-        self._last_price_hints: dict[str, float] = {}
+        self._solwyn_last_price_hints: dict[str, float] = {}
 
         # One circuit breaker per DISTINCT provider across ALL runtimes.
         # Additional providers get lazily-created breakers via
         # _get_circuit_breaker (same jitter).
-        self._circuit_breakers: dict[str, CircuitBreaker] = {}
-        self._breaker_lock = threading.Lock()
+        self._solwyn_circuit_breakers: dict[str, CircuitBreaker] = {}
+        self._solwyn_breaker_lock = threading.Lock()
         for runtime in runtimes:
             provider = runtime.entry.provider.value
-            if provider not in self._circuit_breakers:
-                self._circuit_breakers[provider] = self._new_circuit_breaker()
+            if provider not in self._solwyn_circuit_breakers:
+                self._solwyn_circuit_breakers[provider] = self._new_circuit_breaker()
 
         # PJ-8/R8: Solwyn's per-hop bound is unenforceable on boto3 (no
         # per-call timeout override; the deadline is only checked between
@@ -945,20 +945,20 @@ class _SolwynBase:
         # ONE control-plane breaker per client instance, shared by the budget
         # enforcer (check) and the reporter (confirm): the SDK discovers a
         # Solwyn outage once, not once per call. Never provider-reported.
-        self._control_plane_breaker = CircuitBreaker(
+        self._solwyn_control_plane_breaker = CircuitBreaker(
             failure_threshold=config.control_plane_failure_threshold,
             recovery_timeout=config.control_plane_recovery_timeout,
             success_threshold=1,
             name="control-plane",
         )
 
-        # Fork repair: a user thread can hold _breaker_lock (lazy provider-
-        # breaker creation) or _signal_lock (latency window append) at fork
+        # Fork repair: a user thread can hold _solwyn_breaker_lock (lazy provider-
+        # breaker creation) or _solwyn_signal_lock (latency window append) at fork
         # time; the child would inherit them held by a thread it doesn't have.
         register_fork_reset(self)
 
     def _validate_acknowledgments(self, raw_client: object) -> None:
-        for token in sorted(self._config.acknowledge_untracked):
+        for token in sorted(self._solwyn_config.acknowledge_untracked):
             applicable = self._applicable_rules_for_token(token)
             eligible = [rule for rule in applicable if rule.kind is SurfaceKind.UNMETERED_SPEND]
             if applicable and not eligible:
@@ -992,7 +992,7 @@ class _SolwynBase:
             )
             if any(
                 resolve_surface_rule(
-                    context=self._surface_context,
+                    context=self._solwyn_surface_context,
                     path=rule.surface,
                     source=source,
                     condition=rule.condition,
@@ -1023,7 +1023,7 @@ class _SolwynBase:
                 self._invalid_acknowledgment(token, f"path {path!r} is not statically visible")
             descriptor_category, static_return_shape = static
             rule = resolve_surface_rule(
-                context=self._surface_context,
+                context=self._solwyn_surface_context,
                 path=path,
                 source=SurfaceSource.RAW,
             )
@@ -1156,27 +1156,27 @@ class _SolwynBase:
 
     def _is_guardable_provider_resource(self, value: object) -> bool:
         return _return_shape(value) in _GUARDABLE_RETURN_SHAPES and _belongs_to_client_shape(
-            value, self._surface_context.client_shape
+            value, self._solwyn_surface_context.client_shape
         )
 
     def _guard_resource(self, value: object, path: str) -> _GuardedResource:
-        with self._guard_lock:
-            cached = self._guarded_resources.get(path)
+        with self._solwyn_guard_lock:
+            cached = self._solwyn_guarded_resources.get(path)
             if cached is not None:
                 return cached
             guarded = _GuardedResource(self, value, path)
-            self._guarded_resources[path] = guarded
+            self._solwyn_guarded_resources[path] = guarded
             return guarded
 
     def _has_acknowledged_descendant(self, path: str) -> bool:
         prefix = f"{path}."
-        return any(token.startswith(prefix) for token in self._config.acknowledge_untracked)
+        return any(token.startswith(prefix) for token in self._solwyn_config.acknowledge_untracked)
 
     def _is_exact_raw_response_escape(self, path: str, rule: SurfaceRule) -> bool:
         return (
             rule.capability_scope is CapabilityScope.RAW_RESPONSE
             and rule.token == path
-            and path in self._config.acknowledge_untracked
+            and path in self._solwyn_config.acknowledge_untracked
         )
 
     def _apply_untracked_posture(
@@ -1189,7 +1189,8 @@ class _SolwynBase:
     ) -> None:
         token = rule.token if rule is not None else path
         if honor_acknowledgment and (
-            token in self._config.acknowledge_untracked or self._has_acknowledged_descendant(path)
+            token in self._solwyn_config.acknowledge_untracked
+            or self._has_acknowledged_descendant(path)
         ):
             return
         scope = (
@@ -1198,32 +1199,32 @@ class _SolwynBase:
             else None
         )
         kind = rule.kind.value if rule is not None else SurfaceKind.UNKNOWN.value
-        posture = self._config.on_unmetered
+        posture = self._solwyn_config.on_unmetered
         if posture == "allow":
             _record_untracked_surface_observation(
-                context=self._surface_context,
+                context=self._solwyn_surface_context,
                 surface=path,
                 rule_kind=cast(Literal["unmetered_spend", "unknown"], kind),
                 capability_scope=scope,
                 posture="allow",
-                notifier=self._untracked_observation_notifier,
+                notifier=self._solwyn_untracked_observation_notifier,
             )
             return
         if posture == "warn":
             _warn_contextual_surface_once(
-                context=self._surface_context,
+                context=self._solwyn_surface_context,
                 surface=path,
                 rule_kind=cast(Literal["unmetered_spend", "unknown"], kind),
                 capability_scope=scope,
                 drifted_from_rule_id=(drifted_from.rule_id if drifted_from is not None else None),
-                notifier=self._untracked_observation_notifier,
+                notifier=self._solwyn_untracked_observation_notifier,
             )
             return
         raise UntrackedSpendSurfaceError(
             surface=path,
             token=token,
-            provider=self._surface_context.provider,
-            client_shape=self._surface_context.client_shape,
+            provider=self._solwyn_surface_context.provider,
+            client_shape=self._solwyn_surface_context.client_shape,
             kind=kind,
             capability_scope=scope,
             drifted_from_rule_id=(drifted_from.rule_id if drifted_from is not None else None),
@@ -1247,7 +1248,7 @@ class _SolwynBase:
         """Resolve policy before an explicit wrapper method dispatches."""
 
         rule = resolve_surface_rule(
-            context=self._surface_context,
+            context=self._solwyn_surface_context,
             path=path,
             source=source,
             condition=condition,
@@ -1265,7 +1266,7 @@ class _SolwynBase:
         if rule.kind is SurfaceKind.UNSUPPORTED:
             raise UnsupportedSurfaceError(
                 surface=path,
-                provider=self._surface_context.provider,
+                provider=self._solwyn_surface_context.provider,
             )
         raise RuntimeError(f"non-dispatch surface reached explicit resolver: {path}")
 
@@ -1281,13 +1282,13 @@ class _SolwynBase:
 
         if name.startswith("_"):
             return getattr(value, name)
-        with self._guard_lock:
-            cached = self._guarded_resources.get(path)
+        with self._solwyn_guard_lock:
+            cached = self._solwyn_guarded_resources.get(path)
         if cached is not None:
             return cached
 
         rule = resolve_surface_rule(
-            context=self._surface_context,
+            context=self._solwyn_surface_context,
             path=path,
             source=source,
         )
@@ -1304,7 +1305,7 @@ class _SolwynBase:
             if rule is not None and rule.kind is SurfaceKind.UNSUPPORTED:
                 raise UnsupportedSurfaceError(
                     surface=path,
-                    provider=self._surface_context.provider,
+                    provider=self._solwyn_surface_context.provider,
                 )
             if rule is not None and rule.kind is SurfaceKind.METERED:
                 raise RuntimeError(f"metered surface reached generic resolver: {path}")
@@ -1325,7 +1326,7 @@ class _SolwynBase:
         if rule.kind is SurfaceKind.UNSUPPORTED:
             raise UnsupportedSurfaceError(
                 surface=path,
-                provider=self._surface_context.provider,
+                provider=self._solwyn_surface_context.provider,
             )
         if rule.kind is SurfaceKind.METERED:
             raise RuntimeError(f"metered surface reached generic resolver: {path}")
@@ -1413,17 +1414,17 @@ class _SolwynBase:
         (the breakers repair their own internal locks via their own
         registration).
         """
-        self._signal_lock = threading.Lock()
-        self._breaker_lock = threading.Lock()
-        self._guard_lock = threading.Lock()
+        self._solwyn_signal_lock = threading.Lock()
+        self._solwyn_breaker_lock = threading.Lock()
+        self._solwyn_guard_lock = threading.Lock()
 
     def _new_circuit_breaker(self) -> CircuitBreaker:
         """Create a circuit breaker from the configured tuning + jitter."""
         return CircuitBreaker(
-            failure_threshold=self._config.circuit_breaker_failure_threshold,
-            recovery_timeout=self._config.circuit_breaker_recovery_timeout,
-            success_threshold=self._config.circuit_breaker_success_threshold,
-            recovery_timeout_jitter=self._config.circuit_breaker_recovery_timeout_jitter,
+            failure_threshold=self._solwyn_config.circuit_breaker_failure_threshold,
+            recovery_timeout=self._solwyn_config.circuit_breaker_recovery_timeout,
+            success_threshold=self._solwyn_config.circuit_breaker_success_threshold,
+            recovery_timeout_jitter=self._solwyn_config.circuit_breaker_recovery_timeout_jitter,
         )
 
     def _apply_failover_tuning_directive(self, allowed: bool | None) -> FailoverTuning:
@@ -1438,44 +1439,45 @@ class _SolwynBase:
         post-check routing.
         """
         if allowed is None:
-            with self._breaker_lock:
+            with self._solwyn_breaker_lock:
                 return self._tuning_snapshot_locked()
 
         if allowed:
-            effective = dict(self._requested_failover_tuning)
+            effective = dict(self._solwyn_requested_failover_tuning)
         else:
             effective = {
                 name: SolwynConfig.model_fields[name].default for name in _FAILOVER_TUNING_FIELDS
             }
 
         should_log_suppression = False
-        with self._breaker_lock:
+        with self._solwyn_breaker_lock:
             tuning_changed = any(
-                getattr(self._config, name) != effective[name] for name in _FAILOVER_TUNING_FIELDS
+                getattr(self._solwyn_config, name) != effective[name]
+                for name in _FAILOVER_TUNING_FIELDS
             )
             if tuning_changed:
                 for name, value in effective.items():
-                    setattr(self._config, name, value)
-                for breaker in self._circuit_breakers.values():
+                    setattr(self._solwyn_config, name, value)
+                for breaker in self._solwyn_circuit_breakers.values():
                     breaker.replace_tuning(
-                        failure_threshold=self._config.circuit_breaker_failure_threshold,
-                        recovery_timeout=self._config.circuit_breaker_recovery_timeout,
-                        success_threshold=self._config.circuit_breaker_success_threshold,
+                        failure_threshold=self._solwyn_config.circuit_breaker_failure_threshold,
+                        recovery_timeout=self._solwyn_config.circuit_breaker_recovery_timeout,
+                        success_threshold=self._solwyn_config.circuit_breaker_success_threshold,
                         recovery_timeout_jitter=(
-                            self._config.circuit_breaker_recovery_timeout_jitter
+                            self._solwyn_config.circuit_breaker_recovery_timeout_jitter
                         ),
                     )
 
             suppresses_requested_tuning = any(
-                effective[name] != self._requested_failover_tuning[name]
+                effective[name] != self._solwyn_requested_failover_tuning[name]
                 for name in _FAILOVER_TUNING_FIELDS
             )
             if (
                 not allowed
                 and suppresses_requested_tuning
-                and not self._failover_tuning_suppression_logged
+                and not self._solwyn_failover_tuning_suppression_logged
             ):
-                self._failover_tuning_suppression_logged = True
+                self._solwyn_failover_tuning_suppression_logged = True
                 should_log_suppression = True
             snapshot = self._tuning_snapshot_locked()
 
@@ -1486,12 +1488,12 @@ class _SolwynBase:
         return snapshot
 
     def _tuning_snapshot_locked(self) -> FailoverTuning:
-        """Read one coherent tuning snapshot. Caller must hold _breaker_lock."""
+        """Read one coherent tuning snapshot. Caller must hold _solwyn_breaker_lock."""
         return FailoverTuning(
-            failover_total_timeout=self._config.failover_total_timeout,
-            failover_idempotency=self._config.failover_idempotency,
-            same_provider_retries=self._config.same_provider_retries,
-            failover_hop_read_timeout=self._config.failover_hop_read_timeout,
+            failover_total_timeout=self._solwyn_config.failover_total_timeout,
+            failover_idempotency=self._solwyn_config.failover_idempotency,
+            same_provider_retries=self._solwyn_config.same_provider_retries,
+            failover_hop_read_timeout=self._solwyn_config.failover_hop_read_timeout,
         )
 
     def _get_circuit_breaker(self, provider: str) -> CircuitBreaker:
@@ -1499,10 +1501,10 @@ class _SolwynBase:
 
         Lazily creates a circuit breaker if one doesn't exist for this provider.
         """
-        with self._breaker_lock:
-            if provider not in self._circuit_breakers:
-                self._circuit_breakers[provider] = self._new_circuit_breaker()
-            return self._circuit_breakers[provider]
+        with self._solwyn_breaker_lock:
+            if provider not in self._solwyn_circuit_breakers:
+                self._solwyn_circuit_breakers[provider] = self._new_circuit_breaker()
+            return self._solwyn_circuit_breakers[provider]
 
     def _get_breaker_snapshots(self) -> list[tuple[ProviderName, CircuitBreakerState]]:
         """Return one frozen current-state snapshot per distinct provider.
@@ -1511,8 +1513,8 @@ class _SolwynBase:
         before each breaker acquires its own state lock. This keeps the two lock
         domains independent while allowing providers to be added concurrently.
         """
-        with self._breaker_lock:
-            breakers = list(self._circuit_breakers.items())
+        with self._solwyn_breaker_lock:
+            breakers = list(self._solwyn_circuit_breakers.items())
         return [(ProviderName(provider), breaker.get_state()) for provider, breaker in breakers]
 
     def record_latency(self, provider: str, ms: float) -> None:
@@ -1522,8 +1524,8 @@ class _SolwynBase:
         multi-threaded sync client (uncontended on the async client). Pure signal
         store — no I/O, no breaker mutation.
         """
-        with self._signal_lock:
-            self._latency_windows[provider].append(ms)
+        with self._solwyn_signal_lock:
+            self._solwyn_latency_windows[provider].append(ms)
 
     def observed_p50(self, provider: str) -> float | None:
         """Observed p50 (median) latency (ms) for a provider, or None.
@@ -1533,8 +1535,8 @@ class _SolwynBase:
         queue. Lock-guarded; snapshots the window under the lock and computes the
         median outside it.
         """
-        with self._signal_lock:
-            window = self._latency_windows.get(provider)
+        with self._solwyn_signal_lock:
+            window = self._solwyn_latency_windows.get(provider)
             samples = list(window) if window is not None else []
         if len(samples) < _LATENCY_MIN_SAMPLES:
             return None
@@ -1547,8 +1549,8 @@ class _SolwynBase:
         RELATIVE price signal. The SDK never computes price — it only stores and
         forwards this. An empty dict clears the hints (server provided none).
         """
-        with self._signal_lock:
-            self._last_price_hints = dict(hints)
+        with self._solwyn_signal_lock:
+            self._solwyn_last_price_hints = dict(hints)
 
     def _select_candidates(self, req: RoutingRequest) -> list[ProviderRuntime]:
         """Order runtimes into attempt order via the pure SelectionPolicy.
@@ -1563,18 +1565,18 @@ class _SolwynBase:
         # statistics.median per provider) and the hint snapshot unless the
         # configured policy declares it consumes them. Unknown injected
         # policies default to True and keep receiving full signals.
-        wants_latency = getattr(self._policy, "uses_latency_signal", True)
-        wants_price = getattr(self._policy, "uses_price_signal", True)
+        wants_latency = getattr(self._solwyn_policy, "uses_latency_signal", True)
+        wants_price = getattr(self._solwyn_policy, "uses_price_signal", True)
         if wants_price:
             # Snapshot the price hints once under the lock so every candidate in
             # this selection sees a consistent view (the setter may replace the
             # dict concurrently on another thread).
-            with self._signal_lock:
-                price_hints = dict(self._last_price_hints)
+            with self._solwyn_signal_lock:
+                price_hints = dict(self._solwyn_last_price_hints)
         else:
             price_hints = {}
         candidates: list[ProviderCandidate] = []
-        for runtime in self._runtimes:
+        for runtime in self._solwyn_runtimes:
             breaker = self._get_circuit_breaker(runtime.adapter.name)
             state = breaker.get_state()
             candidates.append(
@@ -1592,8 +1594,8 @@ class _SolwynBase:
                     price_hint=price_hints.get(runtime.adapter.name),
                 )
             )
-        ordered = self._policy.order(candidates, req)
-        if isinstance(self._policy, CostPolicy) and not any(
+        ordered = self._solwyn_policy.order(candidates, req)
+        if isinstance(self._solwyn_policy, CostPolicy) and not any(
             c.price_hint is not None for c in candidates
         ):
             # CostPolicy was selected but no candidate carries a server price
@@ -1604,7 +1606,7 @@ class _SolwynBase:
         # dispatch walk. Keep ONLY candidates whose runtime is one of our own
         # runtimes (identity check), preserving the policy's order for that valid
         # subset. Drops any foreign/unknown runtime the policy may have appended.
-        chain = set(map(id, self._runtimes))
+        chain = set(map(id, self._solwyn_runtimes))
         return [c.runtime for c in ordered if id(c.runtime) in chain]
 
     def _build_metadata_event(
@@ -1669,7 +1671,7 @@ class _SolwynBase:
             attempt_index=attempt_index,
             possibly_succeeded=possibly_succeeded,
             service_tier=service_tier,
-            sdk_instance_id=sdk_instance_id or self._sdk_instance_id,
+            sdk_instance_id=sdk_instance_id or self._solwyn_sdk_instance_id,
             timestamp=timestamp or datetime.now(UTC),
             agent_run_id=agent_run_id,
             parent_agent_run_id=parent_agent_run_id,

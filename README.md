@@ -52,6 +52,52 @@ with Solwyn(OpenAI(), api_key="sk_proj_...") as client:
     )
 ```
 
+### Drop-in type compatibility
+
+Solwyn wrappers pass framework admission checks that require the concrete
+provider SDK type:
+
+```python
+raw = OpenAI()
+client = Solwyn(raw, api_key="sk_proj_...")
+
+assert isinstance(client, OpenAI)
+assert isinstance(client, type(raw))
+```
+
+`type(client)` remains the truthful wrapper class (`Solwyn` or
+`AsyncSolwyn`), while `client.__class__` reports the wrapped provider class for
+`isinstance`-based framework compatibility. The same contract holds for
+`AsyncSolwyn(AsyncOpenAI(...))`. Every non-`_solwyn_*` attribute assignment and
+deletion forwards to the provider client, including names also defined by the
+wrapper; only `_solwyn_*` state remains local.
+
+These clients own live reporter, budget, and provider-transport state.
+`copy.copy(client)` and `copy.deepcopy(client)` therefore return the same
+shared wrapper, rather than cloning those resources. Pickling is rejected with
+guidance to construct a fresh `Solwyn(...)` or `AsyncSolwyn(...)` in the target
+process.
+
+## Framework integrations
+
+See the [framework support matrix](docs/integrations/README.md) for the exact
+enforcement boundary, admitted call surfaces, dependency posture, and current
+limitations.
+
+- [OpenAI Agents SDK](docs/integrations/openai-agents.md) — a docs-and-smoke
+  recipe injects an `AsyncSolwyn` default client for enforced Chat Completions
+  and stable workflow/agent attribution; no Agents integration module ships.
+- [LangChain and LangGraph](docs/integrations/langchain.md) — the shipped
+  content-free handler plus the exact recipe shim covers basic non-streaming
+  `invoke`/`ainvoke` Chat Completions and explicit graph hierarchy.
+- [CrewAI](docs/integrations/crewai.md) — the shipped content-free listener
+  adds crew/task hierarchy; native LiteLLM has no Solwyn enforcement, while the
+  narrow custom-`BaseLLM` recipe routes one sync plain-text call through a
+  wrapped client.
+
+Compatibility is limited to the paths named in the matrix and recipes; do not
+infer budget enforcement for other framework call surfaces.
+
 ## Providers
 
 ### OpenAI

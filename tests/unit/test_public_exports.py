@@ -71,3 +71,13 @@ def test_run_context_and_tag_bounds_are_publicly_exported() -> None:
     assert solwyn.TAGS_MAX_KEYS == 10
     assert solwyn.TAG_KEY_MAX_LENGTH == 64
     assert solwyn.TAG_VALUE_MAX_LENGTH == 256
+
+
+@pytest.mark.unit
+def test_run_handle_api_is_publicly_exported() -> None:
+    expected = {"RunHandle", "create_run", "start_run"}
+
+    assert expected <= set(solwyn.__all__)
+    assert solwyn.RunHandle is not None
+    assert callable(solwyn.create_run)
+    assert callable(solwyn.start_run)

@@ -303,19 +303,19 @@ def _openai_stream_chunks() -> list[SimpleNamespace]:
 
 def _make_solwyn(client: object, recorder: _ControlPlaneRecorder) -> Solwyn:
     solwyn = Solwyn(client, api_key=VALID_API_KEY, model="gpt-5.5")
-    solwyn._budget._http.close()
-    solwyn._budget._http = recorder.client()
-    solwyn._reporter._http.close()
-    solwyn._reporter._http = recorder.client()
+    solwyn._solwyn_budget._http.close()
+    solwyn._solwyn_budget._http = recorder.client()
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_reporter._http = recorder.client()
     return solwyn
 
 
 async def _make_async_solwyn(client: object, recorder: _ControlPlaneRecorder) -> AsyncSolwyn:
     solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, model="gpt-5.5")
-    await solwyn._budget._http.aclose()
-    solwyn._budget._http = recorder.aclient()
-    await solwyn._reporter._http.aclose()
-    solwyn._reporter._http = recorder.aclient()
+    await solwyn._solwyn_budget._http.aclose()
+    solwyn._solwyn_budget._http = recorder.aclient()
+    await solwyn._solwyn_reporter._http.aclose()
+    solwyn._solwyn_reporter._http = recorder.aclient()
     return solwyn
 
 
@@ -334,7 +334,7 @@ class TestPaidResponseSurvivesBookkeepingFailure:
         client.chat.completions.create.return_value = _openai_response()
         recorder = _ControlPlaneRecorder()
         solwyn = _make_solwyn(client, recorder)
-        adapter = solwyn._runtimes[0].adapter
+        adapter = solwyn._solwyn_runtimes[0].adapter
 
         with patch.object(type(adapter), "extract_usage", side_effect=RuntimeError("shape drift")):
             response = solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -353,7 +353,7 @@ class TestPaidResponseSurvivesBookkeepingFailure:
         client.chat.completions.create.return_value = _openai_response()
         recorder = _ControlPlaneRecorder()
         solwyn = _make_solwyn(client, recorder)
-        adapter = solwyn._runtimes[0].adapter
+        adapter = solwyn._solwyn_runtimes[0].adapter
 
         with (
             patch.object(type(adapter), "extract_service_tier", side_effect=KeyError("tier")),
@@ -382,7 +382,7 @@ class TestPaidResponseSurvivesBookkeepingFailure:
         client.chat.completions.create = AsyncMock(return_value=_openai_response())
         recorder = _ControlPlaneRecorder()
         solwyn = await _make_async_solwyn(client, recorder)
-        adapter = solwyn._runtimes[0].adapter
+        adapter = solwyn._solwyn_runtimes[0].adapter
 
         with patch.object(type(adapter), "extract_usage", side_effect=RuntimeError("shape drift")):
             response = await solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -411,7 +411,7 @@ class TestLeaseFundedUnmeasurableCall:
         client.chat.completions.create.return_value = _openai_response()
         recorder = _ControlPlaneRecorder()
         solwyn = _make_solwyn(client, recorder)
-        adapter = solwyn._runtimes[0].adapter
+        adapter = solwyn._solwyn_runtimes[0].adapter
 
         with (
             patch.object(type(adapter), "extract_usage", side_effect=RuntimeError("shape drift")),
@@ -423,7 +423,7 @@ class TestLeaseFundedUnmeasurableCall:
             )
             assert response.choices[0].message.content == "ok"
             # Snapshot BEFORE close(): the lease is surrendered on shutdown.
-            state = solwyn._budget._lease.state_for(run_id)
+            state = solwyn._solwyn_budget._lease.state_for(run_id)
             assert state is not None
             granted_remaining = state.granted_remaining_tokens
             spent = state.spent_tokens_since_report
@@ -439,7 +439,7 @@ class TestLeaseFundedUnmeasurableCall:
         client.chat.completions.create = AsyncMock(return_value=_openai_response())
         recorder = _ControlPlaneRecorder()
         solwyn = await _make_async_solwyn(client, recorder)
-        adapter = solwyn._runtimes[0].adapter
+        adapter = solwyn._solwyn_runtimes[0].adapter
 
         with (
             patch.object(type(adapter), "extract_usage", side_effect=RuntimeError("shape drift")),
@@ -450,7 +450,7 @@ class TestLeaseFundedUnmeasurableCall:
                 max_completion_tokens=_OUTPUT_BOUND, **_PLAIN_REQUEST
             )
             assert response.choices[0].message.content == "ok"
-            state = solwyn._budget._lease.state_for(run_id)
+            state = solwyn._solwyn_budget._lease.state_for(run_id)
             assert state is not None
             granted_remaining = state.granted_remaining_tokens
             spent = state.spent_tokens_since_report
@@ -470,7 +470,7 @@ class TestLeaseFundedUnmeasurableCall:
         with solwyn_pkg.run("measured-lease"):
             run_id = solwyn_pkg.current_run()[0]
             solwyn.chat.completions.create(max_completion_tokens=_OUTPUT_BOUND, **_PLAIN_REQUEST)
-            state = solwyn._budget._lease.state_for(run_id)
+            state = solwyn._solwyn_budget._lease.state_for(run_id)
             assert state is not None
             granted_remaining = state.granted_remaining_tokens
             spent = state.spent_tokens_since_report
@@ -524,7 +524,7 @@ class TestStreamingAndMediaBookkeepingFailSoft:
         client.chat.completions.create.return_value = iter(_openai_stream_chunks())
         recorder = _ControlPlaneRecorder()
         solwyn = _make_solwyn(client, recorder)
-        adapter = solwyn._runtimes[0].adapter
+        adapter = solwyn._solwyn_runtimes[0].adapter
 
         with patch.object(type(adapter), "extract_region", side_effect=AttributeError("region")):
             stream = solwyn.chat.completions.create(stream=True, **_PLAIN_REQUEST)
@@ -539,7 +539,7 @@ class TestStreamingAndMediaBookkeepingFailSoft:
         client.chat.completions.create.side_effect = RuntimeError("provider down")
         recorder = _ControlPlaneRecorder()
         solwyn = _make_solwyn(client, recorder)
-        adapter = solwyn._runtimes[0].adapter
+        adapter = solwyn._solwyn_runtimes[0].adapter
 
         with (
             patch.object(type(adapter), "extract_region", side_effect=AttributeError("region")),
@@ -566,7 +566,7 @@ class TestStreamingAndMediaBookkeepingFailSoft:
         )
 
         with patch.object(
-            solwyn._runtimes[0].adapter, "prepare_media_call", _route_media_to_embeddings
+            solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_media_to_embeddings
         ):
             result = solwyn._media_call(spec, model="text-embedding-3-small", input="hello world")
         solwyn.close()
@@ -596,7 +596,7 @@ class TestStreamingAndMediaBookkeepingFailSoft:
         )
 
         with patch.object(
-            solwyn._runtimes[0].adapter, "prepare_media_call", _route_media_to_embeddings
+            solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_media_to_embeddings
         ):
             result = await solwyn._media_call(
                 spec, model="text-embedding-3-small", input="hello world"
