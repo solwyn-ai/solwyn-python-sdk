@@ -23,6 +23,21 @@ derived from git tags (hatch-vcs).
   lease recovery ladders. The README adds copy/paste enforcement recipes and
   `solwyn.testing.pytest_plugin` provides explicitly opt-in, function-scoped
   plane and denial-client fixtures—never automatic pytest registration.
+- **The control-plane double now simulates runaway protection end to end.**
+  `FakeControlPlane.stop_run(run_id)` denies every later check, lease grant, and
+  lease renewal for that run with a version 1 `run_control` terminate directive
+  whenever the request opted in, `clear_stop(run_id)` lifts it, and the
+  `solwyn-test/kill` magic model scripts the same kill from a model name.
+  `misroute_stops()` echoes directives for the wrong run, so server contract
+  drift is testable deterministically. `denial_receipts` and
+  `aggregate_replays` expose the recorded content-free denial evidence, and
+  `reject_ingest(...)` scripts index-aware, legacy, and malformed ingest
+  rejection bodies that drive the SDK's receipt fold and replay path. The
+  shared `solwyn.testing.contract` pack gained `assert_run_control_contract`
+  and `assert_receipt_ingest_contract`, and the CI game-day recipes cover an
+  operator kill surviving an outage, a kill landing on the lease renewal
+  channel, receipt loss folding into one aggregate replay, and a local velocity
+  stop that no server allow can lift.
 - **Provider wrappers now pass `isinstance`-shaped framework admission.**
   `Solwyn(client)` and `AsyncSolwyn(client)` report the wrapped provider class
   through `__class__` while `type(wrapper)` remains the truthful Solwyn class.

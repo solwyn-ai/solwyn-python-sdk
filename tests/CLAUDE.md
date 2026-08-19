@@ -39,6 +39,14 @@ pricing-catalog behavior, and deployed API integration stay in `tests/integratio
 `tests/integration/test_contract_against_live.py` is the file that runs `solwyn.testing.contract`
 against the live API — that's the file to edit when the pack changes.
 
+Run-control and denial-receipt parity rides that shared pack too:
+`assert_run_control_contract` (the `run_control` v1 terminate directive on the
+check and lease channels) and `assert_receipt_ingest_contract` (per-call
+receipts and aggregate replays through `/metadata/ingest`) run in both lanes, so
+a drifted directive or receipt field fails the double and the live API alike.
+Each lane still scripts its own server state: the double calls
+`plane.stop_run(...)`, the live lane POSTs the dashboard stop.
+
 ## Markers
 
 Every test must have a category marker. Marker order on methods:

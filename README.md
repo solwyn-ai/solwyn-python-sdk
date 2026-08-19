@@ -670,6 +670,7 @@ Magic models are reserved, deterministic verdict scripts:
 | `solwyn-test/deny-tag` | `tag`-period denial using the plane's configured mode (`hard_deny` by default) on the check path; the lease path treats tag-scoped rules as lease ineligibility instead of a denial |
 | `solwyn-test/deny-stopped` | Always a `hard_deny` `run_stopped` denial with zero remaining budget — dashboard stops override alert-only projects and raise `RunStoppedError` through the wrapper. Requires an active `solwyn.run(...)` scope |
 | `solwyn-test/runaway` | First check per run is allowed; later `agent_run` denials use the plane's configured mode (`hard_deny` by default). Requires an active `solwyn.run(...)` scope |
+| `solwyn-test/kill` | First check per run is allowed; every later check, lease grant, and renewal for that run is a `hard_deny` `run_stopped` denial carrying a version 1 `run_control` terminate directive, exactly as `plane.stop_run(run_id)` does. Requires an active `solwyn.run(...)` scope |
 | `solwyn-test/lease-ineligible` | Allow the call but make its run ineligible for a token lease |
 
 For overlapping scripts, precedence is transport failure → endpoint refusal → verdict → allow.
@@ -787,6 +788,39 @@ def test_deny_outage_recovery():
 See the in-repo
 [`test_gameday_recipes.py`](tests/unit/testing_double/test_gameday_recipes.py)
 for the full refusal, breaker, reporter, lease-drawdown, and recovery ladder.
+
+### 4. Simulating an operator kill
+
+`plane.stop_run(run_id)` is the dashboard kill switch: from the next request on,
+every check, lease grant, and lease renewal naming that run is denied and the
+wrapper raises `RunStoppedError` — which is not a `BudgetExceededError`, so a
+budget-denial handler cannot swallow it. The stop stays terminal through a
+control-plane outage, and `plane.clear_stop(run_id)` lifts it.
+
+<!-- test-double-snippet:operator-kill -->
+```python
+import pytest
+import solwyn
+from openai import OpenAI
+from solwyn import RunStoppedError
+from solwyn.testing import FakeControlPlane
+
+def test_operator_kill_stops_the_run():
+    plane = FakeControlPlane()
+    with OpenAI(api_key="test") as provider:
+        with plane.wrap(provider) as client, solwyn.run("nightly-report") as run_id:
+            plane.stop_run(run_id, reason="operator_stop")
+            with pytest.raises(RunStoppedError) as stopped:
+                client.chat.completions.create(model="gpt-5.5", messages=[])
+        assert stopped.value.agent_run_id == run_id
+        assert stopped.value.reason == "operator_stop"
+        assert [receipt.deny_reason for receipt in plane.denial_receipts] == ["operator_stop"]
+```
+
+`plane.denial_receipts` holds the content-free evidence the SDK reported for
+every call it refused — who denied it (`deny_source`), why (`deny_reason`), and
+under which period — with `plane.aggregate_replays` holding the folded
+aggregates the SDK replays after an ingest rejection.
 
 ### Opt-in pytest fixtures
 

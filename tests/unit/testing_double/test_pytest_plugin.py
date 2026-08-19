@@ -20,7 +20,13 @@ _SNIPPET_PATTERN = re.compile(
     r"```python\n(?P<code>.*?)\n```",
     re.DOTALL,
 )
-_EXPECTED_SNIPPETS = {"deny-handler", "fail-open", "game-day", "pytest-fixtures"}
+_EXPECTED_SNIPPETS = {
+    "deny-handler",
+    "fail-open",
+    "game-day",
+    "operator-kill",
+    "pytest-fixtures",
+}
 
 
 def _read_testing_section() -> str:
@@ -243,6 +249,7 @@ def test_readme_testing_guide_has_complete_boundary_and_magic_table() -> None:
         "solwyn-test/deny-tag",
         "solwyn-test/deny-stopped",
         "solwyn-test/runaway",
+        "solwyn-test/kill",
         "solwyn-test/lease-ineligible",
     ):
         assert f"`{magic_model}`" in section
@@ -266,11 +273,14 @@ def test_readme_magic_table_distinguishes_configured_and_forced_modes() -> None:
     assert "configured mode" in runaway_description
     assert "hard_deny" in runaway_description
 
-    stopped_description = rows["solwyn-test/deny-stopped"].lower()
-    assert "configured mode" not in stopped_description
-    assert "hard_deny" in stopped_description
+    for scripted in ("deny-stopped", "kill"):
+        # An operator/dashboard stop is authoritative: it never softens to the
+        # project's configured mode the way an ordinary budget verdict does.
+        forced_description = rows[f"solwyn-test/{scripted}"].lower()
+        assert "configured mode" not in forced_description
+        assert "hard_deny" in forced_description
 
-    for model in ("deny-stopped", "runaway"):
+    for model in ("deny-stopped", "runaway", "kill"):
         assert "solwyn.run(" in rows[f"solwyn-test/{model}"].lower()
 
     assert "forces" in rows["solwyn-test/deny-alert"].lower()
