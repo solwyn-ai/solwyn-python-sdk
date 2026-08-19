@@ -220,7 +220,7 @@ class _UntrackedReportState:
             previous_attempt_at = last_attempted_at.get(key)
             if (
                 previous_attempt_at is not None
-                and now - previous_attempt_at < _UNTRACKED_REPORT_INTERVAL
+                and now < previous_attempt_at + _UNTRACKED_REPORT_INTERVAL
             ):
                 continue
             delta = min(total - baseline, _UNTRACKED_OCCURRENCES_MAX)
@@ -270,7 +270,7 @@ class _UntrackedReportState:
                 if observation["occurrences"] <= self.last_sent_occurrences.get(key, 0):
                     continue
                 attempted_at = self.last_attempted_at.get(key)
-                if attempted_at is None or now - attempted_at >= _UNTRACKED_REPORT_INTERVAL:
+                if attempted_at is None or now >= attempted_at + _UNTRACKED_REPORT_INTERVAL:
                     return True
         return False
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -17,10 +18,16 @@ from conftest import (
 )
 
 import solwyn as solwyn_pkg
+from solwyn import client as solwyn_client
 from solwyn import exceptions as solwyn_exceptions
 from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn._privacy import estimate_content_length
-from solwyn._types import BudgetMode, ProviderName
+from solwyn._run_control import (
+    clear_run_termination,
+    mark_terminated,
+    run_termination,
+)
+from solwyn._types import BudgetCheckResponse, BudgetMode, ProviderName
 from solwyn.client import Solwyn, _build_hop_kwargs
 from solwyn.exceptions import BudgetExceededError, ProviderUnavailableError, RunStoppedError
 from solwyn.providers import get_adapter_for_client
@@ -31,6 +38,17 @@ from solwyn.stream import AsyncStreamWrapper, SyncStreamWrapper
 def _reset_spend_surface_latch() -> None:
     """Reset the per-process warn-once latch so warn tests stay order-independent."""
     _reset_unmetered_spend_warnings()
+
+
+@pytest.fixture(autouse=True)
+def _reset_run_control_registry() -> Iterator[None]:
+    from solwyn import _run_control
+
+    with _run_control._STATE.lock:
+        _run_control._STATE._clear_for_test_locked()
+    yield
+    with _run_control._STATE.lock:
+        _run_control._STATE._clear_for_test_locked()
 
 
 def _mock_openai_client():
@@ -114,6 +132,14 @@ def _deny_budget_result(denied_by_period: str | None) -> SimpleNamespace:
         denied_by_period=denied_by_period,
         mode=BudgetMode.HARD_DENY,
     )
+
+
+def _budget_denied_events(reporter: object) -> list[object]:
+    return [
+        call.args[0]
+        for call in reporter.report.call_args_list  # type: ignore[attr-defined]
+        if call.args[0].status == "budget_denied"
+    ]
 
 
 def _fake_runtime(
@@ -433,14 +459,11 @@ class TestBudgetCheckBeforeCall:
 
         error = exc_info.value
         assert type(error) is RunStoppedError
-        assert isinstance(error, BudgetExceededError)
-        assert str(error) == f"Run {run_id} was stopped from the Solwyn dashboard"
-        assert error.project_id == VALID_PROJECT_ID
-        assert error.budget_limit == 10.0
-        assert error.current_usage == 10.0
-        assert error.estimated_cost > 0.0
-        assert error.budget_period == "run_stopped"
-        assert error.mode == "hard_deny"
+        assert not isinstance(error, BudgetExceededError)
+        assert str(error) == f"Agent run {run_id} was stopped (server: run_stopped)"
+        assert error.agent_run_id == run_id
+        assert error.reason == "run_stopped"
+        assert error.source == "server"
 
     def test_run_stopped_label_without_active_run_raises_plain_budget_error(self) -> None:
         client, _ = _mock_openai_client()
@@ -467,6 +490,50 @@ class TestBudgetCheckBeforeCall:
         assert type(exc_info.value) is BudgetExceededError
         assert exc_info.value.budget_period == "run_stopped"
         assert "Run None" not in str(exc_info.value)
+
+    def test_server_registry_stop_wins_over_budget_error_and_live_allow_clears_it(
+        self,
+    ) -> None:
+        client, mock_response = _mock_openai_client()
+        solwyn = _make_solwyn(client, budget_mode=BudgetMode.HARD_DENY)
+        checks = 0
+
+        def check_budget(**kwargs: object) -> SimpleNamespace:
+            nonlocal checks
+            checks += 1
+            if checks == 1:
+                return _deny_budget_result("monthly")
+            solwyn._solwyn_budget._cache_response(
+                BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE),
+                agent_run_id=str(kwargs["agent_run_id"]),
+            )
+            return _allow_budget_result()
+
+        solwyn._solwyn_budget.check_budget = MagicMock(side_effect=check_budget)
+        solwyn._solwyn_reporter.report = MagicMock()
+
+        with solwyn_pkg.run("server-stop-then-allow") as run_id:
+            mark_terminated(run_id, reason="run_stopped", source="server")
+
+            with pytest.raises(RunStoppedError) as exc_info:
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "Hello"}],
+                )
+
+            result = solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello again"}],
+            )
+
+        assert exc_info.value.source == "server"
+        assert exc_info.value.reason == "run_stopped"
+        assert result is mock_response
+        assert solwyn._solwyn_budget.check_budget.call_count == 2
+        assert client.chat.completions.create.call_count == 1
+        assert run_termination(run_id) is None
+        assert len(_budget_denied_events(solwyn._solwyn_reporter)) == 1
+        solwyn.close()
 
     @pytest.mark.parametrize(
         ("denied_by_period", "expected_budget_period"),
@@ -1308,6 +1375,7 @@ class TestSyncStreamingInterception:
             )
 
         assert isinstance(result, SyncStreamWrapper)
+        assert result._abort_check is None
         solwyn._solwyn_reporter._http.close()
         solwyn._solwyn_budget._http.close()
 
@@ -2089,14 +2157,11 @@ class TestAsyncNonStreamingInterception:
 
         error = exc_info.value
         assert type(error) is RunStoppedError
-        assert isinstance(error, BudgetExceededError)
-        assert str(error) == f"Run {run_id} was stopped from the Solwyn dashboard"
-        assert error.project_id == VALID_PROJECT_ID
-        assert error.budget_limit == 10.0
-        assert error.current_usage == 10.0
-        assert error.estimated_cost > 0.0
-        assert error.budget_period == "run_stopped"
-        assert error.mode == "hard_deny"
+        assert not isinstance(error, BudgetExceededError)
+        assert str(error) == f"Agent run {run_id} was stopped (server: run_stopped)"
+        assert error.agent_run_id == run_id
+        assert error.reason == "run_stopped"
+        assert error.source == "server"
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -2266,3 +2331,550 @@ class TestAsyncNonStreamingInterception:
 
         await solwyn._solwyn_budget._http.aclose()
         await solwyn._solwyn_reporter._http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# Run-scoped velocity wiring
+# ---------------------------------------------------------------------------
+
+
+def _velocity_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        record for record in caplog.records if record.getMessage().startswith("velocity.flagged")
+    ]
+
+
+@pytest.mark.unit
+class TestVelocityWiring:
+    def test_server_entry_with_velocity_flag_allows_live_check_then_denies_locally(
+        self,
+    ) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, velocity_mode="deny")
+
+        def live_allow(**kwargs: object) -> SimpleNamespace:
+            solwyn._solwyn_budget._cache_response(
+                BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE),
+                agent_run_id=str(kwargs["agent_run_id"]),
+            )
+            return _allow_budget_result()
+
+        solwyn._solwyn_budget.check_budget = MagicMock(side_effect=live_allow)
+        solwyn._solwyn_budget.release_reservation = MagicMock(
+            wraps=solwyn._solwyn_budget.release_reservation
+        )
+        solwyn._solwyn_reporter.report = MagicMock()
+        solwyn._solwyn_velocity.observe = MagicMock(return_value=("repeat_size",))
+
+        with solwyn_pkg.run("server-stop-races-local-velocity") as run_id:
+            mark_terminated(run_id, reason="run_stopped", source="server")
+
+            with pytest.raises(RunStoppedError) as exc_info:
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "Hello"}],
+                )
+
+        assert exc_info.value.agent_run_id == run_id
+        assert exc_info.value.reason == "velocity:repeat_size"
+        assert exc_info.value.source == "local_velocity"
+        termination = run_termination(run_id)
+        assert termination is not None
+        assert termination.source == "local_velocity"
+        solwyn._solwyn_budget.check_budget.assert_called_once()
+        solwyn._solwyn_budget.release_reservation.assert_called_once()
+        client.chat.completions.create.assert_not_called()
+        denied = _budget_denied_events(solwyn._solwyn_reporter)
+        assert len(denied) == 1
+        assert denied[0].requested_provider is None
+        assert denied[0].requested_model is None
+        solwyn.close()
+
+    def test_deny_mode_stops_fifth_repeat_and_pre_gates_subsequent_call(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, velocity_mode="deny")
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+
+        with solwyn_pkg.run("repeat-deny") as run_id:
+            for _ in range(4):
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "same-sized request"}],
+                )
+
+            with pytest.raises(RunStoppedError) as fifth:
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "same-sized request"}],
+                )
+
+            checks_after_fifth = solwyn._solwyn_budget.check_budget.call_count
+            provider_calls_after_fifth = client.chat.completions.create.call_count
+
+            with pytest.raises(RunStoppedError) as sixth:
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "different request"}],
+                )
+
+        assert fifth.value.agent_run_id == run_id
+        assert fifth.value.reason == "velocity:repeat_size"
+        assert fifth.value.source == "local_velocity"
+        assert sixth.value.reason == fifth.value.reason
+        assert solwyn._solwyn_budget.check_budget.call_count == checks_after_fifth == 4
+        assert client.chat.completions.create.call_count == provider_calls_after_fifth == 4
+        denied_events = _budget_denied_events(solwyn._solwyn_reporter)
+        assert len(denied_events) == 2
+        assert all(event.agent_run_id == run_id for event in denied_events)
+        assert all(event.model == "gpt-5.5" for event in denied_events)
+        assert all(event.provider == "openai" for event in denied_events)
+        assert all(event.input_tokens > 0 for event in denied_events)
+        assert all(event.call_id for event in denied_events)
+        assert all(event.requested_provider is None for event in denied_events)
+        assert all(event.requested_model is None for event in denied_events)
+        solwyn.close()
+
+    def test_evicted_local_stop_does_not_false_stop_sync_provider_dispatch(self) -> None:
+        from solwyn import _run_control
+
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, velocity_mode="deny")
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+
+        with solwyn_pkg.run("evicted-local-sync") as run_id:
+            solwyn._solwyn_velocity.observe(
+                run_id=run_id,
+                estimated_input_tokens=10,
+                model="gpt-5.5",
+                now=0.0,
+            )
+            mark_terminated(
+                run_id,
+                reason="velocity:repeat_size",
+                source="local_velocity",
+            )
+            for index in range(257):
+                mark_terminated(
+                    f"sync-local-stop-churn-{index}",
+                    reason="velocity:repeat_size",
+                    source="local_velocity",
+                )
+            for index in range(129):
+                solwyn._solwyn_velocity.observe(
+                    run_id=f"sync-velocity-history-churn-{index}",
+                    estimated_input_tokens=index,
+                    model="gpt-5.5",
+                    now=1.0,
+                )
+
+            assert run_id not in _run_control._STATE.terminations
+            assert run_id not in solwyn._solwyn_velocity._runs
+            result = solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "dispatch after exact eviction"}],
+            )
+
+        assert result is client.chat.completions.create.return_value
+        solwyn._solwyn_budget.check_budget.assert_called_once()
+        client.chat.completions.create.assert_called_once()
+        solwyn.close()
+
+    def test_rate_acceleration_alone_does_not_terminate_in_deny_mode(self) -> None:
+        client, mock_response = _mock_openai_client()
+        solwyn = _make_solwyn(client, velocity_mode="deny")
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+        solwyn._solwyn_velocity.observe = MagicMock(return_value=("rate_acceleration",))
+
+        with solwyn_pkg.run("rate-only") as run_id:
+            result = solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+
+        assert result is mock_response
+        assert run_termination(run_id) is None
+        solwyn._solwyn_budget.check_budget.assert_called_once()
+        client.chat.completions.create.assert_called_once()
+        solwyn.close()
+
+    def test_local_deny_survives_an_operator_clear_racing_the_mark(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A concurrent public clear must still stop the run, never raise RuntimeError."""
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, velocity_mode="deny")
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+        solwyn._solwyn_velocity.observe = MagicMock(return_value=("repeat_size",))
+
+        real_mark_terminated = solwyn_client.mark_terminated
+
+        def clearing_mark_terminated(run_id: str, **kwargs: str):
+            termination = real_mark_terminated(run_id, **kwargs)
+            clear_run_termination(run_id)
+            return termination
+
+        monkeypatch.setattr(solwyn_client, "mark_terminated", clearing_mark_terminated)
+
+        with (
+            solwyn_pkg.run("clear-races-local-deny") as run_id,
+            pytest.raises(RunStoppedError) as exc_info,
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+
+        assert exc_info.value.agent_run_id == run_id
+        assert exc_info.value.reason == "velocity:repeat_size"
+        assert exc_info.value.source == "local_velocity"
+        solwyn._solwyn_budget.check_budget.assert_not_called()
+        client.chat.completions.create.assert_not_called()
+        solwyn.close()
+
+    def test_sync_media_velocity_deny_and_subsequent_pre_gate(self) -> None:
+        client, _ = _mock_openai_client()
+        client.embeddings.create.return_value = SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=10)
+        )
+        solwyn = _make_solwyn(
+            client,
+            velocity_mode="deny",
+            velocity_repeat_count=2,
+        )
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+        solwyn._solwyn_velocity.observe = MagicMock(wraps=solwyn._solwyn_velocity.observe)
+
+        with solwyn_pkg.run("sync-media-deny") as run_id:
+            solwyn.embeddings.create(model="text-embedding-3-small", input="hello")
+
+            with pytest.raises(RunStoppedError) as second:
+                solwyn.embeddings.create(model="text-embedding-3-small", input="hello")
+
+            with pytest.raises(RunStoppedError):
+                solwyn.embeddings.create(model="text-embedding-3-small", input="different")
+
+        assert second.value.agent_run_id == run_id
+        assert second.value.reason == "velocity:repeat_size"
+        assert solwyn._solwyn_velocity.observe.call_count == 2
+        assert solwyn._solwyn_budget.check_budget.call_count == 1
+        assert client.embeddings.create.call_count == 1
+        denied_events = _budget_denied_events(solwyn._solwyn_reporter)
+        assert len(denied_events) == 2
+        assert all(event.requested_provider is None for event in denied_events)
+        assert all(event.requested_model is None for event in denied_events)
+        solwyn.close()
+
+    def test_run_scoped_repeat_loop_warns_exactly_once(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client)
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+
+        with caplog.at_level(logging.WARNING), solwyn_pkg.run("repeat-loop") as run_id:
+            for _ in range(5):
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "same-sized request"}],
+                )
+
+        records = _velocity_records(caplog)
+        assert len(records) == 1
+        assert records[0].msg == "velocity.flagged: rule=%s run=%s"
+        assert records[0].args == ("repeat_size", run_id)
+        assert client.chat.completions.create.call_count == 5
+        solwyn.close()
+
+    def test_off_mode_never_feeds_monitor_or_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, velocity_mode="off")
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+        solwyn._solwyn_velocity.observe = MagicMock(wraps=solwyn._solwyn_velocity.observe)
+
+        with caplog.at_level(logging.WARNING), solwyn_pkg.run("off-loop"):
+            for _ in range(5):
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "same-sized request"}],
+                )
+
+        solwyn._solwyn_velocity.observe.assert_not_called()
+        assert _velocity_records(caplog) == []
+        solwyn.close()
+
+    def test_unscoped_calls_never_feed_monitor(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client)
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+        solwyn._solwyn_velocity.observe = MagicMock(wraps=solwyn._solwyn_velocity.observe)
+
+        solwyn.chat.completions.create(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "same-sized request"}],
+        )
+
+        solwyn._solwyn_velocity.observe.assert_not_called()
+        solwyn.close()
+
+    def test_sync_media_call_feeds_same_run_monitor(self) -> None:
+        client, _ = _mock_openai_client()
+        client.embeddings.create.return_value = SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=10)
+        )
+        solwyn = _make_solwyn(client)
+        solwyn._solwyn_budget.check_budget = MagicMock(return_value=_allow_budget_result())
+        solwyn._solwyn_reporter.report = MagicMock()
+        solwyn._solwyn_velocity.observe = MagicMock(return_value=())
+
+        with solwyn_pkg.run("sync-media") as run_id:
+            solwyn.embeddings.create(model="text-embedding-3-small", input="hello")
+
+        solwyn._solwyn_velocity.observe.assert_called_once()
+        observed = solwyn._solwyn_velocity.observe.call_args.kwargs
+        assert observed["run_id"] == run_id
+        assert observed["model"] == "text-embedding-3-small"
+        assert isinstance(observed["estimated_input_tokens"], int)
+        assert isinstance(observed["now"], float)
+        solwyn.close()
+
+    def test_base_fork_reset_clears_velocity_monitor(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client)
+        solwyn._solwyn_velocity.observe(
+            run_id="parent-run",
+            estimated_input_tokens=1000,
+            model="gpt-5.5",
+            now=0.0,
+        )
+        old_lock = solwyn._solwyn_velocity._lock
+
+        solwyn._reset_after_fork_in_child()
+
+        assert solwyn._solwyn_velocity.run_count() == 0
+        assert solwyn._solwyn_velocity._lock is not old_lock
+        solwyn.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_velocity_async_chat_and_media_calls_feed_same_run_monitor() -> None:
+    client, response = _mock_openai_client()
+    client.chat.completions.create = AsyncMockFn(return_value=response)
+    client.embeddings.create = AsyncMockFn(
+        return_value=SimpleNamespace(usage=SimpleNamespace(prompt_tokens=10))
+    )
+    solwyn = _make_async_solwyn(client)
+    solwyn._solwyn_budget.check_budget = AsyncMockFn(return_value=_allow_budget_result())
+    solwyn._solwyn_reporter.report = MagicMock()
+    solwyn._solwyn_velocity.observe = MagicMock(return_value=())
+
+    async with solwyn_pkg.run("async-chat-media") as run_id:
+        await solwyn.chat.completions.create(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        await solwyn.embeddings.create(model="text-embedding-3-small", input="hello")
+
+    assert solwyn._solwyn_velocity.observe.call_count == 2
+    assert [call.kwargs["run_id"] for call in solwyn._solwyn_velocity.observe.call_args_list] == [
+        run_id,
+        run_id,
+    ]
+    assert [call.kwargs["model"] for call in solwyn._solwyn_velocity.observe.call_args_list] == [
+        "gpt-5.5",
+        "text-embedding-3-small",
+    ]
+    await solwyn._solwyn_budget._http.aclose()
+    await solwyn._solwyn_reporter._http.aclose()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_deny_mode_stops_fifth_repeat_and_pre_gates_subsequent_call() -> None:
+    client, response = _mock_openai_client()
+    client.chat.completions.create = AsyncMockFn(return_value=response)
+    solwyn = _make_async_solwyn(client, velocity_mode="deny")
+    solwyn._solwyn_budget.check_budget = AsyncMockFn(return_value=_allow_budget_result())
+    solwyn._solwyn_reporter.report = MagicMock()
+
+    async with solwyn_pkg.run("async-repeat-deny") as run_id:
+        for _ in range(4):
+            await solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "same-sized request"}],
+            )
+
+        with pytest.raises(RunStoppedError) as fifth:
+            await solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "same-sized request"}],
+            )
+
+        checks_after_fifth = solwyn._solwyn_budget.check_budget.call_count
+        provider_calls_after_fifth = client.chat.completions.create.call_count
+
+        with pytest.raises(RunStoppedError):
+            await solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "different request"}],
+            )
+
+    assert fifth.value.agent_run_id == run_id
+    assert fifth.value.reason == "velocity:repeat_size"
+    assert fifth.value.source == "local_velocity"
+    assert solwyn._solwyn_budget.check_budget.call_count == checks_after_fifth == 4
+    assert client.chat.completions.create.call_count == provider_calls_after_fifth == 4
+    denied_events = _budget_denied_events(solwyn._solwyn_reporter)
+    assert len(denied_events) == 2
+    assert all(event.requested_provider is None for event in denied_events)
+    assert all(event.requested_model is None for event in denied_events)
+    await solwyn._solwyn_budget._http.aclose()
+    await solwyn._solwyn_reporter._http.aclose()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_media_velocity_deny_and_subsequent_pre_gate() -> None:
+    client, _ = _mock_openai_client()
+    client.embeddings.create = AsyncMockFn(
+        return_value=SimpleNamespace(usage=SimpleNamespace(prompt_tokens=10))
+    )
+    solwyn = _make_async_solwyn(
+        client,
+        velocity_mode="deny",
+        velocity_repeat_count=2,
+    )
+    solwyn._solwyn_budget.check_budget = AsyncMockFn(return_value=_allow_budget_result())
+    solwyn._solwyn_reporter.report = MagicMock()
+    solwyn._solwyn_velocity.observe = MagicMock(wraps=solwyn._solwyn_velocity.observe)
+
+    async with solwyn_pkg.run("async-media-deny") as run_id:
+        await solwyn.embeddings.create(model="text-embedding-3-small", input="hello")
+
+        with pytest.raises(RunStoppedError) as second:
+            await solwyn.embeddings.create(model="text-embedding-3-small", input="hello")
+
+        with pytest.raises(RunStoppedError):
+            await solwyn.embeddings.create(
+                model="text-embedding-3-small",
+                input="different",
+            )
+
+    assert second.value.agent_run_id == run_id
+    assert second.value.reason == "velocity:repeat_size"
+    assert solwyn._solwyn_velocity.observe.call_count == 2
+    assert solwyn._solwyn_budget.check_budget.call_count == 1
+    assert client.embeddings.create.call_count == 1
+    denied_events = _budget_denied_events(solwyn._solwyn_reporter)
+    assert len(denied_events) == 2
+    assert all(event.requested_provider is None for event in denied_events)
+    assert all(event.requested_model is None for event in denied_events)
+    await solwyn._solwyn_budget._http.aclose()
+    await solwyn._solwyn_reporter._http.aclose()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_async_server_entry_with_velocity_flag_checks_then_denies_locally() -> None:
+    client, response = _mock_openai_client()
+    client.chat.completions.create = AsyncMockFn(return_value=response)
+    solwyn = _make_async_solwyn(client, velocity_mode="deny")
+
+    async def live_allow(**kwargs: object) -> SimpleNamespace:
+        solwyn._solwyn_budget._cache_response(
+            BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE),
+            agent_run_id=str(kwargs["agent_run_id"]),
+        )
+        return _allow_budget_result()
+
+    solwyn._solwyn_budget.check_budget = AsyncMockFn(side_effect=live_allow)
+    solwyn._solwyn_budget.release_reservation = MagicMock(
+        wraps=solwyn._solwyn_budget.release_reservation
+    )
+    solwyn._solwyn_reporter.report = MagicMock()
+    solwyn._solwyn_velocity.observe = MagicMock(return_value=("repeat_size",))
+
+    async with solwyn_pkg.run("async-server-stop-races-local-velocity") as run_id:
+        mark_terminated(run_id, reason="run_stopped", source="server")
+
+        with pytest.raises(RunStoppedError) as exc_info:
+            await solwyn.chat.completions.create(
+                model="gpt-5.5",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+
+    assert exc_info.value.agent_run_id == run_id
+    assert exc_info.value.reason == "velocity:repeat_size"
+    assert exc_info.value.source == "local_velocity"
+    termination = run_termination(run_id)
+    assert termination is not None
+    assert termination.source == "local_velocity"
+    solwyn._solwyn_budget.check_budget.assert_awaited_once()
+    solwyn._solwyn_budget.release_reservation.assert_called_once()
+    client.chat.completions.create.assert_not_awaited()
+    denied = _budget_denied_events(solwyn._solwyn_reporter)
+    assert len(denied) == 1
+    assert denied[0].requested_provider is None
+    assert denied[0].requested_model is None
+    await solwyn._solwyn_budget._http.aclose()
+    await solwyn._solwyn_reporter._http.aclose()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_evicted_local_stop_does_not_false_stop_async_provider_dispatch() -> None:
+    from solwyn import _run_control
+
+    client, response = _mock_openai_client()
+    client.chat.completions.create = AsyncMockFn(return_value=response)
+    solwyn = _make_async_solwyn(client, velocity_mode="deny")
+    solwyn._solwyn_budget.check_budget = AsyncMockFn(return_value=_allow_budget_result())
+    solwyn._solwyn_reporter.report = MagicMock()
+
+    async with solwyn_pkg.run("evicted-local-async") as run_id:
+        solwyn._solwyn_velocity.observe(
+            run_id=run_id,
+            estimated_input_tokens=10,
+            model="gpt-5.5",
+            now=0.0,
+        )
+        mark_terminated(
+            run_id,
+            reason="velocity:repeat_size",
+            source="local_velocity",
+        )
+        for index in range(257):
+            mark_terminated(
+                f"async-local-stop-churn-{index}",
+                reason="velocity:repeat_size",
+                source="local_velocity",
+            )
+        for index in range(129):
+            solwyn._solwyn_velocity.observe(
+                run_id=f"async-velocity-history-churn-{index}",
+                estimated_input_tokens=index,
+                model="gpt-5.5",
+                now=1.0,
+            )
+
+        assert run_id not in _run_control._STATE.terminations
+        assert run_id not in solwyn._solwyn_velocity._runs
+        result = await solwyn.chat.completions.create(
+            model="gpt-5.5",
+            messages=[{"role": "user", "content": "dispatch after exact eviction"}],
+        )
+
+    assert result is response
+    solwyn._solwyn_budget.check_budget.assert_awaited_once()
+    client.chat.completions.create.assert_awaited_once()
+    await solwyn._solwyn_budget._http.aclose()
+    await solwyn._solwyn_reporter._http.aclose()

@@ -381,6 +381,26 @@ def test_validation_failed_advisory_key_is_throttled_after_one_cycle() -> None:
 
 
 @pytest.mark.unit
+def test_advisory_cadence_is_due_at_fractional_absolute_deadline() -> None:
+    reporter = _quiet_sync_reporter()
+    _observe(reporter)
+    state = reporter._untracked_state
+    assert state is not None
+    attempted_at = 152.339735525
+    reports = state.build_reports(attempted_at)
+    state.mark_attempted(reports, attempted_at)
+    deadline = attempted_at + 900.0
+
+    try:
+        assert state.reports_due(deadline - 0.001) is False
+        assert state.build_reports(deadline - 0.001) == []
+        assert state.reports_due(deadline) is True
+        assert len(state.build_reports(deadline)) == 1
+    finally:
+        reporter._http.close()
+
+
+@pytest.mark.unit
 def test_validation_failed_advisory_key_never_respawns_its_worker() -> None:
     reporter = _quiet_sync_reporter()
     state = reporter._untracked_state

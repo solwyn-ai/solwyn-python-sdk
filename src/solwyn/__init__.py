@@ -43,6 +43,12 @@ from solwyn._run import (
     run_in_executor,
     start_run,
 )
+from solwyn._run_control import (
+    RunTermination,
+    clear_run_termination,
+    current_run_terminated,
+    run_termination,
+)
 from solwyn._surface_graph import SurfaceInspectionError
 from solwyn._types import CircuitState, FailoverReason, ProviderEntry, ProviderName
 from solwyn.circuit_breaker import CircuitBreakerState
@@ -79,6 +85,7 @@ __all__ = [
     "SolwynTagsClampedWarning",
     "BudgetExceededError",
     "RunStoppedError",
+    "RunTermination",
     "ProviderUnavailableError",
     "ConfigurationError",
     "CoverageMismatchError",
@@ -104,6 +111,9 @@ __all__ = [
     "run_in_executor",
     "current_run",
     "current_run_context",
+    "current_run_terminated",
+    "run_termination",
+    "clear_run_termination",
     "RunContext",
     "RunHandle",
     "TAGS_MAX_KEYS",

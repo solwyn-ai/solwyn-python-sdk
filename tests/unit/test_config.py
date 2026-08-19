@@ -430,6 +430,93 @@ class TestLeaseConfig:
 
 
 @pytest.mark.unit
+class TestVelocityConfig:
+    """Content-free velocity detector configuration."""
+
+    def test_defaults(self) -> None:
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+        )
+
+        assert config.velocity_mode == "warn"
+        assert config.velocity_repeat_count == 5
+        assert config.velocity_repeat_window_s == 60.0
+        assert config.velocity_growth_streak == 8
+        assert config.velocity_growth_factor == 3.0
+        assert config.velocity_accel_floor_per_min == 30
+        assert config.velocity_accel_factor == 3.0
+
+    def test_mode_and_repeat_count_load_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOLWYN_VELOCITY_MODE", "deny")
+        monkeypatch.setenv("SOLWYN_VELOCITY_REPEAT_COUNT", "9")
+
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+        )
+
+        assert config.velocity_mode == "deny"
+        assert config.velocity_repeat_count == 9
+
+    def test_invalid_mode_raises_validation_error(self) -> None:
+        with pytest.raises(ValidationError):
+            SolwynConfig(
+                api_key=VALID_API_KEY,
+                providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+                velocity_mode="block",
+            )
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "velocity_repeat_count",
+            "velocity_growth_streak",
+            "velocity_accel_floor_per_min",
+        ],
+    )
+    def test_history_dependent_counts_cannot_exceed_capacity(self, field: str) -> None:
+        with pytest.raises(ValidationError):
+            SolwynConfig(
+                api_key=VALID_API_KEY,
+                providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+                **{field: 65},
+            )
+
+    @pytest.mark.parametrize(
+        "env_name",
+        [
+            "SOLWYN_VELOCITY_REPEAT_COUNT",
+            "SOLWYN_VELOCITY_GROWTH_STREAK",
+            "SOLWYN_VELOCITY_ACCEL_FLOOR_PER_MIN",
+        ],
+    )
+    def test_history_capacity_is_enforced_for_env_values(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env_name: str,
+    ) -> None:
+        monkeypatch.setenv(env_name, "65")
+
+        with pytest.raises(ValidationError):
+            SolwynConfig(
+                api_key=VALID_API_KEY,
+                providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+            )
+
+    def test_history_capacity_boundary_is_accepted(self) -> None:
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+            velocity_repeat_count=64,
+            velocity_growth_streak=64,
+        )
+
+        assert config.velocity_repeat_count == 64
+        assert config.velocity_growth_streak == 64
+
+
+@pytest.mark.unit
 class TestReporterRetryConfig:
     """Reporter at-least-once delivery knobs: retry/backoff/shutdown-deadline."""
 

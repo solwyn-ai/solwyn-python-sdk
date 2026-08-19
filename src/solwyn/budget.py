@@ -34,6 +34,7 @@ from solwyn._lease import (
 )
 from solwyn._lifecycle import register_fork_reset, register_lease_holder
 from solwyn._read_only_key import handle_read_only_key_error
+from solwyn._run_control import clear_termination_if
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
     BudgetCheckRequest,
@@ -305,6 +306,8 @@ class _BudgetEnforcerBase:
         denials stay selector-local: they clear stale project state without
         creating or erasing run sticky state.
         """
+        if response.allowed and agent_run_id is not None:
+            clear_termination_if(agent_run_id, source="server")
         with self._state_lock:
             # Always remember the limit for local enforcement fallback
             self._last_known_budget_limit = response.budget_limit
