@@ -9,7 +9,8 @@ under ``src/solwyn``.
 from __future__ import annotations
 
 import uuid
-from typing import Any, TypeVar, cast
+from datetime import UTC, datetime
+from typing import Any, Literal, TypeVar, cast
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -19,15 +20,19 @@ from solwyn._types import (
     BudgetCheckRequest,
     BudgetCheckResponse,
     BudgetConfirmRequest,
+    CallStatus,
+    DenySource,
     LeaseGrantRequest,
     LeaseGrantResponse,
     LeaseRenewRequest,
     LeaseSurrenderRequest,
+    MetadataEvent,
     ProviderName,
 )
 
 _CHECK_PATH = "/api/v1/budgets/check"
 _CONFIRM_PATH = "/api/v1/budgets/confirm"
+_INGEST_PATH = "/api/v1/metadata/ingest"
 _LEASE_PATH = "/api/v1/budgets/lease"
 _LEASE_RENEW_PATH = "/api/v1/budgets/lease/renew"
 _LEASE_SURRENDER_PATH = "/api/v1/budgets/lease/surrender"
@@ -53,6 +58,8 @@ _DISPLAY_KEYS = frozenset(
         "remaining_budget",
     }
 )
+_RUN_CONTROL_KEYS = frozenset({"version", "action", "agent_run_id", "reason"})
+_RUN_CONTROL_REASON_MAX_LENGTH = 64
 _UNPRICED_LEASE_MODEL = "no-such-model-for-leases"
 _BODY_PREVIEW_LIMIT = 200
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
@@ -121,6 +128,7 @@ def _check_payload(
     *,
     agent_run_id: str | None = None,
     tags: dict[str, str] | None = None,
+    run_directive_version: Literal["1"] | None = None,
 ) -> dict[str, Any]:
     return BudgetCheckRequest(
         estimated_input_tokens=1000,
@@ -129,6 +137,7 @@ def _check_payload(
         agent_run_id=agent_run_id,
         tags=tags,
         failover_directive_version="1",
+        run_directive_version=run_directive_version,
     ).model_dump(mode="json")
 
 
@@ -186,12 +195,17 @@ def _post_check(
     context: str,
     agent_run_id: str | None = None,
     tags: dict[str, str] | None = None,
+    run_directive_version: Literal["1"] | None = None,
 ) -> dict[str, Any]:
     response = _post(
         http,
         api_key,
         _CHECK_PATH,
-        _check_payload(agent_run_id=agent_run_id, tags=tags),
+        _check_payload(
+            agent_run_id=agent_run_id,
+            tags=tags,
+            run_directive_version=run_directive_version,
+        ),
     )
     _require_status(response, 200, context)
     return _object_json(response, context)
@@ -624,4 +638,168 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
     _require(
         repeated_tokens == 0,
         "repeated surrender was not idempotent",
+    )
+
+
+def _require_terminate_directive(
+    payload: dict[str, Any],
+    context: str,
+    *,
+    stopped_run_id: str,
+) -> None:
+    raw_directive = payload.get("run_control")
+    _require(
+        isinstance(raw_directive, dict),
+        f"{context} omitted the run-control directive: {payload!r}",
+    )
+    directive = cast(dict[str, Any], raw_directive)
+    _require(
+        set(directive) == _RUN_CONTROL_KEYS,
+        f"{context} run_control keys drifted: {sorted(directive)}",
+    )
+    _require(directive.get("version") == "1", f"{context} run_control version drifted")
+    _require(
+        directive.get("action") == "terminate",
+        f"{context} run_control action drifted: {directive!r}",
+    )
+    _require(
+        directive.get("agent_run_id") == stopped_run_id,
+        f"{context} run_control echoed the wrong run id: {directive!r}",
+    )
+    reason = directive.get("reason")
+    _require(
+        isinstance(reason, str) and 0 < len(reason) <= _RUN_CONTROL_REASON_MAX_LENGTH,
+        f"{context} run_control reason drifted: {reason!r}",
+    )
+    parsed = _validate_model(BudgetCheckResponse, payload, context)
+    _require(parsed.run_control is not None, f"{context} failed SDK directive validation")
+    _require(
+        parsed.run_control is not None and parsed.run_control.agent_run_id == stopped_run_id,
+        f"{context} parsed a directive for a different run",
+    )
+
+
+def assert_run_control_contract(
+    http: httpx.Client,
+    api_key: str,
+    *,
+    stopped_run_id: str,
+) -> None:
+    """Assert the run-control directive shapes that stop a run client-side.
+
+    The caller stops ``stopped_run_id`` before calling this — server-state
+    manipulation is lane-specific (the double scripts it, the live lane POSTs
+    the dashboard stop), exactly like the pack's other setup.
+    """
+    opted_in = _post_check(
+        http,
+        api_key,
+        context="stopped run directive check",
+        agent_run_id=stopped_run_id,
+        run_directive_version="1",
+    )
+    _require_deny_shape(opted_in, "run_stopped")
+    _require_terminate_directive(
+        opted_in,
+        "stopped run directive check",
+        stopped_run_id=stopped_run_id,
+    )
+
+    without_opt_in = _post_check(
+        http,
+        api_key,
+        context="stopped run legacy check",
+        agent_run_id=stopped_run_id,
+    )
+    _require_deny_shape(without_opt_in, "run_stopped")
+    _require(
+        "run_control" not in without_opt_in,
+        f"stopped run legacy check sent an unrequested directive: {without_opt_in!r}",
+    )
+
+    other_run_id = f"contract-unstopped-{uuid.uuid4().hex[:12]}"
+    other_run = _post_check(
+        http,
+        api_key,
+        context="unstopped run check",
+        agent_run_id=other_run_id,
+        run_directive_version="1",
+    )
+    _require(
+        "run_control" not in other_run,
+        f"unstopped run check received a directive: {other_run!r}",
+    )
+    _validate_model(BudgetCheckResponse, other_run, "unstopped run check")
+
+
+def _receipt_event(
+    *,
+    deny_source: DenySource,
+    input_tokens: int,
+    receipt_aggregate_count: int | None = None,
+) -> MetadataEvent:
+    return MetadataEvent(
+        model="gpt-5.5",
+        provider=ProviderName.OPENAI,
+        input_tokens=input_tokens,
+        output_tokens=0,
+        token_details=None,
+        latency_ms=0.0,
+        status=CallStatus.BUDGET_DENIED,
+        is_model_fallback=False,
+        sdk_instance_id=uuid.uuid4().hex,
+        timestamp=datetime.now(UTC),
+        agent_run_id=f"contract-receipt-{uuid.uuid4().hex[:12]}",
+        call_id=str(uuid.uuid4()),
+        deny_source=deny_source,
+        deny_reason="monthly",
+        denied_by_period="monthly",
+        estimated_output_bound=512,
+        velocity_flags=["monotonic_growth", "repeat_size"],
+        receipt_aggregate_count=receipt_aggregate_count,
+    )
+
+
+def _post_receipt(
+    http: httpx.Client,
+    api_key: str,
+    event: MetadataEvent,
+    context: str,
+) -> None:
+    response = http.post(
+        _INGEST_PATH,
+        json=[event.model_dump(mode="json")],
+        headers=_headers(api_key),
+    )
+    _require_status(response, 202, context)
+    body = _object_json(response, context)
+    _require(
+        body == {"ingested": 1, "rejected": []},
+        f"{context} ingest body drifted: {body!r}",
+    )
+
+
+def assert_receipt_ingest_contract(http: httpx.Client, api_key: str) -> None:
+    """Assert that denial receipts and aggregate replays ingest cleanly.
+
+    Both events ride the ordinary metadata-ingest path and must be accepted
+    whole: a fully-populated per-call receipt and the coarse aggregate replay
+    the reporter emits for receipts it could not deliver. Every call id is
+    fresh so a live server's ingest dedup can never mask a rejection.
+    """
+    _post_receipt(
+        http,
+        api_key,
+        _receipt_event(deny_source="server", input_tokens=1000),
+        "denial receipt ingest",
+    )
+    _post_receipt(
+        http,
+        api_key,
+        _receipt_event(
+            deny_source="aggregate_replay",
+            input_tokens=3000,
+            receipt_aggregate_count=3,
+        ),
+        "aggregate replay ingest",
     )

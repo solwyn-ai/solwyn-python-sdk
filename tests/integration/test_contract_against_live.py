@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -30,6 +31,8 @@ from solwyn.testing.contract import (
     assert_check_contract,
     assert_confirm_contract,
     assert_lease_contract,
+    assert_receipt_ingest_contract,
+    assert_run_control_contract,
 )
 
 _SCOPED_CAP_USD = 0.05
@@ -119,9 +122,8 @@ def _burn_scoped_budget(
         confirmed.raise_for_status()
 
 
-def _create_stopped_project(api_url: str) -> Credentials:
+def _create_stopped_project(api_url: str, *, run_id: str = "contract-stopped-run") -> Credentials:
     session_id = uuid.uuid4().hex[:12]
-    run_id = "contract-stopped-run"
     run_name = f"contract-stopped-{session_id}"
     with httpx.Client(base_url=api_url, timeout=15) as http:
         token = _signup_token(http, session_id)
@@ -189,6 +191,9 @@ def check_contract_credentials(
         threshold={
             "type": "runaway_run",
             "spend_threshold_usd": _SCOPED_CAP_USD,
+            # Core requires an explicit mode on every new/changed runaway_run
+            # rule; the run-scoped denial this fixture provokes is a hard deny.
+            "mode": "hard_deny",
             "channel_ids": [],
         },
     )
@@ -261,6 +266,34 @@ def test_shared_check_contract_against_live(
         event_hooks={"request": [_route_check_contract(credentials)]},
     ) as http:
         assert_check_contract(http, credentials.allow.api_key)
+
+
+@pytest.mark.integration
+def test_shared_run_control_contract_against_live(api_url: str) -> None:
+    # Same provisioning shape as test_live_contract.StoppableRun: ingest one
+    # event to mint the run, resolve its stored id, then stop it over the
+    # dashboard JWT before the pack reads the wire.
+    run_id = f"run-{uuid.uuid4().hex[:12]}"
+    credentials = _create_stopped_project(api_url, run_id=run_id)
+
+    with httpx.Client(base_url=credentials.api_url, timeout=15) as http:
+        assert_run_control_contract(http, credentials.api_key, stopped_run_id=run_id)
+
+
+@pytest.mark.integration
+def test_shared_receipt_ingest_contract_against_live(api_url: str) -> None:
+    host = urlparse(api_url).hostname
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        pytest.skip("denial-receipt live contract requires an explicitly local Core C-1 API")
+    credentials = provision_project(
+        api_url,
+        name="sdk-shared-receipt-contract",
+        budget_limit=100.0,
+        budget_mode="alert_only",
+    )
+
+    with httpx.Client(base_url=credentials.api_url, timeout=15) as http:
+        assert_receipt_ingest_contract(http, credentials.api_key)
 
 
 @pytest.mark.integration
