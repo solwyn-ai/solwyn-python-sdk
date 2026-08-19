@@ -28,6 +28,7 @@ from solwyn._types import (
     LeaseSurrenderRequest,
     MetadataEvent,
     ProviderName,
+    RunControlDirective,
     UntrackedSurfaceReport,
 )
 from solwyn.client import AsyncSolwyn, Solwyn
@@ -50,6 +51,7 @@ MAGIC_MODELS = frozenset(
         "solwyn-test/deny-tag",
         "solwyn-test/deny-stopped",
         "solwyn-test/runaway",
+        "solwyn-test/kill",
         "solwyn-test/lease-ineligible",
     }
 )
@@ -60,7 +62,13 @@ _DENIAL_SCOPES = frozenset({"check", "lease"})
 _RUN_SCOPED_MAGIC_PERIODS = {
     "solwyn-test/deny-stopped": "run_stopped",
     "solwyn-test/runaway": "agent_run",
+    "solwyn-test/kill": "run_stopped",
 }
+_DEFAULT_STOP_REASON = "manual_kill"
+_STOP_REASON_MAX_LENGTH = 64
+# Deterministic stand-in for a server that echoes a directive for the wrong
+# run — the contract drift the SDK must survive without opening its breaker.
+_MISROUTED_RUN_ID = "solwyn-test-misrouted-run"
 _SCOPED_RULES_INELIGIBLE_REASON = "scoped_rules_present"
 _LIVE_CONTRACT_UNPRICED_LEASE_MODEL = "no-such-model-for-leases"
 _LEASE_PATHS = frozenset(
@@ -76,6 +84,7 @@ _ENV_PREFIX = "SOLWYN_"
 # derived by the client constructor from its own arguments.
 _WRAPPER_OWNED_CONFIG_FIELDS = frozenset({"api_key", "api_url", "providers", "default_params"})
 _GRANT_ONLY_LEASE_PATH = "/api/v1/budgets/lease"
+_LEASE_RENEW_PATH = "/api/v1/budgets/lease/renew"
 
 
 def _validate_magic_model(model: object) -> None:
@@ -328,6 +337,8 @@ class FakeControlPlane:
         self._pending_lease_denials: deque[str] = deque()
         self._denied_runs: set[str] = set()
         self._runaway_seen: set[str] = set()
+        self._stopped_runs: dict[str, str] = {}
+        self._kill_seen_runs: set[str] = set()
         self._scenario_windows: list[_ScenarioWindow] = []
         self._active_reservations: set[str] = set()
         self._settled_reservations: set[str] = set()
@@ -376,11 +387,123 @@ class FakeControlPlane:
             self._denied_runs.add(agent_run_id)
 
     def clear_denials(self) -> None:
-        """Clear queued and run-scoped scripts so later checks can recover."""
+        """Clear queued and run-scoped scripts so later checks can recover.
+
+        A run stop is NOT a denial script: it models a dashboard kill the
+        server keeps until an operator lifts it. Use :meth:`clear_stop`.
+        """
         with self._lock:
             self._pending_denials.clear()
             self._pending_lease_denials.clear()
             self._denied_runs.clear()
+
+    def stop_run(self, agent_run_id: str, *, reason: str = _DEFAULT_STOP_REASON) -> None:
+        """Stop one agent run the way a dashboard kill does, from now on.
+
+        Every later check, lease grant, and lease renewal naming
+        ``agent_run_id`` is denied with ``denied_by_period="run_stopped"`` in
+        ``hard_deny`` mode, and carries a version 1 ``run_control`` terminate
+        directive whenever the request opted in with
+        ``run_directive_version="1"`` — the wire the SDK always sends. The
+        directive echoes the requested run id verbatim, so the SDK's own
+        run registry marks that exact run terminated and the wrapper raises
+        ``RunStoppedError``.
+
+        A stop beats a queued :meth:`deny_next` for the same request, exactly
+        as a server kill outranks an ordinary budget verdict, and it consumes
+        no scripted denial. Other runs are untouched.
+
+        ``reason`` is first-writer-wins per run: re-stopping a stopped run with
+        a DIFFERENT reason raises ``RuntimeError`` (two reasons for one run is a
+        scripting bug), while repeating the same reason is a no-op. Stops
+        survive :meth:`reset_recording` and :meth:`clear_denials`;
+        :meth:`clear_stop` is the only reset channel.
+        """
+        if not reason:
+            raise ValueError("reason must not be empty")
+        if len(reason) > _STOP_REASON_MAX_LENGTH:
+            raise ValueError(f"reason must be at most {_STOP_REASON_MAX_LENGTH} characters")
+        with self._lock:
+            self._stop_run_locked(agent_run_id, reason)
+
+    def clear_stop(self, agent_run_id: str) -> None:
+        """Lift a scripted run stop so later requests get ordinary verdicts.
+
+        The plane forgets the stop immediately; whether the SDK's own sticky
+        denial clears is decided client-side by its epoch fencing, which is the
+        behavior this trigger exists to exercise. Clearing an unstopped run is a
+        no-op.
+        """
+        with self._lock:
+            self._stopped_runs.pop(agent_run_id, None)
+
+    @property
+    def stopped_runs(self) -> dict[str, str]:
+        """Currently stopped run ids mapped to their stop reason (a copy)."""
+        with self._lock:
+            return dict(self._stopped_runs)
+
+    @contextmanager
+    def misroute_stops(self, *, requests: int | None = None) -> Iterator[None]:
+        """Echo run-stop directives for the WRONG run: contract drift in a can.
+
+        While active, every emitted ``run_control`` directive names
+        ``"solwyn-test-misrouted-run"`` instead of the requested run. Nothing
+        else changes — the budget verdict is still the run-stopped denial.
+
+        This is the deterministic way to test that server drift degrades ONE
+        call down the unreachable posture ladder without opening the shared
+        control-plane breaker and without marking the SDK's run registry.
+        ``requests`` bounds how many directives are rewritten.
+        """
+        window = _ScenarioWindow("misroute_stops", self._request_count(requests))
+        with self._scenario(window):
+            yield
+
+    def _stop_run_locked(self, agent_run_id: str, reason: str) -> None:
+        """Record a run stop, refusing a second reason for the same run."""
+        existing = self._stopped_runs.get(agent_run_id)
+        if existing is not None:
+            if existing != reason:
+                raise RuntimeError(
+                    f"solwyn.testing: run {agent_run_id!r} is already stopped with reason "
+                    f"{existing!r}; clear_stop() before scripting reason {reason!r}"
+                )
+            return
+        self._stopped_runs[agent_run_id] = reason
+
+    def _run_stop_directive(
+        self,
+        agent_run_id: str | None,
+        denied_by_period: str | None,
+        *,
+        opted_in: bool,
+        path: str,
+    ) -> RunControlDirective | None:
+        """Build the v1 terminate directive for an opted-in stopped request.
+
+        A request carrying no run has no run to guard, an unopted-in request
+        never sees a directive, and only a stop this plane is holding emits one
+        — a scripted ``run_stopped`` denial period stays directive-free.
+        """
+        if not opted_in or agent_run_id is None or denied_by_period != "run_stopped":
+            return None
+        reason = self._stopped_runs.get(agent_run_id)
+        if reason is None:
+            return None
+        return RunControlDirective(
+            version="1",
+            action="terminate",
+            agent_run_id=self._directive_run_id(agent_run_id, path),
+            reason=reason,
+        )
+
+    def _directive_run_id(self, agent_run_id: str, path: str) -> str:
+        """Rewrite the echoed run id while a misroute window is active."""
+        for window in self._scenario_windows:
+            if window.kind == "misroute_stops" and window.consume_if_matching(path):
+                return _MISROUTED_RUN_ID
+        return agent_run_id
 
     def expire_reservations(self) -> None:
         """Invalidate open reservation ids to exercise late settlement handling."""
@@ -706,6 +829,8 @@ class FakeControlPlane:
         verdict = self._lease_chain_verdict(
             parsed.agent_run_id,
             (parsed.model, *parsed.fallback_models),
+            run_opted_in=parsed.run_directive_version == "1",
+            path=_GRANT_ONLY_LEASE_PATH,
         )
         if verdict is not None:
             return PlaneResponse(200, verdict, model_only=True)
@@ -763,6 +888,8 @@ class FakeControlPlane:
         verdict = self._lease_chain_verdict(
             record.agent_run_id,
             tuple(model for _, model in effective_pairs),
+            run_opted_in=parsed.run_directive_version == "1",
+            path=_LEASE_RENEW_PATH,
         )
         if verdict is not None:
             record.last_renewal_from_generation = parsed.generation
@@ -922,12 +1049,18 @@ class FakeControlPlane:
         self,
         agent_run_id: str,
         models: tuple[str, ...],
+        *,
+        run_opted_in: bool,
+        path: str,
     ) -> LeaseGrantResponse | None:
         """Return the terminal lease verdict for one chain, or None to proceed.
 
         Every lease-path denial is a hard deny, a stopped run reports no
         remaining budget, and a tag-scoped trigger surfaces as lease
         ineligibility because scoped rules keep the whole project off leases.
+        A stopped run's denial carries the v1 terminate directive whenever the
+        grant or renewal request opted in, on the stopped-lease shape: the
+        whole lease block is omitted, so the holder keeps no authority.
         """
         denied_by_period, _trigger_model, ineligible = self._evaluate_chain(
             agent_run_id,
@@ -947,6 +1080,12 @@ class FakeControlPlane:
                 denied_by_period=denied_by_period,
                 mode=BudgetMode.HARD_DENY,
                 remaining_budget=self._denied_remaining_budget(denied_by_period),
+                run_control=self._run_stop_directive(
+                    agent_run_id,
+                    denied_by_period,
+                    opted_in=run_opted_in,
+                    path=path,
+                ),
             )
         if ineligible:
             return self._lease_verdict_response(
@@ -971,6 +1110,7 @@ class FakeControlPlane:
         denied_by_period: str | None = None,
         mode: BudgetMode | None = None,
         remaining_budget: float | None = None,
+        run_control: RunControlDirective | None = None,
     ) -> LeaseGrantResponse:
         return LeaseGrantResponse(
             eligible=eligible,
@@ -984,6 +1124,7 @@ class FakeControlPlane:
             remaining_budget=(
                 self.remaining_budget if remaining_budget is None else remaining_budget
             ),
+            run_control=run_control,
         )
 
     @staticmethod
@@ -1092,6 +1233,13 @@ class FakeControlPlane:
             self._active_reservations.add(reservation_id)
 
         opted_in = parsed.failover_directive_version == "1"
+        run_opted_in = parsed.run_directive_version == "1"
+        run_control = self._run_stop_directive(
+            parsed.agent_run_id,
+            denied_by_period,
+            opted_in=run_opted_in,
+            path="/api/v1/budgets/check",
+        )
         response = BudgetCheckResponse(
             allowed=denied_by_period is None,
             remaining_budget=remaining_budget,
@@ -1114,11 +1262,15 @@ class FakeControlPlane:
                 if opted_in
                 else None
             ),
+            run_control=run_control,
         )
         return PlaneResponse(
             200,
             response,
-            exclude_none=opted_in,
+            # Either directive-v1 opt-in puts the response on core's
+            # exclude-none wire; a request opting into neither is the legacy
+            # nullable shape.
+            exclude_none=opted_in or run_opted_in,
             model_only=True,
         )
 
@@ -1207,6 +1359,11 @@ class FakeControlPlane:
         ``agent_run_id`` fails the scenario loudly instead of silently drifting
         from the live plane.
         """
+        if agent_run_id is not None and agent_run_id in self._stopped_runs:
+            # A server kill outranks an ordinary verdict and consumes no
+            # scripted denial — the queued script is still owed to some other
+            # request, exactly as the live plane leaves it.
+            return "run_stopped", None, False
         pending = self._pending_lease_denials if lease else self._pending_denials
         if pending:
             period = pending.popleft()
@@ -1233,6 +1390,17 @@ class FakeControlPlane:
                 if agent_run_id in self._runaway_seen:
                     return "agent_run", model, False
                 self._runaway_seen.add(agent_run_id)
+                return None, model, False
+            if model == "solwyn-test/kill":
+                if agent_run_id is None:
+                    raise _run_scope_error(_RUN_SCOPED_MAGIC_PERIODS[model])
+                if agent_run_id in self._kill_seen_runs:
+                    # Every later sighting behaves exactly as a scripted
+                    # stop_run(): the stop is recorded, so the run stays dead
+                    # on every channel, not just this model's requests.
+                    self._stop_run_locked(agent_run_id, _DEFAULT_STOP_REASON)
+                    return "run_stopped", model, False
+                self._kill_seen_runs.add(agent_run_id)
                 return None, model, False
             if lease and model in {
                 "solwyn-test/lease-ineligible",
