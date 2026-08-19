@@ -14,6 +14,7 @@ import pytest
 from conftest import call_uuid
 from pydantic import ValidationError
 
+from solwyn._constants import AGENT_RUN_ID_MAX_LENGTH
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
     BudgetConfirmRequest,
@@ -24,6 +25,7 @@ from solwyn._types import (
     LeaseRenewRequest,
     LeaseSurrenderRequest,
     ProviderName,
+    RunControlDirective,
 )
 
 # A grant/renew response with every optional field present.
@@ -95,6 +97,27 @@ class TestLeaseGrantRequest:
         assert payload["agent_run_id"] == "run_1"
         assert payload["provider"] == "openai"
         assert payload["estimated_input_tokens"] == 1_000
+        assert "run_directive_version" not in payload
+
+    def test_run_directive_opt_in_round_trips(self) -> None:
+        request = LeaseGrantRequest(
+            agent_run_id="run_1",
+            holder_id="sdk-instance-1",
+            model="gpt-5.5",
+            provider=ProviderName.OPENAI,
+            run_directive_version="1",
+        )
+
+        assert request.model_dump(mode="json")["run_directive_version"] == "1"
+
+        with pytest.raises(ValidationError):
+            LeaseGrantRequest(
+                agent_run_id="run_1",
+                holder_id="sdk-instance-1",
+                model="gpt-5.5",
+                provider=ProviderName.OPENAI,
+                run_directive_version="2",  # type: ignore[arg-type]
+            )
 
     def test_rejects_extra_fields(self) -> None:
         with pytest.raises(ValidationError):
@@ -187,6 +210,17 @@ class TestLeaseRenewRequest:
         assert payload["generation"] == 3
         assert payload["spent_tokens"] == 1_234
         assert payload["uncounted_calls"] == 2
+        assert "run_directive_version" not in payload
+
+    def test_run_directive_opt_in_round_trips(self) -> None:
+        request = LeaseRenewRequest(
+            lease_id="lse_abc",
+            holder_id="sdk-instance-1",
+            generation=3,
+            run_directive_version="1",
+        )
+
+        assert request.model_dump(mode="json")["run_directive_version"] == "1"
 
     def test_redeclaration_present_when_set(self) -> None:
         request = LeaseRenewRequest(
@@ -293,7 +327,33 @@ class TestLeaseGrantResponse:
         assert response.final_grant is False
         assert response.ineligible_reason is None
         assert response.denied_by_period is None
+        assert response.run_control is None
 
+    def test_response_with_and_without_run_control_is_compatible(self) -> None:
+        legacy = LeaseGrantResponse.model_validate(_FULL_RESPONSE)
+        directed = LeaseGrantResponse.model_validate(
+            {
+                **_FULL_RESPONSE,
+                "run_control": {
+                    "version": "1",
+                    "action": "terminate",
+                    "agent_run_id": "run_1",
+                    "reason": "manual_kill",
+                },
+            }
+        )
+
+        assert legacy.run_control is None
+        assert directed.run_control == RunControlDirective(
+            version="1",
+            action="terminate",
+            agent_run_id="run_1",
+            reason="manual_kill",
+        )
+
+
+@pytest.mark.unit
+class TestLeaseGrantResponseOmissions:
     def test_ineligible_response_omits_every_lease_field(self) -> None:
         # Arrange — an ineligible run's response carries only the display snapshot
         # plus the reason (core serializes directive-v1 style exclude_none).
@@ -358,6 +418,31 @@ class TestLeaseGrantResponse:
             LeasePosture.model_validate(
                 {"mode": "alert_only", "on_unreachable": "fail_open", "extra": 1}
             )
+
+
+@pytest.mark.unit
+class TestRunControlDirective:
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"version": "2"},
+            {"action": "pause"},
+            {"agent_run_id": "x" * (AGENT_RUN_ID_MAX_LENGTH + 1)},
+            {"reason": "x" * 65},
+            {"surprise": True},
+        ],
+    )
+    def test_rejects_invalid_contract_shapes(self, override: dict[str, Any]) -> None:
+        payload: dict[str, Any] = {
+            "version": "1",
+            "action": "terminate",
+            "agent_run_id": "run_1",
+            "reason": "manual_kill",
+        }
+        payload.update(override)
+
+        with pytest.raises(ValidationError):
+            RunControlDirective.model_validate(payload)
 
 
 def _confirm(**overrides: Any) -> BudgetConfirmRequest:

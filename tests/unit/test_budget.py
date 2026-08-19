@@ -9,6 +9,7 @@ import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
 from pydantic import BaseModel
 
+from solwyn._lease import LeaseAdmission, LeaseDecision
 from solwyn._run_control import (
     clear_run_termination,
     mark_terminated,
@@ -114,7 +115,9 @@ class TestBudgetEnforcerBase:
         assert req.model == "gpt-5.5"
         assert req.provider == "openai"
         assert req.failover_directive_version == "1"
+        assert req.run_directive_version == "1"
         assert req.model_dump(mode="json")["failover_directive_version"] == "1"
+        assert req.model_dump(mode="json")["run_directive_version"] == "1"
 
     def test_build_check_request_carries_agent_run_id(self) -> None:
         base = _BudgetEnforcerBase(
@@ -377,6 +380,98 @@ class TestCloudAllow:
         assert result.warning is None
         assert result.failover_tuning_allowed is True
 
+    def test_ordered_live_allow_keeps_old_handle_stopped_but_new_handle_clean(self) -> None:
+        from solwyn._run_control import _acquire_termination_handle
+
+        enforcer = _make_legacy_enforcer()
+        old = _acquire_termination_handle("run_server_allow")
+        mark_terminated("run_server_allow", reason="old_stop", source="server")
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            return_value=_response(ALLOW_BUDGET_RESPONSE),
+        ):
+            result = enforcer.check_budget(
+                estimated_input_tokens=500,
+                estimated_output_bound=100,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run_server_allow",
+                call_id="3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b",
+            )
+        new = _acquire_termination_handle("run_server_allow")
+
+        assert result.allowed is True
+        assert old.termination is not None
+        assert old.termination.reason == "old_stop"
+        assert new.termination is None
+        new.release()
+        old.release()
+        enforcer.close()
+
+    @pytest.mark.parametrize("first_stop_before_request", [False, True])
+    def test_newer_stop_observation_survives_registry_eviction_during_check(
+        self,
+        first_stop_before_request: bool,
+    ) -> None:
+        from solwyn._run_control import _acquire_termination_handle
+
+        run_id = f"run_ordered_lru_sync_{first_stop_before_request}"
+        churn_prefix = f"ordered_lru_sync_{first_stop_before_request}"
+        enforcer = _make_legacy_enforcer()
+        old = _acquire_termination_handle(run_id)
+        new = None
+        if first_stop_before_request:
+            with patch("solwyn._run_control.time.monotonic", return_value=1.0):
+                mark_terminated(run_id, reason="first_stop", source="server")
+
+        def allow_after_newer_stop(*_args: object, **_kwargs: object) -> MagicMock:
+            with patch("solwyn._run_control.time.monotonic", return_value=3.0):
+                mark_terminated(run_id, reason="newer_stop", source="server")
+                for index in range(300):
+                    mark_terminated(
+                        f"{churn_prefix}_{index}",
+                        reason="unrelated",
+                        source="server",
+                    )
+            return _response(ALLOW_BUDGET_RESPONSE)
+
+        try:
+            with (
+                patch("solwyn.budget.time.monotonic", return_value=2.0),
+                patch.object(
+                    enforcer._http,
+                    "post",
+                    side_effect=allow_after_newer_stop,
+                ),
+            ):
+                result = enforcer.check_budget(
+                    estimated_input_tokens=500,
+                    estimated_output_bound=100,
+                    model="gpt-5.5",
+                    provider="openai",
+                    agent_run_id=run_id,
+                    call_id="3f1a2b4c-5d6e-4f70-8a9b-0c1d2e3f4a5b",
+                )
+            new = _acquire_termination_handle(run_id)
+
+            assert (result.allowed, result.denied_by_period, result.deny_reason) == (
+                False,
+                "run_stopped",
+                "first_stop" if first_stop_before_request else "newer_stop",
+            )
+            assert old.termination is not None
+            assert new.termination is old.termination
+        finally:
+            if new is not None:
+                new.release()
+            old.release()
+            clear_run_termination(run_id)
+            for index in range(300):
+                clear_run_termination(f"{churn_prefix}_{index}")
+            enforcer.close()
+
     def test_tagged_run_uses_per_call_check_and_sends_tags(self) -> None:
         enforcer = _make_enforcer()
         mock_response = MagicMock()
@@ -398,6 +493,7 @@ class TestCloudAllow:
         post.assert_called_once()
         assert post.call_args.args[0].endswith("/api/v1/budgets/check")
         assert post.call_args.kwargs["json"]["tags"] == {"team": "research"}
+        assert post.call_args.kwargs["json"]["run_directive_version"] == "1"
 
     def test_shared_allow_fixture_propagates_non_none_price_hints(self) -> None:
         enforcer = _make_enforcer()
@@ -1337,6 +1433,8 @@ class TestBudgetCheckResult:
         assert result.mode == BudgetMode.ALERT_ONLY
         assert result.warning is None
         assert result.denied_by_period is None
+        assert result.deny_source is None
+        assert result.deny_reason is None
         assert result.failover_tuning_allowed is None
 
     def test_all_fields(self) -> None:
@@ -1352,6 +1450,103 @@ class TestBudgetCheckResult:
         assert result.reservation_id == "res_456"
         assert result.mode == BudgetMode.HARD_DENY
         assert result.denied_by_period == "run_stopped"
+
+
+@pytest.mark.unit
+class TestDenialReceiptAttribution:
+    """Every sans-I/O denial builder stamps its structural source."""
+
+    def test_live_hard_deny_is_server_attributed_with_exact_period(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+
+        result = base._build_result_from_response(
+            BudgetCheckResponse.model_validate(_STOPPED_RUN_DENY_RESPONSE)
+        )
+
+        assert (result.deny_source, result.deny_reason, result.denied_by_period) == (
+            "server",
+            "run_stopped",
+            "run_stopped",
+        )
+
+    @pytest.mark.parametrize("payload", [ALLOW_BUDGET_RESPONSE, _ALERT_ONLY_DENY_RESPONSE])
+    def test_allowed_result_has_no_denial_attribution(self, payload: dict[str, object]) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+
+        result = base._build_result_from_response(BudgetCheckResponse.model_validate(payload))
+
+        assert result.allowed is True
+        assert result.deny_source is None
+        assert result.deny_reason is None
+
+    def test_sticky_replay_preserves_exact_period_and_reason(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+        response = BudgetCheckResponse.model_validate(_STOPPED_RUN_DENY_RESPONSE)
+        base._cache_response(response, agent_run_id="run_a")
+
+        result = base._build_prior_hard_deny_unavailable_result("run_a")
+
+        assert result is not None
+        assert (result.deny_source, result.deny_reason, result.denied_by_period) == (
+            "sticky_replay",
+            "run_stopped",
+            "run_stopped",
+        )
+
+    def test_fail_closed_local_builders_use_structural_reasons(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+            fail_open=False,
+        )
+
+        cold = base._build_local_enforcement_result(estimated_input_tokens=10)
+        base._last_known_budget_limit = 1.0
+        base._track_local_cost(1.0)
+        exhausted = base._build_local_enforcement_result(estimated_input_tokens=10)
+
+        assert (cold.allowed, cold.deny_source, cold.deny_reason) == (
+            False,
+            "local_enforcement",
+            "no_prior_budget_limit",
+        )
+        assert (exhausted.allowed, exhausted.deny_source, exhausted.deny_reason) == (
+            False,
+            "local_enforcement",
+            "local_budget_exceeded",
+        )
+        assert cold.denied_by_period is None
+        assert exhausted.denied_by_period is None
+
+    def test_lease_ladder_terminal_deny_preserves_reason_and_period(self) -> None:
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai",
+            api_key=VALID_API_KEY,
+        )
+
+        result = base._result_from_admission(
+            "run_a",
+            LeaseAdmission(
+                LeaseDecision.DENY,
+                mode=BudgetMode.HARD_DENY,
+                reason="lease_share_exhausted",
+            ),
+        )
+
+        assert (result.deny_source, result.deny_reason, result.denied_by_period) == (
+            "lease_exhausted",
+            "lease_share_exhausted",
+            "agent_run",
+        )
 
 
 # ---------------------------------------------------------------------------

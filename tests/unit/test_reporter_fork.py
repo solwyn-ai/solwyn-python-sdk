@@ -264,13 +264,16 @@ def test_sync_reporter_reset_relaunches_thread_and_swaps_client() -> None:
 
 
 @pytest.mark.unit
-def test_sync_reporter_reset_closed_stays_closed() -> None:
+def test_sync_reporter_reset_completed_delivery_stays_terminal() -> None:
     reporter = _quiet(flush_interval=3600.0)  # _shutdown SET
+    reporter._seal_delivery()
     old_http = reporter._http
 
     reporter._reset_after_fork_in_child()
 
     assert reporter._shutdown.is_set()
+    assert reporter._delivery_closed is True
+    assert reporter._delivery_completed is True
     assert not reporter._thread.is_alive()  # no relaunch for a closed reporter
     reporter._http.close()
     old_http.close()

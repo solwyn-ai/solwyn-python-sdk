@@ -107,7 +107,7 @@ def _active_group_termination_locked(
     *,
     source: TerminationSource | None = None,
 ) -> RunTermination | None:
-    """Return a winner only from the active group's current generation."""
+    """Return a winner only from the active group's current clear epoch."""
     group = _STATE.active_handles.get(run_id)
     if group is None:
         return None
@@ -150,8 +150,15 @@ def _mark_terminated_locked(
     *,
     reason: str,
     source: TerminationSource,
-) -> RunTermination:
-    """First-writer mark while ``_STATE.lock`` is already held."""
+) -> tuple[RunTermination, float]:
+    """First-writer mark while ``_STATE.lock`` is already held.
+
+    Returns the preserved winner AND the stamp this mark recorded. Callers
+    that also file an enforcer-side sticky denial must reuse THIS value rather
+    than read the clock again: the registry and the sticky are ordered against
+    the same request epochs, so two stamps would let one live ALLOW clear the
+    registry while the sticky survives and denies.
+    """
     observed_at = time.monotonic()
     group = _STATE.active_handles.get(run_id)
     termination = _STATE.terminations.get(run_id)
@@ -186,7 +193,7 @@ def _mark_terminated_locked(
             if handle.generation == group.generation and handle.termination is None:
                 handle.termination = termination
     _trim_registry_locked()
-    return termination
+    return termination, observed_at
 
 
 def _clear_server_termination_before_request_locked(
@@ -235,7 +242,12 @@ def mark_terminated(
 ) -> RunTermination:
     """Return the preserved first winner while recording the latest stop."""
     with _STATE.lock:
-        return _mark_terminated_locked(run_id, reason=reason, source=source)
+        termination, _observed_at = _mark_terminated_locked(
+            run_id,
+            reason=reason,
+            source=source,
+        )
+        return termination
 
 
 def _acquire_termination_handle(run_id: str) -> _TerminationHandle:
@@ -270,6 +282,21 @@ def run_termination(run_id: str) -> RunTermination | None:
         return termination
 
 
+def run_observed_at(run_id: str) -> float | None:
+    """Return the stamp the registry last ordered this run's stop against.
+
+    The enforcer files its sticky denial after the registry mark returns, so a
+    re-cache on that path must adopt THIS stamp instead of reading the clock a
+    second time — see ``_mark_terminated_locked``.
+    """
+    with _STATE.lock:
+        observed_at = _STATE.observed_at.get(run_id)
+        if observed_at is not None:
+            return observed_at
+        group = _STATE.active_handles.get(run_id)
+        return group.observed_at if group is not None else None
+
+
 def _outage_termination_locked(run_id: str) -> RunTermination | None:
     """Return any exact or active stop while ``_STATE.lock`` is held."""
     termination = _STATE.terminations.get(run_id)
@@ -299,7 +326,19 @@ def clear_termination_if(run_id: str, *, source: TerminationSource) -> None:
 
 
 def clear_run_termination(run_id: str) -> None:
-    """Clear any termination source for ``run_id``."""
+    """Clear any termination source for ``run_id``.
+
+    Clearing is forward-looking only. It drops the registry entry and advances
+    the active group's generation, so every LATER call and every stream that
+    has not yet latched a stop sees a live run again. A stream whose watcher
+    already latched the termination keeps aborting: the latched value is
+    immutable on the handle (``_TerminationHandle.termination``), and
+    ``client._stream_abort_exception`` reads that cell, not the registry.
+    That is deliberate — an in-flight stream was admitted under an authority
+    that has since said stop, and re-admitting it mid-body would need spend
+    authority no one has re-granted. Restart the stream to run under the
+    cleared state.
+    """
     with _STATE.lock:
         termination = _STATE.terminations.pop(run_id, None)
         sibling_termination = _active_group_termination_locked(run_id)

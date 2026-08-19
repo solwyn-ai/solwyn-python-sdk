@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,13 +25,20 @@ import httpx
 import pytest
 from conftest import VALID_API_KEY, call_uuid
 
-from solwyn._lifecycle import _drain_queues_blocking, blocking_exit_flush
+import solwyn._lifecycle as lifecycle
+from solwyn._lifecycle import (
+    _drain_queues_blocking,
+    _ExitIngestRejectionKind,
+    _gc_drop_counter,
+    _parse_exit_ingest_rejections,
+    blocking_exit_flush,
+)
 from solwyn._surfaces import SurfaceContext
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
 from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.client import AsyncSolwyn
-from solwyn.reporter import AsyncMetadataReporter
+from solwyn.reporter import AsyncMetadataReporter, MetadataReporter, _IngestRejectionKind
 
 _URL = "https://api.test.solwyn.ai"
 
@@ -463,6 +471,222 @@ def test_gc_finalizer_losses_are_logged(
 
 
 @pytest.mark.unit
+def test_gc_finalizer_failed_aggregate_logs_underlying_receipt_count(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A terminal aggregate replay represents every folded denial, not one."""
+
+    def _down(_url: str) -> object:
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(httpx, "Client", _make_recording_client([], _down))
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter._fold_or_count_event_drop(
+        _make_event(
+            status="budget_denied",
+            output_tokens=0,
+            agent_run_id="gc-fold-run",
+            deny_source="server",
+            deny_reason="structural",
+            estimated_output_bound=20,
+            receipt_aggregate_count=5,
+        ),
+        "retry_exhausted",
+    )
+
+    with caplog.at_level("WARNING", logger="solwyn._lifecycle"):
+        del reporter
+        gc.collect()
+
+    assert "lifecycle.gc_flush_dropped" in caplog.text
+    assert "kind=event" in caplog.text
+    assert "reason=retry_exhausted" in caplog.text
+    assert "n=5" in caplog.text
+
+
+@pytest.mark.unit
+def test_gc_finalizer_full_legacy_rejection_logs_aggregate_cardinality(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class _LegacyRejectResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "ingested": 0,
+                "rejected": [
+                    {
+                        "code": "unknown_model",
+                        "model": "gpt-5.5",
+                        "message": "structural",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        httpx, "Client", _make_recording_client([], lambda _url: _LegacyRejectResponse())
+    )
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter.report(
+        _make_event(
+            status="budget_denied",
+            output_tokens=0,
+            agent_run_id="gc-legacy-run",
+            deny_source="aggregate_replay",
+            deny_reason=None,
+            estimated_output_bound=20,
+            receipt_aggregate_count=100,
+        )
+    )
+
+    with caplog.at_level("WARNING", logger="solwyn._lifecycle"):
+        del reporter
+        gc.collect()
+
+    assert "lifecycle.gc_flush_dropped" in caplog.text
+    assert "reason=ingest_rejected" in caplog.text
+    assert "n=100" in caplog.text
+
+
+@pytest.mark.unit
+def test_gc_finalizer_exact_index_rejection_disposes_only_the_named_event(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The GC/atexit parser resolves EXACT indexes against its own batch: only
+    the named member is terminal, and it is counted at full receipt weight."""
+
+    class _ExactRejectResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "ingested": 1,
+                "rejected": [
+                    {
+                        "index": 1,
+                        "code": "unknown_model",
+                        "model": "gpt-5.5",
+                        "message": "structural",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        httpx, "Client", _make_recording_client([], lambda _url: _ExactRejectResponse())
+    )
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter.report(_make_event(call_id=call_uuid("gc-exact-accepted")))
+    reporter.report(
+        _make_event(
+            call_id=call_uuid("gc-exact-rejected"),
+            status="budget_denied",
+            output_tokens=0,
+            agent_run_id="gc-exact-run",
+            deny_source="aggregate_replay",
+            deny_reason=None,
+            estimated_output_bound=20,
+            receipt_aggregate_count=4,
+        )
+    )
+
+    with caplog.at_level("WARNING", logger="solwyn._lifecycle"):
+        del reporter
+        gc.collect()
+
+    drops = [
+        record.getMessage()
+        for record in caplog.records
+        if "lifecycle.gc_flush_dropped" in record.getMessage()
+    ]
+    assert len(drops) == 1
+    assert "kind=event" in drops[0]
+    assert "reason=ingest_rejected" in drops[0]
+    assert "n=4" in drops[0]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("rejected", "expected_kind", "expected_count"),
+    [
+        # Exact indexes agree.
+        ([{"index": 0, "code": "c", "model": "m", "message": "x"}], "exact", 1),
+        # Missing (code, model, message) costs the WARNING, never the identity.
+        ([{"index": 0}], "exact", 1),
+        # Index-shape violations degrade to the count the legacy parser proved.
+        (
+            [
+                {"index": 0, "code": "c", "model": "m", "message": "x"},
+                {"index": 0, "code": "c", "model": "m", "message": "x"},
+            ],
+            "legacy",
+            2,
+        ),
+        ([{"index": 5, "code": "c", "model": "m", "message": "x"}], "legacy", 1),
+        ([{"index": -1, "code": "c", "model": "m", "message": "x"}], "legacy", 1),
+        ([{"index": 0.5, "code": "c", "model": "m", "message": "x"}], "legacy", 1),
+        ([{"code": "c", "model": "m", "message": "x"}], "legacy", 1),
+        # Only an untrustworthy COUNT stays malformed.
+        (["not-a-dict"], "malformed", 0),
+    ],
+)
+def test_both_ingest_rejection_parsers_reach_the_same_disposition(
+    rejected: list[object], expected_kind: str, expected_count: int
+) -> None:
+    """Same server body, same accounting: the in-process reporter and the exit
+    twin must never disagree about how much loss a 202 proves."""
+    response = MagicMock(spec=httpx.Response)
+    response.json.return_value = {"ingested": 0, "rejected": rejected}
+    reporter = MetadataReporter(
+        _URL,
+        VALID_API_KEY,
+        flush_interval=60.0,
+        breaker_reporting_enabled=False,
+        report_untracked_surfaces=False,
+    )
+    try:
+        in_process = reporter._parse_ingest_rejections(response, 2)
+    finally:
+        reporter.close(timeout=1.0)
+    at_exit = _parse_exit_ingest_rejections(response, 2)
+
+    assert in_process.kind is _IngestRejectionKind(expected_kind)
+    assert at_exit.kind is _ExitIngestRejectionKind(expected_kind)
+    assert in_process.count == at_exit.count == expected_count
+    assert set(in_process.indexes) == set(at_exit.indexes)
+
+
+@pytest.mark.unit
+def test_gc_drop_logging_exceptions_do_not_abort_remaining_exit_dispositions() -> None:
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter.report_confirm(_make_confirm_request())
+    reporter.report(_make_event())
+
+    with patch("solwyn._lifecycle.logger.warning", side_effect=RuntimeError("handler")) as warning:
+        _drain_queues_blocking(
+            reporter._confirm_queue,
+            reporter._settlement_queue,
+            reporter._queue,
+            reporter.api_url,
+            reporter.api_key,
+            reporter._control_plane_breaker,
+            0.0,
+            _gc_drop_counter,
+            reporter._untracked_state,
+            reporter._receipt_fold_state,
+            reporter._sdk_instance_id,
+        )
+
+    assert warning.call_count == 2
+    assert not reporter._confirm_queue
+    assert not reporter._queue
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+    reporter._close_completed = True
+
+
+@pytest.mark.unit
 def test_exit_flush_skips_when_breaker_open(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -669,6 +893,489 @@ def test_exit_flush_counts_202_rejections(monkeypatch: pytest.MonkeyPatch) -> No
     assert not reporter.dropped_counts.get("settlement_confirm.terminal_status")
     if reporter._finalizer is not None:
         reporter._finalizer.detach()
+
+
+@pytest.mark.unit
+def test_exit_flush_counts_legacy_indexless_rejections_without_guessing_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy 202 bodies prove a loss count but not which event was rejected."""
+    sink: list[str] = []
+
+    class _LegacyRejectResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "ingested": 0,
+                "rejected": [
+                    {
+                        "code": "unknown_model",
+                        "model": "gpt-5.5",
+                        "message": "structural",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        httpx, "Client", _make_recording_client(sink, lambda _url: _LegacyRejectResponse())
+    )
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    denied = _make_event(
+        call_id=call_uuid("legacy-pair-denied"),
+        status="budget_denied",
+        output_tokens=0,
+        agent_run_id="legacy-run",
+        deny_source="server",
+        deny_reason="structural",
+        estimated_output_bound=20,
+    )
+    reporter.report_settlement(_make_confirm_request(), denied)
+    reporter.report(_make_event(call_id=call_uuid("legacy-standalone-success")))
+
+    blocking_exit_flush(reporter)
+    blocking_exit_flush(reporter)  # ownership was released; no shutdown double count
+
+    assert reporter.dropped_counts.get("event.ingest_rejected") == 2
+    assert reporter._receipt_fold_snapshot() == {}
+    assert not reporter._settlement_queue
+    assert not reporter._queue
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+
+
+@pytest.mark.unit
+def test_exit_flush_full_legacy_rejection_counts_aggregate_cardinality(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _LegacyRejectResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "ingested": 0,
+                "rejected": [
+                    {
+                        "code": "unknown_model",
+                        "model": "gpt-5.5",
+                        "message": "structural",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        httpx, "Client", _make_recording_client([], lambda _url: _LegacyRejectResponse())
+    )
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter.report(
+        _make_event(
+            status="budget_denied",
+            output_tokens=0,
+            agent_run_id="exit-legacy-run",
+            deny_source="aggregate_replay",
+            deny_reason=None,
+            estimated_output_bound=20,
+            receipt_aggregate_count=100,
+        )
+    )
+
+    blocking_exit_flush(reporter)
+
+    assert reporter.dropped_counts == {"event.ingest_rejected": 100}
+    assert reporter._receipt_fold_snapshot() == {}
+    assert not reporter._queue
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+
+
+@pytest.mark.unit
+def test_exit_flush_partial_legacy_rejection_charges_the_heaviest_receipt_weight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _LegacyRejectResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {
+                "ingested": 1,
+                "rejected": [
+                    {
+                        "code": "unknown_model",
+                        "model": "gpt-5.5",
+                        "message": "structural",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(
+        httpx, "Client", _make_recording_client([], lambda _url: _LegacyRejectResponse())
+    )
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter.report(
+        _make_event(
+            call_id=call_uuid("exit-partial-aggregate"),
+            status="budget_denied",
+            output_tokens=0,
+            agent_run_id="exit-partial-run",
+            deny_source="aggregate_replay",
+            deny_reason=None,
+            estimated_output_bound=20,
+            receipt_aggregate_count=100,
+        )
+    )
+    reporter.report(_make_event(call_id=call_uuid("exit-partial-success")))
+
+    blocking_exit_flush(reporter)
+
+    # One proven rejection, no proven identity: the heaviest candidate in the
+    # batch is charged so an aggregate receipt can never be understated.
+    assert reporter.dropped_counts == {"event.ingest_rejected": 100}
+    assert reporter._receipt_fold_snapshot() == {}
+    assert not reporter._queue
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("invalid_index", [0.9, True])
+def test_exit_flush_non_integer_rejection_index_degrades_to_legacy_count_only(
+    monkeypatch: pytest.MonkeyPatch, invalid_index: object
+) -> None:
+    class _MalformedIndexResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, object]:
+            return {"ingested": 1, "rejected": [{"index": invalid_index}]}
+
+    monkeypatch.setattr(
+        httpx, "Client", _make_recording_client([], lambda _url: _MalformedIndexResponse())
+    )
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter.report(
+        _make_event(
+            call_id=call_uuid("exit-malformed-denied"),
+            status="budget_denied",
+            output_tokens=0,
+            agent_run_id="exit-malformed-run",
+            deny_source="server",
+            deny_reason="structural",
+            estimated_output_bound=20,
+        )
+    )
+    reporter.report(_make_event(call_id=call_uuid("exit-malformed-success")))
+
+    blocking_exit_flush(reporter)
+
+    # Same rule as the in-process parser: an unusable index costs identity,
+    # never the count. The denied event stays unfolded (identity unproven).
+    assert reporter.dropped_counts == {"event.ingest_rejected": 1}
+    assert reporter._receipt_fold_snapshot() == {}
+    assert not reporter._queue
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+
+
+@pytest.mark.unit
+def test_exit_flush_refuses_reentrant_async_report_after_final_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        httpx, "Client", _make_recording_client([], lambda _url: _terminal_response(400))
+    )
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter.report(_make_event(call_id=call_uuid("exit-before-reentrant")))
+    reentrant = _make_event(call_id=call_uuid("exit-reentrant"))
+    reentered = threading.Event()
+
+    monkeypatch.setattr(lifecycle, "_LIVE_SYNC_REPORTERS", [])
+    monkeypatch.setattr(lifecycle, "_LIVE_ASYNC_REPORTERS", [reporter])
+    monkeypatch.setattr(lifecycle, "_exit_surrender_all", lambda: None)
+
+    def warning(message: str, *_args: object, **_kwargs: object) -> None:
+        if message.startswith("reporter.spend_events_dropped") and not reentered.is_set():
+            reentered.set()
+            reporter.report(reentrant)
+
+    with patch("solwyn.reporter.logger.warning", side_effect=warning):
+        lifecycle._exit_flush_all()
+
+    assert reentered.is_set()
+    assert reporter._closed is True
+    assert reporter.dropped_counts == {
+        "event.terminal_status": 1,
+        "event.closed_enqueue": 1,
+    }
+    assert reporter._receipt_fold_snapshot() == {}
+    assert not reporter._queue
+    if reporter._finalizer is not None:
+        reporter._finalizer.detach()
+    reporter._close_completed = True
+    asyncio.run(reporter._http.aclose())
+
+
+@pytest.mark.unit
+def test_exit_flush_waits_for_sync_seal_dispositions_before_skipping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The enqueue gate is not a completion marker until seal publishes loss."""
+    reporter = MetadataReporter(
+        _URL,
+        VALID_API_KEY,
+        flush_interval=60.0,
+        shutdown_deadline=0.5,
+        breaker_reporting_enabled=False,
+        report_untracked_surfaces=False,
+    )
+    reporter.report(_make_event(call_id=call_uuid("mid-seal-exit")))
+    mutation_entered = threading.Event()
+    release_mutation = threading.Event()
+    seal_finished = threading.Event()
+    exit_finished = threading.Event()
+    original_record = reporter._record_drop
+
+    def gated_record(kind: str, reason: str, n: int = 1) -> None:
+        if (
+            threading.current_thread().name == "sync-seal-race"
+            and kind == "event"
+            and reason == "shutdown_deadline"
+        ):
+            mutation_entered.set()
+            assert release_mutation.wait(timeout=5.0)
+        original_record(kind, reason, n)
+
+    def seal() -> None:
+        reporter._seal_delivery()
+        seal_finished.set()
+
+    def exit_flush() -> None:
+        lifecycle._exit_flush_all()
+        exit_finished.set()
+
+    monkeypatch.setattr(lifecycle, "_LIVE_SYNC_REPORTERS", [reporter])
+    monkeypatch.setattr(lifecycle, "_LIVE_ASYNC_REPORTERS", [])
+    monkeypatch.setattr(lifecycle, "_exit_surrender_all", lambda: None)
+    sealer = threading.Thread(target=seal, name="sync-seal-race", daemon=True)
+    exiter = threading.Thread(target=exit_flush, name="sync-exit-race", daemon=True)
+    try:
+        with patch.object(reporter, "_record_drop", side_effect=gated_record):
+            sealer.start()
+            assert mutation_entered.wait(timeout=2.0)
+            assert reporter._delivery_closed is True
+            assert getattr(reporter, "_delivery_completed", False) is False
+            assert not reporter._queue
+            assert reporter.dropped_counts == {}
+
+            exiter.start()
+            assert not exit_finished.wait(timeout=0.1), (
+                "exit returned while seal still owned an unpublished event disposition"
+            )
+            release_mutation.set()
+            sealer.join(timeout=2.0)
+            exiter.join(timeout=2.0)
+
+        assert seal_finished.is_set()
+        assert exit_finished.is_set()
+        assert reporter._delivery_completed is True
+        assert reporter.dropped_counts == {"event.shutdown_deadline": 1}
+        assert not reporter._queue
+    finally:
+        release_mutation.set()
+        sealer.join(timeout=2.0)
+        exiter.join(timeout=2.0)
+        if not reporter._shutdown.is_set():
+            reporter.close(timeout=1.0)
+
+
+@pytest.mark.unit
+def test_worker_reentrant_close_finalizes_before_last_sync_reporter_reference_drops() -> None:
+    """A weak registry cannot rescue spend after the worker releases its last ref."""
+    reporter = MetadataReporter(
+        _URL,
+        VALID_API_KEY,
+        batch_size=1,
+        flush_interval=0.01,
+        max_send_attempts=5,
+        retry_backoff_base=60.0,
+        retry_backoff_cap=60.0,
+        shutdown_deadline=1.0,
+        breaker_reporting_enabled=False,
+        report_untracked_surfaces=False,
+    )
+    current = _make_event(call_id=call_uuid("worker-finalize-current"))
+    queued = _make_event(
+        call_id=call_uuid("worker-finalize-queued"),
+        status="budget_denied",
+        output_tokens=0,
+        agent_run_id="queued-weighted-run",
+        deny_source="server",
+        deny_reason="structural",
+        estimated_output_bound=30,
+        receipt_aggregate_count=5,
+    )
+    folded = _make_event(
+        call_id=call_uuid("worker-finalize-folded"),
+        status="budget_denied",
+        input_tokens=70,
+        output_tokens=0,
+        agent_run_id="folded-weighted-run",
+        deny_source="server",
+        deny_reason="structural",
+        estimated_output_bound=90,
+        receipt_aggregate_count=7,
+    )
+    request = httpx.Request("POST", f"{_URL}/api/v1/metadata/ingest")
+    healthy = MagicMock(spec=httpx.Response)
+    healthy.raise_for_status.return_value = None
+    healthy.json.return_value = {"ingested": 1, "rejected": []}
+    failed_once = False
+    delivered: list[dict[str, object]] = []
+
+    def post(
+        _url: str,
+        *,
+        json: object,
+        headers: object,
+        timeout: object,
+    ) -> httpx.Response:
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise httpx.ConnectError("control plane unavailable", request=request)
+        assert isinstance(json, list)
+        delivered.extend(json)
+        return healthy
+
+    close_entered = threading.Event()
+    close_finished = threading.Event()
+    close_errors: list[BaseException] = []
+    reporter_ref = weakref.ref(reporter)
+
+    def warning(message: str, *_args: object, **_kwargs: object) -> None:
+        if message.startswith("Failed to send metadata batch") and not close_entered.is_set():
+            close_entered.set()
+            live = reporter_ref()
+            assert live is not None
+            try:
+                live.close(timeout=1.0)
+            except BaseException as exc:
+                close_errors.append(exc)
+                raise
+            finally:
+                close_finished.set()
+
+    worker = reporter._thread
+    try:
+        with (
+            patch.object(reporter._http, "post", side_effect=post),
+            patch("solwyn.reporter.logger.warning", side_effect=warning),
+        ):
+            reporter._fold_or_count_event_drop(folded, "retry_exhausted")
+            reporter.report(current)
+            reporter.report(queued)
+            assert close_entered.wait(timeout=2.0)
+            assert close_finished.wait(timeout=2.0)
+            worker.join(timeout=2.0)
+            assert not worker.is_alive()
+
+        assert close_errors == []
+        assert reporter._shutdown.is_set()
+        assert reporter._delivery_closed is True
+        assert reporter._delivery_completed is True
+        assert not reporter._queue
+        assert reporter._receipt_fold_snapshot() == {}
+        assert reporter.dropped_counts == {}
+        by_call = {str(item["call_id"]): item for item in delivered}
+        assert by_call[str(current.call_id)]["status"] == "success"
+        assert by_call[str(queued.call_id)]["receipt_aggregate_count"] == 5
+        replay = [
+            item
+            for item in delivered
+            if item.get("deny_source") == "aggregate_replay"
+            and item.get("agent_run_id") == "folded-weighted-run"
+        ]
+        assert len(replay) == 1
+        assert replay[0]["receipt_aggregate_count"] == 7
+        assert replay[0]["input_tokens"] == 70
+        assert replay[0]["estimated_output_bound"] == 90
+
+        del reporter
+        gc.collect()
+        assert reporter_ref() is None
+    finally:
+        live = reporter_ref()
+        if live is not None and not getattr(live, "_delivery_completed", False):
+            live._shutdown.set()
+            live._seal_delivery()
+            live._http.close()
+
+
+@pytest.mark.unit
+def test_reentrant_close_from_final_flush_worker_sends_instead_of_sealing() -> None:
+    """A close-calling log handler on close()'s OWN final-flush worker must not
+    deadlock into the expired force-seal: the worker is reporter-owned, so it
+    takes the same finalize-request path as the flush/breaker/advisory threads
+    and keeps draining."""
+    reporter = MetadataReporter(
+        _URL,
+        VALID_API_KEY,
+        batch_size=10,
+        flush_interval=60.0,
+        max_send_attempts=1,
+        shutdown_deadline=1.0,
+        breaker_reporting_enabled=False,
+        report_untracked_surfaces=False,
+    )
+    request = httpx.Request("POST", f"{_URL}/api/v1/budgets/confirm")
+    healthy = MagicMock(spec=httpx.Response)
+    healthy.raise_for_status.return_value = None
+    healthy.json.return_value = {"ingested": 1, "rejected": []}
+    delivered: list[dict[str, object]] = []
+
+    def post(url: str, *, json: object, headers: object, timeout: object) -> httpx.Response:
+        if url.endswith("/budgets/confirm"):
+            raise httpx.ConnectError("control plane unavailable", request=request)
+        assert isinstance(json, list)
+        delivered.extend(json)
+        return healthy
+
+    reentrant_thread: list[str] = []
+    close_errors: list[BaseException] = []
+
+    def warning(message: str, *_args: object, **_kwargs: object) -> None:
+        if not message.startswith("reporter.confirm_send_failed") or reentrant_thread:
+            return
+        reentrant_thread.append(threading.current_thread().name)
+        try:
+            reporter.close(timeout=1.0)
+        except BaseException as exc:  # pragma: no cover - failure detail only
+            close_errors.append(exc)
+
+    reporter.report_confirm(_make_confirm_request())
+    reporter.report(_make_event(call_id=call_uuid("final-flush-reentrant")))
+    try:
+        with (
+            patch.object(reporter._http, "post", side_effect=post),
+            patch("solwyn.reporter.logger.warning", side_effect=warning),
+        ):
+            reporter.close(timeout=2.0)
+
+        assert close_errors == []
+        assert reentrant_thread == ["solwyn-final-flush"]
+        # The queued event was DELIVERED, not force-sealed at a burnt deadline.
+        assert [str(item["call_id"]) for item in delivered] == [
+            str(call_uuid("final-flush-reentrant"))
+        ]
+        assert reporter.dropped_counts == {"confirm.retry_exhausted": 1}
+        assert reporter._delivery_completed is True
+    finally:
+        if not getattr(reporter, "_delivery_completed", False):
+            reporter._shutdown.set()
+            reporter._seal_delivery()
+            reporter._http.close()
 
 
 @pytest.mark.unit
