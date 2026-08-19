@@ -237,6 +237,7 @@ def register_async_reporter(reporter: AsyncMetadataReporter) -> None:
         reporter._control_plane_breaker,
         reporter.shutdown_deadline,
         _gc_drop_counter,
+        reporter._exit_http_client_factory._new_exit_http_client,
         reporter._untracked_state,
         reporter._receipt_fold_state,
         reporter._sdk_instance_id,
@@ -278,34 +279,45 @@ def _exit_surrender_all() -> None:
     deadline = _monotonic() + _EXIT_SURRENDER_BUDGET_S
 
     def _run() -> None:
-        client: httpx.Client | None = None
         try:
             for holder in holders:
+                client: httpx.Client | None = None
                 try:
                     payloads = holder.lease_surrender_payloads()
+                    if payloads:
+                        client = holder._new_exit_http_client()
+                    for request in payloads:
+                        if _monotonic() >= deadline:
+                            _log_debug("lifecycle.exit_surrender_expired")
+                            return
+                        if client is None:
+                            raise RuntimeError("exit surrender client is required")
+                        _post_confirm_blocking(
+                            client,
+                            f"{holder.api_url}/api/v1/budgets/lease/surrender",
+                            request.model_dump(mode="json"),
+                            holder._auth_headers(),
+                            holder._control_plane_breaker,
+                            deadline,
+                        )
                 except Exception as exc:
                     _log_warning("lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__)
-                    continue
-                for request in payloads:
-                    if _monotonic() >= deadline:
-                        _log_debug("lifecycle.exit_surrender_expired")
-                        return
-                    if client is None:
-                        client = httpx.Client(timeout=5.0)
-                    _post_confirm_blocking(
-                        client,
-                        f"{holder.api_url}/api/v1/budgets/lease/surrender",
-                        request.model_dump(mode="json"),
-                        holder._auth_headers(),
-                        holder._control_plane_breaker,
-                        deadline,
-                    )
+                finally:
+                    if client is not None:
+                        # Best-effort transport teardown (NOT the bound — the
+                        # join is). A no-op when the holder was constructed
+                        # with a caller-injected transport: the client wraps
+                        # it non-closing, and the caller keeps it open by
+                        # design. Only an SDK-owned transport actually closes.
+                        try:
+                            client.close()
+                        except Exception as exc:
+                            _log_warning(
+                                "lifecycle.exit_surrender_failed: exc_type=%s",
+                                type(exc).__name__,
+                            )
         except Exception as exc:  # the exit hook must never raise
             _log_warning("lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__)
-        finally:
-            if client is not None:
-                # Best-effort transport teardown (NOT the bound — the join is).
-                client.close()
 
     # At interpreter shutdown new threads can be refused; the inline fallback
     # keeps the per-request deadline clamps as the only bound there.
@@ -409,6 +421,7 @@ def blocking_exit_flush(base: AsyncMetadataReporter) -> None:
         base._control_plane_breaker,
         base.shutdown_deadline,
         base._record_drop,
+        base._new_exit_http_client,
         base._untracked_state,
         base._receipt_fold_state,
         base._sdk_instance_id,
@@ -585,6 +598,7 @@ def _drain_queues_blocking(
     breaker: CircuitBreaker | None,
     budget: float,
     drop_counter: Callable[[str, str, int], None],
+    new_exit_http_client: Callable[[], httpx.Client],
     untracked_state: _UntrackedReportState | None = None,
     receipt_fold_state: _ReceiptFoldState | None = None,
     sdk_instance_id: str | None = None,
@@ -646,7 +660,7 @@ def _drain_queues_blocking(
     ingest_url = f"{base_url}/api/v1/metadata/ingest"
     untracked_url = f"{base_url}/api/v1/untracked-surfaces"
     own = _ExitOwnership()
-    client = httpx.Client(timeout=5.0)
+    client = new_exit_http_client()
 
     def _dispose_pending(item: object, reason: str) -> None:
         _dispose_exit_event(
@@ -890,7 +904,11 @@ def _drain_queues_blocking(
     if drop_emitter is not None:
         with suppress(Exception):
             drop_emitter()
-    # Best-effort transport teardown for a still-stuck worker (NOT the bound).
+    # Best-effort transport teardown for a still-stuck worker (NOT the bound —
+    # the join above is). A no-op when ``new_exit_http_client`` wraps a
+    # caller-injected transport: the client's close() never forwards to it,
+    # and the caller keeps it open by design. Only an SDK-owned transport
+    # actually closes here.
     client.close()
 
 

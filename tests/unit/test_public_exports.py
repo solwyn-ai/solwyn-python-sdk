@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 
 import solwyn
-from solwyn import exceptions
+from solwyn import exceptions, testing
 
 
 @pytest.mark.unit
@@ -41,6 +44,16 @@ def test_untracked_spend_surface_error_is_publicly_exported() -> None:
     assert solwyn.UntrackedSpendSurfaceError is exceptions.UntrackedSpendSurfaceError
     assert issubclass(solwyn.UntrackedSpendSurfaceError, solwyn.SolwynError)
     assert issubclass(solwyn.UntrackedSpendSurfaceError, AttributeError)
+
+
+@pytest.mark.unit
+def test_control_plane_transport_is_publicly_exported() -> None:
+    # The injected-transport seam (Solwyn/AsyncSolwyn's control_plane_transport=)
+    # is only usable by external callers if its protocol is importable from the
+    # package root, not just from the private _control_plane_transport module.
+    assert "ControlPlaneTransport" in solwyn.__all__
+    assert solwyn.ControlPlaneTransport is not None
+    assert getattr(solwyn.ControlPlaneTransport, "_is_protocol", False) is True
 
 
 @pytest.mark.unit
@@ -82,3 +95,40 @@ def test_run_handle_api_is_publicly_exported() -> None:
     assert solwyn.RunHandle is not None
     assert callable(solwyn.create_run)
     assert callable(solwyn.start_run)
+
+
+@pytest.mark.unit
+def test_testing_package_exports_are_deliberately_pinned() -> None:
+    assert testing.__all__ == ["FakeControlPlane", "MAGIC_MODELS"]
+    assert testing.FakeControlPlane is not None
+    assert testing.MAGIC_MODELS
+
+
+@pytest.mark.unit
+def test_testing_package_cold_import_does_not_activate_or_require_pytest() -> None:
+    script = """
+import builtins
+import sys
+
+real_import = builtins.__import__
+
+def import_without_pytest(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "pytest" or name.startswith("pytest."):
+        raise ModuleNotFoundError("pytest intentionally unavailable")
+    return real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = import_without_pytest
+import solwyn.testing as testing
+assert testing.__all__ == ["FakeControlPlane", "MAGIC_MODELS"]
+assert "solwyn.testing.pytest_plugin" not in sys.modules
+assert not any(name == "pytest" or name.startswith("pytest.") for name in sys.modules)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr

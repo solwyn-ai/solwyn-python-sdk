@@ -40,6 +40,11 @@ from solwyn._base import (
     _responses_output_bound,
     _SolwynBase,
 )
+from solwyn._control_plane_transport import (
+    ControlPlaneTransport,
+    require_dual_transport,
+    require_sync_transport,
+)
 from solwyn._privacy import (
     estimate_content_length,
     estimate_responses_content_length,
@@ -1567,6 +1572,14 @@ class Solwyn(_SolwynBase):
             messages=[{"role": "user", "content": "Hello"}],
         )
         client.close()
+
+    Args:
+        control_plane_transport: An optional caller-owned ``httpx.BaseTransport``
+            (e.g. ``httpx.MockTransport``) routing budget-check, confirm, and
+            metadata-ingest requests instead of real network I/O. Any transport
+            implementing the sync httpx transport interface is accepted. The
+            caller retains ownership: it is never closed by the SDK, including
+            at ``close()`` and interpreter exit.
     """
 
     _solwyn_is_wrapper_type = True
@@ -1584,8 +1597,11 @@ class Solwyn(_SolwynBase):
         on_unmetered: Literal["warn", "raise", "allow"] | None = None,
         acknowledge_untracked: Collection[str] | None = None,
         selection_policy: SelectionPolicy | None = None,
+        control_plane_transport: httpx.BaseTransport | None = None,
         **config_kwargs: object,
     ) -> None:
+        require_sync_transport(control_plane_transport)
+
         # self._solwyn_client is typed Any because each provider SDK has a different
         # public surface (chat/messages/models). A unified Protocol would not
         # match all three. Type safety stops at the _sync_dispatch boundary.
@@ -1641,6 +1657,7 @@ class Solwyn(_SolwynBase):
             fail_open=config.fail_open,
             cache_ttl=config.budget_check_cache_ttl,
             control_plane_breaker=self._solwyn_control_plane_breaker,
+            transport=control_plane_transport,
             # PJ-2: the SDK instance id IS the lease holder identity.
             holder_id=self._solwyn_sdk_instance_id,
             lease_enabled=config.lease_enabled,
@@ -1661,6 +1678,7 @@ class Solwyn(_SolwynBase):
             report_untracked_surfaces=config.report_untracked_surfaces,
             breaker_report_heartbeat=config.breaker_report_heartbeat,
             control_plane_breaker=self._solwyn_control_plane_breaker,
+            transport=control_plane_transport,
             max_send_attempts=config.reporter_max_send_attempts,
             retry_backoff_base=config.reporter_retry_backoff_base,
             retry_backoff_cap=config.reporter_retry_backoff_cap,
@@ -3099,6 +3117,17 @@ class AsyncSolwyn(_SolwynBase):
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
+
+    Args:
+        control_plane_transport: An optional caller-owned transport routing
+            budget-check, confirm, and metadata-ingest requests instead of
+            real network I/O. Async components also perform blocking
+            interpreter-exit drains, so this requires the dual sync+async
+            interface — see :class:`solwyn.ControlPlaneTransport` (only
+            ``handle_request`` and ``handle_async_request`` are called; a
+            transport satisfying ``httpx.MockTransport`` plus an async
+            handler qualifies). The caller retains ownership: it is never
+            closed by the SDK, including at ``close()`` and interpreter exit.
     """
 
     _solwyn_is_wrapper_type = True
@@ -3116,8 +3145,11 @@ class AsyncSolwyn(_SolwynBase):
         on_unmetered: Literal["warn", "raise", "allow"] | None = None,
         acknowledge_untracked: Collection[str] | None = None,
         selection_policy: SelectionPolicy | None = None,
+        control_plane_transport: ControlPlaneTransport | None = None,
         **config_kwargs: object,
     ) -> None:
+        require_dual_transport(control_plane_transport)
+
         # See sync Solwyn.__init__ for why _solwyn_client is typed Any.
         self._solwyn_client: Any = client
 
@@ -3166,6 +3198,7 @@ class AsyncSolwyn(_SolwynBase):
             fail_open=config.fail_open,
             cache_ttl=config.budget_check_cache_ttl,
             control_plane_breaker=self._solwyn_control_plane_breaker,
+            transport=control_plane_transport,
             # PJ-2: the SDK instance id IS the lease holder identity.
             holder_id=self._solwyn_sdk_instance_id,
             lease_enabled=config.lease_enabled,
@@ -3185,6 +3218,7 @@ class AsyncSolwyn(_SolwynBase):
             report_untracked_surfaces=config.report_untracked_surfaces,
             breaker_report_heartbeat=config.breaker_report_heartbeat,
             control_plane_breaker=self._solwyn_control_plane_breaker,
+            transport=control_plane_transport,
             max_send_attempts=config.reporter_max_send_attempts,
             retry_backoff_base=config.reporter_retry_backoff_base,
             retry_backoff_cap=config.reporter_retry_backoff_cap,

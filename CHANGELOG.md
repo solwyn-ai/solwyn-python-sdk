@@ -9,6 +9,35 @@ derived from git tags (hatch-vcs).
 
 ### Added
 
+- **A first-class, zero-network control-plane test double now exercises budget
+  enforcement through production wire models.** The injected transport seam is
+  shared by normal operation, fork recovery, interpreter-exit delivery, and
+  lease surrender. `FakeControlPlane` scripts transport and endpoint failures,
+  magic-model verdicts, request recording, reservations, and the complete lease
+  lifecycle without pricing provider work. A reusable
+  `solwyn.testing.contract` pack is dogfooded against both the double and the
+  live API. SDK-behavior integration cases now run on `FakeControlPlane` in the
+  zero-network CI lane, while live integration retains authentication, routing,
+  persistence, and pricing-catalog checks as deployed server-state coverage.
+  Deterministic CI game-day recipes cover denial, outage, breaker, reporter, and
+  lease recovery ladders. The README adds copy/paste enforcement recipes and
+  `solwyn.testing.pytest_plugin` provides explicitly opt-in, function-scoped
+  plane and denial-client fixtures—never automatic pytest registration.
+- **The control-plane double now simulates runaway protection end to end.**
+  `FakeControlPlane.stop_run(run_id)` denies every later check, lease grant, and
+  lease renewal for that run with a version 1 `run_control` terminate directive
+  whenever the request opted in, `clear_stop(run_id)` lifts it, and the
+  `solwyn-test/kill` magic model scripts the same kill from a model name.
+  `misroute_stops()` echoes directives for the wrong run, so server contract
+  drift is testable deterministically. `denial_receipts` and
+  `aggregate_replays` expose the recorded content-free denial evidence, and
+  `reject_ingest(...)` scripts index-aware, legacy, and malformed ingest
+  rejection bodies that drive the SDK's receipt fold and replay path. The
+  shared `solwyn.testing.contract` pack gained `assert_run_control_contract`
+  and `assert_receipt_ingest_contract`, and the CI game-day recipes cover an
+  operator kill surviving an outage, a kill landing on the lease renewal
+  channel, receipt loss folding into one aggregate replay, and a local velocity
+  stop that no server allow can lift.
 - **Provider wrappers now pass `isinstance`-shaped framework admission.**
   `Solwyn(client)` and `AsyncSolwyn(client)` report the wrapped provider class
   through `__class__` while `type(wrapper)` remains the truthful Solwyn class.

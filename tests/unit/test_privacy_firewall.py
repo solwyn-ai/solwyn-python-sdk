@@ -35,8 +35,12 @@ from solwyn._privacy import (
     measure_video_media,
 )
 from solwyn._types import (
+    BreakerStateReport,
     BudgetCheckRequest,
     BudgetConfirmRequest,
+    LeaseGrantRequest,
+    LeaseRenewRequest,
+    LeaseSurrenderRequest,
     MetadataEvent,
     UntrackedSurfaceReport,
 )
@@ -678,6 +682,10 @@ def test_wire_models_stay_content_free() -> None:
         BudgetCheckRequest,
         BudgetConfirmRequest,
         UntrackedSurfaceReport,
+        LeaseGrantRequest,
+        LeaseRenewRequest,
+        LeaseSurrenderRequest,
+        BreakerStateReport,
     ):
         leaked = set(model.model_fields) & FORBIDDEN_FIELDS
         assert not leaked, f"{model.__name__} leaks content-bearing fields: {leaked}"

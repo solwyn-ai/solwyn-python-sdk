@@ -119,8 +119,9 @@ class TestTranscriptionUsageExtraction:
 
         assert token is None
         assert media is None
-        assert len(caplog.records) == 1
-        message = caplog.records[0].getMessage()
+        records = foreground_records(caplog)
+        assert len(records) == 1
+        message = records[0].getMessage()
         assert "unpriced" in message.lower()
         assert "response_format" in message
         assert "json" in message.lower()
@@ -329,8 +330,9 @@ class TestAudioTranscriptionsProxy:
 
         assert first is client.audio.translations
         assert second is client.audio.translations
-        assert len(caplog.records) == 1
-        assert "surface 'audio.translations'" in caplog.records[0].getMessage()
+        records = foreground_records(caplog)
+        assert len(records) == 1
+        assert "surface 'audio.translations'" in records[0].getMessage()
         _close_sync(solwyn)
 
     def test_accessing_audio_attribute_does_not_warn(

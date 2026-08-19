@@ -673,6 +673,7 @@ def test_gc_drop_logging_exceptions_do_not_abort_remaining_exit_dispositions() -
             reporter._control_plane_breaker,
             0.0,
             _gc_drop_counter,
+            reporter._new_exit_http_client,
             reporter._untracked_state,
             reporter._receipt_fold_state,
             reporter._sdk_instance_id,
@@ -1496,6 +1497,7 @@ def test_exit_drain_publishes_disposition_before_returning(
             reporter._control_plane_breaker,
             0.15,  # join deadline expires while the publication is gated
             gated_counter,
+            reporter._new_exit_http_client,
         )
     finally:
         releaser.cancel()

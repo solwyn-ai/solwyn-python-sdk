@@ -16,6 +16,7 @@ except PackageNotFoundError:
     __version__ = "0.0.0-dev"
 
 from solwyn._constants import TAG_KEY_MAX_LENGTH, TAG_VALUE_MAX_LENGTH, TAGS_MAX_KEYS
+from solwyn._control_plane_transport import ControlPlaneTransport
 from solwyn._coverage import (
     CoverageAuditEntry,
     CoverageEntry,
@@ -73,6 +74,7 @@ __all__ = [
     "Solwyn",
     "AsyncSolwyn",
     "SolwynConfig",
+    "ControlPlaneTransport",
     "coverage",
     "CoverageRuntime",
     "CoverageEntry",

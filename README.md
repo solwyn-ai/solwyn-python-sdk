@@ -626,6 +626,224 @@ except BudgetExceededError as e:
     print(f"Budget limit: ${e.budget_limit}, usage: ${e.current_usage}")
 ```
 
+## Testing your budget enforcement
+
+`FakeControlPlane` exercises the production control-plane transport seam with
+zero network traffic and the same request, response, and Pydantic wire models as
+Solwyn Cloud. You create and own the plane, wrap your provider client with it,
+and inspect its request recordings after the call. The provider remains your
+responsibility: mock it normally whenever the test can reach provider dispatch.
+Closing the wrapper shuts down Solwyn's control-plane resources and then
+forwards to the wrapped provider client's own close seam — the recipes below
+nest both context managers and verify that forwarding.
+
+The double never prices anything — the API owns pricing. Scripted denials test your handling, not your budget math.
+
+### 1. Test a deny handler
+
+The magic denial happens during preflight, so no provider request can occur.
+The wrapper context manager closes the client even if the assertion fails.
+
+<!-- test-double-snippet:deny-handler -->
+```python
+import pytest
+from openai import OpenAI
+from solwyn import BudgetExceededError
+from solwyn.testing import FakeControlPlane
+
+def test_deny_handler():
+    plane = FakeControlPlane()
+    with OpenAI(api_key="test") as provider:
+        with plane.wrap(provider) as client:
+            with pytest.raises(BudgetExceededError):
+                client.chat.completions.create(model="solwyn-test/deny", messages=[])
+        # Closing the wrapper forwards to the provider client's close seam.
+        assert provider.is_closed()
+```
+
+Magic models are reserved, deterministic verdict scripts:
+
+| Model | Scripted control-plane behavior |
+|-------|---------------------------------|
+| `solwyn-test/deny` | Monthly denial using the plane's configured mode (`hard_deny` by default) |
+| `solwyn-test/deny-alert` | Monthly denial that forces `alert_only` on per-call checks, regardless of configured mode; lease-path denials are always `hard_deny` |
+| `solwyn-test/deny-tag` | `tag`-period denial using the plane's configured mode (`hard_deny` by default) on the check path; the lease path treats tag-scoped rules as lease ineligibility instead of a denial |
+| `solwyn-test/deny-stopped` | Always a `hard_deny` `run_stopped` denial with zero remaining budget — dashboard stops override alert-only projects and raise `RunStoppedError` through the wrapper. Requires an active `solwyn.run(...)` scope |
+| `solwyn-test/runaway` | First check per run is allowed; later `agent_run` denials use the plane's configured mode (`hard_deny` by default). Requires an active `solwyn.run(...)` scope |
+| `solwyn-test/kill` | First check per run is allowed; every later check, lease grant, and renewal for that run is a `hard_deny` `run_stopped` denial carrying a version 1 `run_control` terminate directive, exactly as `plane.stop_run(run_id)` does. Requires an active `solwyn.run(...)` scope |
+| `solwyn-test/lease-ineligible` | Allow the call but make its run ineligible for a token lease |
+
+For overlapping scripts, precedence is transport failure → endpoint refusal → verdict → allow.
+An outage therefore tests unreachable posture without a
+scripted denial leaking through, while a reachable endpoint refusal wins over
+the normal verdict.
+
+### 2. Test fail-open posture
+
+Mock the provider separately with the HTTP dialect used by the installed
+OpenAI SDK, and assert both that dispatch proceeded and that the control-plane
+warning surfaced.
+
+<!-- test-double-snippet:fail-open -->
+```python
+import logging
+from openai import OpenAI
+from solwyn.testing import FakeControlPlane
+
+try:
+    import httpx2 as provider_httpx
+except ImportError:
+    import httpx as provider_httpx
+
+def test_fail_open_provider_proceeds(caplog):
+    plane = FakeControlPlane()
+    provider_requests = []
+
+    def handle_provider(request):
+        provider_requests.append(request)
+        return provider_httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test", "object": "chat.completion", "created": 0,
+                "model": "gpt-5.5", "choices": [{"index": 0,
+                    "message": {"role": "assistant", "content": "served"},
+                    "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            },
+        )
+
+    transport = provider_httpx.MockTransport(handle_provider)
+    with provider_httpx.Client(transport=transport) as provider_http_client:
+        with OpenAI(
+            base_url="https://provider.test/v1",
+            api_key="test",
+            http_client=provider_http_client,
+        ) as provider:
+            with (
+                plane.wrap(provider, fail_open=True, lease_enabled=False) as client,
+                caplog.at_level(logging.WARNING),
+                plane.outage(),
+            ):
+                response = client.chat.completions.create(model="gpt-5.5", messages=[])
+            # Closing the wrapper forwards to the provider client's close seam.
+            assert provider.is_closed()
+    assert len(provider_requests) == 1
+    assert response.choices[0].message.content == "served"
+    assert "budget check failed" in caplog.text.lower()
+```
+
+### 3. Run a deny → outage → recovery game day
+
+Compose scenarios on one caller-owned plane to prove that a known hard denial
+is preserved during an outage and cleared only by a recovered allow verdict.
+
+<!-- test-double-snippet:game-day -->
+```python
+import pytest
+from openai import OpenAI
+from solwyn import BudgetExceededError
+from solwyn.testing import FakeControlPlane
+
+try:
+    import httpx2 as provider_httpx
+except ImportError:
+    import httpx as provider_httpx
+
+def test_deny_outage_recovery():
+    plane = FakeControlPlane()
+    provider_requests = []
+
+    def handle_provider(request):
+        provider_requests.append(request)
+        return provider_httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test", "object": "chat.completion", "created": 0,
+                "model": "gpt-5.5", "choices": [{"index": 0,
+                    "message": {"role": "assistant", "content": "served"},
+                    "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            },
+        )
+
+    transport = provider_httpx.MockTransport(handle_provider)
+    with provider_httpx.Client(transport=transport) as provider_http_client:
+        with OpenAI(
+            base_url="https://provider.test/v1",
+            api_key="test",
+            http_client=provider_http_client,
+        ) as provider:
+            with plane.wrap(provider, fail_open=True, lease_enabled=False) as client:
+                with pytest.raises(BudgetExceededError):
+                    client.chat.completions.create(model="solwyn-test/deny", messages=[])
+                with plane.outage(), pytest.raises(BudgetExceededError):
+                    client.chat.completions.create(model="gpt-5.5", messages=[])
+                recovered = client.chat.completions.create(model="gpt-5.5", messages=[])
+            # Closing the wrapper forwards to the provider client's close seam.
+            assert provider.is_closed()
+    assert len(provider_requests) == 1
+    assert recovered.choices[0].message.content == "served"
+```
+
+See the in-repo
+[`test_gameday_recipes.py`](tests/unit/testing_double/test_gameday_recipes.py)
+for the full refusal, breaker, reporter, lease-drawdown, and recovery ladder.
+
+### 4. Simulating an operator kill
+
+`plane.stop_run(run_id)` is the dashboard kill switch: from the next request on,
+every check, lease grant, and lease renewal naming that run is denied and the
+wrapper raises `RunStoppedError` — which is not a `BudgetExceededError`, so a
+budget-denial handler cannot swallow it. The stop stays terminal through a
+control-plane outage, and `plane.clear_stop(run_id)` lifts it.
+
+<!-- test-double-snippet:operator-kill -->
+```python
+import pytest
+import solwyn
+from openai import OpenAI
+from solwyn import RunStoppedError
+from solwyn.testing import FakeControlPlane
+
+def test_operator_kill_stops_the_run():
+    plane = FakeControlPlane()
+    with OpenAI(api_key="test") as provider:
+        with plane.wrap(provider) as client, solwyn.run("nightly-report") as run_id:
+            plane.stop_run(run_id, reason="operator_stop")
+            with pytest.raises(RunStoppedError) as stopped:
+                client.chat.completions.create(model="gpt-5.5", messages=[])
+        assert stopped.value.agent_run_id == run_id
+        assert stopped.value.reason == "operator_stop"
+        assert [receipt.deny_reason for receipt in plane.denial_receipts] == ["operator_stop"]
+```
+
+`plane.denial_receipts` holds the content-free evidence the SDK reported for
+every call it refused — who denied it (`deny_source`), why (`deny_reason`), and
+under which period — with `plane.aggregate_replays` holding the folded
+aggregates the SDK replays after an ingest rejection.
+
+### Opt-in pytest fixtures
+
+Fixtures never auto-register. Enable them in the test module (or your own
+`conftest.py`) and request both fixtures when you want to script and inspect the
+same plane. `solwyn_test_client` is the normal `Solwyn` wrapper around a private
+denial-only dispatch sentinel; it does not simulate provider responses.
+
+<!-- test-double-snippet:pytest-fixtures -->
+```python
+import pytest
+from solwyn import BudgetExceededError
+
+pytest_plugins = ["solwyn.testing.pytest_plugin"]
+
+def test_denial_fixture(solwyn_control_plane, solwyn_test_client):
+    with pytest.raises(BudgetExceededError):
+        solwyn_test_client.chat.completions.create(
+            model="solwyn-test/deny", messages=[]
+        )
+    assert len(solwyn_control_plane.checks) == 1
+```
+
 ## Configuration
 
 | Parameter | Env Var | Default | Description |
