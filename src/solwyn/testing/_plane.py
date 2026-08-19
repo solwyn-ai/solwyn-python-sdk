@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -85,6 +85,20 @@ _ENV_PREFIX = "SOLWYN_"
 _WRAPPER_OWNED_CONFIG_FIELDS = frozenset({"api_key", "api_url", "providers", "default_params"})
 _GRANT_ONLY_LEASE_PATH = "/api/v1/budgets/lease"
 _LEASE_RENEW_PATH = "/api/v1/budgets/lease/renew"
+_INGEST_PATH = "/api/v1/metadata/ingest"
+# The live plane's closed rejection-code enum; a code outside it is a typo.
+_INGEST_REJECTION_CODES = frozenset(
+    {
+        "unknown_model",
+        "unknown_service_tier",
+        "invalid_tags",
+        "tag_cardinality_exceeded",
+        "unsupported_modality",
+    }
+)
+_DEFAULT_INGEST_REJECTION_CODE = "invalid_tags"
+# A rejection entry echoes a bounded model label, not the event's full field.
+_INGEST_REJECTION_MODEL_MAX_LENGTH = 50
 
 
 def _validate_magic_model(model: object) -> None:
@@ -226,6 +240,9 @@ class _ScenarioWindow:
     status: int = 0
     code: str = ""
     retry_after: int | None = None
+    indices: tuple[int, ...] | None = None
+    count: int | None = None
+    malformed: bool = False
 
     def consume_if_matching(self, path: str) -> bool:
         if self.path is not None and self.path != path:
@@ -442,6 +459,113 @@ class FakeControlPlane:
         """Currently stopped run ids mapped to their stop reason (a copy)."""
         with self._lock:
             return dict(self._stopped_runs)
+
+    @property
+    def denial_receipts(self) -> list[MetadataEvent]:
+        """Ingested events carrying a denial receipt, in arrival order.
+
+        A receipt is any recorded metadata event with a ``deny_source`` — the
+        content-free evidence the SDK emits for a call it refused, whoever
+        refused it (this plane, the SDK's sticky replay, a lease exhaustion, or
+        a local velocity stop). Cleared by :meth:`reset_recording`.
+        """
+        with self._lock:
+            return [event for event in self.ingested if event.deny_source is not None]
+
+    @property
+    def aggregate_replays(self) -> list[MetadataEvent]:
+        """Ingested receipts the SDK folded and replayed, in arrival order.
+
+        The subset of :attr:`denial_receipts` with
+        ``deny_source == "aggregate_replay"``: one event standing in for
+        ``receipt_aggregate_count`` receipts an earlier ingest failure dropped.
+        """
+        with self._lock:
+            return [event for event in self.ingested if event.deny_source == "aggregate_replay"]
+
+    @contextmanager
+    def reject_ingest(
+        self,
+        *,
+        indices: Sequence[int] | None = None,
+        code: str = _DEFAULT_INGEST_REJECTION_CODE,
+        count: int | None = None,
+        malformed: bool = False,
+        requests: int | None = 1,
+    ) -> Iterator[None]:
+        """Script rejection entries onto the next ingest responses.
+
+        The plane still answers 202 and still records every event — a rejection
+        is the server refusing to PRICE an event, not a transport failure — so
+        this shapes the response body alone. It drives the SDK's receipt-fold
+        path: rejected denial receipts fold and replay later as aggregates.
+
+        Exactly one mode must be given, otherwise ``RuntimeError``:
+
+        - ``indices=[...]`` — EXACT: one ``{"index", "code", "model",
+          "message"}`` entry per index, with the model echoed from the batch
+          entry at that index. This is what the live plane sends today; the SDK
+          disposes exactly those events.
+        - ``count=n`` — LEGACY: ``n`` entries with no ``index`` key, the shape
+          an older or drifted server sends. The SDK can prove only a count from
+          it, so it keeps the double's LEGACY disposition tier testable.
+        - ``malformed=True`` — a non-list ``"rejected"`` value, the fail-open
+          path where the SDK must acknowledge the send and guess nothing.
+
+        ``requests`` bounds how many ingest requests are shaped (default one);
+        ``None`` shapes every ingest request while the window is open. An
+        ``indices`` entry or a ``count`` larger than the batch it meets raises
+        ``RuntimeError`` — the live plane can never reject what it never
+        received.
+        """
+        scripted = self._ingest_rejection_window(
+            indices=indices,
+            code=code,
+            count=count,
+            malformed=malformed,
+            requests=requests,
+        )
+        with self._scenario(scripted):
+            yield
+
+    @staticmethod
+    def _ingest_rejection_window(
+        *,
+        indices: Sequence[int] | None,
+        code: str,
+        count: int | None,
+        malformed: bool,
+        requests: int | None,
+    ) -> _ScenarioWindow:
+        """Validate one rejection script and freeze it into a window."""
+        selected = [indices is not None, count is not None, malformed]
+        if sum(selected) != 1:
+            raise RuntimeError(
+                "solwyn.testing: reject_ingest needs exactly one of indices=, "
+                "count=, or malformed=True"
+            )
+        if code not in _INGEST_REJECTION_CODES:
+            raise ValueError(f"code must be one of {sorted(_INGEST_REJECTION_CODES)}")
+        ordered: tuple[int, ...] | None = None
+        if indices is not None:
+            ordered = tuple(indices)
+            if not ordered:
+                raise ValueError("indices must not be empty")
+            if any(index < 0 for index in ordered):
+                raise ValueError("indices must not be negative")
+            if len(set(ordered)) != len(ordered):
+                raise ValueError("indices must not repeat")
+        if count is not None and count < 1:
+            raise ValueError("count must reject at least one event")
+        return _ScenarioWindow(
+            "reject_ingest",
+            FakeControlPlane._request_count(requests),
+            path=_INGEST_PATH,
+            code=code,
+            indices=ordered,
+            count=count,
+            malformed=malformed,
+        )
 
     @contextmanager
     def misroute_stops(self, *, requests: int | None = None) -> Iterator[None]:
@@ -1312,7 +1436,62 @@ class FakeControlPlane:
             self._seen_ingest_legacy_identities.add(legacy_identity)
             newly_ingested.append(event)
         self.ingested.extend(newly_ingested)
-        return PlaneResponse(202, {"ingested": len(newly_ingested), "rejected": []})
+        # Recording and dedup are complete before any scripted rejection: the
+        # server refuses to price a rejected event, it does not unsee it.
+        scripted = self._consume_ingest_rejection_window()
+        if scripted is None:
+            return PlaneResponse(202, {"ingested": len(newly_ingested), "rejected": []})
+        return PlaneResponse(202, self._scripted_ingest_body(scripted, parsed))
+
+    def _consume_ingest_rejection_window(self) -> _ScenarioWindow | None:
+        """Take the first open rejection window scoped to the ingest path."""
+        for window in self._scenario_windows:
+            if window.kind == "reject_ingest" and window.consume_if_matching(_INGEST_PATH):
+                return window
+        return None
+
+    def _scripted_ingest_body(
+        self,
+        window: _ScenarioWindow,
+        events: list[MetadataEvent],
+    ) -> dict[str, Any]:
+        """Build the 202 body one scripted rejection window calls for."""
+        if window.malformed:
+            return {"rejected": "corrupt"}
+        rejected: list[dict[str, Any]] = []
+        if window.indices is not None:
+            for index in window.indices:
+                if index >= len(events):
+                    raise RuntimeError(
+                        f"solwyn.testing: reject_ingest index {index} is outside the "
+                        f"{len(events)}-event batch it met"
+                    )
+                rejected.append(self._rejection_entry(window.code, events[index], index=index))
+        else:
+            count = window.count or 0
+            if count > len(events):
+                raise RuntimeError(
+                    f"solwyn.testing: reject_ingest count {count} exceeds the "
+                    f"{len(events)}-event batch it met"
+                )
+            rejected.extend(
+                self._rejection_entry(window.code, event, index=None) for event in events[:count]
+            )
+        return {"ingested": max(len(events) - len(rejected), 0), "rejected": rejected}
+
+    @staticmethod
+    def _rejection_entry(
+        code: str,
+        event: MetadataEvent,
+        *,
+        index: int | None,
+    ) -> dict[str, Any]:
+        """Build one rejection entry; LEGACY entries carry no ``index`` key."""
+        entry: dict[str, Any] = {} if index is None else {"index": index}
+        entry["code"] = code
+        entry["model"] = event.model[:_INGEST_REJECTION_MODEL_MAX_LENGTH]
+        entry["message"] = f"scripted {code} rejection"
+        return entry
 
     def _handle_untracked(self, body: object) -> PlaneResponse:
         if isinstance(body, list) and len(body) > 100:
