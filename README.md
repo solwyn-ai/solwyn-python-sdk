@@ -52,6 +52,52 @@ with Solwyn(OpenAI(), api_key="sk_proj_...") as client:
     )
 ```
 
+### Drop-in type compatibility
+
+Solwyn wrappers pass framework admission checks that require the concrete
+provider SDK type:
+
+```python
+raw = OpenAI()
+client = Solwyn(raw, api_key="sk_proj_...")
+
+assert isinstance(client, OpenAI)
+assert isinstance(client, type(raw))
+```
+
+`type(client)` remains the truthful wrapper class (`Solwyn` or
+`AsyncSolwyn`), while `client.__class__` reports the wrapped provider class for
+`isinstance`-based framework compatibility. The same contract holds for
+`AsyncSolwyn(AsyncOpenAI(...))`. Every non-`_solwyn_*` attribute assignment and
+deletion forwards to the provider client, including names also defined by the
+wrapper; only `_solwyn_*` state remains local.
+
+These clients own live reporter, budget, and provider-transport state.
+`copy.copy(client)` and `copy.deepcopy(client)` therefore return the same
+shared wrapper, rather than cloning those resources. Pickling is rejected with
+guidance to construct a fresh `Solwyn(...)` or `AsyncSolwyn(...)` in the target
+process.
+
+## Framework integrations
+
+See the [framework support matrix](docs/integrations/README.md) for the exact
+enforcement boundary, admitted call surfaces, dependency posture, and current
+limitations.
+
+- [OpenAI Agents SDK](docs/integrations/openai-agents.md) — a docs-and-smoke
+  recipe injects an `AsyncSolwyn` default client for enforced Chat Completions
+  and stable workflow/agent attribution; no Agents integration module ships.
+- [LangChain and LangGraph](docs/integrations/langchain.md) — the shipped
+  content-free handler plus the exact recipe shim covers basic non-streaming
+  `invoke`/`ainvoke` Chat Completions and explicit graph hierarchy.
+- [CrewAI](docs/integrations/crewai.md) — the shipped content-free listener
+  adds crew/task hierarchy; native LiteLLM has no Solwyn enforcement, while the
+  narrow custom-`BaseLLM` recipe routes one sync plain-text call through a
+  wrapped client.
+
+Compatibility is limited to the paths named in the matrix and recipes; do not
+infer budget enforcement for other framework call surfaces.
+
 ## Providers
 
 ### OpenAI
@@ -587,9 +633,9 @@ zero network traffic and the same request, response, and Pydantic wire models as
 Solwyn Cloud. You create and own the plane, wrap your provider client with it,
 and inspect its request recordings after the call. The provider remains your
 responsibility: mock it normally whenever the test can reach provider dispatch.
-Solwyn closes only its own control-plane resources; close caller-owned provider
-clients yourself. The recipes below nest both context managers and verify that
-provider ownership remains with the caller.
+Closing the wrapper shuts down Solwyn's control-plane resources and then
+forwards to the wrapped provider client's own close seam — the recipes below
+nest both context managers and verify that forwarding.
 
 The double never prices anything — the API owns pricing. Scripted denials test your handling, not your budget math.
 
@@ -611,8 +657,8 @@ def test_deny_handler():
         with plane.wrap(provider) as client:
             with pytest.raises(BudgetExceededError):
                 client.chat.completions.create(model="solwyn-test/deny", messages=[])
-        assert not provider.is_closed()
-    assert provider.is_closed()
+        # Closing the wrapper forwards to the provider client's close seam.
+        assert provider.is_closed()
 ```
 
 Magic models are reserved, deterministic verdict scripts:
@@ -678,8 +724,8 @@ def test_fail_open_provider_proceeds(caplog):
                 plane.outage(),
             ):
                 response = client.chat.completions.create(model="gpt-5.5", messages=[])
-            assert not provider.is_closed()
-    assert provider.is_closed()
+            # Closing the wrapper forwards to the provider client's close seam.
+            assert provider.is_closed()
     assert len(provider_requests) == 1
     assert response.choices[0].message.content == "served"
     assert "budget check failed" in caplog.text.lower()
@@ -732,8 +778,8 @@ def test_deny_outage_recovery():
                 with plane.outage(), pytest.raises(BudgetExceededError):
                     client.chat.completions.create(model="gpt-5.5", messages=[])
                 recovered = client.chat.completions.create(model="gpt-5.5", messages=[])
-            assert not provider.is_closed()
-    assert provider.is_closed()
+            # Closing the wrapper forwards to the provider client's close seam.
+            assert provider.is_closed()
     assert len(provider_requests) == 1
     assert recovered.choices[0].message.content == "served"
 ```
@@ -777,11 +823,25 @@ def test_denial_fixture(solwyn_control_plane, solwyn_test_client):
 | `budget_check_timeout` | `SOLWYN_BUDGET_CHECK_TIMEOUT` | `1.0` | Hot-path control-plane check/grant timeout in seconds |
 | `lease_enabled` | `SOLWYN_LEASE_ENABLED` | `True` | Use in-memory token leases for eligible run-scoped calls |
 | `lease_output_bound_default` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token allowance when no configured provider hop has an explicit cap |
+| `velocity_mode` | `SOLWYN_VELOCITY_MODE` | `warn` | Content-free run velocity posture: `off`, advisory `warn`, or local `deny` |
+| `velocity_repeat_count` | `SOLWYN_VELOCITY_REPEAT_COUNT` | `5` | Near-identical same-model calls required inside the repeat window |
+| `velocity_repeat_window_s` | `SOLWYN_VELOCITY_REPEAT_WINDOW_S` | `60.0` | Seconds retained for repeat-size matching |
+| `velocity_growth_streak` | `SOLWYN_VELOCITY_GROWTH_STREAK` | `8` | Strictly increasing calls required for monotonic-growth detection |
+| `velocity_growth_factor` | `SOLWYN_VELOCITY_GROWTH_FACTOR` | `3.0` | Required last/first input-size ratio for monotonic growth |
+| `velocity_accel_floor_per_min` | `SOLWYN_VELOCITY_ACCEL_FLOOR_PER_MIN` | `30` | Minimum current-window call count for rate acceleration (maximum `64`) |
+| `velocity_accel_factor` | `SOLWYN_VELOCITY_ACCEL_FACTOR` | `3.0` | Required current/prior one-minute call-count ratio |
 | `on_unmetered` | `SOLWYN_ON_UNMETERED` | `warn` | Handle untracked or unknown pre-call capabilities with `warn`, `raise`, or `allow` |
 | `report_untracked_surfaces` | `SOLWYN_REPORT_UNTRACKED_SURFACES` | `True` | Send optional structural advisory reports for unacknowledged `warn`/`allow` observations; set false to keep them local |
 | `acknowledge_untracked` | `SOLWYN_ACKNOWLEDGE_UNTRACKED` | empty | Exact terminal capability tokens; env format is comma-delimited |
 | `control_plane_failure_threshold` | `SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD` | `3` | Consecutive Solwyn API failures before local outage posture applies |
 | `control_plane_recovery_timeout` | `SOLWYN_CONTROL_PLANE_RECOVERY_TIMEOUT` | `30.0` | Seconds before probing the Solwyn API after its breaker opens |
+
+Velocity detection retains only scalar token counts, monotonic timestamps, and
+structural run/model identifiers—never prompts or responses. `repeat_size` and
+`monotonic_growth` are eligible to stop a run in `deny` mode;
+`rate_acceleration` is advisory only. Scalar history is fixed at 128 runs × 64
+observations, with fixed-memory conservative suppression under extreme identity
+churn so losing an exact identifier can suppress a signal but can never invent one.
 
 Failover and routing (`model=`, `fallback=`, `provider=`, `default_params=`, `selection_policy=`, and the failover tuning knobs) are configured in code only — they take client objects and policies, not strings. See [Provider Failover](https://docs.solwyn.ai/docs/sdk/guides/provider-failover) and [Configuration](https://docs.solwyn.ai/docs/sdk/guides/configuration).
 
@@ -827,7 +887,7 @@ All SDK errors inherit from `SolwynError`:
 | Exception | Raised when |
 |-----------|-------------|
 | `BudgetExceededError` | Cloud denies a budget check in `hard_deny` mode, or local enforcement denies while Cloud is unreachable and `fail_open=False` |
-| `RunStoppedError` | A dashboard stop is learned for an agent run — on the next budget check for per-call traffic, or after lease renewal or re-grant for leased traffic |
+| `RunStoppedError` | A server/operator stop or a deny-eligible local velocity rule prevents provider dispatch for an agent run |
 | `ProviderUnavailableError` | Circuit breaker is open, or the failover chain is exhausted |
 | `ConfigurationError` | Invalid API key format, invalid `provider=` pin/client pairing, or an untracked call surface (e.g. Bedrock `invoke_model`) |
 | `UntrackedSpendSurfaceError` | Strict coverage posture refuses an unacknowledged untracked or unknown capability before provider I/O |
@@ -835,9 +895,29 @@ All SDK errors inherit from `SolwynError`:
 | `UntranslatableRequestError` | A cross-provider failover hop cannot represent the request (structural labels only — never content) |
 | `UntranslatableModelError` | No model mapping exists for a cross-provider failover hop |
 
-`RunStoppedError` is a `BudgetExceededError` subclass, so existing
-`except BudgetExceededError` handlers continue to catch dashboard stops. A stop
-does not interrupt requests already in flight or streams already returned.
+`RunStoppedError` inherits directly from `SolwynError`, not `BudgetExceededError`.
+This deliberate separation prevents an agent loop's `except BudgetExceededError`
+handler from swallowing and retrying an explicit stop. The exception carries the
+structural `agent_run_id`, `reason`, and `source`; server/operator stops use the
+`server` source and eligible local `velocity_mode="deny"` decisions use
+`local_velocity`. Exact first-writer reasons and structural run IDs live only in
+a 256-entry LRU. The registry never guesses from fingerprints, so churn cannot
+false-stop an unrelated or new run. Active stream handles retain their immutable
+first stop independently of registry eviction until the stream settles, closes,
+or is abandoned. A stopped run with no active stream handle may be forgotten
+after LRU eviction; a later call can proceed if the control plane is unavailable
+or does not reaffirm the stop. This is the unavoidable tradeoff between exact
+answers and fixed memory under unbounded identity churn.
+
+Cooperative run code can call `current_run_terminated()` for the ambient run,
+inspect `run_termination(run_id)`, or explicitly clear stored stop state with
+`clear_run_termination(run_id)`. `run_termination` returns an immutable
+`RunTermination` (`reason`, `source`, and `at_monotonic`) or `None`. A non-streaming
+request already in flight is not preempted. A metered stream already returned is
+stopped cooperatively at its next raw provider-chunk boundary: that chunk is
+pulled and discarded, previously observed usage is settled exactly once as a
+partial success, the provider stream is closed, and the original
+`RunStoppedError` remains terminal for later iterator calls.
 
 Provider errors (e.g., `openai.RateLimitError`) pass through unmodified.
 
@@ -863,6 +943,18 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `agent_run_name` | `str \| None` | Run name passed to `solwyn.run(...)`, if any |
 | `provider_region` | `str \| None` | Cloud region of the serving endpoint (Bedrock — pricing is per model and region); omitted for other providers |
 | `tags` | `object \| None` | Optional explicit customer-supplied tags from `solwyn.run(..., tags=...)` and `solwyn_tags=`. Never inferred from prompts or responses; omitted when empty or unset |
+| `deny_source` | `str \| None` | Structural denial source (`server`, sticky/local enforcement sources, or `aggregate_replay`) |
+| `deny_reason` | `str \| None` | Bounded structural reason for a denied call; never derived from content |
+| `denied_by_period` | `str \| None` | Budget period that denied the call, when supplied by the control plane |
+| `estimated_output_bound` | `int \| None` | Output-token bound used for the denied pre-flight |
+| `velocity_flags` | `list[str] \| None` | Content-free v1 rule names: `repeat_size`, `monotonic_growth`, and `rate_acceleration` |
+| `receipt_aggregate_count` | `int \| None` | Number of denied receipts represented by a content-free aggregate replay |
+| `receipt_pricing_input_tokens` | `int \| None` | Original per-call input-token count used to select the pricing card for a homogeneous aggregate replay; omitted for ordinary and legacy events |
+
+Token, output-bound, aggregate-count, pricing-basis, and non-token media
+quantities are each capped at 100,000,000 per event. Larger folded receipt
+totals replay as multiple pricing-compatible events without changing their
+exact totals or turning an unknown media quantity into zero.
 
 **The SDK never captures, logs, or transmits prompts or responses.** Explicit customer-supplied tags are outside this zero-content guarantee and are transmitted as provided. Prompt and response privacy is enforced by [structural tests](tests/unit/test_privacy_firewall.py) and the [privacy module](src/solwyn/_privacy.py).
 

@@ -60,18 +60,20 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
     defaults.update(overrides)
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
-    solwyn._reporter.report = MagicMock()
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter.report = MagicMock()
     # Non-streaming settlement now rides report_settlement(confirm, event); keep
     # the SUCCESS event observable on report() by forwarding the settled event.
-    solwyn._reporter.report_settlement = lambda _req, event: solwyn._reporter.report(event)
+    solwyn._solwyn_reporter.report_settlement = lambda _req, event: solwyn._solwyn_reporter.report(
+        event
+    )
     return solwyn
 
 
 def _close(solwyn: Solwyn) -> None:
-    solwyn._reporter._http.close()
-    solwyn._budget._http.close()
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_budget._http.close()
 
 
 _PLAIN_REQUEST = {
@@ -93,14 +95,14 @@ class TestCallIdJoinKey:
 
         def report_settlement(req: object, event: object) -> None:
             settlements.append((req, event))
-            solwyn._reporter.report(event)
+            solwyn._solwyn_reporter.report(event)
 
-        solwyn._reporter.report_settlement = report_settlement
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        solwyn._solwyn_reporter.report_settlement = report_settlement
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # The success metadata event carries a call_id…
-        events = [c.args[0] for c in solwyn._reporter.report.call_args_list]
+        events = [c.args[0] for c in solwyn._solwyn_reporter.report.call_args_list]
         success = [e for e in events if e.status is CallStatus.SUCCESS]
         assert len(success) == 1
         event_call_id = success[0].call_id
@@ -119,11 +121,11 @@ class TestCallIdJoinKey:
         openai.chat.completions.create.return_value = _openai_response()
         solwyn = _make_solwyn(openai, model="gpt-5.5")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-        events = [c.args[0] for c in solwyn._reporter.report.call_args_list]
+        events = [c.args[0] for c in solwyn._solwyn_reporter.report.call_args_list]
         ids = [e.call_id for e in events if e.status is CallStatus.SUCCESS]
         assert len(ids) == 2
         assert ids[0] != ids[1]
@@ -149,9 +151,11 @@ class TestCacheHitReconciliation:
         # reservation_id=None mimics a budget-cache hit.
         with (
             patch.object(
-                solwyn._budget, "check_budget", return_value=_allow_budget(reservation_id=None)
+                solwyn._solwyn_budget,
+                "check_budget",
+                return_value=_allow_budget(reservation_id=None),
             ),
-            patch.object(solwyn._reporter, "report_settlement", settle_spy),
+            patch.object(solwyn._solwyn_reporter, "report_settlement", settle_spy),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -162,7 +166,7 @@ class TestCacheHitReconciliation:
         # (b) the SUCCESS metadata event ALONE carries everything the Cloud API
         #     needs to reconcile: a non-None call_id, token_details, and the
         #     served provider.
-        events = [c.args[0] for c in solwyn._reporter.report.call_args_list]
+        events = [c.args[0] for c in solwyn._solwyn_reporter.report.call_args_list]
         success = [e for e in events if e.status is CallStatus.SUCCESS]
         assert len(success) == 1
         ev = success[0]
@@ -187,13 +191,13 @@ class TestPossiblySucceededAbortFlag:
         solwyn = _make_solwyn(openai, model="gpt-5.5")
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             solwyn_pkg.run("timeout-job", tags={"team": "platform"}),
             pytest.raises(APITimeoutError),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST, solwyn_tags={"outcome": "timeout"})
 
-        events = [c.args[0] for c in solwyn._reporter.report.call_args_list]
+        events = [c.args[0] for c in solwyn._solwyn_reporter.report.call_args_list]
         errors = [e for e in events if e.status is CallStatus.ERROR]
         assert len(errors) == 1
         # The abort event flags possibly_succeeded for Cloud-API reconciliation…
@@ -210,10 +214,10 @@ class TestPossiblySucceededAbortFlag:
         openai.chat.completions.create.return_value = _openai_response()
         solwyn = _make_solwyn(openai, model="gpt-5.5")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-        events = [c.args[0] for c in solwyn._reporter.report.call_args_list]
+        events = [c.args[0] for c in solwyn._solwyn_reporter.report.call_args_list]
         success = [e for e in events if e.status is CallStatus.SUCCESS]
         assert len(success) == 1
         # Non-abort events leave possibly_succeeded None (None-skipped on the wire).

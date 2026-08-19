@@ -171,9 +171,9 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
     defaults.update(overrides)
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
-    solwyn._reporter.report = MagicMock()
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter.report = MagicMock()
     return solwyn
 
 
@@ -181,18 +181,18 @@ def _make_async_solwyn(client: object, **overrides: object) -> AsyncSolwyn:
     defaults: dict[str, object] = {"api_key": VALID_API_KEY}
     defaults.update(overrides)
     solwyn = AsyncSolwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter.report = MagicMock()
+    solwyn._solwyn_reporter.report = MagicMock()
     return solwyn
 
 
 def _close(solwyn: Solwyn) -> None:
-    solwyn._reporter._http.close()
-    solwyn._budget._http.close()
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_budget._http.close()
 
 
 async def _aclose(solwyn: AsyncSolwyn) -> None:
-    await solwyn._reporter._http.aclose()
-    await solwyn._budget._http.aclose()
+    await solwyn._solwyn_reporter._http.aclose()
+    await solwyn._solwyn_budget._http.aclose()
 
 
 def _async_iter(chunks: list[Any]) -> AsyncIterator[Any]:
@@ -295,7 +295,7 @@ class TestGoogleStreamingEstablishmentFailover:
             "config": {"max_output_tokens": 256},
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.models.generate_content_stream(**request)
             chunks = list(stream)
 
@@ -341,7 +341,7 @@ class TestCrossProviderStreamingIntoGoogle:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(**request)
             chunks = list(stream)
 
@@ -383,7 +383,7 @@ class TestCrossProviderStreamingIntoGoogle:
         }
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             stream = await solwyn.chat.completions.create(**request)
             chunks = [c async for c in stream]
@@ -423,7 +423,7 @@ class TestGooglePrimaryStreamingFailoverIntoOpenAI:
             "config": {"max_output_tokens": 256},
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.models.generate_content_stream(**request)
             chunks = list(stream)
 
@@ -467,7 +467,7 @@ class TestGooglePrimaryStreamingFailoverIntoOpenAI:
         }
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             stream = await solwyn.models.generate_content_stream(**request)
             chunks = [c async for c in stream]
@@ -514,7 +514,7 @@ class TestCrossProviderTextStreamingNormalizes:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(**request)
             chunks = list(stream)
 
@@ -557,7 +557,7 @@ class TestCrossProviderTextStreamingNormalizes:
         }
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(UntranslatableRequestError) as exc_info,
         ):
             solwyn.chat.completions.create(**request)
@@ -589,7 +589,7 @@ class TestSameDialectStreamingNoTranslation:
         }
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             patch.object(
                 _translation,
                 "translate_stream_chunk",
@@ -633,7 +633,7 @@ class TestMidStreamErrorNeverFailsOver:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(**request)
             with pytest.raises(ConnectionError, match="mid-stream reset"):
                 list(stream)
@@ -642,7 +642,7 @@ class TestMidStreamErrorNeverFailsOver:
         anthropic.messages.create.assert_not_called()
         errors = [
             c.args[0]
-            for c in solwyn._reporter.report.call_args_list
+            for c in solwyn._solwyn_reporter.report.call_args_list
             if c.args[0].status is CallStatus.ERROR
         ]
         assert len(errors) == 1
@@ -678,7 +678,7 @@ class TestMidStreamErrorNeverFailsOver:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             # The wrapper IS returned (establishment succeeded); the error only
             # surfaces on iteration — proving OpenAI was NOT materialized.
             stream = solwyn.chat.completions.create(**request)
@@ -692,7 +692,7 @@ class TestMidStreamErrorNeverFailsOver:
         assert openai_cb.failure_count == 1
         errors = [
             c.args[0]
-            for c in solwyn._reporter.report.call_args_list
+            for c in solwyn._solwyn_reporter.report.call_args_list
             if c.args[0].status is CallStatus.ERROR
         ]
         assert len(errors) == 1
@@ -729,7 +729,7 @@ class TestMidStreamErrorNeverFailsOver:
         }
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             stream = await solwyn.chat.completions.create(**request)
             with pytest.raises(ConnectionError, match="mid-stream reset"):
@@ -741,7 +741,7 @@ class TestMidStreamErrorNeverFailsOver:
         assert openai_cb.failure_count == 1
         errors = [
             c.args[0]
-            for c in solwyn._reporter.report.call_args_list
+            for c in solwyn._solwyn_reporter.report.call_args_list
             if c.args[0].status is CallStatus.ERROR
         ]
         assert len(errors) == 1
@@ -772,7 +772,7 @@ class TestEagerEstablishmentFailover:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(**request)
             chunks = list(stream)
 
@@ -807,7 +807,7 @@ class TestEagerEstablishmentFailover:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(**request)
             chunks = list(stream)
 
@@ -836,7 +836,7 @@ class TestEagerEstablishmentFailover:
         }
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             stream = await solwyn.chat.completions.create(**request)
             chunks = [c async for c in stream]
@@ -886,7 +886,7 @@ class TestAsyncGoogleStreamingEstablishmentFailover:
         }
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             stream = await solwyn.models.generate_content_stream(**request)
             chunks = [c async for c in stream]
@@ -969,7 +969,7 @@ class TestMaterializedGoogleStreamForwardsClose:
 
         solwyn = _make_solwyn(google, model="gemini-3.5-flash")
         confirms: list[Any] = []
-        solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: confirms.append(req)
 
         request = {
             "model": "gemini-3.5-flash",
@@ -979,7 +979,7 @@ class TestMaterializedGoogleStreamForwardsClose:
 
         with (
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
                 return_value=_allow_budget(reservation_id="resv_g"),
             ),
@@ -1005,7 +1005,7 @@ class TestMaterializedGoogleStreamForwardsClose:
 
         solwyn = _make_async_solwyn(google, model="gemini-3.5-flash")
         confirms: list[Any] = []
-        solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: confirms.append(req)
 
         request = {
             "model": "gemini-3.5-flash",
@@ -1014,7 +1014,9 @@ class TestMaterializedGoogleStreamForwardsClose:
         }
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget("resv_g"))
+            solwyn._solwyn_budget,
+            "check_budget",
+            new=AsyncMock(return_value=_allow_budget("resv_g")),
         ):
             stream = await solwyn.models.generate_content_stream(**request)
             async with stream:
@@ -1073,7 +1075,7 @@ class TestNoDoubleEmitThreeChunks:
         solwyn = _make_solwyn(client, model="gpt-5.5")
 
         # Wrap the served runtime's accumulator so we can count observe() calls.
-        rt = solwyn._runtimes[0]
+        rt = solwyn._solwyn_runtimes[0]
         real_factory = rt.adapter.create_stream_accumulator
         counting: list[_CountingAccumulator] = []
 
@@ -1089,7 +1091,7 @@ class TestNoDoubleEmitThreeChunks:
         }
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             patch.object(rt.adapter, "create_stream_accumulator", _factory),
         ):
             stream = solwyn.chat.completions.create(**request)
@@ -1131,7 +1133,7 @@ class TestCrossProviderStreamSettlement:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list[Any] = []
-        solwyn._reporter.report = lambda e: events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: events.append(e)
 
         request = {
             "model": "gpt-5.5",
@@ -1139,7 +1141,7 @@ class TestCrossProviderStreamSettlement:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(**request)
             chunks = list(stream)
 
@@ -1185,7 +1187,7 @@ class TestCrossProviderStreamSettlement:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list[Any] = []
-        solwyn._reporter.report = lambda e: events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: events.append(e)
 
         request = {
             "model": "gpt-5.5",
@@ -1194,7 +1196,7 @@ class TestCrossProviderStreamSettlement:
         }
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             stream = await solwyn.chat.completions.create(**request)
             chunks = [c async for c in stream]
@@ -1245,7 +1247,7 @@ class TestStreamingIdempotencyMatrix:
         }
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(APITimeoutError) as exc_info,
         ):
             solwyn.chat.completions.create(**request)
@@ -1274,7 +1276,7 @@ class TestStreamingIdempotencyMatrix:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(**request)
             chunks = list(stream)
 
@@ -1309,7 +1311,7 @@ class TestStreamingIdempotencyMatrix:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(**request)
             chunks = list(stream)
 
@@ -1345,7 +1347,7 @@ class TestStreamingIdempotencyMatrix:
         }
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(_Status, match="rate limited"),
         ):
             solwyn.chat.completions.create(**request)
@@ -1379,7 +1381,7 @@ class TestStreamingIdempotencyMatrix:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(solwyn_idempotent=True, **request)
             chunks = list(stream)
 
@@ -1412,7 +1414,7 @@ class TestAbandonedStreamSettlement:
         solwyn = _make_solwyn(client, model="gpt-5.5")
         # A reservation makes on_complete build + fire-and-forget a confirm.
         confirms: list[Any] = []
-        solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: confirms.append(req)
 
         request = {
             "model": "gpt-5.5",
@@ -1422,7 +1424,7 @@ class TestAbandonedStreamSettlement:
 
         with (
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
                 return_value=_allow_budget(reservation_id="resv_1"),
             ),
@@ -1447,7 +1449,7 @@ class TestAbandonedStreamSettlement:
 
         solwyn = _make_solwyn(client, model="gpt-5.5")
         confirms: list[Any] = []
-        solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: confirms.append(req)
 
         request = {
             "model": "gpt-5.5",
@@ -1456,7 +1458,9 @@ class TestAbandonedStreamSettlement:
         }
 
         with patch.object(
-            solwyn._budget, "check_budget", return_value=_allow_budget(reservation_id="resv_2")
+            solwyn._solwyn_budget,
+            "check_budget",
+            return_value=_allow_budget(reservation_id="resv_2"),
         ):
             stream = solwyn.chat.completions.create(**request)
             for _chunk in stream:
@@ -1480,7 +1484,7 @@ class TestAbandonedStreamSettlement:
 
         solwyn = _make_async_solwyn(client, model="gpt-5.5")
         confirms: list[Any] = []
-        solwyn._reporter.report_settlement = lambda req, event: confirms.append(req)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: confirms.append(req)
 
         request = {
             "model": "gpt-5.5",
@@ -1489,7 +1493,9 @@ class TestAbandonedStreamSettlement:
         }
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget("resv_3"))
+            solwyn._solwyn_budget,
+            "check_budget",
+            new=AsyncMock(return_value=_allow_budget("resv_3")),
         ):
             stream = await solwyn.chat.completions.create(**request)
             async with stream:
@@ -1540,7 +1546,7 @@ class TestStreamingSuccessSingleBreakerCredit:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(**request)
             list(stream)  # drain the stream to completion -> on_complete settles
 
@@ -1574,7 +1580,7 @@ class TestStreamingSuccessSingleBreakerCredit:
             "stream": True,
         }
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             stream = solwyn.chat.completions.create(**request)
             with pytest.raises(ConnectionError, match="mid-stream reset"):
                 list(stream)
@@ -1600,7 +1606,7 @@ class TestStreamingSuccessSingleBreakerCredit:
         _force_half_open(cb)
 
         request = {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**request)
 
         assert cb.state == CircuitState.HALF_OPEN
@@ -1629,7 +1635,7 @@ class TestStreamingSuccessSingleBreakerCredit:
         }
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             stream = await solwyn.chat.completions.create(**request)
             _ = [c async for c in stream]
@@ -1664,7 +1670,7 @@ class TestStreamingSuccessSingleBreakerCredit:
         }
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             stream = await solwyn.chat.completions.create(**request)
             with pytest.raises(ConnectionError, match="mid-stream reset"):

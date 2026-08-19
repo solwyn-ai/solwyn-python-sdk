@@ -119,10 +119,10 @@ def test_wrap_defaults_to_uncached_checks_and_production_lease_behavior() -> Non
     wrapped = plane.wrap(_OpenAIStub())
 
     assert isinstance(wrapped, Solwyn)
-    assert wrapped._config.api_key == plane.api_key
-    assert wrapped._config.api_url == plane.api_url
-    assert wrapped._config.budget_check_cache_ttl == 0
-    assert wrapped._config.lease_enabled is True
+    assert wrapped._solwyn_config.api_key == plane.api_key
+    assert wrapped._solwyn_config.api_url == plane.api_url
+    assert wrapped._solwyn_config.budget_check_cache_ttl == 0
+    assert wrapped._solwyn_config.lease_enabled is True
     wrapped.close()
 
 
@@ -136,8 +136,8 @@ def test_wrap_allows_callers_to_override_wrapper_defaults() -> None:
         lease_enabled=True,
     )
 
-    assert wrapped._config.budget_check_cache_ttl == 9
-    assert wrapped._config.lease_enabled is True
+    assert wrapped._solwyn_config.budget_check_cache_ttl == 9
+    assert wrapped._solwyn_config.lease_enabled is True
     wrapped.close()
 
 
@@ -174,9 +174,9 @@ async def test_wrap_async_uses_the_dual_transport_and_same_defaults() -> None:
     wrapped = plane.wrap_async(_AsyncOpenAIStub())
 
     assert isinstance(wrapped, AsyncSolwyn)
-    assert wrapped._config.api_url == plane.api_url
-    assert wrapped._config.budget_check_cache_ttl == 0
-    assert wrapped._config.lease_enabled is True
+    assert wrapped._solwyn_config.api_url == plane.api_url
+    assert wrapped._solwyn_config.budget_check_cache_ttl == 0
+    assert wrapped._solwyn_config.lease_enabled is True
     await wrapped.close()
 
 
@@ -383,12 +383,13 @@ async def test_magic_fallback_denies_async_wrapper_before_any_provider_dispatch(
 
     try:
         async with solwyn_pkg.run("wrap-stopped-fallback"):
-            with pytest.raises(BudgetExceededError) as captured:
+            with pytest.raises(solwyn_pkg.RunStoppedError) as captured:
                 await wrapped.chat.completions.create(model="gpt-5.5", messages=[])
     finally:
         await wrapped.close()
 
-    assert captured.value.budget_period == "run_stopped"
+    assert captured.value.reason == "run_stopped"
+    assert captured.value.source == "server"
     assert primary.chat.completions.calls == 0
     assert fallback.chat.completions.calls == 0
 
@@ -412,8 +413,8 @@ def test_stopped_run_hard_denies_a_wrapped_call_on_an_alert_only_plane() -> None
         wrapped.close()
 
     assert captured.value.agent_run_id == run_id
-    assert captured.value.budget_period == "run_stopped"
-    assert captured.value.mode == "hard_deny"
+    assert captured.value.reason == "run_stopped"
+    assert captured.value.source == "server"
     assert provider.chat.completions.calls == 0
 
 
@@ -469,16 +470,18 @@ def test_wrap_neutralizes_ambient_solwyn_environment_variables(
     monkeypatch.setenv("SOLWYN_REPORTER_BATCH_SIZE", "7")
     monkeypatch.setenv("SOLWYN_ACKNOWLEDGE_UNTRACKED", "chat.completions.create")
     monkeypatch.setenv("SOLWYN_BUDGET_CHECK_CACHE_TTL", "99")
+    monkeypatch.setenv("SOLWYN_VELOCITY_MODE", "deny")
     plane = FakeControlPlane()
 
     wrapped = plane.wrap(_OpenAIStub())
 
-    assert wrapped._config.fail_open is True
-    assert wrapped._config.budget_mode == BudgetMode.ALERT_ONLY
-    assert wrapped._config.lease_enabled is True
-    assert wrapped._config.reporter_batch_size == 50
-    assert wrapped._config.acknowledge_untracked == frozenset()
-    assert wrapped._config.budget_check_cache_ttl == 0
+    assert wrapped._solwyn_config.fail_open is True
+    assert wrapped._solwyn_config.budget_mode == BudgetMode.ALERT_ONLY
+    assert wrapped._solwyn_config.lease_enabled is True
+    assert wrapped._solwyn_config.reporter_batch_size == 50
+    assert wrapped._solwyn_config.acknowledge_untracked == frozenset()
+    assert wrapped._solwyn_config.budget_check_cache_ttl == 0
+    assert wrapped._solwyn_config.velocity_mode == "warn"
     wrapped.close()
 
 
@@ -496,8 +499,8 @@ def test_wrap_kwargs_win_over_both_the_environment_and_the_declared_default(
         budget_mode="hard_deny",
     )
 
-    assert wrapped._config.reporter_batch_size == 13
-    assert wrapped._config.budget_mode == BudgetMode.HARD_DENY
+    assert wrapped._solwyn_config.reporter_batch_size == 13
+    assert wrapped._solwyn_config.budget_mode == BudgetMode.HARD_DENY
     wrapped.close()
 
 
@@ -511,8 +514,8 @@ async def test_wrap_async_neutralizes_ambient_solwyn_environment_variables(
 
     wrapped = plane.wrap_async(_AsyncOpenAIStub())
 
-    assert wrapped._config.fail_open is True
-    assert wrapped._config.lease_enabled is True
+    assert wrapped._solwyn_config.fail_open is True
+    assert wrapped._solwyn_config.lease_enabled is True
     await wrapped.close()
 
 
@@ -531,8 +534,8 @@ def test_direct_client_construction_still_honors_ambient_environment_variables(
         control_plane_transport=plane.transport,
     )
 
-    assert client._config.fail_open is False
-    assert client._config.reporter_batch_size == 7
+    assert client._solwyn_config.fail_open is False
+    assert client._solwyn_config.reporter_batch_size == 7
     client.close()
 
 

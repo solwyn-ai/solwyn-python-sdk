@@ -268,6 +268,7 @@ class TestSyncBreakerReporter:
         release_breaker = threading.Event()
         close_finished = threading.Event()
         sent_providers: list[str] = []
+        sent_failures: list[tuple[str, int]] = []
         openai = CircuitBreaker(failure_threshold=1)
         anthropic = CircuitBreaker(failure_threshold=1)
         reporter = _quiet_sync_reporter(
@@ -283,7 +284,9 @@ class TestSyncBreakerReporter:
             if url.endswith("/breaker-reports"):
                 payload = kwargs["json"]
                 assert isinstance(payload, dict)
-                sent_providers.append(str(payload["provider"]))
+                provider = str(payload["provider"])
+                sent_providers.append(provider)
+                sent_failures.append((provider, int(payload["failure_count"])))
                 if len(sent_providers) == 1:
                     breaker_started.set()
                     assert release_breaker.wait(timeout=2.0)
@@ -312,11 +315,19 @@ class TestSyncBreakerReporter:
                 assert not close_finished.wait(timeout=0.05)
                 assert sent_providers == ["openai"]
                 http_close.assert_not_called()
+                # This state change misses the active worker's eager snapshot.
+                # Close's forced final cycle must take a fresh one after join.
+                anthropic.record_failure()
                 release_breaker.set()
                 assert close_finished.wait(timeout=2.0)
                 close_thread.join(timeout=2.0)
 
                 assert sent_providers == ["openai", "openai", "anthropic"]
+                assert sent_failures == [
+                    ("openai", 1),
+                    ("openai", 1),
+                    ("anthropic", 1),
+                ]
                 http_close.assert_called_once_with()
         finally:
             release_breaker.set()
@@ -363,6 +374,67 @@ class TestSyncBreakerReporter:
                 worker.join(timeout=2.0)
             real_close()
 
+    def test_breaker_worker_warning_can_reenter_close_without_self_join(self) -> None:
+        reporter = _quiet_sync_reporter(
+            breaker_snapshots=lambda: [(ProviderName.OPENAI, CircuitBreaker().get_state())],
+            sdk_instance_id=SDK_INSTANCE_ID,
+            report_untracked_surfaces=False,
+        )
+        reporter.observe_project_id(VALID_PROJECT_ID)
+        queued = _event()
+        reporter.report(queued)
+        close_finished = threading.Event()
+        close_started = threading.Event()
+        close_errors: list[BaseException] = []
+        delivered: list[str] = []
+        real_close = reporter._http.close
+
+        def warning(message: str, *_args: object, **_kwargs: object) -> None:
+            if not message.startswith("reporter.breaker_send_failed") or close_started.is_set():
+                return
+            close_started.set()
+            try:
+                reporter.close(timeout=0.2)
+            except BaseException as exc:
+                close_errors.append(exc)
+            finally:
+                close_finished.set()
+
+        def post(url: str, **kwargs: object) -> MagicMock:
+            if url.endswith("/breaker-reports"):
+                return _error_response()
+            payload = kwargs["json"]
+            assert isinstance(payload, list)
+            delivered.extend(str(item["call_id"]) for item in payload)
+            response = _ok_response()
+            response.json.return_value = {"ingested": len(payload), "rejected": []}
+            return response
+
+        worker: threading.Thread | None = None
+        try:
+            with (
+                patch.object(reporter._http, "post", side_effect=post),
+                patch.object(reporter._http, "close") as http_close,
+                patch("solwyn.reporter.logger.warning", side_effect=warning),
+            ):
+                worker = reporter._start_breaker_cycle()
+                assert worker is not None
+                assert close_finished.wait(timeout=2.0)
+                worker.join(timeout=2.0)
+
+                assert close_errors == []
+                assert not worker.is_alive()
+                assert delivered == [str(queued.call_id)]
+                assert not reporter._queue
+                assert reporter.dropped_counts == {}
+                assert reporter._delivery_completed is True
+                assert reporter._close_is_completed() is True
+                http_close.assert_called_once_with()
+        finally:
+            if worker is not None:
+                worker.join(timeout=2.0)
+            real_close()
+
     def test_client_supplies_distinct_provider_snapshots_and_instance_config(self) -> None:
         openai = MagicMock()
         openai.__class__.__module__ = "openai._client"
@@ -379,20 +451,20 @@ class TestSyncBreakerReporter:
                 fallback=[(anthropic, "claude-sonnet-5")],
                 breaker_reporting_enabled=False,
             )
-        solwyn._reporter._thread.join(timeout=2.0)
+        solwyn._solwyn_reporter._thread.join(timeout=2.0)
 
-        assert solwyn._reporter._breaker_snapshots is not None
-        snapshots = solwyn._reporter._breaker_snapshots()
+        assert solwyn._solwyn_reporter._breaker_snapshots is not None
+        snapshots = solwyn._solwyn_reporter._breaker_snapshots()
         assert {provider for provider, _snapshot in snapshots} == {
             ProviderName.OPENAI,
             ProviderName.ANTHROPIC,
         }
         assert all(snapshot.model_config["frozen"] for _provider, snapshot in snapshots)
-        assert solwyn._reporter._sdk_instance_id == solwyn._sdk_instance_id
-        assert solwyn._reporter._breaker_reporting_enabled is False
+        assert solwyn._solwyn_reporter._sdk_instance_id == solwyn._solwyn_sdk_instance_id
+        assert solwyn._solwyn_reporter._breaker_reporting_enabled is False
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_next_flush_uses_current_state_and_wall_clock_only(self) -> None:
         breaker = CircuitBreaker(failure_threshold=1)

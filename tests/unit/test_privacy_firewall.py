@@ -55,6 +55,27 @@ SDK_SRC = Path(__file__).resolve().parent.parent.parent / "src" / "solwyn"
 # replaces the older filename-set notion so a content-privileged *package* (not
 # just a single file) stays fully covered as modules are added.
 TRANSLATION_PKG_REL = Path("providers") / "_translation"
+INTEGRATIONS_PKG_REL = Path("integrations")
+
+_INTEGRATION_CONTENT_NAMES = frozenset(
+    {
+        "inputs",
+        "outputs",
+        "prompts",
+        "messages",
+        "generations",
+        "response",
+        "chunk",
+        "text",
+        "content",
+        "event",
+        "output",
+        "raw",
+        "error",
+        "description",
+    }
+)
+_INTEGRATION_STRUCTURAL_LOG_NAMES = frozenset({"run_id", "parent_run_id"})
 
 
 def _is_content_privileged(path: Path) -> bool:
@@ -83,6 +104,135 @@ FORBIDDEN_FIELDS = {
 def _iter_source_files() -> list[Path]:
     """All SDK source files EXCEPT the content-privileged allowlist."""
     return [p for p in SDK_SRC.rglob("*.py") if not _is_content_privileged(p)]
+
+
+def _integration_privacy_violations(path: Path) -> list[str]:
+    """Return structural privacy violations in one integration module."""
+    tree = ast.parse(path.read_text())
+    violations: list[str] = []
+    rel = path.relative_to(SDK_SRC) if path.is_relative_to(SDK_SRC) else path.name
+
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in _INTEGRATION_CONTENT_NAMES
+        ):
+            violations.append(f"content-load:{rel}:{node.lineno}:{node.id}")
+
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "httpx" or alias.name.startswith("httpx."):
+                    violations.append(f"httpx-import:{rel}:{node.lineno}")
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and (node.module == "httpx" or node.module.startswith("httpx."))
+        ):
+            violations.append(f"httpx-import:{rel}:{node.lineno}")
+
+        if not isinstance(node, ast.Call):
+            continue
+        called_name = None
+        if isinstance(node.func, ast.Name):
+            called_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            called_name = node.func.attr
+        if called_name == "MetadataEvent":
+            violations.append(f"metadata-event:{rel}:{node.lineno}")
+
+        if not (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "logger"
+        ):
+            continue
+        if not node.args or not (
+            isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)
+        ):
+            violations.append(f"logging-argument:{rel}:{node.lineno}:template")
+        for argument in node.args[1:]:
+            if not (
+                isinstance(argument, ast.Name) and argument.id in _INTEGRATION_STRUCTURAL_LOG_NAMES
+            ):
+                violations.append(f"logging-argument:{rel}:{node.lineno}:positional")
+        if node.keywords:
+            violations.append(f"logging-argument:{rel}:{node.lineno}:keyword")
+
+    return violations
+
+
+@pytest.mark.unit
+def test_integrations_are_content_free_and_sans_io() -> None:
+    """Framework adapters bind content callbacks but never read their values."""
+    paths = sorted((SDK_SRC / INTEGRATIONS_PKG_REL).rglob("*.py"))
+    assert paths, "src/solwyn/integrations must contain at least one module"
+    violations = [
+        violation for path in paths for violation in _integration_privacy_violations(path)
+    ]
+    assert not violations, "Integration privacy firewall violations:\n" + "\n".join(violations)
+
+
+@pytest.mark.unit
+def test_integration_privacy_firewall_fixture_proves_every_rule_bites(tmp_path: Path) -> None:
+    fixture = tmp_path / "privacy_violation.py"
+    fixture.write_text(
+        """\
+import httpx
+import logging
+
+from solwyn._types import MetadataEvent
+
+logger = logging.getLogger(__name__)
+
+def violate(inputs, run_id):
+    MetadataEvent()
+    return inputs
+"""
+    )
+
+    categories = {item.split(":", 1)[0] for item in _integration_privacy_violations(fixture)}
+
+    assert categories == {
+        "content-load",
+        "httpx-import",
+        "metadata-event",
+    }
+
+    nonliteral_log_fixture = tmp_path / "nonliteral_log.py"
+    nonliteral_log_fixture.write_text(
+        """\
+import logging
+
+logger = logging.getLogger(__name__)
+
+def violate(run_id):
+    template = "unsafe %s"
+    logger.warning(template, run_id)
+"""
+    )
+    nonliteral_violations = _integration_privacy_violations(nonliteral_log_fixture)
+    assert [item.rsplit(":", 1)[-1] for item in nonliteral_violations] == ["template"]
+
+    unsafe_positional_fixture = tmp_path / "unsafe_positional_log.py"
+    unsafe_positional_fixture.write_text(
+        """\
+import logging
+
+logger = logging.getLogger(__name__)
+
+def violate(run_id):
+    logger.warning("unsafe %s", str(run_id))
+"""
+    )
+    positional_violations = _integration_privacy_violations(unsafe_positional_fixture)
+    assert [item.rsplit(":", 1)[-1] for item in positional_violations] == ["positional"]
+
+    for crewai_name in ("event", "output", "raw", "error", "description"):
+        crewai_fixture = tmp_path / f"unsafe_crewai_{crewai_name}.py"
+        crewai_fixture.write_text(f"def violate({crewai_name}):\n    return {crewai_name}\n")
+        crewai_violations = _integration_privacy_violations(crewai_fixture)
+        assert [item.rsplit(":", 1)[-1] for item in crewai_violations] == [crewai_name]
 
 
 def _content_privileged_paths() -> list[Path]:
@@ -741,10 +891,10 @@ class _RecordingResponse:
 class _RecordingHttpClient:
     """Fake httpx client capturing every ``json=`` body POSTed to the Cloud API.
 
-    Stands in for BOTH ``_budget._http`` and ``_reporter._http`` so the test
-    sees the budget check, the confirm, AND the metadata-ingest payloads. The
-    budget-check URL returns an allow-response so the call proceeds and the
-    cross-provider hop (translation + Anthropic serve) actually fires.
+    Stands in for BOTH ``_solwyn_budget._http`` and ``_solwyn_reporter._http``
+    so the test sees the budget check, the confirm, AND the metadata-ingest
+    payloads. The budget-check URL returns an allow-response so the call proceeds
+    and the cross-provider hop (translation + Anthropic serve) actually fires.
     """
 
     def __init__(self, captured: list[object]) -> None:
@@ -794,12 +944,12 @@ def test_failover_solwyn_payloads_carry_no_content() -> None:
     # The background thread ran the no-op _flush_loop and exited; _shutdown stays
     # UNSET so the non-streaming report_settlement can still enqueue the
     # settlement (report_settlement drops items once shutdown is set).
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
 
     # Capture every json= body POSTed to config.api_url on BOTH clients.
     captured: list[object] = []
-    solwyn._budget._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
-    solwyn._reporter._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
+    solwyn._solwyn_budget._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
+    solwyn._solwyn_reporter._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
 
     # Force the primary circuit OPEN so the chain skips OpenAI and the
     # cross-provider Anthropic hop fires (translation + normalization run).
@@ -817,7 +967,7 @@ def test_failover_solwyn_payloads_carry_no_content() -> None:
 
     # ── Act: run the call; then drain the reporter queue through the fake. ─
     result = solwyn.chat.completions.create(**request)
-    solwyn._reporter._flush_remaining()  # drives metadata-ingest through the fake
+    solwyn._solwyn_reporter._flush_remaining()  # drives metadata-ingest through the fake
 
     # Sanity: the cross-provider hop actually served (so translation DID run on
     # SENTINEL-bearing content) and the response normalized back to OpenAI shape.
@@ -833,8 +983,8 @@ def test_failover_solwyn_payloads_carry_no_content() -> None:
         "the translating cross-provider failover path."
     )
 
-    solwyn._budget._http.close()
-    solwyn._reporter._http.close()
+    solwyn._solwyn_budget._http.close()
+    solwyn._solwyn_reporter._http.close()
 
 
 @pytest.mark.unit
@@ -899,11 +1049,11 @@ def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
         )
     # The background thread ran the no-op _flush_loop and exited; _shutdown stays
     # UNSET so on_complete's report_settlement can still enqueue the settlement.
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
 
     captured: list[object] = []
-    solwyn._budget._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
-    solwyn._reporter._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
+    solwyn._solwyn_budget._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
+    solwyn._solwyn_reporter._http = _RecordingHttpClient(captured)  # type: ignore[assignment]
 
     # Force the primary circuit OPEN so the cross-provider Anthropic stream hop
     # fires (per-chunk translation runs on SENTINEL-bearing chunk content).
@@ -924,7 +1074,7 @@ def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
     #         fires; then flush the reporter queue through the fake. ───────────
     stream = solwyn.chat.completions.create(**request)
     chunks = list(stream)
-    solwyn._reporter._flush_remaining()
+    solwyn._solwyn_reporter._flush_remaining()
 
     # Sanity: the cross-provider stream hop actually served, and the caller saw
     # OpenAI-dialect chunks carrying the (SENTINEL-bearing) Anthropic text.
@@ -940,8 +1090,8 @@ def test_failover_streaming_solwyn_payloads_carry_no_content() -> None:
         "API on the translating cross-provider failover STREAM path."
     )
 
-    solwyn._budget._http.close()
-    solwyn._reporter._http.close()
+    solwyn._solwyn_budget._http.close()
+    solwyn._solwyn_reporter._http.close()
 
 
 # --------------------------------------------------------------------------- #

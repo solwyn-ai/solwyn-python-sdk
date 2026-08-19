@@ -34,7 +34,22 @@ from solwyn._routing import (
     RoutingRequest,
     SelectionPolicy,
 )
-from solwyn._run import RunContext, current_run, current_run_context, run, run_in_executor
+from solwyn._run import (
+    RunContext,
+    RunHandle,
+    create_run,
+    current_run,
+    current_run_context,
+    run,
+    run_in_executor,
+    start_run,
+)
+from solwyn._run_control import (
+    RunTermination,
+    clear_run_termination,
+    current_run_terminated,
+    run_termination,
+)
 from solwyn._surface_graph import SurfaceInspectionError
 from solwyn._types import CircuitState, FailoverReason, ProviderEntry, ProviderName
 from solwyn.circuit_breaker import CircuitBreakerState
@@ -72,6 +87,7 @@ __all__ = [
     "SolwynTagsClampedWarning",
     "BudgetExceededError",
     "RunStoppedError",
+    "RunTermination",
     "ProviderUnavailableError",
     "ConfigurationError",
     "CoverageMismatchError",
@@ -92,10 +108,16 @@ __all__ = [
     "LatencyPolicy",
     "CostPolicy",
     "run",
+    "create_run",
+    "start_run",
     "run_in_executor",
     "current_run",
     "current_run_context",
+    "current_run_terminated",
+    "run_termination",
+    "clear_run_termination",
     "RunContext",
+    "RunHandle",
     "TAGS_MAX_KEYS",
     "TAG_KEY_MAX_LENGTH",
     "TAG_VALUE_MAX_LENGTH",

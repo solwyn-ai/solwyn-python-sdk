@@ -393,7 +393,7 @@ SAMPLE_TOKEN_DETAILS = TokenDetails(input_tokens=100, output_tokens=50)
 #   for a second same-client call inside the 5s default TTL.
 # - Happy-path calls use a model the API prices (gpt-5.5): unpriced models are
 #   allowed WITHOUT a reservation, so confirm never fires.
-# - WireRecorder wraps private seams (client._budget / client._reporter) by
+# - WireRecorder wraps private seams (client._solwyn_budget / client._solwyn_reporter) by
 #   design: it records the wire-bound payloads while REAL delivery to the live
 #   API still happens (precedent: test_metadata_ingest asserts on _queue).
 # ---------------------------------------------------------------------------
@@ -475,8 +475,8 @@ class WireRecorder:
         self.settlements: list[tuple[Any, MetadataEvent]] = []
 
     def attach(self, client: Any) -> WireRecorder:
-        budget = client._budget
-        reporter = client._reporter
+        budget = client._solwyn_budget
+        reporter = client._solwyn_reporter
         real_check = budget.check_budget
         real_report = reporter.report
         real_settlement = reporter.report_settlement

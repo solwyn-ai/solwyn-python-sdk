@@ -297,7 +297,7 @@ def test_reviewed_shape_drift_counts_after_the_matching_surface_already_warned(
     client = _OpenAIClient()
     wrapper = _make_solwyn(client, on_unmetered="warn")
     reviewed_rule = resolve_surface_rule(
-        context=wrapper._surface_context,
+        context=wrapper._solwyn_surface_context,
         path="post",
         source=SurfaceSource.RAW,
     )
@@ -1053,7 +1053,7 @@ def test_exported_conditional_acknowledgment_is_valid_without_a_raw_path() -> No
         acknowledge_untracked={"audio.speech.create:gpt-4o-mini-tts"},
     )
 
-    assert wrapper._config.acknowledge_untracked == frozenset(
+    assert wrapper._solwyn_config.acknowledge_untracked == frozenset(
         {"audio.speech.create:gpt-4o-mini-tts"}
     )
     _close(wrapper)
@@ -1111,7 +1111,7 @@ def test_wire_ineligible_identifier_forwards_and_stays_local(
     from solwyn import _base
 
     wrapper = _make_solwyn(_DynamicOpenAIClient(), on_unmetered=posture)
-    notifier = wrapper._untracked_observation_notifier
+    notifier = wrapper._solwyn_untracked_observation_notifier
     assert isinstance(notifier, MagicMock)
     notifier.reset_mock()
 
@@ -1142,7 +1142,7 @@ def test_nine_segment_identifier_chain_forwards_without_an_advisory_report(
     for segment in ("one", "two", "three", "four", "five", "six", "seven"):
         resource = getattr(resource, segment)
     terminal_path = "deep.one.two.three.four.five.six.seven.call"
-    notifier = wrapper._untracked_observation_notifier
+    notifier = wrapper._solwyn_untracked_observation_notifier
     assert isinstance(notifier, MagicMock)
     notifier.reset_mock()
     caplog.clear()
@@ -1381,7 +1381,7 @@ def test_safe_metadata_return_shape_drift_reenters_strict_unknown_posture() -> N
     wrapper = _make_solwyn(client, on_unmetered="raise")
     client.base_url_evaluations = 0
     reviewed_rule = resolve_surface_rule(
-        context=wrapper._surface_context,
+        context=wrapper._solwyn_surface_context,
         path="base_url",
         source=SurfaceSource.RAW,
     )
@@ -1410,7 +1410,7 @@ def test_safe_metadata_return_shape_drift_warning_names_the_reviewed_rule(
     client = _DriftedBaseURLClient()
     wrapper = _make_solwyn(client, on_unmetered="warn")
     reviewed_rule = resolve_surface_rule(
-        context=wrapper._surface_context,
+        context=wrapper._solwyn_surface_context,
         path="base_url",
         source=SurfaceSource.RAW,
     )

@@ -23,6 +23,34 @@ derived from git tags (hatch-vcs).
   lease recovery ladders. The README adds copy/paste enforcement recipes and
   `solwyn.testing.pytest_plugin` provides explicitly opt-in, function-scoped
   plane and denial-client fixtures—never automatic pytest registration.
+- **Provider wrappers now pass `isinstance`-shaped framework admission.**
+  `Solwyn(client)` and `AsyncSolwyn(client)` report the wrapped provider class
+  through `__class__` while `type(wrapper)` remains the truthful Solwyn class.
+  Public attribute writes and deletes forward to the provider client;
+  `copy.copy` and `copy.deepcopy` preserve one shared enforcement handle; and
+  pickling fails with guidance to construct a fresh wrapper in the target
+  process. Public passthrough reads still cross the capability guard, so known
+  untracked and newly observed leaves keep the existing warn-once default (or
+  the configured strict/allow posture) instead of silently acquiring coverage.
+- **Detached run identities support begin/end framework callbacks and
+  cross-task activation.** `start_run(...)` exposes the scoped `RunHandle`
+  lifecycle, while `create_run(...)` snapshots a stable run ID, parent, and
+  inherited tags without changing the current context. Its reusable
+  `handle.activate()` scope binds that identity around provider work in another
+  task or thread, and `finish()` fails loud while an activation remains live.
+- **OpenAI Agents, LangChain/LangGraph, and CrewAI have admitted integration
+  recipes and offline real-framework smokes.** OpenAI Agents uses a wrapped
+  `AsyncSolwyn` default client plus recipe-local model/provider adapters; its
+  locked/current smoke covers Chat Completions retries, streaming, handoffs,
+  function-tool turns, and budget denial, but no
+  `solwyn.integrations.agents` module ships. `solwyn[langchain]` adds the
+  content-free `SolwynRunScopeHandler`; the exact docs/test raw-response shim
+  admits basic non-streaming `invoke`/`ainvoke` and two-node LangGraph calls.
+  `solwyn[crewai]` adds the content-free structural `SolwynEventListener`;
+  native LiteLLM remains attribution-only with zero Solwyn enforcement, while
+  the narrowly tested sync plain-text custom-`BaseLLM` recipe crosses a wrapped
+  client. CrewAI/LiteLLM run in an isolated dependency lane, and scheduled
+  smoke jobs re-resolve current framework releases to expose churn.
 - **Native OpenAI and Azure OpenAI Responses calls are now budget-metered.**
   Sync and async `responses.create(...)`, `responses.parse(...)`, and new-response
   `responses.stream(...)` helper calls use one primary-only path with
@@ -85,17 +113,58 @@ derived from git tags (hatch-vcs).
   `SOLWYN_REPORT_UNTRACKED_SURFACES=false` to disable optional external
   advisory egress without changing local `on_unmetered`
   `warn`/`allow`/`raise` behavior.
-- **Dashboard-stopped runs raise `RunStoppedError`.** The public exception is
-  a `BudgetExceededError` subclass, so existing hard-deny handlers remain
-  compatible. It identifies the stopped run, preserves the budget snapshot
-  fields, and per-call traffic raises it on the next budget check. Leased
-  traffic raises only after a lease renewal or re-grant learns the stop.
-  Requests already in flight and streams already returned are not interrupted,
-  and control-plane connectivity failures retain the configured fail-open
-  posture.
+- **Agent-run stops raise `RunStoppedError`.** The public exception inherits
+  directly from `SolwynError`, not `BudgetExceededError`, so an agent loop's
+  budget-denial handler cannot swallow and retry an explicit stop. It carries
+  only the structural `agent_run_id`, `reason`, and `source`; server/operator
+  stops use `server`, while deny-eligible local velocity rules use
+  `local_velocity`. The bounded process-wide registry is exposed cooperatively
+  through `current_run_terminated()`, `run_termination(run_id)`,
+  `clear_run_termination(run_id)`, and immutable `RunTermination` values.
+  Exact reasons remain a 256-entry LRU that never guesses from fingerprints, so
+  churn cannot false-stop an unrelated or new run. A stopped run may be
+  forgotten after LRU eviction if the control plane does not reaffirm it—the
+  fixed-memory tradeoff required to preserve exact answers. Active stream handles
+  retain their immutable first stop independently of registry eviction until
+  release. These controls govern future dispatch and do not preempt a
+  non-streaming request already in flight. Streams stop at the next raw
+  provider-chunk boundary: that chunk is pulled and discarded, prior usage is
+  settled exactly once as a partial success, the provider stream is closed, and
+  the original error remains terminal.
+- **Content-free run velocity detection is configurable and bounded.** Seven
+  `velocity_*` / `SOLWYN_VELOCITY_*` settings control mode, repeat-size,
+  monotonic-growth, and rate-acceleration thresholds. Only repeat-size and
+  monotonic-growth are deny-eligible; rate acceleration remains advisory.
+  State contains scalar token counts, timestamps, and structural identifiers
+  only, with 128×64 detailed history and fixed-memory conservative suppression.
+- **Denied-call receipts carry structural attribution.** `deny_source`,
+  `deny_reason`, `denied_by_period`, `estimated_output_bound`, `velocity_flags`,
+  `receipt_aggregate_count`, and `receipt_pricing_input_tokens` are optional,
+  content-free metadata fields. Unavoidable receipt losses fold by
+  pricing-compatible identity — which includes the denial reason and period,
+  so a run's `run_stopped` and `monthly` evidence never merge — and replay in
+  per-field 100-million-unit-safe aggregates after delivery recovers,
+  carrying reason, period, and the union of velocity flags. Aggregates
+  preserve exact token/media totals, optional media quantity presence, and
+  the original per-call input-token pricing basis. Each run holds a bounded
+  budget of exact-pricing fold keys; past it (or with the shared table full)
+  receipts fold into one coarse per-run aggregate whose null pricing basis
+  marks it unpriceable — counts and attribution survive instead of the
+  receipt being refused. Terminal receipt losses are counted at receipt
+  weight, never per event, so an aggregate can never understate its
+  cardinality. A run-stop directive echoed for the wrong run is treated as
+  server contract drift on every channel: it credits the shared
+  control-plane breaker, logs a distinct ERROR, and degrades that one call
+  to the outage posture instead of opening the breaker fleet-wide.
 
 ### Changed
 
+- **Breaking only for consumers of private wrapper attributes: Solwyn-owned
+  state now lives under `_solwyn_*`.** Names such as the former wrapper
+  `_client`, `_budget`, and `_reporter` no longer expose Solwyn internals;
+  non-prefixed names belong to the wrapped provider client. Public Solwyn APIs
+  are unchanged, and the partition prevents collisions with provider SDK
+  private state after type-transparent framework admission.
 - **Breaking (pre-launch): native OpenAI and Azure OpenAI Responses create,
   parse, and stream leaves are no longer acknowledgeable unmetered
   capabilities.** Remove those leaves from `acknowledge_untracked`; they are

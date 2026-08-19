@@ -34,8 +34,8 @@ def _make_solwyn(client: object, **config_kwargs: object) -> Solwyn:
     """Create a Solwyn wrapper without running the reporter background loop."""
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **config_kwargs)
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
     return solwyn
 
 
@@ -44,8 +44,8 @@ def test_solwyn_constructor_accepts_only_api_key(openai_client: MagicMock) -> No
     """Tier-zero: project_id is no longer a constructor parameter."""
     client = _make_solwyn(openai_client, api_key=VALID_PROJECT_KEY)
 
-    assert client._config.api_key == VALID_PROJECT_KEY
-    assert not hasattr(client._config, "project_id")
+    assert client._solwyn_config.api_key == VALID_PROJECT_KEY
+    assert not hasattr(client._solwyn_config, "project_id")
 
     client.close()
 
@@ -72,8 +72,8 @@ def test_solwyn_loads_only_solwyn_api_key_from_env(
 
     client = _make_solwyn(openai_client)
 
-    assert client._config.api_key == VALID_PROJECT_KEY
-    assert not hasattr(client._config, "project_id")
+    assert client._solwyn_config.api_key == VALID_PROJECT_KEY
+    assert not hasattr(client._solwyn_config, "project_id")
 
     client.close()
 

@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, VALID_PROJECT_ID
+from conftest import VALID_API_KEY, VALID_PROJECT_ID, patch_wrapper_local
 
 from solwyn import run
 from solwyn._base import FailoverTuning
@@ -144,15 +144,15 @@ def _make_solwyn(client: object, **overrides: object) -> Solwyn:
     defaults.update(overrides)
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **defaults)  # type: ignore[arg-type]
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
-    solwyn._reporter.report = MagicMock()
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter.report = MagicMock()
     return solwyn
 
 
 def _close(solwyn: Solwyn) -> None:
-    solwyn._reporter._http.close()
-    solwyn._budget._http.close()
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_budget._http.close()
 
 
 @pytest.fixture
@@ -194,7 +194,7 @@ _CUSTOM_FAILOVER_TUNING = {
 
 
 def _current_failover_tuning(solwyn: Solwyn | AsyncSolwyn) -> dict[str, object]:
-    return {name: getattr(solwyn._config, name) for name in _FAILOVER_TUNING_FIELDS}
+    return {name: getattr(solwyn._solwyn_config, name) for name in _FAILOVER_TUNING_FIELDS}
 
 
 # ── policy signal capabilities ───────────────────────────────────────────
@@ -213,48 +213,42 @@ def test_routing_request_is_a_frozen_dataclass() -> None:
 
 @pytest.mark.unit
 class TestRoutingSignalCapabilities:
-    def test_health_policy_skips_latency_median(
-        self, wrapped_client: Solwyn, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_health_policy_skips_latency_median(self, wrapped_client: Solwyn) -> None:
         def _boom(provider: str) -> None:
             raise AssertionError("observed_p50 must not be called under HealthBasedPolicy")
 
-        monkeypatch.setattr(wrapped_client, "observed_p50", _boom)
-        req = RoutingRequest(requested_provider=wrapped_client._runtimes[0].entry.provider)
-        candidates = wrapped_client._select_candidates(req)
+        req = RoutingRequest(requested_provider=wrapped_client._solwyn_runtimes[0].entry.provider)
+        with patch_wrapper_local(wrapped_client, "observed_p50", _boom):
+            candidates = wrapped_client._select_candidates(req)
         assert candidates
 
-    def test_latency_policy_still_receives_p50(
-        self, wrapped_client: Solwyn, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        wrapped_client._policy = LatencyPolicy()
+    def test_latency_policy_still_receives_p50(self, wrapped_client: Solwyn) -> None:
+        wrapped_client._solwyn_policy = LatencyPolicy()
         calls: list[str] = []
-        monkeypatch.setattr(
+        req = RoutingRequest(requested_provider=wrapped_client._solwyn_runtimes[0].entry.provider)
+        with patch_wrapper_local(
             wrapped_client,
             "observed_p50",
             lambda provider: calls.append(provider) or None,
-        )
-        req = RoutingRequest(requested_provider=wrapped_client._runtimes[0].entry.provider)
-        wrapped_client._select_candidates(req)
-        assert len(calls) == len(wrapped_client._runtimes)
+        ):
+            wrapped_client._select_candidates(req)
+        assert len(calls) == len(wrapped_client._solwyn_runtimes)
 
-    def test_unknown_custom_policy_gets_full_signals(
-        self, wrapped_client: Solwyn, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_unknown_custom_policy_gets_full_signals(self, wrapped_client: Solwyn) -> None:
         class LegacyPolicy:
             def order(self, candidates: list, req: RoutingRequest) -> list:
                 return list(candidates)
 
-        wrapped_client._policy = LegacyPolicy()
+        wrapped_client._solwyn_policy = LegacyPolicy()
         calls: list[str] = []
-        monkeypatch.setattr(
+        req = RoutingRequest(requested_provider=wrapped_client._solwyn_runtimes[0].entry.provider)
+        with patch_wrapper_local(
             wrapped_client,
             "observed_p50",
             lambda provider: calls.append(provider) or None,
-        )
-        req = RoutingRequest(requested_provider=wrapped_client._runtimes[0].entry.provider)
-        wrapped_client._select_candidates(req)
-        assert len(calls) == len(wrapped_client._runtimes)
+        ):
+            wrapped_client._select_candidates(req)
+        assert len(calls) == len(wrapped_client._solwyn_runtimes)
 
     def test_builtin_policy_signal_declarations(self) -> None:
         assert HealthBasedPolicy.uses_latency_signal is False
@@ -283,7 +277,7 @@ class TestCrossProviderFailover:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # Anthropic served the request. The plain-text request crossed via real
@@ -326,7 +320,7 @@ class TestCrossProviderFailover:
             patch.object(
                 anthropic_cb, "record_success", wraps=anthropic_cb.record_success
             ) as served_success,
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -356,10 +350,10 @@ class TestCrossProviderFailover:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list = []
-        solwyn._reporter.report = lambda e: events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: events.append(e)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             run("fallback-agent", tags={"route": "cross-provider"}) as run_id,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -399,9 +393,9 @@ class TestCrossProviderFailover:
         # Primary breaker starts CLOSED, so the primary IS attempted in the walk.
         assert solwyn._get_circuit_breaker("openai").state == CircuitState.CLOSED
         events: list = []
-        solwyn._reporter.report = lambda e: events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: events.append(e)
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # Primary WAS dispatched (and errored); fallback served.
@@ -426,7 +420,7 @@ class TestCrossProviderFailover:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list = []
-        solwyn._reporter.report = lambda e: events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: events.append(e)
         # Force the primary breaker OPEN and not recovery-eligible.
         openai_cb = solwyn._get_circuit_breaker("openai")
         for _ in range(3):
@@ -434,7 +428,7 @@ class TestCrossProviderFailover:
         assert openai_cb.state == CircuitState.OPEN
         assert openai_cb.recovery_eligible is False
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         # Primary was NOT attempted; fallback served directly.
@@ -475,7 +469,7 @@ class TestCrossProviderFailover:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
         events: list = []
-        solwyn._reporter.report = lambda e: events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: events.append(e)
         openai_cb = solwyn._get_circuit_breaker("openai")
         for _ in range(3):
             openai_cb.record_failure()
@@ -483,7 +477,7 @@ class TestCrossProviderFailover:
         assert openai_cb.recovery_eligible is False
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             await solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -492,8 +486,8 @@ class TestCrossProviderFailover:
         assert len(success) == 1
         assert success[0].is_provider_fallback is True
         assert success[0].attempt_index == 1
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_openai_down_anthropic_served(self) -> None:
@@ -509,12 +503,12 @@ class TestCrossProviderFailover:
             model="gpt-5.5",
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
-        solwyn._reporter.report = MagicMock()
+        solwyn._solwyn_reporter.report = MagicMock()
         openai_cb = solwyn._get_circuit_breaker("openai")
         anthropic_cb = solwyn._get_circuit_breaker("anthropic")
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             result = await solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -530,8 +524,8 @@ class TestCrossProviderFailover:
         assert openai_cb.failure_count == 1
         assert anthropic_cb.failure_count == 0
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
 
 # ── same-provider model swap ─────────────────────────────────────────────
@@ -547,9 +541,9 @@ class TestSameProviderModelSwap:
 
         solwyn = _make_solwyn(client, model="gpt-5.5", fallback=[(client, "gpt-5.4-mini")])
         events: list = []
-        solwyn._reporter.report = lambda e: events.append(e)
+        solwyn._solwyn_reporter.report = lambda e: events.append(e)
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         assert result is success
@@ -584,7 +578,7 @@ class TestFailFast:
         openai_cb = solwyn._get_circuit_breaker("openai")
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(_Status) as exc_info,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -620,7 +614,7 @@ class TestFailFast:
         openai_cb = solwyn._get_circuit_breaker("openai")
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(_Status) as exc_info,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -656,7 +650,7 @@ class TestChainExhaustion:
             assert cb.recovery_eligible is False
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(ProviderUnavailableError) as exc_info,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -684,7 +678,7 @@ class TestChainExhaustion:
         )
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(_Status) as exc_info,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -713,7 +707,7 @@ class TestChainExhaustion:
 
         with (
             patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
             ),
             pytest.raises(_Status) as exc_info,
         ):
@@ -723,8 +717,8 @@ class TestChainExhaustion:
         assert solwyn._get_circuit_breaker("openai").failure_count == 1
         assert solwyn._get_circuit_breaker("anthropic").failure_count == 1
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
 
 # ── server failover-tuning directive ────────────────────────────────────
@@ -746,16 +740,16 @@ class TestFailoverTuningDirective:
             budget_check_cache_ttl=17,
             **_CUSTOM_FAILOVER_TUNING,
         )
-        runtime_order = [runtime.entry for runtime in solwyn._runtimes]
+        runtime_order = [runtime.entry for runtime in solwyn._solwyn_runtimes]
         breaker_ids = {
-            provider: id(breaker) for provider, breaker in solwyn._circuit_breakers.items()
+            provider: id(breaker) for provider, breaker in solwyn._solwyn_circuit_breakers.items()
         }
-        primary_breaker = solwyn._circuit_breakers["openai"]
+        primary_breaker = solwyn._solwyn_circuit_breakers["openai"]
         caplog.set_level("WARNING", logger="solwyn._base")
 
         with (
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
                 side_effect=[
                     _allow_budget(failover_tuning_allowed=False),
@@ -785,11 +779,11 @@ class TestFailoverTuningDirective:
             assert replace_tuning.call_count == 3
 
         assert openai.chat.completions.create.call_count == 3
-        assert [runtime.entry for runtime in solwyn._runtimes] == runtime_order
+        assert [runtime.entry for runtime in solwyn._solwyn_runtimes] == runtime_order
         assert {
-            provider: id(breaker) for provider, breaker in solwyn._circuit_breakers.items()
+            provider: id(breaker) for provider, breaker in solwyn._solwyn_circuit_breakers.items()
         } == breaker_ids
-        assert solwyn._config.budget_check_cache_ttl == 17
+        assert solwyn._solwyn_config.budget_check_cache_ttl == 17
         suppression_logs = [
             record
             for record in caplog.records
@@ -812,11 +806,11 @@ class TestFailoverTuningDirective:
             model="gpt-5.5",
             **_CUSTOM_FAILOVER_TUNING,
         )
-        runtime_order = [runtime.entry for runtime in solwyn._runtimes]
-        solwyn._reporter.report = MagicMock()
+        runtime_order = [runtime.entry for runtime in solwyn._solwyn_runtimes]
+        solwyn._solwyn_reporter.report = MagicMock()
 
         with patch.object(
-            solwyn._budget,
+            solwyn._solwyn_budget,
             "check_budget",
             new=AsyncMock(return_value=_allow_budget(failover_tuning_allowed=False)),
         ):
@@ -826,12 +820,12 @@ class TestFailoverTuningDirective:
             name: SolwynConfig.model_fields[name].default for name in _FAILOVER_TUNING_FIELDS
         }
         assert _current_failover_tuning(solwyn) == defaults
-        assert [runtime.entry for runtime in solwyn._runtimes] == runtime_order
+        assert [runtime.entry for runtime in solwyn._solwyn_runtimes] == runtime_order
         openai.chat.completions.create.assert_awaited_once()
         assert openai.with_options.call_args.kwargs["timeout"].connect <= 30.0
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
     def test_missing_or_fail_open_directive_is_a_noop_and_call_proceeds(self) -> None:
         openai = _openai_client()
@@ -843,7 +837,7 @@ class TestFailoverTuningDirective:
         )
 
         with patch.object(
-            solwyn._budget,
+            solwyn._solwyn_budget,
             "check_budget",
             return_value=_allow_budget(failover_tuning_allowed=None),
         ):
@@ -874,7 +868,7 @@ class TestPerHopDeadline:
 
         solwyn = _make_solwyn(client, model="gpt-5.5")
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         client.with_options.assert_called_once()
@@ -892,7 +886,7 @@ class TestPerHopDeadline:
         solwyn = _make_solwyn(client, model="gemini-3.5-flash")
 
         solwyn._sync_dispatch(
-            solwyn._runtimes[0],
+            solwyn._solwyn_runtimes[0],
             {
                 "model": "gemini-3.5-flash",
                 "contents": "hi",
@@ -933,7 +927,7 @@ class TestPerHopDeadline:
         started = time.perf_counter()
         with pytest.raises(_Status):
             solwyn._sync_dispatch(
-                solwyn._runtimes[0],
+                solwyn._solwyn_runtimes[0],
                 {"model": "gemini-3.5-flash", "contents": "hi"},
                 is_streaming=False,
                 timeout=0.05,
@@ -952,7 +946,7 @@ class TestPerHopDeadline:
         solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, model="gemini-3.5-flash")
 
         await solwyn._async_dispatch(
-            solwyn._runtimes[0],
+            solwyn._solwyn_runtimes[0],
             {
                 "model": "gemini-3.5-flash",
                 "contents": "hi",
@@ -968,8 +962,8 @@ class TestPerHopDeadline:
         assert kwargs["config"]["http_options"]["timeout"] == 125
         assert kwargs["config"]["http_options"]["retry_options"]["attempts"] == 1
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_slow_google_dispatch_raises_within_per_hop_timeout(self) -> None:
@@ -990,7 +984,7 @@ class TestPerHopDeadline:
         started = time.perf_counter()
         with pytest.raises(_Status):
             await solwyn._async_dispatch(
-                solwyn._runtimes[0],
+                solwyn._solwyn_runtimes[0],
                 {"model": "gemini-3.5-flash", "contents": "hi"},
                 is_streaming=False,
                 timeout=0.05,
@@ -1000,8 +994,8 @@ class TestPerHopDeadline:
         elapsed = time.perf_counter() - started
 
         assert elapsed < 0.03
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
     def test_per_hop_timeout_shrinks_across_candidates(self) -> None:
         # Per-hop timeout = remaining / (candidates not yet attempted).
@@ -1019,7 +1013,7 @@ class TestPerHopDeadline:
             fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
         )
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         hop0 = openai.with_options.call_args.kwargs["timeout"].connect
@@ -1052,7 +1046,7 @@ class TestPerHopDeadline:
         )
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(ProviderUnavailableError) as exc_info,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -1095,7 +1089,7 @@ class TestPerHopDeadline:
 
         with (
             patch("solwyn.client.Deadline", _FakeDeadline),
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(_Status) as exc_info,
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -1128,7 +1122,7 @@ class TestHalfOpenRecoveryThroughDispatch:
         assert cb.state == CircuitState.OPEN
         assert cb.recovery_eligible is True
 
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
         assert cb.state == CircuitState.CLOSED
@@ -1156,7 +1150,7 @@ class TestHalfOpenRecoveryThroughDispatch:
         assert cb.recovery_eligible is True
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             await solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -1164,8 +1158,8 @@ class TestHalfOpenRecoveryThroughDispatch:
         assert cb.success_count == 0
         assert cb.failure_count == 0
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
 
 # ── probe-slot release on no-health-signal dispatch exits ────────────────
@@ -1194,7 +1188,7 @@ class TestProbeSlotReleaseOnNoHealthSignalExit:
         assert cb.state == CircuitState.OPEN
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(_Status),
         ):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -1230,7 +1224,7 @@ class TestProbeSlotReleaseOnNoHealthSignalExit:
         # RAISES UntranslatableRequestError before any anthropic network call.
         request = {**_PLAIN_REQUEST, "n": 2}
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
             pytest.raises(UntranslatableRequestError),
         ):
             solwyn.chat.completions.create(**request)
@@ -1262,7 +1256,7 @@ class TestProbeSlotReleaseOnNoHealthSignalExit:
 
         with (
             patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
             ),
             pytest.raises(_Status),
         ):
@@ -1274,8 +1268,8 @@ class TestProbeSlotReleaseOnNoHealthSignalExit:
         assert admission.allowed is True
         assert admission.owns_probe is True
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_translation_abort_in_half_open_frees_probe_slot(self) -> None:
@@ -1299,7 +1293,7 @@ class TestProbeSlotReleaseOnNoHealthSignalExit:
         request = {**_PLAIN_REQUEST, "n": 2}
         with (
             patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
             ),
             pytest.raises(UntranslatableRequestError),
         ):
@@ -1312,8 +1306,8 @@ class TestProbeSlotReleaseOnNoHealthSignalExit:
         assert admission.allowed is True
         assert admission.owns_probe is True
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
 
 # ── circuit-breaker lazy creation under sync concurrency ─────────────────
@@ -1323,7 +1317,7 @@ class TestProbeSlotReleaseOnNoHealthSignalExit:
 class TestCircuitBreakerLazyCreation:
     def test_get_circuit_breaker_lazy_create_is_atomic(self) -> None:
         solwyn = _make_solwyn(_openai_client(), model="gpt-5.5")
-        solwyn._circuit_breakers.clear()
+        solwyn._solwyn_circuit_breakers.clear()
         created: list[object] = []
         original_new_breaker = solwyn._new_circuit_breaker
 
@@ -1333,8 +1327,9 @@ class TestCircuitBreakerLazyCreation:
             created.append(breaker)
             return breaker
 
+        replacement = MagicMock(side_effect=slow_new_breaker)
         with (
-            patch.object(solwyn, "_new_circuit_breaker", side_effect=slow_new_breaker),
+            patch_wrapper_local(solwyn, "_new_circuit_breaker", replacement),
             ThreadPoolExecutor(max_workers=12) as pool,
         ):
             breakers = list(pool.map(lambda _i: solwyn._get_circuit_breaker("google"), range(12)))
@@ -1429,11 +1424,11 @@ class TestFailoverTuningSnapshot:
             failover_hop_read_timeout=600.0,
         )
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
-            patch.object(
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
+            patch_wrapper_local(
                 solwyn,
                 "_apply_failover_tuning_directive",
-                return_value=never_snapshot,
+                MagicMock(return_value=never_snapshot),
             ),
             pytest.raises(_Status),
         ):
@@ -1456,11 +1451,11 @@ class TestFailoverTuningSnapshot:
             failover_hop_read_timeout=600.0,
         )
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()),
-            patch.object(
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()),
+            patch_wrapper_local(
                 solwyn,
                 "_apply_failover_tuning_directive",
-                return_value=retry_snapshot,
+                MagicMock(return_value=retry_snapshot),
             ),
         ):
             result = solwyn.chat.completions.create(**_PLAIN_REQUEST)
@@ -1480,7 +1475,7 @@ class TestDecoupledHopReadTimeout:
         client = _openai_client()
         client.chat.completions.create.return_value = _openai_response()
         solwyn = _make_solwyn(client, model="gpt-5.5", failover_total_timeout=0.25)
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
         bound = client.with_options.call_args.kwargs["timeout"]
         assert isinstance(bound, httpx.Timeout)
@@ -1494,7 +1489,7 @@ class TestDecoupledHopReadTimeout:
         client = _openai_client()
         client.chat.completions.create.return_value = _openai_response()
         solwyn = _make_solwyn(client, model="gpt-5.5", failover_hop_read_timeout=42.0)
-        with patch.object(solwyn._budget, "check_budget", return_value=_allow_budget()):
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
             solwyn.chat.completions.create(**_PLAIN_REQUEST)
         assert client.with_options.call_args.kwargs["timeout"].read == 42.0
         _close(solwyn)
@@ -1513,10 +1508,10 @@ class TestDecoupledHopReadTimeout:
             model="gpt-5.5",
             failover_hop_read_timeout=37.0,
         )
-        solwyn._reporter.report = MagicMock(spec=solwyn._reporter.report)
+        solwyn._solwyn_reporter.report = MagicMock(spec=solwyn._solwyn_reporter.report)
 
         with patch.object(
-            solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
+            solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow_budget())
         ):
             await solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
@@ -1525,8 +1520,8 @@ class TestDecoupledHopReadTimeout:
         assert bound.read == 37.0
         assert bound.write == 37.0
 
-        await solwyn._reporter._http.aclose()
-        await solwyn._budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
 
     def test_directive_suppression_resets_hop_read_bound(self) -> None:
         # Server disallows custom tuning: the custom 120s read bound must be
@@ -1535,7 +1530,7 @@ class TestDecoupledHopReadTimeout:
         client.chat.completions.create.return_value = _openai_response()
         solwyn = _make_solwyn(client, model="gpt-5.5", **_CUSTOM_FAILOVER_TUNING)
         with patch.object(
-            solwyn._budget,
+            solwyn._solwyn_budget,
             "check_budget",
             return_value=_allow_budget(failover_tuning_allowed=False),
         ):

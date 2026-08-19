@@ -164,7 +164,7 @@ class _TestingSolwyn(Solwyn):
         **kwargs: object,
     ) -> Any:
         _validate_testing_model(kwargs.get("model"))
-        for runtime in self._runtimes[1:]:
+        for runtime in self._solwyn_runtimes[1:]:
             _validate_testing_model(runtime.entry.model)
         return super()._intercepted_call(
             _force_stream=_force_stream,
@@ -188,7 +188,7 @@ class _TestingAsyncSolwyn(AsyncSolwyn):
         **kwargs: object,
     ) -> Any:
         _validate_testing_model(kwargs.get("model"))
-        for runtime in self._runtimes[1:]:
+        for runtime in self._solwyn_runtimes[1:]:
             _validate_testing_model(runtime.entry.model)
         return await super()._intercepted_call(
             _force_stream=_force_stream,

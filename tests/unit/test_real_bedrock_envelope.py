@@ -94,7 +94,7 @@ def _mock_budget(solwyn: Any, response: dict[str, Any] | None = None) -> Any:
     resp = MagicMock()
     resp.json.return_value = response or ALLOW_BUDGET_RESPONSE
     resp.raise_for_status = MagicMock()
-    return patch.object(solwyn._budget._http, "post", return_value=resp)
+    return patch.object(solwyn._solwyn_budget._http, "post", return_value=resp)
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +186,8 @@ def test_wrapped_converse_reports_normalized_usage_and_region() -> None:
 
     solwyn = Solwyn(client, api_key=VALID_API_KEY)
     settlements: list = []
-    solwyn._reporter.report = lambda e: None
-    solwyn._reporter.report_settlement = lambda c, e: settlements.append((c, e))
+    solwyn._solwyn_reporter.report = lambda e: None
+    solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
     with _mock_budget(solwyn), stubber:
         result = solwyn.converse(modelId=BEDROCK_MODEL, messages=_messages())

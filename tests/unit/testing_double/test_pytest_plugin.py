@@ -118,13 +118,15 @@ def test_client_fixture_closes_after_a_failing_test(
 
 
         def test_failure_still_runs_teardown(solwyn_test_client):
-            original_close = solwyn_test_client.close
+            # Wrapper attribute writes forward to the provider client, so the
+            # close observation rides the provider-close seam the wrapper's own
+            # close() forwards to at the end of its shutdown chain.
+            inner = solwyn_test_client._solwyn_client
 
             def observed_close():
                 Path({str(close_marker)!r}).write_text("closed")
-                original_close()
 
-            solwyn_test_client.close = observed_close
+            inner.close = observed_close
             raise RuntimeError("intentional failure")
         """
     )
@@ -152,13 +154,14 @@ def test_client_fixture_closes_when_a_dependent_fixture_fails_during_setup(
 
         @pytest.fixture
         def failing_dependency(solwyn_test_client):
-            original_close = solwyn_test_client.close
+            # See test_failure_still_runs_teardown: the observation rides the
+            # provider-close seam because wrapper writes forward to the provider.
+            inner = solwyn_test_client._solwyn_client
 
             def observed_close():
                 Path({str(close_marker)!r}).write_text("closed")
-                original_close()
 
-            solwyn_test_client.close = observed_close
+            inner.close = observed_close
             raise RuntimeError("intentional setup failure")
 
 
@@ -232,8 +235,7 @@ def test_readme_testing_guide_has_complete_boundary_and_magic_table() -> None:
         "The double never prices anything — the API owns pricing. "
         "Scripted denials test your handling, not your budget math."
     ) in normalized
-    assert "Solwyn closes only its own control-plane resources" in normalized
-    assert "close caller-owned provider clients" in normalized
+    assert "forwards to the wrapped provider client's own close seam" in normalized
     assert "transport failure → endpoint refusal → verdict → allow" in normalized
     for magic_model in (
         "solwyn-test/deny",
@@ -284,8 +286,11 @@ def test_readme_provider_recipes_own_and_close_real_provider_clients() -> None:
         assert "with OpenAI(" in recipe
         assert "as provider" in recipe
         assert "plane.wrap(provider" in recipe
-        assert "assert not provider.is_closed()" in recipe
+        # The wrapper's close forwards to the provider's close seam; each
+        # recipe pins that forwarding after the wrapper context exits.
+        assert "forwards to the provider client's close seam" in recipe
         assert "assert provider.is_closed()" in recipe
+        assert "assert not provider.is_closed()" not in recipe
 
     for name in ("fail-open", "game-day"):
         recipe = snippets[name]

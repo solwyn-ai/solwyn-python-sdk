@@ -23,7 +23,7 @@ class TestCompatDetection:
         self, make_wrapped_client, fake_provider: FakeProviderServer
     ) -> None:
         client = make_wrapped_client()
-        assert client._adapter.name == "openai_compatible"
+        assert client._solwyn_adapter.name == "openai_compatible"
 
         recorder = WireRecorder().attach(client)
         client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
@@ -36,7 +36,7 @@ class TestCompatDetection:
     ) -> None:
         expected = expected_compat_provider(fake_provider_known_port)
         client = make_wrapped_client(base_url=fake_provider_known_port.base_url)
-        assert client._adapter.name == expected
+        assert client._solwyn_adapter.name == expected
 
         recorder = WireRecorder().attach(client)
         client.chat.completions.create(model="gpt-5.5", messages=MESSAGES)

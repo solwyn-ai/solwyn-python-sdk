@@ -31,6 +31,7 @@ from solwyn.reporter import (
     _PendingConfirm,
     _PendingEvent,
     _PendingSettlement,
+    _SendOutcome,
 )
 
 _URL = "https://api.test.solwyn.ai"
@@ -123,6 +124,316 @@ class TestSyncShutdownDeadline:
             elapsed = time.monotonic() - start
 
         assert elapsed < 1.5, f"close took {elapsed:.2f}s — must use the 0.2s knob deadline"
+
+    def test_reentrant_longer_close_cannot_extend_outer_earliest_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = {"now": 100.0}
+        monkeypatch.setattr("solwyn.reporter._monotonic", lambda: clock["now"])
+        reporter = _unstarted(
+            batch_size=1,
+            breaker_reporting_enabled=False,
+            report_untracked_surfaces=False,
+        )
+        first = _make_event(call_id=call_uuid("reentrant-deadline-first"))
+        second = _make_event(call_id=call_uuid("reentrant-deadline-second"))
+        reporter._queue.extend((_PendingEvent(first), _PendingEvent(second)))
+        response = MagicMock(spec=httpx.Response)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "ingested": 0,
+            "rejected": [
+                {
+                    "index": 0,
+                    "code": "structural",
+                    "model": "gpt-5.5",
+                    "message": "rejected",
+                }
+            ],
+        }
+        sent: list[str] = []
+        reentered = threading.Event()
+        original_thread_start = threading.Thread.start
+
+        def post(_url: str, **kwargs: object) -> MagicMock:
+            payload = kwargs["json"]
+            assert isinstance(payload, list)
+            sent.extend(str(item["call_id"]) for item in payload)
+            return response
+
+        def warning(message: str, *_args: object, **_kwargs: object) -> None:
+            if message.startswith("reporter.ingest_events_rejected") and not reentered.is_set():
+                reentered.set()
+                clock["now"] = 100.03
+                reporter.close(timeout=0.5)
+
+        def start_thread(thread: threading.Thread) -> None:
+            # Exercise the real documented inline fallback so the host warning
+            # handler and recursive close own the same RLock thread.
+            if thread.name == "solwyn-final-flush":
+                raise RuntimeError("interpreter refuses new thread")
+            original_thread_start(thread)
+
+        with (
+            patch.object(reporter._http, "post", side_effect=post),
+            patch("solwyn.reporter.logger.warning", side_effect=warning),
+            patch.object(threading.Thread, "start", new=start_thread),
+        ):
+            reporter.close(timeout=0.02)
+
+        assert reentered.is_set()
+        assert sent == [str(first.call_id)]
+        # The same-owner recursive close tightens the deadline but cannot seal
+        # beneath the active response owner. Its exact rejection therefore
+        # keeps that disposition; only the untouched tail hits the deadline.
+        assert reporter.dropped_counts == {
+            "event.ingest_rejected": 1,
+            "event.shutdown_deadline": 1,
+        }
+        assert reporter._delivery_completed is True
+        assert reporter._close_is_completed() is True
+
+    def test_worker_self_close_deadline_stops_later_ordinary_batch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = {"now": 200.0}
+        monkeypatch.setattr("solwyn.reporter._monotonic", lambda: clock["now"])
+        reporter = MetadataReporter(
+            _URL,
+            VALID_API_KEY,
+            batch_size=1,
+            flush_interval=0.01,
+            breaker_reporting_enabled=False,
+            report_untracked_surfaces=False,
+        )
+        first = _make_event(call_id=call_uuid("worker-deadline-first"))
+        second = _make_event(call_id=call_uuid("worker-deadline-second"))
+        rejected = MagicMock(spec=httpx.Response)
+        rejected.raise_for_status.return_value = None
+        rejected.json.return_value = {
+            "ingested": 0,
+            "rejected": [
+                {
+                    "index": 0,
+                    "code": "structural",
+                    "model": "gpt-5.5",
+                    "message": "rejected",
+                }
+            ],
+        }
+        accepted = MagicMock(spec=httpx.Response)
+        accepted.raise_for_status.return_value = None
+        accepted.json.return_value = {"ingested": 1, "rejected": []}
+        sent: list[str] = []
+        close_requested = threading.Event()
+
+        def post(_url: str, **kwargs: object) -> MagicMock:
+            payload = kwargs["json"]
+            assert isinstance(payload, list)
+            sent.extend(str(item["call_id"]) for item in payload)
+            return rejected if len(sent) == 1 else accepted
+
+        def warning(message: str, *_args: object, **_kwargs: object) -> None:
+            if (
+                message.startswith("reporter.ingest_events_rejected")
+                and not close_requested.is_set()
+            ):
+                reporter.close(timeout=0.02)
+                close_requested.set()
+                clock["now"] = 200.03
+
+        try:
+            with (
+                patch.object(reporter._http, "post", side_effect=post),
+                patch("solwyn.reporter.logger.warning", side_effect=warning),
+            ):
+                reporter.report(first)
+                reporter.report(second)
+                assert close_requested.wait(timeout=2.0)
+                reporter._thread.join(timeout=2.0)
+
+            assert not reporter._thread.is_alive()
+            assert sent == [str(first.call_id)]
+            assert reporter.dropped_counts == {
+                "event.ingest_rejected": 1,
+                "event.shutdown_deadline": 1,
+            }
+            assert reporter._delivery_completed is True
+            assert reporter._close_is_completed() is True
+        finally:
+            reporter._shutdown.set()
+            reporter._thread.join(timeout=2.0)
+            reporter._http.close()
+
+    def test_ordinary_event_send_uses_newly_published_close_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = {"now": 300.0}
+        monkeypatch.setattr("solwyn.reporter._monotonic", lambda: clock["now"])
+        reporter = _unstarted(
+            breaker_reporting_enabled=False,
+            report_untracked_surfaces=False,
+        )
+        response = MagicMock(spec=httpx.Response)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"ingested": 1, "rejected": []}
+        timeouts: list[float] = []
+
+        def post(_url: str, **kwargs: object) -> MagicMock:
+            timeouts.append(float(kwargs["timeout"]))
+            return response
+
+        reporter._tighten_close_deadline(300.02)
+        with patch.object(reporter._http, "post", side_effect=post):
+            reporter._send_batch([_make_event()], deadline=None)
+
+        assert timeouts == [0.05]
+        reporter._shutdown.set()
+        reporter._http.close()
+
+    def test_competing_transport_close_wait_respects_earliest_deadline(self) -> None:
+        reporter = _unstarted(
+            breaker_reporting_enabled=False,
+            report_untracked_surfaces=False,
+        )
+        transport_entered = threading.Event()
+        release_transport = threading.Event()
+        first_finished = threading.Event()
+        second_finished = threading.Event()
+        close_errors: list[BaseException] = []
+        real_close = reporter._http.close
+
+        def blocked_close() -> None:
+            transport_entered.set()
+            assert release_transport.wait(timeout=2.0)
+
+        def close_first() -> None:
+            try:
+                reporter.close(timeout=1.0)
+            except BaseException as exc:
+                close_errors.append(exc)
+            finally:
+                first_finished.set()
+
+        def close_second() -> None:
+            try:
+                reporter.close(timeout=0.0)
+            except BaseException as exc:
+                close_errors.append(exc)
+            finally:
+                second_finished.set()
+
+        first = threading.Thread(target=close_first, daemon=True)
+        second = threading.Thread(target=close_second, daemon=True)
+        try:
+            with patch.object(reporter._http, "close", side_effect=blocked_close):
+                first.start()
+                assert transport_entered.wait(timeout=1.0)
+                second.start()
+                assert second_finished.wait(timeout=0.2), (
+                    "a zero-deadline close must not wait behind another transport owner"
+                )
+                assert not first_finished.is_set()
+                release_transport.set()
+                first.join(timeout=2.0)
+                second.join(timeout=2.0)
+
+            assert close_errors == []
+            assert first_finished.is_set()
+            assert reporter._close_is_completed() is True
+        finally:
+            release_transport.set()
+            first.join(timeout=2.0)
+            second.join(timeout=2.0)
+            real_close()
+
+    def test_expired_competing_close_seals_spend_without_stealing_whole_close(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = {"now": 500.0}
+        monkeypatch.setattr("solwyn.reporter._monotonic", lambda: clock["now"])
+        reporter = _unstarted(
+            breaker_reporting_enabled=False,
+            report_untracked_surfaces=False,
+        )
+        reporter._queue.append(_PendingEvent(_make_event()))
+        owner_claimed = threading.Event()
+        release_owner = threading.Event()
+        loser_tightened_deadline = threading.Event()
+        owner_finished = threading.Event()
+        loser_finished = threading.Event()
+        close_errors: list[BaseException] = []
+        real_close = reporter._http.close
+        original_finish_owned = reporter._finish_close_owned
+        original_tighten = reporter._tighten_close_deadline
+        owner: threading.Thread | None = None
+        loser: threading.Thread | None = None
+
+        def finish_owned(deadline: float) -> None:
+            if threading.current_thread() is owner:
+                owner_claimed.set()
+                assert release_owner.wait(timeout=2.0)
+            original_finish_owned(deadline)
+
+        def tighten(deadline: float) -> float:
+            tightened = original_tighten(deadline)
+            if threading.current_thread() is loser:
+                loser_tightened_deadline.set()
+            return tightened
+
+        def close_reporter(timeout: float, finished: threading.Event) -> None:
+            try:
+                reporter.close(timeout=timeout)
+            except BaseException as exc:
+                close_errors.append(exc)
+            finally:
+                finished.set()
+
+        owner = threading.Thread(
+            target=close_reporter,
+            args=(1.0, owner_finished),
+            daemon=True,
+        )
+        loser = threading.Thread(
+            target=close_reporter,
+            args=(0.03, loser_finished),
+            daemon=True,
+        )
+        try:
+            with (
+                patch.object(reporter, "_finish_close_owned", side_effect=finish_owned),
+                patch.object(reporter, "_tighten_close_deadline", side_effect=tighten),
+                patch.object(reporter._http, "close") as http_close,
+            ):
+                owner.start()
+                assert owner_claimed.wait(timeout=1.0)
+                loser.start()
+                assert loser_tightened_deadline.wait(timeout=1.0)
+                clock["now"] = 500.04
+                with reporter._close_state_changed:
+                    reporter._close_state_changed.notify_all()
+                assert loser_finished.wait(timeout=1.0)
+
+                assert reporter._delivery_completed is True
+                assert not reporter._queue
+                assert reporter.dropped_counts == {"event.shutdown_deadline": 1}
+                assert reporter._close_is_completed() is False
+                http_close.assert_not_called()
+
+                release_owner.set()
+                assert owner_finished.wait(timeout=2.0)
+                owner.join(timeout=2.0)
+                loser.join(timeout=2.0)
+
+                assert close_errors == []
+                assert reporter.dropped_counts == {"event.shutdown_deadline": 1}
+                assert reporter._close_is_completed() is True
+                http_close.assert_called_once_with()
+        finally:
+            release_owner.set()
+            owner.join(timeout=2.0)
+            loser.join(timeout=2.0)
+            real_close()
 
 
 @pytest.mark.unit
@@ -336,8 +647,110 @@ def test_pop_in_hand_is_atomic_with_seal() -> None:
     # Sealed: pops are refused outright (the seal owns whatever re-appears).
     reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
     assert reporter._pop_in_hand(reporter._confirm_queue, "confirm") is None
-    assert reporter._pop_batch_in_hand(now=time.monotonic(), final=True) == []
+    assert reporter._pop_batch_in_hand(now=time.monotonic(), final=True) is None
     reporter._http.close()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "outcome,reason,queue_size,deadline_expired",
+    [
+        (_SendOutcome.DROPPED, "terminal_status", 1, False),
+        (_SendOutcome.RETRY, "retry_exhausted", 1, False),
+        (_SendOutcome.HELD, "exit_breaker_open", 2, False),
+        (_SendOutcome.SENT, "shutdown_deadline", 2, True),
+    ],
+)
+def test_close_publishes_confirm_disposition_before_releasing_ownership(
+    outcome: _SendOutcome,
+    reason: str,
+    queue_size: int,
+    deadline_expired: bool,
+) -> None:
+    """A bounded close must never return while a daemon owns an untracked loss."""
+    reporter = _unstarted(max_send_attempts=1)
+    for index in range(queue_size):
+        reporter._confirm_queue.append(
+            _PendingConfirm(_make_confirm_request(call_id=call_uuid(f"atomic-confirm-{index}")))
+        )
+
+    disposition_entered = threading.Event()
+    disposition_finished = threading.Event()
+    release_unsafe_disposition = threading.Event()
+    original_record = reporter._record_drop
+
+    def gated_record(kind: str, drop_reason: str, n: int = 1) -> None:
+        if (
+            threading.current_thread().name == "solwyn-final-flush"
+            and kind == "confirm"
+            and drop_reason == reason
+        ):
+            # The vulnerable path releases/drains ownership before mutation.
+            # Pause only when the ownership lock is therefore available; the
+            # fixed transaction records while holding it and never enters the
+            # ownerless interval.
+            owns_no_lock = reporter._ownership_lock.acquire(blocking=False)
+            if owns_no_lock:
+                reporter._ownership_lock.release()
+            disposition_entered.set()
+            if owns_no_lock:
+                assert release_unsafe_disposition.wait(timeout=5.0)
+        original_record(kind, drop_reason, n)
+        disposition_finished.set()
+
+    close_finished = threading.Event()
+
+    def close() -> None:
+        reporter.close(timeout=0.1)
+        close_finished.set()
+
+    closer = threading.Thread(target=close, daemon=True)
+    try:
+        with (
+            patch.object(reporter, "_record_drop", side_effect=gated_record),
+            patch.object(reporter, "_send_confirm", return_value=outcome),
+            patch.object(
+                reporter,
+                "_deadline_expired",
+                side_effect=lambda _deadline: (
+                    deadline_expired and threading.current_thread().name == "solwyn-final-flush"
+                ),
+            ),
+            patch.object(reporter, "_start_breaker_cycle", return_value=None),
+        ):
+            closer.start()
+            assert disposition_entered.wait(timeout=2.0)
+            closer.join(timeout=2.0)
+            assert close_finished.is_set()
+
+            assert not reporter._confirm_queue
+            assert reporter._in_hand.get("confirm", 0) == 0
+            assert reporter.dropped_counts == {f"confirm.{reason}": queue_size}
+            before_late_worker = reporter.dropped_counts
+
+            release_unsafe_disposition.set()
+            assert disposition_finished.wait(timeout=2.0)
+            assert reporter.dropped_counts == before_late_worker
+    finally:
+        release_unsafe_disposition.set()
+        closer.join(timeout=2.0)
+        reporter._shutdown.set()
+        reporter._http.close()
+
+
+@pytest.mark.unit
+def test_sent_confirm_releases_ownership_without_a_drop() -> None:
+    reporter = _unstarted()
+    reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
+    try:
+        with patch.object(reporter, "_send_confirm", return_value=_SendOutcome.SENT):
+            reporter._drain_confirms(final=True)
+        assert not reporter._confirm_queue
+        assert reporter._in_hand.get("confirm", 0) == 0
+        assert reporter.dropped_counts == {}
+    finally:
+        reporter._shutdown.set()
+        reporter._http.close()
 
 
 @pytest.mark.unit

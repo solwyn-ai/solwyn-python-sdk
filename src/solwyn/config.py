@@ -16,6 +16,7 @@ from solwyn._lease import DEFAULT_OUTPUT_BOUND
 from solwyn._run import _copy_tags
 from solwyn._types import BudgetMode, ProviderEntry
 from solwyn._validation import validate_project_key_format
+from solwyn._velocity import VELOCITY_HISTORY_LIMIT
 from solwyn.exceptions import ConfigurationError
 
 # Environment variable prefix for automatic loading.
@@ -107,6 +108,22 @@ class SolwynConfig(BaseModel):
     lease_enabled: bool = True
     lease_output_bound_default: int = Field(default=DEFAULT_OUTPUT_BOUND, gt=0)
 
+    # Run-scoped, content-free velocity signals. PR-1 is warn-only at the
+    # client boundary; ``deny`` is admitted now for the later enforcement stage.
+    velocity_mode: Literal["off", "warn", "deny"] = "warn"
+    # History-dependent thresholds cannot exceed the retained detailed window;
+    # this keeps every accepted configuration achievable.
+    velocity_repeat_count: int = Field(default=5, ge=2, le=VELOCITY_HISTORY_LIMIT)
+    velocity_repeat_window_s: float = Field(default=60.0, gt=0)
+    velocity_growth_streak: int = Field(default=8, ge=3, le=VELOCITY_HISTORY_LIMIT)
+    velocity_growth_factor: float = Field(default=3.0, gt=1.0)
+    velocity_accel_floor_per_min: int = Field(
+        default=30,
+        ge=1,
+        le=VELOCITY_HISTORY_LIMIT,
+    )
+    velocity_accel_factor: float = Field(default=3.0, gt=1.0)
+
     # Control-plane breaker: after this many consecutive check/confirm
     # failures against Solwyn's own API, skip the network call and apply the
     # configured posture (fail_open / local enforcement) instantly for
@@ -162,6 +179,13 @@ class SolwynConfig(BaseModel):
             "budget_check_timeout": "BUDGET_CHECK_TIMEOUT",
             "lease_enabled": "LEASE_ENABLED",
             "lease_output_bound_default": "LEASE_OUTPUT_BOUND_DEFAULT",
+            "velocity_mode": "VELOCITY_MODE",
+            "velocity_repeat_count": "VELOCITY_REPEAT_COUNT",
+            "velocity_repeat_window_s": "VELOCITY_REPEAT_WINDOW_S",
+            "velocity_growth_streak": "VELOCITY_GROWTH_STREAK",
+            "velocity_growth_factor": "VELOCITY_GROWTH_FACTOR",
+            "velocity_accel_floor_per_min": "VELOCITY_ACCEL_FLOOR_PER_MIN",
+            "velocity_accel_factor": "VELOCITY_ACCEL_FACTOR",
             "control_plane_failure_threshold": "CONTROL_PLANE_FAILURE_THRESHOLD",
             "control_plane_recovery_timeout": "CONTROL_PLANE_RECOVERY_TIMEOUT",
             "reporter_batch_size": "REPORTER_BATCH_SIZE",

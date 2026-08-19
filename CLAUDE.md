@@ -43,7 +43,7 @@ _SolwynBase          # Shared sans-I/O logic (config, token estimation, metadata
 ## Key Conventions
 
 - Pydantic models use `extra="forbid"` — catches typos and contract drift
-- Response models (e.g. `BudgetCheckResponse`) use `Field(...)` for all fields the API returns — no silent defaults that mask contract changes. Documented exception: fields the API conditionally omits by design (`denied_by_period`, `price_hints`, `failover_directive` — directive-v1 responses serialize exclude-none) carry explicit `None` defaults; their server-side drift is caught by `tests/integration/test_live_contract.py`, not by required-field validation
+- Response models (e.g. `BudgetCheckResponse`) use `Field(...)` for all fields the API returns — no silent defaults that mask contract changes. Documented exception: fields the API conditionally omits by design (`denied_by_period`, `price_hints`, `failover_directive`, `run_control` — directive-v1 responses serialize exclude-none) carry explicit `None` defaults; their server-side drift is caught by `tests/integration/test_live_contract.py`, not by required-field validation
 - Provider adapter registry lazy-loads concrete adapters on first call; ORDER IS LOAD-BEARING — OpenAI-compatible adapters (base_url/host detection) must precede the plain OpenAIAdapter, with the generic catch-all last among them
 - The `together` compatibility slot remains OpenAI dialect but uniquely admits native `together.Together` / `AsyncTogether` clients by module and class name; keep one slot rather than adding a separate native adapter
 - Provider `name` (attribution: budgets, metadata, breakers) is distinct from `dialect` (wire shape: dispatch, translation). Same-dialect failover is native passthrough; cross-dialect runs the translation subset
@@ -51,6 +51,7 @@ _SolwynBase          # Shared sans-I/O logic (config, token estimation, metadata
 - `check_budget(provider=...)` is required and keyword-only
 - ALL settlement (streaming AND non-streaming, chat AND media) rides `reporter.report_settlement(confirm, event)` off the caller's thread — the enforcers have no `confirm_cost`. The reporter tracks consecutive confirm-send failures; after 10, logs at ERROR level
 - A shared control-plane `CircuitBreaker` (name `"control-plane"`, one per client) guards both the `/budgets/check` POST (enforcer) and the `/budgets/confirm` POST (reporter): a streak of failures against Solwyn's own API short-circuits the network call so the SDK discovers an outage once, not once per call. It is never a provider breaker (excluded from breaker reports). The budget pre-flight timeout defaults to `budget_check_timeout=1.0`
+- Shipped framework integration modules are attribution-only, content-free, and privacy-firewall-enforced; budget enforcement comes only from explicitly admitted recipes whose provider call crosses a Solwyn-wrapped client (OpenAI Agents is docs/tests only, not a shipped module)
 
 ## Privacy
 

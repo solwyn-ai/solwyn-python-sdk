@@ -13,6 +13,7 @@ import inspect
 import logging
 import threading
 import time
+import weakref
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any, Self, cast
@@ -45,6 +46,13 @@ class SyncStreamWrapper:
     raw chunk is yielded unchanged (same-dialect / primary / same-provider swap).
     This wrapper never logs/stores/stringifies chunk content; it only ROUTES the
     raw chunk to ``chunk_translator`` (a content-privileged ``_translation`` seam).
+
+    A keyword-only ``abort_check`` may cooperatively stop a run at a raw provider
+    chunk boundary. The next chunk is pulled first, then the check runs before
+    that chunk is observed or yielded. A returned exception closes and partially
+    settles the stream before that exact exception is raised. A failing provider
+    close is logged structurally and suppressed, while a BaseException raised by
+    that close propagates — the latched stop still ends every later pull.
     """
 
     def __init__(
@@ -54,6 +62,9 @@ class SyncStreamWrapper:
         on_complete: Callable[[TokenDetails, float], None],
         on_error: Callable[[BaseException], None],
         chunk_translator: Callable[[Any], list[Any]] | None = None,
+        *,
+        abort_check: Callable[[], Exception | None] | None = None,
+        abort_release: Callable[[], None] | None = None,
     ) -> None:
         self._stream = stream
         self._iterator: Iterator[Any] | None = None
@@ -62,9 +73,24 @@ class SyncStreamWrapper:
         self._on_complete = on_complete
         self._on_error = on_error
         self._chunk_translator = chunk_translator
+        self._abort_check = abort_check
+        self._abort_finalizer = (
+            weakref.finalize(self, abort_release) if abort_release is not None else None
+        )
+        self._abort_exc: Exception | None = None
         self._start_time = time.monotonic()
         self._settled = False
         self._lock = threading.Lock()
+
+    def _latched_abort(self) -> Exception | None:
+        with self._lock:
+            return self._abort_exc
+
+    def _latch_abort(self, exc: Exception) -> Exception:
+        with self._lock:
+            if self._abort_exc is None:
+                self._abort_exc = exc
+            return self._abort_exc
 
     def _settle(self) -> None:
         """Fire on_complete exactly once with accumulated data."""
@@ -72,6 +98,7 @@ class SyncStreamWrapper:
             if self._settled:
                 return
             self._settled = True
+        self._release_abort_handle()
         elapsed_ms = (time.monotonic() - self._start_time) * 1000
         token_details = self._accumulator.finalize()
         try:
@@ -91,6 +118,7 @@ class SyncStreamWrapper:
             if self._settled:
                 return
             self._settled = True
+        self._release_abort_handle()
         try:
             self._on_error(exc)
         except Exception as cb_exc:
@@ -101,8 +129,16 @@ class SyncStreamWrapper:
                 type(cb_exc).__name__,
             )
 
+    def _release_abort_handle(self) -> None:
+        finalizer = self._abort_finalizer
+        if finalizer is not None and finalizer.alive:
+            finalizer()
+
     def __next__(self) -> Any:
         """Return one observed caller-dialect chunk."""
+        latched_abort = self._latched_abort()
+        if latched_abort is not None:
+            raise latched_abort
         while not self._pending_chunks:
             try:
                 iterator = self._iterator
@@ -110,6 +146,23 @@ class SyncStreamWrapper:
                     iterator = iter(self._stream)
                     self._iterator = iterator
                 chunk = next(iterator)
+                if self._abort_check is not None:
+                    abort_exc = self._abort_check()
+                    if abort_exc is not None:
+                        abort_exc = self._latch_abort(abort_exc)
+                        try:
+                            self.close()
+                        except Exception as close_exc:
+                            # Structural-only log of the provider-close failure;
+                            # never a traceback (fix [D]). A BaseException here
+                            # (KeyboardInterrupt) propagates instead of being
+                            # replaced by the latched stop; the abort is already
+                            # latched, so the wrapper stays terminal.
+                            logger.warning(
+                                "provider close raised during run-stop abort; suppressing (%s)",
+                                type(close_exc).__name__,
+                            )
+                        raise abort_exc
                 self._accumulator.observe(chunk)
                 if self._chunk_translator is None:
                     return chunk
@@ -118,6 +171,8 @@ class SyncStreamWrapper:
                 self._settle()
                 raise
             except Exception as exc:
+                if self._latched_abort() is exc:
+                    raise
                 self._settle_error(exc)
                 raise
         return self._pending_chunks.popleft()
@@ -178,6 +233,8 @@ class AsyncStreamWrapper:
     Cross-provider stream normalization: see ``SyncStreamWrapper`` — the
     optional ``chunk_translator`` reshapes raw served chunks into caller-dialect
     chunks while the accumulator still observes the RAW served chunk.
+    ``abort_check`` has the same post-pull, pre-observe boundary as the sync
+    wrapper and is evaluated synchronously (registry reads perform no I/O).
     """
 
     def __init__(
@@ -187,6 +244,9 @@ class AsyncStreamWrapper:
         on_complete: Callable[[TokenDetails, float], Awaitable[None]],
         on_error: Callable[[BaseException], Awaitable[None]],
         chunk_translator: Callable[[Any], list[Any]] | None = None,
+        *,
+        abort_check: Callable[[], Exception | None] | None = None,
+        abort_release: Callable[[], None] | None = None,
     ) -> None:
         self._stream = stream
         self._iterator: AsyncIterator[Any] | None = None
@@ -195,6 +255,11 @@ class AsyncStreamWrapper:
         self._on_complete = on_complete
         self._on_error = on_error
         self._chunk_translator = chunk_translator
+        self._abort_check = abort_check
+        self._abort_finalizer = (
+            weakref.finalize(self, abort_release) if abort_release is not None else None
+        )
+        self._abort_exc: Exception | None = None
         self._start_time = time.monotonic()
         self._settled = False
         self._cleanup_complete = False
@@ -205,6 +270,7 @@ class AsyncStreamWrapper:
         if self._settled:
             return
         self._settled = True
+        self._release_abort_handle()
         elapsed_ms = (time.monotonic() - self._start_time) * 1000
         token_details = self._accumulator.finalize()
         try:
@@ -221,6 +287,7 @@ class AsyncStreamWrapper:
         if self._settled:
             return
         self._settled = True
+        self._release_abort_handle()
         try:
             await self._on_error(exc)
         except Exception as cb_exc:
@@ -231,8 +298,15 @@ class AsyncStreamWrapper:
                 type(cb_exc).__name__,
             )
 
+    def _release_abort_handle(self) -> None:
+        finalizer = self._abort_finalizer
+        if finalizer is not None and finalizer.alive:
+            finalizer()
+
     async def __anext__(self) -> Any:
         """Return one observed caller-dialect chunk."""
+        if self._abort_exc is not None:
+            raise self._abort_exc
         while not self._pending_chunks:
             try:
                 iterator = self._iterator
@@ -240,6 +314,25 @@ class AsyncStreamWrapper:
                     iterator = self._stream.__aiter__()
                     self._iterator = iterator
                 chunk = await iterator.__anext__()
+                if self._abort_check is not None:
+                    abort_exc = self._abort_check()
+                    if abort_exc is not None:
+                        if self._abort_exc is None:
+                            self._abort_exc = abort_exc
+                        abort_exc = self._abort_exc
+                        try:
+                            await self.close()
+                        except Exception as close_exc:
+                            # Structural-only log of the provider-close failure;
+                            # never a traceback (fix [D]). A BaseException here
+                            # (CancelledError) propagates instead of being
+                            # replaced by the latched stop; the abort is already
+                            # latched, so the wrapper stays terminal.
+                            logger.warning(
+                                "provider close raised during run-stop abort; suppressing (%s)",
+                                type(close_exc).__name__,
+                            )
+                        raise abort_exc
                 self._accumulator.observe(chunk)
                 if self._chunk_translator is None:
                     return chunk
@@ -248,6 +341,8 @@ class AsyncStreamWrapper:
                 await self._settle()
                 raise
             except Exception as exc:
+                if self._abort_exc is exc:
+                    raise
                 await self._settle_error(exc)
                 raise
         return self._pending_chunks.popleft()
@@ -394,12 +489,16 @@ class _SyncResponsesStreamManagerWrapper:
         on_error: Callable[[BaseException], None],
         on_entry_error: Callable[[BaseException], None],
         on_abandoned_before_entry: Callable[[], None],
+        abort_release: Callable[[], None] | None = None,
     ) -> None:
         self._manager = manager
         self._wrap_stream = wrap_stream
         self._on_error = on_error
         self._on_entry_error = on_entry_error
         self._on_abandoned_before_entry = on_abandoned_before_entry
+        self._abort_finalizer = (
+            weakref.finalize(self, abort_release) if abort_release is not None else None
+        )
         self._stream: SyncStreamWrapper | None = None
         self._pre_entry_settled = False
         self._dispatched = False
@@ -409,7 +508,18 @@ class _SyncResponsesStreamManagerWrapper:
     def _wrapped_stream(self, source: Any = ()) -> SyncStreamWrapper:
         if self._stream is None:
             self._stream = self._wrap_stream(source)
+            self._detach_abort_handle()
         return self._stream
+
+    def _release_abort_handle(self) -> None:
+        finalizer = self._abort_finalizer
+        if finalizer is not None and finalizer.alive:
+            finalizer()
+
+    def _detach_abort_handle(self) -> None:
+        finalizer = self._abort_finalizer
+        if finalizer is not None and finalizer.alive:
+            finalizer.detach()
 
     def _settle_before_stream(
         self,
@@ -430,6 +540,8 @@ class _SyncResponsesStreamManagerWrapper:
                 "Responses entry settlement raised; suppressing (%s)",
                 type(settlement_exc).__name__,
             )
+        finally:
+            self._release_abort_handle()
 
     def _settle_entry_error(self, exc: BaseException) -> None:
         """The provider request failed in ``__enter__``: classify it."""
@@ -444,7 +556,10 @@ class _SyncResponsesStreamManagerWrapper:
         if self._pre_entry_settled:
             return
         self._pre_entry_settled = True
-        self._on_abandoned_before_entry()
+        try:
+            self._on_abandoned_before_entry()
+        finally:
+            self._release_abort_handle()
 
     def _close_failed_entry(self, exc: BaseException) -> None:
         try:
@@ -545,12 +660,16 @@ class _AsyncResponsesStreamManagerWrapper:
         on_error: Callable[[BaseException], Awaitable[None]],
         on_entry_error: Callable[[BaseException], Awaitable[None]],
         on_abandoned_before_entry: Callable[[], Awaitable[None]],
+        abort_release: Callable[[], None] | None = None,
     ) -> None:
         self._manager = manager
         self._wrap_stream = wrap_stream
         self._on_error = on_error
         self._on_entry_error = on_entry_error
         self._on_abandoned_before_entry = on_abandoned_before_entry
+        self._abort_finalizer = (
+            weakref.finalize(self, abort_release) if abort_release is not None else None
+        )
         self._stream: AsyncStreamWrapper | None = None
         self._pre_entry_settled = False
         self._dispatched = False
@@ -560,7 +679,18 @@ class _AsyncResponsesStreamManagerWrapper:
     def _wrapped_stream(self, source: Any = ()) -> AsyncStreamWrapper:
         if self._stream is None:
             self._stream = self._wrap_stream(source)
+            self._detach_abort_handle()
         return self._stream
+
+    def _release_abort_handle(self) -> None:
+        finalizer = self._abort_finalizer
+        if finalizer is not None and finalizer.alive:
+            finalizer()
+
+    def _detach_abort_handle(self) -> None:
+        finalizer = self._abort_finalizer
+        if finalizer is not None and finalizer.alive:
+            finalizer.detach()
 
     @property
     def _cleanup_complete(self) -> bool:
@@ -585,6 +715,8 @@ class _AsyncResponsesStreamManagerWrapper:
                 "Responses entry settlement raised; suppressing (%s)",
                 type(settlement_exc).__name__,
             )
+        finally:
+            self._release_abort_handle()
 
     async def _settle_entry_error(self, exc: BaseException) -> None:
         """The provider request failed in ``__aenter__``: classify it."""
@@ -599,7 +731,10 @@ class _AsyncResponsesStreamManagerWrapper:
         if self._pre_entry_settled:
             return
         self._pre_entry_settled = True
-        await self._on_abandoned_before_entry()
+        try:
+            await self._on_abandoned_before_entry()
+        finally:
+            self._release_abort_handle()
 
     async def _close_failed_entry(self, exc: BaseException) -> None:
         try:

@@ -36,8 +36,8 @@ def _make_solwyn(client: object, **config_kwargs: object) -> Solwyn:
     """Create a Solwyn wrapper with mocked reporter thread."""
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, **config_kwargs)
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
     return solwyn
 
 
@@ -52,8 +52,8 @@ class TestEnvVarConstruction:
         client = _mock_openai_client()
         solwyn = _make_solwyn(client)
 
-        assert solwyn._config.api_key == VALID_API_KEY
-        assert not hasattr(solwyn._config, "project_id")
+        assert solwyn._solwyn_config.api_key == VALID_API_KEY
+        assert not hasattr(solwyn._solwyn_config, "project_id")
 
         solwyn.close()
 
@@ -65,8 +65,8 @@ class TestEnvVarConstruction:
         client = _mock_openai_client()
         solwyn = _make_solwyn(client, api_key=VALID_API_KEY)
 
-        assert solwyn._config.api_key == VALID_API_KEY
-        assert not hasattr(solwyn._config, "project_id")
+        assert solwyn._solwyn_config.api_key == VALID_API_KEY
+        assert not hasattr(solwyn._solwyn_config, "project_id")
 
         solwyn.close()
 
@@ -87,7 +87,7 @@ class TestEnvVarConstruction:
         client = _mock_openai_client()
         solwyn = _make_solwyn(client)
 
-        assert not hasattr(solwyn._config, "project_id")
+        assert not hasattr(solwyn._solwyn_config, "project_id")
 
         solwyn.close()
 
@@ -99,7 +99,7 @@ class TestEnvVarConstruction:
         client = _mock_openai_client()
         solwyn = _make_solwyn(client)
 
-        assert solwyn._config.api_url == "https://custom.solwyn.ai"
+        assert solwyn._solwyn_config.api_url == "https://custom.solwyn.ai"
 
         solwyn.close()
 
@@ -109,7 +109,7 @@ class TestEnvVarConstruction:
 
         solwyn = _make_solwyn(_mock_openai_client())
 
-        assert getattr(solwyn._config, "tags", None) == {
+        assert getattr(solwyn._solwyn_config, "tags", None) == {
             "env": "prod",
             "expression": "left=right",
         }
@@ -122,7 +122,7 @@ class TestEnvVarConstruction:
 
         solwyn = _make_solwyn(_mock_openai_client())
 
-        assert getattr(solwyn._config, "tags", None) == {" env ": " prod "}
+        assert getattr(solwyn._solwyn_config, "tags", None) == {" env ": " prod "}
 
         solwyn.close()
 
@@ -132,7 +132,7 @@ class TestEnvVarConstruction:
 
         solwyn = _make_solwyn(_mock_openai_client())
 
-        assert getattr(solwyn._config, "tags", None) == {"environment": ""}
+        assert getattr(solwyn._solwyn_config, "tags", None) == {"environment": ""}
 
         solwyn.close()
 
@@ -155,7 +155,7 @@ class TestEnvVarConstruction:
         )
         tags["environment"] = "mutated"
 
-        assert solwyn._config.tags == {"environment": "prod"}
+        assert solwyn._solwyn_config.tags == {"environment": "prod"}
 
         solwyn.close()
 
@@ -166,7 +166,7 @@ class TestEnvVarConstruction:
             tags={"description": "alpha,beta"},
         )
 
-        assert solwyn._config.tags == {"description": "alpha,beta"}
+        assert solwyn._solwyn_config.tags == {"description": "alpha,beta"}
 
         solwyn.close()
 
@@ -219,7 +219,7 @@ class TestEnvVarConstruction:
         client = _mock_openai_client()
         solwyn = _make_solwyn(client)
 
-        assert solwyn._config.budget_mode == BudgetMode.HARD_DENY
+        assert solwyn._solwyn_config.budget_mode == BudgetMode.HARD_DENY
 
         solwyn.close()
 
@@ -247,7 +247,7 @@ class TestEnvVarConstruction:
         client = _mock_openai_client()
         solwyn = _make_solwyn(client)
 
-        assert solwyn._config.fail_open is expected
+        assert solwyn._solwyn_config.fail_open is expected
 
         solwyn.close()
 
@@ -273,7 +273,7 @@ class TestEnvVarConstruction:
 
         solwyn = _make_solwyn(_mock_openai_client())
 
-        assert solwyn._config.breaker_reporting_enabled is expected
+        assert solwyn._solwyn_config.breaker_reporting_enabled is expected
 
         solwyn.close()
 
@@ -299,7 +299,7 @@ class TestEnvVarConstruction:
 
         solwyn = _make_solwyn(_mock_openai_client())
 
-        assert solwyn._config.report_untracked_surfaces is expected
+        assert solwyn._solwyn_config.report_untracked_surfaces is expected
 
         solwyn.close()
 
@@ -335,7 +335,7 @@ class TestControlPlaneConfig:
 
         solwyn = _make_solwyn(_mock_openai_client())
 
-        assert solwyn._config.budget_check_timeout == 2.5
+        assert solwyn._solwyn_config.budget_check_timeout == 2.5
 
         solwyn.close()
 
@@ -348,8 +348,8 @@ class TestControlPlaneConfig:
 
         solwyn = _make_solwyn(_mock_openai_client())
 
-        assert solwyn._config.control_plane_failure_threshold == 7
-        assert solwyn._config.control_plane_recovery_timeout == 45.0
+        assert solwyn._solwyn_config.control_plane_failure_threshold == 7
+        assert solwyn._solwyn_config.control_plane_recovery_timeout == 45.0
 
         solwyn.close()
 
@@ -414,7 +414,7 @@ class TestLeaseConfig:
 
         solwyn = _make_solwyn(_mock_openai_client())
 
-        assert solwyn._config.lease_enabled is expected
+        assert solwyn._solwyn_config.lease_enabled is expected
 
         solwyn.close()
 
@@ -424,9 +424,96 @@ class TestLeaseConfig:
 
         solwyn = _make_solwyn(_mock_openai_client())
 
-        assert solwyn._config.lease_output_bound_default == 8192
+        assert solwyn._solwyn_config.lease_output_bound_default == 8192
 
         solwyn.close()
+
+
+@pytest.mark.unit
+class TestVelocityConfig:
+    """Content-free velocity detector configuration."""
+
+    def test_defaults(self) -> None:
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+        )
+
+        assert config.velocity_mode == "warn"
+        assert config.velocity_repeat_count == 5
+        assert config.velocity_repeat_window_s == 60.0
+        assert config.velocity_growth_streak == 8
+        assert config.velocity_growth_factor == 3.0
+        assert config.velocity_accel_floor_per_min == 30
+        assert config.velocity_accel_factor == 3.0
+
+    def test_mode_and_repeat_count_load_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOLWYN_VELOCITY_MODE", "deny")
+        monkeypatch.setenv("SOLWYN_VELOCITY_REPEAT_COUNT", "9")
+
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+        )
+
+        assert config.velocity_mode == "deny"
+        assert config.velocity_repeat_count == 9
+
+    def test_invalid_mode_raises_validation_error(self) -> None:
+        with pytest.raises(ValidationError):
+            SolwynConfig(
+                api_key=VALID_API_KEY,
+                providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+                velocity_mode="block",
+            )
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "velocity_repeat_count",
+            "velocity_growth_streak",
+            "velocity_accel_floor_per_min",
+        ],
+    )
+    def test_history_dependent_counts_cannot_exceed_capacity(self, field: str) -> None:
+        with pytest.raises(ValidationError):
+            SolwynConfig(
+                api_key=VALID_API_KEY,
+                providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+                **{field: 65},
+            )
+
+    @pytest.mark.parametrize(
+        "env_name",
+        [
+            "SOLWYN_VELOCITY_REPEAT_COUNT",
+            "SOLWYN_VELOCITY_GROWTH_STREAK",
+            "SOLWYN_VELOCITY_ACCEL_FLOOR_PER_MIN",
+        ],
+    )
+    def test_history_capacity_is_enforced_for_env_values(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        env_name: str,
+    ) -> None:
+        monkeypatch.setenv(env_name, "65")
+
+        with pytest.raises(ValidationError):
+            SolwynConfig(
+                api_key=VALID_API_KEY,
+                providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+            )
+
+    def test_history_capacity_boundary_is_accepted(self) -> None:
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+            velocity_repeat_count=64,
+            velocity_growth_streak=64,
+        )
+
+        assert config.velocity_repeat_count == 64
+        assert config.velocity_growth_streak == 64
 
 
 @pytest.mark.unit
@@ -467,15 +554,15 @@ class TestReporterRetryConfig:
         solwyn = _make_solwyn(_mock_openai_client())
 
         # Config parsed the env vars...
-        assert solwyn._config.reporter_max_send_attempts == 3
-        assert solwyn._config.reporter_retry_backoff_base == 0.5
-        assert solwyn._config.reporter_retry_backoff_cap == 10.0
-        assert solwyn._config.reporter_shutdown_deadline == 2.5
+        assert solwyn._solwyn_config.reporter_max_send_attempts == 3
+        assert solwyn._solwyn_config.reporter_retry_backoff_base == 0.5
+        assert solwyn._solwyn_config.reporter_retry_backoff_cap == 10.0
+        assert solwyn._solwyn_config.reporter_shutdown_deadline == 2.5
         # ...and the client threaded them into the reporter's public attrs.
-        assert solwyn._reporter.max_send_attempts == 3
-        assert solwyn._reporter.retry_backoff_base == 0.5
-        assert solwyn._reporter.retry_backoff_cap == 10.0
-        assert solwyn._reporter.shutdown_deadline == 2.5
+        assert solwyn._solwyn_reporter.max_send_attempts == 3
+        assert solwyn._solwyn_reporter.retry_backoff_base == 0.5
+        assert solwyn._solwyn_reporter.retry_backoff_cap == 10.0
+        assert solwyn._solwyn_reporter.shutdown_deadline == 2.5
 
         solwyn.close()
 
@@ -503,8 +590,8 @@ class TestReporterRetryConfig:
 
         solwyn = _make_solwyn(_mock_openai_client())
 
-        assert solwyn._config.breaker_report_heartbeat == 12.5
-        assert solwyn._reporter._breaker_report_heartbeat == 12.5
+        assert solwyn._solwyn_config.breaker_report_heartbeat == 12.5
+        assert solwyn._solwyn_reporter._breaker_report_heartbeat == 12.5
 
         solwyn.close()
 
@@ -614,8 +701,8 @@ class TestAsyncSolwynConstructors:
         client = _mock_openai_client()
         solwyn = _make_async_solwyn(client)
 
-        assert solwyn._config.api_key == VALID_API_KEY
-        assert not hasattr(solwyn._config, "project_id")
+        assert solwyn._solwyn_config.api_key == VALID_API_KEY
+        assert not hasattr(solwyn._solwyn_config, "project_id")
 
         await solwyn.close()
 
@@ -628,8 +715,8 @@ class TestAsyncSolwynConstructors:
 
         solwyn = _make_async_solwyn(_mock_openai_client())
 
-        assert solwyn._config.breaker_report_heartbeat == 12.5
-        assert solwyn._reporter._breaker_report_heartbeat == 12.5
+        assert solwyn._solwyn_config.breaker_report_heartbeat == 12.5
+        assert solwyn._solwyn_reporter._breaker_report_heartbeat == 12.5
 
         await solwyn.close()
 
@@ -644,7 +731,7 @@ class TestAsyncSolwynConstructors:
         )
         tags["environment"] = "mutated"
 
-        assert solwyn._config.tags == {"environment": "prod"}
+        assert solwyn._solwyn_config.tags == {"environment": "prod"}
 
         await solwyn.close()
 
@@ -771,7 +858,7 @@ class TestFailoverHopReadTimeout:
         # 600s is the openai/anthropic SDK's READ/WRITE default: the wrapped
         # read/write bound must never fire earlier than the unwrapped SDK's
         # would (connect/pool instead track the shrinking failover window).
-        assert solwyn._config.failover_hop_read_timeout == 600.0
+        assert solwyn._solwyn_config.failover_hop_read_timeout == 600.0
         solwyn.close()
 
     def test_zero_rejected(self) -> None:

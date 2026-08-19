@@ -280,7 +280,7 @@ def _mock_budget(solwyn, response=None):
     resp = MagicMock(spec=httpx.Response)
     resp.json.return_value = response or ALLOW_BUDGET_RESPONSE
     resp.raise_for_status = MagicMock()
-    return patch.object(solwyn._budget._http, "post", return_value=resp)
+    return patch.object(solwyn._solwyn_budget._http, "post", return_value=resp)
 
 
 def _reporting_response() -> MagicMock:
@@ -299,7 +299,7 @@ def test_sync_openai_explicit_proxy_methods_resolve_exact_wrapper_paths_before_d
     with (
         _mock_budget(solwyn) as budget_post,
         patch.object(
-            solwyn._reporter._http,
+            solwyn._solwyn_reporter._http,
             "post",
             return_value=_reporting_response(),
         ) as report_post,
@@ -440,7 +440,7 @@ def test_sync_provider_native_explicit_methods_resolve_before_dispatch() -> None
     with (
         _mock_budget(anthropic) as anthropic_budget_post,
         patch.object(
-            anthropic._reporter._http,
+            anthropic._solwyn_reporter._http,
             "post",
             return_value=_reporting_response(),
         ) as anthropic_report_post,
@@ -461,7 +461,7 @@ def test_sync_provider_native_explicit_methods_resolve_before_dispatch() -> None
     with (
         _mock_budget(google) as google_budget_post,
         patch.object(
-            google._reporter._http,
+            google._solwyn_reporter._http,
             "post",
             return_value=_reporting_response(),
         ) as google_report_post,
@@ -567,10 +567,10 @@ class TestAnthropicMessagesProxy:
         client = _mock_anthropic_client()
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             result = solwyn.messages.create(
@@ -635,10 +635,10 @@ class TestGoogleModelsProxy:
         client = _mock_google_client()
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             result = solwyn.models.generate_content(
@@ -677,10 +677,10 @@ class TestGoogleModelsProxy:
 
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             solwyn.models.generate_content_stream(
@@ -709,10 +709,10 @@ class TestGoogleModelsProxy:
         client = _mock_google_videos_client()
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             result = solwyn.models.generate_videos(
@@ -743,10 +743,10 @@ class TestGoogleModelsProxy:
         client = _mock_google_videos_client()
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             solwyn.models.generate_videos(
@@ -765,10 +765,10 @@ class TestGoogleModelsProxy:
         client = _mock_google_videos_client()
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             solwyn.models.generate_videos(model="veo-3.0-generate-001", prompt="a bird")
@@ -828,10 +828,10 @@ class TestGoogleModelsProxy:
         client = _mock_google_embeddings_client(prompt_token_count=55)
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             result = solwyn.models.embed_content(
@@ -856,10 +856,10 @@ class TestGoogleModelsProxy:
         client = _mock_google_embeddings_client(usage=False)
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             solwyn.models.embed_content(
@@ -912,10 +912,10 @@ class TestGoogleModelsProxy:
         client = _mock_google_images_client()
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             result = solwyn.models.generate_images(
@@ -943,10 +943,10 @@ class TestGoogleModelsProxy:
         client = _mock_google_images_client()
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             solwyn.models.generate_images(
@@ -964,10 +964,10 @@ class TestGoogleModelsProxy:
         client = _mock_google_images_client()
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             solwyn.models.generate_images(model="imagen-3.0-generate-002", prompt="a bird")
@@ -1060,10 +1060,10 @@ class TestEmbeddingsProxy:
         client = _mock_openai_embeddings_client(prompt_tokens=42)
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             result = solwyn.embeddings.create(
@@ -1108,10 +1108,10 @@ class TestEmbeddingsProxy:
         client = _mock_openai_embeddings_client(usage=False)
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             solwyn.embeddings.create(
@@ -1150,10 +1150,10 @@ class TestImagesProxy:
         client = _mock_openai_images_client(native=True)
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             solwyn.images.generate(
@@ -1185,10 +1185,10 @@ class TestImagesProxy:
         client = _mock_openai_images_client(native=False)
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             solwyn.images.generate(model="dall-e-3", prompt="a cat", n=2, size="1792x1024")
@@ -1206,10 +1206,10 @@ class TestImagesProxy:
         client = _mock_openai_images_client(native=True)
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             solwyn.images.edit(model="gpt-image-2", prompt="add a hat", image=b"png-bytes")
@@ -1267,10 +1267,10 @@ class TestVideosProxy:
         client = _mock_openai_videos_client()
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             result = solwyn.videos.create(
@@ -1299,10 +1299,10 @@ class TestVideosProxy:
         client = _mock_openai_videos_client()
         solwyn = _make_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_budget(solwyn):
             solwyn.videos.create(model="sora-2", prompt="a dog")
@@ -1374,7 +1374,7 @@ def _mock_async_budget(solwyn, response=None):
     resp = MagicMock(spec=httpx.Response)
     resp.json.return_value = response or ALLOW_BUDGET_RESPONSE
     resp.raise_for_status = MagicMock()
-    return patch.object(solwyn._budget._http, "post", return_value=resp)
+    return patch.object(solwyn._solwyn_budget._http, "post", return_value=resp)
 
 
 @pytest.mark.unit
@@ -1397,7 +1397,7 @@ async def test_async_openai_explicit_proxy_methods_resolve_before_dispatch() -> 
 
     with (
         _mock_async_budget(solwyn) as budget_post,
-        patch.object(solwyn._reporter._http, "post", new=report_post),
+        patch.object(solwyn._solwyn_reporter._http, "post", new=report_post),
     ):
         await solwyn.chat.completions.create(model="gpt-5.5", messages=[])
         await solwyn.embeddings.create(model="text-embedding-3-small", input="hi")
@@ -1430,7 +1430,7 @@ async def test_async_provider_native_explicit_methods_resolve_before_dispatch() 
     anthropic_report_post = AsyncMockFn(return_value=_reporting_response())
     with (
         _mock_async_budget(anthropic) as anthropic_budget_post,
-        patch.object(anthropic._reporter._http, "post", new=anthropic_report_post),
+        patch.object(anthropic._solwyn_reporter._http, "post", new=anthropic_report_post),
     ):
         await anthropic.messages.create(
             model="claude-sonnet-5",
@@ -1466,7 +1466,7 @@ async def test_async_provider_native_explicit_methods_resolve_before_dispatch() 
     google_report_post = AsyncMockFn(return_value=_reporting_response())
     with (
         _mock_async_budget(google) as google_budget_post,
-        patch.object(google._reporter._http, "post", new=google_report_post),
+        patch.object(google._solwyn_reporter._http, "post", new=google_report_post),
     ):
         await google.models.generate_content(model="gemini-3.5-flash", contents="hi")
         stream = await google.models.generate_content_stream(
@@ -1691,10 +1691,10 @@ class TestAsyncAnthropicMessagesProxy:
         )
         solwyn = _make_async_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_async_budget(solwyn):
             result = await solwyn.messages.create(
@@ -1708,8 +1708,8 @@ class TestAsyncAnthropicMessagesProxy:
         assert reported[0].status == "success"
         assert result.content[0].text == "Hello"
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
 
 @pytest.mark.unit
@@ -1734,10 +1734,10 @@ class TestAsyncGoogleModelsProxy:
         )
         solwyn = _make_async_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_async_budget(solwyn):
             result = await solwyn.models.generate_content(
@@ -1749,8 +1749,8 @@ class TestAsyncGoogleModelsProxy:
         assert len(reported) == 1
         assert result.text == "Hello"
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1763,10 +1763,10 @@ class TestAsyncGoogleModelsProxy:
         client.models.generate_videos = AsyncMockFn(return_value=operation)
         solwyn = _make_async_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_async_budget(solwyn):
             result = await solwyn.models.generate_videos(
@@ -1785,8 +1785,8 @@ class TestAsyncGoogleModelsProxy:
         # The long-running operation is passed back untouched.
         assert result is operation
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1800,10 +1800,10 @@ class TestAsyncGoogleModelsProxy:
         )
         solwyn = _make_async_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_async_budget(solwyn):
             result = await solwyn.models.embed_content(
@@ -1818,8 +1818,8 @@ class TestAsyncGoogleModelsProxy:
         assert reported[0].output_tokens == 0
         assert result.embeddings[0].values == [0.1, 0.2]
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1834,10 +1834,10 @@ class TestAsyncGoogleModelsProxy:
         )
         solwyn = _make_async_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_async_budget(solwyn):
             await solwyn.models.generate_images(
@@ -1853,8 +1853,8 @@ class TestAsyncGoogleModelsProxy:
         assert event.token_details is None
         assert event.media_usage.image_count == 3
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
 
 @pytest.mark.unit
@@ -1874,10 +1874,10 @@ class TestAsyncEmbeddingsProxy:
         )
         solwyn = _make_async_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_async_budget(solwyn):
             result = await solwyn.embeddings.create(
@@ -1892,8 +1892,8 @@ class TestAsyncEmbeddingsProxy:
         assert reported[0].output_tokens == 0
         assert result.usage.prompt_tokens == 99
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
 
 @pytest.mark.unit
@@ -1908,10 +1908,10 @@ class TestAsyncImagesProxy:
         client.images.generate = AsyncMockFn(return_value=client.images.generate.return_value)
         solwyn = _make_async_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_async_budget(solwyn):
             await solwyn.images.generate(model="gpt-image-2", prompt="a cat", n=1, size="1024x1024")
@@ -1925,8 +1925,8 @@ class TestAsyncImagesProxy:
         assert event.media_usage.image_count == 1
         assert event.media_usage.resolution == "1024x1024"
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.unit
     @pytest.mark.asyncio
@@ -1937,10 +1937,10 @@ class TestAsyncImagesProxy:
         client.images.edit = AsyncMockFn(return_value=edit_response)
         solwyn = _make_async_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_async_budget(solwyn):
             await solwyn.images.edit(model="gpt-image-2", prompt="add a hat", image=b"png")
@@ -1949,8 +1949,8 @@ class TestAsyncImagesProxy:
         assert _IMAGE_OP_KEY not in client.images.edit.call_args.kwargs
         assert reported[0].media_usage.image_count == 1
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
 
 @pytest.mark.unit
@@ -1969,10 +1969,10 @@ class TestAsyncVideosProxy:
         client.videos.create = AsyncMockFn(return_value=job)
         solwyn = _make_async_solwyn(client)
         reported: list = []
-        solwyn._reporter.report = lambda e: reported.append(e)
+        solwyn._solwyn_reporter.report = lambda e: reported.append(e)
         # Non-streaming settlement (with a reservation) rides report_settlement;
         # route its event into the same list so the SUCCESS event is observed.
-        solwyn._reporter.report_settlement = lambda req, event: reported.append(event)
+        solwyn._solwyn_reporter.report_settlement = lambda req, event: reported.append(event)
 
         with _mock_async_budget(solwyn):
             result = await solwyn.videos.create(
@@ -1990,5 +1990,5 @@ class TestAsyncVideosProxy:
         # The async video job is passed back untouched.
         assert result is job
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()

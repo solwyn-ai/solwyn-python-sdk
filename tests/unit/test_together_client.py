@@ -19,7 +19,12 @@ from typing import Any, TypeVar
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from conftest import VALID_API_KEY, VALID_PROJECT_ID, foreground_records
+from conftest import (
+    VALID_API_KEY,
+    VALID_PROJECT_ID,
+    foreground_records,
+    patch_wrapper_local,
+)
 
 from solwyn import _base
 from solwyn._base import _reset_unmetered_spend_warnings
@@ -191,8 +196,8 @@ def _allow_budget(*, reservation_id: str | None = None) -> SimpleNamespace:
 def _make_solwyn(client: object) -> Solwyn:
     with patch("solwyn.reporter.MetadataReporter._flush_loop", autospec=True):
         solwyn = Solwyn(client, api_key=VALID_API_KEY)
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
     return solwyn
 
 
@@ -208,15 +213,15 @@ def test_sync_unmetered_surface_warns_and_passes_through(caplog: pytest.LogCaptu
     resource.create.return_value = object()
     client.rerank = resource
     solwyn = _make_solwyn(client)
-    check_budget = MagicMock(spec=solwyn._budget.check_budget)
-    report = MagicMock(spec=solwyn._reporter.report)
-    report_settlement = MagicMock(spec=solwyn._reporter.report_settlement)
+    check_budget = MagicMock(spec=solwyn._solwyn_budget.check_budget)
+    report = MagicMock(spec=solwyn._solwyn_reporter.report)
+    report_settlement = MagicMock(spec=solwyn._solwyn_reporter.report_settlement)
 
     with (
         caplog.at_level(logging.WARNING, logger="solwyn._base"),
-        patch.object(solwyn._budget, "check_budget", new=check_budget),
-        patch.object(solwyn._reporter, "report", new=report),
-        patch.object(solwyn._reporter, "report_settlement", new=report_settlement),
+        patch.object(solwyn._solwyn_budget, "check_budget", new=check_budget),
+        patch.object(solwyn._solwyn_reporter, "report", new=report),
+        patch.object(solwyn._solwyn_reporter, "report_settlement", new=report_settlement),
     ):
         result = solwyn.rerank.create(model=MODEL, input="private-input-marker")
 
@@ -240,8 +245,9 @@ def test_sync_unmetered_surface_warns_and_passes_through(caplog: pytest.LogCaptu
 def test_native_together_video_is_unsupported_before_dispatch() -> None:
     solwyn = _make_solwyn(FakeTogetherClient(_completion_response()))
 
+    dispatch = MagicMock()
     with (
-        patch.object(solwyn, "_media_call") as dispatch,
+        patch_wrapper_local(solwyn, "_media_call", dispatch),
         pytest.raises(UnsupportedSurfaceError) as exc_info,
     ):
         solwyn.videos.create(model="video", prompt="private")
@@ -295,15 +301,15 @@ async def test_async_unmetered_surface_warns_and_passes_through(
     resource.create.return_value = object()
     client.rerank = resource
     solwyn = _make_async_solwyn(client)
-    check_budget = AsyncMock(spec=solwyn._budget.check_budget)
-    report = MagicMock(spec=solwyn._reporter.report)
-    report_settlement = MagicMock(spec=solwyn._reporter.report_settlement)
+    check_budget = AsyncMock(spec=solwyn._solwyn_budget.check_budget)
+    report = MagicMock(spec=solwyn._solwyn_reporter.report)
+    report_settlement = MagicMock(spec=solwyn._solwyn_reporter.report_settlement)
 
     with (
         caplog.at_level(logging.WARNING, logger="solwyn._base"),
-        patch.object(solwyn._budget, "check_budget", new=check_budget),
-        patch.object(solwyn._reporter, "report", new=report),
-        patch.object(solwyn._reporter, "report_settlement", new=report_settlement),
+        patch.object(solwyn._solwyn_budget, "check_budget", new=check_budget),
+        patch.object(solwyn._solwyn_reporter, "report", new=report),
+        patch.object(solwyn._solwyn_reporter, "report_settlement", new=report_settlement),
     ):
         result = await solwyn.rerank.create(model=MODEL, prompt="private-input-marker")
 
@@ -328,8 +334,9 @@ async def test_async_unmetered_surface_warns_and_passes_through(
 async def test_async_native_together_video_is_unsupported_before_dispatch() -> None:
     solwyn = _make_async_solwyn(AsyncTogether(_completion_response()))
 
+    dispatch = AsyncMock()
     with (
-        patch.object(solwyn, "_media_call", new=AsyncMock()) as dispatch,
+        patch_wrapper_local(solwyn, "_media_call", dispatch),
         pytest.raises(UnsupportedSurfaceError) as exc_info,
     ):
         await solwyn.videos.create(model="video", prompt="private")
@@ -509,14 +516,14 @@ def test_sync_together_runs_budget_dispatch_usage_and_success_pipeline() -> None
     solwyn = _make_solwyn(client)
     reported: list[Any] = []
     check_budget = MagicMock(
-        spec=solwyn._budget.check_budget,
+        spec=solwyn._solwyn_budget.check_budget,
         side_effect=_record_budget_check(order, _allow_budget()),
     )
 
     # Act
     with (
-        patch.object(solwyn._budget, "check_budget", new=check_budget),
-        patch.object(solwyn._reporter, "report", new=reported.append),
+        patch.object(solwyn._solwyn_budget, "check_budget", new=check_budget),
+        patch.object(solwyn._solwyn_reporter, "report", new=reported.append),
     ):
         result = solwyn.chat.completions.create(model=MODEL, messages=messages)
 
@@ -551,14 +558,14 @@ async def test_async_together_runs_budget_dispatch_usage_and_success_pipeline() 
     solwyn = _make_async_solwyn(client)
     reported: list[Any] = []
     check_budget = AsyncMock(
-        spec=solwyn._budget.check_budget,
+        spec=solwyn._solwyn_budget.check_budget,
         side_effect=_record_budget_check(order, _allow_budget()),
     )
 
     # Act
     with (
-        patch.object(solwyn._budget, "check_budget", new=check_budget),
-        patch.object(solwyn._reporter, "report", new=reported.append),
+        patch.object(solwyn._solwyn_budget, "check_budget", new=check_budget),
+        patch.object(solwyn._solwyn_reporter, "report", new=reported.append),
     ):
         result = await solwyn.chat.completions.create(model=MODEL, messages=messages)
 
@@ -592,16 +599,16 @@ def test_sync_together_stream_settles_from_terminal_usage() -> None:
     reported: list[Any] = []
     settlements: list[tuple[Any, Any]] = []
     check_budget = MagicMock(
-        spec=solwyn._budget.check_budget,
+        spec=solwyn._solwyn_budget.check_budget,
         return_value=_allow_budget(reservation_id="res_together_stream"),
     )
 
     # Act
     with (
-        patch.object(solwyn._budget, "check_budget", new=check_budget),
-        patch.object(solwyn._reporter, "report", new=reported.append),
+        patch.object(solwyn._solwyn_budget, "check_budget", new=check_budget),
+        patch.object(solwyn._solwyn_reporter, "report", new=reported.append),
         patch.object(
-            solwyn._reporter,
+            solwyn._solwyn_reporter,
             "report_settlement",
             new=_capture_settlements(settlements),
         ),
@@ -643,15 +650,15 @@ def test_sync_together_stream_without_usage_settles_flagged_length_estimate() ->
     solwyn = _make_solwyn(client)
     settlements: list[tuple[Any, Any]] = []
     check_budget = MagicMock(
-        spec=solwyn._budget.check_budget,
+        spec=solwyn._solwyn_budget.check_budget,
         return_value=_allow_budget(reservation_id="res_together_estimated"),
     )
 
     # Act
     with (
-        patch.object(solwyn._budget, "check_budget", new=check_budget),
+        patch.object(solwyn._solwyn_budget, "check_budget", new=check_budget),
         patch.object(
-            solwyn._reporter,
+            solwyn._solwyn_reporter,
             "report_settlement",
             new=_capture_settlements(settlements),
         ),
@@ -688,15 +695,15 @@ async def test_async_together_stream_settles_from_terminal_usage() -> None:
     solwyn = _make_async_solwyn(client)
     settlements: list[tuple[Any, Any]] = []
     check_budget = AsyncMock(
-        spec=solwyn._budget.check_budget,
+        spec=solwyn._solwyn_budget.check_budget,
         return_value=_allow_budget(reservation_id="res_together_async_stream"),
     )
 
     # Act
     with (
-        patch.object(solwyn._budget, "check_budget", new=check_budget),
+        patch.object(solwyn._solwyn_budget, "check_budget", new=check_budget),
         patch.object(
-            solwyn._reporter,
+            solwyn._solwyn_reporter,
             "report_settlement",
             new=_capture_settlements(settlements),
         ),
@@ -739,14 +746,14 @@ def test_sync_wrapper_with_async_together_returns_unawaited_coroutine() -> None:
     solwyn = _make_solwyn(client)
     reported: list[Any] = []
     check_budget = MagicMock(
-        spec=solwyn._budget.check_budget,
+        spec=solwyn._solwyn_budget.check_budget,
         return_value=_allow_budget(),
     )
 
     # Act
     with (
-        patch.object(solwyn._budget, "check_budget", new=check_budget),
-        patch.object(solwyn._reporter, "report", new=reported.append),
+        patch.object(solwyn._solwyn_budget, "check_budget", new=check_budget),
+        patch.object(solwyn._solwyn_reporter, "report", new=reported.append),
     ):
         result = solwyn.chat.completions.create(
             model=MODEL,

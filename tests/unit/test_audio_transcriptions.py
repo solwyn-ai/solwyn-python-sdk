@@ -197,14 +197,14 @@ def _deny() -> SimpleNamespace:
 def _build_sync(client: MagicMock, **overrides) -> Solwyn:
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, api_key=VALID_API_KEY, **overrides)
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
     return solwyn
 
 
 def _close_sync(solwyn: Solwyn) -> None:
-    solwyn._reporter._http.close()
-    solwyn._budget._http.close()
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_budget._http.close()
 
 
 @pytest.mark.unit
@@ -213,8 +213,8 @@ class TestAudioTranscriptionsProxy:
         client = _mock_transcription_client(_token_response())
         solwyn = _build_sync(client)
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow()) as check,
-            patch.object(solwyn._reporter, "report_settlement") as settle,
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow()) as check,
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
         ):
             result = solwyn.audio.transcriptions.create(
                 model="gpt-4o-transcribe", file=b"audio-bytes"
@@ -242,8 +242,8 @@ class TestAudioTranscriptionsProxy:
         client = _mock_transcription_client(_duration_response())
         solwyn = _build_sync(client)
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow()),
-            patch.object(solwyn._reporter, "report_settlement") as settle,
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow()),
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
         ):
             solwyn.audio.transcriptions.create(model="whisper-1", file=b"audio-bytes")
 
@@ -269,9 +269,9 @@ class TestAudioTranscriptionsProxy:
         client = _mock_transcription_client("plain transcript")
         solwyn = _build_sync(client)
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow()),
-            patch.object(solwyn._reporter, "report_settlement") as settle,
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow()),
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
+            patch.object(solwyn._solwyn_reporter, "report") as report,
             caplog.at_level(logging.WARNING, logger=_OPENAI_LOGGER),
         ):
             solwyn.audio.transcriptions.create(model="whisper-1", file=b"x", response_format="text")
@@ -305,8 +305,8 @@ class TestAudioTranscriptionsProxy:
         client = _mock_transcription_client(_token_response())
         solwyn = _build_sync(client, budget_mode=BudgetMode.HARD_DENY)
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_deny()),
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_deny()),
+            patch.object(solwyn._solwyn_reporter, "report") as report,
             pytest.raises(BudgetExceededError),
         ):
             solwyn.audio.transcriptions.create(model="gpt-4o-transcribe", file=b"x")
@@ -369,8 +369,10 @@ class TestAsyncAudioTranscriptionsProxy:
         client = _mock_async_transcription_client(_token_response())
         solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY)
         with (
-            patch.object(solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow())),
-            patch.object(solwyn._reporter, "report_settlement") as settle,
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow())
+            ),
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
         ):
             await solwyn.audio.transcriptions.create(model="gpt-4o-transcribe", file=b"audio")
 
@@ -380,16 +382,18 @@ class TestAsyncAudioTranscriptionsProxy:
         assert confirm.token_details.audio_input_tokens == 30
         assert event.modality == "audio"
         assert event.token_details.audio_input_tokens == 30
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_duration_model_intercepted(self) -> None:
         client = _mock_async_transcription_client(_duration_response())
         solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY)
         with (
-            patch.object(solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow())),
-            patch.object(solwyn._reporter, "report_settlement") as settle,
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow())
+            ),
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
         ):
             await solwyn.audio.transcriptions.create(model="whisper-1", file=b"audio")
 
@@ -398,5 +402,5 @@ class TestAsyncAudioTranscriptionsProxy:
         assert confirm.media_usage.audio_seconds == 7.0
         assert event.modality == "audio"
         assert event.media_usage.audio_seconds == 7.0
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()

@@ -106,6 +106,8 @@ def _deny(denied_by_period: str | None = None) -> SimpleNamespace:
         budget_limit=10.0,
         current_usage=10.0,
         denied_by_period=denied_by_period,
+        deny_source="server",
+        deny_reason=denied_by_period or "monthly",
         mode=BudgetMode.HARD_DENY,
     )
 
@@ -123,8 +125,8 @@ def _sync_client() -> tuple[MagicMock, SimpleNamespace]:
 def _build_sync(client: MagicMock, **overrides) -> Solwyn:
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         solwyn = Solwyn(client, api_key=VALID_API_KEY, **overrides)
-    solwyn._reporter._shutdown.set()
-    solwyn._reporter._thread.join(timeout=2.0)
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
     return solwyn
 
 
@@ -136,12 +138,14 @@ class TestMediaCallSync:
 
         with (
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
                 return_value=_allow(None, failover_tuning_allowed=False),
             ),
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
         ):
             result = solwyn._media_call(
                 _spec(),
@@ -150,11 +154,11 @@ class TestMediaCallSync:
             )
 
         assert result is resp
-        assert solwyn._config.failover_total_timeout == 30.0
+        assert solwyn._solwyn_config.failover_total_timeout == 30.0
         assert 0.0 < client.with_options.call_args.kwargs["timeout"].connect <= 30.0
         assert client.with_options.call_args.kwargs["timeout"].read == 600.0
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_custom_hop_read_timeout_flows_to_media_dispatch(self) -> None:
         # The media dispatch site must pass the CONFIGURED per-hop read bound.
@@ -164,9 +168,11 @@ class TestMediaCallSync:
         solwyn = _build_sync(client, failover_hop_read_timeout=37.0)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow(None)),
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow(None)),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
         ):
             result = solwyn._media_call(
                 _spec(),
@@ -178,22 +184,24 @@ class TestMediaCallSync:
         bound = client.with_options.call_args.kwargs["timeout"]
         assert bound.read == 37.0
         assert bound.write == 37.0
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_success_confirms_and_reports_primary_only(self) -> None:
         client, resp = _sync_client()
         solwyn = _build_sync(client)
 
         def create_after_project_learned(**_kwargs):
-            assert solwyn._reporter._breaker_project_id == VALID_PROJECT_ID
+            assert solwyn._solwyn_reporter._breaker_project_id == VALID_PROJECT_ID
             return resp
 
         client.embeddings.create.side_effect = create_after_project_learned
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow()) as check,
-            patch.object(solwyn._reporter, "report_settlement") as settle,
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow()) as check,
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
             solwyn_pkg.run("orchestrator") as parent_run_id,
             solwyn_pkg.run("sync-media", tags={"team": "platform"}) as run_id,
         ):
@@ -236,8 +244,8 @@ class TestMediaCallSync:
         assert check.call_args.kwargs["tags"] == event.tags
         assert "solwyn_tags" not in client.embeddings.create.call_args.kwargs
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_request_derived_quantity_when_response_has_no_usage(self) -> None:
         client, _ = _sync_client()
@@ -245,9 +253,11 @@ class TestMediaCallSync:
         solwyn = _build_sync(client)
         spec = _spec(measure=lambda _kwargs: TokenDetails(input_tokens=7))
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow()),
-            patch.object(solwyn._reporter, "report_settlement") as settle,
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow()),
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
         ):
             solwyn._media_call(spec, model="text-embedding-3-small", input="hi")
 
@@ -256,8 +266,8 @@ class TestMediaCallSync:
         assert confirm.token_details.input_tokens == 7
         assert event.input_tokens == 7
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_unobservable_quantity_reports_none_and_skips_confirm(self) -> None:
         client, _ = _sync_client()
@@ -266,10 +276,12 @@ class TestMediaCallSync:
         # Both hooks report nothing observable -> quantity stays None (never $0).
         spec = _spec(measure=lambda _kwargs: None)
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow()),
-            patch.object(solwyn._reporter, "report_settlement") as settle,
-            patch.object(solwyn._reporter, "report") as report,
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow()),
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
+            patch.object(solwyn._solwyn_reporter, "report") as report,
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
         ):
             solwyn._media_call(spec, model="text-embedding-3-small", input="hi")
 
@@ -281,8 +293,8 @@ class TestMediaCallSync:
         assert event.token_details is None
         assert event.input_tokens == 0
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_both_bases_flow_when_token_and_media_observable(self) -> None:
         # Native gpt-image: token usage (with image buckets) AND request-derived
@@ -304,9 +316,11 @@ class TestMediaCallSync:
             estimate_media=lambda _kwargs: MediaUsage(image_count=2, resolution="1024x1024"),
         )
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow()) as check,
-            patch.object(solwyn._reporter, "report_settlement") as settle,
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_images),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow()) as check,
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_images
+            ),
         ):
             solwyn._media_call(spec, model="gpt-image-2", prompt="a cat", n=2)
 
@@ -326,8 +340,32 @@ class TestMediaCallSync:
         assert event.token_details.image_output_tokens == 1024
         assert event.media_usage.image_count == 2
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
+
+    def test_unexpressible_media_estimate_degrades_instead_of_killing_the_call(self) -> None:
+        # A request-derived quantity past the wire model's bound must not raise
+        # out of the pre-flight: the call proceeds with no media estimate.
+        client, _ = _sync_client()
+        client.images.generate.return_value = SimpleNamespace(service_tier=None)
+        solwyn = _build_sync(client)
+        spec = _media_spec(
+            estimate_media=lambda _kwargs: MediaUsage(image_count=200_000_001),
+        )
+        with (
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow()) as check,
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_images
+            ),
+        ):
+            solwyn._media_call(spec, model="gpt-image-2", prompt="a cat", n=200_000_001)
+
+        client.images.generate.assert_called_once()
+        assert check.call_args.kwargs["estimated_media"] is None
+
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_media_only_quantity_confirms_with_zeroed_token_details(self) -> None:
         # Compat image (Together FLUX): usage: null, so no TOKEN basis — but the
@@ -343,9 +381,11 @@ class TestMediaCallSync:
             estimate_media=lambda _kwargs: MediaUsage(image_count=1),
         )
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow()),
-            patch.object(solwyn._reporter, "report_settlement") as settle,
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_images),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow()),
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_images
+            ),
         ):
             solwyn._media_call(spec, model="black-forest-labs/FLUX.1-schnell", prompt="a cat")
 
@@ -357,33 +397,49 @@ class TestMediaCallSync:
         assert event.input_tokens == 0
         assert event.media_usage.image_count == 1
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_budget_denied_raises_and_reports_without_dispatch(self) -> None:
         client, _ = _sync_client()
         solwyn = _build_sync(client, budget_mode=BudgetMode.HARD_DENY)
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_deny()),
-            patch.object(solwyn._reporter, "report") as report,
-            solwyn_pkg.run("denied-media", tags={"team": "platform"}),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_deny()) as check,
+            patch.object(solwyn._solwyn_reporter, "report") as report,
+            solwyn_pkg.run("denied-media", tags={"team": "platform"}) as run_id,
             pytest.raises(BudgetExceededError),
         ):
             solwyn._media_call(
-                _spec(),
-                model="text-embedding-3-small",
-                input="hi",
+                _media_spec(
+                    estimate_media=lambda _kwargs: MediaUsage(
+                        image_count=2,
+                        resolution="1024x1024",
+                        quality="hd",
+                    )
+                ),
+                model="gpt-image-2",
+                prompt="hi",
+                n=2,
                 solwyn_tags={"job": "embed"},
             )
 
         client.embeddings.create.assert_not_called()
         denied = report.call_args.args[0]
         assert denied.status == CallStatus.BUDGET_DENIED
-        assert denied.modality == "embedding"  # the denied event carries it too
+        assert denied.modality == "image"  # the denied event carries it too
+        assert denied.media_usage == check.call_args.kwargs["estimated_media"]
+        assert denied.media_usage.image_count == 2
+        assert denied.media_usage.resolution == "1024x1024"
+        assert denied.media_usage.quality == "hd"
+        assert denied.agent_run_id == run_id
         assert denied.tags == {"team": "platform", "job": "embed"}
+        assert denied.deny_source == "server"
+        assert denied.deny_reason == "monthly"
+        assert denied.denied_by_period is None
+        assert denied.estimated_output_bound == check.call_args.kwargs["estimated_output_bound"]
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_run_stopped_raises_typed_error_without_media_dispatch(self) -> None:
         client, _ = _sync_client()
@@ -391,30 +447,77 @@ class TestMediaCallSync:
 
         with (
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
                 return_value=_deny("run_stopped"),
             ),
-            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report") as report,
             solwyn_pkg.run("dashboard-stopped-media") as run_id,
             pytest.raises(RunStoppedError) as exc_info,
         ):
-            solwyn._media_call(_spec(), model="text-embedding-3-small", input="hi")
+            solwyn._media_call(
+                _media_spec(
+                    estimate_media=lambda _kwargs: MediaUsage(
+                        generation_count=1,
+                        video_seconds=12.5,
+                    )
+                ),
+                model="sora-2",
+                prompt="hi",
+            )
 
         client.embeddings.create.assert_not_called()
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
         error = exc_info.value
         assert type(error) is RunStoppedError
-        assert isinstance(error, BudgetExceededError)
-        assert str(error) == f"Run {run_id} was stopped from the Solwyn dashboard"
-        assert error.project_id == VALID_PROJECT_ID
-        assert error.budget_limit == 10.0
-        assert error.current_usage == 10.0
-        assert error.estimated_cost == 0.0
-        assert error.budget_period == "run_stopped"
-        assert error.mode == "hard_deny"
+        assert not isinstance(error, BudgetExceededError)
+        assert str(error) == f"Agent run {run_id} was stopped (server: run_stopped)"
+        assert error.agent_run_id == run_id
+        assert error.reason == "run_stopped"
+        assert error.source == "server"
+        denied = report.call_args.args[0]
+        assert denied.modality == "image"
+        assert denied.media_usage.generation_count == 1
+        assert denied.media_usage.video_seconds == 12.5
+
+    def test_pre_gate_media_stop_receipt_uses_admission_quantity(self) -> None:
+        from solwyn._run_control import mark_terminated
+
+        client, _ = _sync_client()
+        solwyn = _build_sync(client, budget_mode=BudgetMode.HARD_DENY)
+        with (
+            patch.object(solwyn._solwyn_budget, "check_budget") as check,
+            patch.object(solwyn._solwyn_reporter, "report") as report,
+            solwyn_pkg.run("pre-gated-audio") as run_id,
+        ):
+            mark_terminated(run_id, reason="velocity:repeat_size", source="local_velocity")
+            with pytest.raises(RunStoppedError):
+                solwyn._media_call(
+                    MediaSurfaceSpec(
+                        surface="audio.speech",
+                        modality="audio",
+                        extract_usage=lambda _response: None,
+                        measure_request=lambda _kwargs: None,
+                        estimate_media=lambda _kwargs: MediaUsage(input_characters=321),
+                    ),
+                    model="gpt-4o-mini-tts",
+                    input="hi",
+                )
+
+        check.assert_not_called()
+        denied = report.call_args.args[0]
+        assert denied.modality == "audio"
+        assert denied.media_usage.input_characters == 321
+        assert (denied.deny_source, denied.deny_reason, denied.denied_by_period) == (
+            "run_terminated",
+            "velocity:repeat_size",
+            "run_stopped",
+        )
+        client.audio.speech.create.assert_not_called()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_unsupported_surface_reports_error_then_raises(self) -> None:
         client, _ = _sync_client()
@@ -422,8 +525,8 @@ class TestMediaCallSync:
         # No prepare_media_call patch -> the real OpenAI adapter serves embeddings,
         # images, audio, and video but still raises for an unrecognized surface.
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow()),
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow()),
+            patch.object(solwyn._solwyn_reporter, "report") as report,
             pytest.raises(UnsupportedSurfaceError),
         ):
             solwyn._media_call(_spec(surface="translations"), model="whisper-1", input="hi")
@@ -432,8 +535,8 @@ class TestMediaCallSync:
         assert event.status == CallStatus.ERROR
         assert event.failover_error_class == "UnsupportedSurfaceError"
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
 
 @pytest.mark.unit
@@ -459,9 +562,11 @@ class TestMediaDeadlineExpiry:
 
         # Act + Assert
         with (
-            patch.object(solwyn._budget, "check_budget", side_effect=slow_check),
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(solwyn._solwyn_budget, "check_budget", side_effect=slow_check),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
             pytest.raises(ProviderUnavailableError) as exc_info,
         ):
             solwyn._media_call(_spec(), model="text-embedding-3-small", input="hello world")
@@ -471,8 +576,8 @@ class TestMediaDeadlineExpiry:
         # THE point of the test: no request was ever sent.
         client.embeddings.create.assert_not_called()
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_expired_preflight_releases_the_reservation(self) -> None:
         # Nothing will settle this call, so the reservation must be handed back
@@ -486,18 +591,20 @@ class TestMediaDeadlineExpiry:
             return _allow("res_media")
 
         with (
-            patch.object(solwyn._budget, "check_budget", side_effect=slow_check),
-            patch.object(solwyn._budget, "release_reservation") as release,
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(solwyn._solwyn_budget, "check_budget", side_effect=slow_check),
+            patch.object(solwyn._solwyn_budget, "release_reservation") as release,
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
             pytest.raises(ProviderUnavailableError),
         ):
             solwyn._media_call(_spec(), model="text-embedding-3-small", input="hello world")
 
         release.assert_called_once()
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_budget_denial_still_wins_over_expiry(self) -> None:
         # Ordering control: a denied budget is the more specific answer, and the
@@ -510,17 +617,19 @@ class TestMediaDeadlineExpiry:
             return _deny()
 
         with (
-            patch.object(solwyn._budget, "check_budget", side_effect=slow_deny),
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(solwyn._solwyn_budget, "check_budget", side_effect=slow_deny),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
             pytest.raises(BudgetExceededError),
         ):
             solwyn._media_call(_spec(), model="text-embedding-3-small", input="hello world")
 
         client.embeddings.create.assert_not_called()
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     def test_live_window_still_dispatches(self) -> None:
         # The guard on the guard: a healthy window must NOT be gated. Without
@@ -529,9 +638,11 @@ class TestMediaDeadlineExpiry:
         solwyn = _build_sync(client, failover_total_timeout=30.0)
 
         with (
-            patch.object(solwyn._budget, "check_budget", return_value=_allow(None)),
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow(None)),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
         ):
             result = solwyn._media_call(
                 _spec(), model="text-embedding-3-small", input="hello world"
@@ -540,8 +651,8 @@ class TestMediaDeadlineExpiry:
         assert result is resp
         client.embeddings.create.assert_called_once()
 
-        solwyn._reporter._http.close()
-        solwyn._budget._http.close()
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
 
     @pytest.mark.asyncio
     async def test_async_expired_preflight_never_calls_provider(self) -> None:
@@ -555,9 +666,13 @@ class TestMediaDeadlineExpiry:
             return _allow()
 
         with (
-            patch.object(solwyn._budget, "check_budget", new=AsyncMock(side_effect=slow_check)),
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(side_effect=slow_check)
+            ),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
             pytest.raises(ProviderUnavailableError) as exc_info,
         ):
             await solwyn._media_call(_spec(), model="text-embedding-3-small", input="hello world")
@@ -566,8 +681,8 @@ class TestMediaDeadlineExpiry:
         assert exc_info.value.attempted == ["openai"]
         client.embeddings.create.assert_not_awaited()
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_expired_preflight_releases_the_reservation(self) -> None:
@@ -579,18 +694,22 @@ class TestMediaDeadlineExpiry:
             return _allow("res_media")
 
         with (
-            patch.object(solwyn._budget, "check_budget", new=AsyncMock(side_effect=slow_check)),
-            patch.object(solwyn._budget, "release_reservation") as release,
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(side_effect=slow_check)
+            ),
+            patch.object(solwyn._solwyn_budget, "release_reservation") as release,
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
             pytest.raises(ProviderUnavailableError),
         ):
             await solwyn._media_call(_spec(), model="text-embedding-3-small", input="hello world")
 
         release.assert_called_once()
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.asyncio
     async def test_async_live_window_still_dispatches(self) -> None:
@@ -598,9 +717,13 @@ class TestMediaDeadlineExpiry:
         solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, failover_total_timeout=30.0)
 
         with (
-            patch.object(solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow(None))),
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow(None))
+            ),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
         ):
             result = await solwyn._media_call(
                 _spec(), model="text-embedding-3-small", input="hello world"
@@ -609,8 +732,8 @@ class TestMediaDeadlineExpiry:
         assert result is resp
         client.embeddings.create.assert_awaited_once()
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
 
 def _async_client() -> tuple[MagicMock, SimpleNamespace]:
@@ -632,12 +755,14 @@ class TestMediaCallAsync:
 
         with (
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
                 new=AsyncMock(return_value=_allow(None, failover_tuning_allowed=False)),
             ),
-            patch.object(solwyn._reporter, "report"),
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
         ):
             result = await solwyn._media_call(
                 _spec(),
@@ -646,11 +771,11 @@ class TestMediaCallAsync:
             )
 
         assert result is resp
-        assert solwyn._config.failover_total_timeout == 30.0
+        assert solwyn._solwyn_config.failover_total_timeout == 30.0
         assert 0.0 < client.with_options.call_args.kwargs["timeout"].connect <= 30.0
         assert client.with_options.call_args.kwargs["timeout"].read == 600.0
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.asyncio
     async def test_success_confirms_and_reports_primary_only(self) -> None:
@@ -658,16 +783,18 @@ class TestMediaCallAsync:
         solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY)
 
         async def create_after_project_learned(**_kwargs):
-            assert solwyn._reporter._breaker_project_id == VALID_PROJECT_ID
+            assert solwyn._solwyn_reporter._breaker_project_id == VALID_PROJECT_ID
             return resp
 
         client.embeddings.create.side_effect = create_after_project_learned
         with (
             patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow())
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow())
             ) as check,
-            patch.object(solwyn._reporter, "report_settlement") as settle,
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_embeddings),
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
+            ),
         ):
             async with solwyn_pkg.run("orchestrator") as parent_run_id:
                 async with solwyn_pkg.run("async-media", tags={"team": "platform"}) as run_id:
@@ -696,8 +823,8 @@ class TestMediaCallAsync:
         assert check.call_args.kwargs["tags"] == event.tags
         assert "solwyn_tags" not in client.embeddings.create.call_args.kwargs
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.asyncio
     async def test_both_bases_flow_when_token_and_media_observable(self) -> None:
@@ -711,10 +838,12 @@ class TestMediaCallAsync:
         )
         with (
             patch.object(
-                solwyn._budget, "check_budget", new=AsyncMock(return_value=_allow())
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_allow())
             ) as check,
-            patch.object(solwyn._reporter, "report_settlement") as settle,
-            patch.object(solwyn._runtimes[0].adapter, "prepare_media_call", _route_to_images),
+            patch.object(solwyn._solwyn_reporter, "report_settlement") as settle,
+            patch.object(
+                solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_images
+            ),
         ):
             await solwyn._media_call(spec, model="gpt-image-2", prompt="a cat", n=2)
 
@@ -727,25 +856,45 @@ class TestMediaCallAsync:
         assert event.modality == "image"
         assert event.media_usage.image_count == 2
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.asyncio
     async def test_budget_denied_raises_without_dispatch(self) -> None:
         client, _ = _async_client()
         solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, budget_mode=BudgetMode.HARD_DENY)
         with (
-            patch.object(solwyn._budget, "check_budget", new=AsyncMock(return_value=_deny())),
-            patch.object(solwyn._reporter, "report") as report,
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", new=AsyncMock(return_value=_deny())
+            ) as check,
+            patch.object(solwyn._solwyn_reporter, "report") as report,
             pytest.raises(BudgetExceededError),
         ):
-            await solwyn._media_call(_spec(), model="text-embedding-3-small", input="hi")
+            async with solwyn_pkg.run("async-denied-media") as run_id:
+                await solwyn._media_call(
+                    _media_spec(
+                        estimate_media=lambda _kwargs: MediaUsage(
+                            audio_seconds=7.25,
+                            quality="standard",
+                        )
+                    ),
+                    model="audio-model",
+                    prompt="hi",
+                )
 
         client.embeddings.create.assert_not_awaited()
-        assert report.call_args.args[0].status == CallStatus.BUDGET_DENIED
+        denied = report.call_args.args[0]
+        assert denied.status == CallStatus.BUDGET_DENIED
+        assert denied.agent_run_id == run_id
+        assert denied.deny_source == "server"
+        assert denied.deny_reason == "monthly"
+        assert denied.denied_by_period is None
+        assert denied.media_usage == check.call_args.kwargs["estimated_media"]
+        assert denied.media_usage.audio_seconds == 7.25
+        assert denied.estimated_output_bound == check.call_args.kwargs["estimated_output_bound"]
 
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
     @pytest.mark.asyncio
     async def test_run_stopped_raises_typed_error_without_media_dispatch(self) -> None:
@@ -754,27 +903,63 @@ class TestMediaCallAsync:
 
         with (
             patch.object(
-                solwyn._budget,
+                solwyn._solwyn_budget,
                 "check_budget",
                 new=AsyncMock(return_value=_deny("run_stopped")),
             ),
-            patch.object(solwyn._reporter, "report"),
+            patch.object(solwyn._solwyn_reporter, "report"),
         ):
             async with solwyn_pkg.run("dashboard-stopped-media-async") as run_id:
                 with pytest.raises(RunStoppedError) as exc_info:
                     await solwyn._media_call(_spec(), model="text-embedding-3-small", input="hi")
 
         client.embeddings.create.assert_not_awaited()
-        await solwyn._budget._http.aclose()
-        await solwyn._reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
 
         error = exc_info.value
         assert type(error) is RunStoppedError
-        assert isinstance(error, BudgetExceededError)
-        assert str(error) == f"Run {run_id} was stopped from the Solwyn dashboard"
-        assert error.project_id == VALID_PROJECT_ID
-        assert error.budget_limit == 10.0
-        assert error.current_usage == 10.0
-        assert error.estimated_cost == 0.0
-        assert error.budget_period == "run_stopped"
-        assert error.mode == "hard_deny"
+        assert not isinstance(error, BudgetExceededError)
+        assert str(error) == f"Agent run {run_id} was stopped (server: run_stopped)"
+        assert error.agent_run_id == run_id
+        assert error.reason == "run_stopped"
+        assert error.source == "server"
+
+    @pytest.mark.asyncio
+    async def test_pre_gate_media_stop_receipt_carries_deny_attribution(self) -> None:
+        from solwyn._run_control import mark_terminated
+
+        client, _ = _async_client()
+        solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY, budget_mode=BudgetMode.HARD_DENY)
+
+        with (
+            patch.object(solwyn._solwyn_budget, "check_budget", new=AsyncMock()) as check,
+            patch.object(solwyn._solwyn_reporter, "report") as report,
+        ):
+            async with solwyn_pkg.run("async-pre-gated-audio") as run_id:
+                mark_terminated(run_id, reason="velocity:repeat_size", source="local_velocity")
+                with pytest.raises(RunStoppedError):
+                    await solwyn._media_call(
+                        MediaSurfaceSpec(
+                            surface="audio.speech",
+                            modality="audio",
+                            extract_usage=lambda _response: None,
+                            measure_request=lambda _kwargs: None,
+                            estimate_media=lambda _kwargs: MediaUsage(input_characters=321),
+                        ),
+                        model="gpt-4o-mini-tts",
+                        input="hi",
+                    )
+
+        check.assert_not_awaited()
+        denied = report.call_args.args[0]
+        assert denied.modality == "audio"
+        assert denied.media_usage.input_characters == 321
+        assert (denied.deny_source, denied.deny_reason, denied.denied_by_period) == (
+            "run_terminated",
+            "velocity:repeat_size",
+            "run_stopped",
+        )
+        client.audio.speech.create.assert_not_called()
+        await solwyn._solwyn_budget._http.aclose()
+        await solwyn._solwyn_reporter._http.aclose()
