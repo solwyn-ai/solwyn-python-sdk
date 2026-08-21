@@ -29,7 +29,7 @@ from typing import Any
 import httpx
 import pytest
 
-from solwyn.providers._errors import Disposition, classify_exception
+from solwyn.providers._errors import Disposition, _httpx2_transport_names, classify_exception
 
 VALID_OPENAI_KEY = "sk-test-not-a-real-key"
 VALID_ANTHROPIC_KEY = "sk-ant-test-not-a-real-key"
@@ -219,6 +219,29 @@ class TestRealSdkTimeoutWrapping:
         cause = ConnectError("post-send protocol failure with a misleading subclass name")
 
         assert classify_exception(cause) is Disposition.POST_SEND_AMBIGUOUS
+
+    def test_mutated_transport_export_never_executes_class_equality(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        anthropic_httpx_mod: Any,
+    ) -> None:
+        class EqualityTrapMeta(type):
+            comparisons = 0
+
+            def __eq__(cls, other: object) -> bool:
+                type(cls).comparisons += 1
+                raise AssertionError("mutated httpx2.TransportError equality executed")
+
+            __hash__ = type.__hash__
+
+        class MutatedTransportError(Exception, metaclass=EqualityTrapMeta):
+            pass
+
+        cause = anthropic_httpx_mod.RemoteProtocolError("real transport ancestor")
+        monkeypatch.setattr(anthropic_httpx_mod, "TransportError", MutatedTransportError)
+
+        assert _httpx2_transport_names(cause) == frozenset()
+        assert EqualityTrapMeta.comparisons == 0
 
 
 @pytest.mark.unit

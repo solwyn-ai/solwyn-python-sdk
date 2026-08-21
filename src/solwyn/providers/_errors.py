@@ -152,7 +152,9 @@ def _httpx2_transport_names(exc: BaseException) -> frozenset[str]:
         return frozenset()
     mro = type(exc).__mro__
     transport_error_type = getattr(httpx2_mod, "TransportError", None)
-    if not isinstance(transport_error_type, type) or transport_error_type not in mro:
+    if not isinstance(transport_error_type, type) or not any(
+        mro_class is transport_error_type for mro_class in mro
+    ):
         return frozenset()
     return frozenset(cls.__name__ for cls in mro if getattr(httpx2_mod, cls.__name__, None) is cls)
 

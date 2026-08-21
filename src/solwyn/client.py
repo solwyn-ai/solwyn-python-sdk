@@ -1027,7 +1027,7 @@ def _hop_httpx_timeout(connect_slice: float, read_timeout: float) -> httpx.Timeo
 def _validate_hop_timeout_bounds(connect_slice: float, read_timeout: float) -> None:
     """Enforce the config invariant again before constructing an HTTP timeout."""
     if any(
-        type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+        not (type(value) is int or type(value) is float) or not math.isfinite(value) or value <= 0
         for value in (connect_slice, read_timeout)
     ):
         raise RuntimeError("per-hop timeout bounds must be finite positive numbers")
@@ -1057,11 +1057,17 @@ def _uses_loaded_httpx2_client(client: object) -> bool:
     if native_client is _STATIC_MISSING:
         return False
     native_client_mro = type(native_client).__mro__
-    if any(client_type in native_client_mro for client_type in _HTTPX_CLIENT_TYPES):
+    if any(
+        mro_class is trusted_class
+        for mro_class in native_client_mro
+        for trusted_class in _HTTPX_CLIENT_TYPES
+    ):
         return False
     client_types = _loaded_httpx2_client_types()
     return client_types is not None and any(
-        client_type in native_client_mro for client_type in client_types
+        mro_class is trusted_class
+        for mro_class in native_client_mro
+        for trusted_class in client_types
     )
 
 
