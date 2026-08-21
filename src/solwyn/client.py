@@ -1005,6 +1005,9 @@ def _hop_connect_slice(deadline: Deadline, remaining_candidates: int) -> float:
 def _hop_httpx_timeout(connect_slice: float, read_timeout: float) -> httpx.Timeout:
     """Granular per-hop bound for with_options clients (PJ-8/R7).
 
+    Uses the import-time frozen httpx1 ``Timeout`` (never a runtime-discovered
+    export); httpx2 clients are served by :func:`_hop_client_timeout` instead.
+
     connect/pool take the deadline-derived slice: a pre-send hang is provably
     failover-safe, so it must fail inside the failover window. read/write take
     the decoupled hop read bound: a read timeout is POST_SEND_AMBIGUOUS and
@@ -1051,45 +1054,105 @@ def _loaded_httpx2_client_types() -> tuple[type[Any], type[Any]] | None:
     )
 
 
-def _uses_loaded_httpx2_client(client: object) -> bool:
-    """Statically prove that a provider owns a loaded httpx2 native client."""
-    native_client = inspect.getattr_static(client, "_client", _STATIC_MISSING)
+def _loaded_httpx2_native_client(client: object) -> object | None:
+    """Statically prove that a provider owns a loaded httpx2 native client.
+
+    Returns the native client itself (never a bare bool) so callers can keep
+    proving further identities against the very object the provider SDK
+    instantiated; ``None`` means the provider is not a proven httpx2 owner.
+    """
+    native_client: object = inspect.getattr_static(client, "_client", _STATIC_MISSING)
     if native_client is _STATIC_MISSING:
-        return False
+        return None
     native_client_mro = type(native_client).__mro__
     if any(
         mro_class is trusted_class
         for mro_class in native_client_mro
         for trusted_class in _HTTPX_CLIENT_TYPES
     ):
-        return False
+        return None
     client_types = _loaded_httpx2_client_types()
-    return client_types is not None and any(
+    if client_types is None:
+        return None
+    if any(
         mro_class is trusted_class
         for mro_class in native_client_mro
         for trusted_class in client_types
-    )
+    ):
+        return native_client
+    return None
+
+
+def _proven_httpx2_timeout_type(native_client: object) -> type[Any] | None:
+    """Identity-prove the loaded httpx2 ``Timeout`` constructor for a native client.
+
+    Two independent identity proofs must agree before Solwyn will call anything:
+    the class must be the ``Timeout`` the loaded ``httpx2`` module exports right
+    now, AND it must be the exact class of the timeout instance that native
+    client already holds (the class its own SDK instantiated). ``__module__`` is
+    deliberately NOT part of the proof - it is a writable string that provider
+    SDKs re-stamp on re-exported third-party classes (anthropic rewrites
+    ``httpx2.Timeout.__module__`` to ``"anthropic"``), so it proves nothing that
+    identity does not prove better. Every lookup is static
+    (``inspect.getattr_static``) and every comparison is ``is``/``is not``, so no
+    provider property, descriptor or ``__eq__`` hook is ever executed.
+    """
+    httpx2_module = sys.modules.get("httpx2")
+    if httpx2_module is None:
+        return None
+    module_timeout_type = inspect.getattr_static(httpx2_module, "Timeout", _STATIC_MISSING)
+    if not isinstance(module_timeout_type, type):
+        return None
+    configured_timeout = inspect.getattr_static(native_client, "_timeout", _STATIC_MISSING)
+    if configured_timeout is _STATIC_MISSING:
+        return None
+    if type(configured_timeout) is not module_timeout_type:
+        return None
+    return module_timeout_type
 
 
 def _hop_client_timeout(client: object, connect_slice: float, read_timeout: float) -> object:
     """Build a granular timeout in the target client's native HTTP stack.
 
-    Provider SDKs can expose ``with_options`` while using incompatible httpx
-    major versions. Statically prove only the native HTTP client identity. A
-    real loaded httpx2 client receives the granular four-tuple that its own SDK
-    converts to its native Timeout; Solwyn never discovers or invokes a mutable
-    runtime Timeout export. Frozen-trusted httpx1 and unknown/synthetic client
-    shapes retain the established httpx Timeout behavior.
+    Provider SDKs can expose ``with_options`` while using an incompatible httpx
+    major version (anthropic 1.x runs on the ``httpx2`` distribution). Only the
+    native HTTP client identity is statically proven. A proven httpx2 client is
+    handed a real native ``httpx2.Timeout``, but only when the constructor itself
+    is identity-proven twice over by :func:`_proven_httpx2_timeout_type` - never
+    an arbitrary discovered callable. That matters beyond the transport: an SDK
+    that stringifies a non-``Timeout`` timeout into a header (anthropic's
+    ``x-stainless-read-timeout``) then sends the read bound instead of a
+    stringified tuple.
+
+    If either proof fails, or the proven constructor raises, the granular
+    four-tuple is used instead - still transport-correct via the SDK's own
+    conversion, only the informational header degrades. Frozen-trusted httpx1 and
+    unknown/synthetic client shapes retain the established httpx Timeout
+    behavior.
     """
     _validate_hop_timeout_bounds(connect_slice, read_timeout)
-    if _uses_loaded_httpx2_client(client):
-        return (
-            connect_slice,
-            read_timeout,
-            read_timeout,
-            connect_slice,
+    native_client = _loaded_httpx2_native_client(client)
+    if native_client is None:
+        return _hop_httpx_timeout(connect_slice, read_timeout)
+    granular_bounds = (
+        connect_slice,
+        read_timeout,
+        read_timeout,
+        connect_slice,
+    )
+    timeout_type = _proven_httpx2_timeout_type(native_client)
+    if timeout_type is None:
+        return granular_bounds
+    try:
+        native_timeout: object = timeout_type(
+            connect=connect_slice,
+            read=read_timeout,
+            write=read_timeout,
+            pool=connect_slice,
         )
-    return _hop_httpx_timeout(connect_slice, read_timeout)
+    except Exception:
+        return granular_bounds
+    return native_timeout
 
 
 class Deadline:
