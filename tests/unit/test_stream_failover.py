@@ -29,7 +29,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
-from solwyn._types import CallStatus, CircuitState
+from solwyn._routing import CostPolicy
+from solwyn._types import CallStatus, CircuitState, FailoverReason
 from solwyn.client import (
     AsyncSolwyn,
     Solwyn,
@@ -157,12 +158,16 @@ def _google_client() -> MagicMock:
     return client
 
 
-def _allow_budget(reservation_id: str | None = None) -> SimpleNamespace:
+def _allow_budget(
+    reservation_id: str | None = None,
+    *,
+    price_hints: dict[str, float] | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         allowed=True,
         reservation_id=reservation_id,
         project_id=VALID_PROJECT_ID,
-        price_hints=None,
+        price_hints=price_hints,
     )
 
 
@@ -1110,6 +1115,92 @@ class TestNoDoubleEmitThreeChunks:
 
 @pytest.mark.unit
 class TestCrossProviderStreamSettlement:
+    def test_cost_routed_stream_success_event_carries_cost_routed(self) -> None:
+        openai = _openai_client()
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = iter(
+            [
+                _anthropic_message_start(input_tokens=31),
+                _anthropic_text_chunk("hello"),
+                _anthropic_message_delta(output_tokens=9),
+            ]
+        )
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
+            selection_policy=CostPolicy(),
+        )
+        events: list[Any] = []
+        solwyn._solwyn_reporter.report = lambda event: events.append(event)
+        request = {
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+
+        with patch.object(
+            solwyn._solwyn_budget,
+            "check_budget",
+            return_value=_allow_budget(price_hints={"openai": 3.0, "anthropic": 1.0}),
+        ):
+            stream = solwyn.chat.completions.create(**request)
+            list(stream)
+
+        openai.chat.completions.create.assert_not_called()
+        success = [event for event in events if event.status is CallStatus.SUCCESS]
+        assert len(success) == 1
+        assert success[0].failover_reason is FailoverReason.COST_ROUTED
+        assert success[0].is_provider_fallback is True
+        assert success[0].attempt_index == 1
+        _close(solwyn)
+
+    @pytest.mark.asyncio
+    async def test_async_cost_routed_stream_success_event_carries_cost_routed(self) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create = AsyncMock()
+        anthropic = _anthropic_client()
+        anthropic.messages.create = AsyncMock(
+            return_value=_async_iter(
+                [
+                    _anthropic_message_start(input_tokens=31),
+                    _anthropic_text_chunk("hello"),
+                    _anthropic_message_delta(output_tokens=9),
+                ]
+            )
+        )
+        solwyn = _make_async_solwyn(
+            openai,
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
+            selection_policy=CostPolicy(),
+        )
+        events: list[Any] = []
+        solwyn._solwyn_reporter.report = lambda event: events.append(event)
+        request = {
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        }
+
+        with patch.object(
+            solwyn._solwyn_budget,
+            "check_budget",
+            new=AsyncMock(
+                return_value=_allow_budget(price_hints={"openai": 3.0, "anthropic": 1.0})
+            ),
+        ):
+            stream = await solwyn.chat.completions.create(**request)
+            _ = [chunk async for chunk in stream]
+
+        openai.chat.completions.create.assert_not_awaited()
+        success = [event for event in events if event.status is CallStatus.SUCCESS]
+        assert len(success) == 1
+        assert success[0].failover_reason is FailoverReason.COST_ROUTED
+        assert success[0].is_provider_fallback is True
+        assert success[0].attempt_index == 1
+        await _aclose(solwyn)
+
     def test_served_anthropic_usage_settles_and_metadata_attributed(self) -> None:
         # OpenAI primary 429s; Anthropic fallback streams text. The user iterates
         # OPENAI-dialect chunks, but the accumulator settles the SERVED (Anthropic)

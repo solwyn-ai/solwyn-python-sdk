@@ -56,6 +56,7 @@ from solwyn._surfaces import (
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
     CallStatus,
+    CircuitState,
     DenySource,
     FailoverReason,
     MediaUsage,
@@ -129,6 +130,14 @@ class FailoverTuning(NamedTuple):
     failover_idempotency: Literal["safe", "never", "always"]
     same_provider_retries: int
     failover_hop_read_timeout: float
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateSelection:
+    """Policy-ordered runtimes plus attribution for a price-driven displacement."""
+
+    runtimes: list[ProviderRuntime]
+    cost_routed: bool
 
 
 _BEDROCK_UNBOUNDED_READ_WARNING = (
@@ -1578,6 +1587,12 @@ class _SolwynBase:
     def _select_candidates(
         self, req: RoutingRequest, *, price_hints: Mapping[str, float] | None = None
     ) -> list[ProviderRuntime]:
+        """Return policy-ordered runtimes while preserving the legacy list seam."""
+        return self._select_candidates_detailed(req, price_hints=price_hints).runtimes
+
+    def _select_candidates_detailed(
+        self, req: RoutingRequest, *, price_hints: Mapping[str, float] | None = None
+    ) -> CandidateSelection:
         """Order runtimes into attempt order via the pure SelectionPolicy.
 
         ``price_hints`` are this request's server hints (str provider-name
@@ -1619,6 +1634,22 @@ class _SolwynBase:
                 )
             )
         ordered = self._solwyn_policy.order(candidates, req)
+        primary = self._solwyn_runtimes[0]
+        first = ordered[0] if ordered else None
+        primary_cand = next(
+            (candidate for candidate in ordered if candidate.runtime is primary),
+            None,
+        )
+        cost_routed = (
+            wants_price
+            and first is not None
+            and first.runtime is not primary
+            and first.runtime.entry.provider != primary.entry.provider
+            and primary_cand is not None
+            and primary_cand.breaker_state is CircuitState.CLOSED
+            and first.breaker_state is CircuitState.CLOSED
+            and first.price_hint is not None
+        )
         if isinstance(self._solwyn_policy, CostPolicy) and price_hints is None:
             # CostPolicy was selected but no candidate carries a server price
             # hint, so it degraded to health-based order — surface the no-op once.
@@ -1629,7 +1660,10 @@ class _SolwynBase:
         # runtimes (identity check), preserving the policy's order for that valid
         # subset. Drops any foreign/unknown runtime the policy may have appended.
         chain = set(map(id, self._solwyn_runtimes))
-        return [c.runtime for c in ordered if id(c.runtime) in chain]
+        return CandidateSelection(
+            runtimes=[candidate.runtime for candidate in ordered if id(candidate.runtime) in chain],
+            cost_routed=cost_routed,
+        )
 
     def _build_metadata_event(
         self,

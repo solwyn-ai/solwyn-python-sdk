@@ -319,6 +319,104 @@ def test_select_candidates_orders_by_request_hints() -> None:
 
 
 @pytest.mark.unit
+def test_detailed_selection_health_policy_is_not_cost_routed() -> None:
+    solwyn = _make_solwyn(
+        _openai_client(),
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
+    )
+    try:
+        selection = solwyn._select_candidates_detailed(
+            _req(), price_hints={"openai": 10.0, "anthropic": 2.0}
+        )
+
+        assert selection.cost_routed is False
+    finally:
+        _close(solwyn)
+
+
+@pytest.mark.unit
+def test_detailed_selection_empty_hints_is_not_cost_routed() -> None:
+    solwyn = _make_solwyn(
+        _openai_client(),
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
+        selection_policy=CostPolicy(),
+    )
+    try:
+        selection = solwyn._select_candidates_detailed(_req(), price_hints={})
+
+        assert selection.cost_routed is False
+    finally:
+        _close(solwyn)
+
+
+@pytest.mark.unit
+def test_detailed_selection_half_open_primary_is_not_cost_routed() -> None:
+    solwyn = _make_solwyn(
+        _openai_client(),
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
+        selection_policy=CostPolicy(),
+    )
+    try:
+        solwyn._get_circuit_breaker("openai").state = CircuitState.HALF_OPEN
+
+        selection = solwyn._select_candidates_detailed(
+            _req(), price_hints={"openai": 10.0, "anthropic": 2.0}
+        )
+
+        assert [rt.adapter.name for rt in selection.runtimes] == ["anthropic", "openai"]
+        assert selection.cost_routed is False
+    finally:
+        _close(solwyn)
+
+
+@pytest.mark.unit
+def test_detailed_selection_same_provider_first_is_not_cost_routed() -> None:
+    class _PriceSignalReversePolicy:
+        uses_latency_signal = False
+        uses_price_signal = True
+
+        def order(self, candidates, req):  # type: ignore[no-untyped-def]
+            return list(reversed(candidates))
+
+    openai = _openai_client()
+    solwyn = _make_solwyn(
+        openai,
+        model="gpt-5.5",
+        fallback=[(openai, "gpt-5.4-mini")],
+        selection_policy=_PriceSignalReversePolicy(),
+    )
+    try:
+        selection = solwyn._select_candidates_detailed(_req(), price_hints={"openai": 2.0})
+
+        assert selection.runtimes[0] is solwyn._solwyn_runtimes[1]
+        assert selection.cost_routed is False
+    finally:
+        _close(solwyn)
+
+
+@pytest.mark.unit
+def test_detailed_selection_cost_policy_displacement_is_cost_routed() -> None:
+    solwyn = _make_solwyn(
+        _openai_client(),
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
+        selection_policy=CostPolicy(),
+    )
+    try:
+        selection = solwyn._select_candidates_detailed(
+            _req(), price_hints={"openai": 10.0, "anthropic": 2.0}
+        )
+
+        assert [rt.adapter.name for rt in selection.runtimes] == ["anthropic", "openai"]
+        assert selection.cost_routed is True
+    finally:
+        _close(solwyn)
+
+
+@pytest.mark.unit
 def test_cost_routing_does_no_price_arithmetic_only_server_hint() -> None:
     # Arrange — the ONLY price input is the server hint. We prove ordering is a
     # pure relative comparison: swapping which provider has the lower hint flips

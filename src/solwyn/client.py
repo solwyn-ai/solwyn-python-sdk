@@ -1185,7 +1185,11 @@ def _normalize_fallback(fallback: object) -> list[Any]:
 
 
 def _success_failover_reason(
-    *, is_provider_fallback: bool, is_model_fallback: bool, primary_errored: bool
+    *,
+    is_provider_fallback: bool,
+    is_model_fallback: bool,
+    primary_errored: bool,
+    cost_routed: bool = False,
 ) -> FailoverReason | None:
     """Pick the success-path failover reason for a served candidate.
 
@@ -1195,11 +1199,15 @@ def _success_failover_reason(
         ERRORED (a transport failure -> reactive failover).
       * ``CIRCUIT_OPEN`` — the primary was SKIPPED because its breaker was
         already OPEN (proactive reroute; the primary was never attempted here).
+      * ``COST_ROUTED`` — a price-signal policy selected a healthy cross-provider
+        candidate before the healthy primary, and that candidate served first.
       * ``MODEL_FALLBACK`` — a same-provider model swap.
     ``None`` for a primary success.
     """
     if is_provider_fallback:
-        return FailoverReason.PRIMARY_ERROR if primary_errored else FailoverReason.CIRCUIT_OPEN
+        if primary_errored:
+            return FailoverReason.PRIMARY_ERROR
+        return FailoverReason.COST_ROUTED if cost_routed else FailoverReason.CIRCUIT_OPEN
     if is_model_fallback:
         return FailoverReason.MODEL_FALLBACK
     return None
@@ -2428,13 +2436,14 @@ class Solwyn(_SolwynBase):
         allow_ambiguous_failover = effective_idempotency == "always"
 
         # 4. Router returns ordered, health-filtered candidates (non-mutating reads).
-        candidates = self._select_candidates(
+        selection = self._select_candidates_detailed(
             RoutingRequest(
                 requested_provider=primary.entry.provider,
                 estimated_input_tokens=est_in,
             ),
             price_hints=budget.price_hints,
         )
+        candidates = selection.runtimes
         if not allow_cross_provider:
             candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
         if _surface == "responses":
@@ -2475,9 +2484,12 @@ class Solwyn(_SolwynBase):
             # walk? Drives the cross-provider success reason (PRIMARY_ERROR if the
             # primary was attempted and raised; CIRCUIT_OPEN if it was skipped OPEN).
             primary_errored = False
+            primary_reached = False
             for idx, rt in enumerate(candidates):
                 if deadline.expired():
                     break
+                if rt is primary:
+                    primary_reached = True
                 provider = rt.adapter.name
                 cb = self._get_circuit_breaker(provider)
                 admission = cb.admit()  # probe CONSUMED only here, for the attempted candidate
@@ -2712,6 +2724,7 @@ class Solwyn(_SolwynBase):
                                 requested_model=requested_model,
                                 is_model_fallback=is_model_fallback,
                                 primary_errored=primary_errored,
+                                cost_routed=selection.cost_routed and not primary_reached,
                                 call_id=call_id,
                                 agent_run=agent_run,
                                 estimated_input_tokens=est_in,
@@ -2742,6 +2755,7 @@ class Solwyn(_SolwynBase):
                         requested_model=requested_model,
                         is_model_fallback=is_model_fallback,
                         primary_errored=primary_errored,
+                        cost_routed=selection.cost_routed and not primary_reached,
                         call_id=call_id,
                         agent_run=agent_run,
                         estimated_input_tokens=est_in,
@@ -2822,6 +2836,7 @@ class Solwyn(_SolwynBase):
                         is_provider_fallback=is_provider_fallback,
                         is_model_fallback=is_model_fallback,
                         primary_errored=primary_errored,
+                        cost_routed=selection.cost_routed and not primary_reached,
                     ),
                     attempt_index=chain_index,
                     call_id=call_id,
@@ -2871,6 +2886,7 @@ class Solwyn(_SolwynBase):
         estimate_empty_usage: bool = False,
         velocity_flags: Collection[str] = (),
         on_error: Callable[[BaseException], None] | None = None,
+        cost_routed: bool = False,
     ) -> Any:
         """Wrap a streaming response, settling against the SERVED runtime.
 
@@ -2948,6 +2964,7 @@ class Solwyn(_SolwynBase):
                     is_provider_fallback=is_provider_fallback,
                     is_model_fallback=is_model_fallback,
                     primary_errored=primary_errored,
+                    cost_routed=cost_routed,
                 ),
                 attempt_index=ctx.attempt_index,
                 call_id=call_id,
@@ -3855,13 +3872,14 @@ class AsyncSolwyn(_SolwynBase):
         allow_cross_provider = effective_idempotency != "never"
         allow_ambiguous_failover = effective_idempotency == "always"
 
-        candidates = self._select_candidates(
+        selection = self._select_candidates_detailed(
             RoutingRequest(
                 requested_provider=primary.entry.provider,
                 estimated_input_tokens=est_in,
             ),
             price_hints=budget.price_hints,
         )
+        candidates = selection.runtimes
         if not allow_cross_provider:
             candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
         if _surface == "responses":
@@ -3901,9 +3919,12 @@ class AsyncSolwyn(_SolwynBase):
             # walk? Drives the cross-provider success reason (PRIMARY_ERROR if the
             # primary was attempted and raised; CIRCUIT_OPEN if it was skipped OPEN).
             primary_errored = False
+            primary_reached = False
             for idx, rt in enumerate(candidates):
                 if deadline.expired():
                     break
+                if rt is primary:
+                    primary_reached = True
                 provider = rt.adapter.name
                 cb = self._get_circuit_breaker(provider)
                 admission = cb.admit()
@@ -4128,6 +4149,7 @@ class AsyncSolwyn(_SolwynBase):
                                 requested_model=requested_model,
                                 is_model_fallback=is_model_fallback,
                                 primary_errored=primary_errored,
+                                cost_routed=selection.cost_routed and not primary_reached,
                                 call_id=call_id,
                                 agent_run=agent_run,
                                 estimated_input_tokens=est_in,
@@ -4158,6 +4180,7 @@ class AsyncSolwyn(_SolwynBase):
                         requested_model=requested_model,
                         is_model_fallback=is_model_fallback,
                         primary_errored=primary_errored,
+                        cost_routed=selection.cost_routed and not primary_reached,
                         call_id=call_id,
                         agent_run=agent_run,
                         estimated_input_tokens=est_in,
@@ -4237,6 +4260,7 @@ class AsyncSolwyn(_SolwynBase):
                         is_provider_fallback=is_provider_fallback,
                         is_model_fallback=is_model_fallback,
                         primary_errored=primary_errored,
+                        cost_routed=selection.cost_routed and not primary_reached,
                     ),
                     attempt_index=chain_index,
                     call_id=call_id,
@@ -4286,6 +4310,7 @@ class AsyncSolwyn(_SolwynBase):
         estimate_empty_usage: bool = False,
         velocity_flags: Collection[str] = (),
         on_error: Callable[[BaseException], Awaitable[None]] | None = None,
+        cost_routed: bool = False,
     ) -> Any:
         """Wrap an async streaming response, settling against the SERVED runtime.
 
@@ -4361,6 +4386,7 @@ class AsyncSolwyn(_SolwynBase):
                     is_provider_fallback=is_provider_fallback,
                     is_model_fallback=is_model_fallback,
                     primary_errored=primary_errored,
+                    cost_routed=cost_routed,
                 ),
                 attempt_index=ctx.attempt_index,
                 call_id=call_id,

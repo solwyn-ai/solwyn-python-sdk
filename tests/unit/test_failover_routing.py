@@ -29,7 +29,7 @@ from conftest import VALID_API_KEY, VALID_PROJECT_ID, patch_wrapper_local
 from solwyn import run
 from solwyn._base import FailoverTuning
 from solwyn._routing import CostPolicy, HealthBasedPolicy, LatencyPolicy, RoutingRequest
-from solwyn._types import CircuitState, ProviderName
+from solwyn._types import CircuitState, FailoverReason, ProviderName
 from solwyn.client import AsyncSolwyn, Deadline, Solwyn
 from solwyn.config import SolwynConfig
 from solwyn.exceptions import ProviderUnavailableError, UntranslatableRequestError
@@ -128,13 +128,17 @@ def _google_chunk() -> SimpleNamespace:
     )
 
 
-def _allow_budget(*, failover_tuning_allowed: bool | None = None) -> SimpleNamespace:
+def _allow_budget(
+    *,
+    failover_tuning_allowed: bool | None = None,
+    price_hints: dict[str, float] | None = None,
+) -> SimpleNamespace:
     """Allow result with no reservation (skips confirm_cost)."""
     return SimpleNamespace(
         allowed=True,
         reservation_id=None,
         project_id=VALID_PROJECT_ID,
-        price_hints=None,
+        price_hints=price_hints,
         failover_tuning_allowed=failover_tuning_allowed,
     )
 
@@ -408,6 +412,242 @@ class TestCrossProviderFailover:
 
         _close(solwyn)
 
+    def test_cost_policy_healthy_primary_displaced_reports_cost_routed(self) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create.return_value = _openai_response()
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
+            selection_policy=CostPolicy(),
+        )
+        events: list = []
+        solwyn._solwyn_reporter.report = lambda event: events.append(event)
+
+        with patch.object(
+            solwyn._solwyn_budget,
+            "check_budget",
+            return_value=_allow_budget(price_hints={"openai": 3.0, "anthropic": 1.0}),
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        openai.chat.completions.create.assert_not_called()
+        anthropic.messages.create.assert_called_once()
+        success = [event for event in events if event.status.value == "success"]
+        assert len(success) == 1
+        assert success[0].failover_reason is FailoverReason.COST_ROUTED
+        assert success[0].is_provider_fallback is True
+        assert success[0].attempt_index == 1
+        _close(solwyn)
+
+    def test_cost_routed_first_candidate_fails_then_primary_errors_reports_primary_error(
+        self,
+    ) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create.side_effect = _Status(429)
+        anthropic = _anthropic_client()
+        anthropic.messages.create.side_effect = _Status(429)
+        google = _google_client()
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-5.5",
+            fallback=[
+                (anthropic, "claude-sonnet-5", {"max_tokens": 256}),
+                (google, "gemini-3.5-flash"),
+            ],
+            selection_policy=CostPolicy(),
+        )
+        events: list = []
+        solwyn._solwyn_reporter.report = lambda event: events.append(event)
+
+        with patch.object(
+            solwyn._solwyn_budget,
+            "check_budget",
+            return_value=_allow_budget(
+                price_hints={"anthropic": 1.0, "openai": 2.0, "google": 3.0}
+            ),
+        ):
+            solwyn.chat.completions.create(
+                **_PLAIN_REQUEST,
+                max_completion_tokens=256,
+            )
+
+        success = [event for event in events if event.status.value == "success"]
+        assert len(success) == 1
+        assert success[0].provider is ProviderName.GOOGLE
+        assert success[0].failover_reason is FailoverReason.PRIMARY_ERROR
+        _close(solwyn)
+
+    def test_cost_routed_then_primary_breaker_refused_reports_circuit_open(self) -> None:
+        openai = _openai_client()
+        anthropic = _anthropic_client()
+        anthropic.messages.create.side_effect = _Status(429)
+        google = _google_client()
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-5.5",
+            fallback=[
+                (anthropic, "claude-sonnet-5", {"max_tokens": 256}),
+                (google, "gemini-3.5-flash"),
+            ],
+            selection_policy=CostPolicy(),
+        )
+        events: list = []
+        solwyn._solwyn_reporter.report = lambda event: events.append(event)
+        primary_breaker = solwyn._get_circuit_breaker("openai")
+        real_admit = primary_breaker.admit
+
+        def _open_before_admission():
+            for _ in range(3):
+                primary_breaker.record_failure()
+            return real_admit()
+
+        with (
+            patch.object(primary_breaker, "admit", side_effect=_open_before_admission),
+            patch.object(
+                solwyn._solwyn_budget,
+                "check_budget",
+                return_value=_allow_budget(
+                    price_hints={"anthropic": 1.0, "openai": 2.0, "google": 3.0}
+                ),
+            ),
+        ):
+            solwyn.chat.completions.create(
+                **_PLAIN_REQUEST,
+                max_completion_tokens=256,
+            )
+
+        openai.chat.completions.create.assert_not_called()
+        success = [event for event in events if event.status.value == "success"]
+        assert len(success) == 1
+        assert success[0].provider is ProviderName.GOOGLE
+        assert success[0].failover_reason is FailoverReason.CIRCUIT_OPEN
+        _close(solwyn)
+
+    def test_open_primary_still_reports_circuit_open_under_cost_policy(self) -> None:
+        openai = _openai_client()
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
+            selection_policy=CostPolicy(),
+        )
+        events: list = []
+        solwyn._solwyn_reporter.report = lambda event: events.append(event)
+        primary_breaker = solwyn._get_circuit_breaker("openai")
+        for _ in range(3):
+            primary_breaker.record_failure()
+
+        with patch.object(
+            solwyn._solwyn_budget,
+            "check_budget",
+            return_value=_allow_budget(price_hints={"openai": 3.0, "anthropic": 1.0}),
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        openai.chat.completions.create.assert_not_called()
+        success = [event for event in events if event.status.value == "success"]
+        assert len(success) == 1
+        assert success[0].failover_reason is FailoverReason.CIRCUIT_OPEN
+        _close(solwyn)
+
+    def test_latency_policy_displacing_primary_keeps_circuit_open(self) -> None:
+        openai = _openai_client()
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
+            selection_policy=LatencyPolicy(),
+        )
+        events: list = []
+        solwyn._solwyn_reporter.report = lambda event: events.append(event)
+        for _ in range(3):
+            solwyn.record_latency("openai", 400.0)
+            solwyn.record_latency("anthropic", 20.0)
+
+        with patch.object(solwyn._solwyn_budget, "check_budget", return_value=_allow_budget()):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        openai.chat.completions.create.assert_not_called()
+        success = [event for event in events if event.status.value == "success"]
+        assert len(success) == 1
+        assert success[0].failover_reason is FailoverReason.CIRCUIT_OPEN
+        _close(solwyn)
+
+    @pytest.mark.asyncio
+    async def test_async_cost_policy_healthy_primary_displaced_reports_cost_routed(self) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create = AsyncMock(return_value=_openai_response())
+        anthropic = _anthropic_client()
+        anthropic.messages.create = AsyncMock(return_value=_anthropic_response())
+        solwyn = AsyncSolwyn(
+            openai,
+            api_key=VALID_API_KEY,
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
+            selection_policy=CostPolicy(),
+        )
+        events: list = []
+        solwyn._solwyn_reporter.report = lambda event: events.append(event)
+
+        with patch.object(
+            solwyn._solwyn_budget,
+            "check_budget",
+            new=AsyncMock(
+                return_value=_allow_budget(price_hints={"openai": 3.0, "anthropic": 1.0})
+            ),
+        ):
+            await solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        openai.chat.completions.create.assert_not_awaited()
+        success = [event for event in events if event.status.value == "success"]
+        assert len(success) == 1
+        assert success[0].failover_reason is FailoverReason.COST_ROUTED
+        assert success[0].attempt_index == 1
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+
+    @pytest.mark.asyncio
+    async def test_async_open_primary_still_reports_circuit_open_under_cost_policy(self) -> None:
+        openai = _openai_client()
+        openai.chat.completions.create = AsyncMock(return_value=_openai_response())
+        anthropic = _anthropic_client()
+        anthropic.messages.create = AsyncMock(return_value=_anthropic_response())
+        solwyn = AsyncSolwyn(
+            openai,
+            api_key=VALID_API_KEY,
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
+            selection_policy=CostPolicy(),
+        )
+        events: list = []
+        solwyn._solwyn_reporter.report = lambda event: events.append(event)
+        primary_breaker = solwyn._get_circuit_breaker("openai")
+        for _ in range(3):
+            primary_breaker.record_failure()
+
+        with patch.object(
+            solwyn._solwyn_budget,
+            "check_budget",
+            new=AsyncMock(
+                return_value=_allow_budget(price_hints={"openai": 3.0, "anthropic": 1.0})
+            ),
+        ):
+            await solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        openai.chat.completions.create.assert_not_awaited()
+        success = [event for event in events if event.status.value == "success"]
+        assert len(success) == 1
+        assert success[0].failover_reason is FailoverReason.CIRCUIT_OPEN
+        await solwyn._solwyn_reporter._http.aclose()
+        await solwyn._solwyn_budget._http.aclose()
+
     def test_primary_open_not_eligible_skips_straight_to_fallback(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
@@ -555,6 +795,30 @@ class TestSameProviderModelSwap:
         assert success_events[0].is_model_fallback is True
         assert success_events[0].is_provider_fallback is False
 
+        _close(solwyn)
+
+    def test_model_fallback_under_cost_policy_stays_model_fallback(self) -> None:
+        client = _openai_client()
+        client.chat.completions.create.side_effect = [_Status(429), _openai_response()]
+        solwyn = _make_solwyn(
+            client,
+            model="gpt-5.5",
+            fallback=[(client, "gpt-5.4-mini")],
+            selection_policy=CostPolicy(),
+        )
+        events: list = []
+        solwyn._solwyn_reporter.report = lambda event: events.append(event)
+
+        with patch.object(
+            solwyn._solwyn_budget,
+            "check_budget",
+            return_value=_allow_budget(price_hints={"openai": 1.0}),
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        success = [event for event in events if event.status.value == "success"]
+        assert len(success) == 1
+        assert success[0].failover_reason is FailoverReason.MODEL_FALLBACK
         _close(solwyn)
 
 
