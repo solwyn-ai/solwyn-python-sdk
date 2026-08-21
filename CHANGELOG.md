@@ -13,7 +13,9 @@ derived from git tags (hatch-vcs).
   into `price_hints_version: "1"`, and the request-scoped hints apply only to
   the call they were priced for. When the policy serves a cheaper healthy
   provider ahead of a healthy primary, the resulting failover metadata reports
-  `FailoverReason.COST_ROUTED`.
+  `FailoverReason.COST_ROUTED` — only when the served provider's hint is
+  strictly below the primary's (or the primary is unhinted), so an injected
+  policy that fronts a pricier provider is still labelled `circuit_open`.
 - **A first-class, zero-network control-plane test double now exercises budget
   enforcement through production wire models.** The injected transport seam is
   shared by normal operation, fork recovery, interpreter-exit delivery, and
@@ -176,14 +178,30 @@ derived from git tags (hatch-vcs).
   server contract drift on every channel: it credits the shared
   control-plane breaker, logs a distinct ERROR, and degrades that one call
   to the outage posture instead of opening the breaker fleet-wide.
+- **Anthropic 1.x clients are supported on their `httpx2` HTTP stack.** Core
+  still never imports `httpx2`: an exception is admitted as an httpx2 transport
+  error only when its ancestry is identity-proven against the loaded module, and
+  a per-hop timeout is delivered in the provider client's own HTTP stack — an
+  httpx `Timeout` for httpx1-based clients, a native `httpx2.Timeout` for
+  Anthropic 1.x whose constructor is identity-proven against both the loaded
+  module export and the client's own timeout instance (so Anthropic's
+  `x-stainless-read-timeout` header carries the numeric read bound; if the
+  proof fails the granular four-tuple is used and only that header degrades).
+  Anthropic 1.0's promoted-stable `files` and `skills` surfaces are
+  classified as unmetered spend, so they keep the ordinary `on_unmetered`
+  posture instead of resolving as unknown surface drift; the provider-surface
+  canary pins them at the `anthropic-stable-files-skills` interval
+  (`anthropic==1.0.0`).
 
 ### Changed
 
-- **The budget allow-cache is now bounded and hint-aware.** Its key includes
-  provider, model, fallback chain, and modality; it remains a 16-entry LRU with
-  the same 5-second TTL. A cache hit replays only the hints belonging to its
-  own entry. `CostPolicy` warns once only when a check carries no hints
-  (`null`), not when the server explicitly clears them with `{}`.
+- **The budget allow-cache is now bounded and hint-aware.** The single cached
+  allow slot is now a bounded 16-entry LRU keyed by provider, model, fallback
+  chain, and modality, with the existing `budget_check_cache_ttl` window
+  (default 5 s, `SOLWYN_BUDGET_CHECK_CACHE_TTL`). A cache hit replays only the
+  hints belonging to its own entry. `CostPolicy` warns once only when a check
+  carries no hints (`null`), not when the server explicitly clears them with
+  `{}`.
 - **Breaking only for consumers of private wrapper attributes: Solwyn-owned
   state now lives under `_solwyn_*`.** Names such as the former wrapper
   `_client`, `_budget`, and `_reporter` no longer expose Solwyn internals;
@@ -212,6 +230,13 @@ derived from git tags (hatch-vcs).
   ids. `BudgetCheckResult.denied_by_period` now carries the Cloud/lease label
   through client error construction; ordinary hard-deny errors expose the
   actual period and fall back to `unknown` only when no label was supplied.
+- **Breaking for anyone passing `inf`: failover timeout bounds must now be
+  finite numbers.** `failover_total_timeout` and `failover_hop_read_timeout`
+  reject booleans, `NaN`, and `±inf` at construction; `float("inf")` was
+  previously accepted and produced an unbounded failover window or hop read
+  bound. `failover_hop_read_timeout` must still be positive, while a zero
+  `failover_total_timeout` remains accepted as the intentional zero-deadline
+  semantics.
 
 ### Fixed
 
@@ -239,6 +264,20 @@ derived from git tags (hatch-vcs).
   The OpenAI SDK merges `extra_body` after named arguments, so an entry there
   would desync Solwyn's streaming mode from the dispatched request and lose the
   call's metered spend.
+- **Anthropic 1.x transport failures are classified instead of failing fast.**
+  An `httpx2` transport error is now dispositioned exactly like its httpx1 twin
+  and at the same position — ahead of any attached HTTP status: provably
+  pre-send connect and pool failures fail over, while read, write, and protocol
+  failures stay post-send ambiguous and are re-raised rather than retried
+  against another provider. Family recognition reads the `httpx2` module and
+  class names statically, so its lazy module `__getattr__` can never raise out
+  of the classifier.
+- **The `solwyn.testing` contract probe now opts into price hints and
+  validates the served hint map.** It sends the SDK's production
+  `price_hints_version: "1"`, and requires every provider key to be a known
+  `ProviderName` (an unknown key makes the whole check response unparseable, so
+  the SDK would fail open with no reservation) and every hint to be a finite
+  JSON number; `{}` and `null` remain valid statements.
 
 ### Removed
 
