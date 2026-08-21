@@ -416,6 +416,86 @@ def test_detailed_selection_cost_policy_displacement_is_cost_routed() -> None:
         _close(solwyn)
 
 
+class _UndeclaredReversePolicy:
+    """Custom policy that declares NEITHER signal flag (so both default True)."""
+
+    def order(self, candidates, req):  # type: ignore[no-untyped-def]
+        return list(reversed(candidates))
+
+
+@pytest.mark.unit
+def test_detailed_selection_custom_policy_placing_pricier_provider_first_is_not_cost_routed() -> (
+    None
+):
+    # Arrange — an injected policy with no signal declarations receives hints
+    # (uses_price_signal defaults True) and reverses the chain, putting the
+    # provider the SERVER priced 9x HIGHER ahead of a healthy, cheaper primary.
+    solwyn = _make_solwyn(
+        _openai_client(),
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
+        selection_policy=_UndeclaredReversePolicy(),
+    )
+    try:
+        # Act
+        selection = solwyn._select_candidates_detailed(
+            _req(), price_hints={"openai": 1.0, "anthropic": 9.0}
+        )
+
+        # Assert — the policy's order stands (routing is untouched), but the hop
+        # is NOT attributed as cost routing: it is not cheaper than the primary.
+        assert [rt.adapter.name for rt in selection.runtimes] == ["anthropic", "openai"]
+        assert selection.cost_routed is False
+    finally:
+        _close(solwyn)
+
+
+@pytest.mark.unit
+def test_detailed_selection_equal_hints_is_not_cost_routed() -> None:
+    # Arrange — displacement with IDENTICAL server hints is not a cost saving;
+    # the rule is a STRICTLY lower hint than the primary's.
+    solwyn = _make_solwyn(
+        _openai_client(),
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
+        selection_policy=_UndeclaredReversePolicy(),
+    )
+    try:
+        # Act
+        selection = solwyn._select_candidates_detailed(
+            _req(), price_hints={"openai": 5.0, "anthropic": 5.0}
+        )
+
+        # Assert
+        assert [rt.adapter.name for rt in selection.runtimes] == ["anthropic", "openai"]
+        assert selection.cost_routed is False
+    finally:
+        _close(solwyn)
+
+
+@pytest.mark.unit
+def test_detailed_selection_unhinted_primary_with_hinted_first_is_cost_routed() -> None:
+    # Arrange — the primary carries NO server hint (unpriceable) while the
+    # displacing candidate is hinted. Decision 4 tolerates this as cost routing:
+    # there is no primary price to compare against, and CostPolicy sorts an
+    # unhinted candidate last, so this IS the policy's cost decision.
+    solwyn = _make_solwyn(
+        _openai_client(),
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
+        selection_policy=CostPolicy(),
+    )
+    try:
+        # Act
+        selection = solwyn._select_candidates_detailed(_req(), price_hints={"anthropic": 2.0})
+
+        # Assert
+        assert [rt.adapter.name for rt in selection.runtimes] == ["anthropic", "openai"]
+        assert selection.cost_routed is True
+    finally:
+        _close(solwyn)
+
+
 @pytest.mark.unit
 def test_cost_routing_does_no_price_arithmetic_only_server_hint() -> None:
     # Arrange — the ONLY price input is the server hint. We prove ordering is a
