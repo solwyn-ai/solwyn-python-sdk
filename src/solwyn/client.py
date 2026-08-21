@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import logging
+import math
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator, Mapping
@@ -122,6 +125,9 @@ from solwyn.stream import (
     _AsyncResponsesStreamManagerWrapper,
     _SyncResponsesStreamManagerWrapper,
 )
+
+_HTTPX_CLIENT_TYPES = (httpx.Client, httpx.AsyncClient)
+_HTTPX_TIMEOUT_TYPE = httpx.Timeout
 
 logger = logging.getLogger(__name__)
 
@@ -1006,7 +1012,8 @@ def _hop_httpx_timeout(connect_slice: float, read_timeout: float) -> httpx.Timeo
     buys no failover, it only converts legitimate slow generations into
     ambiguous spend.
     """
-    return httpx.Timeout(
+    _validate_hop_timeout_bounds(connect_slice, read_timeout)
+    return _HTTPX_TIMEOUT_TYPE(
         connect=connect_slice,
         read=read_timeout,
         write=read_timeout,
@@ -1014,45 +1021,84 @@ def _hop_httpx_timeout(connect_slice: float, read_timeout: float) -> httpx.Timeo
     )
 
 
+def _validate_hop_timeout_bounds(connect_slice: float, read_timeout: float) -> None:
+    """Enforce the config invariant again before constructing an HTTP timeout."""
+    if any(
+        type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+        for value in (connect_slice, read_timeout)
+    ):
+        raise RuntimeError("per-hop timeout bounds must be finite positive numbers")
+
+
+_STATIC_MISSING = object()
+
+
+def _loaded_httpx2_timeout_types() -> tuple[type[Any], tuple[type[Any], type[Any]]] | None:
+    """Return identity-bearing exports only when the optional module is loaded."""
+    httpx2_module = sys.modules.get("httpx2")
+    if httpx2_module is None:
+        return None
+    timeout_type = inspect.getattr_static(httpx2_module, "Timeout", _STATIC_MISSING)
+    sync_client_type = inspect.getattr_static(httpx2_module, "Client", _STATIC_MISSING)
+    async_client_type = inspect.getattr_static(httpx2_module, "AsyncClient", _STATIC_MISSING)
+    if not all(
+        isinstance(value, type) for value in (timeout_type, sync_client_type, async_client_type)
+    ):
+        return None
+    return cast("type[Any]", timeout_type), (
+        cast("type[Any]", sync_client_type),
+        cast("type[Any]", async_client_type),
+    )
+
+
+def _native_timeout_type(client: object) -> type[Any] | None:
+    """Statically prove a provider's normalized native HTTP timeout class."""
+    native_client = inspect.getattr_static(client, "_client", _STATIC_MISSING)
+    if native_client is _STATIC_MISSING:
+        return None
+    native_client_mro = type(native_client).__mro__
+
+    timeout_type: type[Any]
+    if any(client_type in native_client_mro for client_type in _HTTPX_CLIENT_TYPES):
+        timeout_type = _HTTPX_TIMEOUT_TYPE
+    else:
+        loaded_httpx2_types = _loaded_httpx2_timeout_types()
+        if loaded_httpx2_types is None:
+            return None
+        timeout_type, client_types = loaded_httpx2_types
+        if not any(client_type in native_client_mro for client_type in client_types):
+            return None
+
+    normalized_timeout = inspect.getattr_static(native_client, "_timeout", _STATIC_MISSING)
+    if type(normalized_timeout) is not timeout_type:
+        return None
+    return timeout_type
+
+
 def _hop_client_timeout(client: object, connect_slice: float, read_timeout: float) -> object:
     """Build a granular timeout in the target client's native HTTP stack.
 
     Provider SDKs can expose ``with_options`` while using incompatible httpx
-    major versions.  Their public ``timeout`` value is the provider-independent
-    seam: when it has the expected granular shape, construct the hop timeout
-    with that exact class.  Unknown or synthetic client shapes retain the
-    established httpx timeout, so they fail loudly at the SDK boundary instead
-    of silently collapsing connect/read semantics.
+    major versions. Statically inspect the SDK's normalized native HTTP client,
+    prove its client and timeout classes against trusted exports by identity,
+    and construct only that proven timeout type. This avoids executing provider
+    descriptors or arbitrary timeout-shaped constructors. Unknown or synthetic
+    shapes retain the established httpx timeout, so they fail loudly at the SDK
+    boundary instead of silently collapsing connect/read semantics.
     """
-    fallback = _hop_httpx_timeout(connect_slice, read_timeout)
+    _validate_hop_timeout_bounds(connect_slice, read_timeout)
+    timeout_type = _native_timeout_type(client)
+    if timeout_type is None:
+        return _hop_httpx_timeout(connect_slice, read_timeout)
     try:
-        configured = cast("Any", client).timeout
-        configured_values = tuple(
-            getattr(configured, name) for name in ("connect", "read", "write", "pool")
-        )
-    except (AttributeError, TypeError):
-        return fallback
-    if not all(value is None or type(value) in (int, float) for value in configured_values):
-        return fallback
-
-    try:
-        candidate = type(configured)(
+        return timeout_type(
             connect=connect_slice,
             read=read_timeout,
             write=read_timeout,
             pool=connect_slice,
         )
-        candidate_values = tuple(
-            getattr(candidate, name) for name in ("connect", "read", "write", "pool")
-        )
-    except (AttributeError, TypeError, ValueError):
-        return fallback
-    expected = (connect_slice, read_timeout, read_timeout, connect_slice)
-    if not all(type(value) in (int, float) for value in candidate_values):
-        return fallback
-    if candidate_values != expected:
-        return fallback
-    return candidate
+    except Exception as exc:
+        raise RuntimeError("native timeout construction failed") from exc
 
 
 class Deadline:

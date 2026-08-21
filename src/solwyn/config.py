@@ -10,7 +10,7 @@ import os
 from collections.abc import Collection
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, field_validator, model_validator
 
 from solwyn._lease import DEFAULT_OUTPUT_BOUND
 from solwyn._run import _copy_tags
@@ -61,7 +61,7 @@ class SolwynConfig(BaseModel):
     acknowledge_untracked: frozenset[str] = Field(default_factory=frozenset)
 
     # Failover knobs
-    failover_total_timeout: float = 30.0
+    failover_total_timeout: FiniteFloat = 30.0
     # Per-hop READ/WRITE bound (seconds), decoupled from the chain deadline
     # (PJ-8/R7). failover_total_timeout is the FAILOVER WINDOW - it bounds the
     # budget pre-flight, per-hop connect slices, Retry-After sleeps, and
@@ -73,7 +73,7 @@ class SolwynConfig(BaseModel):
     # timeout is POST_SEND_AMBIGUOUS (re-raised, never failed over, under the
     # default idempotency), so a small value converts slow legitimate
     # generations into ambiguous spend - lower it deliberately.
-    failover_hop_read_timeout: float = Field(default=600.0, gt=0)
+    failover_hop_read_timeout: FiniteFloat = Field(default=600.0, gt=0)
     failover_idempotency: Literal["safe", "never", "always"] = "safe"
     # Max same-provider retries on a 429 whose Retry-After the provider asked us
     # to honor, BEFORE failing over cross-provider. On such a 429 the dispatch
@@ -221,6 +221,13 @@ class SolwynConfig(BaseModel):
                         values[field] = env_val
 
         return values
+
+    @field_validator("failover_total_timeout", "failover_hop_read_timeout", mode="before")
+    @classmethod
+    def _reject_boolean_timeout_bounds(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError("timeout bounds must be numbers, not booleans")
+        return value
 
     @field_validator("tags", mode="before")
     @classmethod
