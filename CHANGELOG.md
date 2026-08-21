@@ -9,6 +9,11 @@ derived from git tags (hatch-vcs).
 
 ### Added
 
+- **`CostPolicy` now consumes server price hints.** Every budget check opts
+  into `price_hints_version: "1"`, and the request-scoped hints apply only to
+  the call they were priced for. When the policy serves a cheaper healthy
+  provider ahead of a healthy primary, the resulting failover metadata reports
+  `FailoverReason.COST_ROUTED`.
 - **A first-class, zero-network control-plane test double now exercises budget
   enforcement through production wire models.** The injected transport seam is
   shared by normal operation, fork recovery, interpreter-exit delivery, and
@@ -174,6 +179,11 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **The budget allow-cache is now bounded and hint-aware.** Its key includes
+  provider, model, fallback chain, and modality; it remains a 16-entry LRU with
+  the same 5-second TTL. A cache hit replays only the hints belonging to its
+  own entry. `CostPolicy` warns once only when a check carries no hints
+  (`null`), not when the server explicitly clears them with `{}`.
 - **Breaking only for consumers of private wrapper attributes: Solwyn-owned
   state now lives under `_solwyn_*`.** Names such as the former wrapper
   `_client`, `_budget`, and `_reporter` no longer expose Solwyn internals;
@@ -229,6 +239,19 @@ derived from git tags (hatch-vcs).
   The OpenAI SDK merges `extra_body` after named arguments, so an entry there
   would desync Solwyn's streaming mode from the dispatched request and lose the
   call's metered spend.
+
+### Removed
+
+- **The client-wide price-hint store and update APIs are removed.**
+  `Solwyn.update_price_hints` and `AsyncSolwyn.update_price_hints` no longer
+  exist; price hints are request-scoped and supplied by the server's budget
+  response.
+
+### Known limitation
+
+- **Lease-backed `solwyn.run()` calls carry no price hints.** `CostPolicy`
+  keeps configured provider order for those calls until lease grants carry
+  hints.
 
 ## [0.5.0] - 2026-08-07
 
