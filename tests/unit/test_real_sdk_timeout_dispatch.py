@@ -185,8 +185,6 @@ def test_sync_dispatch_uses_real_anthropic_native_httpx2_timeout(
         http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
         **timeout_kwargs,
     )
-    native_http_client = inspect.getattr_static(provider, "_client")
-    native_timeout_type = type(inspect.getattr_static(native_http_client, "_timeout"))
     original_with_options = provider.with_options
 
     def capture_with_options(**kwargs: Any) -> Any:
@@ -212,7 +210,12 @@ def test_sync_dispatch_uses_real_anthropic_native_httpx2_timeout(
     finally:
         wrapper.close()
 
-    assert type(seen["option_timeout"]) is native_timeout_type
+    assert seen["option_timeout"] == (
+        _CONNECT_SLICE,
+        _READ_WRITE_BOUND,
+        _READ_WRITE_BOUND,
+        _CONNECT_SLICE,
+    )
     _assert_granular_timeout(seen["request_timeout"])
 
 
@@ -241,8 +244,6 @@ async def test_async_dispatch_uses_real_anthropic_native_httpx2_timeout(
         http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
         **timeout_kwargs,
     )
-    native_http_client = inspect.getattr_static(provider, "_client")
-    native_timeout_type = type(inspect.getattr_static(native_http_client, "_timeout"))
     original_with_options = provider.with_options
 
     def capture_with_options(**kwargs: Any) -> Any:
@@ -268,8 +269,59 @@ async def test_async_dispatch_uses_real_anthropic_native_httpx2_timeout(
     finally:
         await wrapper.close()
 
-    assert type(seen["option_timeout"]) is native_timeout_type
+    assert seen["option_timeout"] == (
+        _CONNECT_SLICE,
+        _READ_WRITE_BOUND,
+        _READ_WRITE_BOUND,
+        _CONNECT_SLICE,
+    )
     _assert_granular_timeout(seen["request_timeout"])
+
+
+@pytest.mark.unit
+def test_mutated_httpx2_timeout_export_and_state_never_execute_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anthropic = pytest.importorskip("anthropic")
+    httpx2 = pytest.importorskip("httpx2")
+
+    class ExecutableTimeout:
+        constructions = 0
+
+        def __init__(self, **kwargs: object) -> None:
+            type(self).constructions += 1
+            vars(self).update(kwargs)
+
+    provider = anthropic.Anthropic(api_key="sk-ant-test")
+    native_http_client = inspect.getattr_static(provider, "_client")
+    configured = object.__new__(ExecutableTimeout)
+    monkeypatch.setattr(httpx2, "Timeout", ExecutableTimeout)
+    monkeypatch.setattr(native_http_client, "_timeout", configured)
+    try:
+        timeout = _hop_client_timeout(provider, _CONNECT_SLICE, _READ_WRITE_BOUND)
+    finally:
+        provider.close()
+
+    assert timeout == (
+        _CONNECT_SLICE,
+        _READ_WRITE_BOUND,
+        _READ_WRITE_BOUND,
+        _CONNECT_SLICE,
+    )
+    assert ExecutableTimeout.constructions == 0
+
+
+@pytest.mark.unit
+def test_unknown_client_uses_frozen_httpx_timeout_fallback() -> None:
+    timeout = _hop_client_timeout(object(), _CONNECT_SLICE, _READ_WRITE_BOUND)
+
+    assert type(timeout) is httpx.Timeout
+    assert timeout == httpx.Timeout(
+        connect=_CONNECT_SLICE,
+        read=_READ_WRITE_BOUND,
+        write=_READ_WRITE_BOUND,
+        pool=_CONNECT_SLICE,
+    )
 
 
 @pytest.mark.unit

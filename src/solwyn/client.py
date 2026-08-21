@@ -1013,12 +1013,15 @@ def _hop_httpx_timeout(connect_slice: float, read_timeout: float) -> httpx.Timeo
     ambiguous spend.
     """
     _validate_hop_timeout_bounds(connect_slice, read_timeout)
-    return _HTTPX_TIMEOUT_TYPE(
-        connect=connect_slice,
-        read=read_timeout,
-        write=read_timeout,
-        pool=connect_slice,
-    )
+    try:
+        return _HTTPX_TIMEOUT_TYPE(
+            connect=connect_slice,
+            read=read_timeout,
+            write=read_timeout,
+            pool=connect_slice,
+        )
+    except Exception as exc:
+        raise RuntimeError("native timeout construction failed") from exc
 
 
 def _validate_hop_timeout_bounds(connect_slice: float, read_timeout: float) -> None:
@@ -1033,72 +1036,54 @@ def _validate_hop_timeout_bounds(connect_slice: float, read_timeout: float) -> N
 _STATIC_MISSING = object()
 
 
-def _loaded_httpx2_timeout_types() -> tuple[type[Any], tuple[type[Any], type[Any]]] | None:
-    """Return identity-bearing exports only when the optional module is loaded."""
+def _loaded_httpx2_client_types() -> tuple[type[Any], type[Any]] | None:
+    """Return identity-bearing client exports only when httpx2 is loaded."""
     httpx2_module = sys.modules.get("httpx2")
     if httpx2_module is None:
         return None
-    timeout_type = inspect.getattr_static(httpx2_module, "Timeout", _STATIC_MISSING)
     sync_client_type = inspect.getattr_static(httpx2_module, "Client", _STATIC_MISSING)
     async_client_type = inspect.getattr_static(httpx2_module, "AsyncClient", _STATIC_MISSING)
-    if not all(
-        isinstance(value, type) for value in (timeout_type, sync_client_type, async_client_type)
-    ):
+    if not isinstance(sync_client_type, type) or not isinstance(async_client_type, type):
         return None
-    return cast("type[Any]", timeout_type), (
+    return (
         cast("type[Any]", sync_client_type),
         cast("type[Any]", async_client_type),
     )
 
 
-def _native_timeout_type(client: object) -> type[Any] | None:
-    """Statically prove a provider's normalized native HTTP timeout class."""
+def _uses_loaded_httpx2_client(client: object) -> bool:
+    """Statically prove that a provider owns a loaded httpx2 native client."""
     native_client = inspect.getattr_static(client, "_client", _STATIC_MISSING)
     if native_client is _STATIC_MISSING:
-        return None
+        return False
     native_client_mro = type(native_client).__mro__
-
-    timeout_type: type[Any]
     if any(client_type in native_client_mro for client_type in _HTTPX_CLIENT_TYPES):
-        timeout_type = _HTTPX_TIMEOUT_TYPE
-    else:
-        loaded_httpx2_types = _loaded_httpx2_timeout_types()
-        if loaded_httpx2_types is None:
-            return None
-        timeout_type, client_types = loaded_httpx2_types
-        if not any(client_type in native_client_mro for client_type in client_types):
-            return None
-
-    normalized_timeout = inspect.getattr_static(native_client, "_timeout", _STATIC_MISSING)
-    if type(normalized_timeout) is not timeout_type:
-        return None
-    return timeout_type
+        return False
+    client_types = _loaded_httpx2_client_types()
+    return client_types is not None and any(
+        client_type in native_client_mro for client_type in client_types
+    )
 
 
 def _hop_client_timeout(client: object, connect_slice: float, read_timeout: float) -> object:
     """Build a granular timeout in the target client's native HTTP stack.
 
     Provider SDKs can expose ``with_options`` while using incompatible httpx
-    major versions. Statically inspect the SDK's normalized native HTTP client,
-    prove its client and timeout classes against trusted exports by identity,
-    and construct only that proven timeout type. This avoids executing provider
-    descriptors or arbitrary timeout-shaped constructors. Unknown or synthetic
-    shapes retain the established httpx timeout, so they fail loudly at the SDK
-    boundary instead of silently collapsing connect/read semantics.
+    major versions. Statically prove only the native HTTP client identity. A
+    real loaded httpx2 client receives the granular four-tuple that its own SDK
+    converts to its native Timeout; Solwyn never discovers or invokes a mutable
+    runtime Timeout export. Frozen-trusted httpx1 and unknown/synthetic client
+    shapes retain the established httpx Timeout behavior.
     """
     _validate_hop_timeout_bounds(connect_slice, read_timeout)
-    timeout_type = _native_timeout_type(client)
-    if timeout_type is None:
-        return _hop_httpx_timeout(connect_slice, read_timeout)
-    try:
-        return timeout_type(
-            connect=connect_slice,
-            read=read_timeout,
-            write=read_timeout,
-            pool=connect_slice,
+    if _uses_loaded_httpx2_client(client):
+        return (
+            connect_slice,
+            read_timeout,
+            read_timeout,
+            connect_slice,
         )
-    except Exception as exc:
-        raise RuntimeError("native timeout construction failed") from exc
+    return _hop_httpx_timeout(connect_slice, read_timeout)
 
 
 class Deadline:
