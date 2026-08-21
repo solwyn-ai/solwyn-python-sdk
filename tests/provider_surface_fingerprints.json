@@ -23,6 +23,24 @@
       "distributions": [
         {
           "name": "anthropic",
+          "version": "1.0.0"
+        }
+      ],
+      "mode": "async",
+      "namespace_count": 250,
+      "observation_count": 1366,
+      "provider": "anthropic",
+      "service_model_operation_count": 0,
+      "shape_key": "anthropic_async",
+      "structural_interval": "anthropic-stable-files-skills",
+      "structure_sha256": "f47aaa0f743bd74ab9cdba309330218a4a1a59721efa62a69a0ea06f05ded8b6",
+      "variant": "native"
+    },
+    {
+      "client_shape": "anthropic_sdk",
+      "distributions": [
+        {
+          "name": "anthropic",
           "version": "0.50.0"
         }
       ],
@@ -41,17 +59,17 @@
       "distributions": [
         {
           "name": "anthropic",
-          "version": "0.121.0"
+          "version": "1.0.0"
         }
       ],
       "mode": "async",
-      "namespace_count": 238,
-      "observation_count": 1288,
+      "namespace_count": 250,
+      "observation_count": 1366,
       "provider": "anthropic",
       "service_model_operation_count": 0,
       "shape_key": "anthropic_async",
       "structural_interval": "latest",
-      "structure_sha256": "c132b5b9fba2fedd51d7c359e08d1db1b1e16fb7acd69b76005591f1a1c72484",
+      "structure_sha256": "baa96d90ee590a1cb090501276f8dea7d5cd1b937f73ff590f39675cea25ea56",
       "variant": "native"
     },
     {
@@ -77,6 +95,24 @@
       "distributions": [
         {
           "name": "anthropic",
+          "version": "1.0.0"
+        }
+      ],
+      "mode": "sync",
+      "namespace_count": 250,
+      "observation_count": 1363,
+      "provider": "anthropic",
+      "service_model_operation_count": 0,
+      "shape_key": "anthropic_sync",
+      "structural_interval": "anthropic-stable-files-skills",
+      "structure_sha256": "f3391f1d71597d527e88fe86117513581e7fa6fa77e81847e43e8bfc1a641511",
+      "variant": "native"
+    },
+    {
+      "client_shape": "anthropic_sdk",
+      "distributions": [
+        {
+          "name": "anthropic",
           "version": "0.50.0"
         }
       ],
@@ -95,17 +131,17 @@
       "distributions": [
         {
           "name": "anthropic",
-          "version": "0.121.0"
+          "version": "1.0.0"
         }
       ],
       "mode": "sync",
-      "namespace_count": 238,
-      "observation_count": 1285,
+      "namespace_count": 250,
+      "observation_count": 1363,
       "provider": "anthropic",
       "service_model_operation_count": 0,
       "shape_key": "anthropic_sync",
       "structural_interval": "latest",
-      "structure_sha256": "4edae104f169e2d476bc0590efde4b9dffa3503a3d1f28e6b11f0ee7d7f0dae2",
+      "structure_sha256": "3869ce20a6ca1771a4ceeaf5fcee12840ab6146cb5df9a3e8c00dcafc6a00b48",
       "variant": "native"
     },
     {

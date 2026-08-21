@@ -116,8 +116,10 @@ class TestBudgetEnforcerBase:
         assert req.provider == "openai"
         assert req.failover_directive_version == "1"
         assert req.run_directive_version == "1"
+        assert req.price_hints_version == "1"
         assert req.model_dump(mode="json")["failover_directive_version"] == "1"
         assert req.model_dump(mode="json")["run_directive_version"] == "1"
+        assert req.model_dump(mode="json")["price_hints_version"] == "1"
 
     def test_build_check_request_carries_agent_run_id(self) -> None:
         base = _BudgetEnforcerBase(
@@ -169,8 +171,16 @@ class TestBudgetEnforcerBase:
         )
 
         response = BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE)
-        base._cache_response(response)
-        assert base._should_use_cache() is True
+        key = base._allow_cache_key(
+            provider="openai",
+            model="gpt-5.5",
+            fallback_providers=[],
+            fallback_models=[],
+            modality="text",
+        )
+        base._cache_response(response, cache_key=key)
+        with base._state_lock:
+            assert base._cached_allow_locked(key) is response
 
     def test_live_allow_clears_matching_server_termination(self) -> None:
         base = _BudgetEnforcerBase(
@@ -233,8 +243,7 @@ class TestBudgetEnforcerBase:
 
         response = BudgetCheckResponse(**_DENY_RESPONSE)
         base._cache_response(response)
-        # Should NOT be cached
-        assert base._should_use_cache() is False
+        assert not base._allow_cache
 
     def test_cache_expires(self) -> None:
         base = _BudgetEnforcerBase(
@@ -244,9 +253,16 @@ class TestBudgetEnforcerBase:
         )
 
         response = BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE)
-        base._cache_response(response)
-        # Cache TTL is 0, so it should expire instantly
-        assert base._should_use_cache() is False
+        key = base._allow_cache_key(
+            provider="openai",
+            model="gpt-5.5",
+            fallback_providers=[],
+            fallback_models=[],
+            modality="text",
+        )
+        base._cache_response(response, cache_key=key)
+        with base._state_lock:
+            assert base._cached_allow_locked(key) is None
 
     @pytest.mark.parametrize(
         ("payload", "expected_allowed"),
@@ -317,14 +333,21 @@ class TestBudgetEnforcerBase:
             api_url="https://api.test.solwyn.ai",
             api_key=VALID_API_KEY,
         )
-        base._cache_response(BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE))
+        cached_key = base._allow_cache_key(
+            provider="openai",
+            model="gpt-5.5",
+            fallback_providers=[],
+            fallback_models=[],
+            modality="text",
+        )
+        base._cache_response(BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE), cache_key=cached_key)
         response = BudgetCheckResponse.model_validate(
             {**_DENY_RESPONSE, "denied_by_period": denied_by_period}
         )
 
         base._cache_response(response)
 
-        assert base._should_use_cache() is False
+        assert not base._allow_cache
         assert base._last_hard_deny_response is response
         prior = base._build_prior_hard_deny_unavailable_result()
         assert prior is not None
@@ -494,6 +517,7 @@ class TestCloudAllow:
         assert post.call_args.args[0].endswith("/api/v1/budgets/check")
         assert post.call_args.kwargs["json"]["tags"] == {"team": "research"}
         assert post.call_args.kwargs["json"]["run_directive_version"] == "1"
+        assert post.call_args.kwargs["json"]["price_hints_version"] == "1"
 
     def test_shared_allow_fixture_propagates_non_none_price_hints(self) -> None:
         enforcer = _make_enforcer()
@@ -510,6 +534,15 @@ class TestCloudAllow:
             )
 
         assert result.price_hints == {"openai": 10.0, "anthropic": 2.0}
+
+    def test_check_posts_price_hints_version(self) -> None:
+        enforcer = _make_enforcer()
+        response = _response(ALLOW_BUDGET_RESPONSE)
+
+        with patch.object(enforcer._http, "post", return_value=response) as post:
+            enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
+
+        assert post.call_args.kwargs["json"]["price_hints_version"] == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -874,6 +907,137 @@ class TestCacheBehaviour:
             # Only one HTTP call
             assert mock_post.call_count == 1
 
+    @pytest.mark.parametrize(
+        ("base_overrides", "changed"),
+        [
+            ({}, {"model": "gpt-5.5-mini"}),
+            ({}, {"provider": "anthropic"}),
+            (
+                {"fallback_providers": ["anthropic"], "fallback_models": ["claude-sonnet-4"]},
+                {"fallback_models": ["claude-haiku-4"]},
+            ),
+            (
+                {"fallback_providers": ["anthropic"], "fallback_models": ["claude-sonnet-4"]},
+                {"fallback_providers": ["openai"]},
+            ),
+            ({}, {"modality": "embedding"}),
+        ],
+    )
+    def test_cache_hit_requires_same_provider_model_chain_modality(
+        self,
+        base_overrides: dict[str, object],
+        changed: dict[str, object],
+    ) -> None:
+        enforcer = _make_enforcer()
+        response = _response(ALLOW_BUDGET_RESPONSE)
+        base = {
+            "estimated_input_tokens": 500,
+            "model": "gpt-5.5",
+            "provider": "openai",
+        } | base_overrides
+
+        with patch.object(enforcer._http, "post", return_value=response) as post:
+            enforcer.check_budget(**base)
+            enforcer.check_budget(**base)
+            enforcer.check_budget(**(base | changed))
+
+        assert post.call_count == 2
+
+    def test_cache_hit_replays_its_own_price_hints(self) -> None:
+        enforcer = _make_enforcer()
+        first_response = _response(
+            {**ALLOW_BUDGET_RESPONSE, "price_hints": {"openai": 2.0, "anthropic": 1.0}}
+        )
+        second_response = _response(
+            {**ALLOW_BUDGET_RESPONSE, "price_hints": {"openai": 1.0, "anthropic": 3.0}}
+        )
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[first_response, second_response],
+        ) as post:
+            first = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+            )
+            cached = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+            )
+            changed_model = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5-mini", provider="openai"
+            )
+
+        assert first.price_hints == {"openai": 2.0, "anthropic": 1.0}
+        assert cached.price_hints == {"openai": 2.0, "anthropic": 1.0}
+        assert changed_model.price_hints == {"openai": 1.0, "anthropic": 3.0}
+        assert post.call_count == 2
+
+    def test_cache_hit_with_cleared_hints_replays_empty_dict(self) -> None:
+        enforcer = _make_enforcer()
+        response = _response({**ALLOW_BUDGET_RESPONSE, "price_hints": {}})
+
+        with patch.object(enforcer._http, "post", return_value=response) as post:
+            enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
+            cached = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+            )
+
+        assert cached.price_hints == {}
+        assert post.call_count == 1
+
+    def test_cache_hit_without_hints_replays_none(self) -> None:
+        enforcer = _make_enforcer()
+        response = _response({**ALLOW_BUDGET_RESPONSE, "price_hints": None})
+
+        with patch.object(enforcer._http, "post", return_value=response) as post:
+            enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
+            cached = enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+            )
+
+        assert cached.price_hints is None
+        assert post.call_count == 1
+
+    def test_allow_cache_is_bounded_lru(self) -> None:
+        enforcer = _make_enforcer()
+        response = _response(ALLOW_BUDGET_RESPONSE)
+
+        with patch.object(enforcer._http, "post", return_value=response) as post:
+            for index in range(17):
+                enforcer.check_budget(
+                    estimated_input_tokens=500,
+                    model=f"gpt-5.5-{index}",
+                    provider="openai",
+                )
+            enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5-0", provider="openai")
+
+        assert len(enforcer._allow_cache) <= 16
+        assert post.call_count == 18
+
+    def test_deny_clears_all_cached_allows(self) -> None:
+        enforcer = _make_enforcer(budget_mode=BudgetMode.HARD_DENY)
+        allow = _response(ALLOW_BUDGET_RESPONSE)
+        deny = _response(_DENY_RESPONSE)
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[allow, allow, deny, allow, allow],
+        ) as post:
+            enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
+            enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5-mini", provider="openai"
+            )
+            enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5-nano", provider="openai"
+            )
+            enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
+            enforcer.check_budget(
+                estimated_input_tokens=500, model="gpt-5.5-mini", provider="openai"
+            )
+
+        assert post.call_count == 5
+
     def test_deny_not_cached(self) -> None:
         enforcer = _make_enforcer(budget_mode=BudgetMode.HARD_DENY)
         mock_response = MagicMock()
@@ -924,8 +1088,8 @@ class TestCacheBehaviour:
         assert first.reservation_id == "res_global"
         assert tagged.reservation_id == "res_tagged"
         assert cached.reservation_id is None
-        assert enforcer._cached_response is not None
-        assert enforcer._cached_response.reservation_id == "res_global"
+        assert enforcer._allow_cache
+        assert next(iter(enforcer._allow_cache.values()))[0].reservation_id == "res_global"
         assert enforcer._last_known_budget_limit == 75.0
         assert enforcer._last_known_current_usage == 12.5
         assert post.call_count == 2
@@ -959,7 +1123,7 @@ class TestCacheBehaviour:
 
         assert allowed.allowed is True
         assert post.call_count == 2
-        assert enforcer._cached_response is None
+        assert not enforcer._allow_cache
         assert enforcer._last_hard_deny_response is None
         assert enforcer._last_known_budget_limit == 80.0
         assert enforcer._last_known_current_usage == 20.0
@@ -1096,7 +1260,7 @@ class TestCacheBehaviour:
         assert denied.allowed is False
         assert outage.allowed is False
         assert post.call_count == 3
-        assert enforcer._cached_response is None
+        assert not enforcer._allow_cache
         assert enforcer._last_hard_deny_response is not None
 
     def test_tagged_agent_run_hard_deny_remains_run_scoped(self) -> None:
@@ -1173,8 +1337,8 @@ class TestScopedCacheAndStickyDenials:
         assert mock_post.call_count == 3
         assert mock_post.call_args_list[1].kwargs["json"]["agent_run_id"] == "run_a"
         assert mock_post.call_args_list[2].kwargs["json"]["agent_run_id"] == "run_b"
-        assert enforcer._cached_response is not None
-        assert enforcer._cached_response.reservation_id == "res_global"
+        assert enforcer._allow_cache
+        assert next(iter(enforcer._allow_cache.values()))[0].reservation_id == "res_global"
         assert unscoped.reservation_id is None
 
     def test_run_deny_is_sticky_only_for_same_run_during_outage(self) -> None:

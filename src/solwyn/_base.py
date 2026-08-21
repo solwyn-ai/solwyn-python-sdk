@@ -16,7 +16,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict, deque
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn, TypedDict, cast
@@ -56,6 +56,7 @@ from solwyn._surfaces import (
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
     CallStatus,
+    CircuitState,
     DenySource,
     FailoverReason,
     MediaUsage,
@@ -131,6 +132,14 @@ class FailoverTuning(NamedTuple):
     failover_hop_read_timeout: float
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateSelection:
+    """Policy-ordered runtimes plus attribution for a price-driven displacement."""
+
+    runtimes: list[ProviderRuntime]
+    cost_routed: bool
+
+
 _BEDROCK_UNBOUNDED_READ_WARNING = (
     "Bedrock client (model %r) was built with botocore Config(read_timeout=None): "
     "Solwyn cannot bound Bedrock hops per-call (boto3 has no per-call timeout "
@@ -184,7 +193,9 @@ def _warn_cost_policy_inactive_once() -> None:
         if _cost_policy_inactive_warned:
             return
         _cost_policy_inactive_warned = True
-    logger.warning("CostPolicy selected but no price hints available; using health-based order")
+    logger.warning(
+        "CostPolicy selected but this budget check carried no price hints; using health-based order"
+    )
 
 
 # Per-process observations contain only structural capability data. The registry
@@ -945,11 +956,6 @@ class _SolwynBase:
             lambda: deque(maxlen=_LATENCY_WINDOW)
         )
 
-        # Last server-provided RELATIVE price hints per provider (CostPolicy
-        # signal). The client refreshes this after each budget check. The SDK
-        # never computes price — this only forwards the server signal.
-        self._solwyn_last_price_hints: dict[str, float] = {}
-
         # One circuit breaker per DISTINCT provider across ALL runtimes.
         # Additional providers get lazily-created breakers via
         # _get_circuit_breaker (same jitter).
@@ -1578,18 +1584,20 @@ class _SolwynBase:
             return None
         return statistics.median(samples)
 
-    def update_price_hints(self, hints: dict[str, float]) -> None:
-        """Replace the last-known server price hints (CostPolicy signal).
+    def _select_candidates(
+        self, req: RoutingRequest, *, price_hints: Mapping[str, float] | None = None
+    ) -> list[ProviderRuntime]:
+        """Return policy-ordered runtimes while preserving the legacy list seam."""
+        return self._select_candidates_detailed(req, price_hints=price_hints).runtimes
 
-        Called by the client after each budget check with the server-provided
-        RELATIVE price signal. The SDK never computes price — it only stores and
-        forwards this. An empty dict clears the hints (server provided none).
-        """
-        with self._solwyn_signal_lock:
-            self._solwyn_last_price_hints = dict(hints)
-
-    def _select_candidates(self, req: RoutingRequest) -> list[ProviderRuntime]:
+    def _select_candidates_detailed(
+        self, req: RoutingRequest, *, price_hints: Mapping[str, float] | None = None
+    ) -> CandidateSelection:
         """Order runtimes into attempt order via the pure SelectionPolicy.
+
+        ``price_hints`` are this request's server hints (str provider-name
+        keyed). ``None`` or ``{}`` means every candidate carries
+        ``price_hint=None``.
 
         Builds one ProviderCandidate per runtime using NON-MUTATING breaker
         reads only (``state`` / ``recovery_eligible``) — never ``admit()``
@@ -1597,20 +1605,11 @@ class _SolwynBase:
         single candidate actually attempted, in the dispatch loop.
         """
         # Signal capability gate (PJ-9/P4): the default HealthBasedPolicy
-        # ignores latency_p50 and price_hint, so skip the median (lock + copy +
-        # statistics.median per provider) and the hint snapshot unless the
-        # configured policy declares it consumes them. Unknown injected
-        # policies default to True and keep receiving full signals.
+        # ignores latency_p50 and price_hint, so skip the median unless the
+        # configured policy declares it consumes it. Unknown injected policies
+        # default to True and keep receiving full signals.
         wants_latency = getattr(self._solwyn_policy, "uses_latency_signal", True)
         wants_price = getattr(self._solwyn_policy, "uses_price_signal", True)
-        if wants_price:
-            # Snapshot the price hints once under the lock so every candidate in
-            # this selection sees a consistent view (the setter may replace the
-            # dict concurrently on another thread).
-            with self._solwyn_signal_lock:
-                price_hints = dict(self._solwyn_last_price_hints)
-        else:
-            price_hints = {}
         candidates: list[ProviderCandidate] = []
         for runtime in self._solwyn_runtimes:
             breaker = self._get_circuit_breaker(runtime.adapter.name)
@@ -1627,13 +1626,31 @@ class _SolwynBase:
                     latency_p50=(
                         self.observed_p50(runtime.adapter.name) if wants_latency else None
                     ),
-                    price_hint=price_hints.get(runtime.adapter.name),
+                    price_hint=(
+                        price_hints.get(runtime.adapter.name)
+                        if wants_price and price_hints
+                        else None
+                    ),
                 )
             )
         ordered = self._solwyn_policy.order(candidates, req)
-        if isinstance(self._solwyn_policy, CostPolicy) and not any(
-            c.price_hint is not None for c in candidates
-        ):
+        primary = self._solwyn_runtimes[0]
+        first = ordered[0] if ordered else None
+        primary_cand = next(
+            (candidate for candidate in ordered if candidate.runtime is primary),
+            None,
+        )
+        cost_routed = (
+            wants_price
+            and first is not None
+            and first.runtime is not primary
+            and first.runtime.entry.provider != primary.entry.provider
+            and primary_cand is not None
+            and primary_cand.breaker_state is CircuitState.CLOSED
+            and first.breaker_state is CircuitState.CLOSED
+            and first.price_hint is not None
+        )
+        if isinstance(self._solwyn_policy, CostPolicy) and price_hints is None:
             # CostPolicy was selected but no candidate carries a server price
             # hint, so it degraded to health-based order — surface the no-op once.
             _warn_cost_policy_inactive_once()
@@ -1643,7 +1660,10 @@ class _SolwynBase:
         # runtimes (identity check), preserving the policy's order for that valid
         # subset. Drops any foreign/unknown runtime the policy may have appended.
         chain = set(map(id, self._solwyn_runtimes))
-        return [c.runtime for c in ordered if id(c.runtime) in chain]
+        return CandidateSelection(
+            runtimes=[candidate.runtime for candidate in ordered if id(candidate.runtime) in chain],
+            cost_routed=cost_routed,
+        )
 
     def _build_metadata_event(
         self,

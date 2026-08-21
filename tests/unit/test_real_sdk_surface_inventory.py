@@ -623,7 +623,7 @@ def test_structural_interval_catalog_covers_floor_breakpoints_and_latest() -> No
         "openai-admin",
         "openai-content-provenance",
     } <= by_family["openai"]
-    assert "anthropic-parse" in by_family["anthropic"]
+    assert {"anthropic-parse", "anthropic-stable-files-skills"} <= by_family["anthropic"]
     assert {"google-file-search", "google-webhooks"} <= by_family["google-genai"]
     assert {"bedrock-async-invoke", "bedrock-bidirectional", "bedrock-count-tokens"} <= (
         by_family["bedrock"]

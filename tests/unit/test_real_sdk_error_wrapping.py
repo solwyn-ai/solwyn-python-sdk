@@ -10,11 +10,12 @@ re-raise it as ``APITimeoutError``, so a provably PRE-send ``ConnectTimeout`` /
 Classifying by name alone stranded every connect-slice timeout on a dead
 primary — the chain could never advance under default-safe idempotency.
 
-These tests drive REAL ``openai`` / ``anthropic`` clients over an
-``httpx.MockTransport`` that raises a chosen httpx error, then assert Solwyn's
-disposition for the exception the SDK actually produced. Hermetic: MockTransport
-never opens a socket. Each SDK is gated by its own ``pytest.importorskip``
-fixture so a missing package skips only its own tests.
+These tests drive REAL ``openai`` / ``anthropic`` clients over the matching
+``httpx.MockTransport`` / ``httpx2.MockTransport`` that raises a chosen
+transport error, then assert Solwyn's disposition for the exception the SDK
+actually produced. Hermetic: MockTransport never opens a socket. Each SDK is
+gated by its own ``pytest.importorskip`` fixture so a missing package skips only
+its own tests.
 
 This matters more since PJ-8/R7 split connect from read: the connect slice is
 short and deadline-derived, so on a stalled provider it is the bound that fires
@@ -28,7 +29,7 @@ from typing import Any
 import httpx
 import pytest
 
-from solwyn.providers._errors import Disposition, classify_exception
+from solwyn.providers._errors import Disposition, _httpx2_transport_names, classify_exception
 
 VALID_OPENAI_KEY = "sk-test-not-a-real-key"
 VALID_ANTHROPIC_KEY = "sk-ant-test-not-a-real-key"
@@ -44,20 +45,26 @@ def anthropic_mod() -> Any:
     return pytest.importorskip("anthropic")
 
 
-def _raising_transport(exc: Exception) -> httpx.MockTransport:
+@pytest.fixture(scope="module")
+def anthropic_httpx_mod() -> Any:
+    """Anthropic 1.x ships on httpx2 rather than the app's httpx runtime."""
+    return pytest.importorskip("httpx2")
+
+
+def _raising_transport(transport_mod: Any, exc: Exception) -> Any:
     """A transport that raises ``exc`` instead of performing any I/O."""
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: Any) -> Any:
         raise exc
 
-    return httpx.MockTransport(handler)
+    return transport_mod.MockTransport(handler)
 
 
 def _openai_failure(openai_mod: Any, exc: Exception) -> BaseException:
     """Return the exception a REAL openai client raises for this httpx error."""
     client = openai_mod.OpenAI(
         api_key=VALID_OPENAI_KEY,
-        http_client=httpx.Client(transport=_raising_transport(exc)),
+        http_client=httpx.Client(transport=_raising_transport(httpx, exc)),
         max_retries=0,
     )
     with pytest.raises(Exception) as exc_info:  # noqa: PT011 - the SDK class is the subject
@@ -67,11 +74,17 @@ def _openai_failure(openai_mod: Any, exc: Exception) -> BaseException:
     return exc_info.value
 
 
-def _anthropic_failure(anthropic_mod: Any, exc: Exception) -> BaseException:
+def _anthropic_failure(
+    anthropic_mod: Any,
+    anthropic_httpx_mod: Any,
+    exc: Exception,
+) -> BaseException:
     """Return the exception a REAL anthropic client raises for this httpx error."""
     client = anthropic_mod.Anthropic(
         api_key=VALID_ANTHROPIC_KEY,
-        http_client=httpx.Client(transport=_raising_transport(exc)),
+        http_client=anthropic_httpx_mod.Client(
+            transport=_raising_transport(anthropic_httpx_mod, exc)
+        ),
         max_retries=0,
     )
     with pytest.raises(Exception) as exc_info:  # noqa: PT011 - the SDK class is the subject
@@ -93,6 +106,13 @@ _TIMEOUT_CAUSES = [
     pytest.param(httpx.WriteTimeout("write stalled"), Disposition.POST_SEND_AMBIGUOUS, id="write"),
 ]
 
+_ANTHROPIC_TIMEOUT_CAUSES = [
+    pytest.param("ConnectTimeout", Disposition.FAILOVER, id="connect"),
+    pytest.param("PoolTimeout", Disposition.FAILOVER, id="pool"),
+    pytest.param("ReadTimeout", Disposition.POST_SEND_AMBIGUOUS, id="read"),
+    pytest.param("WriteTimeout", Disposition.POST_SEND_AMBIGUOUS, id="write"),
+]
+
 
 @pytest.mark.unit
 class TestRealSdkTimeoutWrapping:
@@ -111,14 +131,20 @@ class TestRealSdkTimeoutWrapping:
         assert type(raised.__cause__) is type(cause)
         assert classify_exception(raised) is expected
 
-    @pytest.mark.parametrize(("cause", "expected"), _TIMEOUT_CAUSES)
+    @pytest.mark.parametrize(("cause_name", "expected"), _ANTHROPIC_TIMEOUT_CAUSES)
     def test_anthropic_timeout_classified_by_cause(
-        self, anthropic_mod: Any, cause: Exception, expected: Disposition
+        self,
+        anthropic_mod: Any,
+        anthropic_httpx_mod: Any,
+        cause_name: str,
+        expected: Disposition,
     ) -> None:
-        raised = _anthropic_failure(anthropic_mod, cause)
+        cause_type = getattr(anthropic_httpx_mod, cause_name)
+        cause = cause_type(f"{cause_name} from Anthropic's transport")
+        raised = _anthropic_failure(anthropic_mod, anthropic_httpx_mod, cause)
 
         assert type(raised).__name__ == "APITimeoutError"
-        assert type(raised.__cause__) is type(cause)
+        assert type(raised.__cause__) is cause_type
         assert classify_exception(raised) is expected
 
     def test_openai_connect_error_still_failover(self, openai_mod: Any) -> None:
@@ -137,6 +163,85 @@ class TestRealSdkTimeoutWrapping:
 
         assert type(raised).__name__ == "APIConnectionError"
         assert classify_exception(raised) is Disposition.POST_SEND_AMBIGUOUS
+
+    def test_anthropic_connect_error_still_failover(
+        self,
+        anthropic_mod: Any,
+        anthropic_httpx_mod: Any,
+    ) -> None:
+        cause = anthropic_httpx_mod.ConnectError("refused")
+        raised = _anthropic_failure(anthropic_mod, anthropic_httpx_mod, cause)
+
+        assert type(raised).__name__ == "APIConnectionError"
+        assert type(raised.__cause__) is anthropic_httpx_mod.ConnectError
+        assert classify_exception(raised) is Disposition.FAILOVER
+
+    def test_anthropic_remote_protocol_error_stays_ambiguous(
+        self,
+        anthropic_mod: Any,
+        anthropic_httpx_mod: Any,
+    ) -> None:
+        cause = anthropic_httpx_mod.RemoteProtocolError("server disconnected")
+        raised = _anthropic_failure(anthropic_mod, anthropic_httpx_mod, cause)
+
+        assert type(raised).__name__ == "APIConnectionError"
+        assert type(raised.__cause__) is anthropic_httpx_mod.RemoteProtocolError
+        assert classify_exception(raised) is Disposition.POST_SEND_AMBIGUOUS
+
+    @pytest.mark.parametrize(
+        ("cause_name", "expected"),
+        [
+            pytest.param("ConnectError", Disposition.FAILOVER, id="connect-error"),
+            pytest.param(
+                "RemoteProtocolError",
+                Disposition.POST_SEND_AMBIGUOUS,
+                id="remote-protocol",
+            ),
+        ],
+    )
+    def test_direct_anthropic_transport_error_uses_send_certainty(
+        self,
+        anthropic_httpx_mod: Any,
+        cause_name: str,
+        expected: Disposition,
+    ) -> None:
+        cause = getattr(anthropic_httpx_mod, cause_name)("direct transport failure")
+
+        assert classify_exception(cause) is expected
+
+    def test_external_connect_error_name_cannot_override_real_httpx2_ancestry(
+        self,
+        anthropic_httpx_mod: Any,
+    ) -> None:
+        class ConnectError(anthropic_httpx_mod.RemoteProtocolError):
+            pass
+
+        cause = ConnectError("post-send protocol failure with a misleading subclass name")
+
+        assert classify_exception(cause) is Disposition.POST_SEND_AMBIGUOUS
+
+    def test_mutated_transport_export_never_executes_class_equality(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        anthropic_httpx_mod: Any,
+    ) -> None:
+        class EqualityTrapMeta(type):
+            comparisons = 0
+
+            def __eq__(cls, other: object) -> bool:
+                type(cls).comparisons += 1
+                raise AssertionError("mutated httpx2.TransportError equality executed")
+
+            __hash__ = type.__hash__
+
+        class MutatedTransportError(Exception, metaclass=EqualityTrapMeta):
+            pass
+
+        cause = anthropic_httpx_mod.RemoteProtocolError("real transport ancestor")
+        monkeypatch.setattr(anthropic_httpx_mod, "TransportError", MutatedTransportError)
+
+        assert _httpx2_transport_names(cause) == frozenset()
+        assert EqualityTrapMeta.comparisons == 0
 
 
 @pytest.mark.unit
@@ -167,3 +272,15 @@ class TestSyntheticWrapperDefaults:
         exc = APITimeoutError("timed out")
         exc.__cause__ = ValueError("something else entirely")
         assert classify_exception(exc) is Disposition.POST_SEND_AMBIGUOUS
+
+    def test_synthetic_httpx2_module_strings_do_not_admit_a_transport_family(self) -> None:
+        class TransportError(Exception):
+            pass
+
+        class ConnectError(TransportError):
+            pass
+
+        TransportError.__module__ = "httpx2"
+        ConnectError.__module__ = "httpx2"
+
+        assert classify_exception(ConnectError("synthetic pre-send name")) is Disposition.FAIL_FAST

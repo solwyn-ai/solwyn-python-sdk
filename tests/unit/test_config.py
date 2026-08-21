@@ -878,6 +878,27 @@ class TestFailoverHopReadTimeout:
                 failover_hop_read_timeout=-1.0,
             )
 
+    @pytest.mark.parametrize("field", ["failover_total_timeout", "failover_hop_read_timeout"])
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            pytest.param(True, id="bool"),
+            pytest.param(float("nan"), id="nan"),
+            pytest.param(float("inf"), id="positive-infinity"),
+            pytest.param(float("-inf"), id="negative-infinity"),
+            pytest.param("not-a-number", id="nonnumeric"),
+        ],
+    )
+    def test_native_timeout_bounds_reject_non_finite_and_non_numeric_values(
+        self, field: str, invalid: object
+    ) -> None:
+        with pytest.raises(ValidationError):
+            SolwynConfig(
+                api_key=VALID_API_KEY,
+                providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+                **{field: invalid},
+            )
+
 
 @pytest.mark.unit
 class TestUnmeteredPostureConfig:

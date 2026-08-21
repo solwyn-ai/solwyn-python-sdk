@@ -11,6 +11,13 @@ numeric status from ``getattr(exc, "status_code", ...)`` (OpenAI/Anthropic) or
 *names* via the MRO rather than the classes themselves. Unknown → ``FAIL_FAST``;
 we never failover into the unknown.
 
+Anthropic 1.x uses the separate ``httpx2`` distribution internally. Core does
+not depend on or import it: an exception is admitted as an httpx2 transport
+error only when its MRO contains the real ``httpx2.TransportError`` provenance
+(matching the already-loaded module's exported class by identity). Within that
+gated family the same safe split applies: ConnectTimeout/PoolTimeout/ConnectError
+are provably pre-send; every other transport error is post-send-possible.
+
 THE ORDERING TRAP (the reason the branch order below is load-bearing).
 ``APITimeoutError`` SUBCLASSES ``APIConnectionError`` in both the
 openai and anthropic SDKs. A read timeout is POST-send: the request may have
@@ -56,8 +63,8 @@ classify purely by name; note ``ReadTimeoutError`` subclasses
 Consequently the checks MUST run in this exact order, narrowest-and-safest
 first:
 
-  1. ``APITimeoutError`` (by MRO name) -> classify by its chained httpx cause:
-       pre-send httpx (ConnectTimeout/PoolTimeout/ConnectError) -> FAILOVER
+  1. ``APITimeoutError`` (by MRO name) -> classify by its chained transport cause:
+       pre-send httpx/httpx2 (ConnectTimeout/PoolTimeout/ConnectError) -> FAILOVER
        read/write/any other/no cause (post-send possible) -> POST_SEND_AMBIGUOUS
   2. httpx ReadTimeout / WriteTimeout, and
      botocore ``ReadTimeoutError`` (by name)  -> POST_SEND_AMBIGUOUS
@@ -77,11 +84,11 @@ first:
        429 / 529 -> FAILOVER
        4xx       -> FAIL_FAST
        5xx       -> POST_SEND_AMBIGUOUS
-  6. ``APIConnectionError`` (by MRO name) -> classify by its chained httpx cause:
-       pre-send httpx (ConnectError/ConnectTimeout/PoolTimeout) -> FAILOVER
-       any other httpx TransportError cause (post-send possible) -> POST_SEND_AMBIGUOUS
-       no inspectable httpx cause -> FAILOVER (canonical connect-refused outage)
-  7. httpx TransportError (any other)         -> POST_SEND_AMBIGUOUS
+  6. ``APIConnectionError`` (by MRO name) -> classify by its chained transport cause:
+       pre-send httpx/httpx2 (ConnectError/ConnectTimeout/PoolTimeout) -> FAILOVER
+       any other recognized TransportError cause (post-send possible) -> POST_SEND_AMBIGUOUS
+       no inspectable transport cause -> FAILOVER (canonical connect-refused outage)
+  7. httpx/httpx2 TransportError (any other)  -> POST_SEND_AMBIGUOUS
   8. default                                  -> FAIL_FAST
 
 Steps 1 and 2 MUST precede step 3 (timeout-before-connection). Step 3 MUST
@@ -100,6 +107,7 @@ request landed.
 from __future__ import annotations
 
 import math
+import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -125,6 +133,45 @@ _POST_SEND_BY_NAME = frozenset(
 # Used both directly (step 3) and as the cause-inspection allowlist for the
 # openai/anthropic wrappers (steps 1 and 6).
 _PRE_SEND_HTTPX = (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ConnectError)
+_PRE_SEND_TRANSPORT_NAMES = frozenset({"ConnectTimeout", "PoolTimeout", "ConnectError"})
+
+
+def _httpx2_transport_names(exc: BaseException) -> frozenset[str]:
+    """Return MRO names only for a proven ``httpx2.TransportError`` family.
+
+    A bare class or module name is insufficient: provider and user exceptions
+    can choose both. The optional module must already be loaded, its exported
+    ``TransportError`` class must appear by identity in the exception MRO, and
+    each returned family name must resolve back to that exact exported class.
+    This keeps recognition scoped without importing Anthropic's transport
+    dependency into core, and prevents an external subclass name from changing
+    the send-certainty of its real httpx2 ancestor.
+    """
+    httpx2_mod = sys.modules.get("httpx2")
+    if httpx2_mod is None:
+        return frozenset()
+    mro = type(exc).__mro__
+    transport_error_type = getattr(httpx2_mod, "TransportError", None)
+    if not isinstance(transport_error_type, type) or not any(
+        mro_class is transport_error_type for mro_class in mro
+    ):
+        return frozenset()
+    return frozenset(cls.__name__ for cls in mro if getattr(httpx2_mod, cls.__name__, None) is cls)
+
+
+def _transport_disposition(exc: BaseException) -> Disposition | None:
+    """Classify recognized httpx/httpx2 transport errors by send certainty."""
+    if isinstance(exc, _PRE_SEND_HTTPX):
+        return Disposition.FAILOVER
+    if isinstance(exc, httpx.TransportError):
+        return Disposition.POST_SEND_AMBIGUOUS
+
+    httpx2_names = _httpx2_transport_names(exc)
+    if not httpx2_names:
+        return None
+    if httpx2_names & _PRE_SEND_TRANSPORT_NAMES:
+        return Disposition.FAILOVER
+    return Disposition.POST_SEND_AMBIGUOUS
 
 
 class Disposition(StrEnum):
@@ -186,7 +233,7 @@ def classify_exception(exc: BaseException) -> Disposition:
     #    bare connection wrapper is canonically connect-refused (pre-send).
     if "APITimeoutError" in names:
         cause = exc.__cause__ or exc.__context__
-        if isinstance(cause, _PRE_SEND_HTTPX):
+        if cause is not None and _transport_disposition(cause) is Disposition.FAILOVER:
             return Disposition.FAILOVER
         return Disposition.POST_SEND_AMBIGUOUS
 
@@ -237,21 +284,22 @@ def classify_exception(exc: BaseException) -> Disposition:
     #    failures (connect refused / DNS / TLS) AND post-send transport drops
     #    (a server disconnect mid-response surfaces as httpx.RemoteProtocolError),
     #    so the class name alone does NOT prove the request never landed. Inspect
-    #    the chained httpx cause: only a pre-send httpx class is failover-safe;
+    #    the chained transport cause: only a recognized pre-send class is failover-safe;
     #    any other transport cause is post-send-possible and stays ambiguous.
     #    Real SDK exceptions always chain a cause; a bare wrapper with no cause is
     #    the canonical connect-refused outage case failover exists to handle.
     if "APIConnectionError" in names:
         cause = exc.__cause__ or exc.__context__
-        if isinstance(cause, _PRE_SEND_HTTPX):
-            return Disposition.FAILOVER
-        if isinstance(cause, httpx.TransportError):
-            return Disposition.POST_SEND_AMBIGUOUS
+        if cause is not None:
+            cause_disposition = _transport_disposition(cause)
+            if cause_disposition is not None:
+                return cause_disposition
         return Disposition.FAILOVER
 
     # 7. Other transport errors (e.g. RemoteProtocolError mid-flight) -> ambiguous.
-    if isinstance(exc, httpx.TransportError):
-        return Disposition.POST_SEND_AMBIGUOUS
+    transport_disposition = _transport_disposition(exc)
+    if transport_disposition is not None:
+        return transport_disposition
 
     # 8. Default: never failover into the unknown.
     return Disposition.FAIL_FAST

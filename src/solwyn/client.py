@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import logging
+import math
+import sys
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator, Mapping
@@ -122,6 +125,9 @@ from solwyn.stream import (
     _AsyncResponsesStreamManagerWrapper,
     _SyncResponsesStreamManagerWrapper,
 )
+
+_HTTPX_CLIENT_TYPES = (httpx.Client, httpx.AsyncClient)
+_HTTPX_TIMEOUT_TYPE = httpx.Timeout
 
 logger = logging.getLogger(__name__)
 
@@ -1006,12 +1012,84 @@ def _hop_httpx_timeout(connect_slice: float, read_timeout: float) -> httpx.Timeo
     buys no failover, it only converts legitimate slow generations into
     ambiguous spend.
     """
-    return httpx.Timeout(
-        connect=connect_slice,
-        read=read_timeout,
-        write=read_timeout,
-        pool=connect_slice,
+    _validate_hop_timeout_bounds(connect_slice, read_timeout)
+    try:
+        return _HTTPX_TIMEOUT_TYPE(
+            connect=connect_slice,
+            read=read_timeout,
+            write=read_timeout,
+            pool=connect_slice,
+        )
+    except Exception as exc:
+        raise RuntimeError("native timeout construction failed") from exc
+
+
+def _validate_hop_timeout_bounds(connect_slice: float, read_timeout: float) -> None:
+    """Enforce the config invariant again before constructing an HTTP timeout."""
+    if any(
+        not (type(value) is int or type(value) is float) or not math.isfinite(value) or value <= 0
+        for value in (connect_slice, read_timeout)
+    ):
+        raise RuntimeError("per-hop timeout bounds must be finite positive numbers")
+
+
+_STATIC_MISSING = object()
+
+
+def _loaded_httpx2_client_types() -> tuple[type[Any], type[Any]] | None:
+    """Return identity-bearing client exports only when httpx2 is loaded."""
+    httpx2_module = sys.modules.get("httpx2")
+    if httpx2_module is None:
+        return None
+    sync_client_type = inspect.getattr_static(httpx2_module, "Client", _STATIC_MISSING)
+    async_client_type = inspect.getattr_static(httpx2_module, "AsyncClient", _STATIC_MISSING)
+    if not isinstance(sync_client_type, type) or not isinstance(async_client_type, type):
+        return None
+    return (
+        cast("type[Any]", sync_client_type),
+        cast("type[Any]", async_client_type),
     )
+
+
+def _uses_loaded_httpx2_client(client: object) -> bool:
+    """Statically prove that a provider owns a loaded httpx2 native client."""
+    native_client = inspect.getattr_static(client, "_client", _STATIC_MISSING)
+    if native_client is _STATIC_MISSING:
+        return False
+    native_client_mro = type(native_client).__mro__
+    if any(
+        mro_class is trusted_class
+        for mro_class in native_client_mro
+        for trusted_class in _HTTPX_CLIENT_TYPES
+    ):
+        return False
+    client_types = _loaded_httpx2_client_types()
+    return client_types is not None and any(
+        mro_class is trusted_class
+        for mro_class in native_client_mro
+        for trusted_class in client_types
+    )
+
+
+def _hop_client_timeout(client: object, connect_slice: float, read_timeout: float) -> object:
+    """Build a granular timeout in the target client's native HTTP stack.
+
+    Provider SDKs can expose ``with_options`` while using incompatible httpx
+    major versions. Statically prove only the native HTTP client identity. A
+    real loaded httpx2 client receives the granular four-tuple that its own SDK
+    converts to its native Timeout; Solwyn never discovers or invokes a mutable
+    runtime Timeout export. Frozen-trusted httpx1 and unknown/synthetic client
+    shapes retain the established httpx Timeout behavior.
+    """
+    _validate_hop_timeout_bounds(connect_slice, read_timeout)
+    if _uses_loaded_httpx2_client(client):
+        return (
+            connect_slice,
+            read_timeout,
+            read_timeout,
+            connect_slice,
+        )
+    return _hop_httpx_timeout(connect_slice, read_timeout)
 
 
 class Deadline:
@@ -1185,7 +1263,11 @@ def _normalize_fallback(fallback: object) -> list[Any]:
 
 
 def _success_failover_reason(
-    *, is_provider_fallback: bool, is_model_fallback: bool, primary_errored: bool
+    *,
+    is_provider_fallback: bool,
+    is_model_fallback: bool,
+    primary_errored: bool,
+    cost_routed: bool = False,
 ) -> FailoverReason | None:
     """Pick the success-path failover reason for a served candidate.
 
@@ -1195,11 +1277,15 @@ def _success_failover_reason(
         ERRORED (a transport failure -> reactive failover).
       * ``CIRCUIT_OPEN`` — the primary was SKIPPED because its breaker was
         already OPEN (proactive reroute; the primary was never attempted here).
+      * ``COST_ROUTED`` — a price-signal policy selected a healthy cross-provider
+        candidate before the healthy primary, and that candidate served first.
       * ``MODEL_FALLBACK`` — a same-provider model swap.
     ``None`` for a primary success.
     """
     if is_provider_fallback:
-        return FailoverReason.PRIMARY_ERROR if primary_errored else FailoverReason.CIRCUIT_OPEN
+        if primary_errored:
+            return FailoverReason.PRIMARY_ERROR
+        return FailoverReason.COST_ROUTED if cost_routed else FailoverReason.CIRCUIT_OPEN
     if is_model_fallback:
         return FailoverReason.MODEL_FALLBACK
     return None
@@ -1912,7 +1998,7 @@ class Solwyn(_SolwynBase):
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(
-                timeout=_hop_httpx_timeout(timeout, read_timeout),
+                timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
             )
         if surface == "responses":
@@ -1959,7 +2045,7 @@ class Solwyn(_SolwynBase):
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(
-                timeout=_hop_httpx_timeout(timeout, read_timeout),
+                timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
             )
         method, call_kwargs = _media_prepare(
@@ -2060,8 +2146,6 @@ class Solwyn(_SolwynBase):
         )
         deadline.replace_total(tuning.failover_total_timeout)
         self._solwyn_reporter.observe_project_id(budget.project_id)
-        if budget.price_hints is not None:
-            self.update_price_hints(budget.price_hints)
 
         if not budget.allowed:
             _report_budget_denial(
@@ -2389,13 +2473,6 @@ class Solwyn(_SolwynBase):
         )
         deadline.replace_total(tuning.failover_total_timeout)
         self._solwyn_reporter.observe_project_id(budget.project_id)
-        # Refresh the CostPolicy signal from the server. Price hints are advisory
-        # and slow-moving, so they PERSIST across hint-less responses — a budget
-        # cache hit (price_hints None) leaves the last-known hints in place; we
-        # only overwrite when the server actually returns hints. The SDK never
-        # computes price — it only forwards this relative signal.
-        if budget.price_hints is not None:
-            self.update_price_hints(budget.price_hints)
 
         if not budget.allowed:
             # Report estimated tokens so the API keeps an accurate running total
@@ -2437,12 +2514,14 @@ class Solwyn(_SolwynBase):
         allow_ambiguous_failover = effective_idempotency == "always"
 
         # 4. Router returns ordered, health-filtered candidates (non-mutating reads).
-        candidates = self._select_candidates(
+        selection = self._select_candidates_detailed(
             RoutingRequest(
                 requested_provider=primary.entry.provider,
                 estimated_input_tokens=est_in,
-            )
+            ),
+            price_hints=budget.price_hints,
         )
+        candidates = selection.runtimes
         if not allow_cross_provider:
             candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
         if _surface == "responses":
@@ -2483,9 +2562,12 @@ class Solwyn(_SolwynBase):
             # walk? Drives the cross-provider success reason (PRIMARY_ERROR if the
             # primary was attempted and raised; CIRCUIT_OPEN if it was skipped OPEN).
             primary_errored = False
+            primary_reached = False
             for idx, rt in enumerate(candidates):
                 if deadline.expired():
                     break
+                if rt is primary:
+                    primary_reached = True
                 provider = rt.adapter.name
                 cb = self._get_circuit_breaker(provider)
                 admission = cb.admit()  # probe CONSUMED only here, for the attempted candidate
@@ -2720,6 +2802,7 @@ class Solwyn(_SolwynBase):
                                 requested_model=requested_model,
                                 is_model_fallback=is_model_fallback,
                                 primary_errored=primary_errored,
+                                cost_routed=selection.cost_routed and not primary_reached,
                                 call_id=call_id,
                                 agent_run=agent_run,
                                 estimated_input_tokens=est_in,
@@ -2750,6 +2833,7 @@ class Solwyn(_SolwynBase):
                         requested_model=requested_model,
                         is_model_fallback=is_model_fallback,
                         primary_errored=primary_errored,
+                        cost_routed=selection.cost_routed and not primary_reached,
                         call_id=call_id,
                         agent_run=agent_run,
                         estimated_input_tokens=est_in,
@@ -2830,6 +2914,7 @@ class Solwyn(_SolwynBase):
                         is_provider_fallback=is_provider_fallback,
                         is_model_fallback=is_model_fallback,
                         primary_errored=primary_errored,
+                        cost_routed=selection.cost_routed and not primary_reached,
                     ),
                     attempt_index=chain_index,
                     call_id=call_id,
@@ -2879,6 +2964,7 @@ class Solwyn(_SolwynBase):
         estimate_empty_usage: bool = False,
         velocity_flags: Collection[str] = (),
         on_error: Callable[[BaseException], None] | None = None,
+        cost_routed: bool = False,
     ) -> Any:
         """Wrap a streaming response, settling against the SERVED runtime.
 
@@ -2956,6 +3042,7 @@ class Solwyn(_SolwynBase):
                     is_provider_fallback=is_provider_fallback,
                     is_model_fallback=is_model_fallback,
                     primary_errored=primary_errored,
+                    cost_routed=cost_routed,
                 ),
                 attempt_index=ctx.attempt_index,
                 call_id=call_id,
@@ -3415,7 +3502,7 @@ class AsyncSolwyn(_SolwynBase):
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(
-                timeout=_hop_httpx_timeout(timeout, read_timeout),
+                timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
             )
         if surface == "responses":
@@ -3464,7 +3551,7 @@ class AsyncSolwyn(_SolwynBase):
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(
-                timeout=_hop_httpx_timeout(timeout, read_timeout),
+                timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
             )
         method, call_kwargs = _media_prepare(
@@ -3544,8 +3631,6 @@ class AsyncSolwyn(_SolwynBase):
         )
         deadline.replace_total(tuning.failover_total_timeout)
         self._solwyn_reporter.observe_project_id(budget.project_id)
-        if budget.price_hints is not None:
-            self.update_price_hints(budget.price_hints)
 
         if not budget.allowed:
             _report_budget_denial(
@@ -3829,11 +3914,6 @@ class AsyncSolwyn(_SolwynBase):
         )
         deadline.replace_total(tuning.failover_total_timeout)
         self._solwyn_reporter.observe_project_id(budget.project_id)
-        # Refresh the CostPolicy signal from the server. Hints PERSIST across
-        # hint-less responses (cache hits) until the server sends new ones — see
-        # the sync _intercepted_call for the rationale.
-        if budget.price_hints is not None:
-            self.update_price_hints(budget.price_hints)
 
         if not budget.allowed:
             # See the sync _intercepted_call: region rides the denied event.
@@ -3870,12 +3950,14 @@ class AsyncSolwyn(_SolwynBase):
         allow_cross_provider = effective_idempotency != "never"
         allow_ambiguous_failover = effective_idempotency == "always"
 
-        candidates = self._select_candidates(
+        selection = self._select_candidates_detailed(
             RoutingRequest(
                 requested_provider=primary.entry.provider,
                 estimated_input_tokens=est_in,
-            )
+            ),
+            price_hints=budget.price_hints,
         )
+        candidates = selection.runtimes
         if not allow_cross_provider:
             candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
         if _surface == "responses":
@@ -3915,9 +3997,12 @@ class AsyncSolwyn(_SolwynBase):
             # walk? Drives the cross-provider success reason (PRIMARY_ERROR if the
             # primary was attempted and raised; CIRCUIT_OPEN if it was skipped OPEN).
             primary_errored = False
+            primary_reached = False
             for idx, rt in enumerate(candidates):
                 if deadline.expired():
                     break
+                if rt is primary:
+                    primary_reached = True
                 provider = rt.adapter.name
                 cb = self._get_circuit_breaker(provider)
                 admission = cb.admit()
@@ -4142,6 +4227,7 @@ class AsyncSolwyn(_SolwynBase):
                                 requested_model=requested_model,
                                 is_model_fallback=is_model_fallback,
                                 primary_errored=primary_errored,
+                                cost_routed=selection.cost_routed and not primary_reached,
                                 call_id=call_id,
                                 agent_run=agent_run,
                                 estimated_input_tokens=est_in,
@@ -4172,6 +4258,7 @@ class AsyncSolwyn(_SolwynBase):
                         requested_model=requested_model,
                         is_model_fallback=is_model_fallback,
                         primary_errored=primary_errored,
+                        cost_routed=selection.cost_routed and not primary_reached,
                         call_id=call_id,
                         agent_run=agent_run,
                         estimated_input_tokens=est_in,
@@ -4251,6 +4338,7 @@ class AsyncSolwyn(_SolwynBase):
                         is_provider_fallback=is_provider_fallback,
                         is_model_fallback=is_model_fallback,
                         primary_errored=primary_errored,
+                        cost_routed=selection.cost_routed and not primary_reached,
                     ),
                     attempt_index=chain_index,
                     call_id=call_id,
@@ -4300,6 +4388,7 @@ class AsyncSolwyn(_SolwynBase):
         estimate_empty_usage: bool = False,
         velocity_flags: Collection[str] = (),
         on_error: Callable[[BaseException], Awaitable[None]] | None = None,
+        cost_routed: bool = False,
     ) -> Any:
         """Wrap an async streaming response, settling against the SERVED runtime.
 
@@ -4375,6 +4464,7 @@ class AsyncSolwyn(_SolwynBase):
                     is_provider_fallback=is_provider_fallback,
                     is_model_fallback=is_model_fallback,
                     primary_errored=primary_errored,
+                    cost_routed=cost_routed,
                 ),
                 attempt_index=ctx.attempt_index,
                 call_id=call_id,

@@ -879,7 +879,18 @@ churn so losing an exact identifier can suppress a signal but can never invent o
 
 Failover and routing (`model=`, `fallback=`, `provider=`, `default_params=`, `selection_policy=`, and the failover tuning knobs) are configured in code only — they take client objects and policies, not strings. See [Provider Failover](https://docs.solwyn.ai/docs/sdk/guides/provider-failover) and [Configuration](https://docs.solwyn.ai/docs/sdk/guides/configuration).
 
-`CostPolicy` is not yet active: the API does not send price hints yet, so selecting it currently falls back to health-based ordering (it logs a one-time warning when it does).
+`CostPolicy` orders eligible providers by health and then by server-provided
+relative price hints for that request; the SDK never computes prices locally.
+Every budget check opts into server hints with `price_hints_version: "1"`.
+A populated hint mapping can place a cheaper healthy provider ahead of a
+healthy primary; when that provider serves, failover metadata reports
+`cost_routed`. An empty mapping (`{}`) means the server explicitly supplied no
+hints, while `null` means the check carried no hints and triggers the one-time
+no-hints warning. The allow-cache is a bounded 16-entry LRU with the same
+5-second TTL, keyed by provider, model, fallback chain, and modality; a cache
+hit replays only its own entry's hints. Lease-backed `solwyn.run()` calls carry
+no hints, so `CostPolicy` keeps configured order there until lease grants carry
+hints.
 
 Use env vars to avoid passing credentials in code:
 

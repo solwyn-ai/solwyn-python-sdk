@@ -17,6 +17,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Literal, cast, get_args
 
@@ -83,6 +84,10 @@ _RENEWAL_TIMEOUT_S = 5.0
 # background work, but background must still be bounded: one client owns at
 # most this many renewal threads/tasks regardless of run cardinality.
 _MAX_RENEWAL_WORKERS = 4
+
+# Allow-cache entries are bounded independently from sticky deny state. The
+# key is the server-priced chain shape; estimates are deliberately excluded.
+_ALLOW_CACHE_MAX_ENTRIES = 16
 
 # What a grant round-trip resolved to, from the admission path's point of view.
 # "legacy" means "the plane answered, but this run takes the per-call path".
@@ -160,9 +165,25 @@ class BudgetCheckResult(BaseModel):
     # contract; client error/settlement paths must echo it back to the ledger.
     lease_claim_token: int | None = Field(default=None, exclude=True, repr=False)
     # Server-provided RELATIVE price signal per provider for cost routing
-    # (CostPolicy). The SDK never computes price. None on the cache path.
+    # (CostPolicy). The SDK never computes price. None when not provided.
     price_hints: dict[str, float] | None = None
     failover_tuning_allowed: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _AllowCacheKey:
+    provider: str
+    model: str
+    fallback_providers: tuple[str, ...]
+    fallback_models: tuple[str, ...]
+    modality: str
+
+
+def _str_keyed_hints(response: BudgetCheckResponse) -> dict[str, float] | None:
+    """Return the API's provider-relative price hints for routing consumers."""
+    if response.price_hints is None:
+        return None
+    return {provider.value: hint for provider, hint in response.price_hints.items()}
 
 
 class _BudgetEnforcerBase:
@@ -206,9 +227,10 @@ class _BudgetEnforcerBase:
         self._last_known_budget_limit: float | None = None
         self._last_known_current_usage: float = 0.0
 
-        # Cache for allow decisions (never cache deny)
-        self._cached_response: BudgetCheckResponse | None = None
-        self._cache_expires_at: float = 0.0
+        # Cache allow decisions by their server-priced chain (never cache deny).
+        self._allow_cache: OrderedDict[_AllowCacheKey, tuple[BudgetCheckResponse, float]] = (
+            OrderedDict()
+        )
 
         # Sticky hard-deny state from the last authoritative cloud denial.
         # This is not a cache substitute: live cloud checks still run, but an
@@ -300,16 +322,53 @@ class _BudgetEnforcerBase:
             tags=dict(tags) if tags is not None else None,
             failover_directive_version="1",
             run_directive_version="1",
+            price_hints_version="1",
         )
 
-    def _should_use_cache(self) -> bool:
-        """Return True if we have a valid cached allow response."""
-        with self._state_lock:
-            return (
-                self._cached_response is not None
-                and self._cached_response.allowed
-                and time.monotonic() < self._cache_expires_at
-            )
+    @staticmethod
+    def _allow_cache_key(
+        *,
+        provider: str,
+        model: str,
+        fallback_providers: Sequence[str],
+        fallback_models: Sequence[str],
+        modality: str,
+    ) -> _AllowCacheKey:
+        """Build the cache cohort for one priced provider/model chain."""
+        return _AllowCacheKey(
+            provider=provider,
+            model=model,
+            fallback_providers=tuple(fallback_providers),
+            fallback_models=tuple(fallback_models),
+            modality=modality,
+        )
+
+    def _cached_allow_locked(self, key: _AllowCacheKey) -> BudgetCheckResponse | None:
+        """Return this key's live allow, evicting it if it has expired.
+
+        The caller holds ``_state_lock`` so validity, recency and the returned
+        response snapshot stay one atomic operation for sync and async paths.
+        """
+        cached = self._allow_cache.get(key)
+        if cached is None:
+            return None
+        response, expires_at = cached
+        if not response.allowed or time.monotonic() >= expires_at:
+            self._allow_cache.pop(key, None)
+            return None
+        self._allow_cache.move_to_end(key)
+        return response
+
+    def _store_allow_locked(self, key: _AllowCacheKey, response: BudgetCheckResponse) -> None:
+        """Insert or refresh a cacheable allow while ``_state_lock`` is held."""
+        self._allow_cache[key] = (response, time.monotonic() + self.cache_ttl)
+        self._allow_cache.move_to_end(key)
+        while len(self._allow_cache) > _ALLOW_CACHE_MAX_ENTRIES:
+            self._allow_cache.popitem(last=False)
+
+    def _clear_allow_cache_locked(self) -> None:
+        """Discard all cached allows while ``_state_lock`` is held."""
+        self._allow_cache.clear()
 
     def _cache_response(
         self,
@@ -317,6 +376,7 @@ class _BudgetEnforcerBase:
         *,
         agent_run_id: str | None = None,
         cache_allowed_response: bool = True,
+        cache_key: _AllowCacheKey | None = None,
         request_epoch: float | None = None,
         observed_at: float | None = None,
     ) -> BudgetCheckResponse:
@@ -362,6 +422,7 @@ class _BudgetEnforcerBase:
                 response,
                 agent_run_id=agent_run_id,
                 cache_allowed_response=cache_allowed_response,
+                cache_key=cache_key,
                 request_epoch=request_epoch,
                 observed_at=observed_at,
             )
@@ -469,6 +530,7 @@ class _BudgetEnforcerBase:
         *,
         agent_run_id: str | None,
         cache_allowed_response: bool = True,
+        cache_key: _AllowCacheKey | None = None,
         request_epoch: float | None = None,
         observed_at: float | None = None,
     ) -> None:
@@ -488,16 +550,14 @@ class _BudgetEnforcerBase:
                 # create the very registry/sticky split the epoch work closes.
                 self._run_hard_deny_responses.pop(agent_run_id, None)
                 self._run_hard_deny_observed_at.pop(agent_run_id, None)
-            elif cache_allowed_response:
-                self._cached_response = response
-                self._cache_expires_at = time.monotonic() + self.cache_ttl
+            elif cache_allowed_response and cache_key is not None:
+                self._store_allow_locked(cache_key, response)
             return
 
         if response.mode != BudgetMode.HARD_DENY:
             self._last_hard_deny_response = None
             self._clear_run_sticky_locked(agent_run_id, request_epoch)
-            self._cached_response = None
-            self._cache_expires_at = 0.0
+            self._clear_allow_cache_locked()
             return
 
         if response.denied_by_period == "tag":
@@ -512,8 +572,7 @@ class _BudgetEnforcerBase:
             if agent_run_id is None:
                 # Contract drift left no run identity to scope by. Fall back to
                 # the safe global posture used before run-scoped labels existed.
-                self._cached_response = None
-                self._cache_expires_at = 0.0
+                self._clear_allow_cache_locked()
                 if self._last_hard_deny_response is None:
                     self._last_hard_deny_response = response
                 return
@@ -528,8 +587,7 @@ class _BudgetEnforcerBase:
                 self._run_hard_deny_observed_at.pop(evicted_run_id, None)
             return
 
-        self._cached_response = None
-        self._cache_expires_at = 0.0
+        self._clear_allow_cache_locked()
         self._last_hard_deny_response = response
         # Deny responses are never cached as freshness-skipping allows/denies.
 
@@ -787,11 +845,7 @@ class _BudgetEnforcerBase:
         # Server-provided RELATIVE price hints (cost routing); str-keyed for the
         # routing layer. None when the server has not provided them. The SDK
         # never computes price — it only forwards this signal to CostPolicy.
-        price_hints = (
-            {provider.value: hint for provider, hint in response.price_hints.items()}
-            if response.price_hints is not None
-            else None
-        )
+        price_hints = _str_keyed_hints(response)
         failover_tuning_allowed = (
             response.failover_directive.failover_tuning_allowed
             if response.failover_directive is not None
@@ -2000,14 +2054,17 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         # Use cache if valid (only allow decisions are cached).
         # Snapshot under the lock to avoid a TOCTOU race between the validity
         # check and reading the cached fields.
+        cache_key = self._allow_cache_key(
+            provider=provider,
+            model=model,
+            fallback_providers=fallback_providers,
+            fallback_models=fallback_models,
+            modality=modality,
+        )
         if agent_run_id is None and tags is None:
             with self._state_lock:
-                cached = self._cached_response
-                if (
-                    cached is not None
-                    and cached.allowed
-                    and time.monotonic() < self._cache_expires_at
-                ):
+                cached = self._cached_allow_locked(cache_key)
+                if cached is not None:
                     return BudgetCheckResult(
                         allowed=True,
                         remaining_budget=cached.remaining_budget,
@@ -2017,6 +2074,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                         budget_limit=cached.budget_limit,
                         current_usage=cached.current_usage,
                         denied_by_period=cached.denied_by_period,
+                        price_hints=_str_keyed_hints(cached),
                     )
 
         breaker = self._control_plane_breaker
@@ -2125,6 +2183,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     cloud_response,
                     agent_run_id=agent_run_id,
                     cache_allowed_response=tags is None,
+                    cache_key=cache_key,
                     request_epoch=request_epoch,
                 )
             if breaker is not None:
@@ -2634,20 +2693,28 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             if leased is not None:
                 return leased
 
-        if agent_run_id is None and tags is None and self._should_use_cache():
-            cached = self._cached_response
-            if cached is None:
-                raise RuntimeError("_should_use_cache returned True but cache is None")
-            return BudgetCheckResult(
-                allowed=True,
-                remaining_budget=cached.remaining_budget,
-                project_id=cached.project_id,
-                reservation_id=None,  # Don't reuse — each call needs its own reservation
-                mode=cached.mode,
-                budget_limit=cached.budget_limit,
-                current_usage=cached.current_usage,
-                denied_by_period=cached.denied_by_period,
-            )
+        cache_key = self._allow_cache_key(
+            provider=provider,
+            model=model,
+            fallback_providers=fallback_providers,
+            fallback_models=fallback_models,
+            modality=modality,
+        )
+        if agent_run_id is None and tags is None:
+            with self._state_lock:
+                cached = self._cached_allow_locked(cache_key)
+                if cached is not None:
+                    return BudgetCheckResult(
+                        allowed=True,
+                        remaining_budget=cached.remaining_budget,
+                        project_id=cached.project_id,
+                        reservation_id=None,  # Don't reuse — each call needs its own reservation
+                        mode=cached.mode,
+                        budget_limit=cached.budget_limit,
+                        current_usage=cached.current_usage,
+                        denied_by_period=cached.denied_by_period,
+                        price_hints=_str_keyed_hints(cached),
+                    )
 
         breaker = self._control_plane_breaker
         admission = breaker.admit() if breaker is not None else None
@@ -2755,6 +2822,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                     cloud_response,
                     agent_run_id=agent_run_id,
                     cache_allowed_response=tags is None,
+                    cache_key=cache_key,
                     request_epoch=request_epoch,
                 )
             if breaker is not None:
