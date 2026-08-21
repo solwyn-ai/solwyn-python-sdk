@@ -11,9 +11,10 @@ mutate a breaker (inspection-vs-consumption rule).
 from __future__ import annotations
 
 import types
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
+from conftest import VALID_API_KEY, make_mock_client
 
 from solwyn._routing import (
     CostPolicy,
@@ -23,6 +24,7 @@ from solwyn._routing import (
     RoutingRequest,
 )
 from solwyn._types import CircuitState, ProviderName
+from solwyn.client import Solwyn
 
 
 def _candidate(
@@ -48,6 +50,17 @@ def _candidate(
 
 def _req() -> RoutingRequest:
     return RoutingRequest(requested_provider=ProviderName.OPENAI)
+
+
+def _routing_client(base_url: str) -> MagicMock:
+    client = make_mock_client()
+    client.base_url = base_url
+    return client
+
+
+def _close(solwyn: Solwyn) -> None:
+    solwyn._solwyn_reporter._http.close()
+    solwyn._solwyn_budget._http.close()
 
 
 @pytest.mark.unit
@@ -299,6 +312,50 @@ def test_cost_policy_none_price_sorts_last() -> None:
 
     # Assert — a known hint outranks a missing hint in the same tier
     assert [c.runtime.tag for c in ordered] == ["known", "unknown"]
+
+
+@pytest.mark.unit
+def test_select_candidates_orders_api_ratios_and_sinks_an_unhinted_provider() -> None:
+    """Catches routing that ignores a zero ratio or lets an unhinted runtime outrank hints."""
+    openai = _routing_client("https://api.openai.com/v1")
+    together = _routing_client("https://api.together.xyz/v1")
+    anthropic = make_mock_client(module="anthropic._client", name="Anthropic")
+    ollama = _routing_client("http://localhost:11434/v1")
+    unhinted = _routing_client("https://api.some-new-vendor.example/v1")
+    wire_price_hints = {
+        "together": 1.0,
+        "openai": 4.7,
+        "anthropic": 9.3,
+        "ollama": 0.0,
+    }
+    expected_hinted = [
+        provider for provider, _ in sorted(wire_price_hints.items(), key=lambda item: item[1])
+    ]
+
+    with patch("solwyn.reporter.MetadataReporter._flush_loop"):
+        solwyn = Solwyn(
+            openai,
+            api_key=VALID_API_KEY,
+            model="gpt-5.4-nano",
+            fallback=[
+                (anthropic, "claude-haiku-4-5"),
+                (unhinted, "vendor/model"),
+                (together, "meta-llama/Llama-3.3-70B-Instruct-Turbo"),
+                (ollama, "llama3.2"),
+            ],
+            selection_policy=CostPolicy(),
+        )
+    solwyn._solwyn_reporter._shutdown.set()
+    solwyn._solwyn_reporter._thread.join(timeout=2.0)
+    try:
+        ordered = solwyn._select_candidates(_req(), price_hints=wire_price_hints)
+
+        assert [runtime.adapter.name for runtime in ordered] == [
+            *expected_hinted,
+            "openai_compatible",
+        ]
+    finally:
+        _close(solwyn)
 
 
 @pytest.mark.unit
