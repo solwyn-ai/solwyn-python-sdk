@@ -284,3 +284,111 @@ class TestSyntheticWrapperDefaults:
         ConnectError.__module__ = "httpx2"
 
         assert classify_exception(ConnectError("synthetic pre-send name")) is Disposition.FAIL_FAST
+
+
+# Both stacks export the same transport class names. The parity contract: an
+# httpx2 exception must be classified at the SAME position in
+# ``classify_exception`` as its httpx1 twin, so no later branch (by-name or
+# numeric-status) can settle one stack while the transport branch settles the
+# other. Names either stack lacks are skipped rather than assumed.
+_TRANSPORT_PARITY_NAMES = [
+    "ConnectTimeout",
+    "PoolTimeout",
+    "ConnectError",
+    "ReadTimeout",
+    "WriteTimeout",
+    "RemoteProtocolError",
+    "ReadError",
+    "WriteError",
+    "ProxyError",
+    "LocalProtocolError",
+]
+
+
+def _with_attribute(exc: Any, attribute: str, value: int) -> Any:
+    """Attach a numeric status to a transport exception (the shadowing bait)."""
+    setattr(exc, attribute, value)
+    return exc
+
+
+@pytest.mark.unit
+class TestTransportStackParity:
+    """httpx2 transport errors classify exactly like their httpx1 twins."""
+
+    @pytest.mark.parametrize("class_name", _TRANSPORT_PARITY_NAMES)
+    def test_both_stacks_agree_and_ignore_an_attached_status(
+        self,
+        anthropic_httpx_mod: Any,
+        class_name: str,
+    ) -> None:
+        # Arrange: the same transport class from each stack.
+        httpx1_type = getattr(httpx, class_name, None)
+        httpx2_type = getattr(anthropic_httpx_mod, class_name, None)
+        if httpx1_type is None or httpx2_type is None:
+            pytest.skip(f"{class_name} is not exported by both transport stacks")
+
+        # A PROVEN transport class settles send certainty on its own; the
+        # bare httpx1 disposition is the reference both stacks must match.
+        expected = classify_exception(httpx1_type("bare transport failure"))
+
+        for exc_type in (httpx1_type, httpx2_type):
+            # Act + Assert: bare, then with each status carrier a provider SDK
+            # might attach. 429 would mean FAILOVER at the status branch (the
+            # double-spend direction for a post-send error) and 500 would mean
+            # POST_SEND_AMBIGUOUS (the stranded-chain direction for a pre-send
+            # error) — transport-class certainty must win over both.
+            assert classify_exception(exc_type("bare transport failure")) is expected
+            assert (
+                classify_exception(
+                    _with_attribute(exc_type("with status_code"), "status_code", 429)
+                )
+                is expected
+            )
+            assert (
+                classify_exception(_with_attribute(exc_type("with code"), "code", 500)) is expected
+            )
+
+    def test_lazy_module_attribute_name_in_the_mro_never_imports(
+        self,
+        anthropic_httpx_mod: Any,
+    ) -> None:
+        # httpx2/__init__.py defines a module-level __getattr__ that
+        # lazy-imports on the name "main" (pulling in click, an optional CLI
+        # dependency). A dynamic getattr during family recognition would let an
+        # MRO class with that name raise ModuleNotFoundError out of the
+        # classifier — inside the dispatch except-handler, over the provider's
+        # own exception. Recognition must be STATIC.
+        class main(anthropic_httpx_mod.TransportError):  # noqa: N801 - the lazy hook's name
+            pass
+
+        assert classify_exception(main("post-send drop")) is Disposition.POST_SEND_AMBIGUOUS
+
+    @pytest.mark.parametrize(
+        ("base_name", "subclass_name", "expected"),
+        [
+            pytest.param(
+                "ReadTimeout",
+                "ConnectTimeout",
+                Disposition.POST_SEND_AMBIGUOUS,
+                id="pre-send-name-over-post-send-ancestor",
+            ),
+            pytest.param(
+                "ConnectTimeout",
+                "ReadTimeout",
+                Disposition.FAILOVER,
+                id="post-send-name-over-pre-send-ancestor",
+            ),
+        ],
+    )
+    def test_send_certainty_follows_ancestry_not_the_subclass_name(
+        self,
+        anthropic_httpx_mod: Any,
+        base_name: str,
+        subclass_name: str,
+        expected: Disposition,
+    ) -> None:
+        # An external subclass can pick any name; only the real httpx2 ancestor
+        # it inherits from proves whether the request could have landed.
+        subclass = type(subclass_name, (getattr(anthropic_httpx_mod, base_name),), {})
+
+        assert classify_exception(subclass("misleadingly named")) is expected
