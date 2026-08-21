@@ -209,6 +209,17 @@ class TestRealSdkTimeoutWrapping:
 
         assert classify_exception(cause) is expected
 
+    def test_external_connect_error_name_cannot_override_real_httpx2_ancestry(
+        self,
+        anthropic_httpx_mod: Any,
+    ) -> None:
+        class ConnectError(anthropic_httpx_mod.RemoteProtocolError):
+            pass
+
+        cause = ConnectError("post-send protocol failure with a misleading subclass name")
+
+        assert classify_exception(cause) is Disposition.POST_SEND_AMBIGUOUS
+
 
 @pytest.mark.unit
 class TestSyntheticWrapperDefaults:
@@ -238,3 +249,15 @@ class TestSyntheticWrapperDefaults:
         exc = APITimeoutError("timed out")
         exc.__cause__ = ValueError("something else entirely")
         assert classify_exception(exc) is Disposition.POST_SEND_AMBIGUOUS
+
+    def test_synthetic_httpx2_module_strings_do_not_admit_a_transport_family(self) -> None:
+        class TransportError(Exception):
+            pass
+
+        class ConnectError(TransportError):
+            pass
+
+        TransportError.__module__ = "httpx2"
+        ConnectError.__module__ = "httpx2"
+
+        assert classify_exception(ConnectError("synthetic pre-send name")) is Disposition.FAIL_FAST

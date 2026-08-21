@@ -14,9 +14,9 @@ we never failover into the unknown.
 Anthropic 1.x uses the separate ``httpx2`` distribution internally. Core does
 not depend on or import it: an exception is admitted as an httpx2 transport
 error only when its MRO contains the real ``httpx2.TransportError`` provenance
-(matching both class name and module root). Within that gated family the same
-safe split applies: ConnectTimeout/PoolTimeout/ConnectError are provably
-pre-send; every other transport error is post-send-possible.
+(matching the already-loaded module's exported class by identity). Within that
+gated family the same safe split applies: ConnectTimeout/PoolTimeout/ConnectError
+are provably pre-send; every other transport error is post-send-possible.
 
 THE ORDERING TRAP (the reason the branch order below is load-bearing).
 ``APITimeoutError`` SUBCLASSES ``APIConnectionError`` in both the
@@ -107,6 +107,7 @@ request landed.
 from __future__ import annotations
 
 import math
+import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -138,18 +139,22 @@ _PRE_SEND_TRANSPORT_NAMES = frozenset({"ConnectTimeout", "PoolTimeout", "Connect
 def _httpx2_transport_names(exc: BaseException) -> frozenset[str]:
     """Return MRO names only for a proven ``httpx2.TransportError`` family.
 
-    A bare class name is insufficient: provider and user exceptions can choose
-    the same names. Requiring the ``TransportError`` base to originate from the
-    ``httpx2`` module keeps this optional-dependency recognition scoped without
-    importing Anthropic's private transport dependency into core.
+    A bare class or module name is insufficient: provider and user exceptions
+    can choose both. The optional module must already be loaded, its exported
+    ``TransportError`` class must appear by identity in the exception MRO, and
+    each returned family name must resolve back to that exact exported class.
+    This keeps recognition scoped without importing Anthropic's transport
+    dependency into core, and prevents an external subclass name from changing
+    the send-certainty of its real httpx2 ancestor.
     """
-    mro = type(exc).__mro__
-    if not any(
-        cls.__name__ == "TransportError" and cls.__module__.partition(".")[0] == "httpx2"
-        for cls in mro
-    ):
+    httpx2_mod = sys.modules.get("httpx2")
+    if httpx2_mod is None:
         return frozenset()
-    return frozenset(cls.__name__ for cls in mro)
+    mro = type(exc).__mro__
+    transport_error_type = getattr(httpx2_mod, "TransportError", None)
+    if not isinstance(transport_error_type, type) or transport_error_type not in mro:
+        return frozenset()
+    return frozenset(cls.__name__ for cls in mro if getattr(httpx2_mod, cls.__name__, None) is cls)
 
 
 def _transport_disposition(exc: BaseException) -> Disposition | None:
