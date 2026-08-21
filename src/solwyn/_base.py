@@ -178,10 +178,13 @@ def _wire_token_quantity(value: int) -> int:
     return min(max(value, 0), ORDINARY_TOKEN_COUNT_MAX)
 
 
-# CostPolicy is inert until the server sends a relative price hint: with no hint
-# on any candidate it degrades to health-based ordering. Warn ONCE per process
-# when that fallback is in effect so the no-op is visible without logging on
-# every routed call. Lock-guarded because the sync client is multi-threaded.
+# CostPolicy is inert when the request carried NO hint map at all
+# (``price_hints is None`` — a legacy/lease/outage response that never priced
+# this chain): it degrades to health-based ordering. Warn ONCE per process when
+# that fallback is in effect so the no-op is visible without logging on every
+# routed call. An explicit empty map (``{}`` — the server priced the chain and
+# found nothing priceable) is a deliberate server answer and degrades silently.
+# Lock-guarded because the sync client is multi-threaded.
 _cost_policy_inactive_warned = False
 _cost_policy_warn_lock = threading.Lock()
 
@@ -1443,8 +1446,8 @@ class _SolwynBase:
     def _reset_after_fork_in_child(self) -> None:
         """Replace locks and clear process-local velocity state in a child.
 
-        Latency windows, price hints, breakers, and the control-plane breaker
-        are plain state the child legitimately inherits (the breakers repair
+        Latency windows, breakers, and the control-plane breaker are plain
+        state the child legitimately inherits (the breakers repair
         their own internal locks via their own registration). Run velocity is
         process-local and starts empty with a fresh lock.
         """
@@ -1603,6 +1606,11 @@ class _SolwynBase:
         reads only (``state`` / ``recovery_eligible``) — never ``admit()``
         (which consumes a probe). Probe consumption happens exactly once, on the
         single candidate actually attempted, in the dispatch loop.
+
+        ``CandidateSelection.cost_routed`` is True iff a price-signal policy put
+        a CLOSED, hinted, DIFFERENT-provider candidate first while the CLOSED
+        primary was either unhinted or hinted STRICTLY HIGHER. It is attribution
+        only — it never changes the order the policy returned.
         """
         # Signal capability gate (PJ-9/P4): the default HealthBasedPolicy
         # ignores latency_p50 and price_hint, so skip the median unless the
@@ -1640,6 +1648,15 @@ class _SolwynBase:
             (candidate for candidate in ordered if candidate.runtime is primary),
             None,
         )
+        # cost_routed iff a price-signal policy put a CLOSED, hinted,
+        # different-provider candidate first while the CLOSED primary was either
+        # unhinted or hinted STRICTLY HIGHER. The final conjunct is a plain
+        # comparison of the server's own relative hints (the SDK never does
+        # arithmetic on them): it stops a custom injected policy — which gets
+        # hints by default, since ``uses_price_signal`` is opt-out — from
+        # labelling a pricier hop "cost routed". CostPolicy's stable ascending
+        # sort can never trip it: if its first candidate is not the primary, its
+        # hint is already strictly lower or the primary is unhinted.
         cost_routed = (
             wants_price
             and first is not None
@@ -1649,10 +1666,14 @@ class _SolwynBase:
             and primary_cand.breaker_state is CircuitState.CLOSED
             and first.breaker_state is CircuitState.CLOSED
             and first.price_hint is not None
+            and (primary_cand.price_hint is None or first.price_hint < primary_cand.price_hint)
         )
         if isinstance(self._solwyn_policy, CostPolicy) and price_hints is None:
-            # CostPolicy was selected but no candidate carries a server price
-            # hint, so it degraded to health-based order — surface the no-op once.
+            # The response carried NO hint map (null), so CostPolicy degraded to
+            # health-based order — surface the no-op once. Deliberately `is None`
+            # and NOT `any(...)`/`not price_hints`: an explicit `{}` means the
+            # server priced this chain and found nothing priceable, which is an
+            # answer, not a degradation, and must stay silent.
             _warn_cost_policy_inactive_once()
         # Defensive: a custom (possibly misbehaving) injected policy must not be
         # able to inject a runtime that was never in the configured chain into the

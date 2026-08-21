@@ -1,4 +1,4 @@
-"""Status-first, duck-typed transport-error classification.
+"""Send-certainty-first, duck-typed transport-error classification.
 
 Maps an arbitrary transport exception onto a failover ``Disposition`` WITHOUT
 importing any provider SDK. The core depends only on ``httpx`` + ``pydantic``;
@@ -27,7 +27,9 @@ TLS / connection refused — provably never delivered), so it is safe to failove
 A naive ``except APIConnectionError: failover`` would catch the timeout subclass
 and silently double-spend. The same trap exists in ``httpx``: ``ConnectTimeout``
 subclasses ``TimeoutException`` (the generic, ambiguous case), and both
-``ConnectError`` and ``RemoteProtocolError`` subclass ``TransportError``.
+``ConnectError`` and ``RemoteProtocolError`` subclass ``TransportError`` — which
+is why ``_transport_disposition`` tests the narrow pre-send tuple before the
+generic transport base, for both stacks.
 
 THE MIRROR TRAP (why ``APITimeoutError`` is not simply post-send). Both SDKs
 wrap the WHOLE ``httpx.TimeoutException`` family in ``APITimeoutError`` — so a
@@ -66,52 +68,66 @@ first:
   1. ``APITimeoutError`` (by MRO name) -> classify by its chained transport cause:
        pre-send httpx/httpx2 (ConnectTimeout/PoolTimeout/ConnectError) -> FAILOVER
        read/write/any other/no cause (post-send possible) -> POST_SEND_AMBIGUOUS
-  2. httpx ReadTimeout / WriteTimeout, and
-     botocore ``ReadTimeoutError`` (by name)  -> POST_SEND_AMBIGUOUS
-  3. httpx ConnectTimeout / PoolTimeout /
-     ConnectError (provably pre-send), and
-     botocore ``EndpointConnectionError`` /
+  2. recognized httpx/httpx2 transport error
+     (``_transport_disposition``, ONE branch for
+     BOTH stacks) -> classify by send certainty:
+       ConnectTimeout / PoolTimeout /
+       ConnectError (provably pre-send)        -> FAILOVER
+       every other transport error (read/write
+       timeout, generic TimeoutException,
+       RemoteProtocolError, ReadError, ...)    -> POST_SEND_AMBIGUOUS
+  3. botocore ``ReadTimeoutError`` (by name)  -> POST_SEND_AMBIGUOUS
+  4. botocore ``EndpointConnectionError`` /
      ``ConnectTimeoutError`` /
      ``ProxyConnectionError`` (by name)       -> FAILOVER
-  4. httpx TimeoutException (any other)       -> POST_SEND_AMBIGUOUS
-  4b. Bedrock post-send-by-name:
+  5. Bedrock post-send-by-name:
      ``ModelTimeoutException`` /
      ``ModelErrorException`` (misleading 4xx
      statuses — name wins over status), and
      botocore ``ConnectionClosedError``       -> POST_SEND_AMBIGUOUS
-  5. numeric status (.status_code, then .code,
+  6. numeric status (.status_code, then .code,
      then botocore ``response["ResponseMetadata"]["HTTPStatusCode"]``):
        429 / 529 -> FAILOVER
        4xx       -> FAIL_FAST
        5xx       -> POST_SEND_AMBIGUOUS
-  6. ``APIConnectionError`` (by MRO name) -> classify by its chained transport cause:
+  7. ``APIConnectionError`` (by MRO name) -> classify by its chained transport cause:
        pre-send httpx/httpx2 (ConnectError/ConnectTimeout/PoolTimeout) -> FAILOVER
        any other recognized TransportError cause (post-send possible) -> POST_SEND_AMBIGUOUS
        no inspectable transport cause -> FAILOVER (canonical connect-refused outage)
-  7. httpx/httpx2 TransportError (any other)  -> POST_SEND_AMBIGUOUS
   8. default                                  -> FAIL_FAST
 
-Steps 1 and 2 MUST precede step 3 (timeout-before-connection). Step 3 MUST
-precede step 4 (specific pre-send timeouts before the generic ambiguous
-timeout). Step 4b MUST precede step 5 (Bedrock's post-send 408/424 names win
-over their misleading statuses). Step 6 (bare connection failure) MUST come
-AFTER the status check so a connection error that somehow carries a status is
-classified by status first. The cause-inspection in steps 1 and 6 closes the
-double-spend/stranded-chain vector from both sides: each wrapper covers BOTH
-provably pre-send failures AND post-send ones (a server disconnect mid-response
-surfaces as ``httpx.RemoteProtocolError``; a connect stall surfaces as
-``httpx.ConnectTimeout``), so neither class name alone settles whether the
-request landed.
+Step 1 MUST precede step 7 (``APITimeoutError`` subclasses
+``APIConnectionError``; the timeout must not be settled by the bare-connection
+branch). Step 2 is ONE branch covering both transport stacks so an httpx2
+exception can never be classified at a different position than its httpx1 twin
+— the ordering trap inside the family (specific pre-send classes before the
+generic ambiguous ``TimeoutException``/``TransportError``) lives in
+``_transport_disposition``. Step 2 MUST precede step 6: a PROVEN transport class
+settles send certainty, so it outranks any numeric status attached to the same
+exception (an httpx ``ReadTimeout`` carrying a 429 is still post-send). It
+cannot shadow steps 3-5 either: ``_transport_disposition`` returns ``None`` for
+everything outside the two transport families, and no httpx/httpx2 MRO name
+collides with the botocore name sets. Step 5 MUST precede step 6 (Bedrock's
+post-send 408/424 names win over their misleading statuses). Step 7 (bare
+connection failure) MUST come AFTER the status check so a connection error that
+somehow carries a status is classified by status first. The cause-inspection in
+steps 1 and 7 closes the double-spend/stranded-chain vector from both sides:
+each wrapper covers BOTH provably pre-send failures AND post-send ones (a server
+disconnect mid-response surfaces as ``httpx.RemoteProtocolError``; a connect
+stall surfaces as ``httpx.ConnectTimeout``), so neither class name alone settles
+whether the request landed.
 """
 
 from __future__ import annotations
 
+import inspect
 import math
 import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from enum import StrEnum
+from typing import cast
 
 import httpx
 
@@ -130,10 +146,26 @@ _POST_SEND_BY_NAME = frozenset(
 )
 # httpx classes that PROVE the request never reached the model: the TCP/TLS
 # connect never completed, or we never even got a connection out of the pool.
-# Used both directly (step 3) and as the cause-inspection allowlist for the
-# openai/anthropic wrappers (steps 1 and 6).
+# Used both directly (via ``_transport_disposition``, step 2) and as the
+# cause-inspection allowlist for the openai/anthropic wrappers (steps 1 and 7).
 _PRE_SEND_HTTPX = (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ConnectError)
 _PRE_SEND_TRANSPORT_NAMES = frozenset({"ConnectTimeout", "PoolTimeout", "ConnectError"})
+
+# Sentinel for static attribute lookups: distinguishes "absent" from a real
+# ``None`` export without ever running the owner's attribute machinery.
+_STATIC_MISSING = object()
+
+
+def _static_class_name(cls: type) -> str:
+    """Read ``cls.__name__`` without executing a metaclass ``__name__`` property.
+
+    Classification runs inside the dispatch except-handler on an ARBITRARY
+    third-party exception, so every attribute read here must be total: a
+    metaclass that shadows ``__name__`` with a property must not raise over the
+    original provider exception. ``type.__dict__["__name__"]`` is the real
+    getset descriptor, bound directly to the class.
+    """
+    return cast(str, type.__dict__["__name__"].__get__(cls))
 
 
 def _httpx2_transport_names(exc: BaseException) -> frozenset[str]:
@@ -146,17 +178,28 @@ def _httpx2_transport_names(exc: BaseException) -> frozenset[str]:
     This keeps recognition scoped without importing Anthropic's transport
     dependency into core, and prevents an external subclass name from changing
     the send-certainty of its real httpx2 ancestor.
+
+    Every lookup is STATIC (``inspect.getattr_static``, like ``client.py``):
+    ``httpx2/__init__.py`` defines a module-level ``__getattr__`` that
+    lazy-imports on some names (``main`` pulls in ``click``, an optional CLI
+    dependency), so a plain ``getattr`` would let an MRO class named after one
+    of those hooks raise ``ModuleNotFoundError`` out of the classifier.
     """
     httpx2_mod = sys.modules.get("httpx2")
     if httpx2_mod is None:
         return frozenset()
     mro = type(exc).__mro__
-    transport_error_type = getattr(httpx2_mod, "TransportError", None)
+    transport_error_type = inspect.getattr_static(httpx2_mod, "TransportError", _STATIC_MISSING)
     if not isinstance(transport_error_type, type) or not any(
         mro_class is transport_error_type for mro_class in mro
     ):
         return frozenset()
-    return frozenset(cls.__name__ for cls in mro if getattr(httpx2_mod, cls.__name__, None) is cls)
+    family_names: set[str] = set()
+    for mro_class in mro:
+        name = _static_class_name(mro_class)
+        if inspect.getattr_static(httpx2_mod, name, _STATIC_MISSING) is mro_class:
+            family_names.add(name)
+    return frozenset(family_names)
 
 
 def _transport_disposition(exc: BaseException) -> Disposition | None:
@@ -216,19 +259,22 @@ def _numeric_status(exc: BaseException) -> int | None:
 def classify_exception(exc: BaseException) -> Disposition:
     """Classify a transport exception into a failover ``Disposition``.
 
-    Status-first and duck-typed: never ``isinstance`` on a provider SDK class
-    (they may be absent or differ across versions). See the module docstring for
-    why the branch ordering below is load-bearing (the double-spend trap).
+    Duck-typed: never ``isinstance`` on a provider SDK class (they may be absent
+    or differ across versions). Certainty-first: a PROVEN httpx/httpx2 transport
+    class settles whether the request could have landed before any class name or
+    numeric status is consulted; everything unrecognized falls through to the
+    status check. See the module docstring for why the branch ordering below is
+    load-bearing (the double-spend trap).
     """
     # MRO names let us match provider classes by name without importing them.
-    names = {cls.__name__ for cls in type(exc).__mro__}
+    names = {_static_class_name(cls) for cls in type(exc).__mro__}
 
     # 1. APITimeoutError subclasses APIConnectionError — it MUST win first.
     #    But the openai/anthropic SDKs wrap EVERY httpx.TimeoutException in it,
     #    and ConnectTimeout/PoolTimeout subclass TimeoutException — so the class
     #    name alone does NOT prove the request landed. Inspect the chained cause
-    #    exactly like step 6: a provably pre-send cause is failover-safe.
-    #    The DEFAULT here is the MIRROR IMAGE of step 6's: a bare timeout with no
+    #    exactly like step 7: a provably pre-send cause is failover-safe.
+    #    The DEFAULT here is the MIRROR IMAGE of step 7's: a bare timeout with no
     #    inspectable cause is canonically a READ timeout (post-send), whereas a
     #    bare connection wrapper is canonically connect-refused (pre-send).
     if "APITimeoutError" in names:
@@ -237,37 +283,40 @@ def classify_exception(exc: BaseException) -> Disposition:
             return Disposition.FAILOVER
         return Disposition.POST_SEND_AMBIGUOUS
 
-    # 2. httpx read/write timeouts are post-send: bytes were already sent.
-    #    botocore's ReadTimeoutError is the same post-send case (note: it
-    #    subclasses HTTPClientError, NOT botocore's ConnectionError).
-    if isinstance(exc, httpx.ReadTimeout | httpx.WriteTimeout):
-        return Disposition.POST_SEND_AMBIGUOUS
+    # 2. A PROVEN httpx/httpx2 transport class settles send certainty on its
+    #    own — read/write timeouts and protocol drops are post-send, while
+    #    ConnectTimeout/PoolTimeout/ConnectError are provably pre-send. ONE
+    #    branch serves BOTH stacks (httpx1 by isinstance, httpx2 by gated MRO
+    #    identity) so anthropic's httpx2 exceptions are never classified at a
+    #    later position than their httpx1 twins. It sits above the by-name and
+    #    numeric-status branches because transport-class certainty outranks a
+    #    status attached to the same exception; it cannot shadow them, since
+    #    _transport_disposition returns None outside the two families.
+    transport_disposition = _transport_disposition(exc)
+    if transport_disposition is not None:
+        return transport_disposition
+
+    # 3. botocore's ReadTimeoutError is the same post-send case as an httpx
+    #    read timeout (note: it subclasses HTTPClientError, NOT botocore's
+    #    ConnectionError). It carries no status, so it classifies by name.
     if "ReadTimeoutError" in names:
         return Disposition.POST_SEND_AMBIGUOUS
 
-    # 3. Provably pre-send transport failures — safe to failover.
-    #    ConnectTimeout subclasses TimeoutException, so it MUST be checked
-    #    before the generic TimeoutException branch (step 4) below. The
-    #    botocore pre-send names are the boto equivalents (never the bare
+    # 4. Provably pre-send botocore transport failures — safe to failover.
+    #    These are the boto equivalents of _PRE_SEND_HTTPX (never the bare
     #    "ConnectionError" — that name collides with the Python builtin).
-    if isinstance(exc, _PRE_SEND_HTTPX):
-        return Disposition.FAILOVER
     if names & _BOTOCORE_PRE_SEND_NAMES:
         return Disposition.FAILOVER
 
-    # 4. Any other timeout we cannot prove pre-send -> ambiguous.
-    if isinstance(exc, httpx.TimeoutException):
-        return Disposition.POST_SEND_AMBIGUOUS
-
-    # 4b. Post-send by NAME, before the status check: Bedrock's
-    #     ModelTimeoutException (408) and ModelErrorException (424) carry
-    #     request-shaped statuses but mean the model RAN — classifying them by
-    #     status would skip reservation reconciliation (silent double-count).
-    #     ConnectionClosedError is botocore's mid-response connection drop.
+    # 5. Post-send by NAME, before the status check: Bedrock's
+    #    ModelTimeoutException (408) and ModelErrorException (424) carry
+    #    request-shaped statuses but mean the model RAN — classifying them by
+    #    status would skip reservation reconciliation (silent double-count).
+    #    ConnectionClosedError is botocore's mid-response connection drop.
     if names & _POST_SEND_BY_NAME:
         return Disposition.POST_SEND_AMBIGUOUS
 
-    # 5. Numeric status classification (OpenAI/Anthropic .status_code,
+    # 6. Numeric status classification (OpenAI/Anthropic .status_code,
     #    Google .code). Comes before the bare-connection branch so a status
     #    always wins over class-name matching.
     status = _numeric_status(exc)
@@ -279,7 +328,7 @@ def classify_exception(exc: BaseException) -> Disposition:
         if status >= 500:
             return Disposition.POST_SEND_AMBIGUOUS
 
-    # 6. Provider connection-error wrapper (no status, not itself a timeout).
+    # 7. Provider connection-error wrapper (no status, not itself a timeout).
     #    The openai/anthropic APIConnectionError wraps BOTH provably pre-send
     #    failures (connect refused / DNS / TLS) AND post-send transport drops
     #    (a server disconnect mid-response surfaces as httpx.RemoteProtocolError),
@@ -296,11 +345,6 @@ def classify_exception(exc: BaseException) -> Disposition:
                 return cause_disposition
         return Disposition.FAILOVER
 
-    # 7. Other transport errors (e.g. RemoteProtocolError mid-flight) -> ambiguous.
-    transport_disposition = _transport_disposition(exc)
-    if transport_disposition is not None:
-        return transport_disposition
-
     # 8. Default: never failover into the unknown.
     return Disposition.FAIL_FAST
 
@@ -308,8 +352,8 @@ def classify_exception(exc: BaseException) -> Disposition:
 def retry_after_seconds(exc: BaseException) -> float | None:
     """Return a non-negative ``Retry-After`` delay (seconds) for an HTTP 429, else None.
 
-    Duck-typed and status-first, exactly like :func:`classify_exception` — never
-    imports a provider SDK. Only HTTP 429 qualifies (the provider explicitly asked
+    Duck-typed exactly like :func:`classify_exception`, and purely status-driven
+    — never imports a provider SDK. Only HTTP 429 qualifies (the provider explicitly asked
     us to retry); every other status (including 529) returns ``None`` so the caller
     falls through to normal failover. The header is read off ``exc.response.headers``
     (the OpenAI/Anthropic/httpx shape) and honored in both RFC 7231 forms:

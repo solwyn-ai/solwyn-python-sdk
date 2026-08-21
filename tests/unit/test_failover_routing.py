@@ -580,6 +580,49 @@ class TestCrossProviderFailover:
         assert success[0].failover_reason is FailoverReason.CIRCUIT_OPEN
         _close(solwyn)
 
+    def test_custom_policy_serving_pricier_provider_does_not_report_cost_routed(self) -> None:
+        # Arrange — a custom injected policy that declares NEITHER signal flag
+        # still receives price hints (uses_price_signal defaults True). It
+        # reverses the chain, so the provider the SERVER priced 9x HIGHER serves
+        # ahead of a healthy, cheaper primary. That displacement is real routing,
+        # but it is NOT cost routing: the label stays the pre-existing
+        # "displaced but not cheaper" circuit_open.
+        class _UndeclaredReversePolicy:
+            def order(self, candidates, req):  # type: ignore[no-untyped-def]
+                return list(reversed(candidates))
+
+        openai = _openai_client()
+        openai.chat.completions.create.return_value = _openai_response()
+        anthropic = _anthropic_client()
+        anthropic.messages.create.return_value = _anthropic_response()
+        solwyn = _make_solwyn(
+            openai,
+            model="gpt-5.5",
+            fallback=[(anthropic, "claude-sonnet-5", {"max_tokens": 256})],
+            selection_policy=_UndeclaredReversePolicy(),
+        )
+        events: list = []
+        solwyn._solwyn_reporter.report = lambda event: events.append(event)
+
+        # Act
+        with patch.object(
+            solwyn._solwyn_budget,
+            "check_budget",
+            return_value=_allow_budget(price_hints={"openai": 1.0, "anthropic": 9.0}),
+        ):
+            solwyn.chat.completions.create(**_PLAIN_REQUEST)
+
+        # Assert — anthropic served the call, attributed as a fallback but NOT
+        # as a cost-routed one.
+        openai.chat.completions.create.assert_not_called()
+        anthropic.messages.create.assert_called_once()
+        success = [event for event in events if event.status.value == "success"]
+        assert len(success) == 1
+        assert success[0].provider is ProviderName.ANTHROPIC
+        assert success[0].failover_reason is FailoverReason.CIRCUIT_OPEN
+        assert success[0].is_provider_fallback is True
+        _close(solwyn)
+
     @pytest.mark.asyncio
     async def test_async_cost_policy_healthy_primary_displaced_reports_cost_routed(self) -> None:
         openai = _openai_client()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -52,6 +53,44 @@ def _json_response(
     )
 
 
+def _raw_json_response(
+    request: httpx.Request,
+    response: httpx.Response,
+    payload: dict[str, Any],
+) -> httpx.Response:
+    """Serve a body httpx's own JSON encoder refuses (non-finite numbers).
+
+    ``json.loads`` accepts them on the way back in, so this is exactly what a
+    server emitting ``Infinity`` would put on the wire.
+    """
+    return httpx.Response(
+        response.status_code,
+        content=json.dumps(payload, allow_nan=True).encode(),
+        headers={"content-type": "application/json"},
+        request=request,
+    )
+
+
+def _check_contract_plane(*, price_hints: dict[str, float] | None = None) -> FakeControlPlane:
+    plane = FakeControlPlane(price_hints=price_hints)
+    plane.deny_next(period="monthly")
+    plane.deny_next(period="run_stopped")
+    plane.deny_next(period="tag")
+    plane.deny_run("contract-agent-run")
+    return plane
+
+
+def _record_checks(
+    served: list[dict[str, Any]],
+) -> Callable[[httpx.Request, httpx.Response], httpx.Response]:
+    def record(request: httpx.Request, response: httpx.Response) -> httpx.Response:
+        if request.url.path == "/api/v1/budgets/check":
+            served.append(response.json())
+        return response
+
+    return record
+
+
 def _lease_contract_plane() -> FakeControlPlane:
     plane = FakeControlPlane()
     plane.deny_next(period="monthly", scope="lease")
@@ -96,6 +135,106 @@ def test_shared_check_contract_against_double() -> None:
     assert plane.checks[1].agent_run_id == "contract-stopped-run"
     assert plane.checks[2].tags == {"customer": "acme"}
     assert plane.checks[3].agent_run_id == "contract-agent-run"
+
+
+@pytest.mark.unit
+def test_shared_check_contract_opts_into_and_validates_price_hints() -> None:
+    # Arrange: a plane that serves hints ONLY to a request carrying the SDK's
+    # production price_hints_version opt-in.
+    plane = _check_contract_plane(price_hints={"openai": 2.0, "anthropic": 1.0})
+    served: list[dict[str, Any]] = []
+    transport = _ResponseMutationTransport(plane.transport, _record_checks(served))
+
+    # Act
+    with httpx.Client(transport=transport, base_url=plane.api_url) as http:
+        assert_check_contract(http, plane.api_key)
+
+    # Assert: the probe sends the SDK's exact wire bytes, so the served hint
+    # map is observable — without the opt-in the shape check is unreachable.
+    assert [check.price_hints_version for check in plane.checks] == ["1"] * len(plane.checks)
+    assert served[0]["price_hints"] == {"openai": 2.0, "anthropic": 1.0}
+
+
+@pytest.mark.unit
+def test_shared_check_contract_rejects_unknown_price_hint_provider() -> None:
+    # Arrange: an unknown provider key would fail BudgetCheckResponse
+    # validation for the WHOLE response, so the SDK would fail open with no
+    # reservation — the probe must name the offending key.
+    plane = _check_contract_plane(price_hints={"openai": 2.0})
+
+    def rewrite_hint_provider(
+        request: httpx.Request,
+        response: httpx.Response,
+    ) -> httpx.Response:
+        if request.url.path != "/api/v1/budgets/check":
+            return response
+        payload = response.json()
+        payload["price_hints"] = {"brandnew": 1.0}
+        return _json_response(request, response, payload)
+
+    transport = _ResponseMutationTransport(plane.transport, rewrite_hint_provider)
+
+    # Act / Assert
+    with (
+        httpx.Client(transport=transport, base_url=plane.api_url) as http,
+        pytest.raises(
+            AssertionError,
+            match=r"price hint provider 'brandnew' is not a known ProviderName",
+        ),
+    ):
+        assert_check_contract(http, plane.api_key)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("wire_hint", "message"),
+    [
+        (float("inf"), "must be a finite JSON number"),
+        (True, "must be a JSON number"),
+    ],
+)
+def test_shared_check_contract_rejects_unusable_price_hint_values(
+    wire_hint: object,
+    message: str,
+) -> None:
+    # Arrange: a hint the SDK's cost policy cannot order by is drift too.
+    plane = _check_contract_plane(price_hints={"openai": 2.0})
+
+    def rewrite_hint_value(
+        request: httpx.Request,
+        response: httpx.Response,
+    ) -> httpx.Response:
+        if request.url.path != "/api/v1/budgets/check":
+            return response
+        payload = response.json()
+        payload["price_hints"] = {"openai": wire_hint}
+        return _raw_json_response(request, response, payload)
+
+    transport = _ResponseMutationTransport(plane.transport, rewrite_hint_value)
+
+    # Act / Assert
+    with (
+        httpx.Client(transport=transport, base_url=plane.api_url) as http,
+        pytest.raises(AssertionError, match=message),
+    ):
+        assert_check_contract(http, plane.api_key)
+
+
+@pytest.mark.unit
+def test_shared_check_contract_accepts_a_null_price_hint_statement() -> None:
+    # Arrange: a plane with no hints. The directive-v1 wire serializes the null
+    # statement by omitting the key, exactly as the live API does.
+    plane = _check_contract_plane()
+    served: list[dict[str, Any]] = []
+    transport = _ResponseMutationTransport(plane.transport, _record_checks(served))
+
+    # Act
+    with httpx.Client(transport=transport, base_url=plane.api_url) as http:
+        assert_check_contract(http, plane.api_key)
+
+    # Assert
+    assert served
+    assert all("price_hints" not in payload for payload in served)
 
 
 @pytest.mark.unit

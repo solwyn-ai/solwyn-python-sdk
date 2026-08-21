@@ -6,7 +6,8 @@ Hermetic: provider requests terminate at MockTransport and never open a socket.
 from __future__ import annotations
 
 import inspect
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -19,6 +20,10 @@ from solwyn.client import AsyncSolwyn, Solwyn, _hop_client_timeout
 _CONNECT_SLICE = 0.25
 _READ_WRITE_BOUND = 12.5
 _TIMEOUT_UNSET = object()
+# Stainless-generated SDKs (openai, anthropic) stringify the per-request timeout
+# into this header: `timeout.read if isinstance(timeout, Timeout) else timeout`.
+# A non-Timeout hop timeout therefore leaks its whole repr onto the wire.
+_READ_TIMEOUT_HEADER = "x-stainless-read-timeout"
 
 
 def _openai_response() -> dict[str, Any]:
@@ -51,6 +56,33 @@ def _anthropic_response() -> dict[str, Any]:
     }
 
 
+def _granular_tuple() -> tuple[float, float, float, float]:
+    """The transport-correct fallback shape: (connect, read, write, pool)."""
+    return (_CONNECT_SLICE, _READ_WRITE_BOUND, _READ_WRITE_BOUND, _CONNECT_SLICE)
+
+
+def _install_fake_httpx2(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    client_type: type,
+    timeout_export: object = _TIMEOUT_UNSET,
+) -> None:
+    """Install a fake ``httpx2`` whose exports we control by identity.
+
+    A fake module (rather than monkeypatching the real one) is what makes the
+    httpx2 branch reachable with hostile exports: ``client_type`` becomes the
+    module's ``Client``, so any instance of it is a *proven* httpx2 native client
+    and discovery proceeds to the Timeout proofs instead of short-circuiting on
+    the native-client MRO.
+    """
+    module = ModuleType("httpx2")
+    module.Client = client_type
+    module.AsyncClient = type("FakeHttpx2AsyncClient", (), {})
+    if timeout_export is not _TIMEOUT_UNSET:
+        module.Timeout = timeout_export
+    monkeypatch.setitem(sys.modules, "httpx2", module)
+
+
 def _assert_granular_timeout(values: dict[str, Any]) -> None:
     assert values == {
         "connect": _CONNECT_SLICE,
@@ -74,6 +106,7 @@ def test_sync_dispatch_uses_real_openai_native_httpx_timeout(
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen["request_timeout"] = request.extensions["timeout"]
+        seen["read_timeout_header"] = request.headers.get(_READ_TIMEOUT_HEADER)
         return httpx.Response(200, request=request, json=_openai_response())
 
     timeout_kwargs = {} if configured_timeout is _TIMEOUT_UNSET else {"timeout": configured_timeout}
@@ -108,6 +141,9 @@ def test_sync_dispatch_uses_real_openai_native_httpx_timeout(
 
     assert type(seen["option_timeout"]) is native_timeout_type
     _assert_granular_timeout(seen["request_timeout"])
+    # httpx1 control: a real native Timeout also keeps the advertised read bound
+    # honest instead of stringifying a tuple into the header.
+    assert seen["read_timeout_header"] == str(_READ_WRITE_BOUND)
 
 
 @pytest.mark.unit
@@ -125,6 +161,7 @@ async def test_async_dispatch_uses_real_openai_native_httpx_timeout(
 
     async def handler(request: httpx.Request) -> httpx.Response:
         seen["request_timeout"] = request.extensions["timeout"]
+        seen["read_timeout_header"] = request.headers.get(_READ_TIMEOUT_HEADER)
         return httpx.Response(200, request=request, json=_openai_response())
 
     timeout_kwargs = {} if configured_timeout is _TIMEOUT_UNSET else {"timeout": configured_timeout}
@@ -159,6 +196,9 @@ async def test_async_dispatch_uses_real_openai_native_httpx_timeout(
 
     assert type(seen["option_timeout"]) is native_timeout_type
     _assert_granular_timeout(seen["request_timeout"])
+    # httpx1 control: a real native Timeout also keeps the advertised read bound
+    # honest instead of stringifying a tuple into the header.
+    assert seen["read_timeout_header"] == str(_READ_WRITE_BOUND)
 
 
 @pytest.mark.unit
@@ -176,6 +216,7 @@ def test_sync_dispatch_uses_real_anthropic_native_httpx2_timeout(
 
     def handler(request: Any) -> Any:
         seen["request_timeout"] = request.extensions["timeout"]
+        seen["read_timeout_header"] = request.headers.get(_READ_TIMEOUT_HEADER)
         return httpx2.Response(200, request=request, json=_anthropic_response())
 
     timeout_kwargs = {} if configured_timeout is _TIMEOUT_UNSET else {"timeout": configured_timeout}
@@ -210,13 +251,17 @@ def test_sync_dispatch_uses_real_anthropic_native_httpx2_timeout(
     finally:
         wrapper.close()
 
-    assert seen["option_timeout"] == (
-        _CONNECT_SLICE,
-        _READ_WRITE_BOUND,
-        _READ_WRITE_BOUND,
-        _CONNECT_SLICE,
+    # A real, identity-proven httpx2.Timeout - not a four-tuple, which anthropic
+    # would stringify whole into x-stainless-read-timeout.
+    assert type(seen["option_timeout"]) is httpx2.Timeout
+    assert seen["option_timeout"] == httpx2.Timeout(
+        connect=_CONNECT_SLICE,
+        read=_READ_WRITE_BOUND,
+        write=_READ_WRITE_BOUND,
+        pool=_CONNECT_SLICE,
     )
     _assert_granular_timeout(seen["request_timeout"])
+    assert seen["read_timeout_header"] == str(_READ_WRITE_BOUND)
 
 
 @pytest.mark.unit
@@ -235,6 +280,7 @@ async def test_async_dispatch_uses_real_anthropic_native_httpx2_timeout(
 
     async def handler(request: Any) -> Any:
         seen["request_timeout"] = request.extensions["timeout"]
+        seen["read_timeout_header"] = request.headers.get(_READ_TIMEOUT_HEADER)
         return httpx2.Response(200, request=request, json=_anthropic_response())
 
     timeout_kwargs = {} if configured_timeout is _TIMEOUT_UNSET else {"timeout": configured_timeout}
@@ -269,46 +315,99 @@ async def test_async_dispatch_uses_real_anthropic_native_httpx2_timeout(
     finally:
         await wrapper.close()
 
-    assert seen["option_timeout"] == (
-        _CONNECT_SLICE,
-        _READ_WRITE_BOUND,
-        _READ_WRITE_BOUND,
-        _CONNECT_SLICE,
+    # A real, identity-proven httpx2.Timeout - not a four-tuple, which anthropic
+    # would stringify whole into x-stainless-read-timeout.
+    assert type(seen["option_timeout"]) is httpx2.Timeout
+    assert seen["option_timeout"] == httpx2.Timeout(
+        connect=_CONNECT_SLICE,
+        read=_READ_WRITE_BOUND,
+        write=_READ_WRITE_BOUND,
+        pool=_CONNECT_SLICE,
     )
     _assert_granular_timeout(seen["request_timeout"])
+    assert seen["read_timeout_header"] == str(_READ_WRITE_BOUND)
 
 
 @pytest.mark.unit
-def test_mutated_httpx2_timeout_export_and_state_never_execute_constructor(
+def test_identity_proven_httpx2_timeout_export_is_the_constructor_used(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    anthropic = pytest.importorskip("anthropic")
-    httpx2 = pytest.importorskip("httpx2")
+    """The one constructor Solwyn may call: the loaded export the client itself holds."""
 
-    class ExecutableTimeout:
+    class FakeTimeout:
         constructions = 0
 
         def __init__(self, **kwargs: object) -> None:
             type(self).constructions += 1
             vars(self).update(kwargs)
 
-    provider = anthropic.Anthropic(api_key="sk-ant-test")
-    native_http_client = inspect.getattr_static(provider, "_client")
-    configured = object.__new__(ExecutableTimeout)
-    monkeypatch.setattr(httpx2, "Timeout", ExecutableTimeout)
-    monkeypatch.setattr(native_http_client, "_timeout", configured)
-    try:
-        timeout = _hop_client_timeout(provider, _CONNECT_SLICE, _READ_WRITE_BOUND)
-    finally:
-        provider.close()
+    class FakeHttpx2Client:
+        pass
 
-    assert timeout == (
-        _CONNECT_SLICE,
-        _READ_WRITE_BOUND,
-        _READ_WRITE_BOUND,
-        _CONNECT_SLICE,
+    _install_fake_httpx2(monkeypatch, client_type=FakeHttpx2Client, timeout_export=FakeTimeout)
+    native_http_client = FakeHttpx2Client()
+    # object.__new__ so the client's own state costs no construction count.
+    native_http_client._timeout = object.__new__(FakeTimeout)
+
+    timeout = _hop_client_timeout(
+        SimpleNamespace(_client=native_http_client), _CONNECT_SLICE, _READ_WRITE_BOUND
     )
-    assert ExecutableTimeout.constructions == 0
+
+    assert type(timeout) is FakeTimeout
+    assert FakeTimeout.constructions == 1
+    assert vars(timeout) == {
+        "connect": _CONNECT_SLICE,
+        "read": _READ_WRITE_BOUND,
+        "write": _READ_WRITE_BOUND,
+        "pool": _CONNECT_SLICE,
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "export_kind",
+    ["foreign_class", "callable_instance", "absent"],
+)
+def test_unproven_httpx2_timeout_export_is_never_called(
+    monkeypatch: pytest.MonkeyPatch,
+    export_kind: str,
+) -> None:
+    """No export survives without matching the class the client already instantiated."""
+    calls: list[str] = []
+
+    class ExportedTimeout:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append("foreign_class")
+
+    class CallableExport:
+        def __call__(self, **kwargs: object) -> object:
+            calls.append("callable_instance")
+            return object()
+
+    class ClientTimeout:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append("client_timeout")
+
+    class FakeHttpx2Client:
+        pass
+
+    exports: dict[str, object] = {
+        "foreign_class": ExportedTimeout,  # a real type, but not the client's
+        "callable_instance": CallableExport(),  # callable, but not a type at all
+        "absent": _TIMEOUT_UNSET,  # module exports no Timeout
+    }
+    _install_fake_httpx2(
+        monkeypatch, client_type=FakeHttpx2Client, timeout_export=exports[export_kind]
+    )
+    native_http_client = FakeHttpx2Client()
+    native_http_client._timeout = object.__new__(ClientTimeout)
+
+    timeout = _hop_client_timeout(
+        SimpleNamespace(_client=native_http_client), _CONNECT_SLICE, _READ_WRITE_BOUND
+    )
+
+    assert timeout == _granular_tuple()
+    assert calls == []
 
 
 @pytest.mark.unit
@@ -428,53 +527,99 @@ def test_timeout_discovery_does_not_execute_provider_descriptors() -> None:
 
 
 @pytest.mark.unit
-def test_timeout_discovery_does_not_execute_an_unproven_constructor() -> None:
-    class ExecutableTimeout:
+def test_native_client_timeout_descriptor_is_never_executed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proving the Timeout class must not run provider code (getattr_static only)."""
+
+    class FakeTimeout:
         constructions = 0
 
         def __init__(self, **kwargs: object) -> None:
             type(self).constructions += 1
-            vars(self).update(kwargs)
 
-    configured = object.__new__(ExecutableTimeout)
-    configured.connect = 5.0
-    configured.read = 30.0
-    configured.write = 30.0
-    configured.pool = 5.0
-    client = SimpleNamespace(timeout=configured)
+    class FakeHttpx2Client:
+        @property
+        def _timeout(self) -> object:
+            raise AssertionError("native client _timeout descriptor executed")
 
-    timeout = _hop_client_timeout(client, _CONNECT_SLICE, _READ_WRITE_BOUND)
+    _install_fake_httpx2(monkeypatch, client_type=FakeHttpx2Client, timeout_export=FakeTimeout)
 
-    assert type(timeout) is httpx.Timeout
-    assert ExecutableTimeout.constructions == 0
+    timeout = _hop_client_timeout(
+        SimpleNamespace(_client=FakeHttpx2Client()), _CONNECT_SLICE, _READ_WRITE_BOUND
+    )
+
+    assert timeout == _granular_tuple()
+    assert FakeTimeout.constructions == 0
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    "configured",
-    [
-        pytest.param(SimpleNamespace(connect=True, read=1.0, write=1.0, pool=1.0), id="bool"),
-        pytest.param(SimpleNamespace(connect="1", read=1.0, write=1.0, pool=1.0), id="nonnumeric"),
-        pytest.param(SimpleNamespace(connect=1.0, read=1.0, write=1.0), id="malformed"),
-    ],
-)
-def test_timeout_discovery_rejects_malformed_unproven_shapes(configured: object) -> None:
-    native_http_client = httpx.Client()
-    native_http_client._timeout = configured
+def test_proven_httpx2_timeout_constructor_failure_falls_back_to_granular_tuple(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """httpx2 has a transport-correct fallback, so it degrades instead of failing closed."""
+
+    class ExplodingTimeout:
+        def __init__(self, **kwargs: object) -> None:
+            raise ValueError("constructor failed")
+
+    class FakeHttpx2Client:
+        pass
+
+    _install_fake_httpx2(monkeypatch, client_type=FakeHttpx2Client, timeout_export=ExplodingTimeout)
+    native_http_client = FakeHttpx2Client()
+    native_http_client._timeout = object.__new__(ExplodingTimeout)
+
+    timeout = _hop_client_timeout(
+        SimpleNamespace(_client=native_http_client), _CONNECT_SLICE, _READ_WRITE_BOUND
+    )
+
+    assert timeout == _granular_tuple()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("timeout_state", ["removed", "malformed", "foreign_type"])
+def test_real_httpx2_client_without_proven_timeout_state_still_bounds_the_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    timeout_state: str,
+) -> None:
+    """Fallback path, end to end: the tuple still reaches the transport as granular bounds."""
+    anthropic = pytest.importorskip("anthropic")
+    httpx2 = pytest.importorskip("httpx2")
+    seen: dict[str, Any] = {}
+
+    def handler(request: Any) -> Any:
+        seen["request_timeout"] = request.extensions["timeout"]
+        seen["read_timeout_header"] = request.headers.get(_READ_TIMEOUT_HEADER)
+        return httpx2.Response(200, request=request, json=_anthropic_response())
+
+    native_http_client = httpx2.Client(transport=httpx2.MockTransport(handler))
+    provider = anthropic.Anthropic(
+        api_key="sk-ant-test", max_retries=0, http_client=native_http_client
+    )
+    if timeout_state == "removed":
+        monkeypatch.delattr(native_http_client, "_timeout")
+    elif timeout_state == "malformed":
+        monkeypatch.setattr(native_http_client, "_timeout", SimpleNamespace(connect=1.0, read=1.0))
+    else:
+        # A real Timeout - from the wrong httpx major.
+        monkeypatch.setattr(native_http_client, "_timeout", httpx.Timeout(1.0))
+
+    timeout = _hop_client_timeout(provider, _CONNECT_SLICE, _READ_WRITE_BOUND)
+    assert timeout == _granular_tuple()
+
     try:
-        timeout = _hop_client_timeout(
-            SimpleNamespace(_client=native_http_client), _CONNECT_SLICE, _READ_WRITE_BOUND
+        provider.with_options(timeout=timeout, max_retries=0).messages.create(
+            model="claude-sonnet-5",
+            max_tokens=1,
+            messages=[{"role": "user", "content": "hi"}],
         )
     finally:
-        native_http_client.close()
+        provider.close()
 
-    assert type(timeout) is httpx.Timeout
-    assert timeout == httpx.Timeout(
-        connect=_CONNECT_SLICE,
-        read=_READ_WRITE_BOUND,
-        write=_READ_WRITE_BOUND,
-        pool=_CONNECT_SLICE,
-    )
+    _assert_granular_timeout(seen["request_timeout"])
+    # Documented degradation of the fallback: the header carries the tuple repr.
+    assert seen["read_timeout_header"] == str(_granular_tuple())
 
 
 @pytest.mark.unit

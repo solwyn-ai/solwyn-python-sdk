@@ -8,6 +8,7 @@ under ``src/solwyn``.
 
 from __future__ import annotations
 
+import math
 import uuid
 from datetime import UTC, datetime
 from typing import Any, Literal, TypeVar, cast
@@ -62,6 +63,9 @@ _RUN_CONTROL_KEYS = frozenset({"version", "action", "agent_run_id", "reason"})
 _RUN_CONTROL_REASON_MAX_LENGTH = 64
 _UNPRICED_LEASE_MODEL = "no-such-model-for-leases"
 _BODY_PREVIEW_LIMIT = 200
+# BudgetCheckResponse.price_hints is a strict dict[ProviderName, float]; a key
+# outside this set makes the WHOLE check response unreadable to the SDK.
+_KNOWN_PROVIDER_NAMES = frozenset(provider.value for provider in ProviderName)
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
 
@@ -130,6 +134,14 @@ def _check_payload(
     tags: dict[str, str] | None = None,
     run_directive_version: Literal["1"] | None = None,
 ) -> dict[str, Any]:
+    """Build the probe check exactly as the SDK builds a production one.
+
+    ``price_hints_version`` is as load-bearing as the directive opt-ins: the
+    server states nothing about pricing without it, so an unopted probe could
+    never observe — let alone validate — the hint map every SDK check consumes.
+    ``run_directive_version`` stays a parameter because the pack asserts both
+    the opted-in and the legacy run-control shapes.
+    """
     return BudgetCheckRequest(
         estimated_input_tokens=1000,
         model="gpt-5.5",
@@ -138,6 +150,7 @@ def _check_payload(
         tags=tags,
         failover_directive_version="1",
         run_directive_version=run_directive_version,
+        price_hints_version="1",
     ).model_dump(mode="json")
 
 
@@ -145,6 +158,14 @@ def _require_numeric(value: object, label: str) -> None:
     _require(
         isinstance(value, (int, float)) and not isinstance(value, bool),
         f"{label} must be a JSON number, got {value!r}",
+    )
+
+
+def _require_finite_number(value: object, label: str) -> None:
+    _require_numeric(value, label)
+    _require(
+        math.isfinite(cast(float, value)),
+        f"{label} must be a finite JSON number, got {value!r}",
     )
 
 
@@ -180,12 +201,38 @@ def _require_directive_shape(payload: dict[str, Any], context: str) -> None:
         isinstance(directive.get("failover_tuning_allowed"), bool),
         f"{context} directive entitlement must be a JSON boolean",
     )
-    if "price_hints" in payload:
-        hints = payload["price_hints"]
-        _require(isinstance(hints, dict), f"{context} price_hints must be an object")
-        for provider, hint in hints.items():
-            _require(isinstance(provider, str), f"{context} price hint provider must be a string")
-            _require_numeric(hint, f"{context}.price_hints[{provider!r}]")
+    _require_price_hint_shape(payload, context)
+
+
+def _require_price_hint_shape(payload: dict[str, Any], context: str) -> None:
+    """Assert the served hint map is one the SDK can actually read.
+
+    Every check opts into ``price_hints_version="1"``, so the server answers
+    with a populated provider->hint map, an explicit ``{}`` (nothing priceable
+    for this modality or primary), or the null statement — which the
+    directive-v1 wire expresses by omitting the key. Null and absence are the
+    same statement and both pass.
+
+    A present map is strict: ``BudgetCheckResponse.price_hints`` is typed
+    ``dict[ProviderName, float]``, so one unknown provider key fails validation
+    for the ENTIRE response and the SDK fails open with no reservation. Name
+    the offending key here rather than leaving it as schema-validation noise.
+    """
+    hints = payload.get("price_hints")
+    if hints is None:
+        return
+    _require(
+        isinstance(hints, dict),
+        f"{context} price_hints must be an object or null",
+    )
+    for provider, hint in cast(dict[Any, Any], hints).items():
+        _require(isinstance(provider, str), f"{context} price hint provider must be a string")
+        _require(
+            provider in _KNOWN_PROVIDER_NAMES,
+            f"{context} price hint provider {provider!r} is not a known ProviderName; "
+            "the SDK cannot parse this check response",
+        )
+        _require_finite_number(hint, f"{context}.price_hints[{provider!r}]")
 
 
 def _post_check(

@@ -886,11 +886,11 @@ A populated hint mapping can place a cheaper healthy provider ahead of a
 healthy primary; when that provider serves, failover metadata reports
 `cost_routed`. An empty mapping (`{}`) means the server explicitly supplied no
 hints, while `null` means the check carried no hints and triggers the one-time
-no-hints warning. The allow-cache is a bounded 16-entry LRU with the same
-5-second TTL, keyed by provider, model, fallback chain, and modality; a cache
-hit replays only its own entry's hints. Lease-backed `solwyn.run()` calls carry
-no hints, so `CostPolicy` keeps configured order there until lease grants carry
-hints.
+no-hints warning. The allow-cache is a bounded 16-entry LRU keyed by provider,
+model, fallback chain, and modality, with the existing `budget_check_cache_ttl`
+window (default 5 s); a cache hit replays only its own entry's hints.
+Lease-backed `solwyn.run()` calls carry no hints, so `CostPolicy` keeps
+configured order there until lease grants carry hints.
 
 Use env vars to avoid passing credentials in code:
 
