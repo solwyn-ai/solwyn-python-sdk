@@ -1014,6 +1014,47 @@ def _hop_httpx_timeout(connect_slice: float, read_timeout: float) -> httpx.Timeo
     )
 
 
+def _hop_client_timeout(client: object, connect_slice: float, read_timeout: float) -> object:
+    """Build a granular timeout in the target client's native HTTP stack.
+
+    Provider SDKs can expose ``with_options`` while using incompatible httpx
+    major versions.  Their public ``timeout`` value is the provider-independent
+    seam: when it has the expected granular shape, construct the hop timeout
+    with that exact class.  Unknown or synthetic client shapes retain the
+    established httpx timeout, so they fail loudly at the SDK boundary instead
+    of silently collapsing connect/read semantics.
+    """
+    fallback = _hop_httpx_timeout(connect_slice, read_timeout)
+    try:
+        configured = cast("Any", client).timeout
+        configured_values = tuple(
+            getattr(configured, name) for name in ("connect", "read", "write", "pool")
+        )
+    except (AttributeError, TypeError):
+        return fallback
+    if not all(value is None or type(value) in (int, float) for value in configured_values):
+        return fallback
+
+    try:
+        candidate = type(configured)(
+            connect=connect_slice,
+            read=read_timeout,
+            write=read_timeout,
+            pool=connect_slice,
+        )
+        candidate_values = tuple(
+            getattr(candidate, name) for name in ("connect", "read", "write", "pool")
+        )
+    except (AttributeError, TypeError, ValueError):
+        return fallback
+    expected = (connect_slice, read_timeout, read_timeout, connect_slice)
+    if not all(type(value) in (int, float) for value in candidate_values):
+        return fallback
+    if candidate_values != expected:
+        return fallback
+    return candidate
+
+
 class Deadline:
     """A monotonic FAILOVER-WINDOW deadline.
 
@@ -1920,7 +1961,7 @@ class Solwyn(_SolwynBase):
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(
-                timeout=_hop_httpx_timeout(timeout, read_timeout),
+                timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
             )
         if surface == "responses":
@@ -1967,7 +2008,7 @@ class Solwyn(_SolwynBase):
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(
-                timeout=_hop_httpx_timeout(timeout, read_timeout),
+                timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
             )
         method, call_kwargs = _media_prepare(
@@ -3424,7 +3465,7 @@ class AsyncSolwyn(_SolwynBase):
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(
-                timeout=_hop_httpx_timeout(timeout, read_timeout),
+                timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
             )
         if surface == "responses":
@@ -3473,7 +3514,7 @@ class AsyncSolwyn(_SolwynBase):
         client = runtime.sdk_client
         if hasattr(client, "with_options"):
             client = client.with_options(
-                timeout=_hop_httpx_timeout(timeout, read_timeout),
+                timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
             )
         method, call_kwargs = _media_prepare(
