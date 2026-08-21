@@ -327,11 +327,12 @@ class TestLastKnownBudgetLimit:
         mock_resp = _mock_cloud_response(allowed=True, budget_limit=300.0, current_usage=50.0)
 
         # Act
-        with patch.object(enforcer._http, "post", return_value=mock_resp):
+        with patch.object(enforcer._http, "post", return_value=mock_resp) as post:
+            enforcer.check_budget(estimated_input_tokens=50_000, model="gpt-5.5", provider="openai")
             enforcer.check_budget(estimated_input_tokens=50_000, model="gpt-5.5", provider="openai")
 
         # Assert — cache expired, but last-known limit persists
-        assert enforcer._should_use_cache() is False
+        assert post.call_count == 2
         assert enforcer._last_known_budget_limit == 300.0
 
     def test_last_known_limit_is_none_before_any_cloud_contact(self) -> None:

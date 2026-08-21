@@ -223,6 +223,40 @@ class TestAsyncCloudAllow:
         enforcer._http.post.assert_awaited_once()
         assert enforcer._http.post.call_args.args[0].endswith("/api/v1/budgets/check")
         assert enforcer._http.post.call_args.kwargs["json"]["tags"] == {"team": "research"}
+        assert enforcer._http.post.call_args.kwargs["json"]["price_hints_version"] == "1"
+        await enforcer.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_keyed_cache_misses_for_changed_model(self) -> None:
+        enforcer = _make_async_enforcer()
+        enforcer._http.post = AsyncMock(return_value=_response(ALLOW_BUDGET_RESPONSE))
+
+        await enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
+        await enforcer.check_budget(
+            estimated_input_tokens=500, model="gpt-5.5-mini", provider="openai"
+        )
+
+        assert enforcer._http.post.await_count == 2
+        await enforcer.close()
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    async def test_cache_hit_replays_price_hints(self) -> None:
+        enforcer = _make_async_enforcer()
+        enforcer._http.post = AsyncMock(
+            return_value=_response(
+                {**ALLOW_BUDGET_RESPONSE, "price_hints": {"openai": 2.0, "anthropic": 1.0}}
+            )
+        )
+
+        await enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
+        cached = await enforcer.check_budget(
+            estimated_input_tokens=500, model="gpt-5.5", provider="openai"
+        )
+
+        assert cached.price_hints == {"openai": 2.0, "anthropic": 1.0}
+        assert enforcer._http.post.await_count == 1
         await enforcer.close()
 
     @pytest.mark.unit
@@ -260,8 +294,8 @@ class TestAsyncCloudAllow:
         assert first.reservation_id == "res_global"
         assert tagged.reservation_id == "res_tagged"
         assert cached.reservation_id is None
-        assert enforcer._cached_response is not None
-        assert enforcer._cached_response.reservation_id == "res_global"
+        assert enforcer._allow_cache
+        assert next(iter(enforcer._allow_cache.values()))[0].reservation_id == "res_global"
         assert enforcer._last_known_budget_limit == 75.0
         assert enforcer._last_known_current_usage == 12.5
         assert enforcer._http.post.await_count == 2
@@ -299,7 +333,7 @@ class TestAsyncCloudAllow:
 
         assert allowed.allowed is True
         assert enforcer._http.post.await_count == 2
-        assert enforcer._cached_response is None
+        assert not enforcer._allow_cache
         assert enforcer._last_hard_deny_response is None
         assert enforcer._last_known_budget_limit == 80.0
         assert enforcer._last_known_current_usage == 20.0
@@ -454,7 +488,7 @@ class TestAsyncCloudAllow:
         assert denied.allowed is False
         assert outage.allowed is False
         assert enforcer._http.post.await_count == 3
-        assert enforcer._cached_response is None
+        assert not enforcer._allow_cache
         assert enforcer._last_hard_deny_response is not None
         await enforcer.close()
 
@@ -617,8 +651,8 @@ class TestAsyncScopedCacheAndStickyDenials:
         assert enforcer._http.post.call_count == 3
         assert enforcer._http.post.call_args_list[1].kwargs["json"]["agent_run_id"] == "run_a"
         assert enforcer._http.post.call_args_list[2].kwargs["json"]["agent_run_id"] == "run_b"
-        assert enforcer._cached_response is not None
-        assert enforcer._cached_response.reservation_id == "res_global"
+        assert enforcer._allow_cache
+        assert next(iter(enforcer._allow_cache.values()))[0].reservation_id == "res_global"
         assert unscoped.reservation_id is None
         await enforcer.close()
 
