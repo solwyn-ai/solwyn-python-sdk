@@ -10,10 +10,10 @@ hint), never touching the dispatch loop.
 Also covers the two signal seams that feed those policies:
 - latency observation: ``record_latency`` / ``observed_p50`` (min-sample
   threshold, correct median, thread-safety smoke), surfaced onto the candidate.
-- price-hint plumbing: a ``BudgetCheckResponse.price_hints`` flows through
-  ``BudgetCheckResult`` -> ``update_price_hints`` -> ``self._solwyn_last_price_hints``
-  -> ``ProviderCandidate.price_hint``, and ``CostPolicy`` orders by it. The SDK
-  performs NO price arithmetic — the only price input is the server hint.
+- price hints are scoped to the matching routing selection: each
+  ``BudgetCheckResult.price_hints`` is passed directly to
+  ``_select_candidates`` and never persists on the client. ``CostPolicy``
+  orders by that server signal without SDK price arithmetic.
 """
 
 from __future__ import annotations
@@ -79,9 +79,9 @@ def _req() -> RoutingRequest:
     return RoutingRequest(requested_provider=ProviderName.OPENAI)
 
 
-def _ordered_providers(solwyn: Solwyn) -> list[str]:
+def _ordered_providers(solwyn: Solwyn, *, price_hints: dict[str, float] | None = None) -> list[str]:
     """Attempt-order provider names from _select_candidates (the routing seam)."""
-    return [rt.adapter.name for rt in solwyn._select_candidates(_req())]
+    return [rt.adapter.name for rt in solwyn._select_candidates(_req(), price_hints=price_hints)]
 
 
 # ── 1+2: POLICY-SWAP DROP-IN ─────────────────────────────────────────────────
@@ -143,12 +143,11 @@ def test_cost_policy_swap_changes_order_via_price_hints() -> None:
     health = _make_solwyn(_openai_client(), **chain)
     cost = _make_solwyn(_openai_client(), selection_policy=CostPolicy(), **chain)
     try:
-        # Feed the SAME server price hints to both (only the policy consumes them).
-        for s in (health, cost):
-            s.update_price_hints({"openai": 10.0, "anthropic": 2.0})
-
-        health_order = _ordered_providers(health)
-        cost_order = _ordered_providers(cost)
+        # Feed the SAME request-scoped server hints to both (only the policy
+        # consumes them).
+        hints = {"openai": 10.0, "anthropic": 2.0}
+        health_order = _ordered_providers(health, price_hints=hints)
+        cost_order = _ordered_providers(cost, price_hints=hints)
 
         # Assert — health ignores hints (configured order); cost reorders by hint.
         assert health_order == ["openai", "anthropic"]
@@ -302,7 +301,7 @@ def test_price_hints_flow_from_response_to_result() -> None:
 
 
 @pytest.mark.unit
-def test_price_hints_plumb_into_solwyn_last_price_hints_and_candidate() -> None:
+def test_select_candidates_orders_by_request_hints() -> None:
     solwyn = _make_solwyn(
         _openai_client(),
         model="gpt-5.5",
@@ -310,15 +309,10 @@ def test_price_hints_plumb_into_solwyn_last_price_hints_and_candidate() -> None:
         selection_policy=CostPolicy(),
     )
     try:
-        # Act — the client calls update_price_hints after each budget check; here
-        # we drive that seam directly with a server-shaped hint dict.
-        solwyn.update_price_hints({"openai": 10.0, "anthropic": 2.0})
+        ordered = _ordered_providers(solwyn, price_hints={"openai": 10.0, "anthropic": 2.0})
 
-        # Assert — stored on the instance...
-        assert solwyn._solwyn_last_price_hints == {"openai": 10.0, "anthropic": 2.0}
-
-        # ...surfaced onto each candidate and consumed by CostPolicy to reorder.
-        ordered = _ordered_providers(solwyn)
+        # The request's server hints reach candidates and CostPolicy chooses the
+        # cheaper provider first.
         assert ordered == ["anthropic", "openai"]
     finally:
         _close(solwyn)
@@ -337,19 +331,24 @@ def test_cost_routing_does_no_price_arithmetic_only_server_hint() -> None:
     )
     try:
         # openai cheaper -> openai first
-        solwyn.update_price_hints({"openai": 1.0, "anthropic": 9.0})
-        assert _ordered_providers(solwyn) == ["openai", "anthropic"]
+        assert _ordered_providers(solwyn, price_hints={"openai": 1.0, "anthropic": 9.0}) == [
+            "openai",
+            "anthropic",
+        ]
 
-        # flip the hints -> order flips, with NO other input changed (same tokens)
-        solwyn.update_price_hints({"openai": 9.0, "anthropic": 1.0})
-        assert _ordered_providers(solwyn) == ["anthropic", "openai"]
+        # Flip the server hints -> order flips, with NO other input changed.
+        assert _ordered_providers(solwyn, price_hints={"openai": 9.0, "anthropic": 1.0}) == [
+            "anthropic",
+            "openai",
+        ]
 
         # estimated_input_tokens on the request is NOT a price input: changing it
         # must not change cost order (proves no per-token price math).
         ordered_a = [
             rt.adapter.name
             for rt in solwyn._select_candidates(
-                RoutingRequest(requested_provider=ProviderName.OPENAI, estimated_input_tokens=1)
+                RoutingRequest(requested_provider=ProviderName.OPENAI, estimated_input_tokens=1),
+                price_hints={"openai": 9.0, "anthropic": 1.0},
             )
         ]
         ordered_b = [
@@ -357,7 +356,8 @@ def test_cost_routing_does_no_price_arithmetic_only_server_hint() -> None:
             for rt in solwyn._select_candidates(
                 RoutingRequest(
                     requested_provider=ProviderName.OPENAI, estimated_input_tokens=1_000_000
-                )
+                ),
+                price_hints={"openai": 9.0, "anthropic": 1.0},
             )
         ]
         assert ordered_a == ordered_b == ["anthropic", "openai"]
@@ -366,7 +366,9 @@ def test_cost_routing_does_no_price_arithmetic_only_server_hint() -> None:
 
 
 @pytest.mark.unit
-def test_no_price_hints_leaves_cost_policy_on_health_order() -> None:
+def test_select_candidates_with_empty_hints_keeps_configured_order_without_warning(
+    reset_cost_policy_warning: None, caplog: pytest.LogCaptureFixture
+) -> None:
     # Arrange — CostPolicy injected but the server has provided NO hints yet.
     solwyn = _make_solwyn(
         _openai_client(),
@@ -375,11 +377,39 @@ def test_no_price_hints_leaves_cost_policy_on_health_order() -> None:
         selection_policy=CostPolicy(),
     )
     try:
-        # Assert — falls back to health/config order (identical to today).
-        assert solwyn._solwyn_last_price_hints == {}
-        assert _ordered_providers(solwyn) == ["openai", "anthropic"]
+        with caplog.at_level(logging.WARNING):
+            order = _ordered_providers(solwyn, price_hints={})
+
+        # An explicit empty map is a server-directed clear, not a missing signal.
+        assert order == ["openai", "anthropic"]
+        assert _WARN_MSG not in caplog.text
     finally:
         _close(solwyn)
+
+
+@pytest.mark.unit
+def test_hints_do_not_persist_between_selections(
+    reset_cost_policy_warning: None,
+) -> None:
+    solwyn = _make_solwyn(
+        _openai_client(),
+        model="gpt-5.5",
+        fallback=[(_anthropic_client(), "claude-sonnet-5")],
+        selection_policy=CostPolicy(),
+    )
+    try:
+        assert _ordered_providers(solwyn, price_hints={"openai": 10.0, "anthropic": 2.0}) == [
+            "anthropic",
+            "openai",
+        ]
+        assert _ordered_providers(solwyn, price_hints=None) == ["openai", "anthropic"]
+    finally:
+        _close(solwyn)
+
+
+@pytest.mark.unit
+def test_price_hint_updater_is_not_public_api() -> None:
+    assert not hasattr(Solwyn, "update" + "_price_hints")
 
 
 # ── 5: defensive validation of a misbehaving policy's output (fix F) ─────────
@@ -463,7 +493,9 @@ def test_select_candidates_preserves_policy_order_for_valid_subset() -> None:
 
 # ── 6: CostPolicy-inert warning (selected but no server price hints) ──────────
 
-_WARN_MSG = "CostPolicy selected but no price hints available; using health-based order"
+_WARN_MSG = (
+    "CostPolicy selected but this budget check carried no price hints; using health-based order"
+)
 
 
 @pytest.fixture
@@ -480,7 +512,7 @@ def reset_cost_policy_warning() -> Iterator[None]:
 
 
 @pytest.mark.unit
-def test_cost_policy_warns_once_when_no_price_hints(
+def test_select_candidates_with_none_hints_warns_once(
     reset_cost_policy_warning: None, caplog: pytest.LogCaptureFixture
 ) -> None:
     # Arrange — CostPolicy selected but the server has provided NO hints.
@@ -495,7 +527,7 @@ def test_cost_policy_warns_once_when_no_price_hints(
         with caplog.at_level(logging.WARNING):
             order = ["", ""]
             for _ in range(3):
-                order = _ordered_providers(solwyn)
+                order = _ordered_providers(solwyn, price_hints=None)
 
         # Assert — degrades to health/config order, and warns EXACTLY once across
         # all three selections (not once per call).
@@ -518,11 +550,9 @@ def test_cost_policy_warning_suppressed_when_price_hints_present(
         selection_policy=CostPolicy(),
     )
     try:
-        solwyn.update_price_hints({"openai": 10.0, "anthropic": 2.0})
-
         # Act
         with caplog.at_level(logging.WARNING):
-            order = _ordered_providers(solwyn)
+            order = _ordered_providers(solwyn, price_hints={"openai": 10.0, "anthropic": 2.0})
 
         # Assert — hints consumed (cheaper first) and NO inert-warning emitted.
         assert order == ["anthropic", "openai"]
@@ -543,8 +573,8 @@ def test_cost_policy_warning_not_emitted_for_other_policies(
     try:
         # Act
         with caplog.at_level(logging.WARNING):
-            _ordered_providers(health)
-            _ordered_providers(latency)
+            _ordered_providers(health, price_hints=None)
+            _ordered_providers(latency, price_hints=None)
 
         # Assert
         assert _WARN_MSG not in caplog.text
@@ -565,8 +595,8 @@ def test_cost_policy_warning_fires_once_across_multiple_clients(
     try:
         # Act
         with caplog.at_level(logging.WARNING):
-            _ordered_providers(first)
-            _ordered_providers(second)
+            _ordered_providers(first, price_hints=None)
+            _ordered_providers(second, price_hints=None)
 
         # Assert
         warnings = [r.getMessage() for r in caplog.records if _WARN_MSG in r.getMessage()]

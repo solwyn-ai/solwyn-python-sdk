@@ -4,16 +4,13 @@ Where ``test_routing_policy_swap.py`` drives the ``_select_candidates`` seam
 directly, these tests run real intercepted calls (mocked provider clients) so
 the wiring between dispatch and the routing signals is exercised for real:
 
-- price-hint LIFETIME (fix A): hints persist across a budget cache hit; a
-  hint-less (None) budget response must NOT wipe the last-known hints.
 - POLICY-SWAP DROP-IN through dispatch (fix B): the SAME provider chain, the
   SAME dispatch/translation/budget code, served provider changes purely from
   the injected ``selection_policy``.
 - latency observation wiring (fix C): successful non-streaming AND streamed
   hops feed ``record_latency`` so ``observed_p50`` transitions None -> value.
-- price-hint plumbing INTO ``update_price_hints`` (fix D): a budget check that
-  returns non-None ``price_hints`` populates ``_solwyn_last_price_hints`` and a
-  subsequent ``CostPolicy`` ordering reflects it.
+- request-scoped price-hint plumbing (fix D): each budget check's
+  ``price_hints`` orders only that dispatch and never affects a following call.
 
 No real provider SDKs are importable; clients are duck-typed MagicMocks whose
 ``__class__.__module__`` triggers adapter detection.
@@ -23,15 +20,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from conftest import VALID_API_KEY
 
-from solwyn._routing import CostPolicy, LatencyPolicy, RoutingRequest
-from solwyn._types import ProviderName
+from solwyn._routing import CostPolicy, LatencyPolicy
 from solwyn.budget import BudgetCheckResult
-from solwyn.client import AsyncSolwyn, Solwyn
+from solwyn.client import Solwyn
 
 # ── client + response fakes ──────────────────────────────────────────────
 
@@ -126,75 +122,6 @@ _PLAIN_REQUEST = {
     # max_tokens so a cross-provider hop translates cleanly (Anthropic requires it).
     "max_tokens": 256,
 }
-
-
-def _ordered_providers(solwyn: Solwyn) -> list[str]:
-    req = RoutingRequest(requested_provider=ProviderName.OPENAI)
-    return [rt.adapter.name for rt in solwyn._select_candidates(req)]
-
-
-# ── A: price-hint LIFETIME across a budget cache hit ─────────────────────
-
-
-@pytest.mark.unit
-class TestPriceHintLifetimeAcrossCacheHit:
-    def test_cache_hit_with_none_hints_preserves_last_known_hints(self) -> None:
-        # Arrange — two successive intercepted calls. The FIRST budget response
-        # carries server price hints; the SECOND is a cache hit (price_hints
-        # None). The advisory hints must SURVIVE the hint-less second check.
-        openai = _openai_client()
-        openai.chat.completions.create.return_value = _openai_response()
-        solwyn = _make_solwyn(
-            openai,
-            model="gpt-5.5",
-            fallback=[(_anthropic_client(), "claude-sonnet-5")],
-        )
-        try:
-            results = [
-                _budget_result(price_hints={"openai": 10.0, "anthropic": 2.0}),
-                _budget_result(price_hints=None),  # cache hit
-            ]
-            with patch.object(solwyn._solwyn_budget, "check_budget", side_effect=results):
-                solwyn.chat.completions.create(**_PLAIN_REQUEST)
-                # After the first (hint-bearing) call the signal is populated.
-                assert solwyn._solwyn_last_price_hints == {"openai": 10.0, "anthropic": 2.0}
-
-                solwyn.chat.completions.create(**_PLAIN_REQUEST)
-
-            # Assert — the cache-hit (None) response did NOT wipe the hints; the
-            # CostPolicy signal is intact for the whole cache window.
-            assert solwyn._solwyn_last_price_hints == {"openai": 10.0, "anthropic": 2.0}
-        finally:
-            _close(solwyn)
-
-    @pytest.mark.unit
-    @pytest.mark.asyncio
-    async def test_async_cache_hit_with_none_hints_preserves_last_known_hints(self) -> None:
-        openai = _openai_client()
-        openai.chat.completions.create = AsyncMock(return_value=_openai_response())
-        solwyn = AsyncSolwyn(  # type: ignore[arg-type]
-            openai,
-            api_key=VALID_API_KEY,
-            model="gpt-5.5",
-            fallback=[(_anthropic_client(), "claude-sonnet-5")],
-        )
-        solwyn._solwyn_reporter.report = MagicMock()
-        try:
-            results = [
-                _budget_result(price_hints={"openai": 10.0, "anthropic": 2.0}),
-                _budget_result(price_hints=None),
-            ]
-            with patch.object(
-                solwyn._solwyn_budget, "check_budget", AsyncMock(side_effect=results)
-            ):
-                await solwyn.chat.completions.create(**_PLAIN_REQUEST)
-                assert solwyn._solwyn_last_price_hints == {"openai": 10.0, "anthropic": 2.0}
-                await solwyn.chat.completions.create(**_PLAIN_REQUEST)
-
-            assert solwyn._solwyn_last_price_hints == {"openai": 10.0, "anthropic": 2.0}
-        finally:
-            await solwyn._solwyn_reporter._http.aclose()
-            await solwyn._solwyn_budget._http.aclose()
 
 
 # ── B: POLICY-SWAP DROP-IN through the real dispatch loop ────────────────
@@ -304,12 +231,12 @@ class TestLatencyObservedThroughDispatch:
             _close(solwyn)
 
 
-# ── D: price-hint plumbing FROM the budget check INTO update_price_hints ──
+# ── D: request-scoped price-hint plumbing from the budget check ───────────
 
 
 @pytest.mark.unit
 class TestPriceHintPlumbingFromBudgetCheck:
-    def test_budget_hints_populate_solwyn_last_price_hints_and_drive_cost_order(self) -> None:
+    def test_budget_hints_order_only_the_matching_dispatch(self) -> None:
         openai = _openai_client()
         openai.chat.completions.create.return_value = _openai_response()
         anthropic = _anthropic_client()
@@ -321,22 +248,23 @@ class TestPriceHintPlumbingFromBudgetCheck:
             selection_policy=CostPolicy(),
         )
         try:
-            # Before any check, no hints -> CostPolicy is on health/config order.
-            assert solwyn._solwyn_last_price_hints == {}
-            assert _ordered_providers(solwyn) == ["openai", "anthropic"]
-
             with patch.object(
                 solwyn._solwyn_budget,
                 "check_budget",
-                return_value=_budget_result(price_hints={"openai": 10.0, "anthropic": 2.0}),
+                side_effect=[
+                    _budget_result(price_hints={"openai": 10.0, "anthropic": 2.0}),
+                    _budget_result(price_hints=None),
+                ],
             ):
-                solwyn.chat.completions.create(**_PLAIN_REQUEST)
+                first = solwyn.chat.completions.create(**_PLAIN_REQUEST)
+                second = solwyn.chat.completions.create(**_PLAIN_REQUEST)
 
-            # The budget check's hints flowed into _solwyn_last_price_hints...
-            assert solwyn._solwyn_last_price_hints == {"openai": 10.0, "anthropic": 2.0}
-            # ...and a subsequent CostPolicy ordering reflects them (anthropic
-            # cheaper -> first).
-            assert _ordered_providers(solwyn) == ["anthropic", "openai"]
+            # First call receives prices making Anthropic cheaper; the next
+            # check carries None, so its configured primary OpenAI is selected.
+            assert first.choices[0].message.content == "ok from claude"
+            assert second.choices[0].message.content == "ok from gpt"
+            assert anthropic.messages.create.call_count == 1
+            assert openai.chat.completions.create.call_count == 1
         finally:
             _close(solwyn)
 

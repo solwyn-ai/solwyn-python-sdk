@@ -2060,8 +2060,6 @@ class Solwyn(_SolwynBase):
         )
         deadline.replace_total(tuning.failover_total_timeout)
         self._solwyn_reporter.observe_project_id(budget.project_id)
-        if budget.price_hints is not None:
-            self.update_price_hints(budget.price_hints)
 
         if not budget.allowed:
             _report_budget_denial(
@@ -2389,13 +2387,6 @@ class Solwyn(_SolwynBase):
         )
         deadline.replace_total(tuning.failover_total_timeout)
         self._solwyn_reporter.observe_project_id(budget.project_id)
-        # Refresh the CostPolicy signal from the server. Price hints are advisory
-        # and slow-moving, so they PERSIST across hint-less responses — a budget
-        # cache hit (price_hints None) leaves the last-known hints in place; we
-        # only overwrite when the server actually returns hints. The SDK never
-        # computes price — it only forwards this relative signal.
-        if budget.price_hints is not None:
-            self.update_price_hints(budget.price_hints)
 
         if not budget.allowed:
             # Report estimated tokens so the API keeps an accurate running total
@@ -2441,7 +2432,8 @@ class Solwyn(_SolwynBase):
             RoutingRequest(
                 requested_provider=primary.entry.provider,
                 estimated_input_tokens=est_in,
-            )
+            ),
+            price_hints=budget.price_hints,
         )
         if not allow_cross_provider:
             candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
@@ -3544,8 +3536,6 @@ class AsyncSolwyn(_SolwynBase):
         )
         deadline.replace_total(tuning.failover_total_timeout)
         self._solwyn_reporter.observe_project_id(budget.project_id)
-        if budget.price_hints is not None:
-            self.update_price_hints(budget.price_hints)
 
         if not budget.allowed:
             _report_budget_denial(
@@ -3829,11 +3819,6 @@ class AsyncSolwyn(_SolwynBase):
         )
         deadline.replace_total(tuning.failover_total_timeout)
         self._solwyn_reporter.observe_project_id(budget.project_id)
-        # Refresh the CostPolicy signal from the server. Hints PERSIST across
-        # hint-less responses (cache hits) until the server sends new ones — see
-        # the sync _intercepted_call for the rationale.
-        if budget.price_hints is not None:
-            self.update_price_hints(budget.price_hints)
 
         if not budget.allowed:
             # See the sync _intercepted_call: region rides the denied event.
@@ -3874,7 +3859,8 @@ class AsyncSolwyn(_SolwynBase):
             RoutingRequest(
                 requested_provider=primary.entry.provider,
                 estimated_input_tokens=est_in,
-            )
+            ),
+            price_hints=budget.price_hints,
         )
         if not allow_cross_provider:
             candidates = [c for c in candidates if c.entry.provider == primary.entry.provider]
