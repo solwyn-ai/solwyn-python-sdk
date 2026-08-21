@@ -261,8 +261,9 @@ def test_health_policy_ignores_hints_entirely() -> None:
 
 @pytest.mark.unit
 @pytest.mark.asyncio
-async def test_async_second_call_with_different_primary_model_is_never_ordered_by_first_calls_hints(
-) -> None:
+async def test_async_second_call_with_different_primary_model_is_never_ordered_by_first_calls_hints() -> (  # noqa: E501
+    None
+):
     """Catches the async cache key omitting the requested model and replaying stale hints."""
     plane = FakeControlPlane(price_hints={"openai": 3.0, "anthropic": 1.0})
     first_hints = dict(plane.price_hints)
