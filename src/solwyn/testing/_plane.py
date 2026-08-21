@@ -1375,7 +1375,7 @@ class FakeControlPlane:
             project_id=self.project_id,
             price_hints=(
                 {ProviderName(provider): hint for provider, hint in self.price_hints.items()}
-                if self.price_hints is not None
+                if self.price_hints is not None and parsed.price_hints_version == "1"
                 else None
             ),
             failover_directive=(

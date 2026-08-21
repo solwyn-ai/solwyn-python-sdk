@@ -70,12 +70,14 @@ class TestFailoverReason:
         assert FailoverReason.CIRCUIT_OPEN == "circuit_open"
         assert FailoverReason.PRIMARY_ERROR == "primary_error"
         assert FailoverReason.MODEL_FALLBACK == "model_fallback"
+        assert FailoverReason.COST_ROUTED == "cost_routed"
 
     def test_member_set(self) -> None:
         assert {r.value for r in FailoverReason} == {
             "circuit_open",
             "primary_error",
             "model_fallback",
+            "cost_routed",
         }
 
 

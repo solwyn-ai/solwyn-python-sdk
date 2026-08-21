@@ -126,6 +126,7 @@ class FailoverReason(StrEnum):
     CIRCUIT_OPEN = "circuit_open"  # primary breaker was OPEN — never attempted
     PRIMARY_ERROR = "primary_error"  # primary attempt raised before success
     MODEL_FALLBACK = "model_fallback"  # same-provider model swap
+    COST_ROUTED = "cost_routed"  # routing policy put a healthy non-primary provider first
 
 
 # The CONTRACTUAL tier values, pinned lock-step with the Cloud API's
@@ -604,6 +605,13 @@ class BudgetCheckRequest(BaseModel):
     run_directive_version: Literal["1"] | None = Field(
         default=None,
         description="Explicit opt-in to version 1 server run-control directives.",
+    )
+    price_hints_version: Literal["1"] | None = Field(
+        default=None,
+        description=(
+            "Explicit opt-in to server price hints on the response. Omitted requests keep "
+            "price_hints null (no statement)."
+        ),
     )
 
     @model_validator(mode="after")

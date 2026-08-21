@@ -82,6 +82,7 @@ EXPECTED_CHECK_FIELDS = {
     "tags",
     "failover_directive_version",
     "run_directive_version",
+    "price_hints_version",
 }
 
 # Optional check fields the None-skipping serializer drops when unset. Runtime
@@ -93,6 +94,7 @@ _NONE_SKIPPED_CHECK_FIELDS = {
     "tags",
     "failover_directive_version",
     "run_directive_version",
+    "price_hints_version",
 }
 
 EXPECTED_CHECK_RESPONSE_FIELDS = {
@@ -565,6 +567,7 @@ class TestWireModelDumpSnapshots:
             "tags",
             "failover_directive_version",
             "run_directive_version",
+            "price_hints_version",
         }
         assert dumped["agent_run_id"] == "run_abc"
 
@@ -628,9 +631,22 @@ class TestWireModelDumpSnapshots:
             "tags",
             "failover_directive_version",
             "run_directive_version",
+            "price_hints_version",
         }
         assert dumped["estimated_media"]["image_count"] == 2
         assert dumped["modality"] == "image"
+
+    def test_budget_check_request_opted_in_dump_carries_price_hints_version(self) -> None:
+        req = BudgetCheckRequest(
+            estimated_input_tokens=10,
+            model="gpt-5.5",
+            provider=ProviderName.OPENAI,
+            price_hints_version="1",
+        )
+
+        dumped = req.model_dump(mode="json")
+
+        assert dumped["price_hints_version"] == "1"
 
     def test_budget_check_response_dump_keys(self) -> None:
         response = BudgetCheckResponse(
