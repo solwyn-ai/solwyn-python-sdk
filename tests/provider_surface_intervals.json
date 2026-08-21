@@ -10,6 +10,7 @@
 
     {"family": "anthropic", "interval": "floor", "packages": "anthropic==0.50.0"},
     {"family": "anthropic", "interval": "anthropic-parse", "packages": "anthropic==0.80.0"},
+    {"family": "anthropic", "interval": "anthropic-stable-files-skills", "packages": "anthropic==1.0.0"},
     {"family": "anthropic", "interval": "latest", "packages": "anthropic>=0.50"},
 
     {"family": "together", "interval": "floor", "packages": "together==2.0.0"},
