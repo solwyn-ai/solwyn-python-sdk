@@ -7,6 +7,22 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-24
+
+The SDK grows from a budget gate into a control plane for agent runs. Failover
+is cost-aware: every budget check opts into server price hints, and
+`CostPolicy` serves the cheapest healthy provider for exactly the call that was
+priced. Runaway runs stop from either side — a server-pushed `terminate_run`
+directive or the content-free local velocity detector raises `RunStoppedError`,
+aborts streams at the next chunk boundary, and leaves a denial receipt that
+survives control-plane outages. Native OpenAI and Azure OpenAI Responses calls
+are metered; wrappers pass `isinstance`, so LangChain/LangGraph, CrewAI, and
+OpenAI Agents admit them; strict coverage controls can refuse unmetered surfaces
+before provider I/O; Anthropic 1.x clients on `httpx2` are supported; and
+`solwyn.testing.FakeControlPlane` exercises all of it with zero network.
+Wire-contract changes are API-first: Solwyn Cloud accepts every field below
+before this SDK releases. Ships #53–#55, #57–#67, #70, #73, #77, and #78.
+
 ### Added
 
 - **`CostPolicy` now consumes server price hints.** Every budget check opts

@@ -969,12 +969,13 @@ def test_maintainer_docs_define_python_contract_and_ci_artifact() -> None:
 
 
 @pytest.mark.unit
-def test_unreleased_changelog_keeps_posture_and_escape_controls_together() -> None:
+def test_release_changelog_keeps_posture_and_escape_controls_together() -> None:
     # Arrange
     changelog = (_PROJECT_ROOT / "CHANGELOG.md").read_text()
 
     # Act
-    unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+    # Pinned to the entry where this contract shipped; [Unreleased] empties at each release.
+    release_notes = changelog.split("## [0.6.0]", 1)[1].split("\n## [", 1)[0]
 
     # Assert
     for contract_name in (
@@ -985,4 +986,4 @@ def test_unreleased_changelog_keeps_posture_and_escape_controls_together() -> No
         "UntrackedSpendSurfaceError",
         "coverage(client)",
     ):
-        assert contract_name in unreleased
+        assert contract_name in release_notes

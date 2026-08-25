@@ -313,12 +313,13 @@ def test_readme_provider_recipes_own_and_close_real_provider_clients() -> None:
 
 @pytest.mark.unit
 def test_changelog_distinguishes_migrated_sdk_behavior_from_live_state() -> None:
-    unreleased = _CHANGELOG.read_text().partition("## [Unreleased]")[2].partition("\n## [")[0]
+    # Pinned to the entry where this contract shipped; [Unreleased] empties at each release.
+    release_notes = _CHANGELOG.read_text().partition("## [0.6.0]")[2].partition("\n## [")[0]
 
-    assert "SDK-behavior integration" in unreleased
-    assert "zero-network CI lane" in unreleased
-    assert "live integration retains" in unreleased
-    assert "deployed server-state coverage" in unreleased
+    assert "SDK-behavior integration" in release_notes
+    assert "zero-network CI lane" in release_notes
+    assert "live integration retains" in release_notes
+    assert "deployed server-state coverage" in release_notes
 
 
 @pytest.mark.unit
