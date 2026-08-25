@@ -508,10 +508,11 @@ def test_public_docs_describe_run_stop_hierarchy_and_cooperative_api() -> None:
     normalized_error_handling = " ".join(error_handling.split())
 
     changelog = (_PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
-    normalized_unreleased = " ".join(unreleased.split())
+    # Pinned to the entry where this contract shipped; [Unreleased] empties at each release.
+    release_notes = changelog.split("## [0.6.0]", 1)[1].split("\n## [", 1)[0]
+    normalized_release_notes = " ".join(release_notes.split())
 
-    for documented_contract in (normalized_error_handling, normalized_unreleased):
+    for documented_contract in (normalized_error_handling, normalized_release_notes):
         assert "inherits directly from `SolwynError`, not `BudgetExceededError`" in (
             documented_contract
         )
@@ -533,7 +534,7 @@ def test_public_docs_describe_run_stop_hierarchy_and_cooperative_api() -> None:
         "may be forgotten after LRU eviction",
     ):
         assert bounded_registry_contract in normalized_error_handling
-        assert bounded_registry_contract in normalized_unreleased
+        assert bounded_registry_contract in normalized_release_notes
 
     for stream_contract in (
         "Active stream handles retain",
@@ -543,7 +544,7 @@ def test_public_docs_describe_run_stop_hierarchy_and_cooperative_api() -> None:
         "exactly once",
     ):
         assert stream_contract in normalized_error_handling
-        assert stream_contract in normalized_unreleased
+        assert stream_contract in normalized_release_notes
 
 
 @pytest.mark.unit

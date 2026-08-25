@@ -782,7 +782,8 @@ class TestWireModelDumpSnapshots:
             "## Release Compatibility", 1
         )[0]
         changelog = (_PROJECT_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-        unreleased = changelog.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+        # Pinned to the entry where this contract shipped; [Unreleased] empties at each release.
+        release_notes = changelog.split("## [0.6.0]", 1)[1].split("\n## [", 1)[0]
 
         for field in (
             "deny_source",
@@ -794,7 +795,7 @@ class TestWireModelDumpSnapshots:
             "receipt_pricing_input_tokens",
         ):
             assert f"`{field}`" in transparency
-            assert f"`{field}`" in unreleased
+            assert f"`{field}`" in release_notes
 
     @pytest.mark.parametrize(
         ("field", "value"),
