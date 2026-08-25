@@ -64,7 +64,11 @@ Repository = "https://github.com/solwyn-ai/solwyn-python"
 "Model Pricing" = "https://mpi.sh"
 
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
+# hatchling 1.32+ emits core metadata 2.5, which the publish gate rejects:
+# hynek/build-and-inspect-python-package pins twine/packaging that only know
+# 2.4 (v0.6.0's first Publish run failed on exactly this). Lift the ceiling once
+# the action's packaging pin understands 2.5.
+requires = ["hatchling<1.32", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [tool.hatch.version]
