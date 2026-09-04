@@ -148,6 +148,12 @@ def _assert_settled_exactly_once(
     event = success_events[0]
     # The confirm and its metadata event share the reconciliation join key.
     assert event["call_id"] == confirm["call_id"]
+    # ... and the same funding lease: both halves read it from the admission
+    # result, so a reservation-funded pair carries none on either side (the
+    # lease-funded pairing is proved on the double in
+    # test_metadata_event_lease_id.py).
+    assert event.get("lease_id") == confirm.get("lease_id")
+    assert "lease_id" not in event
     # Confirm-before-metadata order on the wire.
     assert recorder._first_index("/budgets/confirm") < recorder._first_index("/metadata/ingest")
     return event
