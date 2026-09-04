@@ -167,6 +167,11 @@ def _reject_reserved_wrap_kwargs(kwargs: dict[str, Any]) -> None:
         raise TypeError(f"reserved control-plane wiring cannot be overridden: {joined}")
 
 
+def _duplicate_entry(index: int, reason: str, event: MetadataEvent) -> dict[str, Any]:
+    """One ``duplicates[]`` entry: submitted index, probe that hit, echoed call id."""
+    return {"index": index, "reason": reason, "call_id": event.call_id}
+
+
 def _metadata_legacy_identity(event: MetadataEvent) -> tuple[datetime, str]:
     timestamp = event.timestamp
     normalized = (
@@ -1424,13 +1429,20 @@ class FakeControlPlane:
         if isinstance(parsed, PlaneResponse):
             return parsed
         newly_ingested: list[MetadataEvent] = []
-        for event in parsed:
+        # Dedup skips ride the 202 body's ``duplicates`` lane exactly as the
+        # API reports them: keyed by SUBMITTED index, attributed to the probe
+        # that hit with the legacy (timestamp, sdk_instance_id) key checked
+        # first, one entry per event. The three lanes partition the batch:
+        # ``len(batch) == ingested + len(rejected) + len(duplicates)``.
+        duplicates: list[dict[str, Any]] = []
+        for index, event in enumerate(parsed):
             identity = (event.call_id, event.attempt_index)
             legacy_identity = _metadata_legacy_identity(event)
-            if (
-                identity in self._seen_ingest_identities
-                or legacy_identity in self._seen_ingest_legacy_identities
-            ):
+            if legacy_identity in self._seen_ingest_legacy_identities:
+                duplicates.append(_duplicate_entry(index, "legacy_key", event))
+                continue
+            if identity in self._seen_ingest_identities:
+                duplicates.append(_duplicate_entry(index, "call_id", event))
                 continue
             self._seen_ingest_identities.add(identity)
             self._seen_ingest_legacy_identities.add(legacy_identity)
@@ -1440,8 +1452,11 @@ class FakeControlPlane:
         # server refuses to price a rejected event, it does not unsee it.
         scripted = self._consume_ingest_rejection_window()
         if scripted is None:
-            return PlaneResponse(202, {"ingested": len(newly_ingested), "rejected": []})
-        return PlaneResponse(202, self._scripted_ingest_body(scripted, parsed))
+            return PlaneResponse(
+                202,
+                {"ingested": len(newly_ingested), "rejected": [], "duplicates": duplicates},
+            )
+        return PlaneResponse(202, self._scripted_ingest_body(scripted, parsed, duplicates))
 
     def _consume_ingest_rejection_window(self) -> _ScenarioWindow | None:
         """Take the first open rejection window scoped to the ingest path."""
@@ -1454,8 +1469,13 @@ class FakeControlPlane:
         self,
         window: _ScenarioWindow,
         events: list[MetadataEvent],
+        duplicates: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Build the 202 body one scripted rejection window calls for."""
+        """Build the 202 body one scripted rejection window calls for.
+
+        ``duplicates`` is the dedup lane the batch already earned; a scripted
+        rejection never shifts it, and the ingested count excludes both lanes.
+        """
         if window.malformed:
             return {"rejected": "corrupt"}
         rejected: list[dict[str, Any]] = []
@@ -1477,7 +1497,11 @@ class FakeControlPlane:
             rejected.extend(
                 self._rejection_entry(window.code, event, index=None) for event in events[:count]
             )
-        return {"ingested": max(len(events) - len(rejected), 0), "rejected": rejected}
+        return {
+            "ingested": max(len(events) - len(rejected) - len(duplicates), 0),
+            "rejected": rejected,
+            "duplicates": duplicates,
+        }
 
     @staticmethod
     def _rejection_entry(

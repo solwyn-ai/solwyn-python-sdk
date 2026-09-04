@@ -18,6 +18,19 @@ derived from git tags (hatch-vcs).
   change for reservation-funded, cache-hit, fail-open, uncounted or denied
   calls, whose events carry no lease id and whose wire bytes are unchanged.
 
+### Changed
+
+- **`FakeControlPlane` reports ingest dedup skips in `duplicates[]`.** The
+  double's `/metadata/ingest` 202 body is now the three-lane shape the live API
+  has answered with since 2026-09-01: `{"ingested", "rejected", "duplicates"}`,
+  where each duplicate names the submitted index, the probe that hit
+  (`legacy_key` for the timestamp-plus-instance key, checked first, or
+  `call_id`) and the echoed call id, and the three lanes partition the batch. A
+  replayed batch used to answer `{"ingested": 0, "rejected": []}`; tests that
+  pinned that two-key body must add the lane. The reporter never read it, so
+  SDK behaviour is unchanged. The shared `solwyn.testing.contract` receipt pack
+  now pins the three-key body in both lanes.
+
 ## [0.6.0] - 2026-08-24
 
 The SDK grows from a budget gate into a control plane for agent runs. Failover

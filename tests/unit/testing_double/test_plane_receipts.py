@@ -97,7 +97,7 @@ def test_denial_receipt_is_accepted_and_recorded() -> None:
     response = _ingest(plane, [_receipt_event(), _ordinary_event()])
 
     assert response.status_code == 202
-    assert response.json() == {"ingested": 2, "rejected": []}
+    assert response.json() == {"ingested": 2, "rejected": [], "duplicates": []}
     (receipt,) = plane.denial_receipts
     assert receipt.deny_source == "server"
     assert receipt.deny_reason == "manual_kill"
@@ -232,7 +232,7 @@ def test_reject_ingest_window_is_request_bounded_and_scoped_to_ingest() -> None:
         second = _ingest(plane, [_receipt_event()]).json()
 
     assert len(first["rejected"]) == 1
-    assert second == {"ingested": 1, "rejected": []}
+    assert second == {"ingested": 1, "rejected": [], "duplicates": []}
 
 
 @pytest.mark.unit

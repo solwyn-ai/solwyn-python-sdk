@@ -845,7 +845,7 @@ def _post_receipt(
     _require_status(response, 202, context)
     body = _object_json(response, context)
     _require(
-        body == {"ingested": 1, "rejected": []},
+        body == {"ingested": 1, "rejected": [], "duplicates": []},
         f"{context} ingest body drifted: {body!r}",
     )
 
