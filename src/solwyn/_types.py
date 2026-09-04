@@ -442,6 +442,18 @@ class MetadataEvent(BaseModel):
         max_length=AGENT_RUN_NAME_MAX_LENGTH,
         description="Human-readable label passed to solwyn.run(name).",
     )
+    lease_id: str | None = Field(
+        default=None,
+        max_length=LEASE_ID_MAX_LENGTH,
+        description=(
+            "Budget lease whose claim funded this call's admission, from "
+            "LeaseGrantResponse; the same id the call's confirm carries. None "
+            "when the call was funded by a per-call reservation, admitted from "
+            "the allow cache, admitted fail-open or uncounted, or denied. Server-"
+            "minted opaque id (lse_...), never content; bounded by "
+            "LEASE_ID_MAX_LENGTH exactly as BudgetConfirmRequest.lease_id (D7)."
+        ),
+    )
     provider_region: str | None = Field(
         default=None,
         max_length=PROVIDER_REGION_MAX_LENGTH,
