@@ -7,6 +7,17 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
+### Added
+
+- **`MetadataEvent.lease_id`.** Every telemetry event for a lease-funded call
+  now names the budget lease that funded it, the same id its confirm carries,
+  on success and error events alike. Solwyn Cloud uses it to keep a call's
+  spend counted once between its metadata landing and its confirmation
+  settling, including when the confirmation is lost. Wire-contract change,
+  API-first: Solwyn Cloud accepts the field before this release. No behaviour
+  change for reservation-funded, cache-hit, fail-open, uncounted or denied
+  calls, whose events carry no lease id and whose wire bytes are unchanged.
+
 ## [0.6.0] - 2026-08-24
 
 The SDK grows from a budget gate into a control plane for agent runs. Failover
