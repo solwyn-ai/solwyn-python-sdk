@@ -2148,9 +2148,7 @@ async def test_an_async_holder_parks_a_release_it_cannot_schedule() -> None:
     parked = list(enforcer._releases_owed)
     await enforcer.close()
 
-    assert [(run_id, request.lease_id) for run_id, request in parked] == [
-        ("run-lease", "lse_fake1")
-    ]
+    assert [(owed.run_id, owed.request.lease_id) for owed in parked] == [("run-lease", "lse_fake1")]
     assert [request.lease_id for request in plane.lease_surrenders] == ["lse_fake1"]
 
 

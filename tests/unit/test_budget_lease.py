@@ -1461,6 +1461,37 @@ class TestLeaseSurrender:
         assert posted_from[0] != caller
         enforcer._http.close()
 
+    def test_the_regrant_fence_exists_from_the_moment_of_the_drop(self) -> None:
+        # The window this closes: raising the fence when a WORKER starts would
+        # leave the drop-to-start gap open, and a concurrent admission can
+        # claim this run's grant slot inside it. The fence is raised in the
+        # drop's own lock section, before any thread exists — and a drain that
+        # claims the payload opens it, so nothing waits for a release close()
+        # has taken over.
+        enforcer = _make_enforcer()
+        request = LeaseSurrenderRequest(
+            lease_id="lease_1",
+            holder_id=enforcer._lease.holder_id,
+            generation=1,
+            spent_tokens=3,
+        )
+
+        with enforcer._state_lock:
+            enforcer._owe_release_locked(RUN, request)
+            pending = enforcer._run_releases.get(RUN)
+
+        assert pending is not None
+        done, deadline = pending
+        assert done.is_set() is False
+        assert enforcer._release_threads == set()
+        assert deadline > time.monotonic()
+
+        payloads = enforcer.lease_surrender_payloads()
+
+        assert payloads == [request]
+        assert done.is_set() is True
+        enforcer._http.close()
+
     def test_a_regrant_waits_for_the_release_of_the_lease_it_replaces(self) -> None:
         # The S1 sequencing rule: a drop that can be followed by another grant
         # from the SAME holder (an unreadable body after its 30s floor, a
@@ -1735,7 +1766,12 @@ class TestLeaseSurrender:
                 threading.Thread, "start", side_effect=RuntimeError("can't start new thread")
             ):
                 enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
-                parked = [request.lease_id for _run_id, request in enforcer._releases_owed]
+                parked = [owed.request.lease_id for owed in enforcer._releases_owed]
+                # The fence is OPEN: nothing is in flight for a re-grant to
+                # wait on, so it must not sit out the whole release budget.
+                assert all(
+                    owed.done is not None and owed.done.is_set() for owed in enforcer._releases_owed
+                )
                 assert surrender.call_count == 0
             assert all(thread.ident is not None for thread in enforcer._release_threads)
 
