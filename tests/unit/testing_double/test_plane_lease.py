@@ -15,6 +15,7 @@ import httpx
 import pytest
 
 import solwyn as solwyn_pkg
+from solwyn._token_details import TokenDetails
 from solwyn._types import (
     BudgetMode,
     LeaseGrantRequest,
@@ -1884,6 +1885,145 @@ async def test_async_transport_parity_for_lease_lifecycle_and_refusal() -> None:
     assert [type(item) for item in plane.lease_grants] == [LeaseGrantRequest]
     assert [type(item) for item in plane.lease_renewals] == [LeaseRenewRequest]
     assert [type(item) for item in plane.lease_surrenders] == [LeaseSurrenderRequest]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("drop", ["ineligible", "denied", "run_stopped"])
+def test_a_terminal_renewal_surrenders_the_dropped_lease_exactly_once(drop: str) -> None:
+    """S1: every renewal answer that ends the lease hands it straight back.
+
+    Today the plane answers 409 — it advanced the generation when it stored
+    the terminal successor — and that is fine: the release is a courtesy, and
+    the fence is the server's decision. What must hold either way is that
+    exactly ONE release is sent, that it names the lease and generation the
+    holder actually held, and that close() does not send a second one.
+    """
+    plane = FakeControlPlane(mode=BudgetMode.HARD_DENY)
+    enforcer = _make_enforcer(plane)
+    granted = _check(enforcer)
+    if drop == "ineligible":
+        plane.lease_eligible = False
+    elif drop == "denied":
+        plane.deny_next(scope="lease", period="monthly")
+    else:
+        plane.stop_run("run-lease")
+    renewal = enforcer._build_renewal(
+        "run-lease",
+        model="gpt-5.5",
+        provider="openai",
+        fallback_providers=[],
+        fallback_models=[],
+    )
+    if renewal is None:
+        pytest.fail("held lease did not produce a renewal request")
+
+    enforcer._renew_lease("run-lease", renewal, ["gpt-5.5"])
+    enforcer.close()
+
+    assert granted.lease_id == "lse_fake1"  # type: ignore[attr-defined]
+    assert enforcer._lease.lease_id_for("run-lease") is None
+    assert [
+        (request.lease_id, request.holder_id, request.generation)
+        for request in plane.lease_surrenders
+    ] == [("lse_fake1", "holder-1", 1)]
+
+
+@pytest.mark.unit
+def test_a_refused_release_is_logged_once_and_never_retried(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The plane fences the release at the successor generation, exactly as the
+    # deployed API does until it learns to accept a terminal predecessor.
+    plane = FakeControlPlane()
+    enforcer = _make_enforcer(plane)
+    _check(enforcer)
+    plane.lease_eligible = False
+    renewal = enforcer._build_renewal(
+        "run-lease",
+        model="gpt-5.5",
+        provider="openai",
+        fallback_providers=[],
+        fallback_models=[],
+    )
+    if renewal is None:
+        pytest.fail("held lease did not produce a renewal request")
+
+    with caplog.at_level("DEBUG", logger="solwyn.budget"):
+        enforcer._renew_lease("run-lease", renewal, ["gpt-5.5"])
+        enforcer.close()
+
+    assert len(plane.lease_surrenders) == 1
+    failures = [r for r in caplog.records if r.getMessage().startswith("lease.surrender_failed")]
+    assert len(failures) == 1
+    assert failures[0].levelname == "DEBUG"
+
+
+@pytest.mark.unit
+def test_a_trailing_confirm_still_settles_on_the_dropped_lease_id() -> None:
+    # The call was admitted under lse_fake1; its confirm must keep naming it
+    # after the release, so the server settles it against the row it funded
+    # (as excess once the float is gone) instead of charging it in full.
+    plane = FakeControlPlane()
+    enforcer = _make_enforcer(plane)
+    call_id = str(uuid4())
+    admitted = enforcer.check_budget(
+        estimated_input_tokens=10,
+        estimated_output_bound=20,
+        model="gpt-5.5",
+        provider="openai",
+        fallback_providers=[],
+        fallback_models=[],
+        agent_run_id="run-lease",
+        call_id=call_id,
+    )
+    plane.lease_eligible = False
+    renewal = enforcer._build_renewal(
+        "run-lease",
+        model="gpt-5.5",
+        provider="openai",
+        fallback_providers=[],
+        fallback_models=[],
+    )
+    if renewal is None:
+        pytest.fail("held lease did not produce a renewal request")
+    enforcer._renew_lease("run-lease", renewal, ["gpt-5.5"])
+
+    confirm = enforcer.build_confirm_request(
+        model="gpt-5.5",
+        token_details=TokenDetails(input_tokens=8, output_tokens=4),
+        provider="openai",
+        call_id=call_id,
+        lease_id=admitted.lease_id,  # type: ignore[attr-defined]
+        lease_claim_token=admitted.lease_claim_token,  # type: ignore[attr-defined]
+    )
+    enforcer.close()
+
+    assert confirm.lease_id == "lse_fake1"
+    assert len(plane.lease_surrenders) == 1
+
+
+@pytest.mark.unit
+async def test_async_terminal_renewal_surrenders_the_dropped_lease_once() -> None:
+    plane = FakeControlPlane()
+    enforcer = _make_async_enforcer(plane)
+    await _acheck(enforcer)
+    plane.lease_eligible = False
+    renewal = enforcer._build_renewal(
+        "run-lease",
+        model="gpt-5.5",
+        provider="openai",
+        fallback_providers=[],
+        fallback_models=[],
+    )
+    if renewal is None:
+        pytest.fail("held lease did not produce a renewal request")
+
+    await enforcer._renew_lease("run-lease", renewal, ["gpt-5.5"])
+    await enforcer.close()
+
+    assert [(request.lease_id, request.generation) for request in plane.lease_surrenders] == [
+        ("lse_fake1", 1)
+    ]
 
 
 @pytest.mark.unit

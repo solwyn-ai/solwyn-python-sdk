@@ -1422,6 +1422,134 @@ class TestLeaseSurrender:
             assert any(payload["generation"] == 2 for payload in payloads)
             assert enforcer._lease.state_for(RUN) is None
 
+    def test_a_dropped_lease_is_released_off_the_callers_thread(self) -> None:
+        # S1: the release rides its own daemon worker. The customer thread
+        # that observed the drop pays thread dispatch, never a round trip.
+        enforcer = _make_enforcer()
+        posted_from: list[str] = []
+
+        def _surrender(_request: httpx.Request) -> Response:
+            posted_from.append(threading.current_thread().name)
+            return Response(200, json={"released_tokens": 1})
+
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            respx.post(SURRENDER_URL).mock(side_effect=_surrender)
+            respx.post(RENEW_URL).mock(
+                return_value=Response(200, json=_deny_payload()),
+            )
+            _check(enforcer, "call_1")
+            renewal = enforcer._build_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            assert renewal is not None
+            caller = threading.current_thread().name
+            enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
+            assert _wait_for(lambda: len(posted_from) == 1)
+
+        assert posted_from == ["solwyn-lease-release"]
+        assert posted_from[0] != caller
+        enforcer._http.close()
+
+    def test_a_regrant_waits_for_the_release_of_the_lease_it_replaces(self) -> None:
+        # The S1 sequencing rule: a drop that can be followed by another grant
+        # from the SAME holder (an unreadable body after its 30s floor, a
+        # re-used stopped run) must not let that grant overtake the release —
+        # the server would then see a release for a row already replaced.
+        enforcer = _make_enforcer()
+        events: list[str] = []
+
+        def _surrender(_request: httpx.Request) -> Response:
+            events.append("surrender_start")
+            time.sleep(0.05)
+            events.append("surrender_end")
+            return Response(200, json={"released_tokens": 1})
+
+        def _grant(_request: httpx.Request) -> Response:
+            events.append("grant")
+            return Response(200, json=_grant_payload())
+
+        with respx.mock:
+            respx.post(GRANT_URL).mock(side_effect=_grant)
+            respx.post(SURRENDER_URL).mock(side_effect=_surrender)
+            respx.post(RENEW_URL).mock(
+                return_value=Response(200, json=_grant_payload(eligible=False, lease_id=None))
+            )
+            _check(enforcer, "call_1")
+            renewal = enforcer._build_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            assert renewal is not None
+            enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
+            # Exactly what the next admission on this run would do.
+            verdict, _response = enforcer._grant_lease(
+                agent_run_id=RUN,
+                estimated_input_tokens=100,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+                timeout=None,
+            )
+
+        assert verdict == "applied"
+        assert events == ["grant", "surrender_start", "surrender_end", "grant"]
+        enforcer._http.close()
+
+    async def test_async_regrant_waits_for_the_release_it_replaces(self) -> None:
+        # The async fence matters MORE than the sync one: the release task
+        # does not start until something awaits, so without the fence the
+        # re-grant's own await is what lets it run — concurrently, in an
+        # order the loop picks.
+        enforcer = _make_async_enforcer()
+        events: list[str] = []
+
+        def _surrender(_request: httpx.Request) -> Response:
+            events.append("surrender")
+            return Response(200, json={"released_tokens": 1})
+
+        def _grant(_request: httpx.Request) -> Response:
+            events.append("grant")
+            return Response(200, json=_grant_payload())
+
+        with respx.mock:
+            respx.post(GRANT_URL).mock(side_effect=_grant)
+            respx.post(SURRENDER_URL).mock(side_effect=_surrender)
+            respx.post(RENEW_URL).mock(
+                return_value=Response(200, json=_grant_payload(eligible=False, lease_id=None))
+            )
+            await _acheck(enforcer, "call_1")
+            renewal = enforcer._build_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            assert renewal is not None
+            await enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
+            verdict, _response = await enforcer._grant_lease(
+                agent_run_id=RUN,
+                estimated_input_tokens=100,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+                timeout=None,
+            )
+
+        assert verdict == "applied"
+        assert events == ["grant", "surrender", "grant"]
+        await enforcer._http.aclose()
+
     def test_close_surrenders_every_held_lease(self) -> None:
         enforcer = _make_enforcer()
         with respx.mock:
@@ -2303,6 +2431,38 @@ class TestLeaseForkReset:
             enforcer._reset_after_fork_in_child()
             assert enforcer._lease.active_run_ids() == []
             assert enforcer._lease.state_for(RUN) is None
+        enforcer._http.close()
+
+    def test_fork_reset_forgets_every_release_the_parent_owes(self) -> None:
+        # A dropped lease is the PARENT's to hand back: a child that inherited
+        # the payload would reclaim float the parent is still settling against,
+        # and the child is a different holder the server would refuse anyway.
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(
+                return_value=Response(200, json={"released_tokens": 1})
+            )
+            _check(enforcer, "call_1")
+            renewal = enforcer._build_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            assert renewal is not None
+            respx.post(RENEW_URL).mock(
+                return_value=Response(200, json=_grant_payload(eligible=False, lease_id=None))
+            )
+            enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
+            assert _wait_for(lambda: surrender.call_count == 1)
+
+            enforcer._reset_after_fork_in_child()
+
+        assert enforcer._releases_owed == []
+        assert enforcer._run_releases == {}
+        assert enforcer._release_threads == set()
         enforcer._http.close()
 
     def test_fork_reset_takes_a_fresh_holder_identity(self) -> None:

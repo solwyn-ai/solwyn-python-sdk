@@ -297,6 +297,7 @@ def test_stopped_renewal_drops_the_lease_and_terminates_the_run() -> None:
                 call_id=str(uuid4()),
             )
             granted = plane.lease_grants[0]
+            granted_lease_id = enforcer._lease.lease_id_for(run_id)
             plane.stop_run(run_id)
 
             renewal = enforcer._build_renewal(
@@ -326,11 +327,12 @@ def test_stopped_renewal_drops_the_lease_and_terminates_the_run() -> None:
     assert granted.agent_run_id == run_id
     assert plane.lease_renewals[-1].run_directive_version == "1"
     assert terminated is True
-    # The stop drops the lease outright: a killed run has no authority left to
-    # surrender, so no release ever reaches the plane.
+    # The stop drops the lease AND hands it back (S1): a killed run keeps no
+    # authority, and the server can re-lend the float without waiting out the
+    # deadline. The release echoes the generation the holder still held.
     assert state is not None
     assert state.lease_id is None
-    assert plane.lease_surrenders == []
+    assert [(r.lease_id, r.generation) for r in plane.lease_surrenders] == [(granted_lease_id, 1)]
     assert denied.allowed is False
     assert denied.denied_by_period == "run_stopped"
     assert denied.deny_reason == STOPPED_DIRECTIVE_REASON

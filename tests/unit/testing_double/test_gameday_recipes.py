@@ -413,9 +413,10 @@ def test_operator_kill_reaches_a_leased_run_through_its_renewal() -> None:
     assert stopped.agent_run_id == run_id
     assert stopped.reason == "operator_stop"
     assert stopped.source == "server"
-    # A killed run keeps no lease to hand back: the stop drops it outright, so
-    # no surrender is ever owed to the plane.
-    assert plane.lease_surrenders == []
+    # A killed run keeps no lease: the stop drops it AND hands it back exactly
+    # once (S1), echoing the generation the holder held, so the plane can
+    # re-lend the float instead of waiting out the lease deadline.
+    assert [(r.lease_id, r.generation) for r in plane.lease_surrenders] == [("lse_fake1", 1)]
     receipts = plane.denial_receipts
     assert receipts
     assert all(receipt.denied_by_period == "run_stopped" for receipt in receipts)
