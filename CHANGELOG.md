@@ -7,6 +7,16 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-05
+
+Every telemetry event for a lease-funded call now names the budget lease that
+funded it, so Solwyn Cloud counts a call's spend once between its metadata
+landing and its confirmation settling, including when the confirmation is
+lost. The testing double catches up with the live ingest contract's duplicate
+lane, and the surface canary admits the namespaces the September provider SDK
+releases added. Wire-contract changes are API-first: Solwyn Cloud accepts
+`lease_id` before this SDK releases. Ships #81.
+
 ### Added
 
 - **`MetadataEvent.lease_id`.** Every telemetry event for a lease-funded call
