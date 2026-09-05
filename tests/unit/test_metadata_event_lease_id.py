@@ -435,6 +435,48 @@ class TestSyncLeaseId:
         assert {confirm.lease_id for confirm in plane.confirms} == {"lse_fake1"}
         assert {event.lease_id for event in plane.ingested} == {"lse_fake1"}
 
+    def test_regrant_between_admission_and_settlement_keeps_the_admission_id(self) -> None:
+        # A renewal keeps the id, so it cannot tell the admission result apart
+        # from the ledger's live lease. A FRESH GRANT can: the lease expires
+        # while the first call is at the provider, and a second call on the
+        # same run, made before the first settles, takes a new lease. The
+        # first call's event and confirm must still carry the id its own
+        # admission was funded by.
+        plane = FakeControlPlane(refresh_interval_s=0.001, lease_length_s=0.02)
+        calls = 0
+        wrapped: Any = None
+
+        def regrant_during_first_call() -> None:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                return
+            # Both sides forget the first lease: the plane's record (so the
+            # re-grant mints a fresh id instead of replaying the holder's
+            # active one) and the SDK ledger (past its monotonic deadline).
+            plane.expire_leases()
+            time.sleep(0.03)
+            wrapped.chat.completions.create(model="gpt-5.5", messages=_MESSAGES)
+
+        wrapped = plane.wrap(_OpenAIStub(before_return=regrant_during_first_call))
+        try:
+            with solwyn.run("leased-regrant"):
+                wrapped.chat.completions.create(model="gpt-5.5", messages=_MESSAGES)
+        finally:
+            wrapped.close()
+
+        assert len(plane.lease_grants) == 2, "the expired lease must be replaced by a fresh grant"
+        assert len(plane.confirms) == 2
+        assert len(plane.ingested) == 2
+        confirm_lease_by_call = {confirm.call_id: confirm.lease_id for confirm in plane.confirms}
+        assert set(confirm_lease_by_call.values()) == {"lse_fake1", "lse_fake2"}
+        for event in plane.ingested:
+            assert event.lease_id == confirm_lease_by_call[event.call_id]
+        # The outer call settled while the ledger held lse_fake2, yet its
+        # event names lse_fake1: the id came from its admission, not the ledger.
+        outer = next(event for event in plane.ingested if event.lease_id == "lse_fake1")
+        assert outer.status == "success"
+
     def test_media_surface_inside_a_leased_run_is_reservation_funded(self) -> None:
         plane = FakeControlPlane()
         wrapped = plane.wrap(_OpenAIStub())

@@ -271,7 +271,9 @@ def test_shared_receipt_ingest_contract_against_double() -> None:
     leased = [event for event in plane.ingested if event.lease_id is not None]
     assert len(leased) == 1
     assert leased[0].status == "success"
-    assert leased[0].lease_id.startswith("lse_")
+    lease_id = leased[0].lease_id
+    assert lease_id is not None
+    assert lease_id.startswith("lse_")
     assert [event.receipt_aggregate_count for event in plane.aggregate_replays] == [3]
 
 

@@ -1473,11 +1473,18 @@ class FakeControlPlane:
     ) -> dict[str, Any]:
         """Build the 202 body one scripted rejection window calls for.
 
-        ``duplicates`` is the dedup lane the batch already earned; a scripted
-        rejection never shifts it, and the ingested count excludes both lanes.
+        ``duplicates`` is the dedup lane the batch already earned. The server
+        never prices a dedup-skipped event, so it can never reject one either:
+        an exact-index window naming a duplicate is a scenario error, and a
+        count window draws its rejections from the fresh events only. The lanes
+        therefore stay disjoint and partition the batch.
         """
         if window.malformed:
             return {"rejected": "corrupt"}
+        duplicate_indexes = {entry["index"] for entry in duplicates}
+        fresh = [
+            (index, event) for index, event in enumerate(events) if index not in duplicate_indexes
+        ]
         rejected: list[dict[str, Any]] = []
         if window.indices is not None:
             for index in window.indices:
@@ -1486,19 +1493,24 @@ class FakeControlPlane:
                         f"solwyn.testing: reject_ingest index {index} is outside the "
                         f"{len(events)}-event batch it met"
                     )
+                if index in duplicate_indexes:
+                    raise RuntimeError(
+                        f"solwyn.testing: reject_ingest index {index} names a dedup-skipped "
+                        "event; the server never prices a duplicate, so it cannot reject one"
+                    )
                 rejected.append(self._rejection_entry(window.code, events[index], index=index))
         else:
             count = window.count or 0
-            if count > len(events):
+            if count > len(fresh):
                 raise RuntimeError(
-                    f"solwyn.testing: reject_ingest count {count} exceeds the "
-                    f"{len(events)}-event batch it met"
+                    f"solwyn.testing: reject_ingest count {count} exceeds the {len(fresh)} "
+                    f"fresh events in the {len(events)}-event batch it met"
                 )
             rejected.extend(
-                self._rejection_entry(window.code, event, index=None) for event in events[:count]
+                self._rejection_entry(window.code, event, index=None) for _, event in fresh[:count]
             )
         return {
-            "ingested": max(len(events) - len(rejected) - len(duplicates), 0),
+            "ingested": len(events) - len(rejected) - len(duplicates),
             "rejected": rejected,
             "duplicates": duplicates,
         }

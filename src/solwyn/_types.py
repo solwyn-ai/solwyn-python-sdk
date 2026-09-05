@@ -451,7 +451,7 @@ class MetadataEvent(BaseModel):
             "when the call was funded by a per-call reservation, admitted from "
             "the allow cache, admitted fail-open or uncounted, or denied. Server-"
             "minted opaque id (lse_...), never content; bounded by "
-            "LEASE_ID_MAX_LENGTH exactly as BudgetConfirmRequest.lease_id (D7)."
+            "LEASE_ID_MAX_LENGTH exactly as LeaseGrantResponse.lease_id, its source (D7)."
         ),
     )
     provider_region: str | None = Field(
