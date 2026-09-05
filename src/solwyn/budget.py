@@ -1499,10 +1499,16 @@ class _BudgetEnforcerBase:
 
         Every run record is evicted, including inactive/uncounted-only state,
         so a close() followed by the interpreter-exit hook cannot retain or
-        surrender anything twice.
+        surrender anything twice. Releases already owed for DROPPED leases go
+        with them: a payload that could not be dispatched (no thread, no
+        running loop) is no longer in the ledger, and the interpreter-exit
+        hook drains through here — it would otherwise be the one release the
+        process never sends.
         """
         with self._state_lock:
-            return self._lease.drain_surrender_requests()
+            owed = [request for _run_id, request in self._releases_owed]
+            self._releases_owed = []
+            return owed + self._lease.drain_surrender_requests()
 
     def _owe_release_locked(
         self,

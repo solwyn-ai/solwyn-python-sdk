@@ -1662,6 +1662,54 @@ class TestLeaseSurrender:
         assert enforcer._lease.state_for(RUN) is None
         enforcer._http.close()
 
+    def test_a_call_in_flight_when_the_run_scope_exits_still_settles(self) -> None:
+        # The scope can end while a call is still running. Its reservation goes
+        # with the run record, so the true-up no-ops — but the confirm must
+        # still be built, and must still name the lease that funded the call,
+        # or the server would charge it in full instead of as excess.
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            respx.post(SURRENDER_URL).mock(return_value=Response(200, json={"released_tokens": 1}))
+            admitted = _check(enforcer, "call_in_flight")
+            enforcer.surrender_run(RUN)
+
+            confirm = enforcer.build_confirm_request(
+                model="gpt-5.5",
+                token_details=TokenDetails(input_tokens=120, output_tokens=80),
+                provider="openai",
+                call_id=_wire_call_id("call_in_flight"),
+                lease_id=admitted.lease_id,
+                lease_claim_token=admitted.lease_claim_token,
+            )
+
+        assert confirm.lease_id == "lease_1"
+        assert enforcer._lease.state_for(RUN) is None
+        enforcer._http.close()
+
+    def test_an_undispatchable_release_still_rides_the_exit_drain(self) -> None:
+        # A release parked because nothing could dispatch it (an async holder
+        # whose scope ended off-loop) is no longer in the ledger, so the
+        # interpreter-exit hook would miss it unless the drain claims it too.
+        enforcer = _make_async_enforcer()
+        with enforcer._state_lock:
+            enforcer._owe_release_locked(
+                RUN,
+                LeaseSurrenderRequest(
+                    lease_id="lease_1",
+                    holder_id=enforcer._lease.holder_id,
+                    generation=1,
+                    spent_tokens=7,
+                ),
+            )
+
+        payloads = enforcer.lease_surrender_payloads()
+
+        assert [(request.lease_id, request.spent_tokens) for request in payloads] == [
+            ("lease_1", 7)
+        ]
+        assert enforcer._releases_owed == []
+
     def test_close_surrenders_every_held_lease(self) -> None:
         enforcer = _make_enforcer()
         with respx.mock:
