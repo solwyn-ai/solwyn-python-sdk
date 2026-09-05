@@ -106,6 +106,12 @@ python_version = "3.11"
 strict = true
 
 [tool.uv]
+# CrewAI (via instructor) pins openai<3 and jiter<0.16 while the surface canary
+# and the real-SDK tests are audited against the latest openai release; the lock
+# must track that release (tests/provider_surface_fingerprints.json, README's
+# OPENAI_STRICT_FINGERPRINT). Relax those two pins for lock resolution only; the
+# opt-in CrewAI smoke lane (frameworks-smoke.yml) is where a real break surfaces.
+override-dependencies = ["openai>=2.0", "jiter>=0.14"]
 # Current CrewAI constrains MCP/OpenAI below the current OpenAI Agents stack.
 # Resolve and execute their real-framework smoke environments independently so
 # neither drift lane silently downgrades the other.

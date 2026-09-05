@@ -20,6 +20,26 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **Surface canary admits the September provider SDK namespaces.** openai 3.8
+  (`safety.alerts`), anthropic 1.4 (`beta.organization` admin tree,
+  `beta.webhooks.parse_unverified`, raw and streaming variants of
+  `messages.batches.results`) and google-genai 2.22 (`environments.files`) each
+  added surfaces the reviewed rule ledger did not know, so every `latest`
+  inventory lane and the real-SDK fingerprint test went red. All 795 new paths
+  are classified by precedent: resource namespaces, read/write admin and file
+  operations as `unmetered_spend` with exact acknowledgment tokens, and the
+  raw-response wrappers as `unmetered_spend` at `raw_response` scope, exactly
+  like `admin.organization`, `beta.skills` and `environments`. Latest
+  fingerprints, per-context digests and the README strict fingerprint (now
+  audited against `openai==3.8.0`) are refreshed. Runtime behaviour for
+  existing surfaces is unchanged; before this release these paths resolved to
+  `unknown` and followed `on_unmetered`.
+- **The lock tracks the latest openai again.** CrewAI (via `instructor`) pins
+  `openai<3` and `jiter<0.16`, which had frozen the universal lock at openai
+  2.x while CI's real-SDK lanes audit the latest release. `[tool.uv]
+  override-dependencies` relaxes those two pins for lock resolution only; the
+  opt-in CrewAI smoke lane is where a real CrewAI-versus-openai-3 break would
+  surface. Dev-tooling only; nothing changes for installed packages.
 - **`FakeControlPlane` reports ingest dedup skips in `duplicates[]`.** The
   double's `/metadata/ingest` 202 body is now the three-lane shape the live API
   has answered with since 2026-09-01: `{"ingested", "rejected", "duplicates"}`,
