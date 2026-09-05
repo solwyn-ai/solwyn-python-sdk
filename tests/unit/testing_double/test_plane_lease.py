@@ -6,7 +6,8 @@ import asyncio
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from contextvars import copy_context
+from threading import Event, Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
@@ -2024,6 +2025,133 @@ async def test_async_terminal_renewal_surrenders_the_dropped_lease_once() -> Non
     assert [(request.lease_id, request.generation) for request in plane.lease_surrenders] == [
         ("lse_fake1", 1)
     ]
+
+
+@pytest.mark.unit
+def test_run_scope_exit_surrenders_only_the_run_that_ended() -> None:
+    """S2: when the block ends, the budget it held is back — and no more.
+
+    A nested scope's exit releases the nested run's lease and leaves the
+    outer one drawing; the outer exit releases its own; and close() then has
+    nothing left to release, so no lease is ever handed back twice.
+    """
+    plane = FakeControlPlane(granted_tokens=1_000)
+    wrapped = plane.wrap(_SyncOpenAIStub(), lease_output_bound_default=20)
+
+    with solwyn_pkg.run("outer") as outer_id:
+        wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+        with solwyn_pkg.run("inner") as inner_id:
+            wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+        assert _wait_for(lambda: len(plane.lease_surrenders) == 1)
+        inner_surrender = plane.lease_surrenders[0]
+        wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+    assert _wait_for(lambda: len(plane.lease_surrenders) == 2)
+    wrapped.close()
+
+    leases = {
+        grant.agent_run_id: f"lse_fake{index + 1}" for index, grant in enumerate(plane.lease_grants)
+    }
+    assert leases == {outer_id: "lse_fake1", inner_id: "lse_fake2"}
+    assert inner_surrender.lease_id == "lse_fake2"
+    assert [request.lease_id for request in plane.lease_surrenders] == ["lse_fake2", "lse_fake1"]
+    # The outer run kept spending on its own lease after the inner one ended.
+    assert len(plane.lease_grants) == 2
+
+
+@pytest.mark.unit
+def test_a_run_scope_leaving_on_an_exception_still_surrenders() -> None:
+    plane = FakeControlPlane(granted_tokens=1_000)
+    wrapped = plane.wrap(_SyncOpenAIStub(), lease_output_bound_default=20)
+
+    with pytest.raises(RuntimeError, match="boom"), solwyn_pkg.run("failing"):
+        wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+        raise RuntimeError("boom")
+    assert _wait_for(lambda: len(plane.lease_surrenders) == 1)
+    wrapped.close()
+
+    assert [request.lease_id for request in plane.lease_surrenders] == ["lse_fake1"]
+
+
+@pytest.mark.unit
+def test_run_handle_finish_surrenders_but_an_activation_exit_does_not() -> None:
+    # A detached identity is re-entered by design: releasing at every
+    # activation would buy one blocking re-grant per binding and nothing else.
+    plane = FakeControlPlane(granted_tokens=1_000)
+    wrapped = plane.wrap(_SyncOpenAIStub(), lease_output_bound_default=20)
+
+    handle = solwyn_pkg.create_run("detached")
+    with handle.activate():
+        wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+    after_activation = list(plane.lease_surrenders)
+    with handle.activate():
+        wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+    handle.finish()
+    assert _wait_for(lambda: len(plane.lease_surrenders) == 1)
+
+    started = solwyn_pkg.start_run("started")
+    wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+    started.finish()
+    assert _wait_for(lambda: len(plane.lease_surrenders) == 2)
+    wrapped.close()
+
+    assert after_activation == []
+    # One grant for the detached identity (re-entered, never released between
+    # activations) and one for the started run.
+    assert [request.lease_id for request in plane.lease_surrenders] == ["lse_fake1", "lse_fake2"]
+
+
+@pytest.mark.unit
+def test_a_call_that_outlives_its_run_scope_pays_one_grant() -> None:
+    # Documented behaviour: work created inside a scope keeps the run id after
+    # the block exits. Its next call finds no lease and pays one blocking
+    # grant — which the fence holds behind the release of the old lease.
+    plane = FakeControlPlane(granted_tokens=1_000)
+    wrapped = plane.wrap(_SyncOpenAIStub(), lease_output_bound_default=20)
+
+    with solwyn_pkg.run("outliving") as run_id:
+        wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+        kept = copy_context()
+    assert _wait_for(lambda: len(plane.lease_surrenders) == 1)
+
+    kept.run(lambda: wrapped.chat.completions.create(model="gpt-5.5", messages=[]))
+    wrapped.close()
+
+    assert [grant.agent_run_id for grant in plane.lease_grants] == [run_id, run_id]
+    assert [request.lease_id for request in plane.lease_surrenders] == ["lse_fake1", "lse_fake2"]
+
+
+@pytest.mark.unit
+async def test_async_run_scope_exit_surrenders_the_runs_lease() -> None:
+    plane = FakeControlPlane(granted_tokens=1_000)
+    wrapped = plane.wrap_async(_AsyncOpenAIStub(), lease_output_bound_default=20)
+
+    async with solwyn_pkg.run("async-scope"):
+        await wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+    assert await _await_for(lambda: len(plane.lease_surrenders) == 1)
+    await wrapped.close()
+
+    assert [request.lease_id for request in plane.lease_surrenders] == ["lse_fake1"]
+
+
+@pytest.mark.unit
+async def test_an_async_holder_parks_a_release_it_cannot_schedule() -> None:
+    # A run scope can end on a plain thread with no loop to schedule on (an
+    # async client driven from synchronous code). The release must not be
+    # silently dropped there: it stays parked and rides close().
+    plane = FakeControlPlane(granted_tokens=1_000)
+    enforcer = _make_async_enforcer(plane)
+    await _acheck(enforcer)
+
+    off_loop = Thread(target=enforcer.surrender_run, args=("run-lease",))
+    off_loop.start()
+    off_loop.join(timeout=5.0)
+    parked = list(enforcer._releases_owed)
+    await enforcer.close()
+
+    assert [(run_id, request.lease_id) for run_id, request in parked] == [
+        ("run-lease", "lse_fake1")
+    ]
+    assert [request.lease_id for request in plane.lease_surrenders] == ["lse_fake1"]
 
 
 @pytest.mark.unit

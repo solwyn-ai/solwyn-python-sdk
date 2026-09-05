@@ -1517,6 +1517,29 @@ class _BudgetEnforcerBase:
             self._releases_owed = []
             return owed
 
+    def surrender_run(self, agent_run_id: str) -> None:
+        """Release the lease held for a run whose scope has ended (S2).
+
+        ``_lifecycle._surrender_run`` calls this on EVERY live holder, so a run
+        this client never leased must be a cheap no-op. The whole run record
+        goes with the lease: the run is over, so its ineligible marks, outage
+        tallies and snapshot have no next renewal left to ride — the same
+        eviction ``close()`` performs, scoped to one run.
+
+        A call made after the exit by a task that kept the run id is not an
+        error: it finds no lease and pays one blocking grant, which is exactly
+        what "the run ended" should cost.
+        """
+        with self._state_lock:
+            if self._closed:
+                return
+            self._owe_release_locked(
+                agent_run_id,
+                self._lease.build_surrender_request(agent_run_id),
+            )
+            self._lease.discard(agent_run_id)
+        self._dispatch_owed_releases()
+
     def _dispatch_owed_releases(self) -> None:
         """Post every parked release off the caller's thread.
 
@@ -3313,6 +3336,11 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         a run scope closing from synchronous code has no loop, and close()
         is then their last chance.
         """
+        with self._state_lock:
+            if not self._releases_owed:
+                # Every run-scope exit calls this, most with nothing owed:
+                # never make that no-op look like a failed dispatch.
+                return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:

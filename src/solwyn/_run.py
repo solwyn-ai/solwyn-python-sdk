@@ -48,6 +48,7 @@ from solwyn._constants import (
     TAG_VALUE_MAX_LENGTH,
     TAGS_MAX_KEYS,
 )
+from solwyn._lifecycle import _surrender_run
 from solwyn.exceptions import SolwynTagsClampedWarning
 
 _P = ParamSpec("_P")
@@ -324,6 +325,14 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         return identity.run_id
 
     def _exit(self, *, require_same_context: bool = False) -> None:
+        """Pop this scope's frame, and release the leases the run held.
+
+        The release is the run's own (``frame.run_id``), never a nested or
+        outer one, and it happens only where a frame is actually popped: an
+        exit that raises has changed nothing to release. ``require_same_context``
+        is ``RunHandle.finish()``'s path — it owns the release itself, after
+        its handle lock, so nothing here fires twice for one run.
+        """
         frames = _run_frames.get()
         if not frames:
             if require_same_context:
@@ -356,6 +365,9 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
             _active_run.set(frame.prior_active)
         finally:
             _run_frames.set(frames[:-1])
+        # The run is over — including when the block is leaving on an
+        # exception. Hand its float back instead of holding it to the deadline.
+        _surrender_run(frame.run_id)
 
     def __enter__(self) -> str:
         return self._enter()
@@ -411,7 +423,15 @@ class RunHandle:
         return self._run_id
 
     def finish(self) -> None:
-        """Finish this logical run, restoring a started scope when applicable."""
+        """Finish this logical run, restoring a started scope when applicable.
+
+        Finishing ends the run for both handle flavours, so both release the
+        leases it held — outside the handle lock, and only once the finish has
+        actually taken (a refused finish leaves the run running). An
+        ``activate()`` scope deliberately does NOT: a detached identity is
+        re-entered by design, and releasing at each activation would trade one
+        blocking grant per binding for nothing.
+        """
         with self._state_lock:
             if self._finished:
                 raise RuntimeError(f"run handle {self._run_id!r} already finished")
@@ -422,6 +442,7 @@ class RunHandle:
             if self._scope is not None:
                 self._scope._exit(require_same_context=True)
             self._finished = True
+        _surrender_run(self._run_id)
 
     def activate(self) -> _RunActivation:
         """Bind a detached logical identity in the caller's context."""
