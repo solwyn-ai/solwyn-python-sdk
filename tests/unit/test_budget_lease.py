@@ -32,7 +32,13 @@ from solwyn._base import MediaSurfaceSpec, _effective_output_bound
 from solwyn._lease import INELIGIBLE_RETRY_AFTER_S
 from solwyn._registry import ProviderRuntime
 from solwyn._token_details import TokenDetails
-from solwyn._types import BudgetMode, LeaseGrantResponse, ProviderEntry, ProviderName
+from solwyn._types import (
+    BudgetMode,
+    LeaseGrantResponse,
+    LeaseSurrenderRequest,
+    ProviderEntry,
+    ProviderName,
+)
 from solwyn.budget import AsyncBudgetEnforcer, BudgetCheckResult, BudgetEnforcer
 from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.client import AsyncSolwyn, Solwyn
@@ -1617,6 +1623,44 @@ class TestLeaseSurrender:
             await enforcer.close()
 
         assert surrender.call_count == 2
+
+    def test_a_successor_for_a_run_that_ended_mid_renewal_is_released(self) -> None:
+        # S2 leaves one hole if nothing closes it: the scope exits, the ledger
+        # discards the run, and the renewal ALREADY on the wire comes back with
+        # a successor nobody will draw on. The state fence stops it being
+        # installed; it must also be handed back, or the exit that was supposed
+        # to return the float has left a fresh one standing to its deadline.
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(
+                return_value=Response(200, json={"released_tokens": 1})
+            )
+            respx.post(RENEW_URL).mock(
+                return_value=Response(200, json=_grant_payload(generation=2))
+            )
+            _check(enforcer, "call_1")
+            renewal = enforcer._build_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            assert renewal is not None
+
+            # The run scope exits while that renewal is in flight.
+            enforcer.surrender_run(RUN)
+            assert _wait_for(lambda: surrender.call_count == 1)
+            enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
+
+        generations = [
+            LeaseSurrenderRequest.model_validate_json(call.request.content).generation
+            for call in surrender.calls
+        ]
+        assert generations == [1, 2]
+        assert enforcer._lease.state_for(RUN) is None
+        enforcer._http.close()
 
     def test_close_surrenders_every_held_lease(self) -> None:
         enforcer = _make_enforcer()

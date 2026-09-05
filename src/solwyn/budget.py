@@ -1776,7 +1776,14 @@ class _BudgetEnforcerBase:
                 or state.lease_id != request.lease_id
                 or state.generation != request.generation
             ):
-                return None
+                # The holder let go of the lease this renewal came from (a run
+                # scope exited, an expiry re-granted) while it was in flight,
+                # so the successor the server just issued is authority nobody
+                # will ever draw on. Release it rather than leave it standing
+                # to its deadline. It is the same ROW an earlier release may
+                # already have freed, and the route is idempotent, so the
+                # worst case is an answer of zero released tokens.
+                return self._late_lease_surrender_request(response)
 
             if _run_control._outage_termination_locked(agent_run_id) is not None:
                 # The run stopped while this renewal was in flight. Drop the
