@@ -1710,6 +1710,40 @@ class TestLeaseSurrender:
         ]
         assert enforcer._releases_owed == []
 
+    def test_a_release_that_cannot_be_dispatched_waits_for_close(self) -> None:
+        # Thread exhaustion (or an interpreter shutting down) must not eat the
+        # release: it goes back on the parked list, so close() is still able to
+        # send it — and every worker in the join sets has actually STARTED, or
+        # close() would raise trying to join one that never did.
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(
+                return_value=Response(200, json={"released_tokens": 1})
+            )
+            respx.post(RENEW_URL).mock(return_value=Response(200, json=_deny_payload()))
+            _check(enforcer, "call_1")
+            renewal = enforcer._build_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            assert renewal is not None
+            with patch.object(
+                threading.Thread, "start", side_effect=RuntimeError("can't start new thread")
+            ):
+                enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
+                parked = [request.lease_id for _run_id, request in enforcer._releases_owed]
+                assert surrender.call_count == 0
+            assert all(thread.ident is not None for thread in enforcer._release_threads)
+
+            enforcer.close()
+
+        assert parked == ["lease_1"]
+        assert surrender.call_count == 1
+
     def test_close_surrenders_every_held_lease(self) -> None:
         enforcer = _make_enforcer()
         with respx.mock:

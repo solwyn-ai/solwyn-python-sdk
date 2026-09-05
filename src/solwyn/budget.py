@@ -2504,9 +2504,6 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             name="solwyn-lease-renew",
             daemon=True,
         )
-        with self._state_lock:
-            self._renewal_threads = {t for t in self._renewal_threads if t.is_alive()}
-            self._renewal_threads.add(thread)
         try:
             thread.start()
         except Exception as exc:
@@ -2516,7 +2513,6 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             # to expiry without ever renewing again.
             logger.warning("lease.renew_dispatch_failed: %s", type(exc).__name__)
             with self._state_lock:
-                self._renewal_threads.discard(thread)
                 self._lease.renewal_failed(
                     agent_run_id,
                     time.monotonic(),
@@ -2524,6 +2520,12 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     expected_generation=request.generation,
                 )
             self._renewal_slots.release()
+            return
+        # Registered only once STARTED: close() joins this set, and joining a
+        # thread that never started raises RuntimeError out of close().
+        with self._state_lock:
+            self._renewal_threads = {t for t in self._renewal_threads if t.is_alive()}
+            self._renewal_threads.add(thread)
 
     def _run_renewal_worker(
         self,
@@ -2674,6 +2676,18 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 name="solwyn-lease-release",
                 daemon=True,
             )
+            try:
+                worker.start()
+            except Exception as exc:
+                # Thread exhaustion, or an interpreter shutting down. Park it
+                # again rather than drop it: close() is then its last chance,
+                # and the server's deadline is the backstop after that.
+                logger.debug("lease.release_dispatch_failed: %s", type(exc).__name__)
+                with self._state_lock:
+                    self._releases_owed.append((agent_run_id, request))
+                continue
+            # Registered only once STARTED: close() joins both worker sets, and
+            # joining a thread that never started raises.
             with self._state_lock:
                 self._release_threads = {t for t in self._release_threads if t.is_alive()}
                 self._release_threads.add(worker)
@@ -2683,15 +2697,6 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     if pending[0].is_alive()
                 }
                 self._run_releases[agent_run_id] = (worker, deadline)
-            try:
-                worker.start()
-            except Exception as exc:
-                logger.debug("lease.release_dispatch_failed: %s", type(exc).__name__)
-                with self._state_lock:
-                    self._release_threads.discard(worker)
-                    pending = self._run_releases.get(agent_run_id)
-                    if pending is not None and pending[0] is worker:
-                        del self._run_releases[agent_run_id]
 
     def _await_run_release(self, agent_run_id: str) -> None:
         """Fence a re-grant behind the release of the lease it replaces (S1).
