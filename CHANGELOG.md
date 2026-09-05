@@ -86,6 +86,17 @@ calls to the existing surrender endpoint. Ships #81.
   override-dependencies` relaxes those two pins for lock resolution only; the
   opt-in CrewAI smoke lane is where a real CrewAI-versus-openai-3 break would
   surface. Dev-tooling only; nothing changes for installed packages.
+- **`FakeControlPlane` accepts the releases the API now accepts.** The double's
+  `/budgets/lease/surrender` fence mirrors the live plane: the current
+  generation, OR the predecessor of a *terminal* successor (a response with no
+  lease block — nobody can be using that), and a stopped run's lease is released
+  whatever generation it echoes. A predecessor whose successor is a LIVE lease
+  is still a `lease_generation_conflict`, and an expired or already-released
+  lease still answers `released_tokens: 0`. New read-only
+  `FakeControlPlane.released_leases` tells a release that LANDED from one the
+  fence refused — `lease_surrenders` records what the SDK sent, this records
+  what the plane did with it. Tests that pinned a 409 for the predecessor of a
+  terminal successor must flip to a 200.
 - **`FakeControlPlane` reports ingest dedup skips in `duplicates[]`.** The
   double's `/metadata/ingest` 202 body is now the three-lane shape the live API
   has answered with since 2026-09-01: `{"ingested", "rejected", "duplicates"}`,

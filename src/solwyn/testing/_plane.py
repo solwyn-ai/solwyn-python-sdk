@@ -466,6 +466,17 @@ class FakeControlPlane:
             return dict(self._stopped_runs)
 
     @property
+    def released_leases(self) -> frozenset[str]:
+        """Lease ids a surrender has actually RELEASED (a copy).
+
+        ``lease_surrenders`` records what the SDK sent; this records what the
+        plane did with it, so a test can tell a release that landed from one
+        the fence refused.
+        """
+        with self._lock:
+            return frozenset(self._released_leases)
+
+    @property
     def denial_receipts(self) -> list[MetadataEvent]:
         """Ingested events carrying a denial receipt, in arrival order.
 
@@ -1034,6 +1045,19 @@ class FakeControlPlane:
         return self._store_lease_response(record, self._lease_response(record))
 
     def _handle_lease_surrender(self, body: object) -> PlaneResponse:
+        """Release a lease the holder says it has stopped using.
+
+        The fence mirrors the live plane: the CURRENT generation is accepted,
+        and so is the predecessor of a TERMINAL successor — a response with no
+        lease block is authority the holder can never have been using, so
+        refusing its predecessor would strand the float until expiry for
+        exactly the drops an SDK reports fastest. A predecessor whose successor
+        is a LIVE lease stays a conflict: that one IS in use.
+
+        A stopped run's lease is released whatever generation it echoes. The
+        holder can only be surrendering after it learned the stop, and the
+        plane already wanted the lease gone.
+        """
         parsed = parse_model(LeaseSurrenderRequest, body)
         if isinstance(parsed, PlaneResponse):
             return parsed
@@ -1041,7 +1065,8 @@ class FakeControlPlane:
         record = self._find_lease(parsed.lease_id, parsed.holder_id)
         if record is None:
             return self._lease_error(404, "lease_not_found", "Budget lease not found")
-        if parsed.generation != record.generation:
+        revoked = record.agent_run_id in self._stopped_runs
+        if not revoked and not self._surrender_generation_accepted(record, parsed.generation):
             return self._lease_error(
                 409,
                 "lease_generation_conflict",
@@ -1051,6 +1076,23 @@ class FakeControlPlane:
             return PlaneResponse(200, {"released_tokens": 0})
         self._released_leases.add(record.lease_id)
         return PlaneResponse(200, {"released_tokens": record.granted_tokens})
+
+    def _surrender_generation_accepted(self, record: _LeaseRecord, generation: int) -> bool:
+        """Current generation, or the predecessor of a terminal successor."""
+        if generation == record.generation:
+            return True
+        return (
+            record.last_renewal_from_generation is not None
+            and generation == record.last_renewal_from_generation
+            and self._stored_successor_is_terminal(record)
+        )
+
+    @staticmethod
+    def _stored_successor_is_terminal(record: _LeaseRecord) -> bool:
+        """True when the stored successor carries no lease block at all."""
+        if not record.last_response_json:
+            return False
+        return FakeControlPlane._frozen_lease_response(record).lease_id is None
 
     def _find_lease(self, lease_id: str, holder_id: str) -> _LeaseRecord | None:
         record = self._lease_records.get(lease_id)

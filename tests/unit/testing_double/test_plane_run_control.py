@@ -333,6 +333,7 @@ def test_stopped_renewal_drops_the_lease_and_terminates_the_run() -> None:
     assert state is not None
     assert state.lease_id is None
     assert [(r.lease_id, r.generation) for r in plane.lease_surrenders] == [(granted_lease_id, 1)]
+    assert plane.released_leases == {granted_lease_id}
     assert denied.allowed is False
     assert denied.denied_by_period == "run_stopped"
     assert denied.deny_reason == STOPPED_DIRECTIVE_REASON

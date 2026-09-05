@@ -417,6 +417,7 @@ def test_operator_kill_reaches_a_leased_run_through_its_renewal() -> None:
     # once (S1), echoing the generation the holder held, so the plane can
     # re-lend the float instead of waiting out the lease deadline.
     assert [(r.lease_id, r.generation) for r in plane.lease_surrenders] == [("lse_fake1", 1)]
+    assert plane.released_leases == {"lse_fake1"}
     receipts = plane.denial_receipts
     assert receipts
     assert all(receipt.denied_by_period == "run_stopped" for receipt in receipts)
