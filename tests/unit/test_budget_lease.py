@@ -1550,6 +1550,74 @@ class TestLeaseSurrender:
         assert events == ["grant", "surrender", "grant"]
         await enforcer._http.aclose()
 
+    def test_a_timed_out_release_is_retried_exactly_once(self) -> None:
+        # S5: the route is idempotent, and a surrender is not a cheap request
+        # (project lock, pending drain, ingested term, release, commit). One
+        # slow attempt must not cost the float its whole deadline.
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(
+                side_effect=[
+                    httpx.ReadTimeout("surrender timed out"),
+                    Response(200, json={"released_tokens": 5}),
+                ]
+            )
+            _check(enforcer, "call_1")
+            enforcer.close()
+
+        assert surrender.call_count == 2
+        # The SAME release, twice — a retry, never a second lease.
+        bodies = {call.request.content for call in surrender.calls}
+        assert len(bodies) == 1
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            Response(409, json={"detail": {"code": "lease_generation_conflict"}}),
+            Response(404, json={"detail": {"code": "lease_not_found"}}),
+        ],
+    )
+    def test_a_refused_release_is_never_retried(self, answer: Response) -> None:
+        # A refusal is an ANSWER: the server has considered the release and
+        # said no. Repeating it would only spend the deadline the NEXT payload
+        # in the drain still needs.
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(return_value=answer)
+            _check(enforcer, "call_1")
+            enforcer.close()
+
+        assert surrender.call_count == 1
+
+    def test_a_transport_failure_is_never_retried(self) -> None:
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(
+                side_effect=httpx.ConnectError("control plane unreachable")
+            )
+            _check(enforcer, "call_1")
+            enforcer.close()
+
+        assert surrender.call_count == 1
+
+    async def test_an_async_timed_out_release_is_retried_exactly_once(self) -> None:
+        enforcer = _make_async_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(
+                side_effect=[
+                    httpx.ReadTimeout("surrender timed out"),
+                    Response(200, json={"released_tokens": 5}),
+                ]
+            )
+            await _acheck(enforcer, "call_1")
+            await enforcer.close()
+
+        assert surrender.call_count == 2
+
     def test_close_surrenders_every_held_lease(self) -> None:
         enforcer = _make_enforcer()
         with respx.mock:
@@ -1674,7 +1742,9 @@ class TestLeaseSurrender:
         finally:
             release.set()
 
-        assert elapsed < 2.0  # one 1s deadline, not three
+        # ONE drain deadline, not one per run — expressed against the constant
+        # so a change to the surrender bound cannot silently loosen this.
+        assert elapsed < 2 * budget_module._SURRENDER_TIMEOUT_S
 
     def test_exit_surrender_is_bounded_by_wall_clock_not_socket_timeouts(self) -> None:
         # A trickling server must not hold interpreter exit past the budget:

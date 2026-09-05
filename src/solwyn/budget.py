@@ -74,14 +74,23 @@ _LEASE_RENEW_PATH = "/api/v1/budgets/lease/renew"
 _LEASE_SURRENDER_PATH = "/api/v1/budgets/lease/surrender"
 
 # A surrender is a courtesy (the server reclaims the float at expiry anyway):
-# close() must never sit on a down control plane.
-_SURRENDER_TIMEOUT_S = 1.0
+# close() must never sit on a down control plane. It is not a cheap request
+# though — it takes the project lock, drains pending targets, loads the
+# ingested term, runs the release and commits — so 1s timed out under load and
+# left the float to expiry, which is the whole thing this work removes.
+_SURRENDER_TIMEOUT_S = 3.0
+
+# One retry, and ONLY on a timeout: the route is idempotent (a second release
+# of a released lease answers 0), so an attempt that may never have been read
+# is worth repeating, while a refusal is an ANSWER and repeating it would only
+# spend the deadline. The interpreter-exit budget is separate and unchanged.
+_SURRENDER_ATTEMPTS = 2
 
 # A lease dropped for a terminal reason is released off the caller's thread on
-# its own bound. It is separate from close()'s drain deadline because the only
-# wait a customer can ever inherit from it is the re-grant fence
-# (``_await_run_release``), not a shutdown.
-_RELEASE_BUDGET_S = _SURRENDER_TIMEOUT_S
+# its own bound, wide enough for that retry. It is separate from close()'s
+# drain deadline because the only wait a customer can ever inherit from it is
+# the re-grant fence (``_await_run_release``), not a shutdown.
+_RELEASE_BUDGET_S = _SURRENDER_TIMEOUT_S * _SURRENDER_ATTEMPTS
 
 # Renewals run off the caller's thread; give them the normal client timeout.
 _RENEWAL_TIMEOUT_S = 5.0
@@ -2595,32 +2604,36 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         client = self._new_http_client(timeout=_SURRENDER_TIMEOUT_S)
         try:
             for request in payloads:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return
-                breaker = self._control_plane_breaker
-                admission = breaker.admit() if breaker is not None else None
-                try:
-                    if admission is not None and not admission.allowed:
-                        logger.debug("lease.surrender_skipped_breaker_open")
-                        continue
-                    client.post(
-                        f"{self.api_url}{_LEASE_SURRENDER_PATH}",
-                        json=request.model_dump(mode="json"),
-                        headers=self._auth_headers(),
-                        timeout=max(0.001, min(_SURRENDER_TIMEOUT_S, remaining)),
-                    ).raise_for_status()
-                    if breaker is not None:
-                        breaker.record_success()
-                except Exception as exc:
-                    # The server reclaims an unsurrendered lease at its
-                    # deadline; a failed courtesy release never surfaces.
-                    logger.debug("lease.surrender_failed: %s", type(exc).__name__)
-                    if breaker is not None and not handle_read_only_key_error(exc):
-                        breaker.record_failure()
-                finally:
-                    if breaker is not None:
-                        breaker.release_probe(admission)
+                for _attempt in range(_SURRENDER_ATTEMPTS):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    breaker = self._control_plane_breaker
+                    admission = breaker.admit() if breaker is not None else None
+                    try:
+                        if admission is not None and not admission.allowed:
+                            logger.debug("lease.surrender_skipped_breaker_open")
+                            break
+                        client.post(
+                            f"{self.api_url}{_LEASE_SURRENDER_PATH}",
+                            json=request.model_dump(mode="json"),
+                            headers=self._auth_headers(),
+                            timeout=max(0.001, min(_SURRENDER_TIMEOUT_S, remaining)),
+                        ).raise_for_status()
+                        if breaker is not None:
+                            breaker.record_success()
+                    except Exception as exc:
+                        # The server reclaims an unsurrendered lease at its
+                        # deadline; a failed courtesy release never surfaces.
+                        logger.debug("lease.surrender_failed: %s", type(exc).__name__)
+                        if breaker is not None and not handle_read_only_key_error(exc):
+                            breaker.record_failure()
+                        if isinstance(exc, httpx.TimeoutException):
+                            continue
+                    finally:
+                        if breaker is not None:
+                            breaker.release_probe(admission)
+                    break
         finally:
             client.close()
 
@@ -3294,31 +3307,35 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         """Async release drain bounded by one monotonic deadline."""
         async with self._new_async_http_client(timeout=_SURRENDER_TIMEOUT_S) as client:
             for request in payloads:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return
-                breaker = self._control_plane_breaker
-                admission = breaker.admit() if breaker is not None else None
-                try:
-                    if admission is not None and not admission.allowed:
-                        logger.debug("lease.surrender_skipped_breaker_open")
-                        continue
-                    resp = await client.post(
-                        f"{self.api_url}{_LEASE_SURRENDER_PATH}",
-                        json=request.model_dump(mode="json"),
-                        headers=self._auth_headers(),
-                        timeout=max(0.001, min(_SURRENDER_TIMEOUT_S, remaining)),
-                    )
-                    resp.raise_for_status()
-                    if breaker is not None:
-                        breaker.record_success()
-                except Exception as exc:
-                    logger.debug("lease.surrender_failed: %s", type(exc).__name__)
-                    if breaker is not None and not handle_read_only_key_error(exc):
-                        breaker.record_failure()
-                finally:
-                    if breaker is not None:
-                        breaker.release_probe(admission)
+                for _attempt in range(_SURRENDER_ATTEMPTS):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    breaker = self._control_plane_breaker
+                    admission = breaker.admit() if breaker is not None else None
+                    try:
+                        if admission is not None and not admission.allowed:
+                            logger.debug("lease.surrender_skipped_breaker_open")
+                            break
+                        resp = await client.post(
+                            f"{self.api_url}{_LEASE_SURRENDER_PATH}",
+                            json=request.model_dump(mode="json"),
+                            headers=self._auth_headers(),
+                            timeout=max(0.001, min(_SURRENDER_TIMEOUT_S, remaining)),
+                        )
+                        resp.raise_for_status()
+                        if breaker is not None:
+                            breaker.record_success()
+                    except Exception as exc:
+                        logger.debug("lease.surrender_failed: %s", type(exc).__name__)
+                        if breaker is not None and not handle_read_only_key_error(exc):
+                            breaker.record_failure()
+                        if isinstance(exc, httpx.TimeoutException):
+                            continue
+                    finally:
+                        if breaker is not None:
+                            breaker.release_probe(admission)
+                    break
 
     async def _surrender_late_renewal(self, request: LeaseSurrenderRequest) -> None:
         """Release a renewal successor observed after the close epoch changed."""
