@@ -310,18 +310,10 @@ class TestLeaseBoundedRoundTrips:
         )
 
     @pytest.mark.integration
-    def test_alert_only_past_cap_continues_with_reservation(
+    def test_alert_only_past_cap_continues_with_warning(
         self, api_url: str, make_lease_enforcer: EnforcerFactory
     ) -> None:
-        """DoD 3 (live half): alert_only past its cap keeps running, reservation-funded.
-
-        Since core PR #387 (2026-09-01) an alert_only project is never refused a
-        project-level hold: the check answers allowed with a reservation id and
-        a signed, non-positive remaining budget, and carries NO warning (the
-        SDK's "Budget limit reached" warning is built only from a server
-        refusal, which scoped hard caps can still produce). The lease path still
-        hands back a zero-token grant, so every call rides the per-call check.
-        """
+        """DoD 3 (live half): alert_only past its cap keeps running, with a warning."""
         credentials = provision_project(
             api_url, name="sdk-lease-alert", budget_limit=0.05, budget_mode="alert_only"
         )
@@ -335,13 +327,8 @@ class TestLeaseBoundedRoundTrips:
         for _ in range(3):
             result = _admit(enforcer, run_id)
             assert result.allowed is True
-            assert result.reservation_id is not None, (
-                "an alert_only call past the cap is approved WITH a hold, not refused"
-            )
-            assert result.lease_id is None, "past the cap the call is reservation-funded"
-            assert result.remaining_budget is not None and result.remaining_budget <= 0
-            assert result.warning is None, (
-                "the server approves the overshoot, so the SDK has no refusal to warn about"
+            assert result.warning is not None, (
+                "an alert_only call past the cap must carry the customer's warning"
             )
 
         state = enforcer._lease.state_for(run_id)

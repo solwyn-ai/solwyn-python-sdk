@@ -1718,7 +1718,6 @@ class _SolwynBase:
         estimated_output_bound: int | None = None,
         velocity_flags: Collection[str] | None = None,
         receipt_aggregate_count: int | None = None,
-        lease_id: str | None = None,
     ) -> MetadataEvent:
         """Build a MetadataEvent for reporting to the cloud API.
 
@@ -1729,9 +1728,7 @@ class _SolwynBase:
         ``modality`` is the call modality — ``"text"`` for every chat event; the
         media lifecycle passes the surface's modality (e.g. ``"embedding"``).
         ``media_usage`` carries a non-text surface's non-token quantities; None
-        for chat/text events (None-skipped on the wire). ``lease_id`` is the
-        funding lease of the call's admission, the value on ``budget.lease_id``;
-        None for every unfunded or reservation-funded event.
+        for chat/text events (None-skipped on the wire).
         """
         if not call_id:
             raise RuntimeError("call_id is required for metadata reconciliation")
@@ -1777,7 +1774,6 @@ class _SolwynBase:
                 cast("list[VelocityFlag]", list(velocity_flags)) if velocity_flags else None
             ),
             receipt_aggregate_count=receipt_aggregate_count,
-            lease_id=lease_id,
         )
 
     def _build_error_event(
@@ -1796,7 +1792,6 @@ class _SolwynBase:
         possibly_succeeded: bool | None = None,
         agent_run: _RunContextSnapshot | None = None,
         provider_region: str | None = None,
-        lease_id: str | None = None,
     ) -> MetadataEvent:
         """Build an error-status MetadataEvent with zeroed token counts.
 
@@ -1807,9 +1802,6 @@ class _SolwynBase:
         ``provider_region`` is the FAILED hop's endpoint region — on a
         possibly-succeeded abort the Cloud API needs it to reconcile a
         possibly-landed charge per (model, region); None-skipped otherwise.
-        ``lease_id`` is the funding lease of the failed attempt's admission so
-        the error event of a lease-admitted call names its lease like its
-        served sibling would; None-skipped otherwise.
         """
         return self._build_metadata_event(
             model=model,
@@ -1829,5 +1821,4 @@ class _SolwynBase:
             possibly_succeeded=possibly_succeeded,
             agent_run=agent_run,
             provider_region=provider_region,
-            lease_id=lease_id,
         )

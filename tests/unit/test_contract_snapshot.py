@@ -289,7 +289,6 @@ EXPECTED_METADATA_FIELDS = {
     "agent_run_id",
     "parent_agent_run_id",
     "agent_run_name",
-    "lease_id",
     "is_provider_fallback",
     "requested_provider",
     "requested_model",

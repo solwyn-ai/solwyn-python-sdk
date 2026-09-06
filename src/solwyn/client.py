@@ -723,7 +723,6 @@ def _settle_stream_failure(
             possibly_succeeded=possibly_succeeded,
             agent_run=agent_run,
             provider_region=provider_region,
-            lease_id=_settlement_keys(budget)[1],
         )
     )
 
@@ -2280,7 +2279,6 @@ class Solwyn(_SolwynBase):
                     call_id=call_id,
                     agent_run=agent_run,
                     provider_region=provider_region,
-                    lease_id=_settlement_keys(budget)[1],
                 )
             )
             raise
@@ -2363,7 +2361,6 @@ class Solwyn(_SolwynBase):
             modality=spec.modality,
             media_usage=media_usage,
             velocity_flags=velocity_flags,
-            lease_id=lease_id,
         )
         if confirm is not None:
             self._solwyn_reporter.report_settlement(confirm, event)
@@ -2792,7 +2789,6 @@ class Solwyn(_SolwynBase):
                                 possibly_succeeded=True if possibly_succeeded else None,
                                 agent_run=agent_run,
                                 provider_region=_safe_extract_region(rt),
-                                lease_id=_settlement_keys(budget)[1],
                             )
                         )
                         if disp is Disposition.FAIL_FAST:
@@ -2989,7 +2985,6 @@ class Solwyn(_SolwynBase):
                     agent_run=agent_run,
                     provider_region=provider_region,
                     velocity_flags=velocity_flags,
-                    lease_id=lease_id,
                 )
                 if confirm is not None:
                     self._solwyn_reporter.report_settlement(confirm, event)
@@ -3118,7 +3113,6 @@ class Solwyn(_SolwynBase):
                 agent_run=agent_run,
                 provider_region=provider_region,
                 velocity_flags=velocity_flags,
-                lease_id=lease_id,
             )
             if confirm is not None:
                 self._solwyn_reporter.report_settlement(confirm, event)
@@ -3764,7 +3758,6 @@ class AsyncSolwyn(_SolwynBase):
                     call_id=call_id,
                     agent_run=agent_run,
                     provider_region=provider_region,
-                    lease_id=_settlement_keys(budget)[1],
                 )
             )
             raise
@@ -3840,7 +3833,6 @@ class AsyncSolwyn(_SolwynBase):
             modality=spec.modality,
             media_usage=media_usage,
             velocity_flags=velocity_flags,
-            lease_id=lease_id,
         )
         if confirm is not None:
             self._solwyn_reporter.report_settlement(confirm, event)
@@ -4226,7 +4218,6 @@ class AsyncSolwyn(_SolwynBase):
                                 possibly_succeeded=True if possibly_succeeded else None,
                                 agent_run=agent_run,
                                 provider_region=_safe_extract_region(rt),
-                                lease_id=_settlement_keys(budget)[1],
                             )
                         )
                         if disp is Disposition.FAIL_FAST:
@@ -4418,7 +4409,6 @@ class AsyncSolwyn(_SolwynBase):
                     agent_run=agent_run,
                     provider_region=provider_region,
                     velocity_flags=velocity_flags,
-                    lease_id=lease_id,
                 )
                 if confirm is not None:
                     self._solwyn_reporter.report_settlement(confirm, event)
@@ -4545,7 +4535,6 @@ class AsyncSolwyn(_SolwynBase):
                 agent_run=agent_run,
                 provider_region=provider_region,
                 velocity_flags=velocity_flags,
-                lease_id=lease_id,
             )
             if confirm is not None:
                 self._solwyn_reporter.report_settlement(confirm, event)

@@ -167,11 +167,6 @@ def _reject_reserved_wrap_kwargs(kwargs: dict[str, Any]) -> None:
         raise TypeError(f"reserved control-plane wiring cannot be overridden: {joined}")
 
 
-def _duplicate_entry(index: int, reason: str, event: MetadataEvent) -> dict[str, Any]:
-    """One ``duplicates[]`` entry: submitted index, probe that hit, echoed call id."""
-    return {"index": index, "reason": reason, "call_id": event.call_id}
-
-
 def _metadata_legacy_identity(event: MetadataEvent) -> tuple[datetime, str]:
     timestamp = event.timestamp
     normalized = (
@@ -1429,20 +1424,13 @@ class FakeControlPlane:
         if isinstance(parsed, PlaneResponse):
             return parsed
         newly_ingested: list[MetadataEvent] = []
-        # Dedup skips ride the 202 body's ``duplicates`` lane exactly as the
-        # API reports them: keyed by SUBMITTED index, attributed to the probe
-        # that hit with the legacy (timestamp, sdk_instance_id) key checked
-        # first, one entry per event. The three lanes partition the batch:
-        # ``len(batch) == ingested + len(rejected) + len(duplicates)``.
-        duplicates: list[dict[str, Any]] = []
-        for index, event in enumerate(parsed):
+        for event in parsed:
             identity = (event.call_id, event.attempt_index)
             legacy_identity = _metadata_legacy_identity(event)
-            if legacy_identity in self._seen_ingest_legacy_identities:
-                duplicates.append(_duplicate_entry(index, "legacy_key", event))
-                continue
-            if identity in self._seen_ingest_identities:
-                duplicates.append(_duplicate_entry(index, "call_id", event))
+            if (
+                identity in self._seen_ingest_identities
+                or legacy_identity in self._seen_ingest_legacy_identities
+            ):
                 continue
             self._seen_ingest_identities.add(identity)
             self._seen_ingest_legacy_identities.add(legacy_identity)
@@ -1452,11 +1440,8 @@ class FakeControlPlane:
         # server refuses to price a rejected event, it does not unsee it.
         scripted = self._consume_ingest_rejection_window()
         if scripted is None:
-            return PlaneResponse(
-                202,
-                {"ingested": len(newly_ingested), "rejected": [], "duplicates": duplicates},
-            )
-        return PlaneResponse(202, self._scripted_ingest_body(scripted, parsed, duplicates))
+            return PlaneResponse(202, {"ingested": len(newly_ingested), "rejected": []})
+        return PlaneResponse(202, self._scripted_ingest_body(scripted, parsed))
 
     def _consume_ingest_rejection_window(self) -> _ScenarioWindow | None:
         """Take the first open rejection window scoped to the ingest path."""
@@ -1469,22 +1454,10 @@ class FakeControlPlane:
         self,
         window: _ScenarioWindow,
         events: list[MetadataEvent],
-        duplicates: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Build the 202 body one scripted rejection window calls for.
-
-        ``duplicates`` is the dedup lane the batch already earned. The server
-        never prices a dedup-skipped event, so it can never reject one either:
-        an exact-index window naming a duplicate is a scenario error, and a
-        count window draws its rejections from the fresh events only. The lanes
-        therefore stay disjoint and partition the batch.
-        """
+        """Build the 202 body one scripted rejection window calls for."""
         if window.malformed:
             return {"rejected": "corrupt"}
-        duplicate_indexes = {entry["index"] for entry in duplicates}
-        fresh = [
-            (index, event) for index, event in enumerate(events) if index not in duplicate_indexes
-        ]
         rejected: list[dict[str, Any]] = []
         if window.indices is not None:
             for index in window.indices:
@@ -1493,27 +1466,18 @@ class FakeControlPlane:
                         f"solwyn.testing: reject_ingest index {index} is outside the "
                         f"{len(events)}-event batch it met"
                     )
-                if index in duplicate_indexes:
-                    raise RuntimeError(
-                        f"solwyn.testing: reject_ingest index {index} names a dedup-skipped "
-                        "event; the server never prices a duplicate, so it cannot reject one"
-                    )
                 rejected.append(self._rejection_entry(window.code, events[index], index=index))
         else:
             count = window.count or 0
-            if count > len(fresh):
+            if count > len(events):
                 raise RuntimeError(
-                    f"solwyn.testing: reject_ingest count {count} exceeds the {len(fresh)} "
-                    f"fresh events in the {len(events)}-event batch it met"
+                    f"solwyn.testing: reject_ingest count {count} exceeds the "
+                    f"{len(events)}-event batch it met"
                 )
             rejected.extend(
-                self._rejection_entry(window.code, event, index=None) for _, event in fresh[:count]
+                self._rejection_entry(window.code, event, index=None) for event in events[:count]
             )
-        return {
-            "ingested": len(events) - len(rejected) - len(duplicates),
-            "rejected": rejected,
-            "duplicates": duplicates,
-        }
+        return {"ingested": max(len(events) - len(rejected), 0), "rejected": rejected}
 
     @staticmethod
     def _rejection_entry(

@@ -7,60 +7,6 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
-## [0.7.0] - 2026-09-05
-
-Every telemetry event for a lease-funded call now names the budget lease that
-funded it, so Solwyn Cloud counts a call's spend once between its metadata
-landing and its confirmation settling, including when the confirmation is
-lost. The testing double catches up with the live ingest contract's duplicate
-lane, and the surface canary admits the namespaces the September provider SDK
-releases added. Wire-contract changes are API-first: Solwyn Cloud accepts
-`lease_id` before this SDK releases. Ships #81.
-
-### Added
-
-- **`MetadataEvent.lease_id`.** Every telemetry event for a lease-funded call
-  now names the budget lease that funded it, the same id its confirm carries,
-  on success and error events alike. Solwyn Cloud uses it to keep a call's
-  spend counted once between its metadata landing and its confirmation
-  settling, including when the confirmation is lost. Wire-contract change,
-  API-first: Solwyn Cloud accepts the field before this release. No behaviour
-  change for reservation-funded, cache-hit, fail-open, uncounted or denied
-  calls, whose events carry no lease id and whose wire bytes are unchanged.
-
-### Changed
-
-- **Surface canary admits the September provider SDK namespaces.** openai 3.8
-  (`safety.alerts`), anthropic 1.4 (`beta.organization` admin tree,
-  `beta.webhooks.parse_unverified`, raw and streaming variants of
-  `messages.batches.results`) and google-genai 2.22 (`environments.files`) each
-  added surfaces the reviewed rule ledger did not know, so every `latest`
-  inventory lane and the real-SDK fingerprint test went red. All 795 new paths
-  are classified by precedent: resource namespaces, read/write admin and file
-  operations as `unmetered_spend` with exact acknowledgment tokens, and the
-  raw-response wrappers as `unmetered_spend` at `raw_response` scope, exactly
-  like `admin.organization`, `beta.skills` and `environments`. Latest
-  fingerprints, per-context digests and the README strict fingerprint (now
-  audited against `openai==3.8.0`) are refreshed. Runtime behaviour for
-  existing surfaces is unchanged; before this release these paths resolved to
-  `unknown` and followed `on_unmetered`.
-- **The lock tracks the latest openai again.** CrewAI (via `instructor`) pins
-  `openai<3` and `jiter<0.16`, which had frozen the universal lock at openai
-  2.x while CI's real-SDK lanes audit the latest release. `[tool.uv]
-  override-dependencies` relaxes those two pins for lock resolution only; the
-  opt-in CrewAI smoke lane is where a real CrewAI-versus-openai-3 break would
-  surface. Dev-tooling only; nothing changes for installed packages.
-- **`FakeControlPlane` reports ingest dedup skips in `duplicates[]`.** The
-  double's `/metadata/ingest` 202 body is now the three-lane shape the live API
-  has answered with since 2026-09-01: `{"ingested", "rejected", "duplicates"}`,
-  where each duplicate names the submitted index, the probe that hit
-  (`legacy_key` for the timestamp-plus-instance key, checked first, or
-  `call_id`) and the echoed call id, and the three lanes partition the batch. A
-  replayed batch used to answer `{"ingested": 0, "rejected": []}`; tests that
-  pinned that two-key body must add the lane. The reporter never read it, so
-  SDK behaviour is unchanged. The shared `solwyn.testing.contract` receipt pack
-  now pins the three-key body in both lanes.
-
 ## [0.6.0] - 2026-08-24
 
 The SDK grows from a budget gate into a control plane for agent runs. Failover

@@ -186,7 +186,7 @@ def test_ingest_flattens_validated_events_and_returns_accurate_count() -> None:
         )
 
     assert response.status_code == 202
-    assert response.json() == {"ingested": 2, "rejected": [], "duplicates": []}
+    assert response.json() == {"ingested": 2, "rejected": []}
     assert plane.ingested == events
 
 
@@ -210,23 +210,9 @@ def test_ingest_replays_and_partial_overlap_skip_existing_call_attempt_identitie
             json=[event.model_dump(mode="json") for event in overlapping_batch],
         )
 
-    assert first.json() == {"ingested": 2, "rejected": [], "duplicates": []}
-    assert overlap.json() == {
-        "ingested": 1,
-        "rejected": [],
-        "duplicates": [{"index": 0, "reason": "call_id", "call_id": _call_id("dedup-b")}],
-    }
-    assert replay.json() == {
-        "ingested": 0,
-        "rejected": [],
-        "duplicates": [
-            # dedup-b was itself a dedup skip on the overlap, so its legacy key
-            # was never recorded; dedup-c landed there, so its legacy probe hits
-            # first — exactly the API's legacy-then-call-id attribution.
-            {"index": 0, "reason": "call_id", "call_id": _call_id("dedup-b")},
-            {"index": 1, "reason": "legacy_key", "call_id": _call_id("dedup-c")},
-        ],
-    }
+    assert first.json() == {"ingested": 2, "rejected": []}
+    assert overlap.json() == {"ingested": 1, "rejected": []}
+    assert replay.json() == {"ingested": 0, "rejected": []}
     assert [event.call_id for event in plane.ingested] == [
         _call_id("dedup-a"),
         _call_id("dedup-b"),
@@ -248,7 +234,7 @@ def test_ingest_attempt_index_is_part_of_the_production_idempotency_key() -> Non
         [event.model_dump(mode="json") for event in attempts],
     )
 
-    assert response.body == {"ingested": 2, "rejected": [], "duplicates": []}
+    assert response.body == {"ingested": 2, "rejected": []}
     assert plane.ingested == attempts
 
 
@@ -269,18 +255,8 @@ def test_ingest_preserves_core_legacy_timestamp_instance_dedup_surface() -> None
         [legacy_collision.model_dump(mode="json")],
     )
 
-    assert first.body == {"ingested": 1, "rejected": [], "duplicates": []}
-    assert replay.body == {
-        "ingested": 0,
-        "rejected": [],
-        "duplicates": [
-            {
-                "index": 0,
-                "reason": "legacy_key",
-                "call_id": _call_id("legacy-distinct-call"),
-            }
-        ],
-    }
+    assert first.body == {"ingested": 1, "rejected": []}
+    assert replay.body == {"ingested": 0, "rejected": []}
     assert plane.ingested == [original]
 
 
@@ -409,13 +385,7 @@ def test_reset_recording_preserves_ingest_and_untracked_replay_state() -> None:
         [report.model_dump(mode="json")],
     )
 
-    assert ingest_replay.body == {
-        "ingested": 0,
-        "rejected": [],
-        "duplicates": [
-            {"index": 0, "reason": "legacy_key", "call_id": _call_id("reset-idempotency")}
-        ],
-    }
+    assert ingest_replay.body == {"ingested": 0, "rejected": []}
     assert untracked_replay.body == {"accepted": 1}
     assert plane.ingested == []
     assert plane.untracked_reports == []
@@ -506,12 +476,8 @@ async def test_async_ingest_retry_returns_zero_without_duplicate_recording() -> 
         first = await client.post(f"{plane.api_url}/api/v1/metadata/ingest", json=payload)
         replay = await client.post(f"{plane.api_url}/api/v1/metadata/ingest", json=payload)
 
-    assert first.json() == {"ingested": 1, "rejected": [], "duplicates": []}
-    assert replay.json() == {
-        "ingested": 0,
-        "rejected": [],
-        "duplicates": [{"index": 0, "reason": "legacy_key", "call_id": _call_id("async-retry")}],
-    }
+    assert first.json() == {"ingested": 1, "rejected": []}
+    assert replay.json() == {"ingested": 0, "rejected": []}
     assert plane.ingested == [event]
 
 
