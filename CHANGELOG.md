@@ -20,7 +20,7 @@ double catches up with the live ingest contract's duplicate lane, and the
 surface canary admits the namespaces the September provider SDK releases added.
 Wire-contract changes are API-first: Solwyn Cloud accepts `lease_id` before
 this SDK releases, and early release adds no new field or route — only new
-calls to the existing surrender endpoint. Ships #81.
+calls to the existing surrender endpoint. Ships #81 and #82.
 
 ### Added
 
