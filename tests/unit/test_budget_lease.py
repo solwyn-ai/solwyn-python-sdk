@@ -32,7 +32,13 @@ from solwyn._base import MediaSurfaceSpec, _effective_output_bound
 from solwyn._lease import INELIGIBLE_RETRY_AFTER_S
 from solwyn._registry import ProviderRuntime
 from solwyn._token_details import TokenDetails
-from solwyn._types import BudgetMode, LeaseGrantResponse, ProviderEntry, ProviderName
+from solwyn._types import (
+    BudgetMode,
+    LeaseGrantResponse,
+    LeaseSurrenderRequest,
+    ProviderEntry,
+    ProviderName,
+)
 from solwyn.budget import AsyncBudgetEnforcer, BudgetCheckResult, BudgetEnforcer
 from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.client import AsyncSolwyn, Solwyn
@@ -1422,6 +1428,358 @@ class TestLeaseSurrender:
             assert any(payload["generation"] == 2 for payload in payloads)
             assert enforcer._lease.state_for(RUN) is None
 
+    def test_a_dropped_lease_is_released_off_the_callers_thread(self) -> None:
+        # S1: the release rides its own daemon worker. The customer thread
+        # that observed the drop pays thread dispatch, never a round trip.
+        enforcer = _make_enforcer()
+        posted_from: list[str] = []
+
+        def _surrender(_request: httpx.Request) -> Response:
+            posted_from.append(threading.current_thread().name)
+            return Response(200, json={"released_tokens": 1})
+
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            respx.post(SURRENDER_URL).mock(side_effect=_surrender)
+            respx.post(RENEW_URL).mock(
+                return_value=Response(200, json=_deny_payload()),
+            )
+            _check(enforcer, "call_1")
+            renewal = enforcer._build_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            assert renewal is not None
+            caller = threading.current_thread().name
+            enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
+            assert _wait_for(lambda: len(posted_from) == 1)
+
+        assert posted_from == ["solwyn-lease-release"]
+        assert posted_from[0] != caller
+        enforcer._http.close()
+
+    def test_the_regrant_fence_exists_from_the_moment_of_the_drop(self) -> None:
+        # The window this closes: raising the fence when a WORKER starts would
+        # leave the drop-to-start gap open, and a concurrent admission can
+        # claim this run's grant slot inside it. The fence is raised in the
+        # drop's own lock section, before any thread exists — and a drain that
+        # claims the payload opens it, so nothing waits for a release close()
+        # has taken over.
+        enforcer = _make_enforcer()
+        request = LeaseSurrenderRequest(
+            lease_id="lease_1",
+            holder_id=enforcer._lease.holder_id,
+            generation=1,
+            spent_tokens=3,
+        )
+
+        with enforcer._state_lock:
+            enforcer._owe_release_locked(RUN, request)
+            pending = enforcer._run_releases.get(RUN)
+
+        assert pending is not None
+        done, deadline = pending
+        assert done.is_set() is False
+        assert enforcer._release_threads == set()
+        assert deadline > time.monotonic()
+
+        payloads = enforcer.lease_surrender_payloads()
+
+        assert payloads == [request]
+        assert done.is_set() is True
+        enforcer._http.close()
+
+    def test_a_regrant_waits_for_the_release_of_the_lease_it_replaces(self) -> None:
+        # The S1 sequencing rule: a drop that can be followed by another grant
+        # from the SAME holder (an unreadable body after its 30s floor, a
+        # re-used stopped run) must not let that grant overtake the release —
+        # the server would then see a release for a row already replaced.
+        enforcer = _make_enforcer()
+        events: list[str] = []
+
+        def _surrender(_request: httpx.Request) -> Response:
+            events.append("surrender_start")
+            time.sleep(0.05)
+            events.append("surrender_end")
+            return Response(200, json={"released_tokens": 1})
+
+        def _grant(_request: httpx.Request) -> Response:
+            events.append("grant")
+            return Response(200, json=_grant_payload())
+
+        with respx.mock:
+            respx.post(GRANT_URL).mock(side_effect=_grant)
+            respx.post(SURRENDER_URL).mock(side_effect=_surrender)
+            respx.post(RENEW_URL).mock(
+                return_value=Response(200, json=_grant_payload(eligible=False, lease_id=None))
+            )
+            _check(enforcer, "call_1")
+            renewal = enforcer._build_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            assert renewal is not None
+            enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
+            # Exactly what the next admission on this run would do.
+            verdict, _response = enforcer._grant_lease(
+                agent_run_id=RUN,
+                estimated_input_tokens=100,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+                timeout=None,
+            )
+
+        assert verdict == "applied"
+        assert events == ["grant", "surrender_start", "surrender_end", "grant"]
+        enforcer._http.close()
+
+    async def test_async_regrant_waits_for_the_release_it_replaces(self) -> None:
+        # The async fence matters MORE than the sync one: the release task
+        # does not start until something awaits, so without the fence the
+        # re-grant's own await is what lets it run — concurrently, in an
+        # order the loop picks.
+        enforcer = _make_async_enforcer()
+        events: list[str] = []
+
+        def _surrender(_request: httpx.Request) -> Response:
+            events.append("surrender")
+            return Response(200, json={"released_tokens": 1})
+
+        def _grant(_request: httpx.Request) -> Response:
+            events.append("grant")
+            return Response(200, json=_grant_payload())
+
+        with respx.mock:
+            respx.post(GRANT_URL).mock(side_effect=_grant)
+            respx.post(SURRENDER_URL).mock(side_effect=_surrender)
+            respx.post(RENEW_URL).mock(
+                return_value=Response(200, json=_grant_payload(eligible=False, lease_id=None))
+            )
+            await _acheck(enforcer, "call_1")
+            renewal = enforcer._build_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            assert renewal is not None
+            await enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
+            verdict, _response = await enforcer._grant_lease(
+                agent_run_id=RUN,
+                estimated_input_tokens=100,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+                timeout=None,
+            )
+
+        assert verdict == "applied"
+        assert events == ["grant", "surrender", "grant"]
+        await enforcer._http.aclose()
+
+    def test_a_timed_out_release_is_retried_exactly_once(self) -> None:
+        # S5: the route is idempotent, and a surrender is not a cheap request
+        # (project lock, pending drain, ingested term, release, commit). One
+        # slow attempt must not cost the float its whole deadline.
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(
+                side_effect=[
+                    httpx.ReadTimeout("surrender timed out"),
+                    Response(200, json={"released_tokens": 5}),
+                ]
+            )
+            _check(enforcer, "call_1")
+            enforcer.close()
+
+        assert surrender.call_count == 2
+        # The SAME release, twice — a retry, never a second lease.
+        bodies = {call.request.content for call in surrender.calls}
+        assert len(bodies) == 1
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            Response(409, json={"detail": {"code": "lease_generation_conflict"}}),
+            Response(404, json={"detail": {"code": "lease_not_found"}}),
+        ],
+    )
+    def test_a_refused_release_is_never_retried(self, answer: Response) -> None:
+        # A refusal is an ANSWER: the server has considered the release and
+        # said no. Repeating it would only spend the deadline the NEXT payload
+        # in the drain still needs.
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(return_value=answer)
+            _check(enforcer, "call_1")
+            enforcer.close()
+
+        assert surrender.call_count == 1
+
+    def test_a_transport_failure_is_never_retried(self) -> None:
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(
+                side_effect=httpx.ConnectError("control plane unreachable")
+            )
+            _check(enforcer, "call_1")
+            enforcer.close()
+
+        assert surrender.call_count == 1
+
+    async def test_an_async_timed_out_release_is_retried_exactly_once(self) -> None:
+        enforcer = _make_async_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(
+                side_effect=[
+                    httpx.ReadTimeout("surrender timed out"),
+                    Response(200, json={"released_tokens": 5}),
+                ]
+            )
+            await _acheck(enforcer, "call_1")
+            await enforcer.close()
+
+        assert surrender.call_count == 2
+
+    def test_a_successor_for_a_run_that_ended_mid_renewal_is_released(self) -> None:
+        # S2 leaves one hole if nothing closes it: the scope exits, the ledger
+        # discards the run, and the renewal ALREADY on the wire comes back with
+        # a successor nobody will draw on. The state fence stops it being
+        # installed; it must also be handed back, or the exit that was supposed
+        # to return the float has left a fresh one standing to its deadline.
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(
+                return_value=Response(200, json={"released_tokens": 1})
+            )
+            respx.post(RENEW_URL).mock(
+                return_value=Response(200, json=_grant_payload(generation=2))
+            )
+            _check(enforcer, "call_1")
+            renewal = enforcer._build_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            assert renewal is not None
+
+            # The run scope exits while that renewal is in flight.
+            enforcer.surrender_run(RUN)
+            assert _wait_for(lambda: surrender.call_count == 1)
+            enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
+
+        generations = [
+            LeaseSurrenderRequest.model_validate_json(call.request.content).generation
+            for call in surrender.calls
+        ]
+        assert generations == [1, 2]
+        assert enforcer._lease.state_for(RUN) is None
+        enforcer._http.close()
+
+    def test_a_call_in_flight_when_the_run_scope_exits_still_settles(self) -> None:
+        # The scope can end while a call is still running. Its reservation goes
+        # with the run record, so the true-up no-ops — but the confirm must
+        # still be built, and must still name the lease that funded the call,
+        # or the server would charge it in full instead of as excess.
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            respx.post(SURRENDER_URL).mock(return_value=Response(200, json={"released_tokens": 1}))
+            admitted = _check(enforcer, "call_in_flight")
+            enforcer.surrender_run(RUN)
+
+            confirm = enforcer.build_confirm_request(
+                model="gpt-5.5",
+                token_details=TokenDetails(input_tokens=120, output_tokens=80),
+                provider="openai",
+                call_id=_wire_call_id("call_in_flight"),
+                lease_id=admitted.lease_id,
+                lease_claim_token=admitted.lease_claim_token,
+            )
+
+        assert confirm.lease_id == "lease_1"
+        assert enforcer._lease.state_for(RUN) is None
+        enforcer._http.close()
+
+    def test_an_undispatchable_release_still_rides_the_exit_drain(self) -> None:
+        # A release parked because nothing could dispatch it (an async holder
+        # whose scope ended off-loop) is no longer in the ledger, so the
+        # interpreter-exit hook would miss it unless the drain claims it too.
+        enforcer = _make_async_enforcer()
+        with enforcer._state_lock:
+            enforcer._owe_release_locked(
+                RUN,
+                LeaseSurrenderRequest(
+                    lease_id="lease_1",
+                    holder_id=enforcer._lease.holder_id,
+                    generation=1,
+                    spent_tokens=7,
+                ),
+            )
+
+        payloads = enforcer.lease_surrender_payloads()
+
+        assert [(request.lease_id, request.spent_tokens) for request in payloads] == [
+            ("lease_1", 7)
+        ]
+        assert enforcer._releases_owed == []
+
+    def test_a_release_that_cannot_be_dispatched_waits_for_close(self) -> None:
+        # Thread exhaustion (or an interpreter shutting down) must not eat the
+        # release: it goes back on the parked list, so close() is still able to
+        # send it — and every worker in the join sets has actually STARTED, or
+        # close() would raise trying to join one that never did.
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(
+                return_value=Response(200, json={"released_tokens": 1})
+            )
+            respx.post(RENEW_URL).mock(return_value=Response(200, json=_deny_payload()))
+            _check(enforcer, "call_1")
+            renewal = enforcer._build_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            assert renewal is not None
+            with patch.object(
+                threading.Thread, "start", side_effect=RuntimeError("can't start new thread")
+            ):
+                enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
+                parked = [owed.request.lease_id for owed in enforcer._releases_owed]
+                # The fence is OPEN: nothing is in flight for a re-grant to
+                # wait on, so it must not sit out the whole release budget.
+                assert all(
+                    owed.done is not None and owed.done.is_set() for owed in enforcer._releases_owed
+                )
+                assert surrender.call_count == 0
+            assert all(thread.ident is not None for thread in enforcer._release_threads)
+
+            enforcer.close()
+
+        assert parked == ["lease_1"]
+        assert surrender.call_count == 1
+
     def test_close_surrenders_every_held_lease(self) -> None:
         enforcer = _make_enforcer()
         with respx.mock:
@@ -1546,7 +1904,9 @@ class TestLeaseSurrender:
         finally:
             release.set()
 
-        assert elapsed < 2.0  # one 1s deadline, not three
+        # ONE drain deadline, not one per run — expressed against the constant
+        # so a change to the surrender bound cannot silently loosen this.
+        assert elapsed < 2 * budget_module._SURRENDER_TIMEOUT_S
 
     def test_exit_surrender_is_bounded_by_wall_clock_not_socket_timeouts(self) -> None:
         # A trickling server must not hold interpreter exit past the budget:
@@ -2303,6 +2663,38 @@ class TestLeaseForkReset:
             enforcer._reset_after_fork_in_child()
             assert enforcer._lease.active_run_ids() == []
             assert enforcer._lease.state_for(RUN) is None
+        enforcer._http.close()
+
+    def test_fork_reset_forgets_every_release_the_parent_owes(self) -> None:
+        # A dropped lease is the PARENT's to hand back: a child that inherited
+        # the payload would reclaim float the parent is still settling against,
+        # and the child is a different holder the server would refuse anyway.
+        enforcer = _make_enforcer()
+        with respx.mock:
+            respx.post(GRANT_URL).mock(return_value=Response(200, json=_grant_payload()))
+            surrender = respx.post(SURRENDER_URL).mock(
+                return_value=Response(200, json={"released_tokens": 1})
+            )
+            _check(enforcer, "call_1")
+            renewal = enforcer._build_renewal(
+                RUN,
+                model="gpt-5.5",
+                provider="openai",
+                fallback_providers=[],
+                fallback_models=[],
+            )
+            assert renewal is not None
+            respx.post(RENEW_URL).mock(
+                return_value=Response(200, json=_grant_payload(eligible=False, lease_id=None))
+            )
+            enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
+            assert _wait_for(lambda: surrender.call_count == 1)
+
+            enforcer._reset_after_fork_in_child()
+
+        assert enforcer._releases_owed == []
+        assert enforcer._run_releases == {}
+        assert enforcer._release_threads == set()
         enforcer._http.close()
 
     def test_fork_reset_takes_a_fresh_holder_identity(self) -> None:

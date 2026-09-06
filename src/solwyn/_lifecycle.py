@@ -254,6 +254,26 @@ def register_lease_holder(enforcer: _BudgetEnforcerBase) -> None:
     _LIVE_LEASE_HOLDERS.add(enforcer)
 
 
+def _surrender_run(agent_run_id: str) -> None:
+    """Release every held lease for a run whose scope has just ended (S2).
+
+    This is what makes the customer's mental model true: when the
+    ``with solwyn.run(...)`` block ends, the budget it held is back. Only the
+    holder knows the run is over — the server can infer it from nothing but a
+    deadline — so the scope boundary is the one place that can say so.
+
+    Every live holder is asked, because two clients in one process can hold a
+    lease for the same run and each must release its own. The dispatch itself
+    is off the exiting thread (the enforcer owns that); a failure here is
+    swallowed, since a courtesy release must never surface at a scope exit.
+    """
+    for holder in list(_LIVE_LEASE_HOLDERS):
+        try:
+            holder.surrender_run(agent_run_id)
+        except Exception as exc:
+            _log_warning("lifecycle.run_surrender_failed: exc_type=%s", type(exc).__name__)
+
+
 def _exit_surrender_all() -> None:
     """Hand every still-held lease back (spec §5: release, not just flush).
 

@@ -594,9 +594,19 @@ client = Solwyn(
 Token-billed calls inside `solwyn.run(...)` use budget leases by default. The first
 eligible call requests a server grant; later calls reserve tokens from that grant
 in memory, while renewal runs in the background at the refresh deadline or 75%
-depletion. `close()` surrenders held leases. Non-run traffic, non-token/media
-traffic, lease-ineligible runs or models, and clients with `lease_enabled=False`
-keep using the per-call `/budgets/check` path.
+depletion. Run-scope exit and `close()` both surrender held leases. Non-run
+traffic, non-token/media traffic, lease-ineligible runs or models, and clients
+with `lease_enabled=False` keep using the per-call `/budgets/check` path.
+
+A lease is handed back as soon as the SDK knows it has stopped using it: when the
+`with solwyn.run(...)` block exits (or `RunHandle.finish()` is called), when a
+renewal comes back ineligible or denied, when a lease response cannot be read,
+and when the server stops the run. The release is sent off your thread, so an
+exit costs thread dispatch and nothing else, and it is best-effort — an
+unreleased lease is still reclaimed at its server deadline. Work that outlives
+the scope with the run id still bound keeps working: its next call finds no
+lease and pays one grant. An `activate()` scope on a `create_run()` handle does
+not release, because a detached identity is meant to be re-entered.
 
 Each reservation includes the input estimate plus the largest effective output
 cap across the configured provider chain, including global defaults, provider

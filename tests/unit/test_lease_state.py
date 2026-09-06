@@ -90,7 +90,7 @@ def _ledger(**kwargs: Any) -> LeaseLedger:
 def _granted_ledger(now: float = 1_000.0, **response_overrides: Any) -> LeaseLedger:
     """A ledger holding a live lease for RUN, installed at ``now``."""
     ledger = _ledger()
-    outcome = ledger.apply_grant_response(
+    outcome, _release = ledger.apply_grant_response(
         RUN, _response(**response_overrides), now=now, declared_models=["gpt-5.5"]
     )
     if outcome is not GrantOutcome.APPLIED:
@@ -226,7 +226,7 @@ class TestGrantApplication:
     def test_grant_installs_counters_timers_and_posture(self) -> None:
         ledger = _ledger()
 
-        outcome = ledger.apply_grant_response(
+        outcome, _release = ledger.apply_grant_response(
             RUN, _response(), now=1_000.0, declared_models=["gpt-5.5"]
         )
 
@@ -264,7 +264,7 @@ class TestGrantApplication:
         ledger.apply_grant_response(RUN, _response(generation=2, granted_tokens=7), now=1_010.0)
 
         # Act — a delayed generation-1 response lands after generation 2.
-        outcome = ledger.apply_grant_response(
+        outcome, _release = ledger.apply_grant_response(
             RUN, _response(generation=1, granted_tokens=100_000), now=1_020.0
         )
 
@@ -279,7 +279,7 @@ class TestGrantApplication:
         ledger = _granted_ledger()
         _admit(ledger)  # draw the remainder down
 
-        outcome = ledger.apply_grant_response(RUN, _response(generation=1), now=1_010.0)
+        outcome, _release = ledger.apply_grant_response(RUN, _response(generation=1), now=1_010.0)
 
         assert outcome is GrantOutcome.STALE
         state = ledger.state_for(RUN)
@@ -289,7 +289,7 @@ class TestGrantApplication:
     def test_deny_response_drops_the_lease_and_signals_the_enforcer(self) -> None:
         ledger = _granted_ledger()
 
-        outcome = ledger.apply_grant_response(
+        outcome, _release = ledger.apply_grant_response(
             RUN,
             _response(
                 allowed=False,
@@ -312,7 +312,7 @@ class TestGrantApplication:
     def test_ineligible_response_marks_the_run_and_drops_the_lease(self) -> None:
         ledger = _granted_ledger()
 
-        outcome = ledger.apply_grant_response(
+        outcome, _release = ledger.apply_grant_response(
             RUN, _response(eligible=False, ineligible_reason="scoped_rules_present"), now=1_010.0
         )
 
@@ -324,7 +324,7 @@ class TestGrantApplication:
         # break: never install half a lease, and do not hot-loop grant calls.
         ledger = _ledger()
 
-        outcome = ledger.apply_grant_response(RUN, _response(posture=None), now=1_000.0)
+        outcome, _release = ledger.apply_grant_response(RUN, _response(posture=None), now=1_000.0)
 
         assert outcome is GrantOutcome.MALFORMED
         assert ledger.lease_id_for(RUN) is None
@@ -349,6 +349,137 @@ class TestGrantApplication:
         # by definition, so a ratio test would ask for a renewal on every
         # single call — the opposite of bounded round-trips.
         assert admission.renewal_due is False
+
+
+@pytest.mark.unit
+class TestTerminalDropReleases:
+    """S1: which drops owe the server a release, and what that release says.
+
+    The ledger only BUILDS the payload — the enforcer posts it. What is pinned
+    here is the decision (which drop is terminal) and the contents (the lease
+    the holder actually held, the generation it held, and every token it has
+    not yet reported).
+    """
+
+    def _spend(self, ledger: LeaseLedger, call_id: str, actual: int) -> None:
+        _admit(ledger, call_id=call_id, estimated_input_tokens=1_000, output_bound=500)
+        _true_up(ledger, call_id, actual)
+
+    def test_an_ineligible_renewal_owes_the_dropped_lease(self) -> None:
+        ledger = _granted_ledger()
+        self._spend(ledger, "spent-1", 700)
+
+        outcome, release = ledger.apply_grant_response(
+            RUN,
+            _response(eligible=False, ineligible_reason="counter_plan_changed"),
+            now=1_010.0,
+        )
+
+        assert outcome is GrantOutcome.INELIGIBLE
+        assert release is not None
+        assert release.lease_id == "lse_abc"
+        assert release.holder_id == HOLDER
+        assert release.generation == 1
+        assert release.spent_tokens == 700
+        # The authority is gone the instant it is owed — a second attempt at
+        # the same drop can never surrender the same lease twice.
+        assert ledger.lease_id_for(RUN) is None
+        assert ledger.build_surrender_request(RUN) is None
+
+    def test_a_denied_renewal_owes_the_dropped_lease(self) -> None:
+        ledger = _granted_ledger()
+        self._spend(ledger, "spent-2", 400)
+
+        outcome, release = ledger.apply_grant_response(
+            RUN,
+            _response(allowed=False, denied_by_period="monthly"),
+            now=1_010.0,
+        )
+
+        assert outcome is GrantOutcome.DENIED
+        assert release is not None
+        assert (release.lease_id, release.generation, release.spent_tokens) == ("lse_abc", 1, 400)
+
+    def test_a_malformed_allow_owes_the_lease_it_could_not_replace(self) -> None:
+        ledger = _granted_ledger()
+        self._spend(ledger, "spent-3", 250)
+
+        outcome, release = ledger.apply_grant_response(RUN, _response(posture=None), now=1_010.0)
+
+        assert outcome is GrantOutcome.MALFORMED
+        assert release is not None
+        assert (release.lease_id, release.generation, release.spent_tokens) == ("lse_abc", 1, 250)
+
+    def test_the_release_echoes_the_generation_the_holder_HELD(self) -> None:
+        # Not the successor's: the server advanced to generation 3 when it
+        # stored the terminal answer, and only it can decide whether a
+        # predecessor release is acceptable.
+        ledger = _granted_ledger()
+        ledger.apply_grant_response(RUN, _response(generation=2), now=1_010.0)
+
+        _outcome, release = ledger.apply_grant_response(RUN, _response(eligible=False), now=1_020.0)
+
+        assert release is not None
+        assert release.generation == 2
+
+    def test_a_terminal_drop_with_no_lease_owes_nothing(self) -> None:
+        # A cold-start grant answered ineligible: there is no authority to
+        # hand back, so no wasted round trip is scheduled.
+        ledger = _ledger()
+
+        outcome, release = ledger.apply_grant_response(RUN, _response(eligible=False), now=1_000.0)
+
+        assert outcome is GrantOutcome.INELIGIBLE
+        assert release is None
+
+    def test_an_applied_or_stale_response_owes_nothing(self) -> None:
+        ledger = _granted_ledger()
+
+        applied = ledger.apply_grant_response(RUN, _response(generation=2), now=1_010.0)
+        stale = ledger.apply_grant_response(RUN, _response(generation=1), now=1_020.0)
+
+        assert applied == (GrantOutcome.APPLIED, None)
+        assert stale == (GrantOutcome.STALE, None)
+
+    def test_a_run_stop_directive_drop_owes_the_revoked_lease(self) -> None:
+        ledger = _granted_ledger()
+        self._spend(ledger, "spent-4", 900)
+
+        release = ledger.surrender_if_current(RUN, lease_id="lse_abc", generation=1)
+
+        assert release is not None
+        assert (release.lease_id, release.generation, release.spent_tokens) == ("lse_abc", 1, 900)
+        assert ledger.lease_id_for(RUN) is None
+
+    def test_a_directive_for_a_replaced_lease_owes_nothing(self) -> None:
+        ledger = _granted_ledger()
+
+        release = ledger.surrender_if_current(RUN, lease_id="lse_old", generation=1)
+
+        assert release is None
+        assert ledger.lease_id_for(RUN) == "lse_abc"
+
+    def test_a_404_or_409_renewal_drop_owes_nothing(self) -> None:
+        # D3: 404 has nothing to release, and 409 means a LIVE successor the
+        # server would refuse this release for. Neither path can even build a
+        # payload — the lease id is gone by the time the drop returns.
+        ledger = _granted_ledger()
+
+        dropped = ledger.drop_if_current(RUN, lease_id="lse_abc", generation=1)
+
+        assert dropped is True
+        assert ledger.build_surrender_request(RUN) is None
+
+    def test_a_client_side_expiry_drop_owes_nothing(self) -> None:
+        # D6: the next admission re-grants, and a surrender racing that grant
+        # would reclaim a float the server is about to re-lend.
+        ledger = _granted_ledger()
+
+        admission = _admit(ledger, call_id="past-deadline", now=1_500.0)
+
+        assert admission.decision is LeaseDecision.NEED_GRANT
+        assert admission.reason == "lease_expired"
+        assert ledger.build_surrender_request(RUN) is None
 
 
 @pytest.mark.unit
@@ -1129,7 +1260,7 @@ class TestRenewalBookkeeping:
         replacement_request = ledger.claim_renewal_request(RUN)
         assert replacement_request is not None
 
-        outcome = ledger.apply_grant_response(
+        outcome, _release = ledger.apply_grant_response(
             RUN,
             _response(lease_id="lse_abc", generation=2, granted_tokens=1),
             now=1_020.0,
@@ -1201,7 +1332,7 @@ class TestRenewalNetting:
         _true_up(ledger, "in-window", 5_000)
 
         # Act
-        outcome = ledger.apply_grant_response(
+        outcome, _release = ledger.apply_grant_response(
             RUN, _response(generation=2, granted_tokens=50_000), now=1_020.0
         )
 
@@ -1500,7 +1631,7 @@ class TestRenewalNetting:
         installed = state.granted_remaining_tokens
 
         # Act
-        outcome = ledger.apply_grant_response(
+        outcome, _release = ledger.apply_grant_response(
             RUN, _response(generation=2, granted_tokens=90_000), now=1_021.0
         )
 

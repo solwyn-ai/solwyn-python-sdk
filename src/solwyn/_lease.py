@@ -437,6 +437,10 @@ class LeaseLedger:
         it is never drawn down as authority again.
         """
         if not breaker_open:
+            # No release is owed for THIS drop: the very next admission
+            # re-grants, and racing a surrender against that grant would ask
+            # the server to reclaim a float it is about to re-lend. Its
+            # deadline has passed anyway — the server's own sweep owns it.
             self._drop_lease(state)
             return LeaseAdmission(LeaseDecision.NEED_GRANT, reason="lease_expired")
 
@@ -509,7 +513,7 @@ class LeaseLedger:
         declared_models: Iterable[str] = (),
         expected_lease_id: str | None = None,
         expected_generation: int | None = None,
-    ) -> GrantOutcome:
+    ) -> tuple[GrantOutcome, LeaseSurrenderRequest | None]:
         """Install a grant/renew response, or explain why it was not installed.
 
         Fencing (R2-4): a response installs only when its ``generation`` is
@@ -518,6 +522,16 @@ class LeaseLedger:
         late success, denial, or malformed body is stale and mutates nothing.
         Timers restart HERE, from the response's durations measured on the
         caller's monotonic clock.
+
+        The second element is the release owed for a lease this call DROPPED
+        for a TERMINAL reason: an ineligible successor, a denied successor, or
+        an allow whose lease block cannot be read. The holder has stopped
+        drawing on that authority, so the caller (which owns all I/O) must
+        hand it back instead of leaving the server's float standing until the
+        deadline. It echoes the generation held HERE — the server may already
+        have advanced past it, and answering that surrender is the server's
+        decision, not the ledger's. None whenever nothing was dropped, and for
+        a drop with no installed lease to name.
         """
         state = self._states.get(run_id)
         if (expected_lease_id is not None or expected_generation is not None) and (
@@ -526,12 +540,13 @@ class LeaseLedger:
             or state.generation != expected_generation
         ):
             logger.debug("lease.stale_origin_ignored")
-            return GrantOutcome.STALE
+            return GrantOutcome.STALE, None
         if state is None:
             state = LeaseState(run_id=run_id)
             self._states[run_id] = state
 
         if not response.eligible:
+            release = self.build_surrender_request(run_id)
             self._drop_lease(state)
             self._store_snapshot(state, response)
             state.run_ineligible = True
@@ -540,14 +555,15 @@ class LeaseLedger:
                 "lease.run_ineligible: reason=%s (legacy per-call path for this run)",
                 response.ineligible_reason,
             )
-            return GrantOutcome.INELIGIBLE
+            return GrantOutcome.INELIGIBLE, release
 
         if not response.allowed:
             # An authoritative hard deny — the enforcer feeds it to the
             # sticky-deny machinery; nothing is drawn down locally after it.
+            release = self.build_surrender_request(run_id)
             self._drop_lease(state)
             self._store_snapshot(state, response)
-            return GrantOutcome.DENIED
+            return GrantOutcome.DENIED, release
 
         generation = response.generation
         if (
@@ -560,14 +576,15 @@ class LeaseLedger:
             or response.posture is None
         ):
             logger.warning("lease.grant_response_malformed: lease fields missing on an allow")
+            release = self.build_surrender_request(run_id)
             self._drop_lease(state)
             state.run_ineligible = True
             state.ineligible_retry_at = now + INELIGIBLE_RETRY_AFTER_S
-            return GrantOutcome.MALFORMED
+            return GrantOutcome.MALFORMED, release
 
         if state.has_lease and generation <= state.generation:
             logger.debug("lease.stale_generation_ignored")
-            return GrantOutcome.STALE
+            return GrantOutcome.STALE, None
 
         # The declared set belongs to ONE lease: the server folded that
         # lease's worst-case rate over exactly these models. A different
@@ -620,7 +637,7 @@ class LeaseLedger:
                 "lease.final_grant: no further renewal will be granted for this run "
                 "— winding down to the per-call path at expiry"
             )
-        return GrantOutcome.APPLIED
+        return GrantOutcome.APPLIED, None
 
     def mark_ineligible(self, run_id: str, *, now: float, retry_after: float | None = None) -> None:
         """Route a run to the legacy path; ``retry_after`` None means forever.
@@ -683,12 +700,34 @@ class LeaseLedger:
             self._drop_lease(state)
 
     def drop_if_current(self, run_id: str, *, lease_id: str, generation: int) -> bool:
-        """Drop only the lease that originated a failed renewal response."""
+        """Drop only the lease that originated a failed renewal response.
+
+        Nothing is owed to the server here: this is the 404 case (the lease is
+        already gone) and the 409 case (a LIVE successor exists, which would
+        refuse a release echoing the predecessor). Where the server can still
+        act on the news, use ``surrender_if_current`` instead.
+        """
         state = self._states.get(run_id)
         if state is None or state.lease_id != lease_id or state.generation != generation:
             return False
         self._drop_lease(state)
         return True
+
+    def surrender_if_current(
+        self, run_id: str, *, lease_id: str, generation: int
+    ) -> LeaseSurrenderRequest | None:
+        """Drop the named lease and return the release owed for it.
+
+        The TERMINAL twin of ``drop_if_current``, for a drop the server can act
+        on: a run-stop directive revoked this lease, so telling the server the
+        holder has stopped lets it re-lend the float now rather than at the
+        deadline. None when the run has already moved on to another lease —
+        that one is still in use and must not be released.
+        """
+        request = self.build_surrender_request(run_id)
+        if not self.drop_if_current(run_id, lease_id=lease_id, generation=generation):
+            return None
+        return request
 
     def discard(self, run_id: str) -> None:
         """Forget the run entirely (after a surrender)."""
@@ -1039,7 +1078,10 @@ class LeaseLedger:
         """Clear lease authority, keeping what is still owed to the server.
 
         The uncounted tallies and the display snapshot survive a drop: the
-        next lease's first renewal still owes the server that report.
+        next lease's first renewal still owes the server that report. The
+        lease id does NOT — so a caller that wants the dropped lease released
+        must build its ``LeaseSurrenderRequest`` BEFORE calling this. Which
+        drops are worth releasing is decided at each call site, never here.
         """
         state.lease_id = None
         state.generation = 0

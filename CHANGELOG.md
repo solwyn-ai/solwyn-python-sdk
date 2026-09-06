@@ -12,13 +12,39 @@ derived from git tags (hatch-vcs).
 Every telemetry event for a lease-funded call now names the budget lease that
 funded it, so Solwyn Cloud counts a call's spend once between its metadata
 landing and its confirmation settling, including when the confirmation is
-lost. The testing double catches up with the live ingest contract's duplicate
-lane, and the surface canary admits the namespaces the September provider SDK
-releases added. Wire-contract changes are API-first: Solwyn Cloud accepts
-`lease_id` before this SDK releases. Ships #81.
+lost. Budget leases are also released early: the SDK hands a lease back the
+moment it stops using it — a run scope that exits, a renewal answered
+ineligible or denied, an unreadable response, a stopped run — instead of
+leaving the reservation standing until the server's deadline. The testing
+double catches up with the live ingest contract's duplicate lane, and the
+surface canary admits the namespaces the September provider SDK releases added.
+Wire-contract changes are API-first: Solwyn Cloud accepts `lease_id` before
+this SDK releases, and early release adds no new field or route — only new
+calls to the existing surrender endpoint. Ships #81.
 
 ### Added
 
+- **Leases are handed back the moment the SDK stops using them.** A budget lease
+  the SDK drops used to keep its float reserved on the server until the lease
+  deadline (~2 minutes) plus whatever sweep followed — money nobody could spend,
+  and a hard-deny sibling run refused against a counter that still included it.
+  The SDK now surrenders a lease as soon as it knows the authority is dead: a
+  renewal answered ineligible or denied, a lease response whose lease block
+  cannot be read, and a server run-stop directive. It does NOT surrender on a
+  404/409 renewal (there is nothing to release, or a live successor that would
+  refuse it) or on a client-side expiry (the next admission simply re-grants).
+  Every release is sent off the caller's thread and is best-effort: a refusal is
+  a debug log and never retried, and the server's own deadline remains the
+  backstop. A re-grant for the same run is fenced behind the release of the
+  lease it replaces, so the server can never see the replacement before the
+  release of what it replaced.
+- **Run-scope exit surrenders the run's leases.** `with solwyn.run(...)` now
+  ends the reservation it held: leaving the block — including on an exception —
+  and `RunHandle.finish()` release that run's leases, so the budget is back when
+  the run is over instead of at `close()` or the server deadline. `activate()`
+  scopes on a `create_run()` handle deliberately do not release, since a
+  detached identity is re-entered by design. Work that outlives the scope with
+  the run id still bound is unaffected beyond paying one grant on its next call.
 - **`MetadataEvent.lease_id`.** Every telemetry event for a lease-funded call
   now names the budget lease that funded it, the same id its confirm carries,
   on success and error events alike. Solwyn Cloud uses it to keep a call's
@@ -30,6 +56,16 @@ releases added. Wire-contract changes are API-first: Solwyn Cloud accepts
 
 ### Changed
 
+- **A surrender gets 3 seconds and one retry.** Releasing a lease is not a cheap
+  request — the server takes the project lock, drains pending targets, loads the
+  ingested term, runs the release and commits — and the previous 1-second bound
+  timed out under load, leaving the float to expiry. The per-request timeout is
+  now 3 seconds with exactly one retry, and only on a timeout: the route is
+  idempotent, so an attempt that may never have been read is worth repeating,
+  while a refusal is an answer. Transport failures are unchanged (the shared
+  control-plane breaker owns them), and the interpreter-exit budget stays at its
+  own 2 seconds. A `close()` against an unresponsive control plane can now cost
+  up to 3 seconds rather than 1; it still bounds the whole drain, not each lease.
 - **Surface canary admits the September provider SDK namespaces.** openai 3.8
   (`safety.alerts`), anthropic 1.4 (`beta.organization` admin tree,
   `beta.webhooks.parse_unverified`, raw and streaming variants of
@@ -50,6 +86,17 @@ releases added. Wire-contract changes are API-first: Solwyn Cloud accepts
   override-dependencies` relaxes those two pins for lock resolution only; the
   opt-in CrewAI smoke lane is where a real CrewAI-versus-openai-3 break would
   surface. Dev-tooling only; nothing changes for installed packages.
+- **`FakeControlPlane` accepts the releases the API now accepts.** The double's
+  `/budgets/lease/surrender` fence mirrors the live plane: the current
+  generation, OR the predecessor of a *terminal* successor (a response with no
+  lease block — nobody can be using that), and a stopped run's lease is released
+  whatever generation it echoes. A predecessor whose successor is a LIVE lease
+  is still a `lease_generation_conflict`, and an expired or already-released
+  lease still answers `released_tokens: 0`. New read-only
+  `FakeControlPlane.released_leases` tells a release that LANDED from one the
+  fence refused — `lease_surrenders` records what the SDK sent, this records
+  what the plane did with it. Tests that pinned a 409 for the predecessor of a
+  terminal successor must flip to a 200.
 - **`FakeControlPlane` reports ingest dedup skips in `duplicates[]`.** The
   double's `/metadata/ingest` 202 body is now the three-lane shape the live API
   has answered with since 2026-09-01: `{"ingested", "rejected", "duplicates"}`,

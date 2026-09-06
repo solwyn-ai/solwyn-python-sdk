@@ -762,9 +762,15 @@ def test_sync_injected_transport_is_caller_owned_through_settlement_and_surrende
             )
         solwyn.close()
 
+        # The run scope releases its lease as it exits (S2), so the surrender
+        # precedes the confirm this deliberately-slow reporter still holds.
+        # Ordering is not an accounting risk: a confirm landing after the
+        # release settles as excess against a zero baseline, so the durable
+        # total is the same either way. What this test owns is that BOTH still
+        # ride the caller's injected transport.
         confirm_index = recorder.paths.index("/api/v1/budgets/confirm")
         surrender_index = recorder.paths.index("/api/v1/budgets/lease/surrender")
-        assert confirm_index < surrender_index
+        assert surrender_index < confirm_index
         assert transport.close_calls == 0
         assert transport.aclose_calls == 0
         assert transport.closed is False
@@ -801,9 +807,15 @@ async def test_async_injected_transport_is_caller_owned_through_settlement_and_s
             )
         await solwyn.close()
 
+        # The run scope releases its lease as it exits (S2), so the surrender
+        # precedes the confirm this deliberately-slow reporter still holds.
+        # Ordering is not an accounting risk: a confirm landing after the
+        # release settles as excess against a zero baseline, so the durable
+        # total is the same either way. What this test owns is that BOTH still
+        # ride the caller's injected transport.
         confirm_index = recorder.paths.index("/api/v1/budgets/confirm")
         surrender_index = recorder.paths.index("/api/v1/budgets/lease/surrender")
-        assert confirm_index < surrender_index
+        assert surrender_index < confirm_index
         assert transport.close_calls == 0
         assert transport.aclose_calls == 0
         assert transport.closed is False

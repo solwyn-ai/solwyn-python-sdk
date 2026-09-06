@@ -6,7 +6,8 @@ import asyncio
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from threading import Event
+from contextvars import copy_context
+from threading import Event, Thread
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
@@ -15,6 +16,7 @@ import httpx
 import pytest
 
 import solwyn as solwyn_pkg
+from solwyn._token_details import TokenDetails
 from solwyn._types import (
     BudgetMode,
     LeaseGrantRequest,
@@ -1234,9 +1236,16 @@ def test_renewal_rechecks_magic_denials_and_replays_terminal_response(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("terminal_kind", ["deny", "tag", "ineligible"])
-def test_terminal_renewal_advances_generation_and_retains_fenced_surrender(
+def test_terminal_renewal_advances_generation_and_releases_on_the_predecessor(
     terminal_kind: str,
 ) -> None:
+    """A terminal successor keeps the row, and its PREDECESSOR may release it.
+
+    The holder that was told "ineligible" or "denied" still holds generation g
+    and has stopped drawing on it; the successor at g+1 carries no lease block,
+    so nobody can be using it either. Refusing g would strand the float until
+    expiry in exactly the case the SDK reports fastest.
+    """
     plane = FakeControlPlane()
     with httpx.Client(transport=plane.transport) as client:
         grant = _post_grant(client, plane).json()
@@ -1267,7 +1276,7 @@ def test_terminal_renewal_advances_generation_and_retains_fenced_surrender(
             f"{plane.api_url}/api/v1/budgets/lease/renew",
             json=renewal.model_copy(update={"generation": 99}).model_dump(mode="json"),
         )
-        stale_surrender = client.post(
+        predecessor_surrender = client.post(
             f"{plane.api_url}/api/v1/budgets/lease/surrender",
             json=LeaseSurrenderRequest(
                 lease_id=grant["lease_id"],
@@ -1315,11 +1324,78 @@ def test_terminal_renewal_advances_generation_and_retains_fenced_surrender(
     assert changed_predecessor.content == terminal.content
     assert future.status_code == 409
     assert future.json() == generation_conflict
-    assert stale_surrender.status_code == 409
-    assert stale_surrender.json() == generation_conflict
-    assert current_surrender.json()["released_tokens"] > 0
+    # The predecessor of a terminal successor RELEASES...
+    assert predecessor_surrender.status_code == 200
+    assert predecessor_surrender.json()["released_tokens"] > 0
+    assert plane.released_leases == {grant["lease_id"]}
+    # ...and both the current generation and a replay are then idempotent.
+    assert current_surrender.json() == {"released_tokens": 0}
     assert surrender_replay.json() == {"released_tokens": 0}
     assert successor.json()["lease_id"] == "lse_fake2"
+
+
+@pytest.mark.unit
+def test_a_stopped_runs_lease_is_released_whatever_generation_it_echoes() -> None:
+    # The revoked half of the widened fence. A holder can only be surrendering
+    # a stopped run's lease after it learned the stop, and the plane already
+    # wanted the lease gone — so the generation it echoes cannot matter, and
+    # keeping the float to the deadline would punish the holder that told us.
+    plane = FakeControlPlane()
+    with httpx.Client(transport=plane.transport) as client:
+        grant = _post_grant(client, plane).json()
+        plane.stop_run("run-lease")
+        released = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/surrender",
+            json=LeaseSurrenderRequest(
+                lease_id=grant["lease_id"],
+                holder_id="holder-1",
+                generation=99,
+            ).model_dump(mode="json"),
+        )
+        replay = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/surrender",
+            json=LeaseSurrenderRequest(
+                lease_id=grant["lease_id"],
+                holder_id="holder-1",
+                generation=99,
+            ).model_dump(mode="json"),
+        )
+
+    assert released.status_code == 200
+    assert released.json()["released_tokens"] > 0
+    assert replay.json() == {"released_tokens": 0}
+    assert plane.released_leases == {grant["lease_id"]}
+
+
+@pytest.mark.unit
+def test_a_live_successor_still_refuses_its_predecessors_release() -> None:
+    # The pin that must NOT move: a healthy renewal leaves a successor with a
+    # lease block, and that one IS in use — releasing its predecessor would
+    # reclaim authority the holder is still drawing on.
+    plane = FakeControlPlane()
+    with httpx.Client(transport=plane.transport) as client:
+        grant = _post_grant(client, plane).json()
+        renewed = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/renew",
+            json=LeaseRenewRequest(
+                lease_id=grant["lease_id"],
+                holder_id="holder-1",
+                generation=grant["generation"],
+            ).model_dump(mode="json"),
+        )
+        refused = client.post(
+            f"{plane.api_url}/api/v1/budgets/lease/surrender",
+            json=LeaseSurrenderRequest(
+                lease_id=grant["lease_id"],
+                holder_id="holder-1",
+                generation=1,
+            ).model_dump(mode="json"),
+        )
+
+    assert renewed.json()["generation"] == 2
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "lease_generation_conflict"
+    assert plane.released_leases == frozenset()
 
 
 @pytest.mark.unit
@@ -1373,9 +1449,13 @@ def test_terminal_renewal_blocks_regrant_until_expiration() -> None:
     assert changed_grant.json()["detail"]["code"] == "lease_holder_cap_exceeded"
     assert successor.json()["lease_id"] == "lse_fake2"
     assert successor.json()["generation"] == 1
-    assert expired_stale_surrender.status_code == 409
-    assert expired_stale_surrender.json()["detail"]["code"] == "lease_generation_conflict"
+    # Both generations pass the fence now (the successor is terminal); the
+    # EXPIRED status is what answers zero, so a late release still cannot
+    # double-reclaim a float expiry already took back.
+    assert expired_stale_surrender.status_code == 200
+    assert expired_stale_surrender.json() == {"released_tokens": 0}
     assert expired_current_surrender.json() == {"released_tokens": 0}
+    assert plane.released_leases == frozenset()
 
 
 @pytest.mark.unit
@@ -1884,6 +1964,271 @@ async def test_async_transport_parity_for_lease_lifecycle_and_refusal() -> None:
     assert [type(item) for item in plane.lease_grants] == [LeaseGrantRequest]
     assert [type(item) for item in plane.lease_renewals] == [LeaseRenewRequest]
     assert [type(item) for item in plane.lease_surrenders] == [LeaseSurrenderRequest]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("drop", ["ineligible", "denied", "run_stopped"])
+def test_a_terminal_renewal_surrenders_the_dropped_lease_exactly_once(drop: str) -> None:
+    """S1: every renewal answer that ends the lease hands it straight back.
+
+    Exactly ONE release is sent, it names the lease and generation the holder
+    actually held, close() does not send a second — and the plane ACTS on it:
+    the lease is released, not merely recorded. That last part is what the
+    widened fence buys (the predecessor of a terminal successor is accepted,
+    and a stopped run's lease is released whatever generation it echoes).
+    """
+    plane = FakeControlPlane(mode=BudgetMode.HARD_DENY)
+    enforcer = _make_enforcer(plane)
+    granted = _check(enforcer)
+    if drop == "ineligible":
+        plane.lease_eligible = False
+    elif drop == "denied":
+        plane.deny_next(scope="lease", period="monthly")
+    else:
+        plane.stop_run("run-lease")
+    renewal = enforcer._build_renewal(
+        "run-lease",
+        model="gpt-5.5",
+        provider="openai",
+        fallback_providers=[],
+        fallback_models=[],
+    )
+    if renewal is None:
+        pytest.fail("held lease did not produce a renewal request")
+
+    enforcer._renew_lease("run-lease", renewal, ["gpt-5.5"])
+    enforcer.close()
+
+    assert granted.lease_id == "lse_fake1"  # type: ignore[attr-defined]
+    assert enforcer._lease.lease_id_for("run-lease") is None
+    assert [
+        (request.lease_id, request.holder_id, request.generation)
+        for request in plane.lease_surrenders
+    ] == [("lse_fake1", "holder-1", 1)]
+    # It landed: the float is back, not stranded until the lease deadline.
+    assert plane.released_leases == {"lse_fake1"}
+
+
+@pytest.mark.unit
+def test_a_refused_release_is_logged_once_and_never_retried(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A release the fence REFUSES (here: a generation the plane never issued,
+    # the shape of a live successor) is an answer, not a failure to retry.
+    plane = FakeControlPlane()
+    enforcer = _make_enforcer(plane)
+    _check(enforcer)
+    refused = LeaseSurrenderRequest(
+        lease_id="lse_fake1",
+        holder_id="holder-1",
+        generation=99,
+    )
+
+    with caplog.at_level("DEBUG", logger="solwyn.budget"):
+        enforcer._surrender_payloads([refused], time.monotonic() + 5.0)
+    enforcer.close()
+
+    # One attempt for the refused release, then close()'s own for the lease
+    # still held — never a retry of the refusal.
+    assert [request.generation for request in plane.lease_surrenders] == [99, 1]
+    assert plane.released_leases == {"lse_fake1"}
+    failures = [r for r in caplog.records if r.getMessage().startswith("lease.surrender_failed")]
+    assert len(failures) == 1
+    assert failures[0].levelname == "DEBUG"
+
+
+@pytest.mark.unit
+def test_a_trailing_confirm_still_settles_on_the_dropped_lease_id() -> None:
+    # The call was admitted under lse_fake1; its confirm must keep naming it
+    # after the release, so the server settles it against the row it funded
+    # (as excess once the float is gone) instead of charging it in full.
+    plane = FakeControlPlane()
+    enforcer = _make_enforcer(plane)
+    call_id = str(uuid4())
+    admitted = enforcer.check_budget(
+        estimated_input_tokens=10,
+        estimated_output_bound=20,
+        model="gpt-5.5",
+        provider="openai",
+        fallback_providers=[],
+        fallback_models=[],
+        agent_run_id="run-lease",
+        call_id=call_id,
+    )
+    plane.lease_eligible = False
+    renewal = enforcer._build_renewal(
+        "run-lease",
+        model="gpt-5.5",
+        provider="openai",
+        fallback_providers=[],
+        fallback_models=[],
+    )
+    if renewal is None:
+        pytest.fail("held lease did not produce a renewal request")
+    enforcer._renew_lease("run-lease", renewal, ["gpt-5.5"])
+
+    confirm = enforcer.build_confirm_request(
+        model="gpt-5.5",
+        token_details=TokenDetails(input_tokens=8, output_tokens=4),
+        provider="openai",
+        call_id=call_id,
+        lease_id=admitted.lease_id,  # type: ignore[attr-defined]
+        lease_claim_token=admitted.lease_claim_token,  # type: ignore[attr-defined]
+    )
+    enforcer.close()
+
+    assert confirm.lease_id == "lse_fake1"
+    assert len(plane.lease_surrenders) == 1
+
+
+@pytest.mark.unit
+async def test_async_terminal_renewal_surrenders_the_dropped_lease_once() -> None:
+    plane = FakeControlPlane()
+    enforcer = _make_async_enforcer(plane)
+    await _acheck(enforcer)
+    plane.lease_eligible = False
+    renewal = enforcer._build_renewal(
+        "run-lease",
+        model="gpt-5.5",
+        provider="openai",
+        fallback_providers=[],
+        fallback_models=[],
+    )
+    if renewal is None:
+        pytest.fail("held lease did not produce a renewal request")
+
+    await enforcer._renew_lease("run-lease", renewal, ["gpt-5.5"])
+    await enforcer.close()
+
+    assert [(request.lease_id, request.generation) for request in plane.lease_surrenders] == [
+        ("lse_fake1", 1)
+    ]
+
+
+@pytest.mark.unit
+def test_run_scope_exit_surrenders_only_the_run_that_ended() -> None:
+    """S2: when the block ends, the budget it held is back — and no more.
+
+    A nested scope's exit releases the nested run's lease and leaves the
+    outer one drawing; the outer exit releases its own; and close() then has
+    nothing left to release, so no lease is ever handed back twice.
+    """
+    plane = FakeControlPlane(granted_tokens=1_000)
+    wrapped = plane.wrap(_SyncOpenAIStub(), lease_output_bound_default=20)
+
+    with solwyn_pkg.run("outer") as outer_id:
+        wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+        with solwyn_pkg.run("inner") as inner_id:
+            wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+        assert _wait_for(lambda: len(plane.lease_surrenders) == 1)
+        inner_surrender = plane.lease_surrenders[0]
+        wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+    assert _wait_for(lambda: len(plane.lease_surrenders) == 2)
+    wrapped.close()
+
+    leases = {
+        grant.agent_run_id: f"lse_fake{index + 1}" for index, grant in enumerate(plane.lease_grants)
+    }
+    assert leases == {outer_id: "lse_fake1", inner_id: "lse_fake2"}
+    assert inner_surrender.lease_id == "lse_fake2"
+    assert [request.lease_id for request in plane.lease_surrenders] == ["lse_fake2", "lse_fake1"]
+    assert plane.released_leases == {"lse_fake1", "lse_fake2"}
+    # The outer run kept spending on its own lease after the inner one ended.
+    assert len(plane.lease_grants) == 2
+
+
+@pytest.mark.unit
+def test_a_run_scope_leaving_on_an_exception_still_surrenders() -> None:
+    plane = FakeControlPlane(granted_tokens=1_000)
+    wrapped = plane.wrap(_SyncOpenAIStub(), lease_output_bound_default=20)
+
+    with pytest.raises(RuntimeError, match="boom"), solwyn_pkg.run("failing"):
+        wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+        raise RuntimeError("boom")
+    assert _wait_for(lambda: len(plane.lease_surrenders) == 1)
+    wrapped.close()
+
+    assert [request.lease_id for request in plane.lease_surrenders] == ["lse_fake1"]
+
+
+@pytest.mark.unit
+def test_run_handle_finish_surrenders_but_an_activation_exit_does_not() -> None:
+    # A detached identity is re-entered by design: releasing at every
+    # activation would buy one blocking re-grant per binding and nothing else.
+    plane = FakeControlPlane(granted_tokens=1_000)
+    wrapped = plane.wrap(_SyncOpenAIStub(), lease_output_bound_default=20)
+
+    handle = solwyn_pkg.create_run("detached")
+    with handle.activate():
+        wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+    after_activation = list(plane.lease_surrenders)
+    with handle.activate():
+        wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+    handle.finish()
+    assert _wait_for(lambda: len(plane.lease_surrenders) == 1)
+
+    started = solwyn_pkg.start_run("started")
+    wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+    started.finish()
+    assert _wait_for(lambda: len(plane.lease_surrenders) == 2)
+    wrapped.close()
+
+    assert after_activation == []
+    # One grant for the detached identity (re-entered, never released between
+    # activations) and one for the started run.
+    assert [request.lease_id for request in plane.lease_surrenders] == ["lse_fake1", "lse_fake2"]
+
+
+@pytest.mark.unit
+def test_a_call_that_outlives_its_run_scope_pays_one_grant() -> None:
+    # Documented behaviour: work created inside a scope keeps the run id after
+    # the block exits. Its next call finds no lease and pays one blocking
+    # grant — which the fence holds behind the release of the old lease.
+    plane = FakeControlPlane(granted_tokens=1_000)
+    wrapped = plane.wrap(_SyncOpenAIStub(), lease_output_bound_default=20)
+
+    with solwyn_pkg.run("outliving") as run_id:
+        wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+        kept = copy_context()
+    assert _wait_for(lambda: len(plane.lease_surrenders) == 1)
+
+    kept.run(lambda: wrapped.chat.completions.create(model="gpt-5.5", messages=[]))
+    wrapped.close()
+
+    assert [grant.agent_run_id for grant in plane.lease_grants] == [run_id, run_id]
+    assert [request.lease_id for request in plane.lease_surrenders] == ["lse_fake1", "lse_fake2"]
+
+
+@pytest.mark.unit
+async def test_async_run_scope_exit_surrenders_the_runs_lease() -> None:
+    plane = FakeControlPlane(granted_tokens=1_000)
+    wrapped = plane.wrap_async(_AsyncOpenAIStub(), lease_output_bound_default=20)
+
+    async with solwyn_pkg.run("async-scope"):
+        await wrapped.chat.completions.create(model="gpt-5.5", messages=[])
+    assert await _await_for(lambda: len(plane.lease_surrenders) == 1)
+    await wrapped.close()
+
+    assert [request.lease_id for request in plane.lease_surrenders] == ["lse_fake1"]
+
+
+@pytest.mark.unit
+async def test_an_async_holder_parks_a_release_it_cannot_schedule() -> None:
+    # A run scope can end on a plain thread with no loop to schedule on (an
+    # async client driven from synchronous code). The release must not be
+    # silently dropped there: it stays parked and rides close().
+    plane = FakeControlPlane(granted_tokens=1_000)
+    enforcer = _make_async_enforcer(plane)
+    await _acheck(enforcer)
+
+    off_loop = Thread(target=enforcer.surrender_run, args=("run-lease",))
+    off_loop.start()
+    off_loop.join(timeout=5.0)
+    parked = list(enforcer._releases_owed)
+    await enforcer.close()
+
+    assert [(owed.run_id, owed.request.lease_id) for owed in parked] == [("run-lease", "lse_fake1")]
+    assert [request.lease_id for request in plane.lease_surrenders] == ["lse_fake1"]
 
 
 @pytest.mark.unit

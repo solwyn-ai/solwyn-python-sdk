@@ -1462,7 +1462,7 @@ class TestLeaseRunControl:
                     replacement,
                     now=budget_module.time.monotonic(),
                     declared_models=["gpt-5.5"],
-                )
+                )[0]
                 is GrantOutcome.APPLIED
             )
         second_request = base._build_renewal(
@@ -1529,7 +1529,7 @@ class TestLeaseRunControl:
                     ),
                     now=budget_module.time.monotonic(),
                     declared_models=["gpt-5.5"],
-                )
+                )[0]
                 is GrantOutcome.APPLIED
             )
         directed = LeaseGrantResponse.model_validate(
@@ -1750,7 +1750,7 @@ class TestLeaseRunControl:
                     replacement,
                     now=budget_module.time.monotonic(),
                     declared_models=["gpt-5.5"],
-                )
+                )[0]
                 is GrantOutcome.APPLIED
             )
         wrong = LeaseGrantResponse.model_validate(
