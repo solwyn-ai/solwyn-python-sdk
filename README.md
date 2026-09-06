@@ -425,7 +425,7 @@ dispatch behavior and includes provider-chain usage guarantees.
 
 For CI, pin an independently reviewed literal fingerprint. This example is the
 exhaustive strict, unacknowledged fingerprint exercised against
-`openai==2.53.0` by this repository's real-client test:
+`openai==3.8.0` by this repository's real-client test:
 
 ```python
 from openai import OpenAI
@@ -438,11 +438,11 @@ audit_client = Solwyn(
 )
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
-    guarded_namespaces="sha256:38de7d9d718f03bc61f4a24e24f131c1a018434fcb38eb5cb7371290fc72e074",
+    guarded_namespaces="sha256:5e3719923eca6b9b776e98a2e5cfaaed3e9c271b2ed23e07c08dc55071c4f90d",
     tracked="sha256:586f19c33f350871240a3498fbfa255c9759bec35e1285a8fccfeb937ec68148",
-    untracked="sha256:1a3192143f409c0e38edcee32232d411c40706fcddd7a7d729403d67690ffb2c",
+    untracked="sha256:dd84ee3ab68f82cde6f191ff9b41d84ca50835120ff67e7ad083839bca6947a7",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    scoped_escapes="sha256:6808a0f2ac290c9d4d1504b21b1c0ba98267636ced4234416b53533b29bb4073",
+    scoped_escapes="sha256:20e0b7c4bf6e7fda180c8cd0576b8f319a0ce32b7ef424e5fcb68ee8330cd76e",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     unsupported="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     conditional="sha256:ce837f71d1fc97849872c5d0f86b0b1f26e1bc4e46a29c3b1b8004bf4b9bcb77",
@@ -986,6 +986,7 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `timestamp` | `datetime` | When the call completed (UTC) |
 | `agent_run_id` | `str \| None` | Run id from the active `solwyn.run(...)` scope, if any. When omitted, the API creates `_auto-{sdk_instance_id}-{YYYY-MM-DD}` |
 | `agent_run_name` | `str \| None` | Run name passed to `solwyn.run(...)`, if any |
+| `lease_id` | `str \| None` | Id of the budget lease that funded the call: an opaque server-minted token, the same id the call's confirmation carries. Present only on lease-funded calls; omitted for reservation-funded, cached, fail-open, uncounted, and denied calls |
 | `provider_region` | `str \| None` | Cloud region of the serving endpoint (Bedrock — pricing is per model and region); omitted for other providers |
 | `tags` | `object \| None` | Optional explicit customer-supplied tags from `solwyn.run(..., tags=...)` and `solwyn_tags=`. Never inferred from prompts or responses; omitted when empty or unset |
 | `deny_source` | `str \| None` | Structural denial source (`server`, sticky/local enforcement sources, or `aggregate_replay`) |
@@ -1005,7 +1006,7 @@ exact totals or turning an unknown media quantity into zero.
 
 ## Release Compatibility
 
-Wire-contract changes are API-first: Solwyn Cloud must accept new fields and enum values before an SDK release ships them. As of the current release line the Cloud API accepts the full wire contract — the `modality` discriminator, the `media_usage` quantities (image counts, media durations, character counts, and resolution/quality selectors), the image and audio `token_details` buckets, the Bedrock and OpenAI-compatible `provider` values, `provider_region`, bounded `tags`, `service_tier` on budget confirms, `token_details.is_estimated`, 2048-char model identifiers, and per-event ingest dispositions. Optional fields are omitted entirely (never `null`) when unset, so payloads for providers that don't use them are byte-identical to earlier releases.
+Wire-contract changes are API-first: Solwyn Cloud must accept new fields and enum values before an SDK release ships them. As of the current release line the Cloud API accepts the full wire contract — the `modality` discriminator, the `media_usage` quantities (image counts, media durations, character counts, and resolution/quality selectors), the image and audio `token_details` buckets, the Bedrock and OpenAI-compatible `provider` values, `provider_region`, bounded `tags`, `service_tier` on budget confirms, `token_details.is_estimated`, 2048-char model identifiers, `lease_id` on metadata events, and per-event ingest dispositions. Optional fields are omitted entirely (never `null`) when unset, so payloads for providers that don't use them are byte-identical to earlier releases.
 
 ## Requirements
 

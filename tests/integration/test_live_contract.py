@@ -143,7 +143,7 @@ def test_metadata_ingest_accepts_parent_agent_run_id(
 
     response.raise_for_status()
     assert response.status_code == 202
-    assert response.json() == {"ingested": 1, "rejected": []}
+    assert response.json() == {"ingested": 1, "rejected": [], "duplicates": []}
 
 
 @pytest.mark.integration
@@ -187,7 +187,7 @@ def test_local_metadata_ingest_accepts_complete_denial_receipt(api_url: str) -> 
 
     response.raise_for_status()
     assert response.status_code == 202
-    assert response.json() == {"ingested": 1, "rejected": []}
+    assert response.json() == {"ingested": 1, "rejected": [], "duplicates": []}
 
 
 @pytest.fixture(scope="session")

@@ -807,6 +807,30 @@ def _receipt_event(
     )
 
 
+def _lease_tagged_success_event() -> MetadataEvent:
+    """A settled, lease-funded success event exactly as the SDK emits one.
+
+    ``lease_id`` is the funding lease from the admission result — the same id
+    the call's confirm carries. The id is server-minted and opaque; a fresh
+    one here proves the ingest path accepts the FIELD, not any lease state.
+    """
+    return MetadataEvent(
+        model="gpt-5.5",
+        provider=ProviderName.OPENAI,
+        input_tokens=1000,
+        output_tokens=200,
+        token_details=TokenDetails(input_tokens=1000, output_tokens=200),
+        latency_ms=12.5,
+        status=CallStatus.SUCCESS,
+        is_model_fallback=False,
+        sdk_instance_id=uuid.uuid4().hex,
+        timestamp=datetime.now(UTC),
+        agent_run_id=f"contract-lease-{uuid.uuid4().hex[:12]}",
+        call_id=str(uuid.uuid4()),
+        lease_id=f"lse_{uuid.uuid4().hex}",
+    )
+
+
 def _post_receipt(
     http: httpx.Client,
     api_key: str,
@@ -821,18 +845,20 @@ def _post_receipt(
     _require_status(response, 202, context)
     body = _object_json(response, context)
     _require(
-        body == {"ingested": 1, "rejected": []},
+        body == {"ingested": 1, "rejected": [], "duplicates": []},
         f"{context} ingest body drifted: {body!r}",
     )
 
 
 def assert_receipt_ingest_contract(http: httpx.Client, api_key: str) -> None:
-    """Assert that denial receipts and aggregate replays ingest cleanly.
+    """Assert that denial receipts, aggregate replays and lease-tagged events ingest.
 
-    Both events ride the ordinary metadata-ingest path and must be accepted
-    whole: a fully-populated per-call receipt and the coarse aggregate replay
-    the reporter emits for receipts it could not deliver. Every call id is
-    fresh so a live server's ingest dedup can never mask a rejection.
+    All three events ride the ordinary metadata-ingest path and must be
+    accepted whole: a fully-populated per-call receipt, the coarse aggregate
+    replay the reporter emits for receipts it could not deliver, and a
+    lease-funded success event carrying ``lease_id`` (a server that predates
+    the field rejects the whole batch with 422). Every call id is fresh so a
+    live server's ingest dedup can never mask a rejection.
     """
     _post_receipt(
         http,
@@ -849,4 +875,10 @@ def assert_receipt_ingest_contract(http: httpx.Client, api_key: str) -> None:
             receipt_aggregate_count=3,
         ),
         "aggregate replay ingest",
+    )
+    _post_receipt(
+        http,
+        api_key,
+        _lease_tagged_success_event(),
+        "lease-tagged success ingest",
     )

@@ -97,7 +97,7 @@ def test_denial_receipt_is_accepted_and_recorded() -> None:
     response = _ingest(plane, [_receipt_event(), _ordinary_event()])
 
     assert response.status_code == 202
-    assert response.json() == {"ingested": 2, "rejected": []}
+    assert response.json() == {"ingested": 2, "rejected": [], "duplicates": []}
     (receipt,) = plane.denial_receipts
     assert receipt.deny_source == "server"
     assert receipt.deny_reason == "manual_kill"
@@ -187,6 +187,31 @@ def test_reject_ingest_legacy_mode_omits_index() -> None:
 
 
 @pytest.mark.unit
+def test_reject_ingest_never_rejects_a_dedup_skipped_event() -> None:
+    plane = FakeControlPlane()
+    replayed = _receipt_event()
+    _ingest(plane, [replayed])
+
+    # Count mode draws from the fresh events only: the lanes stay disjoint.
+    with plane.reject_ingest(count=1):
+        body = _ingest(plane, [replayed, _receipt_event()]).json()
+
+    assert body["ingested"] == 0
+    assert [entry["reason"] for entry in body["duplicates"]] == ["legacy_key"]
+    assert body["duplicates"][0]["index"] == 0
+    assert len(body["rejected"]) == 1
+    assert body["ingested"] + len(body["rejected"]) + len(body["duplicates"]) == 2
+
+    # Exact mode naming the duplicate is a scenario error, not a double count.
+    with plane.reject_ingest(indices=[0]), pytest.raises(RuntimeError, match="dedup-skipped"):
+        plane.handle(
+            "POST",
+            _INGEST_PATH,
+            [replayed.model_dump(mode="json"), _receipt_event().model_dump(mode="json")],
+        )
+
+
+@pytest.mark.unit
 def test_reject_ingest_malformed_mode_returns_a_non_list_rejected_field() -> None:
     plane = FakeControlPlane()
 
@@ -232,7 +257,7 @@ def test_reject_ingest_window_is_request_bounded_and_scoped_to_ingest() -> None:
         second = _ingest(plane, [_receipt_event()]).json()
 
     assert len(first["rejected"]) == 1
-    assert second == {"ingested": 1, "rejected": []}
+    assert second == {"ingested": 1, "rejected": [], "duplicates": []}
 
 
 @pytest.mark.unit
