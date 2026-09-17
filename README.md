@@ -425,7 +425,7 @@ dispatch behavior and includes provider-chain usage guarantees.
 
 For CI, pin an independently reviewed literal fingerprint. This example is the
 exhaustive strict, unacknowledged fingerprint exercised against
-`openai==3.8.0` by this repository's real-client test:
+`openai==3.14.1` by this repository's real-client test:
 
 ```python
 from openai import OpenAI
@@ -438,11 +438,11 @@ audit_client = Solwyn(
 )
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
-    guarded_namespaces="sha256:5e3719923eca6b9b776e98a2e5cfaaed3e9c271b2ed23e07c08dc55071c4f90d",
+    guarded_namespaces="sha256:5ac4f04a338bb46ce45b15d6a0467aa49ce3540ddf0ea4f71853aca918680bec",
     tracked="sha256:586f19c33f350871240a3498fbfa255c9759bec35e1285a8fccfeb937ec68148",
-    untracked="sha256:dd84ee3ab68f82cde6f191ff9b41d84ca50835120ff67e7ad083839bca6947a7",
+    untracked="sha256:cbd7671e8d10a9650fc62ee428ddaf9703a1e42dd7e49293b0a2004ea5243569",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    scoped_escapes="sha256:20e0b7c4bf6e7fda180c8cd0576b8f319a0ce32b7ef424e5fcb68ee8330cd76e",
+    scoped_escapes="sha256:3fbbd428c53229ed5fb3dda7301bd7ef706e8e5223b556c77d33827563859673",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     unsupported="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     conditional="sha256:ce837f71d1fc97849872c5d0f86b0b1f26e1bc4e46a29c3b1b8004bf4b9bcb77",

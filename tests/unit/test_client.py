@@ -2867,14 +2867,16 @@ class TestAsyncStreamingInterception:
         scope_tags = {"team": "platform", "env": "prod"}
         call_tags = {"env": "stage", "job": "stream"}
         with patch.object(solwyn._solwyn_budget._http, "post", return_value=mock_budget_response):
-            async with solwyn_pkg.run("orchestrator") as parent_run_id:
-                async with solwyn_pkg.run("nightly", tags=scope_tags) as run_id:
-                    stream = await solwyn.chat.completions.create(
-                        model="gpt-5.5",
-                        messages=[{"role": "user", "content": "Hello"}],
-                        stream=True,
-                        solwyn_tags=call_tags,
-                    )
+            async with (
+                solwyn_pkg.run("orchestrator") as parent_run_id,
+                solwyn_pkg.run("nightly", tags=scope_tags) as run_id,
+            ):
+                stream = await solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "Hello"}],
+                    stream=True,
+                    solwyn_tags=call_tags,
+                )
 
         scope_tags["team"] = "mutated"
         call_tags["job"] = "mutated"
@@ -3395,12 +3397,14 @@ class TestAsyncNonStreamingInterception:
             "check_budget",
             new=AsyncMockFn(return_value=_allow_budget_result()),
         ) as check:
-            async with solwyn_pkg.run("orchestrator") as parent_run_id:
-                async with solwyn_pkg.run("async-nightly-batch") as run_id:
-                    await solwyn.chat.completions.create(
-                        model="gpt-5.5",
-                        messages=[{"role": "user", "content": "Hello"}],
-                    )
+            async with (
+                solwyn_pkg.run("orchestrator") as parent_run_id,
+                solwyn_pkg.run("async-nightly-batch") as run_id,
+            ):
+                await solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "Hello"}],
+                )
 
         assert len(reported_events) == 1
         assert check.call_args.kwargs["agent_run_id"] == run_id
