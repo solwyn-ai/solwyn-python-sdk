@@ -83,7 +83,7 @@ EXPECTED_CHECK_FIELDS = {
     "failover_directive_version",
     "run_directive_version",
     "price_hints_version",
-    # Legacy-path outage tally (tokens only). Serialized only when non-zero.
+    # Per-call outage uncounted tally (API-first; advisory, never priced).
     "uncounted_calls",
     "uncounted_tokens",
 }

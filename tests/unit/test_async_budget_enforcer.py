@@ -1161,6 +1161,23 @@ class TestAsyncLegacyUncountedTally:
         assert enforcer._uncounted_report_in_flight is None
         await enforcer.close()
 
+    @pytest.mark.parametrize("status", [409, 503], ids=["409-ledger-overflow", "503-not-recorded"])
+    async def test_non_2xx_check_keeps_the_tally(self, status: int) -> None:
+        enforcer = _make_async_enforcer(fail_open=True)
+        enforcer._record_legacy_uncounted(100, None)
+        request = httpx.Request("POST", "https://api.test.solwyn.ai/api/v1/budgets/check")
+        enforcer._http.post = AsyncMock(
+            return_value=httpx.Response(status, json={"detail": "refused"}, request=request)
+        )
+
+        await enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
+
+        body = enforcer._http.post.call_args.kwargs["json"]
+        assert (body["uncounted_calls"], body["uncounted_tokens"]) == (1, 100)
+        assert enforcer.uncounted_tally() == (2, 105)
+        assert enforcer._uncounted_report_in_flight is None
+        await enforcer.close()
+
     async def test_cancelled_check_keeps_the_tally(self) -> None:
         enforcer = _make_async_enforcer(fail_open=True)
         enforcer._record_legacy_uncounted(100, None)

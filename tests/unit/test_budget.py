@@ -1063,21 +1063,43 @@ class TestLegacyUncountedTally:
         # The failed report is still owed, plus the call this outage just admitted.
         assert enforcer.uncounted_tally() == (2, 105)
 
-    def test_non_2xx_check_keeps_the_tally(self) -> None:
-        enforcer = _make_enforcer(fail_open=True)
+    @pytest.mark.parametrize(
+        ("status", "payload"),
+        [
+            # Core refuses a fold that would overflow its ledger.
+            (409, {"detail": "uncounted tally would overflow the budget ledger"}),
+            # Core could not record the report.
+            (503, {"detail": "uncounted tally could not be recorded"}),
+        ],
+        ids=["409-ledger-overflow", "503-not-recorded"],
+    )
+    def test_non_2xx_check_keeps_the_tally(self, status: int, payload: dict[str, str]) -> None:
+        breaker = MagicMock(spec=CircuitBreaker)
+        breaker.admit.return_value = CircuitBreakerAdmission(allowed=True)
+        enforcer = _make_enforcer(fail_open=True, control_plane_breaker=breaker)
         _outage_check(enforcer, 100)
-        error = httpx.HTTPStatusError(
-            "503",
-            request=httpx.Request("POST", "https://api.test.solwyn.ai/api/v1/budgets/check"),
-            response=httpx.Response(503),
-        )
-        response = MagicMock(spec=httpx.Response)
-        response.raise_for_status.side_effect = error
+        request = httpx.Request("POST", "https://api.test.solwyn.ai/api/v1/budgets/check")
+        breaker.reset_mock()
 
-        with patch.object(enforcer._http, "post", return_value=response):
-            enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
+        with patch.object(
+            enforcer._http,
+            "post",
+            return_value=httpx.Response(status, json=payload, request=request),
+        ) as mock_post:
+            result = enforcer.check_budget(
+                estimated_input_tokens=5, model="gpt-5.5", provider="openai"
+            )
 
+        body = mock_post.call_args.kwargs["json"]
+        assert (body["uncounted_calls"], body["uncounted_tokens"]) == (1, 100)
+        # Not a 2xx: the reported tally is kept, plus the call this admitted.
+        assert result.allowed is True
         assert enforcer.uncounted_tally() == (2, 105)
+        assert enforcer._uncounted_report_in_flight is None
+        # The existing classification applies unchanged: any non-2xx other than
+        # the structured read-only-key 403 is an outage for the breaker.
+        breaker.record_failure.assert_called_once()
+        breaker.record_success.assert_not_called()
 
     def test_unparseable_2xx_keeps_the_tally(self) -> None:
         enforcer = _make_enforcer(fail_open=True)
