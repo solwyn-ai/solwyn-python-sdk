@@ -122,10 +122,10 @@ _RUN_SCOPED_DENIAL_PERIODS = frozenset({"agent_run", "run_stopped"})
 # hour-long outage must stay visible without one warning per call.
 _UNCOUNTED_WARN_INTERVAL_S = 30.0
 
-# 4xx answers to /budgets/check that did NOT fold the uncounted tally, so the
+# 4xx answers to /budgets/check that did NOT record the uncounted tally, so the
 # report stays owed: 408/429 are answered before the route body runs (request
-# timeout, the budget-plane rate limiter), and 409 refuses a fold that would
-# overflow the ledger.
+# timeout, the budget-plane rate limiter), and 409 is a refusal that did not
+# record the report.
 _UNCOUNTED_KEEP_4XX = frozenset({408, 409, 429})
 
 # Same footgun as the sticky-deny map: a long-lived process must not retain an
@@ -1031,7 +1031,7 @@ class _BudgetEnforcerBase:
         answer that is not a 2xx may still have counted it. The tally is KEPT
         only where the fold demonstrably did not land or cannot be known: a 408
         or 429 (answered before the route body ran — request timeout, or the
-        budget-plane rate limiter), a 409 (the fold would overflow the ledger),
+        budget-plane rate limiter), a 409 (a refusal that did not record the report),
         any 5xx (the report could not be recorded), and a transport error or
         timeout (no answer). Every other HTTP answer — any other 4xx, such as a
         422 for an unknown model, a 404, or an auth failure — clears the

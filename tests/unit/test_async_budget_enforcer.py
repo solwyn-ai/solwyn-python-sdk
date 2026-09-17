@@ -1164,7 +1164,7 @@ class TestAsyncLegacyUncountedTally:
     @pytest.mark.parametrize(
         "status",
         [409, 503, 429, 408],
-        ids=["409-ledger-overflow", "503-not-recorded", "429-rate-limited", "408-timeout"],
+        ids=["409-refused", "503-not-recorded", "429-rate-limited", "408-timeout"],
     )
     async def test_non_2xx_check_keeps_the_tally(self, status: int) -> None:
         enforcer = _make_async_enforcer(fail_open=True)

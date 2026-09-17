@@ -1076,15 +1076,15 @@ class TestLegacyUncountedTally:
     @pytest.mark.parametrize(
         ("status", "payload"),
         [
-            # Core refuses a fold that would overflow its ledger.
-            (409, {"detail": "uncounted tally would overflow the budget ledger"}),
+            # A refusal that did not record the report.
+            (409, {"detail": "conflict"}),
             # Core could not record the report.
             (503, {"detail": "uncounted tally could not be recorded"}),
             # Answered by middleware before the route body (and the fold) ran.
             (429, {"detail": "rate limit exceeded"}),
             (408, {"detail": "request timeout"}),
         ],
-        ids=["409-ledger-overflow", "503-not-recorded", "429-rate-limited", "408-timeout"],
+        ids=["409-refused", "503-not-recorded", "429-rate-limited", "408-timeout"],
     )
     def test_non_2xx_check_keeps_the_tally(self, status: int, payload: dict[str, str]) -> None:
         breaker = MagicMock(spec=CircuitBreaker)
