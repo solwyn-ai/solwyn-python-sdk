@@ -284,15 +284,17 @@ class _BudgetEnforcerBase:
         # call). Every fail-open admission made while the control plane is
         # unreachable adds one call and its input estimate; settlement replaces
         # the estimate with provider-reported usage. The tally rides the next
-        # /budgets/check and is subtracted only once that check is answered.
+        # /budgets/check and is subtracted once Solwyn acknowledges it (see
+        # _uncounted_verdict_for_check_error for what counts as acknowledged).
         self._uncounted_calls = 0
         self._uncounted_tokens = 0
         # call_id -> admission-time estimate still eligible for a true-up.
         self._uncounted_estimates: OrderedDict[str, int] = OrderedDict()
         # The report currently on the wire (at most one), see _UncountedReport.
         self._uncounted_report_in_flight: _UncountedReport | None = None
-        # Rate limit for the fail-closed outage WARNING.
+        # Rate limits for the fail-closed and dropped-report WARNINGs.
         self._fail_closed_warned_at: float | None = None
+        self._uncounted_drop_warned_at: float | None = None
 
         # Last-known budget limit from cloud (survives cache expiry)
         self._last_known_budget_limit: float | None = None
@@ -367,6 +369,7 @@ class _BudgetEnforcerBase:
         self._uncounted_estimates = OrderedDict()
         self._uncounted_report_in_flight = None
         self._fail_closed_warned_at = None
+        self._uncounted_drop_warned_at = None
         self._close_epoch = 0
         self._closed = False
         self._late_renewal_spend = {}
@@ -956,19 +959,24 @@ class _BudgetEnforcerBase:
         token usage to true up against (for example a media call billed per
         unit): the admission-time estimate stays in the tally. As with
         ``true_up(floor_at_reservation=...)``, ``usage_unmeasured`` never lets
-        an unmeasurable call report less than its estimate.
+        an unmeasurable call report less than its estimate. An ALL-ZERO
+        settlement is treated the same way: a stream abandoned before its usage
+        chunk settles with zero tokens, but the provider still billed the
+        prompt, so zero never erases the admission estimate.
 
         The adjustment lands on the running tally even when the estimate has
         already been reported — a positive delta (typically the output tokens)
         rides the next check. A negative delta offsets other pending tallies
-        and is clamped at zero, so the worst case is a conservative overcount.
+        and is clamped at zero, so a late settlement can only OVER-count. That
+        is deliberate: the reported totals stay an upper bound on outage usage,
+        which is the property the Cloud API documents for them.
         """
         with self._state_lock:
             estimate = self._uncounted_estimates.pop(call_id, None)
             if estimate is None or total_tokens is None:
                 return
             actual = max(0, total_tokens)
-            if usage_unmeasured:
+            if usage_unmeasured or actual == 0:
                 actual = max(actual, estimate)
             self._uncounted_tokens = min(
                 SIGNED_BIGINT_MAX, max(0, self._uncounted_tokens + actual - estimate)
@@ -1009,20 +1017,51 @@ class _BudgetEnforcerBase:
             report,
         )
 
+    @staticmethod
+    def _uncounted_verdict_for_check_error(exc: BaseException) -> tuple[bool, int | None]:
+        """Whether a FAILED check still acknowledged its tally: (acknowledged, status).
+
+        The Cloud API folds the tally BEFORE it evaluates the check, so an HTTP
+        answer that is not a 2xx may still have counted it. The tally is KEPT
+        only where the fold demonstrably did not land or cannot be known: a 409
+        (the fold would overflow the ledger), any 5xx (the report could not be
+        recorded), and a transport error or timeout (no answer). Every other
+        HTTP answer — any 4xx but 409, such as a 422 for an unknown model, a
+        404, or an auth failure — clears the report: re-sending a cumulative
+        tally on every probe of a persistently failing check would grow the
+        server's ledger each time, and a server that rejects the fields
+        outright would otherwise pin the tally forever. ``status`` is returned
+        for those drops so the caller can warn. Responses outside 4xx/5xx that
+        still fail ``raise_for_status`` (1xx/3xx) keep the tally.
+        """
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code
+            if 400 <= status < 500 and status != 409:
+                return True, status
+        return False, None
+
     def _finish_uncounted_report(
-        self, report: _UncountedReport | None, *, acknowledged: bool
+        self,
+        report: _UncountedReport | None,
+        *,
+        acknowledged: bool,
+        dropped_status: int | None = None,
     ) -> None:
         """Settle a claimed report: subtract it once acknowledged, else keep it.
 
-        Delivery is AT-LEAST-ONCE by design. The tally is subtracted only after
-        a 2xx whose body parsed — never on a transport failure, a non-2xx, an
-        unreadable body, or a cancelled request — so a server that counted a
-        request whose answer was lost sees the same calls again on the next
-        check. Only what was reported is subtracted: calls tallied while the
-        check was on the wire stay owed.
+        Delivery is AT-LEAST-ONCE by design. The tally is KEPT on a 409, any
+        5xx, a transport error or timeout, and a cancelled request, so a server
+        that counted a request whose answer was lost sees the same calls again.
+        Any 2xx (parsed or not) or other 4xx acknowledges it (see
+        ``_uncounted_verdict_for_check_error``); a check the breaker HELD never
+        claims a report at all. Only what was reported is subtracted: calls
+        tallied while the check was on the wire stay owed. A 4xx that drops a
+        report logs one content-free WARNING, rate-limited like the other
+        outage warnings.
         """
         if report is None:
             return
+        warn = False
         with self._state_lock:
             if self._uncounted_report_in_flight is not report:
                 return
@@ -1031,6 +1070,20 @@ class _BudgetEnforcerBase:
                 return
             self._uncounted_calls = max(0, self._uncounted_calls - report.calls)
             self._uncounted_tokens = max(0, self._uncounted_tokens - report.tokens)
+            if dropped_status is not None:
+                now = time.monotonic()
+                last = self._uncounted_drop_warned_at
+                if last is None or now - last >= _UNCOUNTED_WARN_INTERVAL_S:
+                    self._uncounted_drop_warned_at = now
+                    warn = True
+        if warn:
+            logger.warning(
+                "budget.uncounted_report_dropped: the Cloud API answered status=%d; "
+                "dropped the outage uncounted report (calls=%d, tokens=%d)",
+                dropped_status,
+                report.calls,
+                report.tokens,
+            )
 
     def _build_result_from_response(self, response: BudgetCheckResponse) -> BudgetCheckResult:
         """Convert a cloud API response into a BudgetCheckResult.
@@ -2403,9 +2456,10 @@ class BudgetEnforcer(_BudgetEnforcerBase):
 
         uncounted_report: _UncountedReport | None = None
         uncounted_acknowledged = False
+        uncounted_drop_status: int | None = None
         try:
-            # The legacy outage tally rides this check; it is subtracted only
-            # once the server's answer parses (see _finish_uncounted_report).
+            # The legacy outage tally rides this check; whether an answer
+            # clears it is decided by _uncounted_verdict_for_check_error.
             request, uncounted_report = self._with_uncounted_report(request)
             # ── Phase 1: transport + HTTP status. Failures here are OUTAGE
             # semantics — unchanged from before the split.
@@ -2425,7 +2479,13 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                         headers=self._auth_headers(),
                     )
                 resp.raise_for_status()
+                # The plane answered 2xx: it has folded this request's tally,
+                # whether or not the body below parses.
+                uncounted_acknowledged = True
             except Exception as exc:
+                uncounted_acknowledged, uncounted_drop_status = (
+                    self._uncounted_verdict_for_check_error(exc)
+                )
                 # A read-only-key error means the control plane RESPONDED —
                 # record success. Anything else is an outage: record failure.
                 # Log the exception TYPE only (never a body).
@@ -2458,8 +2518,6 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 return self._build_unreachable_result(
                     estimated_input_tokens, agent_run_id, call_id=call_id
                 )
-            # 2xx and parsed: the server has read this request's tally.
-            uncounted_acknowledged = True
 
             try:
                 cloud_response, cache_response = self._apply_check_run_control(
@@ -2496,9 +2554,17 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             # Cancellation (or any BaseException) bypasses the handlers above;
             # a consumed HALF_OPEN probe slot must be freed or every later
             # recovery probe is refused. No-op once a verdict released it.
-            if breaker is not None:
-                breaker.release_probe(admission)
-            self._finish_uncounted_report(uncounted_report, acknowledged=uncounted_acknowledged)
+            try:
+                if breaker is not None:
+                    breaker.release_probe(admission)
+            finally:
+                # Unconditional: a raise above must never strand the in-flight
+                # marker, or no later check could carry the tally again.
+                self._finish_uncounted_report(
+                    uncounted_report,
+                    acknowledged=uncounted_acknowledged,
+                    dropped_status=uncounted_drop_status,
+                )
 
     # ── lease path ───────────────────────────────────────────────────────
 
@@ -3159,9 +3225,10 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
 
         uncounted_report: _UncountedReport | None = None
         uncounted_acknowledged = False
+        uncounted_drop_status: int | None = None
         try:
-            # The legacy outage tally rides this check; it is subtracted only
-            # once the server's answer parses (see _finish_uncounted_report).
+            # The legacy outage tally rides this check; whether an answer
+            # clears it is decided by _uncounted_verdict_for_check_error.
             request, uncounted_report = self._with_uncounted_report(request)
             # ── Phase 1: transport + HTTP status. Failures here are OUTAGE
             # semantics — unchanged from before the split.
@@ -3181,7 +3248,13 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                         headers=self._auth_headers(),
                     )
                 resp.raise_for_status()
+                # The plane answered 2xx: it has folded this request's tally,
+                # whether or not the body below parses.
+                uncounted_acknowledged = True
             except Exception as exc:
+                uncounted_acknowledged, uncounted_drop_status = (
+                    self._uncounted_verdict_for_check_error(exc)
+                )
                 # A read-only-key error means the control plane RESPONDED —
                 # record success. Anything else is an outage: record failure.
                 # Log the exception TYPE only (never a body).
@@ -3214,8 +3287,6 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 return self._build_unreachable_result(
                     estimated_input_tokens, agent_run_id, call_id=call_id
                 )
-            # 2xx and parsed: the server has read this request's tally.
-            uncounted_acknowledged = True
 
             try:
                 cloud_response, cache_response = self._apply_check_run_control(
@@ -3252,9 +3323,17 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             # Cancellation (or any BaseException) bypasses the handlers above;
             # a consumed HALF_OPEN probe slot must be freed or every later
             # recovery probe is refused. No-op once a verdict released it.
-            if breaker is not None:
-                breaker.release_probe(admission)
-            self._finish_uncounted_report(uncounted_report, acknowledged=uncounted_acknowledged)
+            try:
+                if breaker is not None:
+                    breaker.release_probe(admission)
+            finally:
+                # Unconditional: a raise above must never strand the in-flight
+                # marker, or no later check could carry the tally again.
+                self._finish_uncounted_report(
+                    uncounted_report,
+                    acknowledged=uncounted_acknowledged,
+                    dropped_status=uncounted_drop_status,
+                )
 
     # ── lease path ───────────────────────────────────────────────────────
 

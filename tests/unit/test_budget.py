@@ -975,6 +975,16 @@ class TestLegacyUncountedTally:
 
         assert enforcer.uncounted_tally() == (1, 100)
 
+    def test_all_zero_settlement_never_erases_the_estimate(self) -> None:
+        """An abandoned stream settles with zero tokens; the prompt was still billed."""
+        enforcer = _make_enforcer(fail_open=True)
+        _outage_check(enforcer, 100, "call-a")
+
+        enforcer.settle_uncounted(call_id="call-a", total_tokens=0)
+
+        assert enforcer.uncounted_tally() == (1, 100)
+        assert "call-a" not in enforcer._uncounted_estimates
+
     def test_surface_without_token_usage_keeps_the_estimate(self) -> None:
         enforcer = _make_enforcer(fail_open=True)
         _outage_check(enforcer, 100, "call-a")
@@ -1101,7 +1111,47 @@ class TestLegacyUncountedTally:
         breaker.record_failure.assert_called_once()
         breaker.record_success.assert_not_called()
 
-    def test_unparseable_2xx_keeps_the_tally(self) -> None:
+    @pytest.mark.parametrize(
+        "status",
+        [422, 404, 401],
+        ids=["422-unknown-model", "404", "401"],
+    )
+    def test_4xx_other_than_409_clears_the_report_and_warns_once(
+        self, status: int, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Core folds before it evaluates the check: a 4xx answer already counted
+        the report, so re-sending it on every probe would grow the ledger."""
+        enforcer = _make_enforcer(fail_open=True)
+        _outage_check(enforcer, 100)
+        request = httpx.Request("POST", "https://api.test.solwyn.ai/api/v1/budgets/check")
+
+        with (
+            caplog.at_level("WARNING", logger="solwyn.budget"),
+            patch.object(
+                enforcer._http,
+                "post",
+                return_value=httpx.Response(status, json={"detail": "nope"}, request=request),
+            ) as mock_post,
+        ):
+            enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
+            enforcer._record_legacy_uncounted(7, None)
+            enforcer.check_budget(estimated_input_tokens=3, model="gpt-5.5", provider="openai")
+
+        first_body = mock_post.call_args_list[0].kwargs["json"]
+        assert (first_body["uncounted_calls"], first_body["uncounted_tokens"]) == (1, 100)
+        second_body = mock_post.call_args_list[1].kwargs["json"]
+        # The first report was cleared; only what accrued since was re-sent.
+        assert (second_body["uncounted_calls"], second_body["uncounted_tokens"]) == (2, 12)
+        # ...and this second report was cleared by its own 4xx too, leaving only
+        # the call its fail-open admission tallied.
+        assert enforcer.uncounted_tally() == (1, 3)
+        assert enforcer._uncounted_report_in_flight is None
+        drops = [r for r in caplog.records if "budget.uncounted_report_dropped" in r.getMessage()]
+        assert len(drops) == 1  # rate-limited
+        assert f"status={status}" in drops[0].getMessage()
+        assert "nope" not in drops[0].getMessage()
+
+    def test_unparseable_2xx_clears_the_report(self) -> None:
         enforcer = _make_enforcer(fail_open=True)
         _outage_check(enforcer, 100)
         drifted = MagicMock(spec=httpx.Response)
@@ -1110,7 +1160,57 @@ class TestLegacyUncountedTally:
         with patch.object(enforcer._http, "post", return_value=drifted):
             enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
 
-        assert enforcer.uncounted_tally() == (2, 105)
+        # The 2xx means the plane folded the report; only this call's own
+        # degraded fail-open admission is still owed.
+        assert enforcer.uncounted_tally() == (1, 5)
+        assert enforcer._uncounted_report_in_flight is None
+
+    def test_misrouted_directive_2xx_clears_the_report(self) -> None:
+        """Deliberate: core folds before it answers, even with a drifted directive."""
+        enforcer = _make_legacy_enforcer(fail_open=True)
+        _outage_check(enforcer, 100)
+        misrouted = _response(
+            {
+                **_STOPPED_RUN_DENY_RESPONSE,
+                "run_control": {
+                    "version": "1",
+                    "action": "terminate",
+                    "agent_run_id": "run-elsewhere",
+                    "reason": "manual_kill",
+                },
+            }
+        )
+
+        with patch.object(enforcer._http, "post", return_value=misrouted) as mock_post:
+            result = enforcer.check_budget(
+                estimated_input_tokens=5,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run-here",
+            )
+
+        assert mock_post.call_args.kwargs["json"]["uncounted_calls"] == 1
+        assert result.allowed is True  # this one call degrades to fail-open
+        assert enforcer.uncounted_tally() == (1, 5)
+        assert enforcer._uncounted_report_in_flight is None
+        assert run_termination("run-here") is None
+
+    def test_report_finishes_even_if_releasing_the_probe_raises(self) -> None:
+        breaker = MagicMock(spec=CircuitBreaker)
+        breaker.admit.return_value = CircuitBreakerAdmission(allowed=True)
+        breaker.release_probe.side_effect = RuntimeError("probe bookkeeping failed")
+        enforcer = _make_enforcer(fail_open=True, control_plane_breaker=breaker)
+        enforcer._record_legacy_uncounted(100, None)
+
+        with (
+            patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("down")),
+            pytest.raises(RuntimeError, match="probe bookkeeping failed"),
+        ):
+            enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
+
+        assert enforcer._uncounted_report_in_flight is None
+        # The tally was kept (transport failure) and a later check carries it.
+        assert enforcer._claim_uncounted_report() is not None
 
     def test_breaker_held_check_keeps_accumulating(self) -> None:
         breaker = MagicMock(spec=CircuitBreaker)

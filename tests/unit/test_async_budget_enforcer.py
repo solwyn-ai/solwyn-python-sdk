@@ -1178,6 +1178,31 @@ class TestAsyncLegacyUncountedTally:
         assert enforcer._uncounted_report_in_flight is None
         await enforcer.close()
 
+    @pytest.mark.parametrize("status", [422, 404], ids=["422-unknown-model", "404"])
+    async def test_4xx_other_than_409_clears_the_report_and_warns(
+        self, status: int, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        enforcer = _make_async_enforcer(fail_open=True)
+        enforcer._record_legacy_uncounted(100, None)
+        request = httpx.Request("POST", "https://api.test.solwyn.ai/api/v1/budgets/check")
+        enforcer._http.post = AsyncMock(
+            return_value=httpx.Response(status, json={"detail": "nope"}, request=request)
+        )
+
+        with caplog.at_level("WARNING", logger="solwyn.budget"):
+            await enforcer.check_budget(
+                estimated_input_tokens=5, model="gpt-5.5", provider="openai"
+            )
+
+        body = enforcer._http.post.call_args.kwargs["json"]
+        assert (body["uncounted_calls"], body["uncounted_tokens"]) == (1, 100)
+        assert enforcer.uncounted_tally() == (1, 5)
+        assert enforcer._uncounted_report_in_flight is None
+        drops = [r for r in caplog.records if "budget.uncounted_report_dropped" in r.getMessage()]
+        assert len(drops) == 1
+        assert f"status={status}" in drops[0].getMessage()
+        await enforcer.close()
+
     async def test_cancelled_check_keeps_the_tally(self) -> None:
         enforcer = _make_async_enforcer(fail_open=True)
         enforcer._record_legacy_uncounted(100, None)

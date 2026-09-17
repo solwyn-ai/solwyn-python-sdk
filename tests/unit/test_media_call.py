@@ -14,6 +14,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from conftest import VALID_API_KEY, VALID_PROJECT_ID
 
@@ -963,3 +964,83 @@ class TestMediaCallAsync:
         client.audio.speech.create.assert_not_called()
         await solwyn._solwyn_budget._http.aclose()
         await solwyn._solwyn_reporter._http.aclose()
+
+
+@pytest.mark.unit
+class TestMediaLegacyOutageTally:
+    """Media settle sites true the legacy outage tally up (or keep the estimate)."""
+
+    def _outage_media_call(self, solwyn: Solwyn, spec: MediaSurfaceSpec, route, **kwargs):
+        with (
+            patch.object(
+                solwyn._solwyn_budget._http,
+                "post",
+                side_effect=httpx.ConnectError("unreachable"),
+            ),
+            patch.object(solwyn._solwyn_reporter, "report_settlement"),
+            patch.object(solwyn._solwyn_reporter, "report"),
+            patch.object(solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", route),
+        ):
+            return solwyn._media_call(spec, **kwargs)
+
+    def test_token_billed_media_trues_estimate_up_to_reported_usage(self) -> None:
+        client, resp = _sync_client()
+        solwyn = _build_sync(client, fail_open=True, lease_enabled=False)
+        budget = solwyn._solwyn_budget
+        seen: dict[str, tuple[int, int]] = {}
+
+        def create(**_kwargs):
+            seen["admitted"] = budget.uncounted_tally()
+            return resp
+
+        client.embeddings.create.side_effect = create
+        try:
+            result = self._outage_media_call(
+                solwyn,
+                _spec(),
+                _route_to_embeddings,
+                model="text-embedding-3-small",
+                input="hello world",
+            )
+
+            assert result is resp
+            assert seen["admitted"][0] == 1
+            # prompt_tokens=42 reported by the provider replaces the estimate.
+            assert budget.uncounted_tally() == (1, 42)
+            assert not budget._uncounted_estimates
+        finally:
+            solwyn._solwyn_reporter._http.close()
+            budget._http.close()
+
+    def test_per_unit_media_keeps_the_admission_estimate(self) -> None:
+        client, _ = _sync_client()
+        image_resp = SimpleNamespace(usage=None)
+        solwyn = _build_sync(client, fail_open=True, lease_enabled=False)
+        budget = solwyn._solwyn_budget
+        seen: dict[str, tuple[int, int]] = {}
+
+        def generate(**_kwargs):
+            seen["admitted"] = budget.uncounted_tally()
+            return image_resp
+
+        client.images.generate.side_effect = generate
+        spec = _media_spec(
+            extract=lambda _r: TokenDetails(input_tokens=3, output_tokens=0),
+            measure_media=lambda _kwargs, _response: MediaUsage(
+                image_count=2, resolution="1024x1024", quality="low"
+            ),
+            estimate_media=lambda _kwargs: MediaUsage(image_count=2, resolution="1024x1024"),
+        )
+        try:
+            self._outage_media_call(
+                solwyn, spec, _route_to_images, model="gpt-image-2", prompt="a cat", n=2
+            )
+
+            assert seen["admitted"][0] == 1
+            # Billed per image: the token count cannot true the call up, so the
+            # admission estimate stands (the slot is still consumed).
+            assert budget.uncounted_tally() == seen["admitted"]
+            assert not budget._uncounted_estimates
+        finally:
+            solwyn._solwyn_reporter._http.close()
+            budget._http.close()

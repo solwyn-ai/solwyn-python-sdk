@@ -4222,6 +4222,39 @@ class TestLegacyOutageTallySettlement:
             solwyn._solwyn_reporter._http.close()
             solwyn._solwyn_budget._http.close()
 
+    def test_abandoned_stream_keeps_the_admission_estimate(self) -> None:
+        client, _ = _mock_openai_client()
+        chunks = [SimpleNamespace(usage=None, choices=[]) for _ in range(4)]
+        inner = _CloseableSyncUsageStream(chunks)
+        client.chat.completions.create.return_value = inner
+        solwyn = _make_solwyn(client, fail_open=True, lease_enabled=False)
+        budget = solwyn._solwyn_budget
+        try:
+            with (
+                patch.object(budget._http, "post", side_effect=httpx.ConnectError("unreachable")),
+                patch.object(solwyn._solwyn_reporter, "report"),
+            ):
+                stream = solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "Hello there, a longer prompt"}],
+                    stream=True,
+                )
+                admitted = budget.uncounted_tally()
+                assert admitted[0] == 1 and admitted[1] > 0
+                assert len(budget._uncounted_estimates) == 1
+
+                next(stream)
+                next(stream)
+                stream.close()  # abandoned before any usage chunk
+
+            # Settlement ran (the true-up slot is consumed) with all-zero usage,
+            # and the tally still carries the admission estimate.
+            assert not budget._uncounted_estimates
+            assert budget.uncounted_tally() == admitted
+        finally:
+            solwyn._solwyn_reporter._http.close()
+            budget._http.close()
+
     def test_fail_closed_denial_carries_tokens_not_cost(self) -> None:
         client, _ = _mock_openai_client()
         solwyn = _make_solwyn(client, fail_open=False, lease_enabled=False)

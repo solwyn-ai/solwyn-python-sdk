@@ -630,10 +630,15 @@ nothing to meter against locally:
 - `fail_open=True` admits the call with a warning and tallies it — one call plus
   its token count — in memory. The count starts as the SDK's length-based input
   estimate and is replaced by the provider-reported total when the call settles
-  (a media call billed per unit keeps its estimate). The tally rides the next
-  `/budgets/check` that reaches Solwyn as `uncounted_calls` / `uncounted_tokens`
-  and is cleared only once that check is answered, so delivery is at-least-once:
-  a check whose answer is lost reports the same calls again.
+  (a media call billed per unit, or a call that settles with zero tokens such as
+  an abandoned stream, keeps its estimate). The tally rides the next
+  `/budgets/check` that reaches Solwyn as `uncounted_calls` / `uncounted_tokens`.
+  A 409, a 5xx, a timeout or a lost connection keeps it for the following check,
+  so delivery is at-least-once. A 2xx or any other 4xx clears it, because Solwyn
+  records the tally before evaluating the check; a 4xx drop logs
+  `budget.uncounted_report_dropped`. The tally only rides `/budgets/check`, so
+  if every later call is lease-funded or served from the allow cache it is never
+  sent, and anything still unsent when the process exits is lost.
 - `fail_open=False` fails closed: the call raises `BudgetExceededError`
   (`deny_source="local_enforcement"`, `deny_reason="control_plane_unreachable"`)
   until Solwyn is reachable again, and the SDK logs

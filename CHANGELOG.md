@@ -15,6 +15,11 @@ it on the next successful budget check. Wire-contract change is API-first:
 Solwyn Cloud accepts `uncounted_calls` / `uncounted_tokens` on
 `/budgets/check` before this SDK releases.
 
+**Deployment order is a hard requirement:** Solwyn Cloud must accept the
+`uncounted_*` fields before this SDK version is deployed. Against a server
+without them, the first check after an outage is rejected with a 4xx and the
+SDK drops that outage's tally rather than re-sending it forever.
+
 ### Changed
 
 - **Behaviour change: `fail_open=False` now fails closed on the legacy path
@@ -32,15 +37,23 @@ Solwyn Cloud accepts `uncounted_calls` / `uncounted_tokens` on
   still take precedence exactly as before.
 - **`fail_open=True` tallies the calls it admits during an outage.** Each
   legacy-path admission adds one call and its input token estimate. When the
-  call settles, the estimate is replaced by the provider-reported total; a
-  media call with no token usage keeps its estimate. The tally is sent on the
-  next `/budgets/check` that reaches Solwyn as `uncounted_calls` /
-  `uncounted_tokens` and cleared only after that check returns a 2xx the SDK
-  can parse. Delivery is at-least-once: a check that fails, times out, is held
-  by the control-plane breaker, or is cancelled keeps the tally for the next
-  one. Both fields are omitted when zero, so a check with nothing to report is
-  byte-identical to before. Lease-path outage tallies are unchanged and still
-  ride lease renewals.
+  call settles, the estimate is replaced by the provider-reported total. A
+  media call with no token usage, and a call that settles with zero tokens
+  (such as a stream abandoned before its usage chunk), keeps its estimate. The
+  tally is sent on the next `/budgets/check` that reaches Solwyn as
+  `uncounted_calls` / `uncounted_tokens`. It is kept for the next check when
+  that check gets a 409, any 5xx, a transport error or timeout, is held by the
+  control-plane breaker, or is cancelled, so delivery is at-least-once. Any
+  other answer clears it: a 2xx (even one the SDK cannot parse), or any 4xx
+  other than 409, because Solwyn records the tally before it evaluates the
+  check. A 4xx that drops a report logs `budget.uncounted_report_dropped` with
+  the status, at most every 30 seconds. Both fields are omitted when zero, so a
+  check with nothing to report is byte-identical to before. The tally only
+  rides `/budgets/check`: a process whose traffic is all lease-funded or served
+  from the allow cache never sends one, and a tally still unsent at process
+  exit is lost (there is no exit flush, so `close()` never waits on a down
+  control plane). Lease-path outage tallies are unchanged and still ride lease
+  renewals.
 - **`BudgetExceededError.estimated_cost` is now `float | None` and is `None`
   for every SDK-raised error.** It is set only from a server-supplied figure,
   and the server supplies none today. The new

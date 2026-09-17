@@ -126,7 +126,7 @@ class SolwynConfig(BaseModel):
 
     # Control-plane breaker: after this many consecutive check/confirm
     # failures against Solwyn's own API, skip the network call and apply the
-    # configured posture (fail_open / local enforcement) instantly for
+    # configured outage posture (fail-open tally / fail-closed) instantly for
     # control_plane_recovery_timeout seconds.
     control_plane_failure_threshold: int = 3
     control_plane_recovery_timeout: float = 30.0
