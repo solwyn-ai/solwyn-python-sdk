@@ -622,6 +622,28 @@ local bound. Uncounted episodes log `lease.uncounted_entry` immediately and
 `lease.uncounted_continuing` at most every 30 seconds. Installing a fresh grant
 ends the episode, so a later outage emits a new entry warning.
 
+Calls that do not ride a lease (non-run traffic, media, `lease_enabled=False`,
+or a run the server keeps on the per-call path) take the legacy per-call check.
+The SDK never estimates cost, so when that check cannot reach Solwyn it has
+nothing to meter against locally:
+
+- `fail_open=True` admits the call with a warning and tallies it — one call plus
+  its token count — in memory. The count starts as the SDK's length-based input
+  estimate and is replaced by the provider-reported total when the call settles
+  (a media call billed per unit keeps its estimate). The tally rides the next
+  `/budgets/check` that reaches Solwyn as `uncounted_calls` / `uncounted_tokens`
+  and is cleared only once that check is answered, so delivery is at-least-once:
+  a check whose answer is lost reports the same calls again.
+- `fail_open=False` fails closed: the call raises `BudgetExceededError`
+  (`deny_source="local_enforcement"`, `deny_reason="control_plane_unreachable"`)
+  until Solwyn is reachable again, and the SDK logs
+  `budget.fail_closed_unreachable` at most every 30 seconds. To keep run-scoped
+  calls metered through an outage instead, use budget leases
+  (`lease_enabled=True`, the default) inside `solwyn.run(...)`.
+
+A prior hard deny, or a stop retained for the run, still wins over both postures
+during an outage.
+
 The global allow cache applies only to eligible legacy/non-run checks; it never
 authorizes one run from another run’s state. Cloud usage reporting remains
 asynchronous, so legacy cached work and the reporter flush interval can still
@@ -861,7 +883,7 @@ def test_denial_fixture(solwyn_control_plane, solwyn_test_client):
 | `api_key` | `SOLWYN_API_KEY` | *required* | Solwyn project API key |
 | `api_url` | `SOLWYN_API_URL` | `https://api.solwyn.ai` | Solwyn API endpoint |
 | `tags` | `SOLWYN_TAGS` | `None` | Default spend tags for intercepted calls; env format is comma-separated `key=value` entries |
-| `fail_open` | `SOLWYN_FAIL_OPEN` | `True` | Allow LLM calls when Solwyn API is unreachable |
+| `fail_open` | `SOLWYN_FAIL_OPEN` | `True` | When Solwyn API is unreachable: `True` allows calls and tallies their tokens for the next successful check; `False` denies calls that no live budget lease covers |
 | `budget_mode` | `SOLWYN_BUDGET_MODE` | `alert_only` | Budget enforcement mode |
 | `budget_check_cache_ttl` | `SOLWYN_BUDGET_CHECK_CACHE_TTL` | `5` | Allow-cache lifetime for eligible legacy/non-run checks |
 | `budget_check_timeout` | `SOLWYN_BUDGET_CHECK_TIMEOUT` | `1.0` | Hot-path control-plane check/grant timeout in seconds |
@@ -941,7 +963,7 @@ All SDK errors inherit from `SolwynError`:
 
 | Exception | Raised when |
 |-----------|-------------|
-| `BudgetExceededError` | Cloud denies a budget check in `hard_deny` mode, or local enforcement denies while Cloud is unreachable and `fail_open=False` |
+| `BudgetExceededError` | Cloud denies a budget check in `hard_deny` mode, or Cloud is unreachable and `fail_open=False` (`deny_reason="control_plane_unreachable"`). Carries `estimated_input_tokens`; `estimated_cost` is `None` because the SDK never estimates cost |
 | `RunStoppedError` | A server/operator stop or a deny-eligible local velocity rule prevents provider dispatch for an agent run |
 | `ProviderUnavailableError` | Circuit breaker is open, or the failover chain is exhausted |
 | `ConfigurationError` | Invalid API key format, invalid `provider=` pin/client pairing, or an untracked call surface (e.g. Bedrock `invoke_model`) |
