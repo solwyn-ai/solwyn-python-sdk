@@ -1,11 +1,11 @@
-"""Budget enforcement with cloud API check and local fallback.
+"""Budget enforcement with cloud API check and an outage posture.
 
 BudgetEnforcer (sync) and AsyncBudgetEnforcer (async) handle pre-call
-budget checks via the Solwyn cloud API, with local enforcement as
-fallback when the cloud is unreachable.
-
-Adapted from solwyn-core CostTracker (Redis -> HTTP cloud API).
-Local in-process dict used as fallback when cloud is unreachable.
+budget checks via the Solwyn cloud API. When the cloud is unreachable, the
+legacy per-call path either admits fail-open (``fail_open=True``) and tallies
+the call's TOKENS for the next successful check to report, or fails closed
+(``fail_open=False``). The SDK never computes cost: pricing is owned by the
+Cloud API, so nothing here multiplies tokens by a price.
 """
 
 from __future__ import annotations
@@ -18,14 +18,13 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Annotated, Literal, cast, get_args
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from solwyn import _run_control
-from solwyn._constants import CALL_ID_MAX_LENGTH, CALL_ID_PATTERN
+from solwyn._constants import CALL_ID_MAX_LENGTH, CALL_ID_PATTERN, SIGNED_BIGINT_MAX
 from solwyn._control_plane_transport import (
     ControlPlaneTransport,
     non_closing_async_transport,
@@ -63,9 +62,6 @@ from solwyn._types import (
     ServiceTier,
 )
 from solwyn.circuit_breaker import CircuitBreaker
-
-# Fallback per-token cost when cloud API is unreachable.
-DEFAULT_COST_PER_TOKEN: float = 0.00003
 
 # Lease endpoints (PJ-2). The grant rides the caller's budget-check timeout;
 # renewals and surrenders never sit on a customer call.
@@ -129,6 +125,21 @@ _UNCOUNTED_WARN_INTERVAL_S = 30.0
 # Same footgun as the sticky-deny map: a long-lived process must not retain an
 # episode clock per run id forever. Evicting one only costs an extra ENTRY line.
 _MAX_UNCOUNTED_EPISODES = 128
+
+# Legacy-path outage tally: per-call admission estimates kept so a settled call
+# can replace its estimate with provider-reported usage. Bounded — an evicted
+# call simply keeps its admission-time estimate in the tally.
+_MAX_UNCOUNTED_TRUE_UPS = 1024
+
+# deny_reason for a legacy-path call refused because the control plane is
+# unreachable under fail_open=False (deny_source stays "local_enforcement").
+_CONTROL_PLANE_UNREACHABLE = "control_plane_unreachable"
+
+_FAIL_CLOSED_WARNING = (
+    "Solwyn is unreachable; denying request (fail_open=False). The SDK does not "
+    "estimate cost locally — set lease_enabled=True to keep run-scoped calls "
+    "metered against a budget lease through an outage"
+)
 
 # The contractual confirm tier values (derived from the ServiceTier literal,
 # never hand-copied). Adapters echo arbitrary bounded strings; only these may
@@ -215,6 +226,19 @@ class _AllowCacheKey:
     modality: str
 
 
+@dataclass(frozen=True, slots=True)
+class _UncountedReport:
+    """The legacy outage tally one ``/budgets/check`` carries, pending its answer.
+
+    Identity matters: only the request that claimed the report may settle it,
+    and only one report is on the wire at a time, so two concurrent checks can
+    never both subtract the same tally.
+    """
+
+    calls: int
+    tokens: int
+
+
 def _str_keyed_hints(response: BudgetCheckResponse) -> dict[str, float] | None:
     """Return the API's provider-relative price hints for routing consumers."""
     if response.price_hints is None:
@@ -225,7 +249,7 @@ def _str_keyed_hints(response: BudgetCheckResponse) -> dict[str, float] | None:
 class _BudgetEnforcerBase:
     """Sans-I/O base class for budget enforcement logic.
 
-    Handles local cost tracking, caching, and request construction.
+    Handles the outage uncounted tally, caching, and request construction.
     Subclasses add the HTTP layer (sync or async).
     """
 
@@ -256,8 +280,19 @@ class _BudgetEnforcerBase:
         # contention cannot occur — the event loop serializes coroutines.
         self._state_lock = threading.Lock()
 
-        # Local cost tracking (fallback when cloud is unreachable)
-        self._local_costs: dict[str, float] = {}
+        # Legacy-path outage tally (tokens only — the SDK never prices a
+        # call). Every fail-open admission made while the control plane is
+        # unreachable adds one call and its input estimate; settlement replaces
+        # the estimate with provider-reported usage. The tally rides the next
+        # /budgets/check and is subtracted only once that check is answered.
+        self._uncounted_calls = 0
+        self._uncounted_tokens = 0
+        # call_id -> admission-time estimate still eligible for a true-up.
+        self._uncounted_estimates: OrderedDict[str, int] = OrderedDict()
+        # The report currently on the wire (at most one), see _UncountedReport.
+        self._uncounted_report_in_flight: _UncountedReport | None = None
+        # Rate limit for the fail-closed outage WARNING.
+        self._fail_closed_warned_at: float | None = None
 
         # Last-known budget limit from cloud (survives cache expiry)
         self._last_known_budget_limit: float | None = None
@@ -324,6 +359,14 @@ class _BudgetEnforcerBase:
         self._lease.on_fork_reset()
         self._lease_grants_in_flight = set()
         self._uncounted_episodes = OrderedDict()
+        # The parent owns (and will report) its outage tally; a child reporting
+        # the same inherited counts would double them. Same rule as the lease
+        # ledger's ``on_fork_reset``.
+        self._uncounted_calls = 0
+        self._uncounted_tokens = 0
+        self._uncounted_estimates = OrderedDict()
+        self._uncounted_report_in_flight = None
+        self._fail_closed_warned_at = None
         self._close_epoch = 0
         self._closed = False
         self._late_renewal_spend = {}
@@ -427,7 +470,8 @@ class _BudgetEnforcerBase:
         """Cache an allow response. Never cache deny responses.
 
         Always updates the last-known budget limit (from both allow and deny)
-        so that local enforcement can use it when the cloud becomes unreachable.
+        so an outage result (the retained run stop) can report it when the cloud
+        becomes unreachable.
         Scoped checks never read or populate the global allow cache. Run-specific
         hard denials are sticky only for their raw run id; project-period hard
         denials remain global and invalidate a stale global allow. Tag-period
@@ -502,7 +546,7 @@ class _BudgetEnforcerBase:
             # call the customer has already lost.
             # The budget snapshot is response-shaped, not verdict-shaped: a
             # suppressed ALLOW still carries the freshest limit/usage the
-            # server has, and local enforcement entering an outage needs it.
+            # server has, and an outage result entering an outage needs it.
             self._last_known_budget_limit = response.budget_limit
             self._last_known_current_usage = response.current_usage
             self._run_hard_deny_responses.move_to_end(agent_run_id)
@@ -579,7 +623,7 @@ class _BudgetEnforcerBase:
         observed_at: float | None = None,
     ) -> None:
         """Mutate cache state while the caller holds ``_state_lock``."""
-        # Always remember the limit for local enforcement fallback
+        # Always remember the limit for outage results (retained run stop)
         self._last_known_budget_limit = response.budget_limit
         self._last_known_current_usage = response.current_usage
 
@@ -849,34 +893,144 @@ class _BudgetEnforcerBase:
         )
 
     def _build_unreachable_result(
-        self, estimated_input_tokens: int, agent_run_id: str | None
+        self,
+        estimated_input_tokens: int,
+        agent_run_id: str | None,
+        *,
+        call_id: str | None = None,
+        tally_uncounted: bool = True,
     ) -> BudgetCheckResult:
-        """Posture when the control plane is unreachable (or breaker-open)."""
+        """Posture when the control plane is unreachable (or breaker-open).
+
+        Precedence: a sticky prior hard deny or a retained run stop always
+        wins; then ``fail_open=True`` admits (tallying the call for the next
+        successful check) and ``fail_open=False`` denies.
+
+        ``tally_uncounted=False`` is for the LEASE path's cold start, which
+        tallies the call on the run's lease ledger instead — counting it here
+        too would report it twice.
+        """
         prior_hard_deny = self._build_prior_hard_deny_unavailable_result(agent_run_id)
         if prior_hard_deny is not None:
             return prior_hard_deny
         if self.fail_open:
-            return self._build_fail_open_result(estimated_input_tokens)
-        return self._build_local_enforcement_result(estimated_input_tokens)
+            if tally_uncounted:
+                self._record_legacy_uncounted(estimated_input_tokens, call_id)
+            return self._build_fail_open_result()
+        return self._build_fail_closed_result()
 
-    def _track_local_cost(self, cost: float) -> None:
-        """Track a cost in the local fallback dict."""
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
-        with self._state_lock:
-            self._local_costs[today] = self._local_costs.get(today, 0.0) + cost
+    # ── legacy-path outage tally (sans-I/O) ─────────────────────────────
 
-    def _get_local_remaining(self, budget_limit: float) -> float:
-        """Get remaining budget from local tracking."""
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
-        with self._state_lock:
-            current = self._local_costs.get(today, 0.0)
-        return max(0.0, budget_limit - current)
+    def _record_legacy_uncounted(self, estimated_input_tokens: int, call_id: str | None) -> None:
+        """Tally one legacy fail-open admission that no counter covers.
 
-    def _get_local_current(self) -> float:
-        """Get current local spend for today."""
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        Mirrors the lease ledger's ``record_uncounted``: one call plus its
+        admission-time token estimate. A caller-supplied ``call_id`` keeps the
+        estimate addressable so settlement can replace it with actual usage;
+        without one (or once evicted from the bounded map) the estimate stands.
+        """
+        tokens = max(0, estimated_input_tokens)
         with self._state_lock:
-            return self._local_costs.get(today, 0.0)
+            self._uncounted_calls = min(SIGNED_BIGINT_MAX, self._uncounted_calls + 1)
+            self._uncounted_tokens = min(SIGNED_BIGINT_MAX, self._uncounted_tokens + tokens)
+            if call_id is None:
+                return
+            self._uncounted_estimates[call_id] = tokens
+            self._uncounted_estimates.move_to_end(call_id)
+            while len(self._uncounted_estimates) > _MAX_UNCOUNTED_TRUE_UPS:
+                self._uncounted_estimates.popitem(last=False)
+
+    def settle_uncounted(
+        self,
+        *,
+        call_id: str,
+        total_tokens: int | None,
+        usage_unmeasured: bool = False,
+    ) -> None:
+        """True a legacy fail-open admission's estimate up to its actual usage.
+
+        The legacy twin of the lease reservation true-up, for a call that
+        settled with no reservation or lease to confirm against. A no-op for
+        any call the tally does not track, so settlement sites may call it for
+        every unkeyed call. ``total_tokens=None`` means the surface reported no
+        token usage to true up against (for example a media call billed per
+        unit): the admission-time estimate stays in the tally. As with
+        ``true_up(floor_at_reservation=...)``, ``usage_unmeasured`` never lets
+        an unmeasurable call report less than its estimate.
+
+        The adjustment lands on the running tally even when the estimate has
+        already been reported — a positive delta (typically the output tokens)
+        rides the next check. A negative delta offsets other pending tallies
+        and is clamped at zero, so the worst case is a conservative overcount.
+        """
+        with self._state_lock:
+            estimate = self._uncounted_estimates.pop(call_id, None)
+            if estimate is None or total_tokens is None:
+                return
+            actual = max(0, total_tokens)
+            if usage_unmeasured:
+                actual = max(actual, estimate)
+            self._uncounted_tokens = min(
+                SIGNED_BIGINT_MAX, max(0, self._uncounted_tokens + actual - estimate)
+            )
+
+    def uncounted_tally(self) -> tuple[int, int]:
+        """The legacy outage tally still owed to the server: (calls, tokens)."""
+        with self._state_lock:
+            return self._uncounted_calls, self._uncounted_tokens
+
+    def _claim_uncounted_report(self) -> _UncountedReport | None:
+        """Snapshot the tally for one outgoing check; None when nothing is owed.
+
+        At most one report is on the wire at a time: a concurrent check while
+        one is pending carries nothing new, so an acknowledgement can never
+        subtract a snapshot twice.
+        """
+        with self._state_lock:
+            if self._uncounted_report_in_flight is not None:
+                return None
+            if self._uncounted_calls == 0 and self._uncounted_tokens == 0:
+                return None
+            report = _UncountedReport(calls=self._uncounted_calls, tokens=self._uncounted_tokens)
+            self._uncounted_report_in_flight = report
+            return report
+
+    def _with_uncounted_report(
+        self, request: BudgetCheckRequest
+    ) -> tuple[BudgetCheckRequest, _UncountedReport | None]:
+        """Attach the pending outage tally (if any) to a built check request."""
+        report = self._claim_uncounted_report()
+        if report is None:
+            return request, None
+        return (
+            request.model_copy(
+                update={"uncounted_calls": report.calls, "uncounted_tokens": report.tokens}
+            ),
+            report,
+        )
+
+    def _finish_uncounted_report(
+        self, report: _UncountedReport | None, *, acknowledged: bool
+    ) -> None:
+        """Settle a claimed report: subtract it once acknowledged, else keep it.
+
+        Delivery is AT-LEAST-ONCE by design. The tally is subtracted only after
+        a 2xx whose body parsed — never on a transport failure, a non-2xx, an
+        unreadable body, or a cancelled request — so a server that counted a
+        request whose answer was lost sees the same calls again on the next
+        check. Only what was reported is subtracted: calls tallied while the
+        check was on the wire stay owed.
+        """
+        if report is None:
+            return
+        with self._state_lock:
+            if self._uncounted_report_in_flight is not report:
+                return
+            self._uncounted_report_in_flight = None
+            if not acknowledged:
+                return
+            self._uncounted_calls = max(0, self._uncounted_calls - report.calls)
+            self._uncounted_tokens = max(0, self._uncounted_tokens - report.tokens)
 
     def _build_result_from_response(self, response: BudgetCheckResponse) -> BudgetCheckResult:
         """Convert a cloud API response into a BudgetCheckResult.
@@ -955,9 +1109,8 @@ class _BudgetEnforcerBase:
             failover_tuning_allowed=failover_tuning_allowed,
         )
 
-    def _build_fail_open_result(self, estimated_input_tokens: int) -> BudgetCheckResult:
+    def _build_fail_open_result(self) -> BudgetCheckResult:
         """Build a fail-open result when the cloud is unreachable."""
-        self._track_local_cost(DEFAULT_COST_PER_TOKEN * estimated_input_tokens)
         return BudgetCheckResult(
             allowed=True,
             remaining_budget=0.0,
@@ -965,59 +1118,31 @@ class _BudgetEnforcerBase:
             warning="Cloud API unreachable; proceeding in fail-open mode",
         )
 
-    def _build_local_enforcement_result(
-        self,
-        estimated_input_tokens: int,
-    ) -> BudgetCheckResult:
-        """Enforce budget locally when cloud is unreachable and fail_open=False.
+    def _build_fail_closed_result(self) -> BudgetCheckResult:
+        """Deny when the cloud is unreachable and ``fail_open=False``.
 
-        Uses the last-known budget limit from the most recent cloud response.
-        If the cloud has never been reached, denies the request (fail-closed)
-        since we have no limit to enforce against.
+        The SDK holds no pricing, so it cannot meter spend against a dollar
+        limit on its own: without the control plane there is nothing to admit
+        against. ``deny_source`` stays ``"local_enforcement"`` for existing
+        consumers. Run-scoped traffic that must stay metered through an outage
+        belongs on the lease path (``lease_enabled=True``). The WARNING is
+        rate-limited so an hour-long outage does not log once per call.
         """
-        # Use last-known limit from cloud, or deny if we've never heard from cloud
-        if self._last_known_budget_limit is None:
-            return BudgetCheckResult(
-                allowed=False,
-                remaining_budget=0.0,
-                mode=self.budget_mode,
-                warning=(
-                    "Cloud unreachable and no prior budget limit known; "
-                    "denying request (fail-closed)"
-                ),
-                deny_source="local_enforcement",
-                deny_reason="no_prior_budget_limit",
-            )
-
-        limit = self._last_known_budget_limit
-        current = self._get_local_current()
-        remaining = max(0.0, limit - current)
-        estimated_cost = DEFAULT_COST_PER_TOKEN * estimated_input_tokens
-
-        if current + estimated_cost > limit:
-            return BudgetCheckResult(
-                allowed=False,
-                remaining_budget=remaining,
-                mode=self.budget_mode,
-                warning=(
-                    f"Cloud unreachable; local enforcement denies: "
-                    f"${current:.2f} + ${estimated_cost:.2f} > ${limit:.2f}"
-                ),
-                budget_limit=limit,
-                current_usage=current,
-                deny_source="local_enforcement",
-                deny_reason="local_budget_exceeded",
-            )
-
-        # Within local limit
-        self._track_local_cost(estimated_cost)
+        now = time.monotonic()
+        with self._state_lock:
+            last = self._fail_closed_warned_at
+            should_warn = last is None or now - last >= _UNCOUNTED_WARN_INTERVAL_S
+            if should_warn:
+                self._fail_closed_warned_at = now
+        if should_warn:
+            logger.warning("budget.fail_closed_unreachable: %s", _FAIL_CLOSED_WARNING)
         return BudgetCheckResult(
-            allowed=True,
-            remaining_budget=max(0.0, limit - current - estimated_cost),
+            allowed=False,
+            remaining_budget=0.0,
             mode=self.budget_mode,
-            warning="Cloud API unreachable; enforcing locally",
-            budget_limit=limit,
-            current_usage=current + estimated_cost,
+            warning=_FAIL_CLOSED_WARNING,
+            deny_source="local_enforcement",
+            deny_reason=_CONTROL_PLANE_UNREACHABLE,
         )
 
     # ── lease admission (sans-I/O halves; the HTTP lives on the subclasses) ──
@@ -1445,6 +1570,7 @@ class _BudgetEnforcerBase:
             return self._build_unreachable_result(
                 estimated_input_tokens,
                 agent_run_id,
+                tally_uncounted=False,
             ).model_copy(update={"lease_claim_token": admission.claim_token})
         if admission.decision is LeaseDecision.ADMIT_UNCOUNTED:
             self._note_uncounted_admission(
@@ -1511,9 +1637,14 @@ class _BudgetEnforcerBase:
 
         Safe to call for any call id: a call that never drew on lease authority
         (legacy reservation, non-run traffic, uncounted admit) is a no-op.
+
+        A legacy fail-open admission that will never settle keeps its
+        admission-time estimate in the outage tally (the call may still have
+        been billed); only its true-up slot is freed.
         """
         with self._state_lock:
             self._lease.release(call_id, claim_token=lease_claim_token)
+            self._uncounted_estimates.pop(call_id, None)
 
     def lease_surrender_payloads(self) -> list[LeaseSurrenderRequest]:
         """Drain every held lease into surrender payloads (best-effort release).
@@ -2062,8 +2193,8 @@ class _BudgetEnforcerBase:
 class BudgetEnforcer(_BudgetEnforcerBase):
     """Synchronous budget enforcer using httpx.Client.
 
-    Checks the Solwyn cloud API before each LLM call.
-    Falls back to local enforcement when the cloud is unreachable.
+    Checks the Solwyn cloud API before each LLM call. When the cloud is
+    unreachable it admits fail-open (tallying the call) or fails closed.
     """
 
     def __init__(
@@ -2175,8 +2306,10 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         - Cloud reachable + denied + alert_only: return allowed=True + warning
         - Cloud reachable + denied + hard_deny: return allowed=False
         - Cloud unreachable after hard_deny: return allowed=False
-        - Cloud unreachable + fail_open=True: return allowed=True + warning
-        - Cloud unreachable + fail_open=False: enforce locally
+        - Cloud unreachable + fail_open=True: return allowed=True + warning,
+          and tally the call (tokens only) for the next successful check
+        - Cloud unreachable + fail_open=False: return allowed=False
+          (deny_source="local_enforcement", deny_reason="control_plane_unreachable")
         """
         lease_call_id: str | None = None
         lease_claim_token: int | None = None
@@ -2252,7 +2385,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             )
             if leased is not None:
                 return leased
-            return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
+            return self._build_unreachable_result(
+                estimated_input_tokens, agent_run_id, call_id=call_id
+            )
 
         request = self._build_check_request(
             estimated_input_tokens,
@@ -2266,7 +2401,12 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             tags,
         )
 
+        uncounted_report: _UncountedReport | None = None
+        uncounted_acknowledged = False
         try:
+            # The legacy outage tally rides this check; it is subtracted only
+            # once the server's answer parses (see _finish_uncounted_report).
+            request, uncounted_report = self._with_uncounted_report(request)
             # ── Phase 1: transport + HTTP status. Failures here are OUTAGE
             # semantics — unchanged from before the split.
             try:
@@ -2296,7 +2436,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     if breaker is not None:
                         breaker.record_failure()
                     logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
-                return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
+                return self._build_unreachable_result(
+                    estimated_input_tokens, agent_run_id, call_id=call_id
+                )
 
             # ── Phase 2: response processing (R6). The plane RESPONDED 2xx;
             # a body we cannot parse is server contract drift, NOT an outage:
@@ -2313,7 +2455,11 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     type(exc).__name__,
                     self.fail_open,
                 )
-                return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
+                return self._build_unreachable_result(
+                    estimated_input_tokens, agent_run_id, call_id=call_id
+                )
+            # 2xx and parsed: the server has read this request's tally.
+            uncounted_acknowledged = True
 
             try:
                 cloud_response, cache_response = self._apply_check_run_control(
@@ -2333,6 +2479,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 return self._build_unreachable_result(
                     estimated_input_tokens,
                     agent_run_id,
+                    call_id=call_id,
                 )
             if cache_response:
                 cloud_response = self._cache_response(
@@ -2351,6 +2498,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             # recovery probe is refused. No-op once a verdict released it.
             if breaker is not None:
                 breaker.release_probe(admission)
+            self._finish_uncounted_report(uncounted_report, acknowledged=uncounted_acknowledged)
 
     # ── lease path ───────────────────────────────────────────────────────
 
@@ -2414,6 +2562,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 result = self._build_unreachable_result(
                     estimated_input_tokens,
                     agent_run_id,
+                    tally_uncounted=False,
                 ).model_copy(update={"lease_claim_token": admission.claim_token})
                 return result, admission.claim_token
             if verdict != "applied":
@@ -2992,7 +3141,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             )
             if leased is not None:
                 return leased
-            return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
+            return self._build_unreachable_result(
+                estimated_input_tokens, agent_run_id, call_id=call_id
+            )
 
         request = self._build_check_request(
             estimated_input_tokens,
@@ -3006,7 +3157,12 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             tags,
         )
 
+        uncounted_report: _UncountedReport | None = None
+        uncounted_acknowledged = False
         try:
+            # The legacy outage tally rides this check; it is subtracted only
+            # once the server's answer parses (see _finish_uncounted_report).
+            request, uncounted_report = self._with_uncounted_report(request)
             # ── Phase 1: transport + HTTP status. Failures here are OUTAGE
             # semantics — unchanged from before the split.
             try:
@@ -3036,7 +3192,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                     if breaker is not None:
                         breaker.record_failure()
                     logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
-                return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
+                return self._build_unreachable_result(
+                    estimated_input_tokens, agent_run_id, call_id=call_id
+                )
 
             # ── Phase 2: response processing (R6). The plane RESPONDED 2xx;
             # a body we cannot parse is server contract drift, NOT an outage:
@@ -3053,7 +3211,11 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                     type(exc).__name__,
                     self.fail_open,
                 )
-                return self._build_unreachable_result(estimated_input_tokens, agent_run_id)
+                return self._build_unreachable_result(
+                    estimated_input_tokens, agent_run_id, call_id=call_id
+                )
+            # 2xx and parsed: the server has read this request's tally.
+            uncounted_acknowledged = True
 
             try:
                 cloud_response, cache_response = self._apply_check_run_control(
@@ -3073,6 +3235,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 return self._build_unreachable_result(
                     estimated_input_tokens,
                     agent_run_id,
+                    call_id=call_id,
                 )
             if cache_response:
                 cloud_response = self._cache_response(
@@ -3091,6 +3254,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             # recovery probe is refused. No-op once a verdict released it.
             if breaker is not None:
                 breaker.release_probe(admission)
+            self._finish_uncounted_report(uncounted_report, acknowledged=uncounted_acknowledged)
 
     # ── lease path ───────────────────────────────────────────────────────
 
@@ -3147,6 +3311,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 result = self._build_unreachable_result(
                     estimated_input_tokens,
                     agent_run_id,
+                    tally_uncounted=False,
                 ).model_copy(update={"lease_claim_token": admission.claim_token})
                 return result, admission.claim_token
             if verdict != "applied":

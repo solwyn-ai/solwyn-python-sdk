@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -956,7 +957,7 @@ class TestAsyncFailOpenSticky:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_prior_hard_deny_overrides_local_enforcement_when_cloud_unreachable(
+    async def test_prior_hard_deny_overrides_fail_closed_when_cloud_unreachable(
         self,
     ) -> None:
         enforcer = _make_async_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY)
@@ -1102,14 +1103,105 @@ class TestAsyncContractDriftTaxonomy:
 
     @pytest.mark.unit
     @pytest.mark.asyncio
-    async def test_parse_error_with_fail_open_false_enforces_locally(self) -> None:
+    async def test_parse_error_with_fail_open_false_fails_closed(self) -> None:
         enforcer = _make_async_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY)
         with patch.object(enforcer._http, "post", AsyncMock(return_value=self._drifted_response())):
             result = await enforcer.check_budget(
                 estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
-        # No prior cloud contact -> local enforcement fails closed, mirroring
-        # TestLocalEnforcement::test_denies_when_cloud_never_reached.
+        # Mirrors TestFailClosedWhenUnreachable::test_denies_when_cloud_never_reached.
         assert result.allowed is False
+        assert result.deny_reason == "control_plane_unreachable"
         assert result.warning is not None
-        assert "no prior budget limit" in result.warning.lower()
+        assert "unreachable" in result.warning.lower()
+
+
+# ---------------------------------------------------------------------------
+# Legacy-path outage tally + fail-closed posture (async twin)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+class TestAsyncLegacyUncountedTally:
+    async def test_fail_open_tally_rides_next_check_and_resets_after_success(self) -> None:
+        enforcer = _make_async_enforcer(fail_open=True, cache_ttl=0)
+        enforcer._http.post = AsyncMock(side_effect=httpx.ConnectError("unreachable"))
+        admitted = await enforcer.check_budget(
+            estimated_input_tokens=100, model="gpt-5.5", provider="openai", call_id="call-a"
+        )
+        await enforcer.check_budget(estimated_input_tokens=30, model="gpt-5.5", provider="openai")
+        assert admitted.allowed is True
+        assert enforcer.uncounted_tally() == (2, 130)
+
+        enforcer.settle_uncounted(call_id="call-a", total_tokens=220)
+        assert enforcer.uncounted_tally() == (2, 250)
+
+        enforcer._http.post = AsyncMock(return_value=_response(ALLOW_BUDGET_RESPONSE))
+        await enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
+
+        body = enforcer._http.post.call_args.kwargs["json"]
+        assert (body["uncounted_calls"], body["uncounted_tokens"]) == (2, 250)
+        assert enforcer.uncounted_tally() == (0, 0)
+
+        await enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
+        body = enforcer._http.post.call_args.kwargs["json"]
+        assert "uncounted_calls" not in body and "uncounted_tokens" not in body
+        await enforcer.close()
+
+    async def test_failed_check_keeps_the_tally(self) -> None:
+        enforcer = _make_async_enforcer(fail_open=True)
+        enforcer._record_legacy_uncounted(100, None)
+        enforcer._http.post = AsyncMock(side_effect=httpx.ReadTimeout("slow"))
+
+        await enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
+
+        body = enforcer._http.post.call_args.kwargs["json"]
+        assert (body["uncounted_calls"], body["uncounted_tokens"]) == (1, 100)
+        assert enforcer.uncounted_tally() == (2, 105)
+        assert enforcer._uncounted_report_in_flight is None
+        await enforcer.close()
+
+    async def test_cancelled_check_keeps_the_tally(self) -> None:
+        enforcer = _make_async_enforcer(fail_open=True)
+        enforcer._record_legacy_uncounted(100, None)
+        enforcer._http.post = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await enforcer.check_budget(
+                estimated_input_tokens=5, model="gpt-5.5", provider="openai"
+            )
+
+        assert enforcer.uncounted_tally() == (1, 100)
+        assert enforcer._uncounted_report_in_flight is None
+        await enforcer.close()
+
+    async def test_fail_open_false_denies_with_unreachable_reason(self) -> None:
+        enforcer = _make_async_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY)
+        enforcer._http.post = AsyncMock(side_effect=httpx.ConnectError("unreachable"))
+
+        result = await enforcer.check_budget(
+            estimated_input_tokens=5, model="gpt-5.5", provider="openai"
+        )
+
+        assert result.allowed is False
+        assert result.deny_source == "local_enforcement"
+        assert result.deny_reason == "control_plane_unreachable"
+        assert result.warning is not None and "lease_enabled=True" in result.warning
+        assert enforcer.uncounted_tally() == (0, 0)
+        await enforcer.close()
+
+    async def test_sticky_hard_deny_still_wins_during_outage(self) -> None:
+        enforcer = _make_async_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+        enforcer._http.post = AsyncMock(
+            side_effect=[_response(_DENY_RESPONSE), httpx.ConnectError("unreachable")]
+        )
+
+        await enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
+        result = await enforcer.check_budget(
+            estimated_input_tokens=5, model="gpt-5.5", provider="openai"
+        )
+
+        assert result.allowed is False
+        assert result.deny_source == "sticky_replay"
+        assert enforcer.uncounted_tally() == (0, 0)
+        await enforcer.close()

@@ -47,17 +47,26 @@ class BudgetExceededError(SolwynError):
 
     A Cloud denial raises in ``BudgetMode.HARD_DENY`` mode; in ``ALERT_ONLY``
     mode it logs a warning instead. When Cloud is unreachable and
-    ``fail_open=False``, local fail-closed enforcement can also raise while
-    retaining the configured mode, including ``ALERT_ONLY``.
+    ``fail_open=False``, the SDK fails closed and raises while retaining the
+    configured mode, including ``ALERT_ONLY``.
+
+    The SDK never estimates cost: pricing is owned by the Solwyn Cloud API.
+    ``estimated_input_tokens`` is the SDK's length-based token estimate for the
+    blocked request; ``estimated_cost`` is kept for compatibility and is only
+    ever set from a server-supplied figure, so today it is always ``None``.
 
     Attributes:
         project_id: Project identifier resolved by the API, if available.
         budget_limit: The configured spending cap (dollars).
         current_usage: Spending already consumed in the current period.
-        estimated_cost: Estimated cost of the blocked request.
+        estimated_input_tokens: Length-based input token estimate of the
+            blocked request.
+        estimated_cost: Server-supplied cost of the blocked request, or None
+            (the SDK does not estimate cost).
         budget_period: The Cloud denial label when supplied (for example,
             daily, weekly, monthly, agent_run, tag, or run_stopped); unknown
-            for local enforcement or a Cloud response without a label.
+            for an unreachable-control-plane denial or a Cloud response
+            without a label.
         mode: The active budget mode when the error was raised.
     """
 
@@ -67,9 +76,10 @@ class BudgetExceededError(SolwynError):
         project_id: str | None,
         budget_limit: float,
         current_usage: float,
-        estimated_cost: float,
+        estimated_input_tokens: int,
         budget_period: str,
         mode: str,
+        estimated_cost: float | None = None,
     ) -> None:
         project_label = project_id if project_id is not None else "unknown project"
         message = f"Budget exceeded for project {project_label}"
@@ -77,6 +87,7 @@ class BudgetExceededError(SolwynError):
         self.project_id = project_id
         self.budget_limit = budget_limit
         self.current_usage = current_usage
+        self.estimated_input_tokens = estimated_input_tokens
         self.estimated_cost = estimated_cost
         self.budget_period = budget_period
         self.mode = mode
@@ -96,6 +107,7 @@ class BudgetExceededError(SolwynError):
                 project_id=self.project_id,
                 budget_limit=self.budget_limit,
                 current_usage=self.current_usage,
+                estimated_input_tokens=self.estimated_input_tokens,
                 estimated_cost=self.estimated_cost,
                 budget_period=self.budget_period,
                 mode=self.mode,

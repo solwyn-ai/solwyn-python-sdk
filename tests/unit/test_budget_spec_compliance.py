@@ -6,7 +6,7 @@ behaviour matrix or a specific requirement.
 
 These tests would have caught:
 - Bug 1.1: BudgetExceededError constructed with wrong field values
-- Bug 1.2: Local enforcement using hardcoded $100 instead of last-known limit
+- Bug 1.2: an outage posture that invents a budget instead of failing closed
 """
 
 from __future__ import annotations
@@ -135,14 +135,13 @@ class TestDesignDocFailMatrix:
         assert result.allowed is True
         assert result.warning is not None
 
-    def test_hard_deny_cloud_unreachable_enforces_locally_with_last_known_limit(
+    def test_hard_deny_cloud_unreachable_fails_closed_even_with_last_known_limit(
         self,
     ) -> None:
-        """hard_deny + cloud unreachable -> local enforcement using last-known limit.
+        """hard_deny + fail_open=False + cloud unreachable -> deny.
 
-        This is the critical scenario: cloud was reachable, established a $500
-        budget limit, then goes offline.  Local enforcement should use $500,
-        not a hardcoded default.
+        The SDK holds no pricing, so a last-known dollar limit gives it nothing
+        to meter against: once the cloud is gone the legacy path fails closed.
         """
         # Arrange — cache_ttl=0 so Phase 2 doesn't serve from cache
         enforcer = _make_enforcer(budget_mode=BudgetMode.HARD_DENY, fail_open=False, cache_ttl=0)
@@ -162,50 +161,19 @@ class TestDesignDocFailMatrix:
 
         # Phase 2: Cloud goes offline
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("offline")):
-            # Should allow — local spend ($3 from Phase 1 via 100_000 tokens) + $3 < $500
             result = enforcer.check_budget(
                 estimated_input_tokens=100_000, model="gpt-5.5", provider="openai"
             )
-            assert result.allowed is True
-            assert result.budget_limit == 500.0
-
-    def test_hard_deny_cloud_unreachable_denies_when_local_exceeds_last_known(
-        self,
-    ) -> None:
-        """hard_deny + cloud unreachable + local spend > last-known limit -> deny."""
-        # Arrange — cache_ttl=0 so Phase 2 doesn't serve from cache
-        enforcer = _make_enforcer(budget_mode=BudgetMode.HARD_DENY, fail_open=False, cache_ttl=0)
-
-        # Phase 1: Cloud establishes a $50 limit
-        allow_resp = _mock_cloud_response(
-            allowed=True,
-            budget_limit=50.0,
-            current_usage=0.0,
-            remaining=50.0,
-        )
-        with patch.object(enforcer._http, "post", return_value=allow_resp):
-            enforcer.check_budget(estimated_input_tokens=10_000, model="gpt-5.5", provider="openai")
-
-        # Phase 2: Cloud goes offline. Spend locally up to the limit.
-        with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("offline")):
-            # Fill local budget to ~$48.3 (0.30 from Phase 1 + 48.0 here)
-            for _ in range(48):
-                enforcer._track_local_cost(1.0)
-
-            # ~$48.3 + $3.0 (100_000 tokens × $0.00003) = $51.3 > $50.0 -> deny
-            result = enforcer.check_budget(
-                estimated_input_tokens=100_000, model="gpt-5.5", provider="openai"
-            )
-            assert result.allowed is False
-            assert "denies" in result.warning.lower()
+        assert result.allowed is False
+        assert result.deny_source == "local_enforcement"
+        assert result.deny_reason == "control_plane_unreachable"
+        assert result.warning is not None
+        assert "lease_enabled=true" in result.warning.lower()
+        # Nothing was admitted, so nothing is owed to the next check.
+        assert enforcer.uncounted_tally() == (0, 0)
 
     def test_hard_deny_cloud_never_reached_denies_fail_closed(self) -> None:
-        """hard_deny + cloud NEVER reached + no last-known limit -> deny.
-
-        If the SDK has never successfully communicated with the cloud,
-        there's no known budget limit.  In hard_deny mode, this must
-        fail-closed (deny) rather than allow with an arbitrary default.
-        """
+        """hard_deny + cloud NEVER reached -> deny (fail-closed)."""
         # Arrange
         enforcer = _make_enforcer(budget_mode=BudgetMode.HARD_DENY, fail_open=False)
 
@@ -217,7 +185,8 @@ class TestDesignDocFailMatrix:
 
         # Assert
         assert result.allowed is False
-        assert "no prior budget limit" in result.warning.lower()
+        assert result.deny_reason == "control_plane_unreachable"
+        assert "unreachable" in result.warning.lower()
 
 
 # ---------------------------------------------------------------------------

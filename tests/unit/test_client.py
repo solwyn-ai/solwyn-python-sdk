@@ -1110,7 +1110,7 @@ class TestBudgetCheckBeforeCall:
         ("deny_source", "deny_reason", "denied_by_period"),
         [
             ("sticky_replay", "monthly", "monthly"),
-            ("local_enforcement", "no_prior_budget_limit", None),
+            ("local_enforcement", "control_plane_unreachable", None),
             ("lease_exhausted", "lease_share_exhausted", "agent_run"),
         ],
     )
@@ -1300,8 +1300,10 @@ class TestBudgetCheckBeforeCall:
         assert event.latency_ms == 0.0
         assert event.is_model_fallback is False
 
-        # BudgetExceededError.estimated_cost should be non-zero
-        assert exc_info.value.estimated_cost > 0
+        # The error carries the SDK's token estimate; the SDK never prices a call.
+        assert exc_info.value.estimated_input_tokens == event.input_tokens
+        assert exc_info.value.estimated_input_tokens > 0
+        assert exc_info.value.estimated_cost is None
 
         solwyn._solwyn_reporter._http.close()
         solwyn._solwyn_budget._http.close()
@@ -4163,3 +4165,85 @@ async def test_evicted_server_stop_after_allow_does_not_false_stop_async_dispatc
     solwyn._solwyn_budget.release_reservation.assert_not_called()
     await solwyn._solwyn_budget._http.aclose()
     await solwyn._solwyn_reporter._http.aclose()
+
+
+@pytest.mark.unit
+class TestLegacyOutageTallySettlement:
+    """A fail-open admission's tally estimate is trued up by the client's settlement."""
+
+    def test_non_streaming_settlement_replaces_estimate_with_provider_total(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, fail_open=True, lease_enabled=False)
+        try:
+            with (
+                patch.object(
+                    solwyn._solwyn_budget._http,
+                    "post",
+                    side_effect=httpx.ConnectError("unreachable"),
+                ),
+                patch.object(solwyn._solwyn_reporter, "report"),
+            ):
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "Hello"}],
+                )
+
+            # prompt_tokens=100 + completion_tokens=50 from the provider response.
+            assert solwyn._solwyn_budget.uncounted_tally() == (1, 150)
+            assert not solwyn._solwyn_budget._uncounted_estimates
+        finally:
+            solwyn._solwyn_reporter._http.close()
+            solwyn._solwyn_budget._http.close()
+
+    def test_provider_error_keeps_the_admission_estimate(self) -> None:
+        client, _ = _mock_openai_client()
+        client.chat.completions.create.side_effect = ValueError("bad request")
+        solwyn = _make_solwyn(client, fail_open=True, lease_enabled=False)
+        try:
+            with (
+                patch.object(
+                    solwyn._solwyn_budget._http,
+                    "post",
+                    side_effect=httpx.ConnectError("unreachable"),
+                ),
+                patch.object(solwyn._solwyn_reporter, "report"),
+                pytest.raises(ValueError),
+            ):
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "Hello"}],
+                )
+
+            calls, tokens = solwyn._solwyn_budget.uncounted_tally()
+            assert calls == 1
+            assert tokens > 0
+            assert not solwyn._solwyn_budget._uncounted_estimates
+        finally:
+            solwyn._solwyn_reporter._http.close()
+            solwyn._solwyn_budget._http.close()
+
+    def test_fail_closed_denial_carries_tokens_not_cost(self) -> None:
+        client, _ = _mock_openai_client()
+        solwyn = _make_solwyn(client, fail_open=False, lease_enabled=False)
+        try:
+            with (
+                patch.object(
+                    solwyn._solwyn_budget._http,
+                    "post",
+                    side_effect=httpx.ConnectError("unreachable"),
+                ),
+                patch.object(solwyn._solwyn_reporter, "report"),
+                pytest.raises(BudgetExceededError) as exc_info,
+            ):
+                solwyn.chat.completions.create(
+                    model="gpt-5.5",
+                    messages=[{"role": "user", "content": "Hello"}],
+                )
+
+            client.chat.completions.create.assert_not_called()
+            assert exc_info.value.estimated_input_tokens > 0
+            assert exc_info.value.estimated_cost is None
+            assert exc_info.value.budget_period == "unknown"
+        finally:
+            solwyn._solwyn_reporter._http.close()
+            solwyn._solwyn_budget._http.close()

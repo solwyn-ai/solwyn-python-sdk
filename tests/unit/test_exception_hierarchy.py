@@ -99,7 +99,7 @@ def test_budget_exceeded_error_supports_exception_round_trips(
         project_id="proj_" + "a" * 24,
         budget_limit=100.0,
         current_usage=120.0,
-        estimated_cost=5.0,
+        estimated_input_tokens=1_500,
         budget_period="daily",
         mode="hard_deny",
     )
@@ -112,7 +112,8 @@ def test_budget_exceeded_error_supports_exception_round_trips(
     assert restored.project_id == exc.project_id
     assert restored.budget_limit == exc.budget_limit
     assert restored.current_usage == exc.current_usage
-    assert restored.estimated_cost == exc.estimated_cost
+    assert restored.estimated_input_tokens == exc.estimated_input_tokens
+    assert restored.estimated_cost is None
     assert restored.budget_period == exc.budget_period
     assert restored.mode == exc.mode
     assert restored.__notes__ == exc.__notes__
@@ -154,7 +155,7 @@ def test_solwyn_error_catches_all_families() -> None:
                 "project_id": "proj_" + "a" * 24,
                 "budget_limit": 100.0,
                 "current_usage": 120.0,
-                "estimated_cost": 5.0,
+                "estimated_input_tokens": 1_500,
                 "budget_period": "daily",
                 "mode": "hard_deny",
             },
@@ -286,12 +287,45 @@ class TestUntranslatableModelError:
 
 
 @pytest.mark.unit
+def test_budget_exceeded_error_carries_tokens_and_no_sdk_cost_estimate() -> None:
+    exc = BudgetExceededError(
+        project_id=None,
+        budget_limit=0.0,
+        current_usage=0.0,
+        estimated_input_tokens=42,
+        budget_period="unknown",
+        mode="hard_deny",
+    )
+
+    assert exc.estimated_input_tokens == 42
+    assert exc.estimated_cost is None
+
+
+@pytest.mark.unit
+def test_budget_exceeded_error_round_trips_a_server_supplied_cost() -> None:
+    exc = BudgetExceededError(
+        project_id=None,
+        budget_limit=10.0,
+        current_usage=9.0,
+        estimated_input_tokens=42,
+        estimated_cost=1.25,
+        budget_period="daily",
+        mode="hard_deny",
+    )
+
+    restored = _pickle_round_trip(exc)
+
+    assert restored.estimated_cost == 1.25
+    assert restored.estimated_input_tokens == 42
+
+
+@pytest.mark.unit
 def test_budget_exceeded_error_repr_remains_compatible() -> None:
     exc = BudgetExceededError(
         project_id="proj_" + "a" * 24,
         budget_limit=100.0,
         current_usage=120.0,
-        estimated_cost=5.0,
+        estimated_input_tokens=1_500,
         budget_period="daily",
         mode="hard_deny",
     )

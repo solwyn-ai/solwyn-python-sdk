@@ -83,6 +83,9 @@ EXPECTED_CHECK_FIELDS = {
     "failover_directive_version",
     "run_directive_version",
     "price_hints_version",
+    # Legacy-path outage tally (tokens only). Serialized only when non-zero.
+    "uncounted_calls",
+    "uncounted_tokens",
 }
 
 # Optional check fields the None-skipping serializer drops when unset. Runtime
@@ -95,6 +98,9 @@ _NONE_SKIPPED_CHECK_FIELDS = {
     "failover_directive_version",
     "run_directive_version",
     "price_hints_version",
+    # Zero-valued outage tally counters are omitted too (not None, but unset).
+    "uncounted_calls",
+    "uncounted_tokens",
 }
 
 EXPECTED_CHECK_RESPONSE_FIELDS = {
@@ -503,6 +509,57 @@ class TestWireModelDumpSnapshots:
             "fallback_models": ["claude-x"],
         }
 
+    def test_budget_check_request_uncounted_tally_serializes_only_when_nonzero(self) -> None:
+        base = BudgetCheckRequest(
+            estimated_input_tokens=10,
+            model="gpt-5.5",
+            provider=ProviderName.OPENAI,
+        )
+        zero = base.model_copy(update={"uncounted_calls": 0, "uncounted_tokens": 0})
+        assert zero.model_dump_json() == base.model_dump_json()
+        assert "uncounted" not in base.model_dump_json()
+
+        tallied = BudgetCheckRequest(
+            estimated_input_tokens=10,
+            model="gpt-5.5",
+            provider=ProviderName.OPENAI,
+            uncounted_calls=3,
+            uncounted_tokens=1_250,
+        )
+        assert tallied.model_dump(mode="json") == {
+            "estimated_input_tokens": 10,
+            "model": "gpt-5.5",
+            "provider": "openai",
+            "modality": "text",
+            "fallback_providers": [],
+            "fallback_models": [],
+            "uncounted_calls": 3,
+            "uncounted_tokens": 1_250,
+        }
+        # Tokens may be zero while calls are owed (and vice versa): each counter
+        # is omitted independently.
+        calls_only = base.model_copy(update={"uncounted_calls": 2})
+        assert calls_only.model_dump(mode="json")["uncounted_calls"] == 2
+        assert "uncounted_tokens" not in calls_only.model_dump(mode="json")
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("uncounted_calls", -1),
+            ("uncounted_tokens", -1),
+            ("uncounted_calls", (1 << 63)),
+            ("uncounted_tokens", (1 << 63)),
+        ],
+    )
+    def test_budget_check_request_uncounted_tally_bounds(self, field: str, value: int) -> None:
+        with pytest.raises(ValidationError):
+            BudgetCheckRequest(
+                estimated_input_tokens=10,
+                model="gpt-5.5",
+                provider=ProviderName.OPENAI,
+                **{field: value},  # type: ignore[arg-type]
+            )
+
     def test_breaker_state_report_dump_keys(self) -> None:
         report = BreakerStateReport(
             provider="openai",
@@ -569,6 +626,8 @@ class TestWireModelDumpSnapshots:
             "failover_directive_version",
             "run_directive_version",
             "price_hints_version",
+            "uncounted_calls",
+            "uncounted_tokens",
         }
         assert dumped["agent_run_id"] == "run_abc"
 
@@ -633,6 +692,8 @@ class TestWireModelDumpSnapshots:
             "failover_directive_version",
             "run_directive_version",
             "price_hints_version",
+            "uncounted_calls",
+            "uncounted_tokens",
         }
         assert dumped["estimated_media"]["image_count"] == 2
         assert dumped["modality"] == "image"
