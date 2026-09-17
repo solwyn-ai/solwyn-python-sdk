@@ -633,8 +633,8 @@ nothing to meter against locally:
   (a media call billed per unit, or a call that settles with zero tokens such as
   an abandoned stream, keeps its estimate). The tally rides the next
   `/budgets/check` that reaches Solwyn as `uncounted_calls` / `uncounted_tokens`.
-  A 409, a 5xx, a timeout or a lost connection keeps it for the following check,
-  so delivery is at-least-once. A 2xx or any other 4xx clears it, because Solwyn
+  A 408, 409 or 429, a 5xx, a timeout or a lost connection keeps it for the
+  following check, so delivery is at-least-once. A 2xx or any other 4xx clears it, because Solwyn
   records the tally before evaluating the check; a 4xx drop logs
   `budget.uncounted_report_dropped`. The tally only rides `/budgets/check`, so
   if every later call is lease-funded or served from the allow cache it is never

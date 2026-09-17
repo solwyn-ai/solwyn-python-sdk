@@ -1080,8 +1080,11 @@ class TestLegacyUncountedTally:
             (409, {"detail": "uncounted tally would overflow the budget ledger"}),
             # Core could not record the report.
             (503, {"detail": "uncounted tally could not be recorded"}),
+            # Answered by middleware before the route body (and the fold) ran.
+            (429, {"detail": "rate limit exceeded"}),
+            (408, {"detail": "request timeout"}),
         ],
-        ids=["409-ledger-overflow", "503-not-recorded"],
+        ids=["409-ledger-overflow", "503-not-recorded", "429-rate-limited", "408-timeout"],
     )
     def test_non_2xx_check_keeps_the_tally(self, status: int, payload: dict[str, str]) -> None:
         breaker = MagicMock(spec=CircuitBreaker)
@@ -1116,7 +1119,7 @@ class TestLegacyUncountedTally:
         [422, 404, 401],
         ids=["422-unknown-model", "404", "401"],
     )
-    def test_4xx_other_than_409_clears_the_report_and_warns_once(
+    def test_folding_4xx_clears_the_report_and_warns_once(
         self, status: int, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Core folds before it evaluates the check: a 4xx answer already counted

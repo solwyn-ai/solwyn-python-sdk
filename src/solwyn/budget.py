@@ -122,6 +122,12 @@ _RUN_SCOPED_DENIAL_PERIODS = frozenset({"agent_run", "run_stopped"})
 # hour-long outage must stay visible without one warning per call.
 _UNCOUNTED_WARN_INTERVAL_S = 30.0
 
+# 4xx answers to /budgets/check that did NOT fold the uncounted tally, so the
+# report stays owed: 408/429 are answered before the route body runs (request
+# timeout, the budget-plane rate limiter), and 409 refuses a fold that would
+# overflow the ledger.
+_UNCOUNTED_KEEP_4XX = frozenset({408, 409, 429})
+
 # Same footgun as the sticky-deny map: a long-lived process must not retain an
 # episode clock per run id forever. Evicting one only costs an extra ENTRY line.
 _MAX_UNCOUNTED_EPISODES = 128
@@ -1023,20 +1029,21 @@ class _BudgetEnforcerBase:
 
         The Cloud API folds the tally BEFORE it evaluates the check, so an HTTP
         answer that is not a 2xx may still have counted it. The tally is KEPT
-        only where the fold demonstrably did not land or cannot be known: a 409
-        (the fold would overflow the ledger), any 5xx (the report could not be
-        recorded), and a transport error or timeout (no answer). Every other
-        HTTP answer — any 4xx but 409, such as a 422 for an unknown model, a
-        404, or an auth failure — clears the report: re-sending a cumulative
-        tally on every probe of a persistently failing check would grow the
-        server's ledger each time, and a server that rejects the fields
+        only where the fold demonstrably did not land or cannot be known: a 408
+        or 429 (answered before the route body ran — request timeout, or the
+        budget-plane rate limiter), a 409 (the fold would overflow the ledger),
+        any 5xx (the report could not be recorded), and a transport error or
+        timeout (no answer). Every other HTTP answer — any other 4xx, such as a
+        422 for an unknown model, a 404, or an auth failure — clears the
+        report: re-sending a cumulative tally on every probe of a persistently
+        failing check would grow the server's ledger each time, and a server that rejects the fields
         outright would otherwise pin the tally forever. ``status`` is returned
         for those drops so the caller can warn. Responses outside 4xx/5xx that
         still fail ``raise_for_status`` (1xx/3xx) keep the tally.
         """
         if isinstance(exc, httpx.HTTPStatusError):
             status = exc.response.status_code
-            if 400 <= status < 500 and status != 409:
+            if 400 <= status < 500 and status not in _UNCOUNTED_KEEP_4XX:
                 return True, status
         return False, None
 
@@ -1049,8 +1056,8 @@ class _BudgetEnforcerBase:
     ) -> None:
         """Settle a claimed report: subtract it once acknowledged, else keep it.
 
-        Delivery is AT-LEAST-ONCE by design. The tally is KEPT on a 409, any
-        5xx, a transport error or timeout, and a cancelled request, so a server
+        Delivery is AT-LEAST-ONCE by design. The tally is KEPT on a 408, 409 or
+        429, any 5xx, a transport error or timeout, and a cancelled request, so a server
         that counted a request whose answer was lost sees the same calls again.
         Any 2xx (parsed or not) or other 4xx acknowledges it (see
         ``_uncounted_verdict_for_check_error``); a check the breaker HELD never

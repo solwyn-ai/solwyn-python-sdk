@@ -42,11 +42,11 @@ SDK drops that outage's tally rather than re-sending it forever.
   (such as a stream abandoned before its usage chunk), keeps its estimate. The
   tally is sent on the next `/budgets/check` that reaches Solwyn as
   `uncounted_calls` / `uncounted_tokens`. It is kept for the next check when
-  that check gets a 409, any 5xx, a transport error or timeout, is held by the
-  control-plane breaker, or is cancelled, so delivery is at-least-once. Any
-  other answer clears it: a 2xx (even one the SDK cannot parse), or any 4xx
-  other than 409, because Solwyn records the tally before it evaluates the
-  check. A 4xx that drops a report logs `budget.uncounted_report_dropped` with
+  that check gets a 408, 409 or 429, any 5xx, a transport error or timeout, is
+  held by the control-plane breaker, or is cancelled, so delivery is
+  at-least-once. Any other answer clears it: a 2xx (even one the SDK cannot
+  parse), or any other 4xx, because Solwyn records the tally before it
+  evaluates the check. A 4xx that drops a report logs `budget.uncounted_report_dropped` with
   the status, at most every 30 seconds. Both fields are omitted when zero, so a
   check with nothing to report is byte-identical to before. The tally only
   rides `/budgets/check`: a process whose traffic is all lease-funded or served

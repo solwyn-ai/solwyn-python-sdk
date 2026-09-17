@@ -1161,7 +1161,11 @@ class TestAsyncLegacyUncountedTally:
         assert enforcer._uncounted_report_in_flight is None
         await enforcer.close()
 
-    @pytest.mark.parametrize("status", [409, 503], ids=["409-ledger-overflow", "503-not-recorded"])
+    @pytest.mark.parametrize(
+        "status",
+        [409, 503, 429, 408],
+        ids=["409-ledger-overflow", "503-not-recorded", "429-rate-limited", "408-timeout"],
+    )
     async def test_non_2xx_check_keeps_the_tally(self, status: int) -> None:
         enforcer = _make_async_enforcer(fail_open=True)
         enforcer._record_legacy_uncounted(100, None)
@@ -1179,7 +1183,7 @@ class TestAsyncLegacyUncountedTally:
         await enforcer.close()
 
     @pytest.mark.parametrize("status", [422, 404], ids=["422-unknown-model", "404"])
-    async def test_4xx_other_than_409_clears_the_report_and_warns(
+    async def test_folding_4xx_clears_the_report_and_warns(
         self, status: int, caplog: pytest.LogCaptureFixture
     ) -> None:
         enforcer = _make_async_enforcer(fail_open=True)
