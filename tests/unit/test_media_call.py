@@ -796,14 +796,16 @@ class TestMediaCallAsync:
                 solwyn._solwyn_runtimes[0].adapter, "prepare_media_call", _route_to_embeddings
             ),
         ):
-            async with solwyn_pkg.run("orchestrator") as parent_run_id:
-                async with solwyn_pkg.run("async-media", tags={"team": "platform"}) as run_id:
-                    result = await solwyn._media_call(
-                        _spec(),
-                        model="text-embedding-3-small",
-                        input="hello",
-                        solwyn_tags={"job": "embed"},
-                    )
+            async with (
+                solwyn_pkg.run("orchestrator") as parent_run_id,
+                solwyn_pkg.run("async-media", tags={"team": "platform"}) as run_id,
+            ):
+                result = await solwyn._media_call(
+                    _spec(),
+                    model="text-embedding-3-small",
+                    input="hello",
+                    solwyn_tags={"job": "embed"},
+                )
 
         assert result is resp
         client.embeddings.create.assert_awaited_once()
