@@ -1919,8 +1919,8 @@ class TestDirectiveEpochCoherence:
             request_epoch=marked_at - 1.0,
         )
 
-        # The sticky wins the VERDICT, but the snapshot local enforcement
-        # falls back on is response-shaped and must still advance.
+        # The sticky wins the VERDICT, but the snapshot the outage results
+        # (retained run stop) report is response-shaped and must still advance.
         assert effective.allowed is False
         assert (base._last_known_budget_limit, base._last_known_current_usage) == (250.0, 77.0)
 

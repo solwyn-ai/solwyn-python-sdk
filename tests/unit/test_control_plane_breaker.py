@@ -123,10 +123,10 @@ class TestCheckBreaker:
         assert transport.count == 2  # flat — the network call was skipped
         enforcer.close()
 
-    def test_open_breaker_applies_local_enforcement_when_fail_closed(self) -> None:
+    def test_open_breaker_fails_closed_when_fail_open_false(self) -> None:
         breaker = _breaker(failure_threshold=2)
         transport = _CountingTransport("connect")
-        # fail_open=False + no prior known limit -> local enforcement DENIES.
+        # fail_open=False + control plane unreachable -> the legacy path DENIES.
         enforcer = _make_enforcer(breaker, transport, fail_open=False)
 
         for _ in range(2):
@@ -134,7 +134,8 @@ class TestCheckBreaker:
         assert breaker.get_state().state is CircuitState.OPEN
 
         result = _check(enforcer)
-        assert result.allowed is False  # local-enforcement posture, not a network call
+        assert result.allowed is False  # fail-closed posture, not a network call
+        assert result.deny_reason == "control_plane_unreachable"
         assert transport.count == 2
         enforcer.close()
 

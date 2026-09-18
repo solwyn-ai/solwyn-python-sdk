@@ -153,15 +153,24 @@ class TestBudgetEnforcerBase:
 
         assert req.tags == {"team": "research"}
 
-    def test_local_cost_tracking(self) -> None:
+    def test_no_local_cost_ledger_or_per_token_price(self) -> None:
+        """The SDK never prices a call: no dollar ledger, no per-token constant."""
+        import solwyn.budget as budget_module
+
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
             api_key=VALID_API_KEY,
         )
-        base._track_local_cost(10.0)
-        base._track_local_cost(5.0)
-        remaining = base._get_local_remaining(100.0)
-        assert remaining == pytest.approx(85.0)
+        assert not hasattr(budget_module, "DEFAULT_COST_PER_TOKEN")
+        for name in (
+            "_local_costs",
+            "_track_local_cost",
+            "_get_local_remaining",
+            "_get_local_current",
+            "_build_local_enforcement_result",
+        ):
+            assert not hasattr(base, name), name
+        assert base.uncounted_tally() == (0, 0)
 
     def test_cache_allow_decisions(self) -> None:
         base = _BudgetEnforcerBase(
@@ -763,7 +772,7 @@ class TestFailOpen:
         assert outage.warning is not None
         assert "fail-open" in outage.warning.lower()
 
-    def test_prior_hard_deny_overrides_local_enforcement_when_cloud_unreachable(self) -> None:
+    def test_prior_hard_deny_overrides_fail_closed_when_cloud_unreachable(self) -> None:
         enforcer = _make_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY)
         mock_response = MagicMock()
         mock_response.json.return_value = _DENY_RESPONSE
@@ -790,16 +799,15 @@ class TestFailOpen:
 
 
 # ---------------------------------------------------------------------------
-# Local enforcement when cloud unreachable + hard_deny
+# Cloud unreachable + fail_open=False: fail closed (no local cost estimate)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.unit
-class TestLocalEnforcement:
-    """Cloud unreachable + fail_open=False enforces budget locally."""
+class TestFailClosedWhenUnreachable:
+    """Cloud unreachable + fail_open=False denies on the legacy path."""
 
     def test_denies_when_cloud_never_reached(self) -> None:
-        """No prior cloud contact -> no known limit -> fail-closed (deny)."""
         enforcer = _make_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY)
 
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
@@ -808,72 +816,510 @@ class TestLocalEnforcement:
             )
 
         assert result.allowed is False
+        assert result.deny_source == "local_enforcement"
+        assert result.deny_reason == "control_plane_unreachable"
         assert result.warning is not None
-        assert "no prior budget limit" in result.warning.lower()
+        assert "unreachable" in result.warning.lower()
+        assert "lease_enabled=true" in result.warning.lower()
 
-    def test_allows_within_last_known_limit(self) -> None:
-        """Cloud established limit, then goes offline -> allows within limit."""
+    def test_denies_even_with_last_known_limit(self) -> None:
+        """A remembered dollar limit is not something the SDK can meter against."""
         enforcer = _make_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY, cache_ttl=0)
 
-        # Phase 1: Cloud establishes $100 limit
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "allowed": True,
-            "remaining_budget": 95.0,
-            "reservation_id": "res_1",
-            "mode": "hard_deny",
-            "budget_limit": 100.0,
-            "current_usage": 5.0,
-            "denied_by_period": None,
-            "project_id": VALID_PROJECT_ID,
-        }
-        mock_response.raise_for_status = MagicMock()
-        with patch.object(enforcer._http, "post", return_value=mock_response):
+        with patch.object(enforcer._http, "post", return_value=_response(ALLOW_BUDGET_RESPONSE)):
             enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
-
-        # Phase 2: Cloud goes offline
-        with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
-            result = enforcer.check_budget(
-                estimated_input_tokens=500, model="gpt-5.5", provider="openai"
-            )
-
-        assert result.allowed is True
-        assert result.warning is not None
-        assert "locally" in result.warning.lower()
-
-    def test_denies_when_local_exceeds_last_known_limit(self) -> None:
-        """Cloud established limit, then goes offline -> denies when exceeded."""
-        enforcer = _make_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY, cache_ttl=0)
-
-        # Phase 1: Cloud establishes $100 limit
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "allowed": True,
-            "remaining_budget": 100.0,
-            "reservation_id": "res_1",
-            "mode": "hard_deny",
-            "budget_limit": 100.0,
-            "current_usage": 0.0,
-            "denied_by_period": None,
-            "project_id": VALID_PROJECT_ID,
-        }
-        mock_response.raise_for_status = MagicMock()
-        with patch.object(enforcer._http, "post", return_value=mock_response):
-            enforcer.check_budget(estimated_input_tokens=500, model="gpt-5.5", provider="openai")
-
-        # Fill local budget past the $100 limit (directly via _track_local_cost)
-        for _ in range(10):
-            enforcer._track_local_cost(10.0)  # ~101.0 total
-
-        # Phase 2: Cloud goes offline
         with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
             result = enforcer.check_budget(
                 estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
 
         assert result.allowed is False
-        assert result.warning is not None
-        assert "denies" in result.warning.lower()
+        assert result.deny_source == "local_enforcement"
+        assert result.deny_reason == "control_plane_unreachable"
+        assert enforcer.uncounted_tally() == (0, 0)
+
+    def test_alert_only_mode_still_fails_closed(self) -> None:
+        enforcer = _make_enforcer(fail_open=False, budget_mode=BudgetMode.ALERT_ONLY)
+
+        with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
+            result = enforcer.check_budget(
+                estimated_input_tokens=10, model="gpt-5.5", provider="openai"
+            )
+
+        assert result.allowed is False
+        assert result.mode is BudgetMode.ALERT_ONLY
+        assert result.deny_reason == "control_plane_unreachable"
+
+    def test_fail_closed_warning_is_logged_and_rate_limited(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        enforcer = _make_enforcer(fail_open=False)
+
+        with (
+            caplog.at_level("WARNING", logger="solwyn.budget"),
+            patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")),
+        ):
+            for _ in range(3):
+                enforcer.check_budget(estimated_input_tokens=10, model="gpt-5.5", provider="openai")
+
+        lines = [r for r in caplog.records if "budget.fail_closed_unreachable" in r.getMessage()]
+        assert len(lines) == 1
+        assert "lease_enabled=True" in lines[0].getMessage()
+
+    def test_sticky_hard_deny_still_wins_over_fail_closed(self) -> None:
+        enforcer = _make_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY)
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[_response(_DENY_RESPONSE), httpx.ConnectError("unreachable")],
+        ):
+            enforcer.check_budget(estimated_input_tokens=10, model="gpt-5.5", provider="openai")
+            result = enforcer.check_budget(
+                estimated_input_tokens=10, model="gpt-5.5", provider="openai"
+            )
+
+        assert result.allowed is False
+        assert result.deny_source == "sticky_replay"
+        assert result.deny_reason == "monthly"
+        assert result.budget_limit == _DENY_RESPONSE["budget_limit"]
+
+    def test_retained_run_stop_still_wins_over_fail_closed(self) -> None:
+        enforcer = _make_legacy_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY)
+        mark_terminated("run_retained_outage", reason="operator_stop", source="server")
+        try:
+            with patch.object(
+                enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")
+            ):
+                result = enforcer.check_budget(
+                    estimated_input_tokens=10,
+                    model="gpt-5.5",
+                    provider="openai",
+                    agent_run_id="run_retained_outage",
+                )
+        finally:
+            clear_run_termination("run_retained_outage")
+
+        assert result.allowed is False
+        assert result.deny_source == "sticky_replay"
+        assert result.denied_by_period == "run_stopped"
+        assert result.deny_reason == "operator_stop"
+
+
+# ---------------------------------------------------------------------------
+# Legacy-path outage tally (tokens only) under fail_open=True
+# ---------------------------------------------------------------------------
+
+
+def _outage_check(enforcer: BudgetEnforcer, tokens: int, call_id: str | None = None):
+    with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
+        return enforcer.check_budget(
+            estimated_input_tokens=tokens,
+            model="gpt-5.5",
+            provider="openai",
+            call_id=call_id,
+        )
+
+
+@pytest.mark.unit
+class TestLegacyUncountedTally:
+    def test_fail_open_admission_increments_tally(self) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+
+        first = _outage_check(enforcer, 100, "call-a")
+        second = _outage_check(enforcer, 250)
+
+        assert first.allowed is True and second.allowed is True
+        assert "fail-open" in (first.warning or "").lower()
+        assert enforcer.uncounted_tally() == (2, 350)
+
+    def test_breaker_open_admission_increments_tally(self) -> None:
+        breaker = MagicMock(spec=CircuitBreaker)
+        breaker.admit.return_value = CircuitBreakerAdmission(allowed=False)
+        enforcer = _make_enforcer(fail_open=True, control_plane_breaker=breaker)
+
+        with patch.object(enforcer._http, "post") as mock_post:
+            result = enforcer.check_budget(
+                estimated_input_tokens=40, model="gpt-5.5", provider="openai"
+            )
+
+        mock_post.assert_not_called()
+        assert result.allowed is True
+        assert enforcer.uncounted_tally() == (1, 40)
+
+    def test_settlement_trues_estimate_up_to_actual_total(self) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+        _outage_check(enforcer, 100, "call-a")
+        _outage_check(enforcer, 50, "call-b")
+
+        enforcer.settle_uncounted(call_id="call-a", total_tokens=340)
+
+        assert enforcer.uncounted_tally() == (2, 390)
+        # Exactly once: a repeated settlement is a no-op.
+        enforcer.settle_uncounted(call_id="call-a", total_tokens=10_000)
+        assert enforcer.uncounted_tally() == (2, 390)
+
+    def test_settlement_can_lower_an_overestimate(self) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+        _outage_check(enforcer, 100, "call-a")
+
+        enforcer.settle_uncounted(call_id="call-a", total_tokens=30)
+
+        assert enforcer.uncounted_tally() == (1, 30)
+
+    def test_unmeasured_usage_never_reports_below_the_estimate(self) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+        _outage_check(enforcer, 100, "call-a")
+
+        enforcer.settle_uncounted(call_id="call-a", total_tokens=30, usage_unmeasured=True)
+
+        assert enforcer.uncounted_tally() == (1, 100)
+
+    def test_all_zero_settlement_never_erases_the_estimate(self) -> None:
+        """An abandoned stream settles with zero tokens; the prompt was still billed."""
+        enforcer = _make_enforcer(fail_open=True)
+        _outage_check(enforcer, 100, "call-a")
+
+        enforcer.settle_uncounted(call_id="call-a", total_tokens=0)
+
+        assert enforcer.uncounted_tally() == (1, 100)
+        assert "call-a" not in enforcer._uncounted_estimates
+
+    def test_surface_without_token_usage_keeps_the_estimate(self) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+        _outage_check(enforcer, 100, "call-a")
+
+        enforcer.settle_uncounted(call_id="call-a", total_tokens=None)
+        enforcer.settle_uncounted(call_id="call-a", total_tokens=5)
+
+        assert enforcer.uncounted_tally() == (1, 100)
+
+    def test_release_keeps_the_estimate_and_frees_the_true_up_slot(self) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+        _outage_check(enforcer, 100, "call-a")
+
+        enforcer.release_reservation("call-a")
+        enforcer.settle_uncounted(call_id="call-a", total_tokens=5)
+
+        assert enforcer.uncounted_tally() == (1, 100)
+        assert "call-a" not in enforcer._uncounted_estimates
+
+    def test_settlement_for_an_untracked_call_is_a_noop(self) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+
+        enforcer.settle_uncounted(call_id="never-admitted", total_tokens=500)
+
+        assert enforcer.uncounted_tally() == (0, 0)
+
+    def test_true_up_map_is_bounded(self) -> None:
+        from solwyn.budget import _MAX_UNCOUNTED_TRUE_UPS
+
+        enforcer = _make_enforcer(fail_open=True)
+        for i in range(_MAX_UNCOUNTED_TRUE_UPS + 5):
+            enforcer._record_legacy_uncounted(10, f"call-{i}")
+
+        assert len(enforcer._uncounted_estimates) == _MAX_UNCOUNTED_TRUE_UPS
+        assert "call-0" not in enforcer._uncounted_estimates
+        # An evicted call keeps its admission estimate in the tally.
+        enforcer.settle_uncounted(call_id="call-0", total_tokens=1_000)
+        assert enforcer.uncounted_tally() == (
+            _MAX_UNCOUNTED_TRUE_UPS + 5,
+            10 * (_MAX_UNCOUNTED_TRUE_UPS + 5),
+        )
+
+    def test_tally_rides_next_check_and_resets_only_after_it_succeeds(self) -> None:
+        enforcer = _make_enforcer(fail_open=True, cache_ttl=0)
+        _outage_check(enforcer, 100, "call-a")
+        _outage_check(enforcer, 20)
+        enforcer.settle_uncounted(call_id="call-a", total_tokens=180)
+
+        with patch.object(
+            enforcer._http, "post", return_value=_response(ALLOW_BUDGET_RESPONSE)
+        ) as mock_post:
+            result = enforcer.check_budget(
+                estimated_input_tokens=7, model="gpt-5.5", provider="openai"
+            )
+
+        assert result.allowed is True
+        body = mock_post.call_args.kwargs["json"]
+        assert body["uncounted_calls"] == 2
+        assert body["uncounted_tokens"] == 200
+        assert enforcer.uncounted_tally() == (0, 0)
+
+        with patch.object(
+            enforcer._http, "post", return_value=_response(ALLOW_BUDGET_RESPONSE)
+        ) as mock_post:
+            enforcer.check_budget(estimated_input_tokens=7, model="gpt-5.5", provider="openai")
+        body = mock_post.call_args.kwargs["json"]
+        assert "uncounted_calls" not in body
+        assert "uncounted_tokens" not in body
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            httpx.ConnectError("unreachable"),
+            httpx.ReadTimeout("slow"),
+        ],
+    )
+    def test_failed_check_keeps_the_tally(self, failure: Exception) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+        _outage_check(enforcer, 100, "call-a")
+
+        with patch.object(enforcer._http, "post", side_effect=failure) as mock_post:
+            enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
+
+        body = mock_post.call_args.kwargs["json"]
+        assert (body["uncounted_calls"], body["uncounted_tokens"]) == (1, 100)
+        # The failed report is still owed, plus the call this outage just admitted.
+        assert enforcer.uncounted_tally() == (2, 105)
+
+    @pytest.mark.parametrize(
+        ("status", "payload"),
+        [
+            # A refusal that did not record the report.
+            (409, {"detail": "conflict"}),
+            # Core could not record the report.
+            (503, {"detail": "uncounted tally could not be recorded"}),
+            # Answered by middleware before the route body (and the fold) ran.
+            (429, {"detail": "rate limit exceeded"}),
+            (408, {"detail": "request timeout"}),
+        ],
+        ids=["409-refused", "503-not-recorded", "429-rate-limited", "408-timeout"],
+    )
+    def test_non_2xx_check_keeps_the_tally(self, status: int, payload: dict[str, str]) -> None:
+        breaker = MagicMock(spec=CircuitBreaker)
+        breaker.admit.return_value = CircuitBreakerAdmission(allowed=True)
+        enforcer = _make_enforcer(fail_open=True, control_plane_breaker=breaker)
+        _outage_check(enforcer, 100)
+        request = httpx.Request("POST", "https://api.test.solwyn.ai/api/v1/budgets/check")
+        breaker.reset_mock()
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            return_value=httpx.Response(status, json=payload, request=request),
+        ) as mock_post:
+            result = enforcer.check_budget(
+                estimated_input_tokens=5, model="gpt-5.5", provider="openai"
+            )
+
+        body = mock_post.call_args.kwargs["json"]
+        assert (body["uncounted_calls"], body["uncounted_tokens"]) == (1, 100)
+        # Not a 2xx: the reported tally is kept, plus the call this admitted.
+        assert result.allowed is True
+        assert enforcer.uncounted_tally() == (2, 105)
+        assert enforcer._uncounted_report_in_flight is None
+        # The existing classification applies unchanged: any non-2xx other than
+        # the structured read-only-key 403 is an outage for the breaker.
+        breaker.record_failure.assert_called_once()
+        breaker.record_success.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "status",
+        [422, 404, 401],
+        ids=["422-unknown-model", "404", "401"],
+    )
+    def test_folding_4xx_clears_the_report_and_warns_once(
+        self, status: int, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Core folds before it evaluates the check: a 4xx answer already counted
+        the report, so re-sending it on every probe would grow the ledger."""
+        enforcer = _make_enforcer(fail_open=True)
+        _outage_check(enforcer, 100)
+        request = httpx.Request("POST", "https://api.test.solwyn.ai/api/v1/budgets/check")
+
+        with (
+            caplog.at_level("WARNING", logger="solwyn.budget"),
+            patch.object(
+                enforcer._http,
+                "post",
+                return_value=httpx.Response(status, json={"detail": "nope"}, request=request),
+            ) as mock_post,
+        ):
+            enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
+            enforcer._record_legacy_uncounted(7, None)
+            enforcer.check_budget(estimated_input_tokens=3, model="gpt-5.5", provider="openai")
+
+        first_body = mock_post.call_args_list[0].kwargs["json"]
+        assert (first_body["uncounted_calls"], first_body["uncounted_tokens"]) == (1, 100)
+        second_body = mock_post.call_args_list[1].kwargs["json"]
+        # The first report was cleared; only what accrued since was re-sent.
+        assert (second_body["uncounted_calls"], second_body["uncounted_tokens"]) == (2, 12)
+        # ...and this second report was cleared by its own 4xx too, leaving only
+        # the call its fail-open admission tallied.
+        assert enforcer.uncounted_tally() == (1, 3)
+        assert enforcer._uncounted_report_in_flight is None
+        drops = [r for r in caplog.records if "budget.uncounted_report_dropped" in r.getMessage()]
+        assert len(drops) == 1  # rate-limited
+        assert f"status={status}" in drops[0].getMessage()
+        assert "nope" not in drops[0].getMessage()
+
+    def test_unparseable_2xx_clears_the_report(self) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+        _outage_check(enforcer, 100)
+        drifted = MagicMock(spec=httpx.Response)
+        drifted.json.return_value = {"totally": "unexpected"}
+
+        with patch.object(enforcer._http, "post", return_value=drifted):
+            enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
+
+        # The 2xx means the plane folded the report; only this call's own
+        # degraded fail-open admission is still owed.
+        assert enforcer.uncounted_tally() == (1, 5)
+        assert enforcer._uncounted_report_in_flight is None
+
+    def test_misrouted_directive_2xx_clears_the_report(self) -> None:
+        """Deliberate: core folds before it answers, even with a drifted directive."""
+        enforcer = _make_legacy_enforcer(fail_open=True)
+        _outage_check(enforcer, 100)
+        misrouted = _response(
+            {
+                **_STOPPED_RUN_DENY_RESPONSE,
+                "run_control": {
+                    "version": "1",
+                    "action": "terminate",
+                    "agent_run_id": "run-elsewhere",
+                    "reason": "manual_kill",
+                },
+            }
+        )
+
+        with patch.object(enforcer._http, "post", return_value=misrouted) as mock_post:
+            result = enforcer.check_budget(
+                estimated_input_tokens=5,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run-here",
+            )
+
+        assert mock_post.call_args.kwargs["json"]["uncounted_calls"] == 1
+        assert result.allowed is True  # this one call degrades to fail-open
+        assert enforcer.uncounted_tally() == (1, 5)
+        assert enforcer._uncounted_report_in_flight is None
+        assert run_termination("run-here") is None
+
+    def test_report_finishes_even_if_releasing_the_probe_raises(self) -> None:
+        breaker = MagicMock(spec=CircuitBreaker)
+        breaker.admit.return_value = CircuitBreakerAdmission(allowed=True)
+        breaker.release_probe.side_effect = RuntimeError("probe bookkeeping failed")
+        enforcer = _make_enforcer(fail_open=True, control_plane_breaker=breaker)
+        enforcer._record_legacy_uncounted(100, None)
+
+        with (
+            patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("down")),
+            pytest.raises(RuntimeError, match="probe bookkeeping failed"),
+        ):
+            enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
+
+        assert enforcer._uncounted_report_in_flight is None
+        # The tally was kept (transport failure) and a later check carries it.
+        assert enforcer._claim_uncounted_report() is not None
+
+    def test_breaker_held_check_keeps_accumulating(self) -> None:
+        breaker = MagicMock(spec=CircuitBreaker)
+        breaker.admit.return_value = CircuitBreakerAdmission(allowed=False)
+        enforcer = _make_enforcer(fail_open=True, control_plane_breaker=breaker)
+
+        for _ in range(3):
+            enforcer.check_budget(estimated_input_tokens=10, model="gpt-5.5", provider="openai")
+
+        assert enforcer.uncounted_tally() == (3, 30)
+        assert enforcer._uncounted_report_in_flight is None
+
+    def test_calls_tallied_while_a_check_is_in_flight_stay_owed(self) -> None:
+        enforcer = _make_enforcer(fail_open=True, cache_ttl=0)
+        _outage_check(enforcer, 100, "call-a")
+
+        def answer_after_more_outage_spend(*_args: object, **_kwargs: object) -> MagicMock:
+            # Another thread's fail-open admission and settlement land while
+            # this check is on the wire.
+            enforcer._record_legacy_uncounted(40, "call-b")
+            enforcer.settle_uncounted(call_id="call-a", total_tokens=130)
+            return _response(ALLOW_BUDGET_RESPONSE)
+
+        with patch.object(enforcer._http, "post", side_effect=answer_after_more_outage_spend):
+            enforcer.check_budget(estimated_input_tokens=5, model="gpt-5.5", provider="openai")
+
+        # Reported (1, 100); owed afterwards: call-b and call-a's +30 true-up.
+        assert enforcer.uncounted_tally() == (1, 70)
+
+    def test_only_one_report_is_on_the_wire_at_a_time(self) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+        enforcer._record_legacy_uncounted(100, None)
+
+        request = enforcer._build_check_request(5, "gpt-5.5", "openai")
+        first, first_report = enforcer._with_uncounted_report(request)
+        second, second_report = enforcer._with_uncounted_report(request)
+
+        assert first_report is not None and second_report is None
+        assert first.model_dump(mode="json")["uncounted_calls"] == 1
+        assert "uncounted_calls" not in second.model_dump(mode="json")
+
+        enforcer._finish_uncounted_report(second_report, acknowledged=True)
+        enforcer._finish_uncounted_report(first_report, acknowledged=True)
+        enforcer._finish_uncounted_report(first_report, acknowledged=True)
+        assert enforcer.uncounted_tally() == (0, 0)
+
+    def test_zero_tally_request_is_byte_identical(self) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+        request = enforcer._build_check_request(5, "gpt-5.5", "openai", agent_run_id="run-x")
+
+        attached, report = enforcer._with_uncounted_report(request)
+
+        assert report is None
+        assert attached is request
+        body = attached.model_dump(mode="json")
+        assert "uncounted_calls" not in body
+        assert "uncounted_tokens" not in body
+        assert (
+            attached.model_dump_json()
+            == request.model_copy(
+                update={"uncounted_calls": 0, "uncounted_tokens": 0}
+            ).model_dump_json()
+        )
+
+    def test_sticky_hard_deny_during_outage_is_not_tallied(self) -> None:
+        enforcer = _make_enforcer(fail_open=True, budget_mode=BudgetMode.HARD_DENY)
+
+        with patch.object(
+            enforcer._http,
+            "post",
+            side_effect=[_response(_DENY_RESPONSE), httpx.ConnectError("unreachable")],
+        ):
+            enforcer.check_budget(estimated_input_tokens=10, model="gpt-5.5", provider="openai")
+            result = enforcer.check_budget(
+                estimated_input_tokens=10, model="gpt-5.5", provider="openai"
+            )
+
+        assert result.allowed is False
+        assert result.deny_source == "sticky_replay"
+        assert enforcer.uncounted_tally() == (0, 0)
+
+    def test_lease_cold_start_outage_is_tallied_on_the_lease_not_twice(self) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+
+        with patch.object(enforcer._http, "post", side_effect=httpx.ConnectError("unreachable")):
+            result = enforcer.check_budget(
+                estimated_input_tokens=100,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run-cold",
+                call_id="0b9f2d4e-5c1a-4e7b-9d3f-2a6c8e1b4f70",
+            )
+
+        assert result.allowed is True
+        assert enforcer._lease._states["run-cold"].uncounted_calls == 1
+        assert enforcer.uncounted_tally() == (0, 0)
+
+    def test_fork_reset_drops_the_parent_tally(self) -> None:
+        enforcer = _make_enforcer(fail_open=True)
+        _outage_check(enforcer, 100, "call-a")
+
+        enforcer._reset_after_fork_in_child()
+
+        assert enforcer.uncounted_tally() == (0, 0)
+        assert not enforcer._uncounted_estimates
+        assert enforcer._uncounted_report_in_flight is None
 
 
 # ---------------------------------------------------------------------------
@@ -1666,30 +2112,25 @@ class TestDenialReceiptAttribution:
             "run_stopped",
         )
 
-    def test_fail_closed_local_builders_use_structural_reasons(self) -> None:
+    def test_fail_closed_builder_uses_structural_reason(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
             api_key=VALID_API_KEY,
             fail_open=False,
         )
 
-        cold = base._build_local_enforcement_result(estimated_input_tokens=10)
+        cold = base._build_unreachable_result(10, None)
         base._last_known_budget_limit = 1.0
-        base._track_local_cost(1.0)
-        exhausted = base._build_local_enforcement_result(estimated_input_tokens=10)
+        known_limit = base._build_unreachable_result(10, None)
 
-        assert (cold.allowed, cold.deny_source, cold.deny_reason) == (
-            False,
-            "local_enforcement",
-            "no_prior_budget_limit",
-        )
-        assert (exhausted.allowed, exhausted.deny_source, exhausted.deny_reason) == (
-            False,
-            "local_enforcement",
-            "local_budget_exceeded",
-        )
+        for result in (cold, known_limit):
+            assert (result.allowed, result.deny_source, result.deny_reason) == (
+                False,
+                "local_enforcement",
+                "control_plane_unreachable",
+            )
         assert cold.denied_by_period is None
-        assert exhausted.denied_by_period is None
+        assert known_limit.denied_by_period is None
 
     def test_lease_ladder_terminal_deny_preserves_reason_and_period(self) -> None:
         base = _BudgetEnforcerBase(
@@ -1794,17 +2235,17 @@ class TestContractDriftTaxonomy:
         breaker.record_success.assert_called_once()
         breaker.record_failure.assert_not_called()
 
-    def test_parse_error_with_fail_open_false_enforces_locally(self) -> None:
+    def test_parse_error_with_fail_open_false_fails_closed(self) -> None:
         enforcer = _make_enforcer(fail_open=False, budget_mode=BudgetMode.HARD_DENY)
         with patch.object(enforcer._http, "post", return_value=self._drifted_response()):
             result = enforcer.check_budget(
                 estimated_input_tokens=500, model="gpt-5.5", provider="openai"
             )
-        # No prior cloud contact -> local enforcement fails closed, mirroring
-        # TestLocalEnforcement::test_denies_when_cloud_never_reached.
+        # Mirrors TestFailClosedWhenUnreachable::test_denies_when_cloud_never_reached.
         assert result.allowed is False
+        assert result.deny_reason == "control_plane_unreachable"
         assert result.warning is not None
-        assert "no prior budget limit" in result.warning.lower()
+        assert "unreachable" in result.warning.lower()
 
 
 def test_budget_check_result_is_pydantic_model() -> None:

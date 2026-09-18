@@ -7,8 +7,59 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
+The SDK no longer estimates cost during a control-plane outage. It used a flat
+$0.00003 per token, which meant nothing once calls became multimodal and broke
+the rule that the Solwyn API owns pricing. The legacy per-call path now keeps a
+token-only tally of the calls it admits while Solwyn is unreachable and reports
+it on the next successful budget check. Wire-contract change is API-first:
+Solwyn Cloud accepts `uncounted_calls` / `uncounted_tokens` on
+`/budgets/check` before this SDK releases.
+
+**Deployment order is a hard requirement:** Solwyn Cloud must accept the
+`uncounted_*` fields before this SDK version is deployed. Against a server
+without them, the first check after an outage is rejected with a 4xx and the
+SDK drops that outage's tally rather than re-sending it forever.
+
 ### Changed
 
+- **Behaviour change: `fail_open=False` now fails closed on the legacy path
+  while Solwyn is unreachable.** It used to admit calls against the last known
+  dollar limit using a local per-token cost estimate. That ledger started at
+  zero on every outage and never included the spend the server had already
+  counted, so it could not enforce the real limit. Now every call that no live
+  budget lease covers raises `BudgetExceededError` until Solwyn is reachable
+  again. The result keeps `deny_source="local_enforcement"` and carries
+  `deny_reason="control_plane_unreachable"`; the SDK logs
+  `budget.fail_closed_unreachable` at most every 30 seconds. **Migration:** to
+  keep run-scoped calls metered through an outage, run them inside
+  `solwyn.run(...)` with `lease_enabled=True` (the default), or set
+  `fail_open=True` to admit and tally. A prior hard deny and a retained run stop
+  still take precedence exactly as before.
+- **`fail_open=True` tallies the calls it admits during an outage.** Each
+  legacy-path admission adds one call and its input token estimate. When the
+  call settles, the estimate is replaced by the provider-reported total. A
+  media call with no token usage, and a call that settles with zero tokens
+  (such as a stream abandoned before its usage chunk), keeps its estimate. The
+  tally is sent on the next `/budgets/check` that reaches Solwyn as
+  `uncounted_calls` / `uncounted_tokens`. It is kept for the next check when
+  that check gets a 408, 409 or 429, any 5xx, a transport error or timeout, is
+  held by the control-plane breaker, or is cancelled, so delivery is
+  at-least-once. Any other answer clears it: a 2xx (even one the SDK cannot
+  parse), or any other 4xx, because Solwyn records the tally before it
+  evaluates the check. A 4xx that drops a report logs `budget.uncounted_report_dropped` with
+  the status, at most every 30 seconds. Both fields are omitted when zero, so a
+  check with nothing to report is byte-identical to before. The tally only
+  rides `/budgets/check`: a process whose traffic is all lease-funded or served
+  from the allow cache never sends one, and a tally still unsent at process
+  exit is lost (there is no exit flush, so `close()` never waits on a down
+  control plane). Lease-path outage tallies are unchanged and still ride lease
+  renewals.
+- **`BudgetExceededError.estimated_cost` is now `float | None` and is `None`
+  for every SDK-raised error.** It is set only from a server-supplied figure,
+  and the server supplies none today. The new
+  `BudgetExceededError.estimated_input_tokens` carries the SDK's token estimate
+  for the blocked request. Code that constructs `BudgetExceededError` directly
+  must pass `estimated_input_tokens`.
 - **Surface canary admits the mid-September provider SDK namespaces.** openai
   3.14 (`beta.agents` — agents, sessions, turns, subagents, environments,
   vaults — and `live` — sessions, forks, sideband), together 2.35
@@ -28,6 +79,11 @@ derived from git tags (hatch-vcs).
   flags nested `async with` blocks (SIM117); the three test sites are combined
   into one statement and the lock tracks 0.16.8 so `make check` matches CI.
   Dev-tooling only; nothing changes for installed packages.
+
+### Removed
+
+- `solwyn.budget.DEFAULT_COST_PER_TOKEN` and the enforcer's local dollar ledger.
+  Nothing in the SDK multiplies tokens by a price.
 
 ## [0.7.0] - 2026-09-05
 

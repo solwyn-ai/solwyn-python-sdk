@@ -36,6 +36,7 @@ from solwyn._constants import (
     ORDINARY_TOKEN_COUNT_MAX,
     PROVIDER_REGION_MAX_LENGTH,
     SERVICE_TIER_MAX_LENGTH,
+    SIGNED_BIGINT_MAX,
     TAG_KEY_MAX_LENGTH,
     TAG_VALUE_MAX_LENGTH,
     TAGS_MAX_KEYS,
@@ -541,6 +542,11 @@ class RunControlDirective(BaseModel):
     reason: str = Field(..., max_length=64)
 
 
+# Additive request counters the check serializer omits at zero (see
+# ``BudgetCheckRequest._serialize_without_none``).
+_CHECK_ZERO_OMITTED_FIELDS = frozenset({"uncounted_calls", "uncounted_tokens"})
+
+
 class BudgetCheckRequest(BaseModel):
     """Pre-flight budget check sent before an LLM call."""
 
@@ -557,12 +563,21 @@ class BudgetCheckRequest(BaseModel):
         Optional fields are skipped when None. Runtime request construction
         always opts in to the v1 failover directive; direct model construction
         may omit the version for compatibility tests and legacy callers.
+
+        The outage tally (``uncounted_calls`` / ``uncounted_tokens``) is also
+        skipped when ZERO: a check that carries nothing new stays byte-identical
+        to one built before the fields existed, and a Cloud API that predates
+        them (``extra="forbid"``) never sees an unknown key from a healthy SDK.
         """
         data = handler(self)
         if not isinstance(data, dict):
             raise RuntimeError("BudgetCheckRequest serializer expected dict output")
         serialized = cast(dict[str, Any], data)
-        return {key: value for key, value in serialized.items() if value is not None}
+        return {
+            key: value
+            for key, value in serialized.items()
+            if value is not None and not (key in _CHECK_ZERO_OMITTED_FIELDS and value == 0)
+        }
 
     estimated_input_tokens: int = Field(
         ..., ge=0, description="Estimated input token count for the pending call"
@@ -623,6 +638,25 @@ class BudgetCheckRequest(BaseModel):
         description=(
             "Explicit opt-in to server price hints on the response. Omitted requests keep "
             "price_hints null (no statement)."
+        ),
+    )
+    uncounted_calls: int = Field(
+        default=0,
+        ge=0,
+        le=SIGNED_BIGINT_MAX,
+        description=(
+            "Legacy-path outage tally: calls admitted fail-open while the control plane "
+            "was unreachable, not yet acknowledged by a successful check. Omitted when 0."
+        ),
+    )
+    uncounted_tokens: int = Field(
+        default=0,
+        ge=0,
+        le=SIGNED_BIGINT_MAX,
+        description=(
+            "Token total of those uncounted calls: provider-reported usage once a call "
+            "settled, else its admission-time input estimate. Tokens only — the SDK never "
+            "prices a call. Omitted when 0."
         ),
     )
 

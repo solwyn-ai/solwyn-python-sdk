@@ -101,7 +101,6 @@ from solwyn._types import (
 )
 from solwyn._velocity import DENY_ELIGIBLE_RULES
 from solwyn.budget import (
-    DEFAULT_COST_PER_TOKEN,
     AsyncBudgetEnforcer,
     BudgetCheckResult,
     BudgetEnforcer,
@@ -150,7 +149,7 @@ def _budget_denial_error(
     *,
     budget: BudgetCheckResult,
     agent_run_id: str | None,
-    estimated_cost: float,
+    estimated_input_tokens: int,
 ) -> BudgetExceededError | RunStoppedError:
     """Build the public typed error for one denied pre-flight."""
     budget_period = getattr(budget, "denied_by_period", None)
@@ -171,7 +170,9 @@ def _budget_denial_error(
         project_id=budget.project_id,
         budget_limit=budget.budget_limit,
         current_usage=budget.current_usage,
-        estimated_cost=estimated_cost,
+        estimated_input_tokens=estimated_input_tokens,
+        # The SDK never prices a call; no server figure exists for a denial.
+        estimated_cost=None,
         budget_period=budget_period,
         mode=budget.mode.value,
     )
@@ -2229,7 +2230,7 @@ class Solwyn(_SolwynBase):
             raise _budget_denial_error(
                 budget=budget,
                 agent_run_id=agent_run[0],
-                estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
+                estimated_input_tokens=est_in,
             )
 
         # 3. Deadline gate, mirroring the chat walk (PJ-8/R7 follow-up). Since
@@ -2345,6 +2346,18 @@ class Solwyn(_SolwynBase):
                 service_tier=service_tier,
                 modality=spec.modality,
                 media_usage=media_usage,
+            )
+        if not (reservation_id or lease_id):
+            # A legacy fail-open admission (no key to confirm against): replace its
+            # outage-tally estimate with measured tokens. A per-unit media call with
+            # no token usage cannot be trued up and keeps its admission estimate.
+            self._solwyn_budget.settle_uncounted(
+                call_id=call_id,
+                total_tokens=(
+                    token_details.total_tokens
+                    if token_details is not None and media_usage is None
+                    else None
+                ),
             )
         event = self._build_metadata_event(
             model=requested_model,
@@ -2561,7 +2574,7 @@ class Solwyn(_SolwynBase):
             raise _budget_denial_error(
                 budget=budget,
                 agent_run_id=agent_run[0],
-                estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
+                estimated_input_tokens=est_in,
             )
 
         # 3. Resolve per-call idempotency override (strip before dispatch).
@@ -2965,6 +2978,14 @@ class Solwyn(_SolwynBase):
                         # local lease reservation at its bound, never below it.
                         usage_unmeasured=usage_unmeasured,
                     )
+                else:
+                    # A legacy fail-open admission (no key to confirm against): replace its
+                    # outage-tally estimate with the provider-reported total.
+                    self._solwyn_budget.settle_uncounted(
+                        call_id=call_id,
+                        total_tokens=token_details.total_tokens,
+                        usage_unmeasured=usage_unmeasured,
+                    )
                 event = self._build_metadata_event(
                     model=served_model,
                     provider=provider,
@@ -3092,6 +3113,14 @@ class Solwyn(_SolwynBase):
                     call_id=call_id,
                     provider_region=provider_region,
                     service_tier=service_tier,
+                    usage_unmeasured=usage_unmeasured,
+                )
+            else:
+                # A legacy fail-open admission (no key to confirm against): replace its
+                # outage-tally estimate with the provider-reported total.
+                self._solwyn_budget.settle_uncounted(
+                    call_id=call_id,
+                    total_tokens=token_details.total_tokens,
                     usage_unmeasured=usage_unmeasured,
                 )
             event = self._build_metadata_event(
@@ -3719,7 +3748,7 @@ class AsyncSolwyn(_SolwynBase):
             raise _budget_denial_error(
                 budget=budget,
                 agent_run_id=agent_run[0],
-                estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
+                estimated_input_tokens=est_in,
             )
 
         # Deadline gate, mirroring the sync media path and the chat walk: with
@@ -3822,6 +3851,18 @@ class AsyncSolwyn(_SolwynBase):
                 service_tier=service_tier,
                 modality=spec.modality,
                 media_usage=media_usage,
+            )
+        if not (reservation_id or lease_id):
+            # A legacy fail-open admission (no key to confirm against): replace its
+            # outage-tally estimate with measured tokens. A per-unit media call with
+            # no token usage cannot be trued up and keeps its admission estimate.
+            self._solwyn_budget.settle_uncounted(
+                call_id=call_id,
+                total_tokens=(
+                    token_details.total_tokens
+                    if token_details is not None and media_usage is None
+                    else None
+                ),
             )
         event = self._build_metadata_event(
             model=requested_model,
@@ -4004,7 +4045,7 @@ class AsyncSolwyn(_SolwynBase):
             raise _budget_denial_error(
                 budget=budget,
                 agent_run_id=agent_run[0],
-                estimated_cost=est_in * DEFAULT_COST_PER_TOKEN,
+                estimated_input_tokens=est_in,
             )
 
         idempotent_override = (
@@ -4394,6 +4435,14 @@ class AsyncSolwyn(_SolwynBase):
                         # local lease reservation at its bound, never below it.
                         usage_unmeasured=usage_unmeasured,
                     )
+                else:
+                    # A legacy fail-open admission (no key to confirm against): replace its
+                    # outage-tally estimate with the provider-reported total.
+                    self._solwyn_budget.settle_uncounted(
+                        call_id=call_id,
+                        total_tokens=token_details.total_tokens,
+                        usage_unmeasured=usage_unmeasured,
+                    )
                 event = self._build_metadata_event(
                     model=served_model,
                     provider=provider,
@@ -4519,6 +4568,14 @@ class AsyncSolwyn(_SolwynBase):
                     call_id=call_id,
                     provider_region=provider_region,
                     service_tier=service_tier,
+                    usage_unmeasured=usage_unmeasured,
+                )
+            else:
+                # A legacy fail-open admission (no key to confirm against): replace its
+                # outage-tally estimate with the provider-reported total.
+                self._solwyn_budget.settle_uncounted(
+                    call_id=call_id,
+                    total_tokens=token_details.total_tokens,
                     usage_unmeasured=usage_unmeasured,
                 )
             event = self._build_metadata_event(
