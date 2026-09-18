@@ -7,6 +7,28 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
+### Changed
+
+- **Surface canary admits the mid-September provider SDK namespaces.** openai
+  3.14 (`beta.agents` — agents, sessions, turns, subagents, environments,
+  vaults — and `live` — sessions, forks, sideband), together 2.35
+  (`beta.endpoints.rollouts`) and google-genai 2.24 (`credentials`,
+  `environments.files.upload`) each added surfaces the reviewed rule ledger
+  did not know, so every `latest` inventory lane and the real-SDK fingerprint
+  test went red. All 763 new paths are classified by precedent: 20 resource
+  namespaces, 65 operations as `unmetered_spend` with exact acknowledgment
+  tokens (like `realtime.calls.create` and `beta.endpoints.create`), 676
+  raw-response wrappers as `unmetered_spend` at `raw_response` scope, and the
+  two google-genai credential properties as inert `metadata` (like the
+  anthropic `credentials` row). Latest fingerprints, per-context digests and
+  the README strict fingerprint (now audited against `openai==3.14.1`) are
+  refreshed. Runtime behaviour for existing surfaces is unchanged; before this
+  release these paths resolved to `unknown` and followed `on_unmetered`.
+- **Lint passes on ruff 0.16.8.** CI installs the latest ruff and 0.16.8 now
+  flags nested `async with` blocks (SIM117); the three test sites are combined
+  into one statement and the lock tracks 0.16.8 so `make check` matches CI.
+  Dev-tooling only; nothing changes for installed packages.
+
 ## [0.7.0] - 2026-09-05
 
 Every telemetry event for a lease-funded call now names the budget lease that
