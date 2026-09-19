@@ -1706,6 +1706,22 @@ class _BudgetEnforcerBase:
             self._lease.release(call_id, claim_token=lease_claim_token)
             self._uncounted_estimates.pop(call_id, None)
 
+    def abandon_reservation(self, call_id: str, *, lease_claim_token: int | None) -> None:
+        """Retire unknown post-send usage without re-lending its authorized bound.
+
+        This is local accounting only. The caller enqueues a structural
+        ``possibly_succeeded`` error receipt; no output usage or confirm is
+        invented. Renewal/surrender carries the conservative spent tally.
+        The exact claim token makes late release/settlement harmless, including
+        after renewal or run exit. The bounded call-id replay tombstone stays.
+        """
+        with self._state_lock:
+            self._lease.true_up(
+                call_id, 0, claim_token=lease_claim_token, floor_at_reservation=True
+            )
+            # Legacy fail-open keeps its admission estimate, just like release.
+            self._uncounted_estimates.pop(call_id, None)
+
     def lease_surrender_payloads(self) -> list[LeaseSurrenderRequest]:
         """Drain every held lease into surrender payloads (best-effort release).
 
@@ -2689,10 +2705,11 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             # Another caller is already granting for this run; pay one per-call
             # check instead of stacking a second grant on the same cold start.
             return "legacy", None
-        self._await_run_release(agent_run_id)
         breaker = self._control_plane_breaker
-        admission = breaker.admit() if breaker is not None else None
+        admission = None
         try:
+            self._await_run_release(agent_run_id)
+            admission = breaker.admit() if breaker is not None else None
             if admission is not None and not admission.allowed:
                 logger.debug("lease.grant_skipped_breaker_open")
                 return "unreachable", None
@@ -2733,10 +2750,12 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 self._surrender_late_renewal(late_surrender)
             return self._grant_verdict_for_breaker(verdict, response, breaker)
         finally:
-            if breaker is not None:
-                breaker.release_probe(admission)
-            self._release_grant_slot(agent_run_id)
-            self._dispatch_owed_releases()
+            try:
+                if breaker is not None:
+                    breaker.release_probe(admission)
+            finally:
+                self._release_grant_slot(agent_run_id)
+                self._dispatch_owed_releases()
 
     def _start_renewal(
         self,
@@ -3448,10 +3467,13 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         close_epoch = self._claim_grant_work(agent_run_id)
         if close_epoch is None:
             return "legacy", None
-        await self._await_run_release(agent_run_id)
         breaker = self._control_plane_breaker
-        admission = breaker.admit() if breaker is not None else None
+        admission = None
         try:
+            # Own the grant slot BEFORE the first cancellable fence await.
+            # The predecessor release remains independent of this caller.
+            await self._await_run_release(agent_run_id)
+            admission = breaker.admit() if breaker is not None else None
             if admission is not None and not admission.allowed:
                 logger.debug("lease.grant_skipped_breaker_open")
                 return "unreachable", None
@@ -3492,10 +3514,12 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 await self._surrender_late_renewal(late_surrender)
             return self._grant_verdict_for_breaker(verdict, response, breaker)
         finally:
-            if breaker is not None:
-                breaker.release_probe(admission)
-            self._release_grant_slot(agent_run_id)
-            self._dispatch_owed_releases()
+            try:
+                if breaker is not None:
+                    breaker.release_probe(admission)
+            finally:
+                self._release_grant_slot(agent_run_id)
+                self._dispatch_owed_releases()
 
     def _start_renewal(
         self,

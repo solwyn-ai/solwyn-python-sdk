@@ -1402,11 +1402,11 @@ class TestResponsesPublicProxySync:
 
         with _sync_solwyn(client) as solwyn:
             check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
+            release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
-                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -1489,11 +1489,11 @@ class TestResponsesPublicProxySync:
 
         with _sync_solwyn(client) as solwyn:
             check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
+            release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
-                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
                 patch_wrapper_local(solwyn, "_wrap_stream", MagicMock(side_effect=original)),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
@@ -2698,11 +2698,11 @@ class TestResponsesPublicProxyAsync:
 
         async with _async_solwyn(client) as solwyn:
             check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
+            release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
-                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -2813,11 +2813,11 @@ class TestResponsesPublicProxyAsync:
 
         async with _async_solwyn(client) as solwyn:
             check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
+            release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
-                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -2835,7 +2835,7 @@ class TestResponsesPublicProxyAsync:
 
             check.assert_awaited_once()
             release.assert_called_once()
-            breaker_failure.assert_called_once_with()
+            breaker_failure.assert_not_called()
             solwyn._solwyn_reporter.report.assert_called_once()
             solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert provider_manager.enter_calls == 1
@@ -3007,11 +3007,11 @@ class TestResponsesPublicProxyAsync:
 
         async with _async_solwyn(client) as solwyn:
             check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
+            release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
-                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
                 patch_wrapper_local(solwyn, "_wrap_stream_async", MagicMock(side_effect=original)),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),

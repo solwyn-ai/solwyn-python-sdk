@@ -425,7 +425,7 @@ dispatch behavior and includes provider-chain usage guarantees.
 
 For CI, pin an independently reviewed literal fingerprint. This example is the
 exhaustive strict, unacknowledged fingerprint exercised against
-`openai==3.14.1` by this repository's real-client test:
+`openai==3.16.2` by this repository's real-client test:
 
 ```python
 from openai import OpenAI
@@ -438,11 +438,11 @@ audit_client = Solwyn(
 )
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
-    guarded_namespaces="sha256:5ac4f04a338bb46ce45b15d6a0467aa49ce3540ddf0ea4f71853aca918680bec",
+    guarded_namespaces="sha256:6bfa6a657ab0d7ca4bf590f5025fd62e578f56feda27554bdfe3408afb6330bc",
     tracked="sha256:586f19c33f350871240a3498fbfa255c9759bec35e1285a8fccfeb937ec68148",
-    untracked="sha256:cbd7671e8d10a9650fc62ee428ddaf9703a1e42dd7e49293b0a2004ea5243569",
+    untracked="sha256:296c16faa314d9a65fa544f74c97ce17460dc0f5259745c3ed5b11bfea6f9492",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    scoped_escapes="sha256:3fbbd428c53229ed5fb3dda7301bd7ef706e8e5223b556c77d33827563859673",
+    scoped_escapes="sha256:2c9fecbbdd8a99bbe7450d602e69d3ca859ee7b68ccea965c4e81e0e72d0fed5",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     unsupported="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     conditional="sha256:ce837f71d1fc97849872c5d0f86b0b1f26e1bc4e46a29c3b1b8004bf4b9bcb77",
@@ -612,6 +612,16 @@ Each reservation includes the input estimate plus the largest effective output
 cap across the configured provider chain, including global defaults, provider
 defaults, and Google/Bedrock nested cap fields. When a hop has no explicit cap,
 `lease_output_bound_default` supplies that hop’s conservative output allowance.
+
+Cancelling an async chat or Responses call retires its local reservation
+immediately. If dispatch may have sent the request, the lease keeps the reserved token bound as spent;
+unknown output usage is never invented or refunded into spendable authority.
+The reporter sends a structural `possibly_succeeded` error receipt, and renewal
+or surrender carries the conservative token tally. Proven pre-dispatch
+cancellation and cancellation during a rejected request's Retry-After wait
+return the reservation. Cancellation is neutral to provider health and frees
+only that attempt's recovery probe. Use stream context managers or explicit
+close when abandoning an established stream so its provider connection closes.
 
 During a control-plane outage, a live lease spends its remaining grant and then
 its holder-specific headroom share. Exhausting both follows the customer’s
