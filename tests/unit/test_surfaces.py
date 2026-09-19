@@ -938,6 +938,75 @@ def test_realtime_calls_children_have_exact_operation_and_raw_response_scopes() 
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("provider", ["openai", "azure_openai", "openai_compatible", "together"])
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_openai_webhook_management_and_mirrors_remain_exact_untracked_surfaces(
+    provider: str, mode: str
+) -> None:
+    # Endpoint CRUD, secret rotation, and sample delivery are not metered SDK calls.
+    # The event-type catalog is a guarded namespace; raw helpers retain escape scope.
+    context = SurfaceContext(provider, "openai", "openai_sdk", mode)
+    operations = {"create", "delete", "list", "retrieve", "rotate_secret", "test", "update"}
+    parent = resolve_surface_rule(context=context, path="webhooks", source=SurfaceSource.RAW)
+    event_types = resolve_surface_rule(
+        context=context, path="webhooks.event_types", source=SurfaceSource.RAW
+    )
+    assert parent is not None and parent.kind is SurfaceKind.NAMESPACE
+    assert event_types is not None and event_types.kind is SurfaceKind.NAMESPACE
+    assert event_types.selectors == parent.selectors
+    assert event_types.acknowledgment_token is None
+    assert event_types.expected_shapes == (AttributeShape("cached_property", "resource"),)
+
+    for operation in operations | {"unwrap", "verify_signature"}:
+        _assert_unmetered_operation(context, f"webhooks.{operation}")
+    _assert_unmetered_operation(context, "webhooks.event_types.list")
+    _assert_raw_response_family(context, "webhooks", operations)
+    _assert_raw_response_family(context, "webhooks.event_types", {"list"})
+
+    for helper in ("with_raw_response", "with_streaming_response"):
+        for prefix in (f"webhooks.{helper}", f"{helper}.webhooks"):
+            for suffix in (
+                "",
+                ".event_types",
+                ".event_types.list",
+                *(f".{op}" for op in operations),
+            ):
+                path = prefix + suffix
+                rule = resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW)
+                assert rule is not None and rule.kind is SurfaceKind.UNMETERED_SPEND
+                assert rule.capability_scope is CapabilityScope.RAW_RESPONSE
+                assert rule.acknowledgment_token == path
+                assert rule.selectors == parent.selectors
+                expected = (
+                    AttributeShape("cached_property", "resource")
+                    if suffix in {"", ".event_types"}
+                    else AttributeShape("function", "callable")
+                )
+                assert rule.expected_shapes == (expected,)
+
+    for path in (
+        "webhooks.future_operation",
+        "webhooks.event_types.future_operation",
+        "webhooks.with_raw_response.future_operation",
+        "with_streaming_response.webhooks.event_types.future_operation",
+    ):
+        assert resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW) is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_openai_webhook_rules_do_not_leak_to_native_together(mode: str) -> None:
+    context = SurfaceContext("together", "openai", "native_together", mode)
+    for path in (
+        "webhooks",
+        "webhooks.create",
+        "webhooks.event_types",
+        "with_raw_response.webhooks",
+    ):
+        assert resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW) is None
+
+
+@pytest.mark.unit
 def test_anthropic_work_children_cover_sync_async_and_raw_response_shapes() -> None:
     # Arrange
     operations = {"ack", "heartbeat", "list", "poll", "retrieve", "stats", "stop", "update"}
