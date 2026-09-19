@@ -613,6 +613,16 @@ cap across the configured provider chain, including global defaults, provider
 defaults, and Google/Bedrock nested cap fields. When a hop has no explicit cap,
 `lease_output_bound_default` supplies that hop’s conservative output allowance.
 
+Cancelling an async chat or Responses call retires its local reservation
+immediately. If dispatch may have sent the request, the lease keeps the reserved token bound as spent;
+unknown output usage is never invented or refunded into spendable authority.
+The reporter sends a structural `possibly_succeeded` error receipt, and renewal
+or surrender carries the conservative token tally. Proven pre-dispatch
+cancellation and cancellation during a rejected request's Retry-After wait
+return the reservation. Cancellation is neutral to provider health and frees
+only that attempt's recovery probe. Use stream context managers or explicit
+close when abandoning an established stream so its provider connection closes.
+
 During a control-plane outage, a live lease spends its remaining grant and then
 its holder-specific headroom share. Exhausting both follows the customer’s
 `budget_mode`: `hard_deny` blocks; `alert_only` proceeds with a warning. After a
