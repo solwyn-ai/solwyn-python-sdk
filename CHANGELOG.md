@@ -22,6 +22,18 @@ SDK drops that outage's tally rather than re-sending it forever.
 
 ### Changed
 
+- **Unknown provider usage retains the authorized token bound.** Cancelling an
+  async chat or Responses call after invoking the provider SDK now retires its
+  lease reservation at the reserved bound, rather than leaving a live draw for
+  the reservation sweep to return later. This includes cancellation while the
+  SDK is still waiting for a connection-pool slot: cancellation alone cannot
+  prove that no request was sent. Sync and async dispatch read timeouts, 5xx
+  responses, and protocol drops also retain the bound when ambiguous failover
+  is disabled. Proven pre-send failures and request-shaped FAIL_FAST refusals
+  still return unused authority. The conservative token tally can exceed actual
+  usage and exhaust a lease sooner with aggressive caller timeouts; it does not
+  invent output usage or compute cost. Error receipts retain reconciliation
+  identity, and renewal/surrender carries the token tally off the caller.
 - **Behaviour change: `fail_open=False` now fails closed on the legacy path
   while Solwyn is unreachable.** It used to admit calls against the last known
   dollar limit using a local per-token cost estimate. That ledger started at

@@ -295,6 +295,10 @@ def test_live_sync_stream_keeps_probe_until_one_verdict(failure):
             assert len(calls) == 2
     finally:
         wrapped.close()
+    if failure:
+        event = next(event for event in plane.ingested if event.status == "error")
+        assert event.possibly_succeeded is True
+        assert "failover_error_class" not in event.model_dump(exclude_none=True)
 
 
 @pytest.mark.asyncio
@@ -370,6 +374,10 @@ async def test_live_async_stream_keeps_probe_until_one_verdict(terminal):
             assert len(calls) == 2
     finally:
         await wrapped.close()
+    if terminal == "failure":
+        event = next(event for event in plane.ingested if event.status == "error")
+        assert event.possibly_succeeded is True
+        assert "failover_error_class" not in event.model_dump(exclude_none=True)
 
 
 def test_stale_manager_cleanup_cannot_clear_successor_probe_after_sibling_verdict():

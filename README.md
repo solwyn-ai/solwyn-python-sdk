@@ -622,6 +622,11 @@ cancellation and cancellation during a rejected request's Retry-After wait
 return the reservation. Cancellation is neutral to provider health and frees
 only that attempt's recovery probe. Use stream context managers or explicit
 close when abandoning an established stream so its provider connection closes.
+Sync and async dispatch errors with unknown post-send usage (read timeouts,
+5xx responses, or protocol drops) also retain the bound when ambiguous failover
+is disabled. This conservative debit can exceed actual usage and consume lease
+authority sooner under aggressive timeouts; request-shaped refusals still
+return unused authority.
 
 During a control-plane outage, a live lease spends its remaining grant and then
 its holder-specific headroom share. Exhausting both follows the customer’s

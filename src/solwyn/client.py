@@ -774,7 +774,13 @@ def _make_stream_error_handler(
             agent_run=agent_run,
             record_breaker_failure=provider_failure and isinstance(_exc, Exception),
             possibly_succeeded=True,
-            failover_error_class=type(_exc).__name__,
+            # Ordinary established errors historically omitted this wire field.
+            # Keep new diagnostics limited to cancellation/finalization cleanup.
+            failover_error_class=(
+                type(_exc).__name__
+                if not provider_failure or not isinstance(_exc, Exception)
+                else None
+            ),
             admission=admission,
         )
 
@@ -2863,10 +2869,9 @@ class Solwyn(_SolwynBase):
                             )
                             raise  # 4xx/404/refusal — do NOT advance the chain
                         if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
-                            # The call MAY have landed, but no confirm will ever
-                            # settle it here: the server reconciles the possibly-
-                            # succeeded attempt from the error event.
-                            self._solwyn_budget.release_reservation(
+                            # The receipt lets the server reconcile unknown usage;
+                            # local lease authority must also keep its spent bound.
+                            self._solwyn_budget.abandon_reservation(
                                 call_id,
                                 lease_claim_token=_lease_claim_token(budget),
                             )
@@ -4377,7 +4382,9 @@ class AsyncSolwyn(_SolwynBase):
                             )
                             raise
                         if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
-                            self._solwyn_budget.release_reservation(
+                            # Mirror sync: retire the claim without refunding
+                            # authority the provider may already have consumed.
+                            self._solwyn_budget.abandon_reservation(
                                 call_id,
                                 lease_claim_token=_lease_claim_token(budget),
                             )
