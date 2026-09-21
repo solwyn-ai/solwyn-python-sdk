@@ -48,12 +48,6 @@ class _Status503(Exception):
     status_code = 503
 
 
-class _Status429(Exception):
-    """Rate-limit rejection: provably unserved, so FAILOVER refunds as before."""
-
-    status_code = 429
-
-
 class _Status400(Exception):
     """Request refusal: FAIL_FAST must return unused lease authority."""
 
@@ -289,7 +283,10 @@ async def test_dispatch_abort_retires_draw_without_refunding_unknown_spend(
     event = next(event for event in plane.ingested if event.call_id == call_id)
     assert event.status == "error"
     assert event.possibly_succeeded is (True if ambiguous else None)
-    assert event.failover_error_class == error_type.__name__
+    # The receipt carries the wire-normalized class name: the underscore-prefixed
+    # doubles lose the prefix the API's pattern rejects (`_Status503` ->
+    # `Status503`); the public httpx names are reported unchanged.
+    assert event.failover_error_class == error_type.__name__.removeprefix("_")
     assert event.attempt_index == 0
     assert not event.is_provider_fallback
     assert event.lease_id == _granted_lease_id(plane)

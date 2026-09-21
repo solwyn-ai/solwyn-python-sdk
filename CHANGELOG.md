@@ -110,6 +110,30 @@ SDK drops that outage's tally rather than re-sending it forever.
   into one statement and the lock tracks 0.16.8 so `make check` matches CI.
   Dev-tooling only; nothing changes for installed packages.
 
+### Fixed
+
+- **A provider exception with an unusual class name can no longer cost a
+  metadata batch or hide the provider's error.** Error receipts name the failed
+  call's exception class in `failover_error_class`, which the Solwyn API
+  validates as `^[A-Za-z][A-Za-z0-9_.]*$`, at most 64 characters. The SDK sent
+  `type(exc).__name__` unchanged, so a class with a leading underscore (grpc's
+  `_InactiveRpcError` under the legacy Google client, or any private
+  application class) made the API reject the whole ingest batch with a 422 —
+  which the reporter treats as terminal, dropping the other calls' spend events
+  in that batch too. A class name longer than 64 characters failed earlier, in
+  the SDK's own model, raising a `ValidationError` from the call's error
+  handler in place of the provider's exception and leaving the call's
+  reservation for the sweep. The SDK now normalizes the name before building
+  the event: leading characters up to the first ASCII letter are stripped,
+  every other character outside `[A-Za-z0-9_.]` becomes `_`, and the result is
+  cut to 64 characters (a name with no ASCII letter is omitted). The reported
+  name can therefore differ from `type(exc).__name__` — `_InactiveRpcError` is
+  reported as `InactiveRpcError`. The SDK's wire model now pins the API's
+  pattern, and the dispatch error paths treat the error receipt as best-effort:
+  if one cannot be built or enqueued for any reason, the SDK logs
+  `call.error_receipt_failed` with the failure's class name, still ends the
+  reservation, and re-raises the provider's original exception.
+
 ### Removed
 
 - `solwyn.budget.DEFAULT_COST_PER_TOKEN` and the enforcer's local dollar ledger.

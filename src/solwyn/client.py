@@ -2405,19 +2405,24 @@ class Solwyn(_SolwynBase):
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
-            self._solwyn_reporter.report(
-                self._build_error_event(
-                    model=requested_model,
-                    provider=provider,
-                    latency_ms=(time.monotonic() - start) * 1000,
-                    is_model_fallback=False,
-                    failover_error_class=type(exc).__name__,
-                    call_id=call_id,
-                    agent_run=agent_run,
-                    provider_region=provider_region,
-                    lease_id=_settlement_keys(budget)[1],
+            try:
+                self._solwyn_reporter.report(
+                    self._build_error_event(
+                        model=requested_model,
+                        provider=provider,
+                        latency_ms=(time.monotonic() - start) * 1000,
+                        is_model_fallback=False,
+                        failover_error_class=type(exc).__name__,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                        provider_region=provider_region,
+                        lease_id=_settlement_keys(budget)[1],
+                    )
                 )
-            )
+            except Exception as receipt_exc:
+                # The receipt is best-effort: losing it must never mask the
+                # provider's error or skip the reservation's terminal step.
+                logger.warning("call.error_receipt_failed: %s", type(receipt_exc).__name__)
             raise
         latency_ms = (time.monotonic() - start) * 1000
 
@@ -2943,26 +2948,35 @@ class Solwyn(_SolwynBase):
                         possibly_succeeded = (
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
-                        self._solwyn_reporter.report(
-                            self._build_error_event(
-                                model=served_model,
-                                provider=provider,
-                                latency_ms=ctx.elapsed_ms(),
-                                is_model_fallback=is_model_fallback,
-                                is_provider_fallback=is_provider_fallback,
-                                requested_provider=(
-                                    primary.entry.provider if is_provider_fallback else None
-                                ),
-                                requested_model=requested_model if is_provider_fallback else None,
-                                failover_error_class=type(exc).__name__,
-                                attempt_index=chain_index,
-                                call_id=call_id,
-                                possibly_succeeded=True if possibly_succeeded else None,
-                                agent_run=agent_run,
-                                provider_region=_safe_extract_region(rt),
-                                lease_id=_settlement_keys(budget)[1],
+                        try:
+                            self._solwyn_reporter.report(
+                                self._build_error_event(
+                                    model=served_model,
+                                    provider=provider,
+                                    latency_ms=ctx.elapsed_ms(),
+                                    is_model_fallback=is_model_fallback,
+                                    is_provider_fallback=is_provider_fallback,
+                                    requested_provider=(
+                                        primary.entry.provider if is_provider_fallback else None
+                                    ),
+                                    requested_model=requested_model
+                                    if is_provider_fallback
+                                    else None,
+                                    failover_error_class=type(exc).__name__,
+                                    attempt_index=chain_index,
+                                    call_id=call_id,
+                                    possibly_succeeded=True if possibly_succeeded else None,
+                                    agent_run=agent_run,
+                                    provider_region=_safe_extract_region(rt),
+                                    lease_id=_settlement_keys(budget)[1],
+                                )
                             )
-                        )
+                        except Exception as receipt_exc:
+                            # The receipt is best-effort: losing it must never mask the
+                            # provider's error or skip the reservation's terminal step.
+                            logger.warning(
+                                "call.error_receipt_failed: %s", type(receipt_exc).__name__
+                            )
                         if disp is Disposition.FAIL_FAST:
                             self._solwyn_budget.release_reservation(
                                 call_id,
@@ -4041,19 +4055,24 @@ class AsyncSolwyn(_SolwynBase):
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
-            self._solwyn_reporter.report(
-                self._build_error_event(
-                    model=requested_model,
-                    provider=provider,
-                    latency_ms=(time.monotonic() - start) * 1000,
-                    is_model_fallback=False,
-                    failover_error_class=type(exc).__name__,
-                    call_id=call_id,
-                    agent_run=agent_run,
-                    provider_region=provider_region,
-                    lease_id=_settlement_keys(budget)[1],
+            try:
+                self._solwyn_reporter.report(
+                    self._build_error_event(
+                        model=requested_model,
+                        provider=provider,
+                        latency_ms=(time.monotonic() - start) * 1000,
+                        is_model_fallback=False,
+                        failover_error_class=type(exc).__name__,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                        provider_region=provider_region,
+                        lease_id=_settlement_keys(budget)[1],
+                    )
                 )
-            )
+            except Exception as receipt_exc:
+                # The receipt is best-effort: losing it must never mask the
+                # provider's error or skip the reservation's terminal step.
+                logger.warning("call.error_receipt_failed: %s", type(receipt_exc).__name__)
             raise
         latency_ms = (time.monotonic() - start) * 1000
 
@@ -4529,26 +4548,35 @@ class AsyncSolwyn(_SolwynBase):
                         possibly_succeeded = (
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
-                        self._solwyn_reporter.report(
-                            self._build_error_event(
-                                model=served_model,
-                                provider=provider,
-                                latency_ms=ctx.elapsed_ms(),
-                                is_model_fallback=is_model_fallback,
-                                is_provider_fallback=is_provider_fallback,
-                                requested_provider=(
-                                    primary.entry.provider if is_provider_fallback else None
-                                ),
-                                requested_model=requested_model if is_provider_fallback else None,
-                                failover_error_class=type(exc).__name__,
-                                attempt_index=chain_index,
-                                call_id=call_id,
-                                possibly_succeeded=True if possibly_succeeded else None,
-                                agent_run=agent_run,
-                                provider_region=_safe_extract_region(rt),
-                                lease_id=_settlement_keys(budget)[1],
+                        try:
+                            self._solwyn_reporter.report(
+                                self._build_error_event(
+                                    model=served_model,
+                                    provider=provider,
+                                    latency_ms=ctx.elapsed_ms(),
+                                    is_model_fallback=is_model_fallback,
+                                    is_provider_fallback=is_provider_fallback,
+                                    requested_provider=(
+                                        primary.entry.provider if is_provider_fallback else None
+                                    ),
+                                    requested_model=requested_model
+                                    if is_provider_fallback
+                                    else None,
+                                    failover_error_class=type(exc).__name__,
+                                    attempt_index=chain_index,
+                                    call_id=call_id,
+                                    possibly_succeeded=True if possibly_succeeded else None,
+                                    agent_run=agent_run,
+                                    provider_region=_safe_extract_region(rt),
+                                    lease_id=_settlement_keys(budget)[1],
+                                )
                             )
-                        )
+                        except Exception as receipt_exc:
+                            # The receipt is best-effort: losing it must never mask the
+                            # provider's error or skip the reservation's terminal step.
+                            logger.warning(
+                                "call.error_receipt_failed: %s", type(receipt_exc).__name__
+                            )
                         if disp is Disposition.FAIL_FAST:
                             self._solwyn_budget.release_reservation(
                                 call_id,

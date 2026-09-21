@@ -1426,7 +1426,8 @@ class TestResponsesPublicProxySync:
             solwyn._solwyn_reporter.report.assert_called_once()
             event = solwyn._solwyn_reporter.report.call_args.args[0]
             assert event.possibly_succeeded is True
-            assert event.failover_error_class == "_Status"
+            # `_Status` is reported wire-normalized (leading underscore stripped).
+            assert event.failover_error_class == "Status"
 
     def test_native_stream_helper_fail_fast_enter_failure_spares_the_breaker(self) -> None:
         error = _Status(400, "invalid request")
@@ -1460,7 +1461,8 @@ class TestResponsesPublicProxySync:
             solwyn._solwyn_reporter.report.assert_called_once()
             event = solwyn._solwyn_reporter.report.call_args.args[0]
             assert event.possibly_succeeded is None
-            assert event.failover_error_class == "_Status"
+            # `_Status` is reported wire-normalized (leading underscore stripped).
+            assert event.failover_error_class == "Status"
 
     def test_native_stream_helper_close_failure_does_not_mask_body_exception(self) -> None:
         inner = _FakeSyncResponseStream([], object())
@@ -2732,7 +2734,8 @@ class TestResponsesPublicProxyAsync:
             solwyn._solwyn_reporter.report.assert_called_once()
             event = solwyn._solwyn_reporter.report.call_args.args[0]
             assert event.possibly_succeeded is True
-            assert event.failover_error_class == "_Status"
+            # `_Status` is reported wire-normalized (leading underscore stripped).
+            assert event.failover_error_class == "Status"
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_fail_fast_enter_failure_spares_the_breaker(self) -> None:
@@ -2767,7 +2770,8 @@ class TestResponsesPublicProxyAsync:
             solwyn._solwyn_reporter.report.assert_called_once()
             event = solwyn._solwyn_reporter.report.call_args.args[0]
             assert event.possibly_succeeded is None
-            assert event.failover_error_class == "_Status"
+            # `_Status` is reported wire-normalized (leading underscore stripped).
+            assert event.failover_error_class == "Status"
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_close_failure_does_not_mask_body_exception(self) -> None:
