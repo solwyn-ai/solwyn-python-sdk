@@ -1108,8 +1108,10 @@ async def test_release_request_failure_classification_retains_network_health_and
             enforcer.close()
 
 
-def test_established_native_release_pool_stays_on_owning_loop(
+@pytest.mark.parametrize("closed_owner", [False, True])
+def test_established_native_release_pool_stays_on_owning_loop_while_alive(
     monkeypatch: pytest.MonkeyPatch,
+    closed_owner: bool,
 ) -> None:
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -1159,6 +1161,14 @@ def test_established_native_release_pool_stays_on_owning_loop(
         await enforcer.check_budget(**arguments("foreign"))
         enforcer.surrender_run("foreign")
         await drain(enforcer)
+        if closed_owner:
+            assert requests == ["lease_sent", "lease_foreign"]
+            assert enforcer.release_counts == {}
+            assert breaker.failure_count == 0
+            await enforcer.close()
+            assert enforcer._closed and enforcer._http.is_closed
+            assert requests == ["lease_sent", "lease_foreign", "lease_held"]
+            return
         assert requests == ["lease_sent"]
         assert enforcer.release_counts == {"setup_failed": 1}
         assert breaker.failure_count == 0
@@ -1171,14 +1181,22 @@ def test_established_native_release_pool_stays_on_owning_loop(
         with patch.object(httpx.AsyncHTTPTransport, "handle_async_request", handle):
             owner.run_until_complete(establish())
             pool = enforcer._release_http_task.result()
+            if closed_owner:
+                owner.close()
             asyncio.run(foreign_loop())
-            assert not pool.is_closed
-            owner.run_until_complete(enforcer.close())
-            assert pool.is_closed
-            assert requests == ["lease_sent", "lease_held"]
+            if not closed_owner:
+                assert not pool.is_closed
+                owner.run_until_complete(enforcer.close())
+                assert pool.is_closed
+                assert requests == ["lease_sent", "lease_held"]
+            del pool
+            gc.collect()
     finally:
-        owner.run_until_complete(enforcer.close())
-        owner.close()
+        if owner.is_closed():
+            asyncio.run(enforcer.close())
+        else:
+            owner.run_until_complete(enforcer.close())
+            owner.close()
         server.shutdown()
         server.server_close()
         worker.join(2)
@@ -1269,3 +1287,191 @@ def test_native_pool_teardown_keeps_loop_ownership_after_httpx_marks_closed() ->
             owner.run_until_complete(enforcer.close())
             owner.close()
     assert closing.done() and not closing.cancelled()
+
+
+@pytest.mark.parametrize("release_before_close", [False, True])
+def test_native_release_pool_recovers_after_asyncio_run_closes_owner(
+    release_before_close: bool,
+) -> None:
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    sent: list[str] = []
+    pools: list[weakref.ReferenceType[httpx.AsyncClient]] = []
+
+    async def handle(_transport: object, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("surrender"):
+            sent.append(json.loads(request.content)["lease_id"])
+            return httpx.Response(200, json={})
+        return response(request)
+
+    async def first_loop() -> None:
+        for run_id in ("first", "held"):
+            await enforcer.check_budget(**arguments(run_id))
+        enforcer.surrender_run("first")
+        await drain(enforcer)
+        pools.append(weakref.ref(enforcer._release_http_task.result()))
+
+    async def next_loop() -> None:
+        if release_before_close:
+            await enforcer.check_budget(**arguments("later"))
+            enforcer.surrender_run("later")
+            await drain(enforcer)
+            assert sent == ["lease_first", "lease_later"]
+            assert enforcer._release_http_task.result() is not pools[0]()
+        await enforcer.close()
+        assert sent == [
+            "lease_first",
+            *(["lease_later"] if release_before_close else []),
+            "lease_held",
+        ]
+        assert enforcer._closed and enforcer._http.is_closed
+        assert not enforcer._release_jobs
+        assert enforcer._release_http_task is None
+        assert enforcer.release_counts == {}
+
+    with patch.object(httpx.AsyncHTTPTransport, "handle_async_request", handle):
+        try:
+            asyncio.run(first_loop())
+            assert enforcer._release_http_task.get_loop().is_closed()
+            asyncio.run(next_loop())
+            asyncio.run(enforcer.close())  # Repeated close on another loop is harmless.
+            gc.collect()
+            assert pools[0]() is None
+        finally:
+            asyncio.run(enforcer._http.aclose())
+
+
+def test_queued_release_fence_gets_a_waiter_on_the_new_loop() -> None:
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    held = 0
+    second_loop = False
+    order: list[str] = []
+
+    async def handle(_transport: object, request: httpx.Request) -> httpx.Response:
+        nonlocal held
+        payload = json.loads(request.content)
+        if request.url.path.endswith("surrender"):
+            if not second_loop:
+                held += 1
+                await asyncio.Event().wait()
+            order.append("release:" + payload["lease_id"])
+            return httpx.Response(200, json={})
+        if second_loop:
+            order.append("grant:" + payload["agent_run_id"])
+        return response(request)
+
+    async def first() -> None:
+        for index in range(5):
+            await enforcer.check_budget(**arguments(str(index)))
+        for index in range(4):
+            enforcer.surrender_run(str(index))
+        while held < 4:
+            await asyncio.sleep(0)
+        enforcer.surrender_run("4")
+        admission = asyncio.create_task(enforcer.check_budget(**arguments("4")))
+        while enforcer._releases_owed[0].waiter is None:
+            await asyncio.sleep(0)
+        admission.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await admission
+
+    async def second() -> None:
+        admitted = await asyncio.wait_for(enforcer.check_budget(**arguments("4")), 1)
+        assert admitted.lease_id == "lease_4"
+        assert order[:2] == ["release:lease_4", "grant:4"]
+        assert not enforcer._run_releases
+        await enforcer.close()
+
+    with patch.object(httpx.AsyncHTTPTransport, "handle_async_request", handle):
+        try:
+            asyncio.run(first())
+            assert enforcer._releases_owed[0].waiter.get_loop().is_closed()
+            second_loop = True
+            asyncio.run(second())
+        finally:
+            asyncio.run(enforcer.close())
+
+
+def test_closed_loop_pending_native_initializer_retires_only_its_owned_release() -> None:
+    entered, finish = threading.Event(), threading.Event()
+    original = ssl.create_default_context
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    owner = asyncio.new_event_loop()
+    owner.set_exception_handler(lambda _loop, _context: None)  # Deliberately abandoned tasks.
+    sent: list[str] = []
+
+    def tls(*args: object, **kwargs: object) -> ssl.SSLContext:
+        entered.set()
+        assert finish.wait(5)
+        return original(*args, **kwargs)
+
+    async def handle(_transport: object, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("surrender"):
+            sent.append(json.loads(request.content)["lease_id"])
+            return httpx.Response(200, json={})
+        return response(request)
+
+    async def first() -> None:
+        for run_id in ("abandoned", "held"):
+            await enforcer.check_budget(**arguments(run_id))
+        enforcer.surrender_run("abandoned")
+        assert await asyncio.to_thread(entered.wait, 2)
+
+    with (
+        patch.object(ssl, "create_default_context", tls),
+        patch.object(httpx.AsyncHTTPTransport, "handle_async_request", handle),
+    ):
+        owner.run_until_complete(first())
+        abandoned = list(asyncio.all_tasks(owner))
+        tls_owner = enforcer._release_tls_future
+        owner.close()  # Unlike asyncio.run, this does not cancel/drain pending tasks.
+        try:
+            finish.set()
+            asyncio.run(enforcer.close())
+            assert sent == ["lease_held"]
+            assert enforcer.release_counts == {"cancelled": 1}
+            assert not enforcer._release_jobs and not enforcer._release_active
+            assert enforcer._release_tls_future is tls_owner
+        finally:
+            finish.set()
+            for task in abandoned:
+                task.get_coro().close()  # Exercise delayed finally blocks after replacement.
+            asyncio.run(enforcer.close())
+
+
+def test_abandoned_pool_closer_cannot_clear_replacement_pool_or_closer() -> None:
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    owner = asyncio.new_event_loop()
+    owner.set_exception_handler(lambda _loop, _context: None)  # Deliberately abandoned tasks.
+    entered = asyncio.Event()
+    original = httpx.AsyncHTTPTransport.aclose
+    hold_close = True
+
+    async def slow_close(transport: httpx.AsyncHTTPTransport) -> None:
+        if hold_close:
+            entered.set()
+            await asyncio.Event().wait()
+        await original(transport)
+
+    async def start_close() -> None:
+        await enforcer._release_client()
+        asyncio.create_task(enforcer.close())
+        await entered.wait()
+
+    async def recover(abandoned: list[asyncio.Task[object]]) -> None:
+        fresh_pool = await enforcer._release_client()
+        fresh_initialization = enforcer._release_http_task
+        enforcer._close_release_pool_if_idle()
+        fresh_closer = enforcer._release_pool_closer
+        for task in abandoned:
+            task.get_coro().close()
+        assert enforcer._release_http_task is fresh_initialization
+        assert enforcer._release_pool_closer is fresh_closer
+        await enforcer.close()
+        assert fresh_pool.is_closed and enforcer._http.is_closed
+
+    with patch.object(httpx.AsyncHTTPTransport, "aclose", slow_close):
+        owner.run_until_complete(start_close())
+        abandoned = list(asyncio.all_tasks(owner))
+        owner.close()
+        hold_close = False
+        asyncio.run(recover(abandoned))

@@ -3216,6 +3216,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         # Release tasks (S1), held the same way, plus the per-run index a
         # re-grant fences behind.
         self._release_tasks: set[asyncio.Task[None]] = set()
+        self._release_active: dict[asyncio.Task[None], _OwedRelease] = {}
         self._release_http_task: asyncio.Task[httpx.AsyncClient] | None = None
         self._release_tls_future: Future[ssl.SSLContext] | None = None
         self._release_tls_waiter: asyncio.Future[ssl.SSLContext] | None = None
@@ -3251,6 +3252,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         self._renewal_tasks = set()
         self._renewal_slots_in_use = 0
         self._release_tasks = set()
+        self._release_active = {}
         self._release_http_task = None
         self._release_tls_future = None
         self._release_tls_waiter = None
@@ -3770,6 +3772,39 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             # (this task is not a customer's coroutine) as the slot goes.
             self._dispatch_owed_releases()
 
+    def _discard_closed_loop_release_state(self) -> None:
+        """A closed loop cannot resume its pool, initializer, or teardown.
+
+        Keep the independent TLS owner, but never await/reuse an HTTP pool
+        from a dead loop. No cross-loop aclose is attempted on its sockets.
+        """
+        for name in ("_release_http_task", "_release_pool_closer", "_release_cleanup_task"):
+            task = getattr(self, name)
+            if task is not None and task.get_loop().is_closed():
+                if task.done() and not task.cancelled():
+                    task.exception()
+                setattr(self, name, None)
+        with self._state_lock:
+            if (
+                self._release_tls_waiter is not None
+                and self._release_tls_waiter.get_loop().is_closed()
+            ):
+                self._release_tls_waiter = None
+            # asyncio.run normally cancels/drains these first. Explicitly
+            # closing a loop with pending native tasks can leave exact jobs
+            # behind; that loop can no longer drive their requests. A caller
+            # transport may own external work, so retain its unresolved fences.
+            if self._transport is None:
+                for task in tuple(self._release_tasks):
+                    if task.get_loop().is_closed():
+                        if task.done() and not task.cancelled():
+                            task.exception()
+                        self._release_tasks.discard(task)
+                        owed = self._release_active.pop(task, None)
+                        if owed is not None:
+                            self._count_release_locked("cancelled")
+                            self._finish_release_locked(owed)
+
     def _forget_finished_release_closer(self) -> None:
         closer = self._release_pool_closer
         if closer is not None and closer.done():
@@ -3781,6 +3816,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
     async def _release_client(self) -> httpx.AsyncClient:
         """One loop-local pool initializer over a loop-independent TLS owner."""
         loop = asyncio.get_running_loop()
+        self._discard_closed_loop_release_state()
         self._forget_finished_release_closer()
         closer = self._release_pool_closer
         if closer is not None:
@@ -3803,9 +3839,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             and initialization.get_loop() is not loop
             and (self._transport is None or not initialization.done())
         ):
-            # An established HTTPX pool can contain connections bound to its
-            # original loop. Never silently reuse/discard those resources;
-            # close the enforcer before shutting down that owning loop.
+            # A live owner can still drive/close these resources. Do not
+            # transfer its pool or pending initialization to another loop.
             raise RuntimeError("release HTTP pool belongs to another event loop")
         if initialization is None:
             initialization = asyncio.create_task(self._initialize_release_client())
@@ -3940,6 +3975,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             # new requests from a cancelled renewal's final cleanup. Explicit
             # close's already-owned cleanup task or atexit can claim the queue.
             return
+        self._discard_closed_loop_release_state()
         with self._state_lock:
             self._expire_releases_locked(time.monotonic())
             needed = min(len(self._releases_owed), _MAX_RELEASE_WORKERS - len(self._release_tasks))
@@ -3969,16 +4005,21 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 return
             with self._state_lock:
                 owed = self._next_release_locked()
+                if owed is not None and current is not None:
+                    self._release_active[current] = owed
             if owed is None:
                 return
             try:
                 await self._surrender_payloads([owed.request], owed.deadline)
             except asyncio.CancelledError:
                 with self._state_lock:
-                    self._count_release_locked("cancelled")
+                    if current is None or self._release_active.get(current) is owed:
+                        self._count_release_locked("cancelled")
                 raise
             finally:
                 with self._state_lock:
+                    if current is not None and self._release_active.get(current) is owed:
+                        del self._release_active[current]
                     self._finish_release_locked(owed)
 
     def _release_task_done(self, task: asyncio.Task[None]) -> None:
@@ -4038,6 +4079,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
 
     async def _close_release_pool(self) -> None:
         initialization = self._release_http_task
+        closer = asyncio.current_task()
         try:
             if initialization is not None and not (
                 initialization.done() and initialization.cancelled()
@@ -4049,9 +4091,14 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         finally:
             # A future late renewal may create one fresh pool only AFTER this
             # pool's teardown. Caller transports are wrapped non-closing.
-            if initialization is not None and initialization.done():
+            if (
+                initialization is not None
+                and initialization.done()
+                and self._release_http_task is initialization
+            ):
                 self._release_http_task = None
-            self._release_pool_closer = None
+            if self._release_pool_closer is closer:
+                self._release_pool_closer = None
 
     async def _await_run_release(self, agent_run_id: str, timeout: float | None = None) -> bool:
         self._dispatch_owed_releases()
@@ -4064,7 +4111,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 if not group:
                     return True
                 owed = next(iter(group.values()))
-                if owed.waiter is None:
+                if owed.waiter is None or owed.waiter.get_loop().is_closed():
                     owed.waiter = loop.create_future()
                 waiter = owed.waiter
             remaining = min(deadline, owed.deadline) - time.monotonic()
@@ -4083,6 +4130,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
     async def close(self) -> None:
         """Drain through the same workers; no extra shutdown request fanout."""
         loop = asyncio.get_running_loop()
+        self._discard_closed_loop_release_state()
         initialization = self._release_http_task
         owners = (
             initialization,
@@ -4103,9 +4151,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             and initialization.get_loop() is not loop
             and not initialization.result().is_closed
         ):
-            # Native keep-alive sockets must be closed on their owning loop.
-            # Fail before draining any leases: best-effort aclose on a dead
-            # loop can partially close HTTPX and orphan remaining sockets.
+            # A different live loop still owns this pool and can resume its
+            # I/O or teardown. Fail before draining any leases.
             raise RuntimeError("close the release HTTP pool on its owning event loop")
         payloads = self._begin_close()
         deadline = time.monotonic() + _SURRENDER_TIMEOUT_S

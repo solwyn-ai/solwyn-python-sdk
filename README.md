@@ -607,10 +607,15 @@ and 64 queued releases**, separate from reporter and renewal workers. Releases
 reuse one dedicated HTTP pool; async origin TLS initialization runs in one
 daemon thread, off the application's event loop. If loop shutdown cancels the
 initializer, a later loop can finish initialization using that same TLS work.
-Once established, a native async HTTP pool must be closed on its owning loop;
+While its owning loop is alive, a native async HTTP pool must be closed there;
 close on another loop is rejected before draining leases. Pending initialization
-or cleanup also remains owned by its live loop. HTTPX can still initialize
-separate TLS contexts when connecting through an HTTPS proxy.
+or cleanup also remains owned by its live loop. Once that loop is closed, the
+SDK discards its release pool/task references and creates a fresh pool as needed,
+so that pool no longer blocks a later `asyncio.run(client.close())`. Provider
+clients retain their own loop requirements.
+The same off-loop TLS result remains reusable. Close clients before ending their
+loop for orderly socket teardown. HTTPX can still initialize separate TLS
+contexts when connecting through an HTTPS proxy.
 
 Identical release payloads coalesce; different holder/generation/spend identities
 remain distinct. A full queue abandons the new, unsent courtesy release and
@@ -635,7 +640,9 @@ courtesy budget, expires unsent backlog, and lets outstanding work retain its
 pool until completion. Late renewal authority uses the same dispatcher. The
 existing process-exit fallback is a separate single synchronous sender with a
 shared two-second lease budget; it may overlap already-running release workers.
-Injected transports remain caller-owned throughout. An `activate()` scope on a
+Injected transports remain caller-owned throughout. Manually closing a loop
+with unresolved injected-transport work does not release its request slots or
+fences. An `activate()` scope on a
 `create_run()` handle does not release, because a detached identity is meant to
 be re-entered.
 
