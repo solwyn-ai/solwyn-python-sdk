@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import gc
 import inspect
 from collections.abc import Callable
@@ -760,6 +761,10 @@ def test_sync_injected_transport_is_caller_owned_through_settlement_and_surrende
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
+        # Synchronize the courtesy dispatcher before closing the deliberately
+        # slow reporter so this test exercises confirm AFTER surrender.
+        for worker in list(solwyn._solwyn_budget._release_threads):
+            worker.join(timeout=2)
         solwyn.close()
 
         # The run scope releases its lease as it exits (S2), so the surrender
@@ -805,6 +810,7 @@ async def test_async_injected_transport_is_caller_owned_through_settlement_and_s
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
+        await asyncio.gather(*solwyn._solwyn_budget._release_tasks)
         await solwyn.close()
 
         # The run scope releases its lease as it exits (S2), so the surrender
@@ -829,6 +835,54 @@ async def test_async_injected_transport_is_caller_owned_through_settlement_and_s
 
     assert transport.aclose_calls == 1
     assert transport.closed is True
+
+
+@pytest.mark.unit
+def test_async_wrapper_closes_provider_after_release_pool_owner_loop_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder = _Recorder()
+    provider = _AsyncOpenAIClientStub()
+    provider_closes: list[bool] = []
+
+    async def provider_close() -> None:
+        provider_closes.append(True)
+
+    async def handle(_transport: object, request: httpx.Request) -> httpx.Response:
+        return recorder.handler(request)
+
+    monkeypatch.setattr(provider, "aclose", provider_close, raising=False)
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
+    solwyn = AsyncSolwyn(
+        provider, api_key=VALID_API_KEY, api_url=_API_URL, reporter_flush_interval=3600.0
+    )
+    enforcer = solwyn._solwyn_budget
+
+    async def main() -> None:
+        async with run("run-before-later-close"):
+            await solwyn.chat.completions.create(model="gpt-5.5", messages=[])
+        while enforcer._release_tasks:
+            await asyncio.gather(*enforcer._release_tasks)
+            await asyncio.sleep(0)
+        await enforcer.check_budget(
+            agent_run_id="held",
+            call_id=call_uuid("held-after-owner-exit"),
+            model="gpt-5.5",
+            provider="openai",
+            estimated_input_tokens=1,
+            estimated_output_bound=1,
+        )
+
+    try:
+        asyncio.run(main())
+        assert enforcer._release_http_task.get_loop().is_closed()
+        asyncio.run(solwyn.close())
+        assert provider_closes == [True]
+        assert enforcer._closed and enforcer._http.is_closed
+        assert not enforcer._release_jobs
+        assert recorder.paths.count("/api/v1/budgets/lease/surrender") == 2
+    finally:
+        asyncio.run(enforcer._http.aclose())
 
 
 @pytest.mark.unit

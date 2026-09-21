@@ -1275,6 +1275,7 @@ class TestLeaseSurrender:
             await enforcer.close()
             release.set()
             result = await asyncio.wait_for(check_task, timeout=3.0)
+            await asyncio.gather(*enforcer._release_tasks)
 
             assert result.allowed is True
             assert enforcer._lease.state_for(RUN) is None
@@ -1367,6 +1368,9 @@ class TestLeaseSurrender:
             await asyncio.wait_for(entered.wait(), timeout=3.0)
 
             await enforcer.close()
+            # A successor returned by cancellation cleanup uses the bounded
+            # release workers; it must eventually surrender exactly once.
+            await asyncio.wait_for(enforcer._release_cleanup_task, timeout=3)
 
             import json as _json
 
@@ -1481,7 +1485,8 @@ class TestLeaseSurrender:
             pending = enforcer._run_releases.get(RUN)
 
         assert pending is not None
-        done, deadline = pending
+        owed = next(iter(pending.values()))
+        done, deadline = owed.done, owed.deadline
         assert done.is_set() is False
         assert enforcer._release_threads == set()
         assert deadline > time.monotonic()
@@ -1684,6 +1689,7 @@ class TestLeaseSurrender:
             enforcer.surrender_run(RUN)
             assert _wait_for(lambda: surrender.call_count == 1)
             enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
+            assert _wait_for(lambda: surrender.call_count == 2)
 
         generations = [
             LeaseSurrenderRequest.model_validate_json(call.request.content).generation
@@ -1739,7 +1745,7 @@ class TestLeaseSurrender:
         assert [(request.lease_id, request.spent_tokens) for request in payloads] == [
             ("lease_1", 7)
         ]
-        assert enforcer._releases_owed == []
+        assert not enforcer._releases_owed
 
     def test_a_release_that_cannot_be_dispatched_waits_for_close(self) -> None:
         # Thread exhaustion (or an interpreter shutting down) must not eat the
@@ -1767,11 +1773,9 @@ class TestLeaseSurrender:
             ):
                 enforcer._renew_lease(RUN, renewal, ["gpt-5.5"])
                 parked = [owed.request.lease_id for owed in enforcer._releases_owed]
-                # The fence is OPEN: nothing is in flight for a re-grant to
-                # wait on, so it must not sit out the whole release budget.
-                assert all(
-                    owed.done is not None and owed.done.is_set() for owed in enforcer._releases_owed
-                )
+                # Undispatched work remains fenced: a later retry must not
+                # send an old release after a regrant has overtaken it.
+                assert all(not owed.done.is_set() for owed in enforcer._releases_owed)
                 assert surrender.call_count == 0
             assert all(thread.ident is not None for thread in enforcer._release_threads)
 
@@ -2692,7 +2696,7 @@ class TestLeaseForkReset:
 
             enforcer._reset_after_fork_in_child()
 
-        assert enforcer._releases_owed == []
+        assert not enforcer._releases_owed
         assert enforcer._run_releases == {}
         assert enforcer._release_threads == set()
         enforcer._http.close()

@@ -2168,6 +2168,11 @@ class TestSyncReceiptFolding:
             worker = threading.Thread(target=reporter._drain_event_batches, daemon=True)
             worker.start()
             worker.join(timeout=1.0)
+            assert not worker.is_alive()
+            assert reentered.is_set()
+            # The reentrant arrival belongs to the next bounded event turn.
+            assert [pending.event.call_id for pending in reporter._queue] == [reentrant.call_id]
+            reporter._drain_event_batches()
 
         assert not worker.is_alive()
         assert reentered.is_set()
