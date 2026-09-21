@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, field
 from typing import Annotated, Literal, cast, get_args
 
 import httpx
@@ -95,6 +97,11 @@ _RENEWAL_TIMEOUT_S = 5.0
 # background work, but background must still be bounded: one client owns at
 # most this many renewal threads/tasks regardless of run cardinality.
 _MAX_RENEWAL_WORKERS = 4
+
+# Courtesy releases have their own capacity; they never consume reporter
+# workers. These are fixed implementation bounds, not additional public knobs.
+_MAX_RELEASE_WORKERS = 4
+_MAX_PENDING_RELEASES = 64
 
 # Allow-cache entries are bounded independently from sticky deny state. The
 # key is the server-priced chain shape; estimates are deliberately excluded.
@@ -202,25 +209,29 @@ class BudgetCheckResult(BaseModel):
     failover_tuning_allowed: bool | None = None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class _OwedRelease:
-    """A release the holder owes for a lease it dropped, plus its fence.
+    """Exact release ownership, from drop until no request can still act.
 
-    ``done`` is set when the release has been answered, abandoned, or claimed
-    by ``close()``; a re-grant for the same run waits on it (bounded by the
-    release's own budget) so it can never overtake the release of the lease it
-    replaces. It exists from the instant of the DROP — the same ``_state_lock``
-    section that parked the payload — because the window this closes is the one
-    between the drop and a worker starting.
-
-    None on the async enforcer: there, parking and scheduling happen in one
-    task with no await between them, so no other coroutine can run in between
-    and there is no window to fence.
+    A queue deadline can abandon UNSENT work, never an active request. A
+    caller that exhausts its wait takes legacy admission while the fence and
+    worker capacity remain owned until the underlying request ends.
     """
 
-    run_id: str
+    run_id: str | None
     request: LeaseSurrenderRequest
-    done: threading.Event | None = None
+    deadline: float
+    done: threading.Event = field(default_factory=threading.Event)
+    waiter: asyncio.Future[None] | None = None
+
+    @property
+    def key(self) -> tuple[str, str, int, int]:
+        return (
+            self.request.lease_id,
+            self.request.holder_id,
+            self.request.generation,
+            self.request.spent_tokens,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,7 +359,10 @@ class _BudgetEnforcerBase:
         # (S1). Parked under ``_state_lock`` by whichever ledger seam observed
         # the drop, then posted off the caller's thread by the concrete
         # enforcer. close() drains whatever is still parked.
-        self._releases_owed: list[_OwedRelease] = []
+        self._releases_owed: deque[_OwedRelease] = deque()
+        self._release_jobs: dict[tuple[str, str, int, int], _OwedRelease] = {}
+        self._run_releases: dict[str, dict[tuple[str, str, int, int], _OwedRelease]] = {}
+        self._release_counts: dict[str, int] = {}
 
     def _reset_after_fork_in_child(self) -> None:
         """Replace the state lock in a forked child (concrete classes also swap
@@ -381,7 +395,10 @@ class _BudgetEnforcerBase:
         self._late_renewal_spend = {}
         # The parent's leases are the parent's to release: a child posting
         # them would reclaim float the parent is still drawing on.
-        self._releases_owed = []
+        self._releases_owed = deque()
+        self._release_jobs = {}
+        self._run_releases = {}
+        self._release_counts = {}
 
     def _build_check_request(
         self,
@@ -1751,50 +1768,111 @@ class _BudgetEnforcerBase:
         with self._state_lock:
             return self._claim_owed_releases_locked() + self._lease.drain_surrender_requests()
 
+    @property
+    def release_counts(self) -> dict[str, int]:
+        """Courtesy work omitted locally; the server still reclaims at expiry."""
+        with self._state_lock:
+            return dict(self._release_counts)
+
+    def _count_release_locked(self, reason: str) -> None:
+        self._release_counts[reason] = min(
+            SIGNED_BIGINT_MAX, self._release_counts.get(reason, 0) + 1
+        )
+
     def _owe_release_locked(
         self,
-        agent_run_id: str,
+        agent_run_id: str | None,
         request: LeaseSurrenderRequest | None,
+        *,
+        deadline: float | None = None,
     ) -> None:
-        """Park the release for a dropped lease; ``None`` (no drop) no-ops.
+        """Queue exact authority under the drop's lock, without waiting.
 
-        Called with ``_state_lock`` held, from the seam that observed the
-        drop. The I/O never happens here: a drop can be observed on a
-        customer's thread (a blocking grant) and the enforcer must not post a
-        courtesy release on it. The fence a re-grant waits on is raised in
-        THIS lock section, not when a worker later starts.
+        Only identical payloads coalesce. In particular, a successor generation
+        or a different spent delta is never silently replaced. Queue overflow
+        abandons this UNSENT courtesy request permanently: it cannot later race
+        a successor grant, and the server retains its normal expiry backstop.
         """
-        if request is not None:
-            self._releases_owed.append(self._fence_release_locked(agent_run_id, request))
+        if request is None:
+            return
+        now = time.monotonic()
+        self._expire_releases_locked(now)
+        owed = _OwedRelease(
+            agent_run_id, request, now + _RELEASE_BUDGET_S if deadline is None else deadline
+        )
+        if owed.key in self._release_jobs:
+            return
+        if owed.deadline <= now:
+            self._count_release_locked("expired")
+            return
+        if len(self._releases_owed) >= _MAX_PENDING_RELEASES:
+            self._count_release_locked("queue_full")
+            return
+        self._release_jobs[owed.key] = owed
+        if agent_run_id is not None:
+            self._run_releases.setdefault(agent_run_id, {})[owed.key] = owed
+        self._releases_owed.append(owed)
 
-    def _fence_release_locked(
-        self,
-        agent_run_id: str,
-        request: LeaseSurrenderRequest,
-    ) -> _OwedRelease:
-        """Wrap a parked release; unfenced unless the flavour needs one."""
-        return _OwedRelease(agent_run_id, request)
+    @staticmethod
+    def _wake_release_waiter(waiter: asyncio.Future[None]) -> None:
+        if not waiter.done():
+            waiter.set_result(None)
 
-    def _take_owed_releases(self) -> list[_OwedRelease]:
-        """Claim every parked release for dispatch (never called under the lock)."""
-        with self._state_lock:
-            owed = self._releases_owed
-            self._releases_owed = []
-            return owed
+    def _finish_release_locked(self, owed: _OwedRelease) -> None:
+        """Remove only this identity, never a late worker's successor fence."""
+        if self._release_jobs.get(owed.key) is not owed:
+            return
+        del self._release_jobs[owed.key]
+        if owed.run_id is not None:
+            group = self._run_releases.get(owed.run_id)
+            if group is not None and group.get(owed.key) is owed:
+                del group[owed.key]
+                if not group:
+                    del self._run_releases[owed.run_id]
+        owed.done.set()
+        if owed.waiter is not None:
+            # The owning event loop may already have shut down at process exit.
+            with suppress(RuntimeError):
+                owed.waiter.get_loop().call_soon_threadsafe(self._wake_release_waiter, owed.waiter)
+
+    def _expire_releases_locked(self, now: float) -> None:
+        # At most 64 entries. Active work is absent from this queue and MUST
+        # keep its fence/capacity even after its nominal deadline has passed.
+        for _ in range(len(self._releases_owed)):
+            owed = self._releases_owed.popleft()
+            if owed.deadline <= now:
+                self._count_release_locked("expired")
+                self._finish_release_locked(owed)
+            else:
+                self._releases_owed.append(owed)
+
+    def _next_release_locked(self) -> _OwedRelease | None:
+        self._expire_releases_locked(time.monotonic())
+        return self._releases_owed.popleft() if self._releases_owed else None
 
     def _claim_owed_releases_locked(self) -> list[LeaseSurrenderRequest]:
-        """Take parked releases for a drain that will send them itself.
+        """Transfer only UNSENT releases to the synchronous interpreter exit.
 
-        Opens each fence: once close() or the exit hook owns the payload, no
-        worker will ever answer it, and a re-grant must not wait out a
-        deadline for one that is not coming.
+        Exit does not permit subsequent admission. Active workers retain their
+        own exact ownership; no release can be submitted twice by this drain.
         """
-        owed = self._releases_owed
-        self._releases_owed = []
-        for item in owed:
-            if item.done is not None:
-                item.done.set()
-        return [item.request for item in owed]
+        self._expire_releases_locked(time.monotonic())
+        payloads = []
+        while self._releases_owed:
+            owed = self._releases_owed.popleft()
+            payloads.append(owed.request)
+            self._finish_release_locked(owed)
+        return payloads
+
+    def _queue_close_releases(
+        self, payloads: Sequence[LeaseSurrenderRequest], deadline: float
+    ) -> None:
+        with self._state_lock:
+            for owed in self._releases_owed:
+                owed.deadline = min(owed.deadline, deadline)
+            for request in payloads:
+                self._owe_release_locked(None, request, deadline=deadline)
+        self._dispatch_owed_releases()
 
     def surrender_run(self, agent_run_id: str) -> None:
         """Release the lease held for a run whose scope has ended (S2).
@@ -1843,7 +1921,7 @@ class _BudgetEnforcerBase:
             self._close_epoch += 1
             # A release parked but never dispatched (no thread, no loop) is
             # still owed: close is its last chance to reach the server.
-            return self._claim_owed_releases_locked() + self._lease.drain_surrender_requests()
+            return self._lease.drain_surrender_requests()
 
     def _late_lease_surrender_request(
         self,
@@ -2325,7 +2403,8 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         # Event rather than the worker, because it is raised at the DROP and a
         # worker may not exist yet (or at all).
         self._release_threads: set[threading.Thread] = set()
-        self._run_releases: dict[str, tuple[threading.Event, float]] = {}
+        self._release_http: httpx.Client | None = None
+        self._release_client_lock = threading.Lock()
         register_fork_reset(self)
         register_lease_holder(self)
 
@@ -2353,7 +2432,8 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         self._renewal_threads = set()
         self._renewal_slots = threading.BoundedSemaphore(_MAX_RENEWAL_WORKERS)
         self._release_threads = set()
-        self._run_releases = {}
+        self._release_http = None
+        self._release_client_lock = threading.Lock()
 
     def check_budget(
         self,
@@ -2723,7 +2803,8 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         breaker = self._control_plane_breaker
         admission = None
         try:
-            self._await_run_release(agent_run_id)
+            if not self._await_run_release(agent_run_id, timeout):
+                return "legacy", None
             admission = breaker.admit() if breaker is not None else None
             if admission is not None and not admission.allowed:
                 logger.debug("lease.grant_skipped_breaker_open")
@@ -2762,7 +2843,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 close_epoch=close_epoch,
             )
             if late_surrender is not None:
-                self._surrender_late_renewal(late_surrender)
+                self._surrender_late_renewal(late_surrender, agent_run_id)
             return self._grant_verdict_for_breaker(verdict, response, breaker)
         finally:
             try:
@@ -2898,7 +2979,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 close_epoch=close_epoch,
             )
             if late_surrender is not None:
-                self._surrender_late_renewal(late_surrender)
+                self._surrender_late_renewal(late_surrender, agent_run_id)
         except Exception as exc:  # pragma: no cover — a worker must never raise
             logger.warning("lease.renew_worker_failed: %s", type(exc).__name__)
         finally:
@@ -2913,176 +2994,148 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         payloads: Sequence[LeaseSurrenderRequest],
         deadline: float,
     ) -> None:
-        """Send releases over a temporary client until one global deadline."""
-        client = self._new_http_client(timeout=_SURRENDER_TIMEOUT_S)
-        try:
-            for request in payloads:
-                for _attempt in range(_SURRENDER_ATTEMPTS):
+        """Send courtesy work through one lazily owned, reusable pool."""
+        for request in payloads:
+            for _attempt in range(_SURRENDER_ATTEMPTS):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                breaker = self._control_plane_breaker
+                admission = breaker.admit() if breaker is not None else None
+                try:
+                    if admission is not None and not admission.allowed:
+                        logger.debug("lease.surrender_skipped_breaker_open")
+                        break
+                    # This is a release worker, never the customer's thread.
+                    # A breaker hold/expired item does not even create a pool.
+                    with self._release_client_lock:
+                        if self._release_http is None:
+                            self._release_http = self._new_http_client(_SURRENDER_TIMEOUT_S)
+                        client = self._release_http
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return
-                    breaker = self._control_plane_breaker
-                    admission = breaker.admit() if breaker is not None else None
-                    try:
-                        if admission is not None and not admission.allowed:
-                            logger.debug("lease.surrender_skipped_breaker_open")
-                            break
-                        client.post(
-                            f"{self.api_url}{_LEASE_SURRENDER_PATH}",
-                            json=request.model_dump(mode="json"),
-                            headers=self._auth_headers(),
-                            timeout=max(0.001, min(_SURRENDER_TIMEOUT_S, remaining)),
-                        ).raise_for_status()
-                        if breaker is not None:
-                            breaker.record_success()
-                    except Exception as exc:
-                        # The server reclaims an unsurrendered lease at its
-                        # deadline; a failed courtesy release never surfaces.
-                        logger.debug("lease.surrender_failed: %s", type(exc).__name__)
-                        if breaker is not None and not handle_read_only_key_error(exc):
-                            breaker.record_failure()
-                        if isinstance(exc, httpx.TimeoutException):
-                            continue
-                    finally:
-                        if breaker is not None:
-                            breaker.release_probe(admission)
-                    break
-        finally:
-            client.close()
+                    client.post(
+                        f"{self.api_url}{_LEASE_SURRENDER_PATH}",
+                        json=request.model_dump(mode="json"),
+                        headers=self._auth_headers(),
+                        timeout=max(0.001, min(_SURRENDER_TIMEOUT_S, remaining)),
+                    ).raise_for_status()
+                    if breaker is not None:
+                        breaker.record_success()
+                except Exception as exc:
+                    logger.debug("lease.surrender_failed: %s", type(exc).__name__)
+                    if breaker is not None and not handle_read_only_key_error(exc):
+                        breaker.record_failure()
+                    if isinstance(exc, httpx.TimeoutException):
+                        continue
+                finally:
+                    if breaker is not None:
+                        breaker.release_probe(admission)
+                break
 
-    def _surrender_late_renewal(self, request: LeaseSurrenderRequest) -> None:
-        """Release a successor observed after close fenced its installation."""
-        self._surrender_payloads(
-            [request],
-            time.monotonic() + _SURRENDER_TIMEOUT_S,
-        )
-
-    def _fence_release_locked(
-        self,
-        agent_run_id: str,
-        request: LeaseSurrenderRequest,
-    ) -> _OwedRelease:
-        """Raise this run's re-grant fence in the drop's own lock section.
-
-        Registering it when a worker starts would leave a window: between the
-        drop and that start, a concurrent admission can claim this run's grant
-        slot and reach the server first. Here there is no such window — the
-        fence exists before the lock that observed the drop is released.
-
-        Overwriting an existing fence for the same run is safe: a second drop
-        needs a re-grant in between, and that re-grant already waited out the
-        first fence.
-        """
-        pending = (threading.Event(), time.monotonic() + _RELEASE_BUDGET_S)
-        self._run_releases = {
-            run_id: fence for run_id, fence in self._run_releases.items() if not fence[0].is_set()
-        }
-        self._run_releases[agent_run_id] = pending
-        return _OwedRelease(agent_run_id, request, pending[0])
+    def _surrender_late_renewal(self, request: LeaseSurrenderRequest, agent_run_id: str) -> None:
+        """Late authority uses the same queue, capacity and generation fence."""
+        with self._state_lock:
+            self._owe_release_locked(agent_run_id, request)
+        self._dispatch_owed_releases()
 
     def _dispatch_owed_releases(self) -> None:
-        """Release every dropped lease on its own daemon thread.
-
-        The caller pays thread dispatch and nothing else. A thread that cannot
-        start (exhaustion, or an interpreter shutting down) is exactly the case
-        ``_start_renewal`` already tolerates: log it, open the fence (nothing
-        is in flight to wait for), and re-park the payload so close() is still
-        able to send it.
-        """
-        for owed in self._take_owed_releases():
-            deadline = time.monotonic() + _RELEASE_BUDGET_S
-            worker = threading.Thread(
-                target=self._run_release_worker,
-                args=(owed, deadline),
-                name="solwyn-lease-release",
-                daemon=True,
+        """Start at most four daemon workers; never block for a work slot."""
+        with self._state_lock:
+            self._expire_releases_locked(time.monotonic())
+            needed = min(
+                len(self._releases_owed), _MAX_RELEASE_WORKERS - len(self._release_threads)
             )
-            try:
-                worker.start()
-            except Exception as exc:
-                logger.debug("lease.release_dispatch_failed: %s", type(exc).__name__)
-                if owed.done is not None:
-                    owed.done.set()
-                with self._state_lock:
-                    self._releases_owed.append(owed)
-                continue
-            # Registered only once STARTED: close() joins both worker sets, and
-            # joining a thread that never started raises.
-            with self._state_lock:
-                self._release_threads = {t for t in self._release_threads if t.is_alive()}
+            for _ in range(needed):
+                worker = threading.Thread(
+                    target=self._run_release_worker, name="solwyn-lease-release", daemon=True
+                )
+                # Start and register under the same lock the worker claims
+                # under: completion cannot race registration or close's join.
+                try:
+                    worker.start()
+                except Exception as exc:
+                    self._count_release_locked("dispatch_failed")
+                    logger.debug("lease.release_dispatch_failed: %s", type(exc).__name__)
+                    break  # Bounded parked queue stays fenced for a later try.
                 self._release_threads.add(worker)
 
-    def _run_release_worker(self, owed: _OwedRelease, deadline: float) -> None:
-        """Post one release and open its fence however it ends."""
+    def _run_release_worker(self) -> None:
+        """One capacity owner drains queued requests until no work remains."""
         try:
-            self._surrender_payloads([owed.request], deadline)
+            while True:
+                with self._state_lock:
+                    owed = self._next_release_locked()
+                    if owed is None:
+                        # Atomic idle transition: an enqueue after this point
+                        # sees the free slot and starts its own worker.
+                        self._release_threads.discard(threading.current_thread())
+                        return
+                try:
+                    self._surrender_payloads([owed.request], owed.deadline)
+                finally:
+                    with self._state_lock:
+                        self._finish_release_locked(owed)
         finally:
-            if owed.done is not None:
-                owed.done.set()
+            with self._state_lock:
+                self._release_threads.discard(threading.current_thread())
+            self._close_release_pool_if_idle()
 
-    def _await_run_release(self, agent_run_id: str) -> None:
-        """Fence a re-grant behind the release of the lease it replaces (S1).
+    def _close_release_pool_if_idle(self) -> None:
+        # A timed-out join does NOT free a worker or close its live pool. The
+        # last actual completion owns teardown, including post-close renewals.
+        if not self._release_client_lock.acquire(blocking=False):
+            return  # A live constructor/teardown still owns the pool.
+        try:
+            with self._state_lock:
+                if not self._closed or self._release_threads:
+                    return
+                client, self._release_http = self._release_http, None
+            if client is not None:
+                client.close()
+        finally:
+            self._release_client_lock.release()
 
-        Two drops can be followed by another grant from the SAME holder: an
-        unreadable body (after its 30s ineligible floor) and a stopped run id
-        that comes back. Letting the grant overtake the release would ask the
-        server to reclaim a lease row the grant path has already replaced.
-        Bounded by the release's own budget, and a no-op whenever no release
-        for this run is outstanding — which is every ordinary grant, and every
-        re-grant legal long after that budget.
-        """
-        with self._state_lock:
-            pending = self._run_releases.get(agent_run_id)
-        if pending is None:
-            return
-        done, deadline = pending
-        done.wait(timeout=max(0.0, deadline - time.monotonic()))
-        with self._state_lock:
-            if self._run_releases.get(agent_run_id) is pending:
-                del self._run_releases[agent_run_id]
+    def _await_run_release(self, agent_run_id: str, timeout: float | None = None) -> bool:
+        """Wait within the caller's budget; retain any still-active fence."""
+        self._dispatch_owed_releases()
+        deadline = time.monotonic() + (_RELEASE_BUDGET_S if timeout is None else timeout)
+        while True:
+            with self._state_lock:
+                self._expire_releases_locked(time.monotonic())
+                group = self._run_releases.get(agent_run_id)
+                if not group:
+                    return True
+                owed = next(iter(group.values()))
+            remaining = min(deadline, owed.deadline) - time.monotonic()
+            if remaining <= 0 or not owed.done.wait(remaining):
+                return False  # Legacy check, never an overtaking grant.
 
     def _surrender_leases(self) -> None:
-        """Compatibility helper for explicit best-effort drains."""
-        self._surrender_payloads(
-            self.lease_surrender_payloads(),
-            time.monotonic() + _SURRENDER_TIMEOUT_S,
-        )
+        """Compatibility helper; all work still goes through bounded dispatch."""
+        self.close()
 
     def close(self) -> None:
-        """Fence renewals, drain state, and surrender within one deadline."""
+        """Fence renewal installation, drain releases, and join to one deadline."""
         payloads = self._begin_close()
-        if payloads is None:
-            # Best-effort transport teardown, not a bound — nothing is still
-            # running here. A no-op when ``self._transport`` was injected by
-            # the caller: the client wraps it non-closing and the caller
-            # keeps it open by design.
-            self._http.close()
-            return
         drain_deadline = time.monotonic() + _SURRENDER_TIMEOUT_S
-        with self._state_lock:
-            threads = list(self._renewal_threads | self._release_threads)
-
-        surrender_worker: threading.Thread | None = None
-        if payloads:
-            surrender_worker = threading.Thread(
-                target=self._surrender_payloads,
-                args=(payloads, drain_deadline),
-                name="solwyn-lease-surrender",
-                daemon=True,
-            )
-            try:
-                surrender_worker.start()
-            except RuntimeError:
-                logger.debug("lease.surrender_dispatch_failed")
-                surrender_worker = None
-
-        for thread in threads:
-            thread.join(timeout=max(0.0, drain_deadline - time.monotonic()))
-        if surrender_worker is not None:
-            surrender_worker.join(timeout=max(0.0, drain_deadline - time.monotonic()))
-        # The joins above are the real bound; this is best-effort teardown of
-        # a still-stuck worker's transport, and a no-op when ``self._transport``
-        # was injected by the caller (wrapped non-closing, left open by design).
+        if payloads is not None:
+            self._queue_close_releases(payloads, drain_deadline)
+            while time.monotonic() < drain_deadline:
+                with self._state_lock:
+                    threads = [
+                        thread
+                        for thread in self._renewal_threads | self._release_threads
+                        if thread.is_alive()
+                    ]
+                if not threads:
+                    break
+                for thread in threads:
+                    thread.join(timeout=max(0.0, drain_deadline - time.monotonic()))
+            with self._state_lock:
+                self._expire_releases_locked(drain_deadline)
+        self._close_release_pool_if_idle()
         self._http.close()
 
 
@@ -3129,14 +3182,18 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         # Release tasks (S1), held the same way, plus the per-run index a
         # re-grant fences behind.
         self._release_tasks: set[asyncio.Task[None]] = set()
-        self._run_releases: dict[str, tuple[asyncio.Task[None], float]] = {}
+        self._release_http_task: asyncio.Task[httpx.AsyncClient] | None = None
+        self._release_pool_closer: asyncio.Task[None] | None = None
+        self._release_cleanup_task: asyncio.Task[None] | None = None
         register_fork_reset(self)
         register_lease_holder(self)
 
-    def _new_async_http_client(self, timeout: float = 5.0) -> httpx.AsyncClient:
+    def _new_async_http_client(
+        self, timeout: float = 5.0, *, verify: ssl.SSLContext | bool = True
+    ) -> httpx.AsyncClient:
         """Build an async control-plane client on the configured transport."""
         transport = non_closing_async_transport(self._transport)
-        return httpx.AsyncClient(timeout=timeout, transport=transport)
+        return httpx.AsyncClient(timeout=timeout, transport=transport, verify=verify)
 
     def _new_exit_http_client(self) -> httpx.Client:
         """Build the sync client used by the interpreter-exit lease drain."""
@@ -3158,7 +3215,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         self._renewal_tasks = set()
         self._renewal_slots_in_use = 0
         self._release_tasks = set()
-        self._run_releases = {}
+        self._release_http_task = None
+        self._release_pool_closer = None
+        self._release_cleanup_task = None
 
     async def check_budget(
         self,
@@ -3487,7 +3546,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         try:
             # Own the grant slot BEFORE the first cancellable fence await.
             # The predecessor release remains independent of this caller.
-            await self._await_run_release(agent_run_id)
+            if not await self._await_run_release(agent_run_id, timeout):
+                return "legacy", None
             admission = breaker.admit() if breaker is not None else None
             if admission is not None and not admission.allowed:
                 logger.debug("lease.grant_skipped_breaker_open")
@@ -3526,7 +3586,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 close_epoch=close_epoch,
             )
             if late_surrender is not None:
-                await self._surrender_late_renewal(late_surrender)
+                await self._surrender_late_renewal(late_surrender, agent_run_id)
             return self._grant_verdict_for_breaker(verdict, response, breaker)
         finally:
             try:
@@ -3653,7 +3713,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 close_epoch=close_epoch,
             )
             if late_surrender is not None:
-                await self._surrender_late_renewal(late_surrender)
+                await self._surrender_late_renewal(late_surrender, agent_run_id)
         except asyncio.CancelledError:
             with self._state_lock:
                 self._lease.renewal_failed(
@@ -3672,140 +3732,285 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             # (this task is not a customer's coroutine) as the slot goes.
             self._dispatch_owed_releases()
 
+    async def _release_client(self) -> httpx.AsyncClient:
+        """One construction owner, off-loop, shared by all four workers.
+
+        Shielding retains initialization even when a release await is cancelled:
+        cancellation does not stop synchronous TLS setup. No new initializer
+        can start until this one has actually finished.
+        """
+        if self._release_pool_closer is not None:
+            await asyncio.shield(self._release_pool_closer)
+        if self._release_http_task is None:
+            self._release_http_task = asyncio.create_task(self._initialize_release_client())
+        initialization = self._release_http_task
+        try:
+            return await asyncio.shield(initialization)
+        except Exception:
+            # A failed construction owns no pool. Allow a later item to try
+            # again, without an older waiter's failure detaching a newer try.
+            if initialization.done() and self._release_http_task is initialization:
+                self._release_http_task = None
+            raise
+
+    async def _initialize_release_client(self) -> httpx.AsyncClient:
+        # HTTPX's native constructor loads trust roots synchronously. Offload
+        # just that work, before making the pool: cancellation of the whole
+        # event loop can abandon an SSLContext safely, never a live client.
+        # Passing the completed context makes HTTPX reuse it for origin TLS.
+        # HTTPS proxies can still do their own TLS setup inside HTTPcore.
+        # Caller-injected transports need no TLS setup.
+        verify: ssl.SSLContext | bool = True
+        if self._transport is None:
+            loop = asyncio.get_running_loop()
+            ready: asyncio.Future[ssl.SSLContext] = loop.create_future()
+
+            def complete(context: ssl.SSLContext | None, error: BaseException | None) -> None:
+                if ready.done():
+                    return
+                if error is not None:
+                    ready.set_exception(error)
+                elif context is not None:
+                    ready.set_result(context)
+                else:
+                    ready.set_exception(
+                        RuntimeError("release TLS initialization returned no context")
+                    )
+
+            def initialize_tls() -> None:
+                context = None
+                error = None
+                try:
+                    context = httpx.create_ssl_context()
+                except BaseException as exc:
+                    error = exc
+                with suppress(RuntimeError):
+                    loop.call_soon_threadsafe(complete, context, error)
+
+            # A singleton daemon, not an executor queue (whose shutdown joins
+            # could extend process exit). No sockets/clients exist in it. If
+            # the loop closes first, its result is just a disposable context.
+            threading.Thread(target=initialize_tls, name="solwyn-release-tls", daemon=True).start()
+            verify = await ready
+        return self._new_async_http_client(_SURRENDER_TIMEOUT_S, verify=verify)
+
     async def _surrender_payloads(
         self,
         payloads: Sequence[LeaseSurrenderRequest],
         deadline: float,
     ) -> None:
-        """Async release drain bounded by one monotonic deadline."""
-        async with self._new_async_http_client(timeout=_SURRENDER_TIMEOUT_S) as client:
-            for request in payloads:
-                for _attempt in range(_SURRENDER_ATTEMPTS):
+        """Serial timeout-only retries on the reusable release pool."""
+        for request in payloads:
+            for _attempt in range(_SURRENDER_ATTEMPTS):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                breaker = self._control_plane_breaker
+                admission = breaker.admit() if breaker is not None else None
+                try:
+                    if admission is not None and not admission.allowed:
+                        logger.debug("lease.surrender_skipped_breaker_open")
+                        break
+                    client = await self._release_client()
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return
-                    breaker = self._control_plane_breaker
-                    admission = breaker.admit() if breaker is not None else None
-                    try:
-                        if admission is not None and not admission.allowed:
-                            logger.debug("lease.surrender_skipped_breaker_open")
-                            break
-                        resp = await client.post(
-                            f"{self.api_url}{_LEASE_SURRENDER_PATH}",
-                            json=request.model_dump(mode="json"),
-                            headers=self._auth_headers(),
-                            timeout=max(0.001, min(_SURRENDER_TIMEOUT_S, remaining)),
-                        )
-                        resp.raise_for_status()
-                        if breaker is not None:
-                            breaker.record_success()
-                    except Exception as exc:
-                        logger.debug("lease.surrender_failed: %s", type(exc).__name__)
-                        if breaker is not None and not handle_read_only_key_error(exc):
-                            breaker.record_failure()
-                        if isinstance(exc, httpx.TimeoutException):
-                            continue
-                    finally:
-                        if breaker is not None:
-                            breaker.release_probe(admission)
-                    break
+                    resp = await client.post(
+                        f"{self.api_url}{_LEASE_SURRENDER_PATH}",
+                        json=request.model_dump(mode="json"),
+                        headers=self._auth_headers(),
+                        timeout=max(0.001, min(_SURRENDER_TIMEOUT_S, remaining)),
+                    )
+                    resp.raise_for_status()
+                    if breaker is not None:
+                        breaker.record_success()
+                except Exception as exc:
+                    logger.debug("lease.surrender_failed: %s", type(exc).__name__)
+                    if breaker is not None and not handle_read_only_key_error(exc):
+                        breaker.record_failure()
+                    if isinstance(exc, httpx.TimeoutException):
+                        continue
+                finally:
+                    if breaker is not None:
+                        breaker.release_probe(admission)
+                break
 
-    async def _surrender_late_renewal(self, request: LeaseSurrenderRequest) -> None:
-        """Release a renewal successor observed after the close epoch changed."""
-        await self._surrender_payloads(
-            [request],
-            time.monotonic() + _SURRENDER_TIMEOUT_S,
-        )
+    async def _surrender_late_renewal(
+        self, request: LeaseSurrenderRequest, agent_run_id: str
+    ) -> None:
+        """Queue late authority without borrowing the renewal/caller task."""
+        with self._state_lock:
+            self._owe_release_locked(agent_run_id, request)
+        self._dispatch_owed_releases()
 
     def _dispatch_owed_releases(self) -> None:
-        """Schedule every dropped lease's release as its own task.
-
-        Deliberately NOT a coroutine: it runs from a ``finally`` that may be
-        unwinding a cancellation, and it must never add an await there. With
-        no running loop the releases stay PARKED rather than being dropped —
-        a run scope closing from synchronous code has no loop, and close()
-        is then their last chance.
-
-        No park-time fence is needed here (``_OwedRelease.done`` stays None):
-        the drop, the park and this scheduling all run in ONE task with no
-        await between them, so no other coroutine can observe the drop before
-        the task exists for a re-grant to wait on.
-        """
-        with self._state_lock:
-            if not self._releases_owed:
-                # Every run-scope exit calls this, most with nothing owed:
-                # never make that no-op look like a failed dispatch.
-                return
+        """At most four tasks, each claiming work from the bounded queue."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            logger.debug("lease.release_dispatch_failed: RuntimeError")
+            return  # Off-loop scope exit stays bounded and fenced until startup/exit.
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            # In particular, asyncio.run's cancel-all snapshot must not spawn
+            # new requests from a cancelled renewal's final cleanup. Explicit
+            # close's already-owned cleanup task or atexit can claim the queue.
             return
-        for owed in self._take_owed_releases():
-            deadline = time.monotonic() + _RELEASE_BUDGET_S
-            coroutine = self._surrender_payloads([owed.request], deadline)
+        with self._state_lock:
+            self._expire_releases_locked(time.monotonic())
+            needed = min(len(self._releases_owed), _MAX_RELEASE_WORKERS - len(self._release_tasks))
+        for _ in range(needed):
+            coroutine = self._run_release_worker()
             try:
                 task = loop.create_task(coroutine)
             except Exception as exc:
                 coroutine.close()
+                with self._state_lock:
+                    self._count_release_locked("dispatch_failed")
                 logger.debug("lease.release_dispatch_failed: %s", type(exc).__name__)
-                continue
+                break
             with self._state_lock:
                 self._release_tasks.add(task)
-                self._run_releases[owed.run_id] = (task, deadline)
             task.add_done_callback(self._release_task_done)
+        if needed and self._closed:
+            self._ensure_release_cleanup()
+
+    async def _run_release_worker(self) -> None:
+        while True:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                # A transport may suppress CancelledError and finish its
+                # response. That retires THIS request, not permission to
+                # claim another during the loop's cancel-all shutdown.
+                return
+            with self._state_lock:
+                owed = self._next_release_locked()
+            if owed is None:
+                return
+            try:
+                await self._surrender_payloads([owed.request], owed.deadline)
+            finally:
+                with self._state_lock:
+                    self._finish_release_locked(owed)
 
     def _release_task_done(self, task: asyncio.Task[None]) -> None:
-        """Forget a finished release so neither index grows with run cardinality."""
+        """Capacity follows actual completion, including cancellation cleanup."""
         with self._state_lock:
             self._release_tasks.discard(task)
-            self._run_releases = {
-                run_id: pending
-                for run_id, pending in self._run_releases.items()
-                if pending[0] is not task
-            }
+        if not task.cancelled():
+            task.exception()  # Observe a hostile transport/probe cleanup exception.
+            if not task.cancelling():
+                self._dispatch_owed_releases()
+        # Cancellation never resurrects workers outside asyncio.run's shutdown
+        # snapshot. Queued work stays available to an explicit trigger/atexit.
+        # Pool teardown after close has its own pre-existing ownership task.
 
-    async def _await_run_release(self, agent_run_id: str) -> None:
-        """Async twin of ``BudgetEnforcer._await_run_release`` (the S1 fence)."""
-        with self._state_lock:
-            pending = self._run_releases.get(agent_run_id)
-        if pending is None:
-            return
-        task, deadline = pending
-        # Never cancel it: an unanswered release is worse than a late one.
-        await asyncio.wait([task], timeout=max(0.0, deadline - time.monotonic()))
+    def _ensure_release_cleanup(self) -> None:
+        if self._release_cleanup_task is None or self._release_cleanup_task.done():
+            self._release_cleanup_task = asyncio.create_task(self._cleanup_releases())
+
+    async def _cleanup_releases(self) -> None:
+        """Own post-deadline teardown without creating tasks from cancellation."""
+        while True:
+            with self._state_lock:
+                tasks = list(self._release_tasks | self._renewal_tasks)
+            if tasks:
+                await asyncio.wait(tasks)
+                await asyncio.sleep(0)
+            self._dispatch_owed_releases()
+            if self._release_tasks or self._renewal_tasks:
+                continue
+            self._close_release_pool_if_idle()
+            if self._release_pool_closer is not None:
+                await asyncio.shield(self._release_pool_closer)
+            # A grant can return late during aclose, queue a release and wait
+            # for the old pool to close before building its own. Keep cleanup
+            # ownership through that handoff instead of leaking the new pool.
+            if (
+                not self._release_tasks
+                and not self._renewal_tasks
+                and self._release_http_task is None
+            ):
+                return
+
+    def _close_release_pool_if_idle(self) -> None:
+        if (
+            self._closed
+            and not self._release_tasks
+            and self._release_http_task is not None
+            and self._release_pool_closer is None
+        ):
+            self._release_pool_closer = asyncio.create_task(self._close_release_pool())
+
+    async def _close_release_pool(self) -> None:
+        initialization = self._release_http_task
+        try:
+            if initialization is not None:
+                client = await asyncio.shield(initialization)
+                await client.aclose()
+        except Exception as exc:
+            logger.debug("lease.release_pool_close_failed: %s", type(exc).__name__)
+        finally:
+            # A future late renewal may create one fresh pool only AFTER this
+            # pool's teardown. Caller transports are wrapped non-closing.
+            if initialization is not None and initialization.done():
+                self._release_http_task = None
+            self._release_pool_closer = None
+
+    async def _await_run_release(self, agent_run_id: str, timeout: float | None = None) -> bool:
+        self._dispatch_owed_releases()
+        deadline = time.monotonic() + (_RELEASE_BUDGET_S if timeout is None else timeout)
+        loop = asyncio.get_running_loop()
+        while True:
+            with self._state_lock:
+                self._expire_releases_locked(time.monotonic())
+                group = self._run_releases.get(agent_run_id)
+                if not group:
+                    return True
+                owed = next(iter(group.values()))
+                if owed.waiter is None:
+                    owed.waiter = loop.create_future()
+                waiter = owed.waiter
+            remaining = min(deadline, owed.deadline) - time.monotonic()
+            if remaining <= 0:
+                return False
+            # asyncio.wait never cancels the fence or its request on timeout
+            # or caller cancellation; Sequence A's grant-slot finally remains.
+            done, _ = await asyncio.wait([waiter], timeout=remaining)
+            if not done:
+                return False
 
     async def _surrender_leases(self) -> None:
-        """Compatibility helper for explicit best-effort drains."""
-        await self._surrender_payloads(
-            self.lease_surrender_payloads(),
-            time.monotonic() + _SURRENDER_TIMEOUT_S,
-        )
+        """Compatibility helper; all work still goes through bounded dispatch."""
+        await self.close()
 
     async def close(self) -> None:
-        """Await renewals and release drained leases within one deadline."""
+        """Drain through the same workers; no extra shutdown request fanout."""
         payloads = self._begin_close()
-        if payloads is None:
-            await self._http.aclose()
-            return
-        drain_deadline = time.monotonic() + _SURRENDER_TIMEOUT_S
-        with self._state_lock:
-            renewal_tasks = list(self._renewal_tasks)
-            release_tasks = list(self._release_tasks)
-
-        waitables: list[asyncio.Task[None]] = [*renewal_tasks, *release_tasks]
-        if payloads:
-            waitables.append(
-                asyncio.create_task(self._surrender_payloads(payloads, drain_deadline))
-            )
-        if waitables:
-            _, pending = await asyncio.wait(
-                waitables,
-                timeout=max(0.0, drain_deadline - time.monotonic()),
-            )
-            for task in pending:
-                task.cancel()
-            # Let cooperative cancellation run without adding another
-            # unbounded shutdown wait.
-            await asyncio.sleep(0)
+        deadline = time.monotonic() + _SURRENDER_TIMEOUT_S
+        if payloads is not None:
+            self._queue_close_releases(payloads, deadline)
+            self._ensure_release_cleanup()
+            # Renewals can enqueue a late successor. Re-snapshot after they
+            # finish so that successor gets the same remaining close budget.
+            while True:
+                with self._state_lock:
+                    tasks = list(self._renewal_tasks | self._release_tasks)
+                if not tasks:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    with self._state_lock:
+                        self._expire_releases_locked(deadline)
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.sleep(0)
+                    break
+                await asyncio.wait(tasks, timeout=remaining)
+                await asyncio.sleep(0)  # Let completion callbacks return their slots.
+        self._ensure_release_cleanup()
+        closer = self._release_cleanup_task
+        if closer is not None:
+            # Teardown (including still-running initialization) stays owned if
+            # this wait times out or the customer cancels close().
+            await asyncio.wait([closer], timeout=max(0.0, deadline - time.monotonic()))
         await self._http.aclose()

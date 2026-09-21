@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import gc
 import inspect
 from collections.abc import Callable
@@ -760,6 +761,10 @@ def test_sync_injected_transport_is_caller_owned_through_settlement_and_surrende
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
+        # Synchronize the courtesy dispatcher before closing the deliberately
+        # slow reporter so this test exercises confirm AFTER surrender.
+        for worker in list(solwyn._solwyn_budget._release_threads):
+            worker.join(timeout=2)
         solwyn.close()
 
         # The run scope releases its lease as it exits (S2), so the surrender
@@ -805,6 +810,7 @@ async def test_async_injected_transport_is_caller_owned_through_settlement_and_s
                 model="gpt-5.5",
                 messages=[{"role": "user", "content": "Hello"}],
             )
+        await asyncio.gather(*solwyn._solwyn_budget._release_tasks)
         await solwyn.close()
 
         # The run scope releases its lease as it exits (S2), so the surrender

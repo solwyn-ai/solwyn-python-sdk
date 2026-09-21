@@ -100,7 +100,7 @@ async def test_fence_cancellation_preserves_release_and_future_local_admission()
             release_entered, release_finish = transport.hold("surrender", run_id)
             enforcer.surrender_run(run_id)
             await asyncio.wait_for(release_entered.wait(), timeout=2)
-            release_task = enforcer._run_releases[run_id][0]
+            release_task = next(iter(enforcer._release_tasks))
 
             pending = asyncio.create_task(_check(enforcer, run_id, "cancelled"))
             # The predecessor is held, so this checkpoint puts the winner
@@ -227,6 +227,7 @@ async def test_close_racing_grant_surrenders_late_authority_exactly_once() -> No
         await enforcer.close()
         grant_finish.set()
         result = await asyncio.wait_for(pending, timeout=2)
+        await asyncio.gather(*enforcer._release_tasks)
 
         assert result.lease_id is None
         assert enforcer._lease.state_for(run_id) is None

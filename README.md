@@ -601,12 +601,45 @@ with `lease_enabled=False` keep using the per-call `/budgets/check` path.
 A lease is handed back as soon as the SDK knows it has stopped using it: when the
 `with solwyn.run(...)` block exits (or `RunHandle.finish()` is called), when a
 renewal comes back ineligible or denied, when a lease response cannot be read,
-and when the server stops the run. The release is sent off your thread, so an
-exit costs thread dispatch and nothing else, and it is best-effort — an
-unreleased lease is still reclaimed at its server deadline. Work that outlives
-the scope with the run id still bound keeps working: its next call finds no
-lease and pays one grant. An `activate()` scope on a `create_run()` handle does
-not release, because a detached identity is meant to be re-entered.
+and when the server stops the run. Release enqueue never waits for network or a
+worker slot. Each budget enforcer has at most **four release workers/requests
+and 64 queued releases**, separate from reporter and renewal workers. Releases
+reuse one dedicated HTTP pool; async origin TLS initialization runs once per pool in a
+daemon thread, off the application's event loop. HTTPX can still initialize
+separate TLS contexts when connecting through an HTTPS proxy.
+
+Identical release payloads coalesce; different holder/generation/spend identities
+remain distinct. A full queue abandons the new, unsent courtesy release and
+increments `BudgetEnforcer.release_counts["queue_full"]` (also available on
+`AsyncBudgetEnforcer`). Unsent work expires six seconds after enqueue, counted
+as `expired`; failed worker startup is counted as `dispatch_failed` and leaves
+the bounded queue available for retry or shutdown. The server reclaims leases
+that it did not hear about at its own expiry. These limits add no configuration
+options and do not change the wire protocol.
+
+Work that outlives a scope with the same run id waits for its old release before
+regranting. If the bounded wait expires while that request is still active, the
+call uses the per-call budget check instead; the old request keeps its worker
+slot and fence until it actually ends. `close()` waits up to its three-second
+courtesy budget, expires unsent backlog, and lets outstanding work retain its
+pool until completion. Late renewal authority uses the same dispatcher. The
+existing process-exit fallback is a separate single synchronous sender with a
+shared two-second lease budget; it may overlap already-running release workers.
+Injected transports remain caller-owned throughout. An `activate()` scope on a
+`create_run()` handle does not release, because a detached identity is meant to
+be re-entered.
+
+Settlement delivery remains serial and off the caller. Each reporter cycle
+handles at most `min(reporter_batch_size, reporter_max_queue_size)` standalone
+confirms and the same number of settlement confirms (50 each by default), then
+services ready metadata. Its metadata stage has a bounded snapshot of batches,
+so new arrivals cannot indefinitely postpone heartbeat/advisory work. Productive
+cycles continue immediately; idle and retry-held queues retain their cadence.
+Each settlement's own confirm disposition still precedes its metadata transfer.
+`reporter_max_in_flight` remains an event-send guard, **not a parallel-confirm or
+throughput setting**. Queue capacities, counted overflow, retry limits and the
+single reporter shutdown deadline are unchanged; bursts before the first
+scheduled flush can still overflow.
 
 Each reservation includes the input estimate plus the largest effective output
 cap across the configured provider chain, including global defaults, provider
