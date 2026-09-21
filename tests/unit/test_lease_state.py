@@ -778,6 +778,50 @@ class TestReservationLifecycle:
         assert state.granted_remaining_tokens == 100_000
         assert state.spent_tokens_since_report == 0
 
+    @pytest.mark.parametrize("terminal", ["release", "sweep", "true_up_under", "true_up_over"])
+    def test_a_pinned_reservation_is_never_refunded_below_its_bound(self, terminal: str) -> None:
+        # A failed-over ambiguous hop may already have been billed. The call
+        # keeps walking on the same reservation, so the pin must survive to
+        # whichever terminal ends it — and stay a floor, not a clamp.
+        ledger = _granted_ledger(lease_length_s=10_000.0)
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+
+        ledger.mark_spend_unknown("a", claim_token=_claim_token(ledger, "a"))
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert "a" in state.reservations  # still in flight
+        assert state.spent_tokens_since_report == 0
+
+        if terminal == "release":
+            _release(ledger, "a")
+        elif terminal == "sweep":
+            assert ledger.sweep(now=1_001.0 + RESERVATION_MAX_AGE_S) == 1
+        elif terminal == "true_up_under":
+            _true_up(ledger, "a", 400)
+        else:
+            _true_up(ledger, "a", 9_000)
+
+        spent = 9_000 if terminal == "true_up_over" else 1_500
+        assert state.reservations == {}
+        assert state.granted_remaining_tokens == 100_000 - spent
+        assert state.spent_tokens_since_report == spent
+
+    def test_a_stale_or_unknown_pin_is_a_no_op(self) -> None:
+        ledger = _granted_ledger()
+        _admit(ledger, call_id="a", estimated_input_tokens=1_000, output_bound=500)
+        token = _claim_token(ledger, "a")
+        assert token is not None
+
+        ledger.mark_spend_unknown("never-admitted", claim_token=token)
+        ledger.mark_spend_unknown("a", claim_token=None)
+        ledger.mark_spend_unknown("a", claim_token=token + 1)
+        _release(ledger, "a")
+
+        state = ledger.state_for(RUN)
+        assert state is not None
+        assert state.granted_remaining_tokens == 100_000
+        assert state.spent_tokens_since_report == 0
+
     def test_true_up_and_release_of_an_unknown_call_are_no_ops(self) -> None:
         ledger = _granted_ledger()
 

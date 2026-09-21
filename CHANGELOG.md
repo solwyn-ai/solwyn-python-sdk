@@ -22,6 +22,36 @@ SDK drops that outage's tally rather than re-sending it forever.
 
 ### Changed
 
+- **Unknown provider usage retains the authorized token bound.** Cancelling an
+  async chat or Responses call after invoking the provider SDK now retires its
+  lease reservation at the reserved bound, rather than leaving a live draw for
+  the reservation sweep to return later. This includes cancellation while the
+  SDK is still waiting for a connection-pool slot: cancellation alone cannot
+  prove that no request was sent. A sync call interrupted mid-dispatch by a
+  non-`Exception` `BaseException` (`KeyboardInterrupt`, `SystemExit`, a
+  greenlet kill) is now reconciled the same way instead of being left for the
+  sweep to refund: the bound is kept once the provider SDK was invoked, the
+  reservation is returned when the interrupt provably landed first or during a
+  rejected request's Retry-After wait, the provider breaker records no verdict,
+  and the original interrupt is re-raised. In both clients, a failure while
+  wrapping an already-open provider stream no longer leaks the reservation: it
+  keeps the bound behind a `possibly_succeeded` error receipt, records no
+  provider breaker failure, best-effort closes the provider stream, and
+  re-raises the original error. The Responses `stream()` manager already
+  reconciled a wrap failure at context entry; it now follows the same rule and
+  no longer records a provider breaker failure for it, and that receipt now
+  names the wrapping error's class in `failover_error_class`. Sync and async dispatch read timeouts, 5xx
+  responses, and protocol drops also retain the bound when ambiguous failover
+  is disabled. Under `failover_idempotency="always"` such a hop fails over on
+  the same reservation, which is now pinned at its bound for the rest of the
+  call: a later served hop settles at no less than the bound (its confirm still
+  carries the measured usage), and a later refusal, chain exhaustion,
+  cancellation, or reservation sweep retires the bound instead of refunding
+  it. Proven pre-send failures and request-shaped FAIL_FAST refusals
+  still return unused authority. The conservative token tally can exceed actual
+  usage and exhaust a lease sooner with aggressive caller timeouts; it does not
+  invent output usage or compute cost. Error receipts retain reconciliation
+  identity, and renewal/surrender carries the token tally off the caller.
 - **Behaviour change: `fail_open=False` now fails closed on the legacy path
   while Solwyn is unreachable.** It used to admit calls against the last known
   dollar limit using a local per-token cost estimate. That ledger started at
@@ -79,6 +109,30 @@ SDK drops that outage's tally rather than re-sending it forever.
   flags nested `async with` blocks (SIM117); the three test sites are combined
   into one statement and the lock tracks 0.16.8 so `make check` matches CI.
   Dev-tooling only; nothing changes for installed packages.
+
+### Fixed
+
+- **A provider exception with an unusual class name can no longer cost a
+  metadata batch or hide the provider's error.** Error receipts name the failed
+  call's exception class in `failover_error_class`, which the Solwyn API
+  validates as `^[A-Za-z][A-Za-z0-9_.]*$`, at most 64 characters. The SDK sent
+  `type(exc).__name__` unchanged, so a class with a leading underscore (grpc's
+  `_InactiveRpcError` under the legacy Google client, or any private
+  application class) made the API reject the whole ingest batch with a 422 —
+  which the reporter treats as terminal, dropping the other calls' spend events
+  in that batch too. A class name longer than 64 characters failed earlier, in
+  the SDK's own model, raising a `ValidationError` from the call's error
+  handler in place of the provider's exception and leaving the call's
+  reservation for the sweep. The SDK now normalizes the name before building
+  the event: leading characters up to the first ASCII letter are stripped,
+  every other character outside `[A-Za-z0-9_.]` becomes `_`, and the result is
+  cut to 64 characters (a name with no ASCII letter is omitted). The reported
+  name can therefore differ from `type(exc).__name__` — `_InactiveRpcError` is
+  reported as `InactiveRpcError`. The SDK's wire model now pins the API's
+  pattern, and the dispatch error paths treat the error receipt as best-effort:
+  if one cannot be built or enqueued for any reason, the SDK logs
+  `call.error_receipt_failed` with the failure's class name, still ends the
+  reservation, and re-raises the provider's original exception.
 
 ### Removed
 

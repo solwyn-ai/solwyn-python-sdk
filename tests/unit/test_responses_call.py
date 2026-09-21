@@ -1402,11 +1402,11 @@ class TestResponsesPublicProxySync:
 
         with _sync_solwyn(client) as solwyn:
             check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
+            release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
-                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -1426,7 +1426,8 @@ class TestResponsesPublicProxySync:
             solwyn._solwyn_reporter.report.assert_called_once()
             event = solwyn._solwyn_reporter.report.call_args.args[0]
             assert event.possibly_succeeded is True
-            assert event.failover_error_class == "_Status"
+            # `_Status` is reported wire-normalized (leading underscore stripped).
+            assert event.failover_error_class == "Status"
 
     def test_native_stream_helper_fail_fast_enter_failure_spares_the_breaker(self) -> None:
         error = _Status(400, "invalid request")
@@ -1460,7 +1461,8 @@ class TestResponsesPublicProxySync:
             solwyn._solwyn_reporter.report.assert_called_once()
             event = solwyn._solwyn_reporter.report.call_args.args[0]
             assert event.possibly_succeeded is None
-            assert event.failover_error_class == "_Status"
+            # `_Status` is reported wire-normalized (leading underscore stripped).
+            assert event.failover_error_class == "Status"
 
     def test_native_stream_helper_close_failure_does_not_mask_body_exception(self) -> None:
         inner = _FakeSyncResponseStream([], object())
@@ -1489,17 +1491,22 @@ class TestResponsesPublicProxySync:
 
         with _sync_solwyn(client) as solwyn:
             check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
+            release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
-                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
                 patch_wrapper_local(solwyn, "_wrap_stream", MagicMock(side_effect=original)),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
                     new=breaker_failure,
                 ),
+                patch.object(
+                    solwyn._get_circuit_breaker("openai"),
+                    "release_probe",
+                    wraps=solwyn._get_circuit_breaker("openai").release_probe,
+                ) as probe_release,
             ):
                 manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
                 with pytest.raises(ValueError, match="wrapping failed") as exc_info:
@@ -1508,8 +1515,13 @@ class TestResponsesPublicProxySync:
 
             assert exc_info.value is original
             release.assert_called_once()
-            breaker_failure.assert_called_once_with()
+            # Wrapping is SDK-side bookkeeping, never a provider-health verdict.
+            breaker_failure.assert_not_called()
+            probe_release.assert_called_once()
             solwyn._solwyn_reporter.report.assert_called_once()
+            receipt = solwyn._solwyn_reporter.report.call_args.args[0]
+            assert receipt.possibly_succeeded is True
+            assert receipt.failover_error_class == "ValueError"
             solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert len(provider_manager.exit_calls) == 1
             assert inner.close_calls == 1
@@ -2698,11 +2710,11 @@ class TestResponsesPublicProxyAsync:
 
         async with _async_solwyn(client) as solwyn:
             check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
+            release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
-                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -2722,7 +2734,8 @@ class TestResponsesPublicProxyAsync:
             solwyn._solwyn_reporter.report.assert_called_once()
             event = solwyn._solwyn_reporter.report.call_args.args[0]
             assert event.possibly_succeeded is True
-            assert event.failover_error_class == "_Status"
+            # `_Status` is reported wire-normalized (leading underscore stripped).
+            assert event.failover_error_class == "Status"
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_fail_fast_enter_failure_spares_the_breaker(self) -> None:
@@ -2757,7 +2770,8 @@ class TestResponsesPublicProxyAsync:
             solwyn._solwyn_reporter.report.assert_called_once()
             event = solwyn._solwyn_reporter.report.call_args.args[0]
             assert event.possibly_succeeded is None
-            assert event.failover_error_class == "_Status"
+            # `_Status` is reported wire-normalized (leading underscore stripped).
+            assert event.failover_error_class == "Status"
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_close_failure_does_not_mask_body_exception(self) -> None:
@@ -2813,11 +2827,11 @@ class TestResponsesPublicProxyAsync:
 
         async with _async_solwyn(client) as solwyn:
             check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
+            release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
-                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -2835,7 +2849,7 @@ class TestResponsesPublicProxyAsync:
 
             check.assert_awaited_once()
             release.assert_called_once()
-            breaker_failure.assert_called_once_with()
+            breaker_failure.assert_not_called()
             solwyn._solwyn_reporter.report.assert_called_once()
             solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert provider_manager.enter_calls == 1
@@ -3007,17 +3021,22 @@ class TestResponsesPublicProxyAsync:
 
         async with _async_solwyn(client) as solwyn:
             check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
-            release = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
+            release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
-                patch.object(solwyn._solwyn_budget, "release_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
                 patch_wrapper_local(solwyn, "_wrap_stream_async", MagicMock(side_effect=original)),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
                     new=breaker_failure,
                 ),
+                patch.object(
+                    solwyn._get_circuit_breaker("openai"),
+                    "release_probe",
+                    wraps=solwyn._get_circuit_breaker("openai").release_probe,
+                ) as probe_release,
             ):
                 manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
                 with pytest.raises(ValueError, match="wrapping failed") as exc_info:
@@ -3026,8 +3045,13 @@ class TestResponsesPublicProxyAsync:
 
             assert exc_info.value is original
             release.assert_called_once()
-            breaker_failure.assert_called_once_with()
+            # Wrapping is SDK-side bookkeeping, never a provider-health verdict.
+            breaker_failure.assert_not_called()
+            probe_release.assert_called_once()
             solwyn._solwyn_reporter.report.assert_called_once()
+            receipt = solwyn._solwyn_reporter.report.call_args.args[0]
+            assert receipt.possibly_succeeded is True
+            assert receipt.failover_error_class == "ValueError"
             solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert len(provider_manager.exit_calls) == 1
             assert inner.aclose_calls == 1

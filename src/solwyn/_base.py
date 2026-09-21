@@ -11,6 +11,7 @@ import contextlib
 import inspect
 import logging
 import os
+import re
 import statistics
 import threading
 import time
@@ -23,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn, TypedDict,
 
 from pydantic import BaseModel, ConfigDict
 
-from solwyn._constants import ORDINARY_TOKEN_COUNT_MAX
+from solwyn._constants import FAILOVER_ERROR_CLASS_MAX_LENGTH, ORDINARY_TOKEN_COUNT_MAX
 from solwyn._lifecycle import register_fork_reset
 from solwyn._routing import (
     CostPolicy,
@@ -176,6 +177,42 @@ def _wire_token_quantity(value: int) -> int:
     accounting than a destroyed receipt or a crashed paid call.
     """
     return min(max(value, 0), ORDINARY_TOKEN_COUNT_MAX)
+
+
+# The two halves of FAILOVER_ERROR_CLASS_PATTERN, inverted: everything before
+# the first ASCII letter, and every character the pattern's tail does not admit.
+# Explicit ASCII ranges, so a non-ASCII letter (which str.isalpha would accept
+# and the API would reject) is handled as the foreign character it is.
+_ERROR_CLASS_LEADING_NON_LETTERS = re.compile(r"^[^A-Za-z]+")
+_ERROR_CLASS_FOREIGN_CHARACTER = re.compile(r"[^A-Za-z0-9_.]")
+
+
+def _wire_error_class(name: str | None) -> str | None:
+    """Map an exception CLASS NAME into the wire model's validated shape.
+
+    Same contract as ``_wire_token_quantity``: only the reported artifact is
+    normalized. ``failover_error_class`` is pattern-validated by the API, whose
+    ingest route rejects the WHOLE batch when one event fails, and by the SDK's
+    own model, which would otherwise raise inside an error handler and mask the
+    provider's exception. Real classes fall outside the shape — grpc's
+    ``_InactiveRpcError``, any private or generated class — so the name is
+    normalized rather than trusted:
+
+    * leading characters up to the first ASCII letter are stripped
+      (``_InactiveRpcError`` -> ``InactiveRpcError``);
+    * each remaining character outside ``[A-Za-z0-9_.]`` becomes ``_``;
+    * the result is cut to ``FAILOVER_ERROR_CLASS_MAX_LENGTH``;
+    * ``None`` passes through, and a name with no ASCII letter — or a non-string
+      — is ``None``, which the None-skipping serializer drops from the wire.
+
+    Total and deterministic: never raises. It must only ever be handed a class
+    name; it is not a scrubber and gives no licence to pass exception text.
+    """
+    if not isinstance(name, str):
+        return None
+    stripped = _ERROR_CLASS_LEADING_NON_LETTERS.sub("", name, count=1)
+    bounded = stripped[:FAILOVER_ERROR_CLASS_MAX_LENGTH]
+    return _ERROR_CLASS_FOREIGN_CHARACTER.sub("_", bounded) or None
 
 
 # CostPolicy is inert when the request carried NO hint map at all
@@ -1732,6 +1769,9 @@ class _SolwynBase:
         for chat/text events (None-skipped on the wire). ``lease_id`` is the
         funding lease of the call's admission, the value on ``budget.lease_id``;
         None for every unfunded or reservation-funded event.
+        ``failover_error_class`` is an exception class NAME; this is the single
+        choke point that normalizes it (``_wire_error_class``), so no caller
+        can build an event the API's pattern would reject.
         """
         if not call_id:
             raise RuntimeError("call_id is required for metadata reconciliation")
@@ -1753,7 +1793,7 @@ class _SolwynBase:
             requested_provider=requested_provider,
             requested_model=requested_model,
             failover_reason=failover_reason,
-            failover_error_class=failover_error_class,
+            failover_error_class=_wire_error_class(failover_error_class),
             attempt_index=attempt_index,
             possibly_succeeded=possibly_succeeded,
             service_tier=service_tier,

@@ -30,6 +30,8 @@ from solwyn._constants import (
     AGENT_RUN_NAME_MAX_LENGTH,
     CALL_ID_MAX_LENGTH,
     CALL_ID_PATTERN,
+    FAILOVER_ERROR_CLASS_MAX_LENGTH,
+    FAILOVER_ERROR_CLASS_PATTERN,
     HOLDER_ID_MAX_LENGTH,
     LEASE_ID_MAX_LENGTH,
     MODEL_NAME_MAX_LENGTH,
@@ -391,8 +393,17 @@ class MetadataEvent(BaseModel):
     failover_reason: FailoverReason | None = Field(default=None)
     failover_error_class: str | None = Field(
         default=None,
-        max_length=64,
-        description="type(exc).__name__ ONLY — never str(exc)",
+        max_length=FAILOVER_ERROR_CLASS_MAX_LENGTH,
+        pattern=FAILOVER_ERROR_CLASS_PATTERN,
+        description=(
+            "Exception CLASS NAME only — never str(exc). Carries "
+            "type(exc).__name__ normalized by _base._wire_error_class into the "
+            "API's exact shape (leading non-letters stripped, other characters "
+            "replaced with '_', 64-char cap), so it can differ from the raw "
+            "name. The pattern mirrors the API's pin: it exists to fail drift in "
+            "unit tests, and must never be what rejects a name on a caller's "
+            "path — every producer normalizes BEFORE constructing the event."
+        ),
     )
     attempt_index: int = Field(default=0, ge=0, description="0=primary, 1=first fallback")
     call_id: str = Field(

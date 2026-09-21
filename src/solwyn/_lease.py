@@ -153,6 +153,10 @@ class _Reservation:
     created_at: float
     pool: _Pool
     claim_token: int
+    # An earlier hop of this call may have been served and billed (a
+    # failed-over post-send-ambiguous attempt). Sticky for the call's life:
+    # no later settle, release, or sweep may refund below the reserved bound.
+    spend_unknown: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -813,7 +817,7 @@ class LeaseLedger:
             # The lease that funded this call is gone; its counters are dead.
             return
         actual = max(0, actual_tokens)
-        if floor_at_reservation:
+        if floor_at_reservation or reservation.spend_unknown:
             actual = max(actual, reservation.tokens)
         delta = actual - reservation.tokens
         if reservation.pool is _Pool.GRANTED:
@@ -822,12 +826,36 @@ class LeaseLedger:
             state.share_remaining_tokens -= delta
         state.spent_tokens_since_report += actual
 
+    def mark_spend_unknown(self, call_id: str, *, claim_token: int | None) -> None:
+        """Pin a LIVE reservation at its bound: an attempt may have been billed.
+
+        The reservation stays in flight (the call is still walking its chain);
+        only its eventual disposition changes. ``true_up`` floors at the bound
+        and ``release`` — including the sweep's — retires the bound as spent
+        instead of refunding it. Unknown call / stale claim is a no-op.
+        """
+        if claim_token is None:
+            return
+        run_id = self._call_index.get(call_id)
+        state = self._states.get(run_id) if run_id is not None else None
+        reservation = state.reservations.get(call_id) if state is not None else None
+        if reservation is None or reservation.claim_token != claim_token:
+            return
+        reservation.spend_unknown = True
+
     def release(self, call_id: str, *, claim_token: int | None) -> None:
-        """Give a reservation back untouched (error paths — no spend happened)."""
+        """Give a reservation back untouched (error paths — no spend happened).
+
+        A reservation marked ``spend_unknown`` is the exception: it is retired
+        at its reserved bound, never refunded.
+        """
         state, reservation = self._take_reservation(call_id, claim_token)
         if state is None or reservation is None:
             return
         if reservation.lease_id != state.lease_id:
+            return
+        if reservation.spend_unknown:
+            state.spent_tokens_since_report += reservation.tokens
             return
         if reservation.pool is _Pool.GRANTED:
             state.granted_remaining_tokens += reservation.tokens

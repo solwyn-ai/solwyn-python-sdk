@@ -105,6 +105,7 @@ from solwyn.budget import (
     BudgetCheckResult,
     BudgetEnforcer,
 )
+from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerAdmission
 from solwyn.config import SolwynConfig
 from solwyn.exceptions import (
     BudgetExceededError,
@@ -700,15 +701,22 @@ def _settle_stream_failure(
     record_breaker_failure: bool,
     possibly_succeeded: bool | None,
     failover_error_class: str | None = None,
+    admission: CircuitBreakerAdmission | None = None,
 ) -> None:
-    """Reconcile one unsettleable stream: breaker verdict, release, error event."""
+    """Reconcile a terminal attempt without usage: health, local debit, receipt."""
     is_provider_fallback = ctx.is_provider_fallback
     if record_breaker_failure:
         owner._get_circuit_breaker(provider).record_failure()
-    owner._solwyn_budget.release_reservation(
-        call_id,
-        lease_claim_token=_lease_claim_token(budget),
-    )
+    elif admission is not None:
+        owner._get_circuit_breaker(provider).release_probe(admission)
+    if possibly_succeeded:
+        owner._solwyn_budget.abandon_reservation(
+            call_id, lease_claim_token=_lease_claim_token(budget)
+        )
+    else:
+        owner._solwyn_budget.release_reservation(
+            call_id, lease_claim_token=_lease_claim_token(budget)
+        )
     owner._solwyn_reporter.report(
         owner._build_error_event(
             model=ctx.model,
@@ -729,6 +737,47 @@ def _settle_stream_failure(
     )
 
 
+def _settle_stream_wrap_failure(
+    owner: Any,
+    runtime: ProviderRuntime,
+    ctx: _AttemptContext,
+    budget: Any,
+    primary: ProviderRuntime,
+    *,
+    requested_model: str,
+    is_model_fallback: bool,
+    call_id: str,
+    agent_run: _RunContextSnapshot,
+    exc: Exception,
+) -> None:
+    """Reconcile a dispatched stream whose Solwyn wrapper could not be built.
+
+    The provider accepted the request and opened a stream, so usage is unknown:
+    the reservation keeps its bound behind a possibly-succeeded receipt. The
+    failure is SDK-side bookkeeping, not provider health, so there is no breaker
+    verdict; the candidate walk's ``finally`` frees this admission's probe.
+    Never raises: the caller re-raises the original wrapping error.
+    """
+    try:
+        _settle_stream_failure(
+            owner,
+            ctx,
+            budget,
+            primary,
+            provider=runtime.adapter.name,
+            provider_region=_safe_extract_region(runtime),
+            requested_model=requested_model,
+            is_model_fallback=is_model_fallback,
+            call_id=call_id,
+            agent_run=agent_run,
+            record_breaker_failure=False,
+            possibly_succeeded=True,
+            failover_error_class=type(exc).__name__,
+        )
+    except Exception as cleanup_exc:
+        logger.warning("stream.wrap_cleanup_failed: %s", type(cleanup_exc).__name__)
+
+
 def _make_stream_error_handler(
     owner: Any,
     runtime: ProviderRuntime,
@@ -740,11 +789,14 @@ def _make_stream_error_handler(
     is_model_fallback: bool,
     call_id: str,
     agent_run: _RunContextSnapshot,
+    admission: CircuitBreakerAdmission | None = None,
+    provider_failure: bool = True,
 ) -> Callable[[BaseException], None]:
     """Build the established stream-error reconciliation callback once.
 
-    The stream was already open, so the request provably reached the provider:
-    the abort is a provider-health failure and a possibly-succeeded charge.
+    The stream was already open, so the request may have incurred spend.
+    Provider errors affect health; cancellation and finalization bookkeeping
+    failures only release this admission's probe, without a health verdict.
     """
     provider = runtime.adapter.name
     provider_region = _safe_extract_region(runtime)
@@ -761,8 +813,16 @@ def _make_stream_error_handler(
             is_model_fallback=is_model_fallback,
             call_id=call_id,
             agent_run=agent_run,
-            record_breaker_failure=True,
+            record_breaker_failure=provider_failure and isinstance(_exc, Exception),
             possibly_succeeded=True,
+            # Ordinary established errors historically omitted this wire field.
+            # Keep new diagnostics limited to cancellation/finalization cleanup.
+            failover_error_class=(
+                type(_exc).__name__
+                if not provider_failure or not isinstance(_exc, Exception)
+                else None
+            ),
+            admission=admission,
         )
 
     return on_error
@@ -779,6 +839,7 @@ def _make_stream_entry_error_handler(
     is_model_fallback: bool,
     call_id: str,
     agent_run: _RunContextSnapshot,
+    admission: CircuitBreakerAdmission | None = None,
 ) -> Callable[[BaseException], None]:
     """Build the reconciliation callback for a stream that never established.
 
@@ -812,9 +873,10 @@ def _make_stream_entry_error_handler(
             is_model_fallback=is_model_fallback,
             call_id=call_id,
             agent_run=agent_run,
-            record_breaker_failure=disp is not Disposition.FAIL_FAST,
+            record_breaker_failure=isinstance(exc, Exception) and disp is not Disposition.FAIL_FAST,
             possibly_succeeded=True if disp is Disposition.POST_SEND_AMBIGUOUS else None,
             failover_error_class=type(exc).__name__,
+            admission=admission,
         )
 
     return on_entry_error
@@ -825,18 +887,24 @@ def _make_reservation_release_handler(
     budget: Any,
     *,
     call_id: str,
+    breaker: CircuitBreaker,
+    admission: CircuitBreakerAdmission,
 ) -> Callable[[], None]:
     """Build the release used when a manager is abandoned before it dispatches.
 
     No provider request was sent: there is no usage to confirm, no provider
-    health verdict to record, and no error to report — only the reservation.
+    health verdict to record, and no error to report. Return the reservation
+    and neutrally release only this manager's provider admission.
     """
 
     def release() -> None:
-        owner._solwyn_budget.release_reservation(
-            call_id,
-            lease_claim_token=_lease_claim_token(budget),
-        )
+        try:
+            owner._solwyn_budget.release_reservation(
+                call_id,
+                lease_claim_token=_lease_claim_token(budget),
+            )
+        finally:
+            breaker.release_probe(admission)
 
     return release
 
@@ -852,6 +920,8 @@ def _make_async_stream_error_handler(
     is_model_fallback: bool,
     call_id: str,
     agent_run: _RunContextSnapshot,
+    admission: CircuitBreakerAdmission | None = None,
+    provider_failure: bool = True,
 ) -> Callable[[BaseException], Awaitable[None]]:
     sync_handler = _make_stream_error_handler(
         owner,
@@ -863,6 +933,8 @@ def _make_async_stream_error_handler(
         is_model_fallback=is_model_fallback,
         call_id=call_id,
         agent_run=agent_run,
+        admission=admission,
+        provider_failure=provider_failure,
     )
 
     async def on_error(exc: BaseException) -> None:
@@ -882,6 +954,7 @@ def _make_async_stream_entry_error_handler(
     is_model_fallback: bool,
     call_id: str,
     agent_run: _RunContextSnapshot,
+    admission: CircuitBreakerAdmission | None = None,
 ) -> Callable[[BaseException], Awaitable[None]]:
     sync_handler = _make_stream_entry_error_handler(
         owner,
@@ -893,6 +966,7 @@ def _make_async_stream_entry_error_handler(
         is_model_fallback=is_model_fallback,
         call_id=call_id,
         agent_run=agent_run,
+        admission=admission,
     )
 
     async def on_entry_error(exc: BaseException) -> None:
@@ -906,8 +980,12 @@ def _make_async_reservation_release_handler(
     budget: Any,
     *,
     call_id: str,
+    breaker: CircuitBreaker,
+    admission: CircuitBreakerAdmission,
 ) -> Callable[[], Awaitable[None]]:
-    sync_handler = _make_reservation_release_handler(owner, budget, call_id=call_id)
+    sync_handler = _make_reservation_release_handler(
+        owner, budget, call_id=call_id, breaker=breaker, admission=admission
+    )
 
     async def release() -> None:
         sync_handler()
@@ -1298,7 +1376,56 @@ async def _materialize_stream_async(stream: Any) -> _MaterializedAsyncStream:
         first = await it.__anext__()
     except StopAsyncIteration:
         return _MaterializedAsyncStream(None, stream, it, empty=True)
+    except BaseException:
+        # Establishment never transferred this source to a stream wrapper.
+        # Release its transport here, preserving the original dispatch error
+        # (including cancellation) if provider cleanup itself fails.
+        try:
+            close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
+            if close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        except BaseException as close_exc:
+            logger.warning("stream.establishment_close_failed: %s", type(close_exc).__name__)
+        raise
     return _MaterializedAsyncStream(first, stream, it)
+
+
+def _unowned_stream_source(runtime: ProviderRuntime, response: Any) -> Any:
+    """The open provider stream inside a dispatched response no wrapper owns."""
+    try:
+        return runtime.adapter.unwrap_stream_source(response)
+    except Exception:
+        return response
+
+
+def _close_unowned_stream(runtime: ProviderRuntime, response: Any) -> None:
+    """Best-effort release of a provider stream whose wrapping failed.
+
+    A provider close failure is logged structurally and suppressed so the
+    original wrapping error survives; an interrupt raised by that close
+    propagates to the candidate walk's interrupt handler instead.
+    """
+    try:
+        close = getattr(_unowned_stream_source(runtime, response), "close", None)
+        if close is not None:
+            close()
+    except Exception as close_exc:
+        logger.warning("stream.wrap_close_failed: %s", type(close_exc).__name__)
+
+
+async def _close_unowned_stream_async(runtime: ProviderRuntime, response: Any) -> None:
+    """Async mirror of ``_close_unowned_stream`` (``aclose()``, else ``close()``)."""
+    try:
+        source = _unowned_stream_source(runtime, response)
+        close = getattr(source, "aclose", None) or getattr(source, "close", None)
+        if close is not None:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+    except Exception as close_exc:
+        logger.warning("stream.wrap_close_failed: %s", type(close_exc).__name__)
 
 
 def _make_chunk_translator(*, served: str, requested: str) -> Callable[[Any], list[Any]]:
@@ -2049,6 +2176,7 @@ class Solwyn(_SolwynBase):
         max_retries: int,
         surface: str = "chat",
         responses_leaf: str = "create",
+        on_dispatch: Callable[[], None] | None = None,
     ) -> Any:
         """Dispatch one hop to the runtime's SDK client. Pure I/O - no metrics.
 
@@ -2078,6 +2206,10 @@ class Solwyn(_SolwynBase):
                 is_streaming=is_streaming,
                 leaf=responses_leaf,
             )
+            if responses_leaf == "stream":
+                return method(**call_kwargs)
+            if on_dispatch is not None:
+                on_dispatch()
             return method(**call_kwargs)
         method, call_kwargs = runtime.adapter.prepare_call(
             client,
@@ -2086,6 +2218,8 @@ class Solwyn(_SolwynBase):
             timeout=read_timeout,
             max_retries=max_retries,
         )
+        if on_dispatch is not None:
+            on_dispatch()
         return method(**call_kwargs)
 
     def _media_dispatch(
@@ -2271,19 +2405,24 @@ class Solwyn(_SolwynBase):
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
-            self._solwyn_reporter.report(
-                self._build_error_event(
-                    model=requested_model,
-                    provider=provider,
-                    latency_ms=(time.monotonic() - start) * 1000,
-                    is_model_fallback=False,
-                    failover_error_class=type(exc).__name__,
-                    call_id=call_id,
-                    agent_run=agent_run,
-                    provider_region=provider_region,
-                    lease_id=_settlement_keys(budget)[1],
+            try:
+                self._solwyn_reporter.report(
+                    self._build_error_event(
+                        model=requested_model,
+                        provider=provider,
+                        latency_ms=(time.monotonic() - start) * 1000,
+                        is_model_fallback=False,
+                        failover_error_class=type(exc).__name__,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                        provider_region=provider_region,
+                        lease_id=_settlement_keys(budget)[1],
+                    )
                 )
-            )
+            except Exception as receipt_exc:
+                # The receipt is best-effort: losing it must never mask the
+                # provider's error or skip the reservation's terminal step.
+                logger.warning("call.error_receipt_failed: %s", type(receipt_exc).__name__)
             raise
         latency_ms = (time.monotonic() - start) * 1000
 
@@ -2627,6 +2766,14 @@ class Solwyn(_SolwynBase):
 
         termination_handle: _TerminationHandle | None = None
         termination_handle_transferred = False
+        probe_to_release: tuple[CircuitBreaker, CircuitBreakerAdmission] | None = None
+        interrupted_attempt: _AttemptContext | None = None
+        usage_unknown = False
+
+        def mark_dispatched() -> None:
+            nonlocal usage_unknown
+            usage_unknown = True
+
         try:
             termination_handle = (
                 _acquire_termination_handle(agent_run[0])
@@ -2652,6 +2799,9 @@ class Solwyn(_SolwynBase):
                 admission = cb.admit()  # probe CONSUMED only here, for the attempted candidate
                 if not admission.allowed:
                     continue
+                probe_to_release = (cb, admission)
+                interrupted_attempt = None
+                usage_unknown = False
 
                 is_primary = rt is primary
                 is_provider_fallback = rt.entry.provider != primary.entry.provider
@@ -2694,6 +2844,7 @@ class Solwyn(_SolwynBase):
                             )
                 except Exception:
                     cb.release_probe(admission)
+                    probe_to_release = None
                     self._solwyn_budget.release_reservation(
                         call_id,
                         lease_claim_token=_lease_claim_token(budget),
@@ -2712,6 +2863,10 @@ class Solwyn(_SolwynBase):
                         attempt_index=chain_index,
                     )
                     try:
+                        interrupted_attempt = ctx
+                        # Preparers have not sent anything. Dispatch marks the
+                        # boundary after them, just before invoking the provider.
+                        usage_unknown = False
                         response = self._sync_dispatch(
                             rt,
                             call_kwargs,
@@ -2727,6 +2882,7 @@ class Solwyn(_SolwynBase):
                             max_retries=0,
                             surface=_surface,
                             responses_leaf=_responses_leaf,
+                            on_dispatch=mark_dispatched,
                         )
                         if (
                             is_streaming
@@ -2744,6 +2900,9 @@ class Solwyn(_SolwynBase):
                             response = _materialize_stream(response)
                     except Exception as exc:
                         disp = classify_exception(exc)
+                        # In particular, a rejected 429 followed by Retry-After
+                        # sleep holds the probe but has no paid work to refund.
+                        usage_unknown = disp is Disposition.POST_SEND_AMBIGUOUS
                         # Fix [A]: the PRIMARY was attempted and raised in this walk
                         # -> a later cross-provider success is a REACTIVE failover
                         # (PRIMARY_ERROR), not a proactive breaker-open reroute.
@@ -2782,32 +2941,42 @@ class Solwyn(_SolwynBase):
                             # guard). If the hop consumed a HALF_OPEN probe slot, free it
                             # (no state change) so the breaker is not stranded HALF_OPEN.
                             cb.release_probe(admission)
+                        probe_to_release = None
                         # A correctly-not-failed-over post-send-ambiguous abort
                         # emits an ERROR event with possibly_succeeded=True so the Cloud API
                         # can reconcile the (possibly-landed, never-confirmed) reservation.
                         possibly_succeeded = (
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
-                        self._solwyn_reporter.report(
-                            self._build_error_event(
-                                model=served_model,
-                                provider=provider,
-                                latency_ms=ctx.elapsed_ms(),
-                                is_model_fallback=is_model_fallback,
-                                is_provider_fallback=is_provider_fallback,
-                                requested_provider=(
-                                    primary.entry.provider if is_provider_fallback else None
-                                ),
-                                requested_model=requested_model if is_provider_fallback else None,
-                                failover_error_class=type(exc).__name__,
-                                attempt_index=chain_index,
-                                call_id=call_id,
-                                possibly_succeeded=True if possibly_succeeded else None,
-                                agent_run=agent_run,
-                                provider_region=_safe_extract_region(rt),
-                                lease_id=_settlement_keys(budget)[1],
+                        try:
+                            self._solwyn_reporter.report(
+                                self._build_error_event(
+                                    model=served_model,
+                                    provider=provider,
+                                    latency_ms=ctx.elapsed_ms(),
+                                    is_model_fallback=is_model_fallback,
+                                    is_provider_fallback=is_provider_fallback,
+                                    requested_provider=(
+                                        primary.entry.provider if is_provider_fallback else None
+                                    ),
+                                    requested_model=requested_model
+                                    if is_provider_fallback
+                                    else None,
+                                    failover_error_class=type(exc).__name__,
+                                    attempt_index=chain_index,
+                                    call_id=call_id,
+                                    possibly_succeeded=True if possibly_succeeded else None,
+                                    agent_run=agent_run,
+                                    provider_region=_safe_extract_region(rt),
+                                    lease_id=_settlement_keys(budget)[1],
+                                )
                             )
-                        )
+                        except Exception as receipt_exc:
+                            # The receipt is best-effort: losing it must never mask the
+                            # provider's error or skip the reservation's terminal step.
+                            logger.warning(
+                                "call.error_receipt_failed: %s", type(receipt_exc).__name__
+                            )
                         if disp is Disposition.FAIL_FAST:
                             self._solwyn_budget.release_reservation(
                                 call_id,
@@ -2815,14 +2984,21 @@ class Solwyn(_SolwynBase):
                             )
                             raise  # 4xx/404/refusal — do NOT advance the chain
                         if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
-                            # The call MAY have landed, but no confirm will ever
-                            # settle it here: the server reconciles the possibly-
-                            # succeeded attempt from the error event.
-                            self._solwyn_budget.release_reservation(
+                            # The receipt lets the server reconcile unknown usage;
+                            # local lease authority must also keep its spent bound.
+                            self._solwyn_budget.abandon_reservation(
                                 call_id,
                                 lease_claim_token=_lease_claim_token(budget),
                             )
                             raise  # re-raise ORIGINAL exception (drop-in contract)
+                        if disp is Disposition.POST_SEND_AMBIGUOUS:
+                            # Failing over does not un-send this hop. The call keeps
+                            # its reservation, pinned: no later settlement, refusal,
+                            # or chain exhaustion may refund the bound.
+                            self._solwyn_budget.mark_reservation_spend_unknown(
+                                call_id,
+                                lease_claim_token=_lease_claim_token(budget),
+                            )
                         last_exc = exc
                         advanced = True
                     # Reached on a successful hop OR on a terminal failure that advances
@@ -2856,6 +3032,7 @@ class Solwyn(_SolwynBase):
                             is_model_fallback=is_model_fallback,
                             call_id=call_id,
                             agent_run=agent_run,
+                            admission=admission,
                         )
                         # The manager sends its request in __enter__, AFTER this
                         # candidate walk: its failure needs the walk's classification,
@@ -2870,6 +3047,7 @@ class Solwyn(_SolwynBase):
                             is_model_fallback=is_model_fallback,
                             call_id=call_id,
                             agent_run=agent_run,
+                            admission=admission,
                         )
                         wrapped = _SyncResponsesStreamManagerWrapper(
                             response,
@@ -2889,12 +3067,28 @@ class Solwyn(_SolwynBase):
                                 estimate_empty_usage=True,
                                 velocity_flags=velocity_flags,
                                 on_error=on_error,
+                                admission=admission,
                                 termination_handle=termination_handle,
                             ),
-                            on_error=on_error,
+                            # The manager's own handler fires only when WRAPPING fails after
+                            # its stream opened: SDK-side, so the same possibly-succeeded
+                            # receipt but no provider-health verdict (mirrors the direct path).
+                            on_error=_make_stream_error_handler(
+                                self,
+                                rt,
+                                ctx,
+                                budget,
+                                primary,
+                                requested_model=requested_model,
+                                is_model_fallback=is_model_fallback,
+                                call_id=call_id,
+                                agent_run=agent_run,
+                                admission=admission,
+                                provider_failure=False,
+                            ),
                             on_entry_error=on_entry_error,
                             on_abandoned_before_entry=_make_reservation_release_handler(
-                                self, budget, call_id=call_id
+                                self, budget, call_id=call_id, breaker=cb, admission=admission
                             ),
                             abort_release=(
                                 termination_handle.release
@@ -2903,27 +3097,51 @@ class Solwyn(_SolwynBase):
                             ),
                         )
                         termination_handle_transferred = True
+                        probe_to_release = None  # manager now owns entry/close disposition
                         return wrapped
-                    wrapped = self._wrap_stream(
-                        rt,
-                        response,
-                        ctx,
-                        budget,
-                        primary,
-                        requested_model=requested_model,
-                        is_model_fallback=is_model_fallback,
-                        primary_errored=primary_errored,
-                        cost_routed=selection.cost_routed and not primary_reached,
-                        call_id=call_id,
-                        agent_run=agent_run,
-                        estimated_input_tokens=est_in,
-                        estimate_empty_usage=_surface == "responses",
-                        termination_handle=termination_handle,
-                        velocity_flags=velocity_flags,
-                    )
+                    try:
+                        wrapped = self._wrap_stream(
+                            rt,
+                            response,
+                            ctx,
+                            budget,
+                            primary,
+                            requested_model=requested_model,
+                            is_model_fallback=is_model_fallback,
+                            primary_errored=primary_errored,
+                            cost_routed=selection.cost_routed and not primary_reached,
+                            call_id=call_id,
+                            agent_run=agent_run,
+                            estimated_input_tokens=est_in,
+                            estimate_empty_usage=_surface == "responses",
+                            termination_handle=termination_handle,
+                            velocity_flags=velocity_flags,
+                            admission=admission,
+                        )
+                    except Exception as exc:
+                        # The request was sent and its stream is open, but no
+                        # wrapper owns either: close the transport, then retire
+                        # the bound behind a possibly-succeeded receipt. Not a
+                        # provider-health verdict; the finally frees the probe.
+                        _close_unowned_stream(rt, response)
+                        _settle_stream_wrap_failure(
+                            self,
+                            rt,
+                            ctx,
+                            budget,
+                            primary,
+                            requested_model=requested_model,
+                            is_model_fallback=is_model_fallback,
+                            call_id=call_id,
+                            agent_run=agent_run,
+                            exc=exc,
+                        )
+                        raise
                     termination_handle_transferred = True
+                    probe_to_release = None  # live stream owns its eventual verdict
                     return wrapped
                 cb.record_success()
+                probe_to_release = None
 
                 # LatencyPolicy signal: record this served hop's success latency
                 # (non-streaming). Streaming records in on_complete when the stream
@@ -3019,7 +3237,8 @@ class Solwyn(_SolwynBase):
                 return result
 
             # Every candidate failed (or none was attempted): no settlement will
-            # follow, so the lease reservation goes back now.
+            # follow, so the lease reservation goes back now — unless a failed-over
+            # ambiguous hop pinned it, in which case the ledger retires its bound.
             self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
@@ -3031,9 +3250,42 @@ class Solwyn(_SolwynBase):
                 attempted=[r.adapter.name for r in candidates],
             )
 
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                # Mirror the async cancel handler: KeyboardInterrupt, SystemExit,
+                # or a greenlet kill keeps its identity and is no health verdict.
+                # Retire the claim now rather than leave it to the sweep's refund.
+                try:
+                    if interrupted_attempt is None:
+                        self._solwyn_budget.release_reservation(
+                            call_id, lease_claim_token=_lease_claim_token(budget)
+                        )
+                    else:
+                        _settle_stream_failure(
+                            self,
+                            interrupted_attempt,
+                            budget,
+                            primary,
+                            provider=provider,
+                            provider_region=_safe_extract_region(rt),
+                            requested_model=requested_model,
+                            is_model_fallback=is_model_fallback,
+                            call_id=call_id,
+                            agent_run=agent_run,
+                            record_breaker_failure=False,
+                            possibly_succeeded=True if usage_unknown else None,
+                            failover_error_class=type(exc).__name__,
+                        )
+                except Exception as cleanup_exc:
+                    logger.warning("call.interrupt_cleanup_failed: %s", type(cleanup_exc).__name__)
+            raise
         finally:
-            if termination_handle is not None and not termination_handle_transferred:
-                termination_handle.release()
+            try:
+                if probe_to_release is not None:
+                    probe_to_release[0].release_probe(probe_to_release[1])
+            finally:
+                if termination_handle is not None and not termination_handle_transferred:
+                    termination_handle.release()
 
     def _wrap_stream(
         self,
@@ -3054,6 +3306,7 @@ class Solwyn(_SolwynBase):
         velocity_flags: Collection[str] = (),
         on_error: Callable[[BaseException], None] | None = None,
         cost_routed: bool = False,
+        admission: CircuitBreakerAdmission | None = None,
     ) -> Any:
         """Wrap a streaming response, settling against the SERVED runtime.
 
@@ -3165,6 +3418,7 @@ class Solwyn(_SolwynBase):
                 is_model_fallback=is_model_fallback,
                 call_id=call_id,
                 agent_run=agent_run,
+                admission=admission,
             )
 
         # Cross-DIALECT hop: reshape each served chunk back to the caller's
@@ -3197,6 +3451,19 @@ class Solwyn(_SolwynBase):
                 ),
                 abort_release=(
                     termination_handle.release if termination_handle is not None else None
+                ),
+                on_finalize_error=_make_stream_error_handler(
+                    self,
+                    runtime,
+                    ctx,
+                    budget,
+                    primary,
+                    requested_model=requested_model,
+                    is_model_fallback=is_model_fallback,
+                    call_id=call_id,
+                    agent_run=agent_run,
+                    admission=admission,
+                    provider_failure=False,
                 ),
             )
             return primary.adapter.wrap_stream_result(wrapper, response)
@@ -3586,6 +3853,7 @@ class AsyncSolwyn(_SolwynBase):
         max_retries: int,
         surface: str = "chat",
         responses_leaf: str = "create",
+        on_dispatch: Callable[[], None] | None = None,
     ) -> Any:
         """Dispatch one hop to the runtime's async SDK client. Pure I/O.
 
@@ -3617,6 +3885,8 @@ class AsyncSolwyn(_SolwynBase):
             )
             if responses_leaf == "stream":
                 return method(**call_kwargs)
+            if on_dispatch is not None:
+                on_dispatch()
             return await method(**call_kwargs)
         method, call_kwargs = runtime.adapter.prepare_call(
             client,
@@ -3625,6 +3895,8 @@ class AsyncSolwyn(_SolwynBase):
             timeout=read_timeout,
             max_retries=max_retries,
         )
+        if on_dispatch is not None:
+            on_dispatch()
         return await method(**call_kwargs)
 
     async def _media_dispatch(
@@ -3783,19 +4055,24 @@ class AsyncSolwyn(_SolwynBase):
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
-            self._solwyn_reporter.report(
-                self._build_error_event(
-                    model=requested_model,
-                    provider=provider,
-                    latency_ms=(time.monotonic() - start) * 1000,
-                    is_model_fallback=False,
-                    failover_error_class=type(exc).__name__,
-                    call_id=call_id,
-                    agent_run=agent_run,
-                    provider_region=provider_region,
-                    lease_id=_settlement_keys(budget)[1],
+            try:
+                self._solwyn_reporter.report(
+                    self._build_error_event(
+                        model=requested_model,
+                        provider=provider,
+                        latency_ms=(time.monotonic() - start) * 1000,
+                        is_model_fallback=False,
+                        failover_error_class=type(exc).__name__,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                        provider_region=provider_region,
+                        lease_id=_settlement_keys(budget)[1],
+                    )
                 )
-            )
+            except Exception as receipt_exc:
+                # The receipt is best-effort: losing it must never mask the
+                # provider's error or skip the reservation's terminal step.
+                logger.warning("call.error_receipt_failed: %s", type(receipt_exc).__name__)
             raise
         latency_ms = (time.monotonic() - start) * 1000
 
@@ -4095,6 +4372,14 @@ class AsyncSolwyn(_SolwynBase):
 
         termination_handle: _TerminationHandle | None = None
         termination_handle_transferred = False
+        probe_to_release: tuple[CircuitBreaker, CircuitBreakerAdmission] | None = None
+        interrupted_attempt: _AttemptContext | None = None
+        usage_unknown = False
+
+        def mark_dispatched() -> None:
+            nonlocal usage_unknown
+            usage_unknown = True
+
         try:
             termination_handle = (
                 _acquire_termination_handle(agent_run[0])
@@ -4120,6 +4405,9 @@ class AsyncSolwyn(_SolwynBase):
                 admission = cb.admit()
                 if not admission.allowed:
                     continue
+                probe_to_release = (cb, admission)
+                interrupted_attempt = None
+                usage_unknown = False
 
                 is_primary = rt is primary
                 is_provider_fallback = rt.entry.provider != primary.entry.provider
@@ -4162,6 +4450,7 @@ class AsyncSolwyn(_SolwynBase):
                             )
                 except Exception:
                     cb.release_probe(admission)
+                    probe_to_release = None
                     self._solwyn_budget.release_reservation(
                         call_id,
                         lease_claim_token=_lease_claim_token(budget),
@@ -4180,6 +4469,10 @@ class AsyncSolwyn(_SolwynBase):
                         attempt_index=chain_index,
                     )
                     try:
+                        interrupted_attempt = ctx
+                        # Preparers have not sent anything. Dispatch marks the
+                        # boundary after them, just before invoking the provider.
+                        usage_unknown = False
                         response = await self._async_dispatch(
                             rt,
                             call_kwargs,
@@ -4195,6 +4488,7 @@ class AsyncSolwyn(_SolwynBase):
                             max_retries=0,
                             surface=_surface,
                             responses_leaf=_responses_leaf,
+                            on_dispatch=mark_dispatched,
                         )
                         if (
                             is_streaming
@@ -4208,6 +4502,9 @@ class AsyncSolwyn(_SolwynBase):
                             response = await _materialize_stream_async(response)
                     except Exception as exc:
                         disp = classify_exception(exc)
+                        # In particular, a rejected 429 followed by Retry-After
+                        # sleep holds the probe but has no paid work to refund.
+                        usage_unknown = disp is Disposition.POST_SEND_AMBIGUOUS
                         # Fix [A]: the PRIMARY was attempted and raised in this walk
                         # -> a later cross-provider success is a REACTIVE failover
                         # (PRIMARY_ERROR), not a proactive breaker-open reroute.
@@ -4244,32 +4541,42 @@ class AsyncSolwyn(_SolwynBase):
                             # guard). If the hop consumed a HALF_OPEN probe slot, free it
                             # (no state change) so the breaker is not stranded HALF_OPEN.
                             cb.release_probe(admission)
+                        probe_to_release = None
                         # A correctly-not-failed-over post-send-ambiguous abort
                         # emits an ERROR event with possibly_succeeded=True so the Cloud API
                         # can reconcile the (possibly-landed, never-confirmed) reservation.
                         possibly_succeeded = (
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
-                        self._solwyn_reporter.report(
-                            self._build_error_event(
-                                model=served_model,
-                                provider=provider,
-                                latency_ms=ctx.elapsed_ms(),
-                                is_model_fallback=is_model_fallback,
-                                is_provider_fallback=is_provider_fallback,
-                                requested_provider=(
-                                    primary.entry.provider if is_provider_fallback else None
-                                ),
-                                requested_model=requested_model if is_provider_fallback else None,
-                                failover_error_class=type(exc).__name__,
-                                attempt_index=chain_index,
-                                call_id=call_id,
-                                possibly_succeeded=True if possibly_succeeded else None,
-                                agent_run=agent_run,
-                                provider_region=_safe_extract_region(rt),
-                                lease_id=_settlement_keys(budget)[1],
+                        try:
+                            self._solwyn_reporter.report(
+                                self._build_error_event(
+                                    model=served_model,
+                                    provider=provider,
+                                    latency_ms=ctx.elapsed_ms(),
+                                    is_model_fallback=is_model_fallback,
+                                    is_provider_fallback=is_provider_fallback,
+                                    requested_provider=(
+                                        primary.entry.provider if is_provider_fallback else None
+                                    ),
+                                    requested_model=requested_model
+                                    if is_provider_fallback
+                                    else None,
+                                    failover_error_class=type(exc).__name__,
+                                    attempt_index=chain_index,
+                                    call_id=call_id,
+                                    possibly_succeeded=True if possibly_succeeded else None,
+                                    agent_run=agent_run,
+                                    provider_region=_safe_extract_region(rt),
+                                    lease_id=_settlement_keys(budget)[1],
+                                )
                             )
-                        )
+                        except Exception as receipt_exc:
+                            # The receipt is best-effort: losing it must never mask the
+                            # provider's error or skip the reservation's terminal step.
+                            logger.warning(
+                                "call.error_receipt_failed: %s", type(receipt_exc).__name__
+                            )
                         if disp is Disposition.FAIL_FAST:
                             self._solwyn_budget.release_reservation(
                                 call_id,
@@ -4277,11 +4584,21 @@ class AsyncSolwyn(_SolwynBase):
                             )
                             raise
                         if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
-                            self._solwyn_budget.release_reservation(
+                            # Mirror sync: retire the claim without refunding
+                            # authority the provider may already have consumed.
+                            self._solwyn_budget.abandon_reservation(
                                 call_id,
                                 lease_claim_token=_lease_claim_token(budget),
                             )
                             raise
+                        if disp is Disposition.POST_SEND_AMBIGUOUS:
+                            # Mirror sync: pin the still-live reservation so no
+                            # later exit from this call (cancellation included)
+                            # can refund what this hop may have consumed.
+                            self._solwyn_budget.mark_reservation_spend_unknown(
+                                call_id,
+                                lease_claim_token=_lease_claim_token(budget),
+                            )
                         last_exc = exc
                         advanced = True
                     # Reached on a successful hop OR on a terminal failure that advances
@@ -4314,6 +4631,7 @@ class AsyncSolwyn(_SolwynBase):
                             is_model_fallback=is_model_fallback,
                             call_id=call_id,
                             agent_run=agent_run,
+                            admission=admission,
                         )
                         # The manager sends its request in __aenter__, AFTER this
                         # candidate walk: its failure needs the walk's classification,
@@ -4328,6 +4646,7 @@ class AsyncSolwyn(_SolwynBase):
                             is_model_fallback=is_model_fallback,
                             call_id=call_id,
                             agent_run=agent_run,
+                            admission=admission,
                         )
                         wrapped = _AsyncResponsesStreamManagerWrapper(
                             response,
@@ -4347,12 +4666,28 @@ class AsyncSolwyn(_SolwynBase):
                                 estimate_empty_usage=True,
                                 velocity_flags=velocity_flags,
                                 on_error=on_error,
+                                admission=admission,
                                 termination_handle=termination_handle,
                             ),
-                            on_error=on_error,
+                            # The manager's own handler fires only when WRAPPING fails after
+                            # its stream opened: SDK-side, so the same possibly-succeeded
+                            # receipt but no provider-health verdict (mirrors the direct path).
+                            on_error=_make_async_stream_error_handler(
+                                self,
+                                rt,
+                                ctx,
+                                budget,
+                                primary,
+                                requested_model=requested_model,
+                                is_model_fallback=is_model_fallback,
+                                call_id=call_id,
+                                agent_run=agent_run,
+                                admission=admission,
+                                provider_failure=False,
+                            ),
                             on_entry_error=on_entry_error,
                             on_abandoned_before_entry=_make_async_reservation_release_handler(
-                                self, budget, call_id=call_id
+                                self, budget, call_id=call_id, breaker=cb, admission=admission
                             ),
                             abort_release=(
                                 termination_handle.release
@@ -4361,27 +4696,51 @@ class AsyncSolwyn(_SolwynBase):
                             ),
                         )
                         termination_handle_transferred = True
+                        probe_to_release = None
                         return wrapped
-                    wrapped = self._wrap_stream_async(
-                        rt,
-                        response,
-                        ctx,
-                        budget,
-                        primary,
-                        requested_model=requested_model,
-                        is_model_fallback=is_model_fallback,
-                        primary_errored=primary_errored,
-                        cost_routed=selection.cost_routed and not primary_reached,
-                        call_id=call_id,
-                        agent_run=agent_run,
-                        estimated_input_tokens=est_in,
-                        estimate_empty_usage=_surface == "responses",
-                        termination_handle=termination_handle,
-                        velocity_flags=velocity_flags,
-                    )
+                    try:
+                        wrapped = self._wrap_stream_async(
+                            rt,
+                            response,
+                            ctx,
+                            budget,
+                            primary,
+                            requested_model=requested_model,
+                            is_model_fallback=is_model_fallback,
+                            primary_errored=primary_errored,
+                            cost_routed=selection.cost_routed and not primary_reached,
+                            call_id=call_id,
+                            agent_run=agent_run,
+                            estimated_input_tokens=est_in,
+                            estimate_empty_usage=_surface == "responses",
+                            termination_handle=termination_handle,
+                            velocity_flags=velocity_flags,
+                            admission=admission,
+                        )
+                    except Exception as exc:
+                        # The request was sent and its stream is open, but no
+                        # wrapper owns either: close the transport, then retire
+                        # the bound behind a possibly-succeeded receipt. Not a
+                        # provider-health verdict; the finally frees the probe.
+                        await _close_unowned_stream_async(rt, response)
+                        _settle_stream_wrap_failure(
+                            self,
+                            rt,
+                            ctx,
+                            budget,
+                            primary,
+                            requested_model=requested_model,
+                            is_model_fallback=is_model_fallback,
+                            call_id=call_id,
+                            agent_run=agent_run,
+                            exc=exc,
+                        )
+                        raise
                     termination_handle_transferred = True
+                    probe_to_release = None
                     return wrapped
                 cb.record_success()
+                probe_to_release = None
 
                 # LatencyPolicy signal: record this served hop's success latency
                 # (non-streaming). Streaming records in on_complete when the stream
@@ -4476,7 +4835,8 @@ class AsyncSolwyn(_SolwynBase):
                 return result
 
             # Every candidate failed (or none was attempted): no settlement will
-            # follow, so the lease reservation goes back now.
+            # follow, so the lease reservation goes back now — unless a failed-over
+            # ambiguous hop pinned it, in which case the ledger retires its bound.
             self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
@@ -4488,9 +4848,41 @@ class AsyncSolwyn(_SolwynBase):
                 attempted=[r.adapter.name for r in candidates],
             )
 
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                # No awaits or health verdicts: cancellation keeps its identity,
+                # and the reporter owns delivery after local claim retirement.
+                try:
+                    if interrupted_attempt is None:
+                        self._solwyn_budget.release_reservation(
+                            call_id, lease_claim_token=_lease_claim_token(budget)
+                        )
+                    else:
+                        _settle_stream_failure(
+                            self,
+                            interrupted_attempt,
+                            budget,
+                            primary,
+                            provider=provider,
+                            provider_region=_safe_extract_region(rt),
+                            requested_model=requested_model,
+                            is_model_fallback=is_model_fallback,
+                            call_id=call_id,
+                            agent_run=agent_run,
+                            record_breaker_failure=False,
+                            possibly_succeeded=True if usage_unknown else None,
+                            failover_error_class=type(exc).__name__,
+                        )
+                except Exception as cleanup_exc:
+                    logger.warning("call.cancel_cleanup_failed: %s", type(cleanup_exc).__name__)
+            raise
         finally:
-            if termination_handle is not None and not termination_handle_transferred:
-                termination_handle.release()
+            try:
+                if probe_to_release is not None:
+                    probe_to_release[0].release_probe(probe_to_release[1])
+            finally:
+                if termination_handle is not None and not termination_handle_transferred:
+                    termination_handle.release()
 
     def _wrap_stream_async(
         self,
@@ -4511,6 +4903,7 @@ class AsyncSolwyn(_SolwynBase):
         velocity_flags: Collection[str] = (),
         on_error: Callable[[BaseException], Awaitable[None]] | None = None,
         cost_routed: bool = False,
+        admission: CircuitBreakerAdmission | None = None,
     ) -> Any:
         """Wrap an async streaming response, settling against the SERVED runtime.
 
@@ -4620,6 +5013,7 @@ class AsyncSolwyn(_SolwynBase):
                 is_model_fallback=is_model_fallback,
                 call_id=call_id,
                 agent_run=agent_run,
+                admission=admission,
             )
 
         # Cross-DIALECT hop: reshape each served chunk back to the caller's
@@ -4649,6 +5043,19 @@ class AsyncSolwyn(_SolwynBase):
                 ),
                 abort_release=(
                     termination_handle.release if termination_handle is not None else None
+                ),
+                on_finalize_error=_make_async_stream_error_handler(
+                    self,
+                    runtime,
+                    ctx,
+                    budget,
+                    primary,
+                    requested_model=requested_model,
+                    is_model_fallback=is_model_fallback,
+                    call_id=call_id,
+                    agent_run=agent_run,
+                    admission=admission,
+                    provider_failure=False,
                 ),
             )
             return primary.adapter.wrap_stream_result(wrapper, response)

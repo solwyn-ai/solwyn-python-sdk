@@ -1223,11 +1223,22 @@ class TestWireModelFieldConstraints:
         assert SERVICE_TIER_MAX_LENGTH in max_lengths
 
     def test_metadata_failover_error_class_max_length_pinned(self) -> None:
-        # failover_error_class carries only type(exc).__name__; the 64 bound caps
-        # it defensively (a class name can't legitimately exceed it).
+        # failover_error_class carries only a class name. 64 is the API's bound;
+        # a longer name is CUT by _base._wire_error_class before construction.
+        assert wire_constants.FAILOVER_ERROR_CLASS_MAX_LENGTH == 64
         field = MetadataEvent.model_fields["failover_error_class"]
         max_lengths = [m.max_length for m in field.metadata if hasattr(m, "max_length")]
         assert 64 in max_lengths
+
+    def test_metadata_failover_error_class_pattern_pinned(self) -> None:
+        # Literal copy of core's IngestMetadataEvent.failover_error_class pattern.
+        # /metadata/ingest validates the batch as ONE list, so a name outside
+        # this shape 422s every event sent with it — a terminal rejection the
+        # reporter drops. Pinned so SDK/API drift fails here, not in production.
+        assert wire_constants.FAILOVER_ERROR_CLASS_PATTERN == r"^[A-Za-z][A-Za-z0-9_.]*$"
+        field = MetadataEvent.model_fields["failover_error_class"]
+        patterns = [m.pattern for m in field.metadata if hasattr(m, "pattern")]
+        assert patterns == [wire_constants.FAILOVER_ERROR_CLASS_PATTERN]
 
     def test_budget_check_fallback_models_element_max_length_pinned(self) -> None:
         with pytest.raises(ValidationError):
@@ -1819,8 +1830,10 @@ class TestFailoverErrorClassFirewall:
         errors = [e for e in _reported_events(solwyn) if e.status is CallStatus.ERROR]
         assert len(errors) == 1
         ev = errors[0]
-        # The field equals the class name ONLY — never str(exc).
-        assert ev.failover_error_class == "_LeakyError"
+        # The field equals the (wire-normalized) class name ONLY — never
+        # str(exc). `_LeakyError` loses the leading underscore the API's
+        # pattern rejects.
+        assert ev.failover_error_class == "LeakyError"
         # And the SENTINEL is absent from EVERY byte of the wire payload.
         blob = json.dumps(ev.model_dump(mode="json"))
         assert sentinel not in blob
@@ -1847,7 +1860,7 @@ class TestFailoverErrorClassFirewall:
         errors = [e for e in _reported_events(solwyn) if e.status is CallStatus.ERROR]
         assert len(errors) == 1
         ev = errors[0]
-        assert ev.failover_error_class == "_LeakyError"
+        assert ev.failover_error_class == "LeakyError"
         blob = json.dumps(ev.model_dump(mode="json"))
         assert sentinel not in blob
 

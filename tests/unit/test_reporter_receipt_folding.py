@@ -724,18 +724,22 @@ class TestReceiptFoldState:
     def test_fold_retains_no_content_or_exception_strings(self) -> None:
         reporter = _quiet_sync()
         secret = "TOP-SECRET-PROMPT-CONTENT"
+        # The wire model pins failover_error_class to the API's class-name
+        # pattern, so this field's marker is the identifier-shaped spelling.
+        class_secret = "TOP_SECRET_PROMPT_CONTENT"
         try:
             reporter._fold_or_count_event_drop(
                 _event(
                     deny_reason=secret,
                     tags={"customer-content": secret},
-                    failover_error_class=secret,
+                    failover_error_class=class_secret,
                     agent_run_name=secret,
                 ),
                 "retry_exhausted",
             )
             state = repr(dataclasses.asdict(_only_fold(reporter)))
             assert secret not in state
+            assert class_secret not in state
         finally:
             reporter._shutdown.set()
             reporter._http.close()

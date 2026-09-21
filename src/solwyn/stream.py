@@ -65,6 +65,7 @@ class SyncStreamWrapper:
         *,
         abort_check: Callable[[], Exception | None] | None = None,
         abort_release: Callable[[], None] | None = None,
+        on_finalize_error: Callable[[BaseException], None] | None = None,
     ) -> None:
         self._stream = stream
         self._iterator: Iterator[Any] | None = None
@@ -72,6 +73,7 @@ class SyncStreamWrapper:
         self._accumulator = accumulator
         self._on_complete = on_complete
         self._on_error = on_error
+        self._on_finalize_error = on_finalize_error or on_error
         self._chunk_translator = chunk_translator
         self._abort_check = abort_check
         self._abort_finalizer = (
@@ -100,7 +102,16 @@ class SyncStreamWrapper:
             self._settled = True
         self._release_abort_handle()
         elapsed_ms = (time.monotonic() - self._start_time) * 1000
-        token_details = self._accumulator.finalize()
+        try:
+            token_details = self._accumulator.finalize()
+        except BaseException as exc:
+            # We already won settlement. Finalization is bookkeeping, not a
+            # health verdict; retire ownership even when no usage can be built.
+            try:
+                self._on_finalize_error(exc)
+            except BaseException as cleanup_exc:
+                logger.warning("stream.finalize_cleanup_failed: %s", type(cleanup_exc).__name__)
+            raise
         try:
             self._on_complete(token_details, elapsed_ms)
         except Exception as cb_exc:
@@ -247,6 +258,7 @@ class AsyncStreamWrapper:
         *,
         abort_check: Callable[[], Exception | None] | None = None,
         abort_release: Callable[[], None] | None = None,
+        on_finalize_error: Callable[[BaseException], Awaitable[None]] | None = None,
     ) -> None:
         self._stream = stream
         self._iterator: AsyncIterator[Any] | None = None
@@ -254,6 +266,7 @@ class AsyncStreamWrapper:
         self._accumulator = accumulator
         self._on_complete = on_complete
         self._on_error = on_error
+        self._on_finalize_error = on_finalize_error or on_error
         self._chunk_translator = chunk_translator
         self._abort_check = abort_check
         self._abort_finalizer = (
@@ -272,7 +285,14 @@ class AsyncStreamWrapper:
         self._settled = True
         self._release_abort_handle()
         elapsed_ms = (time.monotonic() - self._start_time) * 1000
-        token_details = self._accumulator.finalize()
+        try:
+            token_details = self._accumulator.finalize()
+        except BaseException as exc:
+            try:
+                await self._on_finalize_error(exc)
+            except BaseException as cleanup_exc:
+                logger.warning("stream.finalize_cleanup_failed: %s", type(cleanup_exc).__name__)
+            raise
         try:
             await self._on_complete(token_details, elapsed_ms)
         except Exception as cb_exc:
@@ -340,9 +360,12 @@ class AsyncStreamWrapper:
             except StopAsyncIteration:
                 await self._settle()
                 raise
-            except Exception as exc:
+            except BaseException as exc:
                 if self._abort_exc is exc:
                     raise
+                # Cancellation retires admission/accounting ownership too. The
+                # callback distinguishes it from a provider-health failure;
+                # explicit close/context exit still owns transport cleanup.
                 await self._settle_error(exc)
                 raise
         return self._pending_chunks.popleft()
@@ -381,6 +404,14 @@ class AsyncStreamWrapper:
 
     async def __aexit__(self, *args: object) -> bool | None:
         try:
+            if (
+                len(args) > 1
+                and isinstance(args[1], BaseException)
+                and not isinstance(args[1], Exception)
+            ):
+                # Cancellation may arrive in the caller's context body, rather
+                # than in __anext__. It still has no measured usage or verdict.
+                await self._settle_error(args[1])
             # self.close() now settles AND forwards to inner aclose()/close().
             # Broad except is intentional: callback/provider-close failures
             # must not mask the application exception propagating through
@@ -477,8 +508,9 @@ class _SyncResponsesStreamManagerWrapper:
     observe terminal Responses events. Closing before entry dispatched no
     provider request at all, so it releases the reservation without settling
     or reporting; a provider entry failure takes the classified entry-error
-    path, and any failure after the provider stream opens takes the
-    established stream-error path.
+    path, and any provider failure after the stream opens takes the
+    established stream-error path. ``on_error`` here fires only when WRAPPING
+    the opened stream fails; the client passes a handler with no breaker verdict.
     """
 
     def __init__(
@@ -785,7 +817,14 @@ class _AsyncResponsesStreamManagerWrapper:
             settlement_error: BaseException | None = None
             try:
                 if self._dispatched:
-                    await self._wrapped_stream()._settle()
+                    if (
+                        len(args) > 1
+                        and isinstance(args[1], BaseException)
+                        and not isinstance(args[1], Exception)
+                    ):
+                        await self._wrapped_stream()._settle_error(args[1])
+                    else:
+                        await self._wrapped_stream()._settle()
                 else:
                     await self._release_before_entry()
             except BaseException as exc:

@@ -24,6 +24,15 @@ LEASE_ID_MAX_LENGTH = 64
 CALL_ID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 # Length of that canonical form; bounds the API's DB column and dedup key.
 CALL_ID_MAX_LENGTH = 36
+# Vendored lock-step with core's ``IngestMetadataEvent.failover_error_class``.
+# The API admits that column to its privacy allowlist only because this shape
+# cannot carry an exception message, and the ingest route validates the batch
+# as ONE list: a single name outside the shape 422s every event sent with it.
+# ``_base._wire_error_class`` maps any class name into the shape before an
+# event is built; the wire model pins the same two values so drift fails in a
+# unit test rather than as that production 422.
+FAILOVER_ERROR_CLASS_PATTERN = r"^[A-Za-z][A-Za-z0-9_.]*$"
+FAILOVER_ERROR_CLASS_MAX_LENGTH = 64
 # Vendored lock-step with core's shared tag constants. Core's cross-repo
 # parity test pins all three values so either definition cannot drift silently.
 TAGS_MAX_KEYS = 10
