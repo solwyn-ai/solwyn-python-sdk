@@ -2876,6 +2876,14 @@ class Solwyn(_SolwynBase):
                                 lease_claim_token=_lease_claim_token(budget),
                             )
                             raise  # re-raise ORIGINAL exception (drop-in contract)
+                        if disp is Disposition.POST_SEND_AMBIGUOUS:
+                            # Failing over does not un-send this hop. The call keeps
+                            # its reservation, pinned: no later settlement, refusal,
+                            # or chain exhaustion may refund the bound.
+                            self._solwyn_budget.mark_reservation_spend_unknown(
+                                call_id,
+                                lease_claim_token=_lease_claim_token(budget),
+                            )
                         last_exc = exc
                         advanced = True
                     # Reached on a successful hop OR on a terminal failure that advances
@@ -3079,7 +3087,8 @@ class Solwyn(_SolwynBase):
                 return result
 
             # Every candidate failed (or none was attempted): no settlement will
-            # follow, so the lease reservation goes back now.
+            # follow, so the lease reservation goes back now — unless a failed-over
+            # ambiguous hop pinned it, in which case the ledger retires its bound.
             self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
@@ -4389,6 +4398,14 @@ class AsyncSolwyn(_SolwynBase):
                                 lease_claim_token=_lease_claim_token(budget),
                             )
                             raise
+                        if disp is Disposition.POST_SEND_AMBIGUOUS:
+                            # Mirror sync: pin the still-live reservation so no
+                            # later exit from this call (cancellation included)
+                            # can refund what this hop may have consumed.
+                            self._solwyn_budget.mark_reservation_spend_unknown(
+                                call_id,
+                                lease_claim_token=_lease_claim_token(budget),
+                            )
                         last_exc = exc
                         advanced = True
                     # Reached on a successful hop OR on a terminal failure that advances
@@ -4590,7 +4607,8 @@ class AsyncSolwyn(_SolwynBase):
                 return result
 
             # Every candidate failed (or none was attempted): no settlement will
-            # follow, so the lease reservation goes back now.
+            # follow, so the lease reservation goes back now — unless a failed-over
+            # ambiguous hop pinned it, in which case the ledger retires its bound.
             self._solwyn_budget.release_reservation(
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),

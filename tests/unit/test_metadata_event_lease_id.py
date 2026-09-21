@@ -48,6 +48,12 @@ class _Status503(Exception):
     status_code = 503
 
 
+class _Status429(Exception):
+    """Rate-limit rejection: provably unserved, so FAILOVER refunds as before."""
+
+    status_code = 429
+
+
 class _Status400(Exception):
     """Request refusal: FAIL_FAST must return unused lease authority."""
 
@@ -294,6 +300,78 @@ async def test_dispatch_abort_retires_draw_without_refunding_unknown_spend(
     assert plane.lease_surrenders[0].spent_tokens == (20 if ambiguous else 15)
     await close()
     assert len(plane.lease_surrenders) == 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize(
+    "primary_error,fallback_error,spent",
+    [
+        pytest.param(_Status503, _Status503, 20, id="ambiguous-then-exhausted"),
+        pytest.param(_Status503, _Status400, 20, id="ambiguous-then-refused"),
+        pytest.param(_Status503, None, 20, id="ambiguous-then-served"),
+        pytest.param(_Status429, _Status429, 0, id="pre-send-exhausted-control"),
+        pytest.param(_Status429, None, 15, id="pre-send-then-served-control"),
+    ],
+)
+async def test_failed_over_ambiguous_hop_pins_the_bound_for_every_later_exit(
+    mode: str,
+    primary_error: type[Exception],
+    fallback_error: type[Exception] | None,
+    spent: int,
+) -> None:
+    # failover_idempotency="always" walks past a post-send-ambiguous hop on the
+    # SAME reservation. Failing over does not un-send that hop, so no later exit
+    # may re-lend its bound; a provably pre-send 429 still refunds as before.
+    plane = FakeControlPlane(granted_tokens=20, headroom_share_tokens=0, final_grant=True)
+    stub = _AsyncOpenAIStub if mode == "async" else _OpenAIStub
+    primary = stub(primary_error("synthetic primary failure"))
+    fallback = stub(fallback_error("synthetic fallback failure") if fallback_error else None)
+    wrap = plane.wrap_async if mode == "async" else plane.wrap
+    wrapped = wrap(
+        primary,
+        fallback=[(fallback, "gpt-5.5-mini")],
+        failover_idempotency="always",
+    )
+
+    async def call() -> None:
+        result = wrapped.chat.completions.create(
+            model="gpt-5.5", messages=[], max_completion_tokens=20
+        )
+        if mode == "async":
+            await result
+
+    try:
+        with solwyn.run("failed-over-ambiguous-accounting") as run_id:
+            if fallback_error is None:
+                await call()
+            else:
+                with pytest.raises(fallback_error):
+                    await call()
+            assert primary.chat.completions.calls == 1
+            assert fallback.chat.completions.calls == 1
+            state = wrapped._solwyn_budget._lease.state_for(run_id)
+            assert state is not None
+            assert state.reservations == {}
+            assert state.reserved_tokens == 0
+            assert state.spent_tokens_since_report == spent
+            assert state.granted_remaining_tokens == 20 - spent
+    finally:
+        if mode == "async":
+            await wrapped.close()
+        else:
+            wrapped.close()
+
+    # The wire is unchanged: a failed-over hop is still not a possibly-succeeded
+    # receipt, and a served hop confirms its MEASURED usage, not the bound.
+    errors = [event for event in plane.ingested if event.status == "error"]
+    assert errors and all(event.possibly_succeeded is None for event in errors)
+    if fallback_error is None:
+        assert _only_confirm(plane).token_details.total_tokens == 15
+    else:
+        assert plane.confirms == []
+    assert [s.spent_tokens for s in plane.lease_surrenders] == [spent]
 
 
 @pytest.mark.unit

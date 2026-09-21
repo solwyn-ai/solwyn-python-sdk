@@ -29,7 +29,12 @@ SDK drops that outage's tally rather than re-sending it forever.
   SDK is still waiting for a connection-pool slot: cancellation alone cannot
   prove that no request was sent. Sync and async dispatch read timeouts, 5xx
   responses, and protocol drops also retain the bound when ambiguous failover
-  is disabled. Proven pre-send failures and request-shaped FAIL_FAST refusals
+  is disabled. Under `failover_idempotency="always"` such a hop fails over on
+  the same reservation, which is now pinned at its bound for the rest of the
+  call: a later served hop settles at no less than the bound (its confirm still
+  carries the measured usage), and a later refusal, chain exhaustion,
+  cancellation, or reservation sweep retires the bound instead of refunding
+  it. Proven pre-send failures and request-shaped FAIL_FAST refusals
   still return unused authority. The conservative token tally can exceed actual
   usage and exhaust a lease sooner with aggressive caller timeouts; it does not
   invent output usage or compute cost. Error receipts retain reconciliation

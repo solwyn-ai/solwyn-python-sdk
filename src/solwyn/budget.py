@@ -1722,6 +1722,21 @@ class _BudgetEnforcerBase:
             # Legacy fail-open keeps its admission estimate, just like release.
             self._uncounted_estimates.pop(call_id, None)
 
+    def mark_reservation_spend_unknown(
+        self, call_id: str, *, lease_claim_token: int | None
+    ) -> None:
+        """Pin a still-live reservation at its bound after an ambiguous hop.
+
+        For a post-send-ambiguous attempt the chain FAILS OVER from
+        (``failover_idempotency="always"``): the call keeps walking on the same
+        reservation, but that hop may already have been billed. Whatever ends
+        the call later — a served hop's settlement, a refusal, chain
+        exhaustion, cancellation, or the sweep — must not re-lend the bound.
+        No-op for a call that drew on no lease authority.
+        """
+        with self._state_lock:
+            self._lease.mark_spend_unknown(call_id, claim_token=lease_claim_token)
+
     def lease_surrender_payloads(self) -> list[LeaseSurrenderRequest]:
         """Drain every held lease into surrender payloads (best-effort release).
 
