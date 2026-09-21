@@ -828,3 +828,93 @@ async def test_real_slow_response_body_cannot_extend_close_or_free_live_sync_slo
         server.server_close()
         thread.join(2)
     assert not enforcer._release_jobs
+
+
+def test_sync_pool_teardown_retains_worker_slot_until_late_grants_can_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import solwyn.budget as budget
+
+    monkeypatch.setattr(budget, "_SURRENDER_TIMEOUT_S", 0.05)
+    release_entered, release_finish = threading.Event(), threading.Event()
+    late_entered, late_finish = threading.Event(), threading.Event()
+    close_entered, close_finish = threading.Event(), threading.Event()
+    lock = threading.Lock()
+    grants = 0
+    sent: list[str] = []
+    old_pool: httpx.Client | None = None
+    original_close = httpx.Client.close
+
+    def handle(_transport: object, request: httpx.Request) -> httpx.Response:
+        nonlocal grants
+        payload = json.loads(request.content)
+        if request.url.path.endswith("surrender"):
+            with lock:
+                sent.append(payload["lease_id"])
+            if payload["lease_id"] == "lease_initial":
+                release_entered.set()
+                assert release_finish.wait(5)
+            return httpx.Response(200, json={})
+        if request.url.path.endswith("lease") and payload["agent_run_id"].startswith("late"):
+            with lock:
+                grants += 1
+                if grants == 4:
+                    late_entered.set()
+            assert late_finish.wait(5)
+        return response(request)
+
+    def close(client: httpx.Client) -> None:
+        if client is old_pool:
+            close_entered.set()
+            assert close_finish.wait(5)
+        original_close(client)
+
+    with (
+        patch.object(httpx.HTTPTransport, "handle_request", handle),
+        patch.object(httpx.Client, "close", close),
+    ):
+        enforcer = BudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+        enforcer.check_budget(**arguments("initial"))
+        enforcer.surrender_run("initial")
+        assert release_entered.wait(2)
+        old_pool = enforcer._release_http
+        old_worker = next(iter(enforcer._release_threads))
+        callers = [
+            threading.Thread(
+                target=lambda i=i: enforcer.check_budget(**arguments(f"late{i}")), daemon=True
+            )
+            for i in range(4)
+        ]
+        try:
+            for caller in callers:
+                caller.start()
+            assert late_entered.wait(2)
+            enforcer.close()
+            release_finish.set()
+            assert close_entered.wait(2)
+            late_finish.set()
+            for caller in callers:
+                caller.join(2)
+                assert not caller.is_alive()
+            # Teardown is still underlying worker work. Its slot cannot be
+            # lent to a fifth worker waiting for this same pool lock.
+            assert old_worker.is_alive()
+            assert old_worker in enforcer._release_threads
+            assert len(enforcer._release_threads | {old_worker}) == 4
+            assert len(enforcer._releases_owed) == 1
+        finally:
+            release_finish.set()
+            late_finish.set()
+            close_finish.set()
+            for worker in [old_worker, *callers, *list(enforcer._release_threads)]:
+                worker.join(3)
+            enforcer.close()
+        assert sorted(sent) == [
+            "lease_initial",
+            "lease_late0",
+            "lease_late1",
+            "lease_late2",
+            "lease_late3",
+        ]
+        assert not enforcer._release_threads
+        assert enforcer._release_http is None

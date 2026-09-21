@@ -3063,33 +3063,48 @@ class BudgetEnforcer(_BudgetEnforcerBase):
 
     def _run_release_worker(self) -> None:
         """One capacity owner drains queued requests until no work remains."""
+        worker = threading.current_thread()
         try:
             while True:
                 with self._state_lock:
                     owed = self._next_release_locked()
-                    if owed is None:
+                    if owed is None and (not self._closed or len(self._release_threads) > 1):
                         # Atomic idle transition: an enqueue after this point
-                        # sees the free slot and starts its own worker.
-                        self._release_threads.discard(threading.current_thread())
+                        # sees the free slot. No blocking cleanup follows it.
+                        self._release_threads.discard(worker)
                         return
+                if owed is None:
+                    # The last worker owns pool teardown as well as requests.
+                    # Keep its capacity while close() runs, then recheck for
+                    # late grants queued during teardown before retiring.
+                    self._close_release_pool_if_idle(worker=worker)
+                    with self._state_lock:
+                        if not self._releases_owed:
+                            self._release_threads.discard(worker)
+                            return
+                    continue
                 try:
                     self._surrender_payloads([owed.request], owed.deadline)
                 finally:
                     with self._state_lock:
                         self._finish_release_locked(owed)
-        finally:
-            with self._state_lock:
-                self._release_threads.discard(threading.current_thread())
-            self._close_release_pool_if_idle()
+        except BaseException:
+            try:
+                self._close_release_pool_if_idle(worker=worker)
+            finally:
+                with self._state_lock:
+                    self._release_threads.discard(worker)
+            raise
 
-    def _close_release_pool_if_idle(self) -> None:
+    def _close_release_pool_if_idle(self, *, worker: threading.Thread | None = None) -> None:
         # A timed-out join does NOT free a worker or close its live pool. The
         # last actual completion owns teardown, including post-close renewals.
-        if not self._release_client_lock.acquire(blocking=False):
+        if not self._release_client_lock.acquire(blocking=worker is not None):
             return  # A live constructor/teardown still owns the pool.
         try:
             with self._state_lock:
-                if not self._closed or self._release_threads:
+                others = self._release_threads - {worker} if worker else self._release_threads
+                if not self._closed or others:
                     return
                 client, self._release_http = self._release_http, None
             if client is not None:
