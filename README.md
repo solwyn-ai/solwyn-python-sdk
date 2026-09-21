@@ -611,7 +611,7 @@ separate TLS contexts when connecting through an HTTPS proxy.
 Identical release payloads coalesce; different holder/generation/spend identities
 remain distinct. A full queue abandons the new, unsent courtesy release and
 increments `BudgetEnforcer.release_counts["queue_full"]` (also available on
-`AsyncBudgetEnforcer`). Unsent work expires six seconds after enqueue, counted
+`AsyncBudgetEnforcer`). Queued, unsent work expires six seconds after enqueue, counted
 as `expired`; failed worker startup is counted as `dispatch_failed` and leaves
 the bounded queue available for retry or shutdown. The server reclaims leases
 that it did not hear about at its own expiry. These limits add no configuration
