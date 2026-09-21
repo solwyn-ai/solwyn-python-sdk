@@ -48,19 +48,35 @@ class _TerminationHandle:
                 return
             self.released = True
             group = _STATE.active_handles.get(self.run_id)
-            if group is None:
+            # A pre-fork handle can outlive the detached parent group, even
+            # after a child creates the same run id and generation again.
+            if group is None or self not in group.handles:
                 return
-            group.handles.discard(self)
+            group.handles.remove(self)
+            if self.generation == group.generation:
+                group.current_owners -= 1
+                if group.current_owners == 0:
+                    group.termination = None
             if not group.handles:
                 del _STATE.active_handles[self.run_id]
 
 
 @dataclass
 class _ActiveHandleGroup:
-    """One bounded active-run watcher group with an ordered clear epoch."""
+    """Live watcher ownership, with an O(1) current-epoch authority index.
+
+    Every current-generation handle has the same termination: acquisition
+    seeds it under the lock, and a stop latches all current handles under that
+    lock. Clear resets the index while old handles keep their immutable cells.
+    The winner is owned only while ``current_owners`` is nonzero; old handles
+    must not extend its lifetime after global LRU eviction. ``observed_at``
+    retains the group's last observation until clear or total group cleanup.
+    """
 
     generation: int = 0
     observed_at: float | None = None
+    termination: RunTermination | None = None
+    current_owners: int = 0
     handles: set[_TerminationHandle] = field(default_factory=set)
 
     def __iter__(self) -> Iterator[_TerminationHandle]:
@@ -111,16 +127,10 @@ def _active_group_termination_locked(
     group = _STATE.active_handles.get(run_id)
     if group is None:
         return None
-    return next(
-        (
-            handle.termination
-            for handle in group.handles
-            if handle.generation == group.generation
-            and handle.termination is not None
-            and (source is None or handle.termination.source == source)
-        ),
-        None,
-    )
+    termination = group.termination
+    if termination is not None and (source is None or termination.source == source):
+        return termination
+    return None
 
 
 def _advance_active_generation_locked(run_id: str) -> None:
@@ -129,6 +139,8 @@ def _advance_active_generation_locked(run_id: str) -> None:
     if group is not None:
         group.generation += 1
         group.observed_at = None
+        group.termination = None
+        group.current_owners = 0
 
 
 def _trim_registry_locked() -> None:
@@ -189,7 +201,10 @@ def _mark_terminated_locked(
     # returning; iteration order must never decide which sibling learns it.
     if group is not None:
         group.observed_at = observed_at
-        for handle in tuple(group.handles):
+        group.termination = termination if group.current_owners else None
+        # A real stop still does O(N) latching. Membership cannot change while
+        # this lock is held, so no snapshot allocation is necessary.
+        for handle in group.handles:
             if handle.generation == group.generation and handle.termination is None:
                 handle.termination = termination
     _trim_registry_locked()
@@ -253,7 +268,10 @@ def mark_terminated(
 def _acquire_termination_handle(run_id: str) -> _TerminationHandle:
     """Register one active stream and seed it from any existing stop."""
     with _STATE.lock:
-        group = _STATE.active_handles.setdefault(run_id, _ActiveHandleGroup())
+        group = _STATE.active_handles.get(run_id)
+        if group is None:
+            group = _ActiveHandleGroup()
+            _STATE.active_handles[run_id] = group
         termination = _STATE.terminations.get(run_id)
         if termination is None:
             termination = _active_group_termination_locked(run_id)
@@ -268,6 +286,8 @@ def _acquire_termination_handle(run_id: str) -> _TerminationHandle:
             termination=termination,
         )
         group.handles.add(handle)
+        group.current_owners += 1
+        group.termination = termination
         return handle
 
 
