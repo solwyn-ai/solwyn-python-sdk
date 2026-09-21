@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import ssl
 import threading
 import time
 import uuid
+import weakref
 from unittest.mock import patch
 
 import httpx
@@ -918,3 +920,352 @@ def test_sync_pool_teardown_retains_worker_slot_until_late_grants_can_progress(
         ]
         assert not enforcer._release_threads
         assert enforcer._release_http is None
+
+
+def test_native_cancelled_initializer_recovers_on_next_loop_without_duplicate_tls() -> None:
+    entered, finish = threading.Event(), threading.Event()
+    calls = 0
+    sent: list[str] = []
+    original = ssl.create_default_context
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+
+    def tls(*args: object, **kwargs: object) -> ssl.SSLContext:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert finish.wait(5)
+        return original(*args, **kwargs)
+
+    async def handle(_transport: object, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("surrender"):
+            sent.append(json.loads(request.content)["lease_id"])
+            return httpx.Response(200, json={})
+        return response(request)
+
+    async def first_loop() -> None:
+        for run_id in ("cancelled", "survivor0", "survivor1", "survivor2"):
+            await enforcer.check_budget(**arguments(run_id))
+        enforcer.surrender_run("cancelled")
+        assert await asyncio.to_thread(entered.wait, 2)
+        # asyncio.run now cancels the initializer while native setup is held.
+
+    async def second_loop() -> None:
+        closing = asyncio.create_task(enforcer.close())
+        for _ in range(12):
+            await asyncio.sleep(0)
+        assert calls == 1, "the original synchronous TLS work still owns initialization"
+        assert not closing.done(), "close must retain the surviving lease releases"
+        finish.set()
+        await asyncio.wait_for(closing, 3)
+        assert sorted(sent) == ["lease_survivor0", "lease_survivor1", "lease_survivor2"]
+        assert not enforcer._release_jobs
+
+    try:
+        with (
+            patch.object(ssl, "create_default_context", tls),
+            patch.object(httpx.AsyncHTTPTransport, "handle_async_request", handle),
+        ):
+            asyncio.run(first_loop())
+            assert enforcer._release_http_task.cancelled()
+            assert enforcer.release_counts == {"cancelled": 1}
+            asyncio.run(second_loop())
+    finally:
+        finish.set()
+        asyncio.run(enforcer.close())
+
+
+def test_restarting_loops_during_native_tls_does_not_retain_abandoned_loops() -> None:
+    entered, finish = threading.Event(), threading.Event()
+    calls = 0
+    loops: list[weakref.ReferenceType[asyncio.AbstractEventLoop]] = []
+    original = ssl.create_default_context
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+
+    def tls(*args: object, **kwargs: object) -> ssl.SSLContext:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert finish.wait(5)
+        return original(*args, **kwargs)
+
+    async def initialize() -> None:
+        loops.append(weakref.ref(asyncio.get_running_loop()))
+        task = asyncio.create_task(enforcer._release_client())
+        for _ in range(8):
+            await asyncio.sleep(0)
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert not task.done()
+
+    try:
+        with patch.object(ssl, "create_default_context", tls):
+            for _ in range(8):
+                asyncio.run(initialize())
+            gc.collect()
+            # Only the most recent cancelled initializer may retain its loop.
+            assert all(loop() is None for loop in loops[:-1])
+            assert enforcer._release_tls_waiter is None
+            assert calls == 1
+    finally:
+        finish.set()
+        enforcer._release_tls_future.result(timeout=2)
+        asyncio.run(enforcer.close())
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError, httpx.ConnectError])
+@pytest.mark.parametrize("half_open", [False, True])
+async def test_local_release_setup_failure_does_not_trip_admission_breaker(
+    async_mode: bool,
+    error_type: type[Exception],
+    half_open: bool,
+) -> None:
+    from solwyn.circuit_breaker import CircuitBreaker
+
+    breaker = CircuitBreaker(name="control-plane", failure_threshold=1, recovery_timeout=0)
+    cls = AsyncBudgetEnforcer if async_mode else BudgetEnforcer
+    enforcer = cls(
+        "https://offline.invalid",
+        VALID_API_KEY,
+        transport=httpx.MockTransport(response),
+        control_plane_breaker=breaker,
+    )
+    if half_open:
+        breaker.record_failure()
+        breaker.release_probe(breaker.admit())
+    previous_health = breaker.get_state()
+    client_type = httpx.AsyncClient if async_mode else httpx.Client
+    request = LeaseSurrenderRequest(
+        lease_id="setup", holder_id="test", generation=1, spent_tokens=0
+    )
+    try:
+        with patch.object(client_type, "__init__", side_effect=error_type("synthetic local setup")):
+            if async_mode:
+                await enforcer._surrender_payloads([request], time.monotonic() + 2)
+            else:
+                enforcer._surrender_payloads([request], time.monotonic() + 2)
+        assert breaker.get_state() == previous_health
+        probe = breaker.admit()
+        assert probe.allowed
+        breaker.release_probe(probe)
+        assert enforcer.release_counts["setup_failed"] == 1
+        # The same healthy API remains available for ordinary admission.
+        if async_mode:
+            result = await enforcer.check_budget(**arguments("healthy"))
+        else:
+            result = enforcer.check_budget(**arguments("healthy"))
+        assert result.lease_id is not None
+    finally:
+        if async_mode:
+            await enforcer.close()
+        else:
+            enforcer.close()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("failure", ["timeout", "connect", "status", "local"])
+async def test_release_request_failure_classification_retains_network_health_and_timeout_retry(
+    async_mode: bool,
+    failure: str,
+) -> None:
+    from solwyn.circuit_breaker import CircuitBreaker
+
+    attempts = 0
+    breaker = CircuitBreaker(name="control-plane", failure_threshold=10)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if failure == "timeout":
+            raise httpx.ReadTimeout("synthetic timeout", request=request)
+        if failure == "connect":
+            raise httpx.ConnectError("synthetic refusal", request=request)
+        if failure == "local":
+            raise RuntimeError("synthetic loop-affinity failure")
+        return httpx.Response(503)
+
+    cls = AsyncBudgetEnforcer if async_mode else BudgetEnforcer
+    enforcer = cls(
+        "https://offline.invalid",
+        VALID_API_KEY,
+        transport=httpx.MockTransport(handle),
+        control_plane_breaker=breaker,
+    )
+    request = LeaseSurrenderRequest(
+        lease_id="request", holder_id="test", generation=1, spent_tokens=0
+    )
+    try:
+        if async_mode:
+            await enforcer._surrender_payloads([request], time.monotonic() + 2)
+        else:
+            enforcer._surrender_payloads([request], time.monotonic() + 2)
+        assert attempts == (2 if failure == "timeout" else 1)
+        assert breaker.failure_count == (0 if failure == "local" else attempts)
+        assert enforcer.release_counts == ({"local_error": 1} if failure == "local" else {})
+    finally:
+        if async_mode:
+            await enforcer.close()
+        else:
+            enforcer.close()
+
+
+def test_established_native_release_pool_stays_on_owning_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from solwyn.circuit_breaker import CircuitBreaker
+
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    requests: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self) -> None:
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append(payload["lease_id"])
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"{}")
+            self.wfile.flush()
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    breaker = CircuitBreaker(name="control-plane", failure_threshold=1)
+    enforcer = AsyncBudgetEnforcer(
+        f"http://127.0.0.1:{server.server_port}", VALID_API_KEY, control_plane_breaker=breaker
+    )
+    original = httpx.AsyncHTTPTransport.handle_async_request
+    owner = asyncio.new_event_loop()
+
+    async def handle(transport: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("surrender"):
+            return await original(transport, request)  # Real keep-alive release connection.
+        return response(request)  # Foreground _http has no sockets to confound this test.
+
+    async def establish() -> None:
+        await enforcer.check_budget(**arguments("sent"))
+        await enforcer.check_budget(**arguments("held"))
+        enforcer.surrender_run("sent")
+        await drain(enforcer)
+
+    async def foreign_loop() -> None:
+        await enforcer.check_budget(**arguments("foreign"))
+        enforcer.surrender_run("foreign")
+        await drain(enforcer)
+        assert requests == ["lease_sent"]
+        assert enforcer.release_counts == {"setup_failed": 1}
+        assert breaker.failure_count == 0
+        with pytest.raises(RuntimeError, match="owning event loop"):
+            await enforcer.close()
+        assert not enforcer._closed
+        assert enforcer._lease.state_for("held") is not None
+
+    try:
+        with patch.object(httpx.AsyncHTTPTransport, "handle_async_request", handle):
+            owner.run_until_complete(establish())
+            pool = enforcer._release_http_task.result()
+            asyncio.run(foreign_loop())
+            assert not pool.is_closed
+            owner.run_until_complete(enforcer.close())
+            assert pool.is_closed
+            assert requests == ["lease_sent", "lease_held"]
+    finally:
+        owner.run_until_complete(enforcer.close())
+        owner.close()
+        server.shutdown()
+        server.server_close()
+        worker.join(2)
+
+
+def test_pending_native_initializer_cannot_be_taken_from_its_live_loop() -> None:
+    entered, finish = threading.Event(), threading.Event()
+    original = ssl.create_default_context
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    owner = asyncio.new_event_loop()
+    sent: list[str] = []
+
+    def tls(*args: object, **kwargs: object) -> ssl.SSLContext:
+        entered.set()
+        assert finish.wait(5)
+        return original(*args, **kwargs)
+
+    async def handle(_transport: object, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("surrender"):
+            sent.append(json.loads(request.content)["lease_id"])
+            return httpx.Response(200, json={})
+        return response(request)
+
+    async def start() -> None:
+        await enforcer.check_budget(**arguments("first"))
+        await enforcer.check_budget(**arguments("held"))
+        enforcer.surrender_run("first")
+        assert await asyncio.to_thread(entered.wait, 2)
+
+    async def foreign_close() -> None:
+        with pytest.raises(RuntimeError, match="owning event loop"):
+            await enforcer.close()
+        assert not enforcer._closed
+        assert enforcer._lease.state_for("held") is not None
+
+    with (
+        patch.object(ssl, "create_default_context", tls),
+        patch.object(httpx.AsyncHTTPTransport, "handle_async_request", handle),
+    ):
+        try:
+            owner.run_until_complete(start())
+            asyncio.run(foreign_close())
+        finally:
+            finish.set()
+            owner.run_until_complete(enforcer.close())
+            owner.close()
+    assert sorted(sent) == ["lease_first", "lease_held"]
+
+
+def test_native_pool_teardown_keeps_loop_ownership_after_httpx_marks_closed() -> None:
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    owner = asyncio.new_event_loop()
+    entered, finish = asyncio.Event(), asyncio.Event()
+    original = httpx.AsyncHTTPTransport.aclose
+
+    async def handle(_transport: object, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("surrender"):
+            return httpx.Response(200, json={})
+        return response(request)
+
+    async def slow_close(transport: httpx.AsyncHTTPTransport) -> None:
+        entered.set()
+        await finish.wait()
+        await original(transport)
+
+    async def start_close() -> asyncio.Task[None]:
+        await enforcer.check_budget(**arguments("first"))
+        enforcer.surrender_run("first")
+        await drain(enforcer)
+        closing = asyncio.create_task(enforcer.close())
+        await asyncio.wait_for(entered.wait(), 2)
+        assert enforcer._release_http_task.result().is_closed
+        return closing
+
+    async def foreign_close() -> None:
+        with pytest.raises(RuntimeError, match="owning event loop"):
+            await enforcer.close()
+
+    with (
+        patch.object(httpx.AsyncHTTPTransport, "handle_async_request", handle),
+        patch.object(httpx.AsyncHTTPTransport, "aclose", slow_close),
+    ):
+        try:
+            closing = owner.run_until_complete(start_close())
+            asyncio.run(foreign_close())
+        finally:
+            finish.set()
+            owner.run_until_complete(enforcer.close())
+            owner.close()
+    assert closing.done() and not closing.cancelled()

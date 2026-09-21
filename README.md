@@ -604,18 +604,28 @@ renewal comes back ineligible or denied, when a lease response cannot be read,
 and when the server stops the run. Release enqueue never waits for network or a
 worker slot. Each budget enforcer has at most **four release workers/requests
 and 64 queued releases**, separate from reporter and renewal workers. Releases
-reuse one dedicated HTTP pool; async origin TLS initialization runs once per pool in a
-daemon thread, off the application's event loop. HTTPX can still initialize
+reuse one dedicated HTTP pool; async origin TLS initialization runs in one
+daemon thread, off the application's event loop. If loop shutdown cancels the
+initializer, a later loop can finish initialization using that same TLS work.
+Once established, a native async HTTP pool must be closed on its owning loop;
+close on another loop is rejected before draining leases. Pending initialization
+or cleanup also remains owned by its live loop. HTTPX can still initialize
 separate TLS contexts when connecting through an HTTPS proxy.
 
 Identical release payloads coalesce; different holder/generation/spend identities
 remain distinct. A full queue abandons the new, unsent courtesy release and
 increments `BudgetEnforcer.release_counts["queue_full"]` (also available on
 `AsyncBudgetEnforcer`). Queued, unsent work expires six seconds after enqueue, counted
-as `expired`; failed worker startup is counted as `dispatch_failed` and leaves
-the bounded queue available for retry or shutdown. The server reclaims leases
-that it did not hear about at its own expiry. These limits add no configuration
-options and do not change the wire protocol.
+as `expired`, including work parked without a running event loop. It is not
+guaranteed to remain available for a later `close()` or process-exit flush.
+Failed worker startup is counted as `dispatch_failed` and leaves the bounded
+queue available for retry or shutdown within that deadline. Client/TLS setup
+failures count as `setup_failed`, other local request errors as `local_error`,
+and cancelled release workers as `cancelled`. These local outcomes do not
+change shared control-plane breaker health; cancellation does not prove whether
+the server received a request. The server reclaims leases that it did not hear
+about at its own expiry. These limits add no configuration options and do not
+change the wire protocol.
 
 Work that outlives a scope with the same run id waits for its old release before
 regranting. If the bounded wait expires while that request is still active, the
@@ -635,6 +645,8 @@ confirms and the same number of settlement confirms (50 each by default), then
 services ready metadata. Its metadata stage has a bounded snapshot of batches,
 so new arrivals cannot indefinitely postpone heartbeat/advisory work. Productive
 cycles continue immediately; idle and retry-held queues retain their cadence.
+`reporter_batch_size` must be at least one; configuration, environment settings,
+and direct reporter constructors reject zero or negative values.
 Each settlement's own confirm disposition still precedes its metadata transfer.
 `reporter_max_in_flight` remains an event-send guard, **not a parallel-confirm or
 throughput setting**. Queue capacities, counted overflow, retry limits and the

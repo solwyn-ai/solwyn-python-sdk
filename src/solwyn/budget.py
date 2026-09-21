@@ -18,6 +18,7 @@ import time
 import uuid
 from collections import OrderedDict, deque
 from collections.abc import Sequence
+from concurrent.futures import Future
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Annotated, Literal, cast, get_args
@@ -1770,7 +1771,7 @@ class _BudgetEnforcerBase:
 
     @property
     def release_counts(self) -> dict[str, int]:
-        """Courtesy work omitted locally; the server still reclaims at expiry."""
+        """Local release dispositions; the server still reclaims at expiry."""
         with self._state_lock:
             return dict(self._release_counts)
 
@@ -1778,6 +1779,25 @@ class _BudgetEnforcerBase:
         self._release_counts[reason] = min(
             SIGNED_BIGINT_MAX, self._release_counts.get(reason, 0) + 1
         )
+
+    def _release_failed(self, exc: Exception, *, request_started: bool) -> bool:
+        """Classify a release error; only actual request timeouts may retry.
+
+        TLS/client construction and loop-affinity failures say nothing about
+        API health. Retain breaker admission before setup (an OPEN breaker
+        must avoid it), but release that probe neutrally for local failures.
+        """
+        logger.debug("lease.surrender_failed: %s", type(exc).__name__)
+        if not request_started or not isinstance(
+            exc, (httpx.RequestError, httpx.HTTPStatusError, OSError)
+        ):
+            with self._state_lock:
+                self._count_release_locked("local_error" if request_started else "setup_failed")
+            return False
+        breaker = self._control_plane_breaker
+        if breaker is not None and not handle_read_only_key_error(exc):
+            breaker.record_failure()
+        return isinstance(exc, httpx.TimeoutException)
 
     def _owe_release_locked(
         self,
@@ -3002,6 +3022,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     return
                 breaker = self._control_plane_breaker
                 admission = breaker.admit() if breaker is not None else None
+                request_started = False
                 try:
                     if admission is not None and not admission.allowed:
                         logger.debug("lease.surrender_skipped_breaker_open")
@@ -3015,6 +3036,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return
+                    request_started = True
                     client.post(
                         f"{self.api_url}{_LEASE_SURRENDER_PATH}",
                         json=request.model_dump(mode="json"),
@@ -3024,10 +3046,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     if breaker is not None:
                         breaker.record_success()
                 except Exception as exc:
-                    logger.debug("lease.surrender_failed: %s", type(exc).__name__)
-                    if breaker is not None and not handle_read_only_key_error(exc):
-                        breaker.record_failure()
-                    if isinstance(exc, httpx.TimeoutException):
+                    if self._release_failed(exc, request_started=request_started):
                         continue
                 finally:
                     if breaker is not None:
@@ -3198,6 +3217,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         # re-grant fences behind.
         self._release_tasks: set[asyncio.Task[None]] = set()
         self._release_http_task: asyncio.Task[httpx.AsyncClient] | None = None
+        self._release_tls_future: Future[ssl.SSLContext] | None = None
+        self._release_tls_waiter: asyncio.Future[ssl.SSLContext] | None = None
         self._release_pool_closer: asyncio.Task[None] | None = None
         self._release_cleanup_task: asyncio.Task[None] | None = None
         register_fork_reset(self)
@@ -3231,6 +3252,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         self._renewal_slots_in_use = 0
         self._release_tasks = set()
         self._release_http_task = None
+        self._release_tls_future = None
+        self._release_tls_waiter = None
         self._release_pool_closer = None
         self._release_cleanup_task = None
 
@@ -3747,66 +3770,114 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             # (this task is not a customer's coroutine) as the slot goes.
             self._dispatch_owed_releases()
 
-    async def _release_client(self) -> httpx.AsyncClient:
-        """One construction owner, off-loop, shared by all four workers.
+    def _forget_finished_release_closer(self) -> None:
+        closer = self._release_pool_closer
+        if closer is not None and closer.done():
+            if not closer.cancelled():
+                closer.exception()
+            if self._release_pool_closer is closer:
+                self._release_pool_closer = None
 
-        Shielding retains initialization even when a release await is cancelled:
-        cancellation does not stop synchronous TLS setup. No new initializer
-        can start until this one has actually finished.
-        """
-        if self._release_pool_closer is not None:
-            await asyncio.shield(self._release_pool_closer)
-        if self._release_http_task is None:
-            self._release_http_task = asyncio.create_task(self._initialize_release_client())
+    async def _release_client(self) -> httpx.AsyncClient:
+        """One loop-local pool initializer over a loop-independent TLS owner."""
+        loop = asyncio.get_running_loop()
+        self._forget_finished_release_closer()
+        closer = self._release_pool_closer
+        if closer is not None:
+            if closer.get_loop() is not loop:
+                raise RuntimeError("release pool teardown belongs to another event loop")
+            await asyncio.shield(closer)
         initialization = self._release_http_task
+        if (
+            initialization is not None
+            and initialization.done()
+            and (initialization.cancelled() or initialization.exception() is not None)
+        ):
+            # A closed loop can cancel this task directly despite shielding
+            # its awaiters. The independent TLS future below still owns any
+            # underlying synchronous work; dropping this task cannot multiply it.
+            self._release_http_task = None
+            initialization = None
+        if (
+            initialization is not None
+            and initialization.get_loop() is not loop
+            and (self._transport is None or not initialization.done())
+        ):
+            # An established HTTPX pool can contain connections bound to its
+            # original loop. Never silently reuse/discard those resources;
+            # close the enforcer before shutting down that owning loop.
+            raise RuntimeError("release HTTP pool belongs to another event loop")
+        if initialization is None:
+            initialization = asyncio.create_task(self._initialize_release_client())
+            self._release_http_task = initialization
         try:
             return await asyncio.shield(initialization)
         except Exception:
-            # A failed construction owns no pool. Allow a later item to try
-            # again, without an older waiter's failure detaching a newer try.
             if initialization.done() and self._release_http_task is initialization:
                 self._release_http_task = None
             raise
 
+    @staticmethod
+    def _complete_release_tls(
+        waiter: asyncio.Future[ssl.SSLContext], result: Future[ssl.SSLContext]
+    ) -> None:
+        if waiter.done():
+            return
+        try:
+            waiter.set_result(result.result())
+        except BaseException as exc:
+            waiter.set_exception(exc)
+
+    def _release_tls_ready(self, result: Future[ssl.SSLContext]) -> None:
+        with self._state_lock:
+            if result is not self._release_tls_future:
+                return
+            waiter = self._release_tls_waiter
+        if waiter is not None:
+            with suppress(RuntimeError):  # A cancelled/closed loop needs no notification.
+                waiter.get_loop().call_soon_threadsafe(self._complete_release_tls, waiter, result)
+
     async def _initialize_release_client(self) -> httpx.AsyncClient:
-        # HTTPX's native constructor loads trust roots synchronously. Offload
-        # just that work, before making the pool: cancellation of the whole
-        # event loop can abandon an SSLContext safely, never a live client.
-        # Passing the completed context makes HTTPX reuse it for origin TLS.
-        # HTTPS proxies can still do their own TLS setup inside HTTPcore.
-        # Caller-injected transports need no TLS setup.
+        # HTTPX loads trust roots synchronously. Keep that work in one daemon
+        # with a loop-independent result: asyncio.run's cancel-all can kill
+        # the awaiter but cannot stop the thread or surrender its ownership.
         verify: ssl.SSLContext | bool = True
         if self._transport is None:
-            loop = asyncio.get_running_loop()
-            ready: asyncio.Future[ssl.SSLContext] = loop.create_future()
+            result = self._release_tls_future
+            if result is None or (result.done() and result.exception() is not None):
+                result = Future()
+                self._release_tls_future = result
+                result.add_done_callback(self._release_tls_ready)
 
-            def complete(context: ssl.SSLContext | None, error: BaseException | None) -> None:
-                if ready.done():
-                    return
-                if error is not None:
-                    ready.set_exception(error)
-                elif context is not None:
-                    ready.set_result(context)
-                else:
-                    ready.set_exception(
-                        RuntimeError("release TLS initialization returned no context")
-                    )
+                def initialize_tls() -> None:
+                    try:
+                        result.set_result(httpx.create_ssl_context())
+                    except BaseException as exc:
+                        result.set_exception(exc)
 
-            def initialize_tls() -> None:
-                context = None
-                error = None
                 try:
-                    context = httpx.create_ssl_context()
-                except BaseException as exc:
-                    error = exc
-                with suppress(RuntimeError):
-                    loop.call_soon_threadsafe(complete, context, error)
-
-            # A singleton daemon, not an executor queue (whose shutdown joins
-            # could extend process exit). No sockets/clients exist in it. If
-            # the loop closes first, its result is just a disposable context.
-            threading.Thread(target=initialize_tls, name="solwyn-release-tls", daemon=True).start()
-            verify = await ready
+                    threading.Thread(
+                        target=initialize_tls, name="solwyn-release-tls", daemon=True
+                    ).start()
+                except Exception as exc:
+                    result.set_exception(exc)
+            # One replaceable subscriber, not wrap_future per loop: a cached
+            # concurrent Future retains every registered callback after firing.
+            # Cancellation detaches this waiter without cancelling native work.
+            ready: asyncio.Future[ssl.SSLContext] = asyncio.get_running_loop().create_future()
+            with self._state_lock:
+                self._release_tls_waiter = ready
+            try:
+                if result.done():  # Completion may have raced waiter registration.
+                    self._complete_release_tls(ready, result)
+                verify = await ready
+            finally:
+                with self._state_lock:
+                    if self._release_tls_waiter is ready:
+                        self._release_tls_waiter = None
+        # No client/socket exists until the await above finishes on this loop.
+        # This prebuilt context covers origin TLS; HTTPS proxies still own
+        # separate dependency-level TLS setup. Injected transports skip TLS.
         return self._new_async_http_client(_SURRENDER_TIMEOUT_S, verify=verify)
 
     async def _surrender_payloads(
@@ -3822,6 +3893,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                     return
                 breaker = self._control_plane_breaker
                 admission = breaker.admit() if breaker is not None else None
+                request_started = False
                 try:
                     if admission is not None and not admission.allowed:
                         logger.debug("lease.surrender_skipped_breaker_open")
@@ -3830,6 +3902,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return
+                    request_started = True
                     resp = await client.post(
                         f"{self.api_url}{_LEASE_SURRENDER_PATH}",
                         json=request.model_dump(mode="json"),
@@ -3840,10 +3913,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                     if breaker is not None:
                         breaker.record_success()
                 except Exception as exc:
-                    logger.debug("lease.surrender_failed: %s", type(exc).__name__)
-                    if breaker is not None and not handle_read_only_key_error(exc):
-                        breaker.record_failure()
-                    if isinstance(exc, httpx.TimeoutException):
+                    if self._release_failed(exc, request_started=request_started):
                         continue
                 finally:
                     if breaker is not None:
@@ -3903,6 +3973,10 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 return
             try:
                 await self._surrender_payloads([owed.request], owed.deadline)
+            except asyncio.CancelledError:
+                with self._state_lock:
+                    self._count_release_locked("cancelled")
+                raise
             finally:
                 with self._state_lock:
                     self._finish_release_locked(owed)
@@ -3921,6 +3995,11 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
 
     def _ensure_release_cleanup(self) -> None:
         if self._release_cleanup_task is None or self._release_cleanup_task.done():
+            if (
+                self._release_cleanup_task is not None
+                and not self._release_cleanup_task.cancelled()
+            ):
+                self._release_cleanup_task.exception()
             self._release_cleanup_task = asyncio.create_task(self._cleanup_releases())
 
     async def _cleanup_releases(self) -> None:
@@ -3948,6 +4027,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 return
 
     def _close_release_pool_if_idle(self) -> None:
+        self._forget_finished_release_closer()
         if (
             self._closed
             and not self._release_tasks
@@ -3959,7 +4039,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
     async def _close_release_pool(self) -> None:
         initialization = self._release_http_task
         try:
-            if initialization is not None:
+            if initialization is not None and not (
+                initialization.done() and initialization.cancelled()
+            ):
                 client = await asyncio.shield(initialization)
                 await client.aclose()
         except Exception as exc:
@@ -4000,6 +4082,31 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
 
     async def close(self) -> None:
         """Drain through the same workers; no extra shutdown request fanout."""
+        loop = asyncio.get_running_loop()
+        initialization = self._release_http_task
+        owners = (
+            initialization,
+            self._release_pool_closer,
+            self._release_cleanup_task,
+            *self._release_tasks,
+        )
+        if any(
+            task is not None and not task.done() and task.get_loop() is not loop for task in owners
+        ):
+            raise RuntimeError("close release work on its owning event loop")
+        if (
+            self._transport is None
+            and initialization is not None
+            and initialization.done()
+            and not initialization.cancelled()
+            and initialization.exception() is None
+            and initialization.get_loop() is not loop
+            and not initialization.result().is_closed
+        ):
+            # Native keep-alive sockets must be closed on their owning loop.
+            # Fail before draining any leases: best-effort aclose on a dead
+            # loop can partially close HTTPX and orphan remaining sockets.
+            raise RuntimeError("close the release HTTP pool on its owning event loop")
         payloads = self._begin_close()
         deadline = time.monotonic() + _SURRENDER_TIMEOUT_S
         if payloads is not None:
