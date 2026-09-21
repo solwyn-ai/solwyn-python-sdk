@@ -3319,7 +3319,12 @@ class AsyncMetadataReporter(_ReporterBase):
                     raise
             return
         try:
-            await asyncio.wait_for(task, timeout=remaining)
+            if task.done():
+                # Completed work needs no loop scheduling. Python 3.11's
+                # wait_for rejects even a done task from a prior closed loop.
+                task.result()
+            else:
+                await asyncio.wait_for(task, timeout=remaining)
         except TimeoutError:
             pass  # wait_for already cancelled (and awaited) the stuck task
         except asyncio.CancelledError:
