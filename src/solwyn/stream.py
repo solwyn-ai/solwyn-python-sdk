@@ -508,8 +508,9 @@ class _SyncResponsesStreamManagerWrapper:
     observe terminal Responses events. Closing before entry dispatched no
     provider request at all, so it releases the reservation without settling
     or reporting; a provider entry failure takes the classified entry-error
-    path, and any failure after the provider stream opens takes the
-    established stream-error path.
+    path, and any provider failure after the stream opens takes the
+    established stream-error path. ``on_error`` here fires only when WRAPPING
+    the opened stream fails; the client passes a handler with no breaker verdict.
     """
 
     def __init__(

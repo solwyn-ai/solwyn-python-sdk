@@ -27,7 +27,20 @@ SDK drops that outage's tally rather than re-sending it forever.
   lease reservation at the reserved bound, rather than leaving a live draw for
   the reservation sweep to return later. This includes cancellation while the
   SDK is still waiting for a connection-pool slot: cancellation alone cannot
-  prove that no request was sent. Sync and async dispatch read timeouts, 5xx
+  prove that no request was sent. A sync call interrupted mid-dispatch by a
+  non-`Exception` `BaseException` (`KeyboardInterrupt`, `SystemExit`, a
+  greenlet kill) is now reconciled the same way instead of being left for the
+  sweep to refund: the bound is kept once the provider SDK was invoked, the
+  reservation is returned when the interrupt provably landed first or during a
+  rejected request's Retry-After wait, the provider breaker records no verdict,
+  and the original interrupt is re-raised. In both clients, a failure while
+  wrapping an already-open provider stream no longer leaks the reservation: it
+  keeps the bound behind a `possibly_succeeded` error receipt, records no
+  provider breaker failure, best-effort closes the provider stream, and
+  re-raises the original error. The Responses `stream()` manager already
+  reconciled a wrap failure at context entry; it now follows the same rule and
+  no longer records a provider breaker failure for it, and that receipt now
+  names the wrapping error's class in `failover_error_class`. Sync and async dispatch read timeouts, 5xx
   responses, and protocol drops also retain the bound when ambiguous failover
   is disabled. Under `failover_idempotency="always"` such a hop fails over on
   the same reservation, which is now pinned at its bound for the rest of the

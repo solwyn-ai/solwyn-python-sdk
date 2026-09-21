@@ -613,14 +613,21 @@ cap across the configured provider chain, including global defaults, provider
 defaults, and Google/Bedrock nested cap fields. When a hop has no explicit cap,
 `lease_output_bound_default` supplies that hop’s conservative output allowance.
 
-Cancelling an async chat or Responses call retires its local reservation
-immediately. If dispatch may have sent the request, the lease keeps the reserved token bound as spent;
+Cancelling an async chat or Responses call, or interrupting a sync one with a
+non-`Exception` `BaseException` (`KeyboardInterrupt`, `SystemExit`), retires its
+local reservation immediately and re-raises the original exception.
+If dispatch may have sent the request, the lease keeps the reserved token bound as spent;
 unknown output usage is never invented or refunded into spendable authority.
 The reporter sends a structural `possibly_succeeded` error receipt, and renewal
 or surrender carries the conservative token tally. Proven pre-dispatch
 cancellation and cancellation during a rejected request's Retry-After wait
 return the reservation. Cancellation is neutral to provider health and frees
-only that attempt's recovery probe. Use stream context managers or explicit
+only that attempt's recovery probe. A streaming call whose already-open provider
+stream cannot be wrapped is reconciled the same way in both clients: the bound is
+kept behind a `possibly_succeeded` receipt, no provider-health failure is
+recorded, the provider stream is closed best-effort, and the original error is
+re-raised. The Responses `stream()` manager applies the same rule to a wrap
+failure at context entry. Use stream context managers or explicit
 close when abandoning an established stream so its provider connection closes.
 Sync and async dispatch errors with unknown post-send usage (read timeouts,
 5xx responses, or protocol drops) also retain the bound when ambiguous failover

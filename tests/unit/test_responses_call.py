@@ -1500,6 +1500,11 @@ class TestResponsesPublicProxySync:
                     "record_failure",
                     new=breaker_failure,
                 ),
+                patch.object(
+                    solwyn._get_circuit_breaker("openai"),
+                    "release_probe",
+                    wraps=solwyn._get_circuit_breaker("openai").release_probe,
+                ) as probe_release,
             ):
                 manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
                 with pytest.raises(ValueError, match="wrapping failed") as exc_info:
@@ -1508,8 +1513,13 @@ class TestResponsesPublicProxySync:
 
             assert exc_info.value is original
             release.assert_called_once()
-            breaker_failure.assert_called_once_with()
+            # Wrapping is SDK-side bookkeeping, never a provider-health verdict.
+            breaker_failure.assert_not_called()
+            probe_release.assert_called_once()
             solwyn._solwyn_reporter.report.assert_called_once()
+            receipt = solwyn._solwyn_reporter.report.call_args.args[0]
+            assert receipt.possibly_succeeded is True
+            assert receipt.failover_error_class == "ValueError"
             solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert len(provider_manager.exit_calls) == 1
             assert inner.close_calls == 1
@@ -3018,6 +3028,11 @@ class TestResponsesPublicProxyAsync:
                     "record_failure",
                     new=breaker_failure,
                 ),
+                patch.object(
+                    solwyn._get_circuit_breaker("openai"),
+                    "release_probe",
+                    wraps=solwyn._get_circuit_breaker("openai").release_probe,
+                ) as probe_release,
             ):
                 manager = solwyn.responses.stream(model="gpt-5.5", input="1234")
                 with pytest.raises(ValueError, match="wrapping failed") as exc_info:
@@ -3026,8 +3041,13 @@ class TestResponsesPublicProxyAsync:
 
             assert exc_info.value is original
             release.assert_called_once()
-            breaker_failure.assert_called_once_with()
+            # Wrapping is SDK-side bookkeeping, never a provider-health verdict.
+            breaker_failure.assert_not_called()
+            probe_release.assert_called_once()
             solwyn._solwyn_reporter.report.assert_called_once()
+            receipt = solwyn._solwyn_reporter.report.call_args.args[0]
+            assert receipt.possibly_succeeded is True
+            assert receipt.failover_error_class == "ValueError"
             solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert len(provider_manager.exit_calls) == 1
             assert inner.aclose_calls == 1
