@@ -371,3 +371,49 @@ async def test_standalone_and_paired_confirm_stages_each_get_bounded_turns(mode)
         assert reporter.dropped_counts == {}
     finally:
         await _close(reporter)
+
+
+@pytest.mark.parametrize("reporter_class", [MetadataReporter, AsyncMetadataReporter])
+@pytest.mark.parametrize("batch_size", [0, -1])
+def test_nonpositive_batch_size_is_rejected_before_client_or_worker_start(
+    reporter_class, batch_size
+):
+    with (
+        patch("solwyn.reporter.httpx.Client", side_effect=AssertionError("client created")) as sync,
+        patch(
+            "solwyn.reporter.httpx.AsyncClient", side_effect=AssertionError("client created")
+        ) as asynchronous,
+    ):
+        with pytest.raises(ValueError, match="batch_size must be >= 1"):
+            reporter_class("https://offline.invalid", "synthetic-unused", batch_size=batch_size)
+        sync.assert_not_called()
+        asynchronous.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+async def test_single_event_batch_size_delivers_every_settlement(mode):
+    confirmed = []
+    ingested = []
+
+    def handle(request):
+        if request.url.path.endswith("/confirm"):
+            confirmed.append(json.loads(request.content)["call_id"])
+        else:
+            batch = json.loads(request.content)
+            assert len(batch) == 1
+            call_id = batch[0]["call_id"]
+            assert call_id in confirmed
+            ingested.append(call_id)
+        return httpx.Response(202, json={"rejected": []})
+
+    reporter = _reporter(mode, handle, batch_size=1)
+    try:
+        for index in range(3):
+            reporter.report_settlement(*_pair(index))
+        for index in range(3):
+            assert await _flush(reporter) is (index < 2)
+        assert confirmed == ingested == [_pair(index)[1].call_id for index in range(3)]
+        assert not reporter._settlement_queue and not reporter._queue
+        assert reporter.dropped_counts == {}
+    finally:
+        await _close(reporter)

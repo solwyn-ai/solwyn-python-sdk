@@ -133,7 +133,7 @@ class SolwynConfig(BaseModel):
 
     # Reporter tuning. A zero-capacity queue has no defined drop-oldest
     # semantics (the reporter constructors reject it too) — at least one slot.
-    reporter_batch_size: int = 50
+    reporter_batch_size: int = Field(default=50, ge=1)
     reporter_flush_interval: float = 5.0
     reporter_max_queue_size: int = Field(default=10_000, ge=1)
     # Event-send guard only: ordinary reporting remains serial. Each control

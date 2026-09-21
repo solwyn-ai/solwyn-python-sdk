@@ -848,6 +848,10 @@ class _ReporterBase:
         retry_backoff_cap: float = 60.0,
         shutdown_deadline: float = 5.0,
     ) -> None:
+        if batch_size < 1:
+            # A nonpositive batch cannot claim an event prefix, so delivery
+            # would never advance. Validate before either I/O adapter starts.
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         if max_queue_size < 1:
             # A zero-capacity queue has no defined drop-oldest semantics: the
             # sync bound would evict every append (all spend counted dropped)

@@ -517,6 +517,47 @@ class TestVelocityConfig:
 
 
 @pytest.mark.unit
+class TestReporterBatchSizeConfig:
+    """Every accepted batch size must allow metadata ingestion to advance."""
+
+    @pytest.mark.parametrize("batch_size", [0, -1])
+    def test_rejects_nonpositive_constructor_value(self, batch_size: int) -> None:
+        with pytest.raises(ValidationError, match="reporter_batch_size"):
+            SolwynConfig(
+                api_key=VALID_API_KEY,
+                providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+                reporter_batch_size=batch_size,
+            )
+
+    @pytest.mark.parametrize("batch_size", ["0", "-1"])
+    def test_rejects_nonpositive_environment_value(
+        self, batch_size: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SOLWYN_REPORTER_BATCH_SIZE", batch_size)
+        with pytest.raises(ValidationError, match="reporter_batch_size"):
+            SolwynConfig(
+                api_key=VALID_API_KEY,
+                providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+            )
+
+    @pytest.mark.parametrize("from_environment", [False, True])
+    def test_accepts_single_event_batches(
+        self, from_environment: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        options = {}
+        if from_environment:
+            monkeypatch.setenv("SOLWYN_REPORTER_BATCH_SIZE", "1")
+        else:
+            options["reporter_batch_size"] = 1
+        config = SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+            **options,
+        )
+        assert config.reporter_batch_size == 1
+
+
+@pytest.mark.unit
 class TestReporterRetryConfig:
     """Reporter at-least-once delivery knobs: retry/backoff/shutdown-deadline."""
 
