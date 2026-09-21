@@ -858,6 +858,9 @@ class _ReporterBase:
         self.batch_size = batch_size
         self.flush_interval = flush_interval
         self.max_queue_size = max_queue_size
+        # This guards overlapping event sends (for example a shutdown race).
+        # Ordinary delivery remains one serial sender; raising this value does
+        # not introduce parallel confirmations or metadata requests.
         self.max_in_flight = max_in_flight
         # At-least-once delivery bounds (see SolwynConfig.reporter_*): retries
         # per item before a counted drop, exponential backoff base/cap, and the
@@ -2077,7 +2080,10 @@ class MetadataReporter(_ReporterBase):
         deadline = self._tighten_close_deadline(_monotonic() + budget)
         # Serialize the stop request with cadence-triggered breaker launches.
         # The finalization owner snapshots advisory workers after ingest stops.
-        with self._breaker_worker_lock:
+        with self._breaker_worker_lock, self._ownership_lock:
+            # An ordinary round may still own a confirm while close joins
+            # it. Its subsequent event transfer must not evict ready data.
+            self._final_delivery_started = True
             self._shutdown.set()
 
         # A host logging handler can reenter close() from this reporter's own
@@ -2262,11 +2268,13 @@ class MetadataReporter(_ReporterBase):
     def _flush_loop(self) -> None:
         """Background thread: periodically flush batches to the cloud."""
         try:
+            more = False
             while not self._shutdown.is_set():
-                if self._shutdown.wait(timeout=self.flush_interval):
+                if self._shutdown.wait(timeout=0.0 if more else self.flush_interval):
                     break
+                more = False
                 try:
-                    self._flush_remaining()
+                    more = self._flush_remaining()
                 except Exception as exc:
                     # The flush loop must survive anything a drain raises: a
                     # dead worker strands ALL queued spend until overflow.
@@ -2278,24 +2286,28 @@ class MetadataReporter(_ReporterBase):
         finally:
             self._finish_worker_requested_close()
 
-    def _flush_remaining(self, *, deadline: float | None = None, final: bool = False) -> None:
-        """Flush queued confirms, settlements, then metadata events in batches.
+    def _flush_remaining(self, *, deadline: float | None = None, final: bool = False) -> bool:
+        """Give each delivery stage one bounded turn; return immediate work.
 
-        ``final`` is the shutdown/exit mode: backoff gates are ignored, a RETRY
-        outcome drops (there is no later cycle), and a HELD outcome drops the
-        remainder (never hammer a known-down control plane while exiting).
-        ``deadline`` (a monotonic instant) caps the whole chain; work still
-        queued when it is reached is counted ``shutdown_deadline`` and dropped.
+        Ordinary control turns resolve at most one metadata batch's worth of
+        items, capped by event capacity. The event turn sends only the number
+        of batches present at its start. Arrivals cannot extend either stage
+        forever. A budget-exhausted stage requests another round after the
+        heartbeat/advisory checks; held or retrying heads retain the periodic
+        cadence and never cause an idle polling loop.
+
+        ``final`` ignores turn/backoff limits because public enqueue is closed.
+        A RETRY drops, HELD drops the remaining confirms, and one ``deadline``
+        caps the entire shutdown chain. Ownership and retry dispositions are
+        identical in ordinary and final rounds.
         """
-        # A prior successful metadata send is the recovery proof. Consume that
-        # one-shot gate before ordinary drains; final close gets exactly one
-        # unconditional attempt inside the same deadline.
         self._drain_receipt_folds_to_queue(final=final)
-        self._drain_confirms(deadline=deadline, final=final)
-        self._drain_settlements(deadline=deadline, final=final)
-        if self._drain_event_batches(deadline=deadline, final=final):
-            self._receipt_fold_state.note_cycle_success()
+        limit = None if final else max(1, min(self.batch_size, self.max_queue_size))
+        more_confirms = self._drain_confirms(deadline=deadline, final=final, limit=limit)
+        more_settlements = self._drain_settlements(deadline=deadline, final=final, limit=limit)
+        more_events = self._drain_event_batches(deadline=deadline, final=final)
         self._maybe_log_drops(force=final)
+        return more_confirms or more_settlements or more_events
 
     # ------------------------------------------------------------------
     # Shutdown ownership: in-hand drain items
@@ -2552,9 +2564,13 @@ class MetadataReporter(_ReporterBase):
     # Drains
     # ------------------------------------------------------------------
 
-    def _drain_confirms(self, *, deadline: float | None = None, final: bool = False) -> None:
+    def _drain_confirms(
+        self, *, deadline: float | None = None, final: bool = False, limit: int | None = None
+    ) -> bool:
         """Send due confirms in FIFO order; a retrying head parks the queue."""
-        while self._confirm_queue:
+        resolved = 0
+        while self._confirm_queue and (limit is None or resolved < limit):
+            resolved += 1
             if self._deadline_expired(deadline):
                 self._dispose_queued_confirms("shutdown_deadline")
                 break
@@ -2589,12 +2605,19 @@ class MetadataReporter(_ReporterBase):
                 self._park_confirm(pending)
                 break  # FIFO: nothing behind a backing-off head may jump it
             self._resolve_confirm(drop_reason="terminal_status")
+        else:
+            return bool(self._confirm_queue)
+        return False
 
-    def _drain_settlements(self, *, deadline: float | None = None, final: bool = False) -> None:
+    def _drain_settlements(
+        self, *, deadline: float | None = None, final: bool = False, limit: int | None = None
+    ) -> bool:
         """Resolve each settlement's confirm first, then hand its event to the
         event queue (confirm-before-metadata order per item is load-bearing).
         A retrying head parks the queue behind it (FIFO)."""
-        while self._settlement_queue:
+        resolved = 0
+        while self._settlement_queue and (limit is None or resolved < limit):
+            resolved += 1
             if self._deadline_expired(deadline):
                 self._dispose_queued_settlements("shutdown_deadline")
                 break
@@ -2637,12 +2660,19 @@ class MetadataReporter(_ReporterBase):
                 break
             # Terminal confirm: the event is still the durable spend truth.
             self._resolve_settlement_to_event_queue(claim, confirm_drop_reason="terminal_status")
+        else:
+            return bool(self._settlement_queue)
+        return False
 
     def _drain_event_batches(self, *, deadline: float | None = None, final: bool = False) -> bool:
         """Send due metadata events in batches; requeue a failed batch to front."""
         sent_clean_batch = False
         cycle_clean = True
-        while self._queue:
+        more = False
+        # Invalid historical batch-size settings must not turn into a new spin.
+        batches_left = math.ceil(len(self._queue) / self.batch_size) if self.batch_size > 0 else 0
+        while self._queue and (final or batches_left > 0):
+            batches_left -= 1
             if self._deadline_expired(deadline):
                 cycle_clean = False
                 self._dispose_queued_events("shutdown_deadline")
@@ -2675,7 +2705,11 @@ class MetadataReporter(_ReporterBase):
                 break
             cycle_clean = False
             self._resolve_dropped_event_batch(claim, "terminal_status")
-        return sent_clean_batch and cycle_clean
+        else:
+            more = bool(self._queue) and self.batch_size > 0
+        if sent_clean_batch and cycle_clean:
+            self._receipt_fold_state.note_cycle_success()
+        return more
 
     def _start_breaker_cycle(
         self,
@@ -3196,7 +3230,9 @@ class AsyncMetadataReporter(_ReporterBase):
         propagates the cancellation but leaves both lifecycle rescue paths
         armed for whatever spend is still queued.
         """
-        self._closed = True
+        with self._ownership_lock:
+            self._closed = True
+            self._final_delivery_started = True
         budget = self.shutdown_deadline if timeout is None else timeout
         deadline = _monotonic() + budget
         active_breaker_task = self._breaker_task
@@ -3255,7 +3291,7 @@ class AsyncMetadataReporter(_ReporterBase):
         if self._finalizer is not None:
             self._finalizer.detach()
 
-    async def _await_within(self, task: asyncio.Task[None], deadline: float) -> None:
+    async def _await_within(self, task: asyncio.Task[_T], deadline: float) -> None:
         """Await ``task`` but never past the shared shutdown deadline.
 
         On timeout the task is cancelled — during close we would rather abandon a
@@ -3302,44 +3338,56 @@ class AsyncMetadataReporter(_ReporterBase):
         """Background task: periodically flush batches to the cloud."""
         if self._shutdown_event is None:
             raise RuntimeError("_flush_loop called before reporter was started")
+        more = False
         while not self._shutdown_event.is_set():
-            try:
-                await asyncio.wait_for(
-                    self._shutdown_event.wait(),
-                    timeout=self.flush_interval,
-                )
-            except TimeoutError:
-                try:
-                    await self._flush_remaining()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    # The flush task must survive anything a drain raises: a
-                    # dead flush task strands ALL queued spend until overflow.
-                    _log_warning("reporter.flush_cycle_failed: exc_type=%s", type(exc).__name__)
-                if self._breaker_reports_due():
-                    self._start_breaker_cycle()
-                if self._untracked_reports_due():
-                    self._start_untracked_cycle()
+            if more:
+                # A local transport can complete without ever suspending.
+                # Yield once per round so producers/close still get a turn.
+                await asyncio.sleep(0)
+                if self._shutdown_event.is_set():
+                    break
             else:
-                break
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=self.flush_interval,
+                    )
+                except TimeoutError:
+                    pass
+                else:
+                    break
+            more = False
+            try:
+                more = await self._flush_remaining()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A dead flush task strands queued spend until overflow.
+                _log_warning("reporter.flush_cycle_failed: exc_type=%s", type(exc).__name__)
+            if self._breaker_reports_due():
+                self._start_breaker_cycle()
+            if self._untracked_reports_due():
+                self._start_untracked_cycle()
 
-    async def _flush_remaining(self, *, deadline: float | None = None, final: bool = False) -> None:
-        """Flush queued confirms, settlements, then metadata events in batches.
-
-        See ``MetadataReporter._flush_remaining`` for the ``final`` / ``deadline``
-        semantics.
-        """
+    async def _flush_remaining(self, *, deadline: float | None = None, final: bool = False) -> bool:
+        """Give each stage a bounded turn; see the sync reporter's contract."""
         self._drain_receipt_folds_to_queue(final=final)
-        await self._drain_confirms(deadline=deadline, final=final)
-        await self._drain_settlements(deadline=deadline, final=final)
-        if await self._drain_event_batches(deadline=deadline, final=final):
-            self._receipt_fold_state.note_cycle_success()
+        limit = None if final else max(1, min(self.batch_size, self.max_queue_size))
+        more_confirms = await self._drain_confirms(deadline=deadline, final=final, limit=limit)
+        more_settlements = await self._drain_settlements(
+            deadline=deadline, final=final, limit=limit
+        )
+        more_events = await self._drain_event_batches(deadline=deadline, final=final)
         self._maybe_log_drops(force=final)
+        return more_confirms or more_settlements or more_events
 
-    async def _drain_confirms(self, *, deadline: float | None = None, final: bool = False) -> None:
+    async def _drain_confirms(
+        self, *, deadline: float | None = None, final: bool = False, limit: int | None = None
+    ) -> bool:
         """Send due confirms in FIFO order; a retrying head parks the queue."""
-        while self._confirm_queue:
+        resolved = 0
+        while self._confirm_queue and (limit is None or resolved < limit):
+            resolved += 1
             if self._deadline_expired(deadline):
                 self._count_drop(
                     "confirm", "shutdown_deadline", n=_drain_count(self._confirm_queue)
@@ -3387,14 +3435,19 @@ class AsyncMetadataReporter(_ReporterBase):
                 self._confirm_queue.appendleft(pending)
                 break  # FIFO: nothing behind a backing-off head may jump it
             self._count_drop("confirm", "terminal_status")
+        else:
+            return bool(self._confirm_queue)
+        return False
 
     async def _drain_settlements(
-        self, *, deadline: float | None = None, final: bool = False
-    ) -> None:
+        self, *, deadline: float | None = None, final: bool = False, limit: int | None = None
+    ) -> bool:
         """Resolve each settlement's confirm first, then hand its event to the
         event queue (confirm-before-metadata order per item is load-bearing).
         A retrying head parks the queue behind it (FIFO)."""
-        while self._settlement_queue:
+        resolved = 0
+        while self._settlement_queue and (limit is None or resolved < limit):
+            resolved += 1
             if self._deadline_expired(deadline):
                 stranded: list[_PendingSettlement] = []
                 while self._settlement_queue:
@@ -3450,6 +3503,9 @@ class AsyncMetadataReporter(_ReporterBase):
                 break
             self._count_drop("settlement_confirm", "terminal_status")
             self._move_event_to_queue(pending.event)
+        else:
+            return bool(self._settlement_queue)
+        return False
 
     async def _drain_event_batches(
         self, *, deadline: float | None = None, final: bool = False
@@ -3457,7 +3513,11 @@ class AsyncMetadataReporter(_ReporterBase):
         """Send due metadata events in batches; requeue a failed batch to front."""
         sent_clean_batch = False
         cycle_clean = True
-        while self._queue:
+        more = False
+        # Invalid historical batch-size settings must not turn into a new spin.
+        batches_left = math.ceil(len(self._queue) / self.batch_size) if self.batch_size > 0 else 0
+        while self._queue and (final or batches_left > 0):
+            batches_left -= 1
             if self._deadline_expired(deadline):
                 cycle_clean = False
                 stranded: list[_PendingEvent] = []
@@ -3509,7 +3569,11 @@ class AsyncMetadataReporter(_ReporterBase):
                 break
             cycle_clean = False
             self._dispose_pending_events(prefix, "terminal_status")
-        return sent_clean_batch and cycle_clean
+        else:
+            more = bool(self._queue) and self.batch_size > 0
+        if sent_clean_batch and cycle_clean:
+            self._receipt_fold_state.note_cycle_success()
+        return more
 
     def _start_breaker_cycle(
         self,

@@ -136,6 +136,8 @@ class SolwynConfig(BaseModel):
     reporter_batch_size: int = 50
     reporter_flush_interval: float = 5.0
     reporter_max_queue_size: int = Field(default=10_000, ge=1)
+    # Event-send guard only: ordinary reporting remains serial. Each control
+    # stage yields to ingestion after min(batch_size, max_queue_size) items.
     reporter_max_in_flight: int = 3
     breaker_reporting_enabled: bool = True
     # Advisory reporting defaults on because silence is the failure mode;
