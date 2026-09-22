@@ -292,17 +292,20 @@ def test_handle_acquired_after_registry_eviction_inherits_live_sibling_winner() 
 
 
 @pytest.mark.unit
-def test_repeated_mark_latches_every_unlatched_sibling_to_first_winner() -> None:
+def test_mark_latches_every_sibling_and_repeated_mark_preserves_first_winner() -> None:
     from solwyn._run_control import (
-        RunTermination,
         _acquire_termination_handle,
         mark_terminated,
     )
 
     first = _acquire_termination_handle("run_stream")
     second = _acquire_termination_handle("run_stream")
-    winner = RunTermination(reason="first_winner", source="server", at_monotonic=4.5)
-    first.termination = winner
+    # Exercise the production publisher: partially latching a group by writing
+    # a handle directly creates a state no stop/acquire transition can produce.
+    with patch("solwyn._run_control.time.monotonic", return_value=4.5):
+        winner = mark_terminated("run_stream", reason="first_winner", source="server")
+    assert first.termination is winner
+    assert second.termination is winner
 
     mark_terminated("run_stream", reason="later_loser", source="local_velocity")
 

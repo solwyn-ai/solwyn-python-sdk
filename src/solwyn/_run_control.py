@@ -3,6 +3,12 @@
 The registry stores structural run identifiers, bounded reasons supplied by
 callers, a source label, and monotonic timestamps only. It performs no I/O and
 never handles prompt or response content.
+
+Active streams share termination authority through per-generation epochs
+rather than per-handle cells: every stream acquired since the run's last clear
+reads the same ``_Epoch``, so a stop is one write and every current watcher
+sees it, while a clear installs a fresh epoch and leaves the old one frozen for
+the streams still holding it.
 """
 
 from __future__ import annotations
@@ -33,13 +39,34 @@ class RunTermination:
 
 
 @dataclass(eq=False)
+class _Epoch:
+    """Termination authority shared by every watcher of one clear generation.
+
+    ``termination`` is the epoch's first winner; ``owners`` counts the live
+    handles that hold this epoch. Only a group's CURRENT epoch is ever written:
+    a stop latches the winner while it has owners, and the last owner's release
+    retires it. A clear replaces the group's epoch instead of mutating it, so a
+    superseded epoch is frozen by construction — a handle that latched a stop
+    keeps it, and one that never latched is never latched by a later stop.
+    """
+
+    termination: RunTermination | None = None
+    owners: int = 0
+
+
+@dataclass(eq=False)
 class _TerminationHandle:
-    """Stable one-stream cell latched before bounded registry eviction."""
+    """One active stream's view of its generation's shared termination cell."""
 
     run_id: str
-    generation: int
-    termination: RunTermination | None = None
+    _group: _ActiveHandleGroup
+    _epoch: _Epoch
     released: bool = False
+
+    @property
+    def termination(self) -> RunTermination | None:
+        """Return the stop latched for this handle's generation, if any."""
+        return self._epoch.termination
 
     def release(self) -> None:
         """Drop this active watcher once its stream has a final disposition."""
@@ -48,26 +75,45 @@ class _TerminationHandle:
                 return
             self.released = True
             group = _STATE.active_handles.get(self.run_id)
-            if group is None:
+            # Identity is the fork fence: a pre-fork handle can outlive the
+            # detached parent group, even after a child creates a replacement
+            # group for the same run id. Only the group that registered this
+            # handle may account for its release.
+            if group is not self._group:
                 return
-            group.handles.discard(self)
-            if not group.handles:
+            if group.members <= 0:
+                raise RuntimeError("active handle group released more handles than it holds")
+            group.members -= 1
+            epoch = self._epoch
+            if epoch is group.epoch:
+                if epoch.owners <= 0:
+                    raise RuntimeError("current epoch released more owners than it holds")
+                epoch.owners -= 1
+                if epoch.owners == 0:
+                    # Authority retires with the last current owner; a later
+                    # stream must re-seed from the bounded registry, never
+                    # inherit a winner no live stream still owns.
+                    epoch.termination = None
+            if group.members == 0:
                 del _STATE.active_handles[self.run_id]
 
 
 @dataclass
 class _ActiveHandleGroup:
-    """One bounded active-run watcher group with an ordered clear epoch."""
+    """Live watcher ownership for one run id, keyed on its current epoch.
 
-    generation: int = 0
+    ``epoch`` is the only cell a stop or acquisition writes; ``members`` counts
+    every live handle of the group across all generations so the group is
+    dropped exactly when its last handle releases. Old-generation handles keep
+    their superseded epochs but never extend the current winner's lifetime
+    after global LRU eviction: that is owned by ``epoch.owners`` alone.
+    ``observed_at`` retains the group's last observation until clear or total
+    group cleanup.
+    """
+
+    epoch: _Epoch = field(default_factory=_Epoch)
     observed_at: float | None = None
-    handles: set[_TerminationHandle] = field(default_factory=set)
-
-    def __iter__(self) -> Iterator[_TerminationHandle]:
-        return iter(self.handles)
-
-    def __len__(self) -> int:
-        return len(self.handles)
+    members: int = 0
 
 
 class _RunControlState:
@@ -87,8 +133,8 @@ class _RunControlState:
         # the inherited lock is unsafe to retain in the child.
         self.lock = threading.Lock()
         # Provider streams inherited across fork are not safe to continue.
-        # Detach their parent-owned watcher cells in the child; already-latched
-        # immutable values remain on the wrapper itself.
+        # Detach their parent-owned groups in the child; each inherited handle
+        # keeps its parent epoch, so an already-latched stop stays readable.
         self.active_handles = {}
 
     def _clear_for_test_locked(self) -> None:
@@ -111,23 +157,21 @@ def _active_group_termination_locked(
     group = _STATE.active_handles.get(run_id)
     if group is None:
         return None
-    return next(
-        (
-            handle.termination
-            for handle in group.handles
-            if handle.generation == group.generation
-            and handle.termination is not None
-            and (source is None or handle.termination.source == source)
-        ),
-        None,
-    )
+    termination = group.epoch.termination
+    if termination is not None and (source is None or termination.source == source):
+        return termination
+    return None
 
 
 def _advance_active_generation_locked(run_id: str) -> None:
-    """Fence obsolete sibling winners without retaining cleared run ids."""
+    """Fence obsolete sibling winners without retaining cleared run ids.
+
+    The old epoch is left with the handles that hold it: nothing writes a
+    non-current epoch, so their latched stop (or absence of one) is final.
+    """
     group = _STATE.active_handles.get(run_id)
     if group is not None:
-        group.generation += 1
+        group.epoch = _Epoch()
         group.observed_at = None
 
 
@@ -184,14 +228,14 @@ def _mark_terminated_locked(
             # first winner. Both maps remain bounded by the ordinary LRU cap.
             _STATE.terminations[run_id] = termination
             _STATE.observed_at[run_id] = observed_at
-    # A bounded global entry may already be gone while one sibling still owns
-    # the immutable first winner. Always latch every unlatched watcher before
-    # returning; iteration order must never decide which sibling learns it.
     if group is not None:
         group.observed_at = observed_at
-        for handle in tuple(group.handles):
-            if handle.generation == group.generation and handle.termination is None:
-                handle.termination = termination
+        # One write latches every current-generation watcher at once; the
+        # shared epoch is what they read. A winner is owned only while a
+        # current stream is live, so an ownerless epoch never gains one.
+        epoch = group.epoch
+        if epoch.owners > 0 and epoch.termination is None:
+            epoch.termination = termination
     _trim_registry_locked()
     return termination, observed_at
 
@@ -251,9 +295,12 @@ def mark_terminated(
 
 
 def _acquire_termination_handle(run_id: str) -> _TerminationHandle:
-    """Register one active stream and seed it from any existing stop."""
+    """Register one active stream on the run's current epoch, seeded from any stop."""
     with _STATE.lock:
-        group = _STATE.active_handles.setdefault(run_id, _ActiveHandleGroup())
+        group = _STATE.active_handles.get(run_id)
+        if group is None:
+            group = _ActiveHandleGroup()
+            _STATE.active_handles[run_id] = group
         termination = _STATE.terminations.get(run_id)
         if termination is None:
             termination = _active_group_termination_locked(run_id)
@@ -262,13 +309,12 @@ def _acquire_termination_handle(run_id: str) -> _TerminationHandle:
                 run_id,
                 termination.at_monotonic,
             )
-        handle = _TerminationHandle(
-            run_id=run_id,
-            generation=group.generation,
-            termination=termination,
-        )
-        group.handles.add(handle)
-        return handle
+        epoch = group.epoch
+        if epoch.termination is None:
+            epoch.termination = termination
+        epoch.owners += 1
+        group.members += 1
+        return _TerminationHandle(run_id=run_id, _group=group, _epoch=epoch)
 
 
 def run_termination(run_id: str) -> RunTermination | None:
@@ -328,16 +374,16 @@ def clear_termination_if(run_id: str, *, source: TerminationSource) -> None:
 def clear_run_termination(run_id: str) -> None:
     """Clear any termination source for ``run_id``.
 
-    Clearing is forward-looking only. It drops the registry entry and advances
-    the active group's generation, so every LATER call and every stream that
-    has not yet latched a stop sees a live run again. A stream whose watcher
-    already latched the termination keeps aborting: the latched value is
-    immutable on the handle (``_TerminationHandle.termination``), and
-    ``client._stream_abort_exception`` reads that cell, not the registry.
-    That is deliberate — an in-flight stream was admitted under an authority
-    that has since said stop, and re-admitting it mid-body would need spend
-    authority no one has re-granted. Restart the stream to run under the
-    cleared state.
+    Clearing is forward-looking only. It drops the registry entry and installs
+    a fresh epoch on the active group, so every LATER call and every stream
+    that has not yet latched a stop sees a live run again. A stream whose
+    watcher already latched the termination keeps aborting: its handle still
+    reads the superseded epoch, which no writer touches again
+    (``_TerminationHandle.termination``), and ``client._stream_abort_exception``
+    reads that cell, not the registry. That is deliberate — an in-flight
+    stream was admitted under an authority that has since said stop, and
+    re-admitting it mid-body would need spend authority no one has re-granted.
+    Restart the stream to run under the cleared state.
     """
     with _STATE.lock:
         termination = _STATE.terminations.pop(run_id, None)

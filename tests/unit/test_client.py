@@ -2276,7 +2276,7 @@ class TestSyncStreamingInterception:
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
             )
-            assert len(_run_control._STATE.active_handles[run_id]) == 2
+            assert _run_control._STATE.active_handles[run_id].members == 2
 
             for stream in (first, second):
                 with pytest.raises(RunStoppedError) as exc_info:
@@ -2719,7 +2719,7 @@ class TestAsyncStreamingInterception:
                 messages=[{"role": "user", "content": "Hello"}],
                 stream=True,
             )
-            assert len(_run_control._STATE.active_handles[run_id]) == 2
+            assert _run_control._STATE.active_handles[run_id].members == 2
 
             for stream in (first, second):
                 with pytest.raises(RunStoppedError) as exc_info:
