@@ -5,15 +5,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
-## [Unreleased]
+## [0.8.0] - 2026-09-21
 
-The SDK no longer estimates cost during a control-plane outage. It used a flat
+The SDK no longer estimates cost during a control-plane outage, and every
+outcome it cannot settle now keeps its token bound instead of leaving a
+reservation for the sweep to refund. The outage estimate used a flat
 $0.00003 per token, which meant nothing once calls became multimodal and broke
 the rule that the Solwyn API owns pricing. The legacy per-call path now keeps a
 token-only tally of the calls it admits while Solwyn is unreachable and reports
-it on the next successful budget check. Wire-contract change is API-first:
-Solwyn Cloud accepts `uncounted_calls` / `uncounted_tokens` on
-`/budgets/check` before this SDK releases.
+it on the next successful budget check. The reporter and the lease-release path
+gain fixed bounds, so a stream of successful confirms cannot stall metadata
+ingestion and a burst of finished runs cannot spawn one worker and one TLS
+client per release. Run-control lookup is constant time in the number of active
+streams in a run. The surface canary admits the mid-September provider SDK
+namespaces through openai 3.16.2. Ships #83, #84, #85, #86 and #87.
+
+Wire-contract change is API-first: Solwyn Cloud accepts `uncounted_calls` /
+`uncounted_tokens` on `/budgets/check` before this SDK releases.
 
 **Deployment order is a hard requirement:** Solwyn Cloud must accept the
 `uncounted_*` fields before this SDK version is deployed. Against a server
@@ -101,10 +109,43 @@ SDK drops that outage's tally rather than re-sending it forever.
   tokens (like `realtime.calls.create` and `beta.endpoints.create`), 676
   raw-response wrappers as `unmetered_spend` at `raw_response` scope, and the
   two google-genai credential properties as inert `metadata` (like the
-  anthropic `credentials` row). Latest fingerprints, per-context digests and
-  the README strict fingerprint (now audited against `openai==3.14.1`) are
-  refreshed. Runtime behaviour for existing surfaces is unchanged; before this
-  release these paths resolved to `unknown` and followed `on_unmetered`.
+  anthropic `credentials` row). openai 3.16.2 then added 53 more exact rules
+  (1 guarded namespace, 8 unmetered operations and 44 raw-response paths);
+  webhook management stays under `on_unmetered` and no method is promoted to
+  metered. Latest fingerprints, per-context digests and the README strict
+  fingerprint (now audited against `openai==3.16.2`) are refreshed. Runtime
+  behaviour for existing surfaces is unchanged; before this release these
+  paths resolved to `unknown` and followed `on_unmetered`.
+- **Lease releases are bounded and share one HTTP pool.** A burst of finished
+  leased runs used to start one release worker and one native HTTP/TLS client
+  per release, which stalled the event loop for over a second at 128 releases.
+  Each budget enforcer now runs at most 4 release workers/requests with at most
+  64 pending releases; identical lease/holder/generation/spend payloads
+  coalesce. A full queue abandons the new, unsent courtesy release and counts
+  `BudgetEnforcer.release_counts["queue_full"]` (also on
+  `AsyncBudgetEnforcer`); queued work still unsent after six seconds expires
+  (`expired`, shortened by `close()`), and worker-start failures count as
+  `dispatch_failed`. Releases reuse a dedicated, component-owned pool separate
+  from provider clients and reporter delivery, and async origin trust-root
+  loading runs once in a daemon initializer instead of on the loop. While its
+  owning loop is alive an async pool must be closed there; once that loop is
+  closed the dispatcher abandons the pool and a later loop builds a fresh one
+  over the same TLS result. Local pool/TLS failures count as `setup_failed`
+  and other local request errors as `local_error` without touching the shared
+  control-plane breaker; cancelled workers count as `cancelled`. Server lease
+  expiry remains the backstop. No configuration field or wire change.
+- **`reporter_batch_size` must be at least one.** Configuration, environment
+  settings and direct reporter construction now reject zero and negative
+  values instead of accepting a batch size that could never make progress.
+- **Run-control lookup is constant time in the number of active streams.**
+  Admission, post-check, stream-handle acquisition, stop publication, clear
+  and release no longer scan a run's live handles. Termination authority is
+  one shared epoch per clear generation, so a stop is a single write every
+  current watcher reads and a per-chunk abort check stays a lock-free read.
+  A 16,000-stream cohort acquires in 9 ms instead of 3.6 s and a stop
+  publishes in 5 µs instead of 1.2 ms. A stream that latched a stop keeps
+  aborting and one that never latched is never latched by a later stop, by
+  construction. No public API, configuration or wire change.
 - **Lint passes on ruff 0.16.8.** CI installs the latest ruff and 0.16.8 now
   flags nested `async with` blocks (SIM117); the three test sites are combined
   into one statement and the lock tracks 0.16.8 so `make check` matches CI.
@@ -133,6 +174,36 @@ SDK drops that outage's tally rather than re-sending it forever.
   if one cannot be built or enqueued for any reason, the SDK logs
   `call.error_receipt_failed` with the failure's class name, still ends the
   reservation, and re-raises the provider's original exception.
+
+- **A cancelled recovery attempt no longer strands the provider's half-open
+  probe.** Cancelling a provider recovery attempt, abandoning a Responses
+  `stream()` manager before entry, or a request-shaped refusal at manager
+  entry used to leave the breaker's single probe held, so no later attempt
+  could prove the provider healthy. Each admitted attempt now owns its probe
+  until a health verdict or an explicit hand-off to a manager or live stream,
+  neutral cleanup checks its admission token so stale cleanup cannot clear a
+  successor's probe, and returning a live stream no longer releases its probe
+  early. Malformed streamed usage that fails finalization also retires
+  ownership without recording a false health verdict.
+- **Cancelling a lease grant behind a predecessor release no longer forces
+  later same-run calls onto legacy budget checks.** Grant-slot cleanup now
+  starts before the predecessor-release wait and breaker admission, and runs
+  even if probe cleanup raises, so the run's next call re-grants instead of
+  falling back to the per-call `/budgets/check` for the rest of the process.
+  If the bounded wait for an old release expires while that request is still
+  active, the call uses the per-call check once and the old request keeps its
+  slot and fence until it actually ends.
+- **A steady stream of successful confirms can no longer starve metadata
+  ingestion.** The reporter used to service confirms for as long as they kept
+  arriving, so metadata batches waited indefinitely and overflowed their
+  queue. Each reporter round now handles at most
+  `min(reporter_batch_size, reporter_max_queue_size)` standalone confirms and
+  the same number of settlement confirms (50 each by default), then a bounded
+  snapshot of ready metadata batches. Productive rounds continue immediately,
+  held and retrying heads keep their FIFO parking and retry cadence, and a
+  settlement's own confirm disposition still precedes its metadata transfer.
+  `reporter_max_in_flight` remains an event-send guard, not a throughput
+  setting; bursts before the first scheduled flush can still overflow.
 
 ### Removed
 
