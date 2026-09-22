@@ -1,9 +1,8 @@
-"""Run-stop authority lifetimes and deterministic healthy-path work bounds."""
+"""Run-stop authority lifetimes and shared-epoch accounting under scale."""
 
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -137,35 +136,27 @@ def test_inherited_handle_release_cannot_retire_child_owner_of_same_generation()
     assert control._STATE.active_handles == {}
 
 
-class _CountedHandles(set[control._TerminationHandle]):
-    """Count handle visits, including scans moved into acquire/clear/release."""
-
-    visits = 0
-
-    def __iter__(self) -> Iterator[control._TerminationHandle]:
-        for handle in super().__iter__():
-            self.visits += 1
-            yield handle
-
-
 @pytest.mark.parametrize("size", [1, 32, 512])
 @pytest.mark.parametrize("independent", [False, True])
-def test_healthy_acquire_admission_postcheck_and_release_do_not_visit_handles(
+def test_healthy_acquire_admission_postcheck_and_release_keep_scalar_accounting(
     size: int, independent: bool
 ) -> None:
     plane = FakeControlPlane()
     enforcer = BudgetEnforcer(plane.api_url, plane.api_key, transport=plane.transport)
     handles = []
-    counted = []
     try:
         for index in range(size):
             run_id = f"run-{index}" if independent else "run-0"
-            handle = control._acquire_termination_handle(run_id)
-            handles.append(handle)
-            group = control._STATE.active_handles[run_id]
-            if not isinstance(group.handles, _CountedHandles):
-                group.handles = _CountedHandles(group.handles)
-                counted.append(group.handles)
+            handles.append(control._acquire_termination_handle(run_id))
+        expected_groups = size if independent else 1
+        assert len(control._STATE.active_handles) == expected_groups
+        for run_id, group in control._STATE.active_handles.items():
+            owned = sum(1 for handle in handles if handle.run_id == run_id)
+            assert group.members == owned
+            assert group.epoch.owners == owned
+            assert group.epoch.termination is None
+            assert group.observed_at is None
+        assert all(handle.termination is None for handle in handles)
         for index in range(20):
             identity = call_uuid(f"healthy-{index}")
             result = enforcer.check_budget(
@@ -183,30 +174,48 @@ def test_healthy_acquire_admission_postcheck_and_release_do_not_visit_handles(
         assert plane.checks == []
         for handle in handles:
             control.clear_run_termination(handle.run_id)
+            group = control._STATE.active_handles[handle.run_id]
+            # A clear installs a fresh epoch; the live handle keeps its own.
+            assert handle._epoch is not group.epoch
+            assert group.epoch.owners == 0
+            members_before = group.members
             handle.release()
             handle.release()
+            if members_before > 1:
+                assert control._STATE.active_handles[handle.run_id].members == members_before - 1
+            else:
+                assert handle.run_id not in control._STATE.active_handles
         assert control._STATE.active_handles == {}
-        assert sum(group.visits for group in counted) == 0
     finally:
         for handle in handles:
             handle.release()
         enforcer.close()
 
 
-def test_generation_churn_retains_only_live_handles_without_release_scans() -> None:
+def test_generation_churn_retains_only_live_handles_on_a_fresh_epoch() -> None:
     old = control._acquire_termination_handle("run")
     group = control._STATE.active_handles["run"]
-    counted = _CountedHandles(group.handles)
-    group.handles = counted
+    old_epoch = old._epoch
+    assert old_epoch is group.epoch
+    assert (group.members, group.epoch.owners) == (1, 1)
     for _ in range(512):
         control.clear_run_termination("run")
+        assert group.epoch is not old_epoch
+        assert group.epoch.owners == 0
         new = control._acquire_termination_handle("run")
         assert new.termination is None
+        assert new._epoch is group.epoch
+        assert (group.members, group.epoch.owners) == (2, 1)
         new.release()
-        assert len(group) == 1
+        assert (group.members, group.epoch.owners) == (1, 0)
+        assert control._STATE.active_handles["run"] is group
+    # The obsolete owner never migrated onto a later epoch, and the superseded
+    # epoch it still reads was never written after the clear.
+    assert old._epoch is old_epoch
+    assert old.termination is None
+    assert old_epoch.owners == 1
     old.release()
     assert control._STATE.active_handles == {}
-    assert counted.visits == 0
 
 
 def test_other_runs_progress_while_large_group_uses_the_production_lock() -> None:
@@ -227,7 +236,9 @@ def test_other_runs_progress_while_large_group_uses_the_production_lock() -> Non
             for task in tasks:
                 task.result(timeout=20)
         assert set(control._STATE.active_handles) == {"large"}
-        assert len(control._STATE.active_handles["large"]) == len(handles)
+        large = control._STATE.active_handles["large"]
+        assert large.members == len(handles)
+        assert large.epoch.owners == len(handles)
     finally:
         for handle in handles:
             handle.release()
@@ -235,25 +246,51 @@ def test_other_runs_progress_while_large_group_uses_the_production_lock() -> Non
 
 
 @pytest.mark.parametrize("size", [1, 32, 512])
-def test_stopped_cohort_release_does_not_scan_or_retain_current_authority(size: int) -> None:
+def test_stop_latches_the_shared_epoch_and_release_retires_it_with_the_last_owner(
+    size: int,
+) -> None:
     old = control._acquire_termination_handle("run")
     control.clear_run_termination("run")
     handles = [control._acquire_termination_handle("run") for _ in range(size)]
     group = control._STATE.active_handles["run"]
-    counted = _CountedHandles(group.handles)
-    group.handles = counted
+    epoch = group.epoch
+    assert all(handle._epoch is epoch for handle in handles)
+    assert old._epoch is not epoch
+    assert (group.members, epoch.owners) == (size + 1, size)
     winner = control.mark_terminated("run", reason="current", source="local_velocity")
+    # One write to the shared epoch is the whole latch: every current handle
+    # reads the winner, the obsolete handle's frozen epoch never learns it.
+    assert epoch.termination is winner
     assert all(handle.termination is winner for handle in handles)
     assert old.termination is None
-    assert counted.visits == size + 1  # One real stop latches the live cohort.
+    assert old._epoch.termination is None
     _evict("run")
-    counted.visits = 0
     for index, handle in enumerate(handles):
         assert control._postcheck_termination("run") is winner
+        assert handle.termination is winner
         handle.release()
         handle.release()
-        assert len(group) == size - index
+        assert group.members == size - index
+        assert epoch.owners == size - index - 1
+    assert epoch.termination is None
     assert control._postcheck_termination("run") is None
-    assert counted.visits == 0
+    assert old.termination is None
     old.release()
+    assert control._STATE.active_handles == {}
+
+
+def test_repeated_stop_never_overwrites_the_current_epoch_first_winner() -> None:
+    first = control._acquire_termination_handle("run")
+    winner = control.mark_terminated("run", reason="first", source="server")
+    second = control._acquire_termination_handle("run")
+    assert second._epoch is first._epoch
+    assert second.termination is winner
+    _evict("run")
+    assert control.mark_terminated("run", reason="loser", source="local_velocity") is winner
+    assert first._epoch.termination is winner
+    assert (first.termination, second.termination) == (winner, winner)
+    first.release()
+    assert second.termination is winner
+    assert control._postcheck_termination("run") is winner
+    second.release()
     assert control._STATE.active_handles == {}

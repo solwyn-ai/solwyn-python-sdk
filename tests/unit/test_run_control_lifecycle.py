@@ -143,22 +143,22 @@ def test_sync_last_current_owner_leaves_old_stream_stopped_through_shutdown(
                     current_source.error = RuntimeError("synthetic stream failure")
                     with pytest.raises(RuntimeError, match="synthetic stream failure"):
                         next(current)
-                    assert len(_run_control._STATE.active_handles[run_id]) == 1
+                    assert _run_control._STATE.active_handles[run_id].members == 1
                 current.close()
 
             # The obsolete owner cannot keep the current stop alive or lose its
             # own original stop when a new stream acquires the same run id.
-            assert len(_run_control._STATE.active_handles[run_id]) == 1
+            assert _run_control._STATE.active_handles[run_id].members == 1
             fresh = client.chat.completions.create(model="gpt-5.5", messages=[], stream=True)
             assert next(fresh) is provider.streams[-1].chunk
             fresh.close()
 
         # Finishing a run and shutting down the client do not retire a stream
         # still owned by its caller.
-        assert len(_run_control._STATE.active_handles[run_id]) == 1
+        assert _run_control._STATE.active_handles[run_id].members == 1
     assert provider.close_calls == 1
     assert old_source.close_calls == 0
-    assert len(_run_control._STATE.active_handles[run_id]) == 1
+    assert _run_control._STATE.active_handles[run_id].members == 1
 
     with pytest.raises(RunStoppedError) as stopped:
         next(old)
@@ -204,19 +204,19 @@ async def test_async_last_current_owner_leaves_old_stream_stopped_through_shutdo
                     current_source.error = asyncio.CancelledError()
                     with pytest.raises(asyncio.CancelledError):
                         await anext(current)
-                    assert len(_run_control._STATE.active_handles[run_id]) == 1
+                    assert _run_control._STATE.active_handles[run_id].members == 1
                 await current.aclose()
 
             # Assert a fresh stream starts clean while the old one stays live.
-            assert len(_run_control._STATE.active_handles[run_id]) == 1
+            assert _run_control._STATE.active_handles[run_id].members == 1
             fresh = await client.chat.completions.create(model="gpt-5.5", messages=[], stream=True)
             assert await anext(fresh) is provider.streams[-1].chunk
             await fresh.aclose()
 
-        assert len(_run_control._STATE.active_handles[run_id]) == 1
+        assert _run_control._STATE.active_handles[run_id].members == 1
     assert provider.close_calls == 1
     assert old_source.close_calls == 0
-    assert len(_run_control._STATE.active_handles[run_id]) == 1
+    assert _run_control._STATE.active_handles[run_id].members == 1
 
     with pytest.raises(RunStoppedError) as stopped:
         await anext(old)
