@@ -20,7 +20,7 @@ from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, call_uuid
 import solwyn.circuit_breaker as circuit_breaker_mod
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, CircuitState, ProviderName
-from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer
+from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer, BudgetMode
 from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 
@@ -417,3 +417,92 @@ class TestProbeCancellationRecovery:
         assert transport.count == 2
         assert breaker.get_state().state is CircuitState.CLOSED
         reporter._http.close()
+
+
+class _OverloadTransport:
+    """A control plane that answers every admission POST with the 503 busy page.
+
+    ``paths`` records the route of each request so a test can prove which
+    admission path was tried, and in what order.
+    """
+
+    def __init__(self) -> None:
+        self.paths: list[str] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.paths.append(request.url.path)
+        return httpx.Response(
+            503,
+            json={"detail": "Budget admission is busy; retry shortly"},
+            headers={"Retry-After": "1"},
+        )
+
+
+@pytest.mark.unit
+class TestAdmissionOverload:
+    """A 503 from the admission gate is an outage for /check but a refusal for /lease.
+
+    Both cases drive the SDK against an ``httpx.MockTransport`` that answers 503;
+    no live control plane is involved.
+    """
+
+    def test_sustained_check_overload_opens_the_breaker(self) -> None:
+        # Three 503s on /budgets/check trip a threshold-3 breaker; the fourth
+        # check short-circuits (no request) and every call degrades fail-open
+        # with no reservation — hard-deny mode does not turn an outage into a
+        # denial.
+        breaker = _breaker(failure_threshold=3)
+        transport = _OverloadTransport()
+        enforcer = BudgetEnforcer(
+            "http://control-plane.test",
+            VALID_API_KEY,
+            budget_mode=BudgetMode.HARD_DENY,
+            control_plane_breaker=breaker,
+            lease_enabled=False,
+            transport=httpx.MockTransport(transport.handler),
+        )
+        try:
+            results = [
+                enforcer.check_budget(
+                    estimated_input_tokens=1,
+                    model="gpt-5.5",
+                    provider="openai",
+                    tags={"call": str(index)},
+                )
+                for index in range(4)
+            ]
+            assert all(result.allowed and result.reservation_id is None for result in results)
+            assert transport.paths == ["/api/v1/budgets/check"] * 3
+            assert breaker.get_state().state is CircuitState.OPEN
+            assert breaker.get_state().failure_count == 3
+        finally:
+            enforcer.close()
+
+    def test_lease_overload_falls_back_to_check(self) -> None:
+        # A 503 on /budgets/lease is a deliberate refusal (the plane answered),
+        # so it credits the breaker and the same call drops to /budgets/check;
+        # only the check's 503 counts as a failure.
+        breaker = _breaker(failure_threshold=3)
+        transport = _OverloadTransport()
+        enforcer = BudgetEnforcer(
+            "http://control-plane.test",
+            VALID_API_KEY,
+            control_plane_breaker=breaker,
+            transport=httpx.MockTransport(transport.handler),
+        )
+        try:
+            result = enforcer.check_budget(
+                estimated_input_tokens=1,
+                model="gpt-5.5",
+                provider="openai",
+                agent_run_id="run-overload",
+                call_id=call_uuid("call-overload"),
+                estimated_output_bound=1,
+            )
+            assert result.allowed
+            assert result.reservation_id is None
+            assert transport.paths == ["/api/v1/budgets/lease", "/api/v1/budgets/check"]
+            assert breaker.get_state().state is CircuitState.CLOSED
+            assert breaker.get_state().failure_count == 1
+        finally:
+            enforcer.close()

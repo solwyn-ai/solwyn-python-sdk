@@ -5,6 +5,38 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
+## [Unreleased]
+
+### Changed
+
+- **Surface canary admits the late-September openai and google-genai
+  namespaces.** openai 3.17.0 added `safety.cases` (case retrieval) and
+  `admin.organization.external_storage` (external-storage configuration
+  create/retrieve/list/validate/delete); google-genai 2.25.0 added the
+  `voices` / `aio.voices` catalog (create/get/list/delete). Neither is a model
+  call nor changes a response shape the SDK reads, so every path is classified
+  by precedent (`safety.alerts`, `admin.organization.certificates`,
+  `environments`): 106 rules, 0 removed, 0 changed — 4 guarded namespaces, 20
+  operations as `unmetered_spend` with exact acknowledgment tokens, 80
+  raw/streaming mirrors at `raw_response` scope, and the two `sdk_configuration`
+  properties at `resource` scope. openai 3.18 and 3.19 add only model
+  identifiers and client fixes; the surface graph is unchanged from 3.17.
+  Latest fingerprints, the ten moved per-context digests and the README strict
+  fingerprint (now audited against `openai==3.19.2`; `tracked`, `unknown`,
+  `blocked`, `unsupported`, `conditional` and `safe` are byte-identical) are
+  refreshed. Runtime behaviour for existing surfaces is unchanged; before this
+  change these paths resolved to `unknown` and followed `on_unmetered`.
+
+### Tests
+
+- **Control-plane overload.** Two unit tests pin the breaker semantics of a
+  budget service that answers 503: sustained 503s on `/budgets/check` count as
+  outages, open the shared control-plane breaker after three requests and
+  degrade every later call fail-open with no reservation, even in hard-deny
+  mode; a 503 on `/budgets/lease` is a refusal that falls back to
+  `/budgets/check` within the same call and is counted once against the
+  breaker.
+
 ## [0.8.0] - 2026-09-21
 
 The SDK no longer estimates cost during a control-plane outage, and every

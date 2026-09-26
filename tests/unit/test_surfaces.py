@@ -994,6 +994,140 @@ def test_openai_webhook_management_and_mirrors_remain_exact_untracked_surfaces(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("provider", ["openai", "azure_openai", "openai_compatible", "together"])
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_openai_safety_cases_and_external_storage_remain_exact_untracked_surfaces(
+    provider: str, mode: str
+) -> None:
+    # Safety case retrieval and organization external-storage management are
+    # account administration, not model spend: guarded namespaces whose exact
+    # operations and raw/streaming mirrors stay acknowledgable but never metered.
+    context = SurfaceContext(provider, "openai", "openai_sdk", mode)
+    families = {
+        "safety.cases": {"retrieve"},
+        "admin.organization.external_storage": {
+            "create",
+            "delete",
+            "list",
+            "retrieve",
+            "validate",
+        },
+    }
+    for base, operations in families.items():
+        parent_path, _, leaf_name = base.rpartition(".")
+        parent = resolve_surface_rule(context=context, path=parent_path, source=SurfaceSource.RAW)
+        namespace = resolve_surface_rule(context=context, path=base, source=SurfaceSource.RAW)
+        assert parent is not None and parent.kind is SurfaceKind.NAMESPACE
+        assert namespace is not None and namespace.kind is SurfaceKind.NAMESPACE
+        assert namespace.selectors == parent.selectors
+        assert namespace.acknowledgment_token is None
+        assert namespace.expected_shapes == (AttributeShape("cached_property", "resource"),)
+
+        for operation in operations:
+            _assert_unmetered_operation(context, f"{base}.{operation}")
+        _assert_raw_response_family(context, base, operations)
+
+        # Every ancestor-level raw/streaming mirror of the new resource is an
+        # exact raw_response escape, like `with_raw_response.safety.alerts`.
+        segments = base.split(".")
+        for helper in ("with_raw_response", "with_streaming_response"):
+            for index in range(len(segments)):
+                prefix = ".".join([*segments[:index], helper, *segments[index:]])
+                for suffix in ("", *(f".{op}" for op in operations)):
+                    path = prefix + suffix
+                    rule = resolve_surface_rule(
+                        context=context, path=path, source=SurfaceSource.RAW
+                    )
+                    assert rule is not None and rule.kind is SurfaceKind.UNMETERED_SPEND
+                    assert rule.capability_scope is CapabilityScope.RAW_RESPONSE
+                    assert rule.acknowledgment_token == path
+                    assert rule.selectors == namespace.selectors
+                    expected = (
+                        AttributeShape("cached_property", "resource")
+                        if suffix == ""
+                        else AttributeShape("function", "callable")
+                    )
+                    assert rule.expected_shapes == (expected,)
+
+        assert (
+            resolve_surface_rule(
+                context=context, path=f"{base}.future_operation", source=SurfaceSource.RAW
+            )
+            is None
+        )
+        assert (
+            resolve_surface_rule(
+                context=context,
+                path=f"with_raw_response.{base}.future_operation",
+                source=SurfaceSource.RAW,
+            )
+            is None
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_google_genai_voices_remain_exact_untracked_surfaces(mode: str) -> None:
+    # The voices catalog (create/get/list/delete) is voice management, not a
+    # generation call: a guarded namespace whose operations follow the
+    # `environments` precedent and whose raw/streaming proxies are dynamic
+    # raw_response escapes.
+    context = SurfaceContext("google", "google", "google_genai", mode)
+    operations = {"create", "delete", "get", "list"}
+    bases = ["voices", "aio.voices"] if mode == "sync" else ["voices"]
+    for base in bases:
+        namespace = resolve_surface_rule(context=context, path=base, source=SurfaceSource.RAW)
+        assert namespace is not None and namespace.kind is SurfaceKind.NAMESPACE
+        assert namespace.acknowledgment_token is None
+        assert namespace.expected_shapes == (AttributeShape("property", "resource"),)
+
+        for operation in operations:
+            _assert_unmetered_operation(context, f"{base}.{operation}")
+        asynchronous = base.startswith("aio.") or mode == "async"
+        transport = "do_request_async" if asynchronous else "do_request"
+        _assert_unmetered_operation(context, f"{base}.{transport}")
+
+        configuration = resolve_surface_rule(
+            context=context, path=f"{base}.sdk_configuration", source=SurfaceSource.RAW
+        )
+        assert configuration is not None and configuration.kind is SurfaceKind.UNMETERED_SPEND
+        assert configuration.capability_scope is CapabilityScope.RESOURCE
+        assert configuration.acknowledgment_token == f"{base}.sdk_configuration"
+
+        for helper in ("with_raw_response", "with_streaming_response"):
+            container_path = f"{base}.{helper}"
+            container = resolve_surface_rule(
+                context=context, path=container_path, source=SurfaceSource.RAW
+            )
+            assert container is not None and container.kind is SurfaceKind.UNMETERED_SPEND
+            assert container.capability_scope is CapabilityScope.RAW_RESPONSE
+            assert container.acknowledgment_token == container_path
+            assert container.expected_shapes == (AttributeShape("property", "resource"),)
+            for operation in operations:
+                path = f"{container_path}.{operation}"
+                leaf = resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW)
+                assert leaf is not None and leaf.kind is SurfaceKind.UNMETERED_SPEND
+                assert leaf.capability_scope is CapabilityScope.RAW_RESPONSE
+                assert leaf.acknowledgment_token == path
+                assert leaf.expected_shapes == (
+                    AttributeShape("dynamic_attribute", "unevaluated_dynamic"),
+                )
+
+        assert (
+            resolve_surface_rule(
+                context=context, path=f"{base}.future_operation", source=SurfaceSource.RAW
+            )
+            is None
+        )
+
+    if mode == "async":
+        assert (
+            resolve_surface_rule(context=context, path="aio.voices", source=SurfaceSource.RAW)
+            is None
+        )
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("mode", ["sync", "async"])
 def test_openai_webhook_rules_do_not_leak_to_native_together(mode: str) -> None:
     context = SurfaceContext("together", "openai", "native_together", mode)
