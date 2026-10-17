@@ -938,6 +938,129 @@ def test_realtime_calls_children_have_exact_operation_and_raw_response_scopes() 
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("context", [ANTHROPIC_SYNC, ANTHROPIC_ASYNC])
+def test_anthropic_open_telemetry_is_metadata_without_an_escape_token(
+    context: SurfaceContext,
+) -> None:
+    rule = resolve_surface_rule(context=context, path="open_telemetry", source=SurfaceSource.RAW)
+
+    assert rule is not None and rule.kind is SurfaceKind.METADATA
+    assert rule.expected_shapes == (
+        AttributeShape("property", "mapping"),
+        AttributeShape("property", "unevaluated_descriptor"),
+    )
+    assert rule.acknowledgment_token is None
+    assert rule.capability_scope is None
+    assert (
+        resolve_surface_rule(context=OPENAI_SYNC, path="open_telemetry", source=SurfaceSource.RAW)
+        is None
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("context", [ANTHROPIC_SYNC, ANTHROPIC_ASYNC])
+@pytest.mark.parametrize(
+    ("base", "operations"),
+    [
+        (
+            "beta.organization.telemetry_destinations",
+            {"create", "delete", "list", "retrieve", "test", "update"},
+        ),
+        ("beta.organization.telemetry_destinations.workspaces", {"add", "list", "remove"}),
+        ("beta.organization.analytics", set()),
+        ("beta.organization.analytics.apps", set()),
+        ("beta.organization.analytics.apps.chat", set()),
+        ("beta.organization.analytics.apps.chat.projects", {"list"}),
+        ("beta.organization.analytics.artifacts", {"list"}),
+        ("beta.organization.analytics.connectors", {"list"}),
+        ("beta.organization.analytics.cost_report", {"list"}),
+        ("beta.organization.analytics.plugins", {"list"}),
+        ("beta.organization.analytics.skills", {"list"}),
+        ("beta.organization.analytics.summaries", {"list"}),
+        ("beta.organization.analytics.usage_report", {"list"}),
+        ("beta.organization.analytics.user_cost_report", {"list"}),
+        ("beta.organization.analytics.user_usage_report", {"list"}),
+        ("beta.organization.analytics.users", {"list"}),
+        (
+            "beta.organization.plugin_marketplaces",
+            {"list", "retrieve", "update", "validate_archive", "validate_repository"},
+        ),
+        ("beta.organization.plugins", {"create", "delete", "list", "retrieve", "update"}),
+        ("beta.organization.plugins.installation_settings", {"list", "remove", "set"}),
+        ("beta.organization.plugins.shares", {"list"}),
+        ("beta.organization.plugins.versions", {"create", "download", "list", "retrieve"}),
+        ("beta.organization.rbac_groups", {"create", "delete", "list", "retrieve", "update"}),
+        ("beta.organization.rbac_groups.members", {"add", "list", "remove"}),
+        ("beta.organization.rbac_roles", {"list", "retrieve"}),
+        ("beta.organization.rbac_roles.permissions", {"list"}),
+        ("beta.organization.spend_limits", {"delete", "list", "retrieve", "set"}),
+        ("beta.organization.spend_limits.effective", {"list"}),
+        (
+            "beta.organization.spend_limits.increase_requests",
+            {"approve", "deny", "list", "retrieve"},
+        ),
+        ("organization", {"retrieve"}),
+        ("organization.api_keys", {"list", "retrieve", "update"}),
+        ("organization.compliance_settings", {"retrieve", "update"}),
+        (
+            "organization.external_keys",
+            {"create", "delete", "list", "retrieve", "update", "validate"},
+        ),
+        ("organization.federation", set()),
+        ("organization.federation.issuers", {"archive", "create", "list", "retrieve", "update"}),
+        ("organization.federation.rules", {"archive", "create", "list", "retrieve", "update"}),
+        ("organization.federation.rules.workspaces", {"add", "list", "remove"}),
+        ("organization.invites", {"create", "delete", "list", "retrieve"}),
+        ("organization.rate_limits", {"list"}),
+        ("organization.service_accounts", {"archive", "create", "list", "retrieve", "update"}),
+        ("organization.service_accounts.workspaces", {"add", "list", "remove"}),
+        ("organization.users", {"list", "remove", "retrieve", "update"}),
+        ("organization.workspaces", {"archive", "create", "list", "retrieve", "update"}),
+        ("organization.workspaces.members", {"add", "list", "remove", "retrieve", "update"}),
+        ("organization.workspaces.rate_limits", {"list"}),
+        (
+            "organization.workspaces.service_accounts",
+            {"add", "list", "remove", "retrieve", "update"},
+        ),
+    ],
+)
+def test_anthropic_organization_administration_has_exact_guarded_operations_and_mirrors(
+    context: SurfaceContext, base: str, operations: set[str]
+) -> None:
+    # These are organization administration endpoints, not model calls. Match
+    # the reviewed beta admin and OpenAI admin precedents at every resource level.
+    namespace = resolve_surface_rule(context=context, path=base, source=SurfaceSource.RAW)
+    assert namespace is not None and namespace.kind is SurfaceKind.NAMESPACE
+    assert namespace.acknowledgment_token is None
+    assert namespace.expected_shapes == (AttributeShape("cached_property", "resource"),)
+
+    for operation in operations:
+        _assert_unmetered_operation(context, f"{base}.{operation}")
+    _assert_raw_response_family(context, base, operations)
+
+    segments = base.split(".")
+    for helper in ("with_raw_response", "with_streaming_response"):
+        for index in range(len(segments)):
+            prefix = ".".join([*segments[:index], helper, *segments[index:]])
+            for suffix in ("", *(f".{op}" for op in operations)):
+                path = prefix + suffix
+                rule = resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW)
+                assert rule is not None and rule.kind is SurfaceKind.UNMETERED_SPEND
+                assert rule.capability_scope is CapabilityScope.RAW_RESPONSE
+                assert rule.acknowledgment_token == path
+                assert rule.selectors == namespace.selectors
+                expected = (
+                    AttributeShape("cached_property", "resource")
+                    if suffix == ""
+                    else AttributeShape("function", "callable")
+                )
+                assert rule.expected_shapes == (expected,)
+
+    for path in (f"{base}.future_operation", f"with_raw_response.{base}.future_operation"):
+        assert resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW) is None
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("provider", ["openai", "azure_openai", "openai_compatible", "together"])
 @pytest.mark.parametrize("mode", ["sync", "async"])
 def test_openai_webhook_management_and_mirrors_remain_exact_untracked_surfaces(
@@ -1216,7 +1339,9 @@ def test_safe_descriptor_rows_pin_the_evaluated_attribute_shape() -> None:
         "default_headers": "mapping",
         "default_query": "mapping",
         "model_name": "scalar",
+        "open_telemetry": "mapping",
         "qs": "resource",
+        "timeout": "resource",
         "user_agent": "scalar",
         "vertexai": "scalar",
     }

@@ -9,6 +9,17 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **Anthropic SDK 1.15 support.** Coverage reports and strict mode recognize
+  the `open_telemetry` configuration and the organization telemetry-destination
+  API, including workspace assignments. The newly exposed organization
+  administration APIs use guarded namespaces and exact acknowledgment tokens;
+  these operations remain unmetered and follow `on_unmetered`. Provider SDK
+  minimum versions are unchanged, and Anthropic versions below 1.14 retain
+  their existing behavior.
+- **Provider version documentation.** The README lists supported SDK floors,
+  tested breakpoints, and latest tested versions, and clarifies that unset
+  optional metadata fields are omitted entirely from transmitted payloads.
+
 - **Surface canary admits the late-September openai and google-genai
   namespaces.** openai 3.17.0 added `safety.cases` (case retrieval) and
   `admin.organization.external_storage` (external-storage configuration

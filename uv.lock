@@ -1,21 +1,21 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.15' and extra != 'group-6-solwyn-frameworks' and extra == 'group-6-solwyn-frameworks-crewai'",
-    "python_full_version == '3.14.*' and extra != 'group-6-solwyn-frameworks' and extra == 'group-6-solwyn-frameworks-crewai'",
-    "python_full_version == '3.13.*' and extra != 'group-6-solwyn-frameworks' and extra == 'group-6-solwyn-frameworks-crewai'",
-    "python_full_version == '3.12.*' and extra != 'group-6-solwyn-frameworks' and extra == 'group-6-solwyn-frameworks-crewai'",
-    "python_full_version < '3.12' and extra != 'group-6-solwyn-frameworks' and extra == 'group-6-solwyn-frameworks-crewai'",
     "python_full_version >= '3.15' and extra != 'extra-6-solwyn-crewai' and extra == 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai'",
-    "python_full_version == '3.14.*' and extra != 'extra-6-solwyn-crewai' and extra == 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai'",
-    "python_full_version == '3.13.*' and extra != 'extra-6-solwyn-crewai' and extra == 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai'",
-    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-6-solwyn-crewai' and extra == 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai'",
-    "(python_full_version < '3.13' and sys_platform != 'emscripten' and extra != 'extra-6-solwyn-crewai' and extra == 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai') or (python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-6-solwyn-crewai' and extra == 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai')",
     "python_full_version >= '3.15' and extra != 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai'",
+    "python_full_version == '3.14.*' and extra != 'group-6-solwyn-frameworks' and extra == 'group-6-solwyn-frameworks-crewai'",
+    "python_full_version == '3.14.*' and extra != 'extra-6-solwyn-crewai' and extra == 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai'",
     "python_full_version == '3.14.*' and extra != 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai'",
+    "python_full_version == '3.13.*' and extra != 'group-6-solwyn-frameworks' and extra == 'group-6-solwyn-frameworks-crewai'",
+    "python_full_version == '3.13.*' and extra != 'extra-6-solwyn-crewai' and extra == 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai'",
     "python_full_version == '3.13.*' and extra != 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai'",
+    "python_full_version == '3.12.*' and extra != 'group-6-solwyn-frameworks' and extra == 'group-6-solwyn-frameworks-crewai'",
+    "python_full_version == '3.12.*' and sys_platform == 'emscripten' and extra != 'extra-6-solwyn-crewai' and extra == 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai'",
     "python_full_version == '3.12.*' and extra != 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai'",
+    "python_full_version < '3.12' and extra != 'group-6-solwyn-frameworks' and extra == 'group-6-solwyn-frameworks-crewai'",
+    "(python_full_version < '3.13' and sys_platform != 'emscripten' and extra != 'extra-6-solwyn-crewai' and extra == 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai') or (python_full_version < '3.12' and sys_platform == 'emscripten' and extra != 'extra-6-solwyn-crewai' and extra == 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai')",
     "python_full_version < '3.12' and extra != 'group-6-solwyn-frameworks' and extra != 'group-6-solwyn-frameworks-crewai'",
 ]
 conflicts = [[
@@ -213,20 +213,21 @@ wheels = [
 
 [[package]]
 name = "anthropic"
-version = "1.4.0"
+version = "1.15.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "docstring-parser" },
     { name = "httpx2" },
     { name = "jiter" },
+    { name = "opentelemetry-api" },
     { name = "pydantic" },
     { name = "sniffio" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/75/6d/793f5cfe2cd444c43b4eeb4cb7c3cc55ebcb38929fdfe81aa1f2fced7326/anthropic-1.4.0.tar.gz", hash = "sha256:f0d017e901e48b343520b5d458f8240c283c8d850bf6d119834c622207e0a74c", size = 1150831, upload-time = "2026-09-04T22:20:31.355Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/10/37/5a2a4316df8babd28f096477a707cd75f240b4264c97fb128c32375105d6/anthropic-1.15.0.tar.gz", hash = "sha256:90caa9df83e2fc8bddb4ddeb83b7191bce255f635c03eae055deec521741df08", size = 1726101, upload-time = "2026-10-15T19:45:34.635Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/dd/e3/34a88f0e1e854022a352d67f72ca9baa8b952d4541315088411ba2bfbc2a/anthropic-1.4.0-py3-none-any.whl", hash = "sha256:590e85bff75b713a123b03f586d68f02266b5fdc49f70dd75f721ced93a4716c", size = 1300390, upload-time = "2026-09-04T22:20:33.078Z" },
+    { url = "https://files.pythonhosted.org/packages/d1/65/54437e7edea49a3be9ef56f6b5965999bfdc52b9dadc9b448124ca51a594/anthropic-1.15.0-py3-none-any.whl", hash = "sha256:10189a7993c5c71a0a2d4bb80020ca6a2fd27679f51e627405da37251d15ff49", size = 2047755, upload-time = "2026-10-15T19:45:32.951Z" },
 ]
 
 [[package]]

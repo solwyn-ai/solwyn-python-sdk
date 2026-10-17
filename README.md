@@ -23,6 +23,27 @@ pip install solwyn[openai]
 
 Other OpenAI-compatible endpoints (Groq, OpenRouter, vLLM, …) ride the `openai` extra. Together can use that path too; `solwyn[together]` supplies its native SDK instead.
 
+### Supported provider SDK versions
+
+| Provider SDK | Declared floor | Tested breakpoints (including floor) | Latest tested |
+|---|---|---|---|
+| `openai` | `openai>=2.0` | `openai==2.0.0`, `openai==2.2.0`, `openai==2.21.0`, `openai==2.34.0`, `openai==2.52.0` | `openai==3.19.2` |
+| `anthropic` | `anthropic>=0.50` | `anthropic==0.50.0`, `anthropic==0.80.0`, `anthropic==1.0.0`, `anthropic==1.14.0` | `anthropic==1.15.0` |
+| `together` | `together>=2.0` | `together==2.0.0` | `together==2.35.0` |
+| `google-genai` | `google-genai>=1.0` | `google-genai==1.0.0`, `google-genai==1.60.0`, `google-genai==2.0.0` | `google-genai==2.25.0` |
+| `google-generativeai` | `google-generativeai>=0.8.5` | `google-generativeai==0.8.5` | `google-generativeai==0.8.6` |
+| `bedrock` | `boto3>=1.34` | `aioboto3==13.0.0`, `aioboto3==13.4.0`, `aioboto3==15.0.0`, `aioboto3==15.5.0` | `boto3==1.43.68`, `aioboto3==15.5.0` |
+
+Floors come from the install extras in `pyproject.toml`; the legacy
+`google-generativeai` floor is declared in the dev extra, and that SDK must be
+installed separately. Breakpoints come from the surface canary's interval
+catalog. Latest tested versions come from the development lock and surface
+inventory; Bedrock's async lanes install `aioboto3` with its compatible `boto3`.
+
+Anthropic versions below 1.14 remain fully supported with no behavior change.
+`opentelemetry-api` is optional and never installed directly by Solwyn
+(Anthropic 1.14+ brings it as its own dependency).
+
 ## Quick Start
 
 ```python
@@ -413,7 +434,8 @@ turn an unsupported adapter surface into a supported one.
 
 The surface contract is verified against pinned structural breakpoints per
 provider (see `tests/provider_surface_intervals.json`): floor, named
-breakpoints, and latest. Versions between tested breakpoints may expose
+breakpoints, and latest, as listed in the [supported provider SDK versions
+table](#supported-provider-sdk-versions). Versions between tested breakpoints may expose
 surfaces we have not classified; those resolve as `unknown` and follow
 `on_unmetered`.
 
@@ -1112,16 +1134,15 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `receipt_aggregate_count` | `int \| None` | Number of denied receipts represented by a content-free aggregate replay |
 | `receipt_pricing_input_tokens` | `int \| None` | Original per-call input-token count used to select the pricing card for a homogeneous aggregate replay; omitted for ordinary and legacy events |
 
+Optional fields are omitted entirely when unset (never `null`), so payloads for
+providers that do not use them are byte-identical to earlier releases.
+
 Token, output-bound, aggregate-count, pricing-basis, and non-token media
 quantities are each capped at 100,000,000 per event. Larger folded receipt
 totals replay as multiple pricing-compatible events without changing their
 exact totals or turning an unknown media quantity into zero.
 
 **The SDK never captures, logs, or transmits prompts or responses.** Explicit customer-supplied tags are outside this zero-content guarantee and are transmitted as provided. Prompt and response privacy is enforced by [structural tests](tests/unit/test_privacy_firewall.py) and the [privacy module](src/solwyn/_privacy.py).
-
-## Release Compatibility
-
-Wire-contract changes are API-first: Solwyn Cloud must accept new fields and enum values before an SDK release ships them. As of the current release line the Cloud API accepts the full wire contract — the `modality` discriminator, the `media_usage` quantities (image counts, media durations, character counts, and resolution/quality selectors), the image and audio `token_details` buckets, the Bedrock and OpenAI-compatible `provider` values, `provider_region`, bounded `tags`, `service_tier` on budget confirms, `token_details.is_estimated`, 2048-char model identifiers, `lease_id` on metadata events, and per-event ingest dispositions. Optional fields are omitted entirely (never `null`) when unset, so payloads for providers that don't use them are byte-identical to earlier releases.
 
 ## Requirements
 

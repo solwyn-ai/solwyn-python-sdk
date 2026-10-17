@@ -5,6 +5,24 @@
       "distributions": [
         {
           "name": "anthropic",
+          "version": "1.14.0"
+        }
+      ],
+      "mode": "async",
+      "namespace_count": 850,
+      "observation_count": 3606,
+      "provider": "anthropic",
+      "service_model_operation_count": 0,
+      "shape_key": "anthropic_async",
+      "structural_interval": "anthropic-otel",
+      "structure_sha256": "2406ccde7d5d0f83d295aa9ab0ae09fa54ee1e5007288f2370642979fc16ead0",
+      "variant": "native"
+    },
+    {
+      "client_shape": "anthropic_sdk",
+      "distributions": [
+        {
+          "name": "anthropic",
           "version": "0.80.0"
         }
       ],
@@ -59,17 +77,35 @@
       "distributions": [
         {
           "name": "anthropic",
-          "version": "1.4.0"
+          "version": "1.15.0"
         }
       ],
       "mode": "async",
-      "namespace_count": 417,
-      "observation_count": 2120,
+      "namespace_count": 850,
+      "observation_count": 3606,
       "provider": "anthropic",
       "service_model_operation_count": 0,
       "shape_key": "anthropic_async",
       "structural_interval": "latest",
-      "structure_sha256": "58903a38623675ea49e63d3d0a9437ab2345fee1e4424b1c0ff7cf71e3d9f97f",
+      "structure_sha256": "d05b6916b27a0459cf416551959ca557a923d255fdd44b64830676ecbab78562",
+      "variant": "native"
+    },
+    {
+      "client_shape": "anthropic_sdk",
+      "distributions": [
+        {
+          "name": "anthropic",
+          "version": "1.14.0"
+        }
+      ],
+      "mode": "sync",
+      "namespace_count": 850,
+      "observation_count": 3603,
+      "provider": "anthropic",
+      "service_model_operation_count": 0,
+      "shape_key": "anthropic_sync",
+      "structural_interval": "anthropic-otel",
+      "structure_sha256": "bccc400800aac4a9804bec9b08cd0a8f25c2b5f8244b52bf4e4d0a8d1cf75b03",
       "variant": "native"
     },
     {
@@ -131,17 +167,17 @@
       "distributions": [
         {
           "name": "anthropic",
-          "version": "1.4.0"
+          "version": "1.15.0"
         }
       ],
       "mode": "sync",
-      "namespace_count": 417,
-      "observation_count": 2117,
+      "namespace_count": 850,
+      "observation_count": 3603,
       "provider": "anthropic",
       "service_model_operation_count": 0,
       "shape_key": "anthropic_sync",
       "structural_interval": "latest",
-      "structure_sha256": "df5fbe46e85c1f1c035c94cb0ea59d6554b403bc237c1a98d6c092bb6f0ed4dd",
+      "structure_sha256": "0f99178fad7bb0bf0ba81009e346b54a620d64b4c21e334f2e49983d7ae403ef",
       "variant": "native"
     },
     {
