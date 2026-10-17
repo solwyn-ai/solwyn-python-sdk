@@ -740,8 +740,6 @@ class MediaSurfaceSpec:
     - ``estimate_input_length``: pre-flight request character count. Defaults to
       the shared content recognizer; surfaces with other input shapes supply a
       length-only privacy helper.
-    - ``response_model``: use the response's structural model identifier for
-      settlement when supplied; otherwise retain the requested model.
     - ``measure_media``: OPTIONAL non-token quantity channel. Derives the
       settled ``MediaUsage`` (image counts, media seconds, character counts,
       variant selectors) from the REQUEST and RESPONSE for a per-unit priced
@@ -768,18 +766,6 @@ class MediaSurfaceSpec:
     measure_media: Callable[[dict[str, Any], Any], MediaUsage | None] | None = None
     estimate_media: Callable[[dict[str, Any]], MediaUsage | None] | None = None
     estimate_input_length: Callable[[dict[str, Any]], int] = estimate_content_length
-    response_model: bool = False
-
-    def settled_model(self, response: Any, requested_model: str) -> str:
-        """Resolve structural model attribution without losing a paid response."""
-        if self.response_model:
-            try:
-                model = getattr(response, "model", None)
-                if isinstance(model, str) and model:
-                    return model
-            except Exception:
-                pass
-        return requested_model
 
     def usage_unmeasured(self, token_details: TokenDetails | None) -> bool:
         """Text estimates cannot prove output spend; retain the lease's bound."""

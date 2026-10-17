@@ -88,7 +88,6 @@ def _decisions_spec() -> MediaSurfaceSpec:
         extract_usage=_extract_decision_usage,
         measure_request=_measure_decision_request,
         estimate_input_length=estimate_decisions_content_length,
-        response_model=True,
     )
 
 

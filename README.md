@@ -361,9 +361,10 @@ Billable quantities are read from the response's usage block where it exists (gp
 
 - **OpenAI Decisions:** Native `decisions.create` no longer needs an
   acknowledgment. Remove `decisions.create` from `acknowledge_untracked` on
-  native OpenAI clients: a stale token now raises `ConfigurationError`, like
-  other tracked leaves. Azure OpenAI and compatible providers retain their
-  unmetered posture and exact `decisions.create` token. Raw/streaming response
+  native OpenAI clients: a stale token now raises `ConfigurationError`, including
+  when the acknowledgment list is shared with Azure or compatible clients.
+  Azure OpenAI and compatible providers retain their unmetered posture and exact
+  `decisions.create` token. Raw/streaming response
   mirrors retain their separate exact-token guards. The read-only
   `admin.organization.usage.decisions` endpoint reports historical organization
   usage; it remains unmetered, requires its own exact acknowledgment in strict

@@ -1180,18 +1180,21 @@ class TestEstimateDecisionsContentLength:
         assert type(result) is int
         assert result == 100
 
-    def test_message_parts_count_text_and_ignore_images(self) -> None:
+    @pytest.mark.parametrize("input_container", [list, tuple], ids=["list", "tuple"])
+    def test_message_parts_count_text_and_ignore_images(self, input_container) -> None:
         request = {
-            "input": [
-                {"role": "user", "content": "a" * 20},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "b" * 12},
-                        {"type": "input_image", "image_url": "SECRET-IMAGE-URL" * 100},
-                    ],
-                },
-            ],
+            "input": input_container(
+                [
+                    {"role": "user", "content": "a" * 20},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "b" * 12},
+                            {"type": "input_image", "image_url": "SECRET-IMAGE-URL" * 100},
+                        ],
+                    },
+                ]
+            ),
             "questions": [{"type": "predicate", "instructions": "c" * 8}],
         }
 

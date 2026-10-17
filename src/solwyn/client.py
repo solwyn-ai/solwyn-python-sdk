@@ -2565,7 +2565,6 @@ class Solwyn(_SolwynBase):
         #    When only media is observed, a zeroed TokenDetails carries the
         #    confirm's required token field.
         service_tier = _safe_extract_service_tier(runtime, response)
-        settled_model = spec.settled_model(response, requested_model)
         confirm = None
         reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
         if (reservation_id or lease_id) and (token_details is not None or media_usage is not None):
@@ -2573,7 +2572,7 @@ class Solwyn(_SolwynBase):
                 reservation_id=reservation_id,
                 lease_id=lease_id,
                 lease_claim_token=lease_claim_token,
-                model=settled_model,
+                model=requested_model,
                 token_details=token_details if token_details is not None else TokenDetails(),
                 provider=provider,
                 is_provider_fallback=False,
@@ -2597,7 +2596,7 @@ class Solwyn(_SolwynBase):
                 ),
             )
         event = self._build_metadata_event(
-            model=settled_model,
+            model=requested_model,
             provider=provider,
             input_tokens=token_details.input_tokens if token_details is not None else 0,
             output_tokens=token_details.output_tokens if token_details is not None else 0,
@@ -4328,7 +4327,6 @@ class AsyncSolwyn(_SolwynBase):
         # + streaming). Confirm fires when EITHER basis is observable; skipped
         # only when both are None. See the sync mirror.
         service_tier = _safe_extract_service_tier(runtime, response)
-        settled_model = spec.settled_model(response, requested_model)
         confirm = None
         reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
         if (reservation_id or lease_id) and (token_details is not None or media_usage is not None):
@@ -4336,7 +4334,7 @@ class AsyncSolwyn(_SolwynBase):
                 reservation_id=reservation_id,
                 lease_id=lease_id,
                 lease_claim_token=lease_claim_token,
-                model=settled_model,
+                model=requested_model,
                 token_details=token_details if token_details is not None else TokenDetails(),
                 provider=provider,
                 is_provider_fallback=False,
@@ -4360,7 +4358,7 @@ class AsyncSolwyn(_SolwynBase):
                 ),
             )
         event = self._build_metadata_event(
-            model=settled_model,
+            model=requested_model,
             provider=provider,
             input_tokens=token_details.input_tokens if token_details is not None else 0,
             output_tokens=token_details.output_tokens if token_details is not None else 0,

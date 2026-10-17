@@ -771,7 +771,10 @@ def estimate_decisions_content_length(kwargs: dict[str, Any]) -> int:
     identifiers are ignored. Only reusable list/tuple containers are walked so
     estimation never consumes an iterator before the provider SDK receives it.
     """
-    total = estimate_responses_content_length({"input": kwargs.get("input")})
+    input_value = kwargs.get("input")
+    if isinstance(input_value, tuple):
+        input_value = list(input_value)
+    total = estimate_responses_content_length({"input": input_value})
     questions = kwargs.get("questions")
     if not isinstance(questions, (list, tuple)):
         return total

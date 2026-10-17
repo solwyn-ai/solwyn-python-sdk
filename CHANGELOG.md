@@ -45,7 +45,9 @@ derived from git tags (hatch-vcs).
 
 - **OpenAI Decisions metering.** Native `decisions.create(...)` calls now have
   budget enforcement and token-usage settlement on sync and async clients
-  (`openai>=3.26`). Remove the now-invalid `decisions.create` acknowledgment
+  (`openai>=3.26`). Settlement uses the requested model even when the response
+  echoes a dated snapshot or an oversized model name. Preflight also measures
+  tuple inputs. Remove the now-invalid `decisions.create` acknowledgment
   token on native OpenAI clients. Azure OpenAI, compatible providers, and
   raw/streaming response mirrors retain their unmetered posture. The read-only
   `admin.organization.usage.decisions` historical usage report remains

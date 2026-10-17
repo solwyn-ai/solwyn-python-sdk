@@ -127,7 +127,7 @@ async def test_decisions_allow_checks_and_settles_text_with_run_attribution(is_a
     assert event.parent_agent_run_id == parent_id
     assert event.tags == {"job": "test", "step": "classify"}
     assert confirm.call_id == event.call_id
-    assert confirm.model == event.model == response.model
+    assert confirm.model == event.model == MODEL
     assert confirm.token_details == event.token_details
     assert event.input_tokens == 120 and event.output_tokens == 40
     assert event.token_details.cached_input_tokens == 30
@@ -141,6 +141,30 @@ async def test_decisions_allow_checks_and_settles_text_with_run_attribution(is_a
     assert REQUEST["input"] not in wire
     assert REQUEST["questions"][0]["instructions"] not in wire
     assert "probability" not in wire
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "echoed_model",
+    ["gpt-6-luna-2026-09-01", "m" * 5000],
+    ids=["dated-snapshot", "oversized"],
+)
+async def test_decisions_settles_requested_model_and_preserves_provider_response(
+    is_async, echoed_model
+):
+    payload = _decision()
+    payload["model"] = echoed_model
+
+    async with _wrapped(is_async, response=payload) as (wrapper, plane, seen):
+        response = await _create(wrapper, is_async, **REQUEST)
+
+    assert isinstance(response, decision_types.Decision)
+    assert response.model == echoed_model
+    assert len(seen) == len(plane.checks) == len(plane.confirms) == len(plane.ingested) == 1
+    check, confirm, event = plane.checks[0], plane.confirms[0], plane.ingested[0]
+    assert check.model == confirm.model == event.model == MODEL
+    assert event.status == CallStatus.SUCCESS
 
 
 @pytest.mark.asyncio
