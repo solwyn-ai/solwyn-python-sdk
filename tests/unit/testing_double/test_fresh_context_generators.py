@@ -17,6 +17,7 @@ import pytest
 
 import solwyn
 from solwyn import _run, _run_control
+from solwyn._lifecycle import _drain_run_cleanups
 from solwyn.testing import FakeControlPlane
 
 pytestmark = pytest.mark.unit
@@ -329,6 +330,7 @@ def test_generator_frame_identity_is_stable_across_context_copies():
     base.copy().run(generator.close)
     assert len(set(ids)) == 1
     assert all(key[0] == keys[0][0] and key[1] is chunks.__code__ for key in keys)
+    _drain_run_cleanups()
     assert keys[0][0] not in _run._generator_runs
 
 
@@ -448,7 +450,7 @@ def test_without_frame_introspection_shared_scope_does_not_guess_the_exiting_run
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
-@pytest.mark.parametrize("held_lock", ["registry", "scope", "record", "handle"])
+@pytest.mark.parametrize("held_lock", ["registry", "scope", "record", "handle", "cleanup"])
 def test_forked_child_can_resolve_and_close_run_with_inherited_locks_held(held_lock):
     subprocess.run(
         [
@@ -462,9 +464,11 @@ from contextvars import copy_context
 from threading import Event, Thread
 import solwyn
 from solwyn import _run
+from solwyn import _lifecycle
 
 released = []
 _run._surrender_run = released.append
+_run._queue_run_surrender = released.append
 handle = solwyn.create_run('chunks') if sys.argv[1] == 'handle' else None
 scope = handle.activate() if handle else solwyn.run('chunks')
 def chunks():
@@ -481,6 +485,7 @@ lock = {
     'scope': getattr(scope, '_records_lock', None),
     'record': record.lock,
     'handle': handle._state_lock if handle else None,
+    'cleanup': _lifecycle._run_cleanup_lock,
 }[sys.argv[1]]
 held, release = Event(), Event()
 def hold():
@@ -497,6 +502,7 @@ if pid == 0:
     base.copy().run(generator.close)
     if handle:
         handle.finish()
+    _lifecycle._drain_run_cleanups()
     assert released == [rid]
     os._exit(0)
 release.set()
@@ -505,6 +511,7 @@ _, status = os.waitpid(pid, 0)
 base.copy().run(generator.close)
 if handle:
     handle.finish()
+_lifecycle._drain_run_cleanups()
 assert os.waitstatus_to_exitcode(status) == 0, status
 """,
             held_lock,

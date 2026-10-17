@@ -51,6 +51,7 @@ from contextlib import (
 )
 from contextvars import ContextVar, Token, copy_context
 from dataclasses import dataclass, field
+from functools import partial
 from threading import RLock
 from types import CodeType, FrameType, TracebackType
 from typing import NamedTuple, ParamSpec, TypeVar
@@ -62,7 +63,14 @@ from solwyn._constants import (
     TAG_VALUE_MAX_LENGTH,
     TAGS_MAX_KEYS,
 )
-from solwyn._lifecycle import _surrender_run, register_fork_reset
+from solwyn._lifecycle import (
+    _defer_run_cleanup,
+    _drain_run_cleanups,
+    _ensure_run_cleanup_worker,
+    _queue_run_surrender,
+    _surrender_run,
+    register_fork_reset,
+)
 from solwyn.exceptions import SolwynTagsClampedWarning
 
 _P = ParamSpec("_P")
@@ -117,8 +125,13 @@ class _OpenRun:
     span: _otel._RunSpan
     owner_key: _OwnerKey
     closed: bool = False
+    closing: bool = False
     retired: bool = False
     generator_owned: bool = False
+    finalizer_sensitive: bool = False
+    # dict.pop is an atomic once-claim on supported CPython versions and never
+    # waits for a lock that may already be held by the GC-triggering thread.
+    surrender_claim: dict[None, bool] = field(default_factory=lambda: {None: True})
     lock: RLock = field(default_factory=RLock)
 
     def _reset_after_fork_in_child(self) -> None:
@@ -172,14 +185,45 @@ if hasattr(os, "register_at_fork"):
 
 
 def _owner_key() -> _OwnerKey:
+    return _owner_details()[0]
+
+
+def _owner_details() -> tuple[_OwnerKey, bool]:
     frame = None
+    sensitive = False
     try:
         frame = sys._getframe(2)
-        while frame is not None and frame.f_globals.get("__name__") == __name__:
-            frame = frame.f_back
-        return (id(frame), frame.f_code) if frame is not None else None
+        for _ in range(256):
+            if frame is None:
+                break
+            if frame.f_globals.get("__name__") == __name__:
+                frame = frame.f_back
+                continue
+            sensitive |= bool(frame.f_code.co_flags & inspect.CO_GENERATOR)
+            # A delegating manager does not own its caller's streaming scope.
+            # Skip contextlib-driven helper generators symmetrically on entry
+            # and exit, including ExitStack's unwind. Stop at the first ordinary
+            # function: a scope entirely inside one call stays a normal scope.
+            helper = (
+                frame.f_code.co_flags & inspect.CO_GENERATOR
+                and frame.f_back is not None
+                and frame.f_back.f_code
+                in (
+                    _GeneratorContextManager.__enter__.__code__,
+                    _GeneratorContextManager.__exit__.__code__,
+                )
+            )
+            machinery = (
+                frame.f_code.co_name in ("__enter__", "__exit__")
+                or frame.f_globals.get("__name__") == "contextlib"
+            )
+            if helper or machinery:
+                frame = frame.f_back
+                continue
+            return (id(frame), frame.f_code), sensitive
+        return None, sensitive
     except (AttributeError, ValueError):
-        return None
+        return None, sensitive
     finally:
         del frame
 
@@ -189,7 +233,9 @@ def _unregister_generator(key: _OwnerKey, reference: weakref.ReferenceType[_Open
         return
     with _generator_runs_lock:
         entries = _generator_runs.get(key[0], ())
-        entries = tuple((code, ref) for code, ref in entries if ref is not reference)
+        entries = tuple(
+            (code, ref) for code, ref in entries if ref is not reference and ref() is not None
+        )
         if entries:
             _generator_runs[key[0]] = entries
         else:
@@ -209,29 +255,32 @@ def _register_generator(record: _OpenRun) -> None:
     key = record.owner_key
     if key is None or not key[1].co_flags & inspect.CO_GENERATOR:
         return
-    frame = None
-    try:
-        frame = sys._getframe(1)
-        while frame is not None and frame.f_globals.get("__name__") == __name__:
-            frame = frame.f_back
-        # contextlib suspends this helper while its caller's body runs. Its
-        # frame cannot recover body calls, and normal copied contexts must keep
-        # the same outliving-work contract as an ordinary with block.
-        if (
-            frame is not None
-            and frame.f_back is not None
-            and frame.f_back.f_code is _GeneratorContextManager.__enter__.__code__
-        ):
-            return
-    except (AttributeError, ValueError):
-        return
-    finally:
-        del frame
+    _ensure_run_cleanup_worker()
     record.generator_owned = True
     reference = weakref.ref(record, lambda ref: _dead_generator_runs.append((key, ref)))
     _drain_generator_runs()
     with _generator_runs_lock:
-        _generator_runs[key[0]] = (*_generator_runs.get(key[0], ()), (key[1], reference))
+        _generator_runs[key[0]] = (
+            *((code, ref) for code, ref in _generator_runs.get(key[0], ()) if ref() is not None),
+            (key[1], reference),
+        )
+
+
+def _retire_later(
+    record: _OpenRun, callback: Callable[[], None], *, retire: bool = True, surrender: bool = False
+) -> None:
+    """Make recovery impossible now; perform all locking/callouts at a safe point."""
+    if retire:
+        record.retired = True
+    record.closing = True
+    if surrender and record.surrender_claim.pop(None, False):
+        _queue_run_surrender(record.run_id)
+    key = record.owner_key
+    if key is not None:
+        for _, reference in _generator_runs.get(key[0], ()):
+            if reference() is record:
+                _dead_generator_runs.append((key, reference))
+    _defer_run_cleanup(callback)
 
 
 def _unregister_record(record: _OpenRun) -> None:
@@ -248,13 +297,14 @@ def _close_record(record: _OpenRun, *, retire: bool = False) -> bool:
     with record.lock:
         if record.closed:
             return False
-        record.retired = retire
+        if retire:
+            record.retired = True
         record.closed = True
     _unregister_record(record)
     return True
 
 
-def _resolve_active() -> _OpenRun | None:
+def _resolve_active(*, drain: bool = True, owner: _OpenRun | None = None) -> _OpenRun | None:
     """Resolve ContextVar scoping plus runs on the executing generator stack.
 
     A binding opened in this step (same owner frame or closer) shadows a
@@ -269,8 +319,9 @@ def _resolve_active() -> _OpenRun | None:
         (item.record for item in reversed(frames) if not item.record.retired),
         None,
     )
-    _drain_generator_runs()
-    if not _generator_runs:
+    if drain:
+        _drain_generator_runs()
+    if not _generator_runs and owner is None:
         return current
     visible = {item.record for item in frames}
     frame = None
@@ -294,9 +345,17 @@ def _resolve_active() -> _OpenRun | None:
                     code is frame.f_code
                     and record is not None
                     and not record.closed
+                    and not record.closing
+                    and not record.retired
                     and record not in visible
                 ):
                     return record
+            if (
+                owner is not None
+                and owner.owner_key == (frame_id, frame.f_code)
+                and not owner.retired
+            ):
+                return owner
             frame = frame.f_back
     except (AttributeError, ValueError):
         pass
@@ -528,6 +587,27 @@ def _called_from_async_generator() -> bool:
         del frame
 
 
+def _called_from_sync_generator(*, helper_exit: bool = False) -> bool:
+    """finish() may be called by a helper after GeneratorExit was handled."""
+    frame = None
+    try:
+        frame = sys._getframe(2)
+        for _ in range(256):
+            if frame is None:
+                break
+            if frame.f_code.co_flags & inspect.CO_GENERATOR:
+                return not helper_exit or (
+                    frame.f_back is not None
+                    and frame.f_back.f_code is _GeneratorContextManager.__exit__.__code__
+                )
+            frame = frame.f_back
+    except (AttributeError, ValueError):
+        pass
+    finally:
+        del frame
+    return False
+
+
 class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
     """Context manager returned by ``solwyn.run(name)``.
 
@@ -550,7 +630,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         )
         self._inherit_tags = inherit_tags
         self._scope_id = id(self)
-        self._open_runs: dict[_OwnerKey, list[_OpenRun]] = {}
+        self._open_runs: dict[_OwnerKey, tuple[_OpenRun, ...]] = {}
         # Without frame introspection only the entry context can identify an
         # ambiguous record. A shared scope must not pin these records forever.
         self._unknown_runs: weakref.WeakSet[_OpenRun] = weakref.WeakSet()
@@ -582,13 +662,21 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         activation = None
         token = None
         try:
-            record = _OpenRun(identity, identity.active_value(), span, _owner_key())
+            key, sensitive = _owner_details()
+            record = _OpenRun(
+                identity, identity.active_value(), span, key, finalizer_sensitive=sensitive
+            )
+            if sensitive:
+                _ensure_run_cleanup_worker()
             register_fork_reset(record)
             with self._records_lock:
                 if record.owner_key is None:
                     self._unknown_runs.add(record)
                 else:
-                    self._open_runs.setdefault(record.owner_key, []).append(record)
+                    self._open_runs[record.owner_key] = (
+                        *self._open_runs.get(record.owner_key, ()),
+                        record,
+                    )
             _register_generator(record)
             activation = span.attach()
             token = _active_run.set(record.active)
@@ -620,51 +708,63 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
 
     def _find_record(self, frames: tuple[_RunFrame, ...]) -> _OpenRun | None:
         key = _owner_key()
-        with self._records_lock:
-            owned = self._open_runs.get(key) if key is not None else None
-            visible = next(
-                (frame for frame in reversed(frames) if frame.scope_id == self._scope_id), None
+        # Writers publish immutable stacks under _records_lock; a finalizer
+        # reads snapshots without ever waiting for a thread holding that lock.
+        owned = (
+            tuple(
+                record
+                for record in self._open_runs.get(key, ())
+                if not record.closed and not record.closing
             )
-            # A closed record can still have a token in its original context.
-            # An executing generator identifies its live invocation. Explicit
-            # later cleanup pops its closed frame before an outer invocation
-            # of this same scope object.
-            if owned and (
-                visible is None
-                or not visible.record.closed
-                or (key is not None and key[1].co_flags & inspect.CO_GENERATOR)
-            ):
-                return owned[-1]
-            if visible is not None:
-                return visible.record
-            # Explicit cleanup from a different caller is unambiguous only
-            # when this scope owns one open record. Never guess by insertion order.
-            records = [record for stack in self._open_runs.copy().values() for record in stack]
-            records.extend(self._unknown_runs)
-            return records[0] if len(records) == 1 else None
+            if key is not None
+            else ()
+        )
+        visible = next(
+            (frame for frame in reversed(frames) if frame.scope_id == self._scope_id), None
+        )
+        if owned and (
+            visible is None
+            or (not visible.record.closed and not visible.record.closing)
+            or (key is not None and key[1].co_flags & inspect.CO_GENERATOR)
+        ):
+            return owned[-1]
+        if visible is not None:
+            return visible.record
+        # Explicit cleanup from a different caller is unambiguous only when
+        # this scope owns one open record. Never guess by insertion order.
+        records = [record for stack in self._open_runs.copy().values() for record in stack]
+        records.extend(self._unknown_runs)
+        return records[0] if len(records) == 1 else None
 
     def _forget(self, record: _OpenRun) -> None:
         with self._records_lock:
             self._unknown_runs.discard(record)
-            stack = self._open_runs.get(record.owner_key, [])
-            stack = [item for item in stack if item is not record]
+            stack = self._open_runs.get(record.owner_key, ())
+            stack = tuple(item for item in stack if item is not record)
             if stack:
                 self._open_runs[record.owner_key] = stack
             else:
                 self._open_runs.pop(record.owner_key, None)
 
-    def _close(self, record: _OpenRun, *, error: bool, retire: bool = False) -> None:
-        if not _close_record(record, retire=retire):
-            return
+    def _close(
+        self, record: _OpenRun, *, error: bool, retire: bool = False, deferred: bool = False
+    ) -> None:
+        claimed = _close_record(record, retire=retire)
         try:
-            with suppress(BaseException):
-                _surrender_run(record.run_id)
+            if claimed and not deferred and record.surrender_claim.pop(None, False):
+                with suppress(BaseException):
+                    _surrender_run(record.run_id)
         finally:
             self._forget(record)
             with suppress(BaseException):
-                record.span.end(error=error)
+                if deferred:
+                    record.span.end_later(error=error)
+                elif claimed:
+                    record.span.end(error=error)
 
-    def _exit(self, *, require_same_context: bool = False, error: bool = False) -> None:
+    def _exit(
+        self, *, require_same_context: bool = False, error: bool = False, finalizing: bool = False
+    ) -> None:
         """Retire our own record once; only pop tokens visible in this context."""
         frames = _run_frames.get()
         record = self._find_record(frames)
@@ -686,7 +786,11 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
                     "start_run() created it"
                 )
             if record is not None:
-                self._close(record, error=error, retire=True)
+                _retire_later(
+                    record,
+                    partial(self._close, record, error=error, retire=True, deferred=True),
+                    surrender=True,
+                )
             return
         if frames[-1] is not matching:
             if matching.record.generator_owned:
@@ -695,7 +799,13 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
                 else:
                     # Generator.close() cannot retry after a LIFO error frees
                     # its frame. Release now, before its address can be reused.
-                    self._close(matching.record, error=True, retire=True)
+                    _retire_later(
+                        matching.record,
+                        partial(
+                            self._close, matching.record, error=True, retire=True, deferred=True
+                        ),
+                        surrender=True,
+                    )
             raise RuntimeError("solwyn.run scopes must exit in LIFO order")
         if require_same_context:
             restore = False
@@ -721,7 +831,20 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         try:
             retire = _pop_frame(matching, frames)
         finally:
-            self._close(matching.record, error=error, retire=retire)
+            normal_helper = not matching.record.generator_owned and _called_from_sync_generator(
+                helper_exit=True
+            )
+            if (finalizing or matching.record.finalizer_sensitive) and not normal_helper:
+                _retire_later(
+                    matching.record,
+                    partial(
+                        self._close, matching.record, error=error, retire=retire, deferred=True
+                    ),
+                    retire=retire,
+                    surrender=True,
+                )
+            else:
+                self._close(matching.record, error=error, retire=retire)
 
     def __enter__(self) -> str:
         return self._enter()
@@ -732,7 +855,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self._exit(error=exc_type is not None)
+        self._exit(error=exc_type is not None, finalizing=exc_type is GeneratorExit)
 
     async def __aenter__(self) -> str:
         return self._enter()
@@ -770,9 +893,12 @@ class RunHandle:
         self._run_id = run_id
         self._identity = identity
         self._finished = False
-        self._active_activations = 0
+        self._finish_pending = False
+        self._finish_claim = {None: True}
+        self._activations: dict[int, _OpenRun | None] = {}
         # GC of an abandoned activation can re-enter this handle's count lock.
         self._state_lock = RLock()
+        _ensure_run_cleanup_worker()
         if span is None:
             span = _otel._start_run_span(
                 run_id,
@@ -791,6 +917,16 @@ class RunHandle:
         """Return the stable id for this run scope."""
         return self._run_id
 
+    @property
+    def _active_activations(self) -> int:
+        return len(self._activations)
+
+    def _has_live_activations(self) -> bool:
+        return any(
+            record is None or (not record.closed and not record.closing)
+            for record in tuple(self._activations.values())
+        )
+
     def finish(self) -> None:
         """Finish this logical run, restoring a started scope when applicable.
 
@@ -801,22 +937,99 @@ class RunHandle:
         re-entered by design, and releasing at each activation would trade one
         blocking grant per binding for nothing.
         """
-        with self._state_lock:
-            if self._finished:
+        # finish() in a generator's finally can itself be invoked by GC, even
+        # when the generator is still executing on the stack. Do not acquire
+        # the handle/scope/record locks or call tracing/enforcers on that path.
+        record = self._scope._find_record(_run_frames.get()) if self._scope is not None else None
+        matching = next(
+            (frame for frame in reversed(_run_frames.get()) if frame.record is record), None
+        )
+        owner_executing = record is not None and _executing_owner(record)
+        sensitive = record is not None and record.finalizer_sensitive and matching is not None
+        normal_helper = (
+            record is None or not record.generator_owned
+        ) and _called_from_sync_generator(helper_exit=True)
+        if owner_executing or ((sensitive or _called_from_sync_generator()) and not normal_helper):
+            if self._finished or self._finish_pending:
                 raise RuntimeError(f"run handle {self._run_id!r} already finished")
-            if self._active_activations:
+            if self._has_live_activations():
                 raise RuntimeError(
                     f"run handle {self._run_id!r} cannot finish while activations are still active"
                 )
-            if self._scope is not None:
-                self._scope._exit(require_same_context=True)
+            if record is not None:
+                if matching is None and not owner_executing:
+                    raise RuntimeError(
+                        "RunHandle.finish() must be called in the same context where "
+                        "start_run() created it"
+                    )
+                if _resolve_active(drain=False, owner=record) is not record:
+                    raise RuntimeError("solwyn.run scopes must exit in LIFO order")
+                if matching is not None:
+                    if _run_frames.get()[-1] is not matching:
+                        raise RuntimeError("solwyn.run scopes must exit in LIFO order")
+                    restore = False
+                    try:
+                        _active_run.reset(matching.token)
+                    except (ValueError, RuntimeError) as exc:
+                        if not owner_executing:
+                            raise RuntimeError(
+                                "RunHandle.finish() must be called in the same context where "
+                                "start_run() created it"
+                            ) from exc
+                        _active_run.set(matching.prior_active)
+                        restore = True
+                    _pop_frame(matching, _run_frames.get(), restore=restore)
+                if not self._finish_claim.pop(None, False):
+                    raise RuntimeError(f"run handle {self._run_id!r} already finished")
+                self._finish_pending = True
+                _retire_later(
+                    record, partial(self._complete_deferred_finish, record), surrender=True
+                )
+            else:
+                if not self._finish_claim.pop(None, False):
+                    raise RuntimeError(f"run handle {self._run_id!r} already finished")
+                self._finish_pending = True
+                _queue_run_surrender(self._run_id)
+                _defer_run_cleanup(partial(self._complete_deferred_finish, None))
+            return
+        _drain_run_cleanups()
+        with self._state_lock:
+            if self._finished or self._finish_pending:
+                raise RuntimeError(f"run handle {self._run_id!r} already finished")
+            if self._has_live_activations():
+                raise RuntimeError(
+                    f"run handle {self._run_id!r} cannot finish while activations are still active"
+                )
+            if not self._finish_claim.pop(None, False):
+                raise RuntimeError(f"run handle {self._run_id!r} already finished")
+            try:
+                if self._scope is not None:
+                    self._scope._exit(require_same_context=True)
+            except BaseException:
+                self._finish_claim[None] = True
+                raise
             self._finished = True
         try:
-            _surrender_run(self._run_id)
+            if record is None or record.surrender_claim.pop(None, False):
+                _surrender_run(self._run_id)
         finally:
             self._span.end()
             if self._span_finalizer is not None:
                 self._span_finalizer.detach()
+
+    def _complete_deferred_finish(self, record: _OpenRun | None) -> None:
+        with self._state_lock:
+            if not self._finished and self._has_live_activations():
+                self._finish_pending = False
+                self._finish_claim[None] = True
+                return
+            if record is not None and self._scope is not None:
+                _close_record(record, retire=True)
+                self._scope._forget(record)
+            self._finished = True
+        self._span.end_later()
+        if self._span_finalizer is not None:
+            self._span_finalizer.detach()
 
     def activate(self) -> _RunActivation:
         """Bind a detached logical identity in the caller's context."""
@@ -824,20 +1037,22 @@ class RunHandle:
             raise RuntimeError("RunHandle.activate() requires a handle created by create_run()")
         return _RunActivation(self)
 
-    def _reserve_activation(self) -> _RunIdentity:
+    def _reserve_activation(self, scope_id: int) -> _RunIdentity:
         with self._state_lock:
-            if self._finished:
+            if self._finished or not self._finish_claim:
                 raise RuntimeError(f"run handle {self._run_id!r} already finished")
             if self._identity is None:
                 raise RuntimeError("RunHandle.activate() requires a handle created by create_run()")
-            self._active_activations += 1
+            self._activations[scope_id] = None
+            if not self._finish_claim:
+                self._activations.pop(scope_id, None)
+                raise RuntimeError(f"run handle {self._run_id!r} already finished")
             return self._identity
 
-    def _release_activation(self) -> None:
+    def _release_activation(self, scope_id: int, record: _OpenRun | None) -> None:
         with self._state_lock:
-            if self._active_activations <= 0:
-                raise RuntimeError("run handle activation count is inconsistent")
-            self._active_activations -= 1
+            if self._activations.get(scope_id) is record:
+                self._activations.pop(scope_id, None)
 
 
 class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[str]):
@@ -858,13 +1073,23 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
             raise RuntimeError(
                 f"run handle {self._handle.run_id!r} is already active in this context"
             )
-        identity = self._handle._reserve_activation()
+        identity = self._handle._reserve_activation(self._scope_id)
         record = None
         prior_active = _active_run.get()
         token: Token[tuple[str, str, dict[str, str] | None] | None] | None = None
         activation = None
         try:
-            record = _OpenRun(identity, identity.active_value(), self._handle._span, _owner_key())
+            key, sensitive = _owner_details()
+            record = _OpenRun(
+                identity,
+                identity.active_value(),
+                self._handle._span,
+                key,
+                finalizer_sensitive=sensitive,
+            )
+            if sensitive:
+                _ensure_run_cleanup_worker()
+            self._handle._activations[self._scope_id] = record
             self._record = record
             register_fork_reset(record)
             _register_generator(record)
@@ -891,12 +1116,12 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
             if record is not None:
                 self._deactivate(record, error=False)
             else:
-                self._handle._release_activation()
+                self._handle._release_activation(self._scope_id, None)
             raise
         self._entered = True
         return identity.run_id
 
-    def _exit(self, *, error: bool = False) -> None:
+    def _exit(self, *, error: bool = False, finalizing: bool = False) -> None:
         frames = _run_frames.get()
         record = self._record
         key = _owner_key()
@@ -911,18 +1136,22 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
             (index for index, frame in enumerate(frames) if frame.record is record),
             None,
         )
-        foreign_exit = record is not None and _executing_owner(record)
+        foreign_exit = record is not None and (
+            _executing_owner(record) or (finalizing and record.generator_owned)
+        )
+        if error and record is not None:
+            record.span.failed()
         if matching_index is None:
-            if not foreign_exit:
+            if not foreign_exit and not (record is not None and record.generator_owned):
                 raise RuntimeError(
                     "RunHandle activation must exit in the same context where it was entered"
                 )
             if record is not None:
-                self._deactivate(record, error=error, retire=True)
+                _retire_later(record, partial(self._deactivate, record, error=error, retire=True))
             return
         if matching_index != len(frames) - 1:
             if foreign_exit and record is not None:
-                self._deactivate(record, error=True, retire=True)
+                _retire_later(record, partial(self._deactivate, record, error=True, retire=True))
             raise RuntimeError("solwyn.run scopes must exit in LIFO order")
         # A refused ordinary activation exit leaves its frame and count intact.
         # Generator steps can lack the entry token; only their owner can soften
@@ -934,16 +1163,28 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
         try:
             _pop_frame(frames[-1], frames, restore=retire)
         finally:
-            self._deactivate(frames[-1].record, error=error, retire=retire)
+            normal_helper = not frames[-1].record.generator_owned and _called_from_sync_generator(
+                helper_exit=True
+            )
+            if (finalizing or frames[-1].record.finalizer_sensitive) and not normal_helper:
+                _retire_later(
+                    frames[-1].record,
+                    partial(self._deactivate, frames[-1].record, error=error, retire=retire),
+                    retire=retire,
+                )
+            else:
+                self._deactivate(frames[-1].record, error=error, retire=retire)
 
     def _deactivate(self, record: _OpenRun, *, error: bool, retire: bool = False) -> None:
-        if _close_record(record, retire=retire):
-            if error:
-                record.span.failed()
-            self._handle._release_activation()
+        _close_record(record, retire=retire)
+        if error:
+            record.span.failed()
+        self._handle._release_activation(self._scope_id, record)
+        if self._record is record:
             self._entered = False
 
     def __enter__(self) -> str:
+        _drain_run_cleanups()
         if self._entered:
             raise RuntimeError("RunHandle activation is already entered")
         return self._enter()
@@ -954,7 +1195,7 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self._exit(error=exc_type is not None)
+        self._exit(error=exc_type is not None, finalizing=exc_type is GeneratorExit)
 
     async def __aenter__(self) -> str:
         return self.__enter__()

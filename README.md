@@ -598,23 +598,25 @@ Use `solwyn.current_run_context()` to read the active `RunContext(id, name, tags
 
 Works the same with `async with` and is safe across concurrent asyncio tasks — each task sees only its own active run. Calls made outside a `solwyn.run(...)` scope are still tracked; the API groups them into `_auto-{sdk_instance_id}-{YYYY-MM-DD}` using the event's UTC timestamp.
 
-Runs opened directly in synchronous generators keep their attribution across
-yields, including when Starlette/FastAPI `StreamingResponse` steps each chunk in
-a fresh context on a worker thread. Every call uses the generator's run and
-recorded parent, and scope exit releases its budget lease and ends its run span
-once. Driver calls
-between steps keep the driver's context. Threads or executors started inside a
-step do not inherit a run recovered from the generator's stack; use a detached
-run handle and explicitly activate it in that work. A plain `for` loop sharing
-one context continues to see the generator's run in its loop body.
-Recovery follows the executing owner frame, up to 256 stack frames; open the run
-in the streaming generator itself when using helper context managers.
+Runs opened in synchronous generators keep their attribution across yields,
+including when Starlette/FastAPI `StreamingResponse` steps each chunk in a fresh
+context on a worker thread. This also works through `@contextmanager` helpers,
+`ExitStack`, and delegating `__enter__` / `__exit__` methods. Every call uses the
+generator's run and recorded parent, and scope exit releases its budget lease
+and ends its run span once. Driver calls between steps keep the driver's
+context. Threads or executors started inside a step do not inherit a run
+recovered from the generator's stack; use a detached run handle and explicitly
+activate it in that work. A plain `for` loop sharing one context continues to
+see the generator's run in its loop body. Recovery follows the executing owner
+frame, up to 256 stack frames. A plain function that opens and closes a run
+within one call keeps ordinary context scoping.
 
 `start_run(...).finish()` normally requires the context that opened the run.
 A run opened directly in a sync generator can also finish from that generator
-in a later fresh-context step. For separate callbacks, tasks, or threads, use
-`create_run()` and `handle.activate()`; ordinary activations must exit in the
-context where they entered.
+in a later fresh-context step. Detached activations, including those wrapped in
+context managers, can span yields and then finish normally. For separate
+callbacks, tasks, or threads, use `create_run()` and `handle.activate()`;
+ordinary activations must exit in the context where they entered.
 
 Do not open `solwyn.run(...)` inside an async generator. Python runs the consumer's `async for` body in the same context after a generator `yield`, so an inner generator scope would leak into customer code. The SDK rejects that pattern at scope entry. Open the scope in the consumer, or await the generator entirely inside an outer run scope.
 
@@ -1265,9 +1267,9 @@ follow the current tracing parent. In fresh-context generator steps, calls and
 nested runs use the recovered run span unless a valid current application span
 differs from the tracing parent captured at run entry; that application span
 takes precedence, including spans opened inside the step. The span ends once
-on sync or async exit, with status `ERROR` when an exception or interruption leaves the scope and
-`OK` otherwise. Run spans contain only `solwyn.agent_run_id` and, for child
-runs, `solwyn.parent_agent_run_id`.
+on sync or async exit, with status `ERROR` when an exception or interruption
+leaves the scope and `OK` otherwise. Run spans contain only
+`solwyn.agent_run_id` and, for child runs, `solwyn.parent_agent_run_id`.
 
 Reusing a `solwyn.run(...)` scope object creates an independent run for each
 entry, including concurrent generators stepped in fresh contexts. Use detached

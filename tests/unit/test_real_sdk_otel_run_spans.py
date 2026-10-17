@@ -9,7 +9,7 @@ import sys
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from contextvars import copy_context
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,6 +25,7 @@ from test_real_sdk_otel_spans import spans as spans
 
 import solwyn
 from solwyn import _otel
+from solwyn._lifecycle import _drain_run_cleanups, _drain_run_span_cleanups
 from solwyn.testing import FakeControlPlane
 
 trace = pytest.importorskip("opentelemetry.trace")
@@ -48,6 +49,8 @@ def enabled(monkeypatch):
 
 
 def _runs(spans):
+    _drain_run_cleanups()
+    _drain_run_span_cleanups()
     return [span for span in spans.exporter.get_finished_spans() if span.name == "solwyn.run"]
 
 
@@ -61,6 +64,30 @@ def _assert_run(spans, span, run_id, *, parent_id=None, error=False):
     assert span.status.description is None
     assert not span.events
     assert spans.ends[span.context.span_id] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("kind", ["scope", "started", "detached"])
+def test_normal_helper_exports_its_run_before_tracer_shutdown(spans, kind):
+    @contextmanager
+    def helper():
+        if kind == "scope":
+            with solwyn.run("helper") as rid:
+                yield rid
+        else:
+            handle = (solwyn.start_run if kind == "started" else solwyn.create_run)("helper")
+            try:
+                with handle.activate() if kind == "detached" else nullcontext():
+                    yield handle.run_id
+            finally:
+                handle.finish()
+
+    with helper() as rid:
+        pass
+    # Read the exporter directly: _runs intentionally drains deferred work.
+    assert [s.attributes["solwyn.agent_run_id"] for s in spans.exporter.get_finished_spans()] == [
+        rid
+    ]
 
 
 @pytest.mark.unit
@@ -469,6 +496,8 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 import solwyn
 from solwyn import _run
+from solwyn._lifecycle import _drain_run_cleanups
+from solwyn._lifecycle import _drain_run_span_cleanups
 
 gc.disable()
 os.environ['SOLWYN_OTEL_SPANS'] = 'true'
@@ -492,6 +521,8 @@ span = entered.run(_run._run_frames.get)[-1].record.span
 del stream, entered
 with span._lock:
     gc.collect()
+_drain_run_cleanups()
+_drain_run_span_cleanups()
 if handle:
     handle.finish()
 assert len(exporter.get_finished_spans()) == 1

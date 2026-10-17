@@ -11,6 +11,7 @@ import re
 import weakref
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
+from functools import partial
 from threading import Lock, RLock
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
@@ -22,7 +23,11 @@ from solwyn._constants import (
     TRACE_ID_PATTERN,
 )
 from solwyn._env import _parse_bool
-from solwyn._lifecycle import register_fork_reset
+from solwyn._lifecycle import (
+    _defer_run_span_cleanup,
+    _ensure_run_cleanup_worker,
+    register_fork_reset,
+)
 from solwyn.exceptions import RunStoppedError
 
 if TYPE_CHECKING:
@@ -216,13 +221,21 @@ class _RunSpan:
 
     def failed(self) -> None:
         if self._span is not None:
-            with self._lock:
-                self._error = True
+            # Sticky flag: publishing failure must also be safe from a GC
+            # finalizer while a span operation holds its lock.
+            self._error = True
+
+    def end_later(self, *, error: bool = False) -> None:
+        if self._span is not None:
+            _defer_run_span_cleanup(partial(self.end, error=error))
 
     def finalize_on_gc(self, owner: object) -> weakref.finalize[..., object] | None:
         if self._span is None:
             return None
-        finalizer = weakref.finalize(owner, self.end, error=True)
+        _ensure_run_cleanup_worker()
+        # SDK and exporter/processor locks may already be held by the thread
+        # invoking cyclic GC. Weakref finalizers only hand off work.
+        finalizer = weakref.finalize(owner, _defer_run_span_cleanup, partial(self.end, error=True))
         finalizer.atexit = False
         return finalizer
 

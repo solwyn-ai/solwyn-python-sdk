@@ -100,19 +100,16 @@ derived from git tags (hatch-vcs).
 
 - Runs entered inside sync generators streamed by frameworks that step each
   chunk in a fresh context, such as Starlette/FastAPI `StreamingResponse`, now
-  attribute every call to the correct run and parent, release their budget lease
-  when the scope exits, and no longer raise when an outer run is active. Run
-  stops and call-span parentage also follow the generator's run. Detached handle
-  activations can exit across yields and then finish normally. Threads started
-  inside a step do not inherit a run recovered from the generator's stack;
-  explicitly activate a detached handle in that work.
-  `start_run()` handles can also finish from their owning sync generator in a
-  later step, and calls inside an application span retain that tracing parent.
-- Abandoned cyclic sync streams no longer deadlock other requests during
-  garbage collection. Invalid generator scope exits retire their run before
-  the frame address can be reused. Helpers built with `@contextmanager` retain
-  ordinary copied-context and outliving-task attribution, and ordinary
-  detached activations keep their retryable wrong-context exit error.
+  attribute every call to the correct run and parent, including runs and
+  detached handle activations wrapped in context managers or `ExitStack`.
+  Scope exit releases the run's budget lease without raising when an outer run
+  is active. Run stops and call spans follow the generator's run; calls inside
+  an application span retain that tracing parent. Activations can exit across
+  yields and then finish normally, and `start_run()` handles can finish from
+  their owning generator in a later step. Recovery follows up to 256 stack
+  frames. Threads started inside a recovered step need an explicit detached
+  activation; shared-context `for` loop visibility is unchanged, and scopes
+  inside async generators remain unsupported.
 
 - **Timeout configuration reads in strict mode.** Reading `client.timeout` on
   wrapped OpenAI, Anthropic, Azure OpenAI, Together, and OpenAI-compatible clients

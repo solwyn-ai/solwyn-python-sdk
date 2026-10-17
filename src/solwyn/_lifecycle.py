@@ -143,6 +143,95 @@ _fork_registered = False
 # Budget enforcers holding PJ-2 leases. Held weakly, like the reporters: a
 # closed enforcer has already surrendered and drops out on its own.
 _LIVE_LEASE_HOLDERS: weakref.WeakSet[_BudgetEnforcerBase] = weakref.WeakSet()
+_LEASE_HOLDER_REFS: tuple[weakref.ReferenceType[_BudgetEnforcerBase], ...] = ()
+
+# A generator/weakref finalizer can run inside ANY SDK critical section.
+# Its only handoff is deque.append: no lock, logger, span processor, or I/O.
+# Normal entry points and one lazy background worker perform the actual work.
+_run_cleanups: collections.deque[Callable[[], None]] = collections.deque()
+_run_span_cleanups: collections.deque[Callable[[], None]] = collections.deque()
+_run_cleanup_lock = threading.RLock()
+_run_span_cleanup_lock = threading.RLock()
+_run_cleanup_start_lock = threading.Lock()
+_run_cleanup_worker: threading.Thread | None = None
+_RUN_CLEANUP_INTERVAL_S = 0.1
+
+
+def _defer_run_cleanup(callback: Callable[[], None]) -> None:
+    _run_cleanups.append(callback)
+
+
+def _defer_run_span_cleanup(callback: Callable[[], None]) -> None:
+    _run_span_cleanups.append(callback)
+
+
+def _drain_run_cleanups(*, blocking: bool = True) -> None:
+    """Only scope bookkeeping; bounded entry points never join another drain."""
+    if not _run_cleanup_lock.acquire(blocking=blocking):
+        return
+    try:
+        while _run_cleanups:
+            # Retain the in-progress callback across fork. Every callback's
+            # bookkeeping is idempotent, including a partially closed record.
+            callback = _run_cleanups[0]
+            with suppress(BaseException):
+                callback()
+            _run_cleanups.popleft()
+    finally:
+        _run_cleanup_lock.release()
+
+
+def _drain_run_span_cleanups() -> None:
+    """Tracing may call arbitrary exporters; never joined by budget/close paths."""
+    with _run_span_cleanup_lock:
+        while _run_span_cleanups:
+            callback = _run_span_cleanups[0]
+            with suppress(BaseException):
+                callback()
+            _run_span_cleanups.popleft()
+
+
+def _queue_run_surrender(agent_run_id: str) -> None:
+    """Finalizer-safe handoff; each holder fences it before its next grant."""
+    for reference in _LEASE_HOLDER_REFS:
+        holder = reference()
+        if holder is not None:
+            holder._pending_run_surrenders.append(agent_run_id)
+
+
+def _drain_run_surrenders() -> None:
+    for reference in _LEASE_HOLDER_REFS:
+        holder = reference()
+        if holder is not None:
+            with suppress(Exception):
+                holder._drain_pending_run_surrenders(blocking=False)
+
+
+def _ensure_run_cleanup_worker() -> None:
+    """Called on ordinary run entry, never from a finalizer."""
+    global _run_cleanup_worker
+    if _run_cleanup_worker is not None:
+        return
+    with _run_cleanup_start_lock:
+        if _run_cleanup_worker is not None:
+            return
+
+        def drain() -> None:
+            while True:
+                time.sleep(_RUN_CLEANUP_INTERVAL_S)
+                _drain_run_cleanups()
+                _drain_run_surrenders()
+
+        def drain_spans() -> None:
+            while True:
+                time.sleep(_RUN_CLEANUP_INTERVAL_S)
+                _drain_run_span_cleanups()
+
+        worker = threading.Thread(target=drain, name="solwyn-run-cleanup", daemon=True)
+        worker.start()
+        _run_cleanup_worker = worker
+        threading.Thread(target=drain_spans, name="solwyn-run-spans", daemon=True).start()
+
 
 _EXIT_BATCH_SIZE = 50
 
@@ -182,6 +271,11 @@ def register_fork_reset(obj: _ForkResettable) -> None:
 
 def _run_fork_resets() -> None:
     """Run every registered object's child-side reset; guard each individually."""
+    global _run_cleanup_lock, _run_cleanup_worker, _run_span_cleanup_lock, _run_cleanup_start_lock
+    _run_cleanup_lock = threading.RLock()
+    _run_span_cleanup_lock = threading.RLock()
+    _run_cleanup_start_lock = threading.Lock()
+    _run_cleanup_worker = None
     for obj in list(_FORK_RESETTABLE):
         try:
             obj._reset_after_fork_in_child()
@@ -251,7 +345,15 @@ def register_async_reporter(reporter: AsyncMetadataReporter) -> None:
 def register_lease_holder(enforcer: _BudgetEnforcerBase) -> None:
     """Track a budget enforcer so its held leases are released at exit."""
     _ensure_atexit_registered()
-    _LIVE_LEASE_HOLDERS.add(enforcer)
+    global _LEASE_HOLDER_REFS
+    with _registry_lock:
+        _LIVE_LEASE_HOLDERS.add(enforcer)
+        # Finalizers read this immutable weak snapshot without iterating a
+        # WeakSet that concurrent client construction may resize.
+        _LEASE_HOLDER_REFS = (
+            *(reference for reference in _LEASE_HOLDER_REFS if reference() is not None),
+            weakref.ref(enforcer),
+        )
 
 
 def _surrender_run(agent_run_id: str) -> None:
@@ -1110,6 +1212,7 @@ def _drop_all(
 
 def _exit_flush_all() -> None:
     """The single atexit hook: flush every still-open live reporter."""
+    _drain_run_surrenders()
     for sync_reporter in list(_LIVE_SYNC_REPORTERS):
         try:
             # _shutdown means stop REQUESTED, _delivery_closed is the EARLY

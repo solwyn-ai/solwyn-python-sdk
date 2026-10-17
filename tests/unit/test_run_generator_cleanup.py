@@ -14,6 +14,7 @@ import pytest
 
 import solwyn
 from solwyn import _run
+from solwyn._lifecycle import _drain_run_cleanups
 
 pytestmark = pytest.mark.unit
 
@@ -31,10 +32,12 @@ from contextlib import nullcontext
 from contextvars import copy_context
 import solwyn
 from solwyn import _run
+from solwyn._lifecycle import _drain_run_cleanups
 
 gc.disable()
 released = []
 _run._surrender_run = released.append
+_run._queue_run_surrender = released.append
 kind = sys.argv[1]
 scope = solwyn.run('shared') if kind != 'weakref' else None
 handle = solwyn.create_run('detached') if kind == 'handle' else None
@@ -62,6 +65,7 @@ lock = {
 del entered, record, stream
 with lock:
     gc.collect()
+_drain_run_cleanups()
 assert solwyn.current_run_context().id is None
 assert not _run._generator_runs
 if handle:
@@ -123,6 +127,7 @@ def test_lifo_error_releases_generator_record_before_frame_address_reuse(detache
     second_handle = solwyn.create_run("other") if detached else None
     released = []
     monkeypatch.setattr(_run, "_surrender_run", released.append)
+    monkeypatch.setattr(_run, "_queue_run_surrender", released.append)
 
     def chunks(binding):
         if binding is not None:
@@ -143,6 +148,7 @@ def test_lifo_error_releases_generator_record_before_frame_address_reuse(detache
         return first_id, second_id, old_key
 
     first_id, second_id, old_key = copy_context().run(request)
+    _drain_run_cleanups()
     assert old_key not in _run._generator_runs
     assert not scope._open_runs
     if handle is not None and second_handle is not None:
@@ -215,6 +221,7 @@ def test_generator_that_exits_in_entry_context_keeps_outliving_attribution(detac
     rid = entered.run(next, generator)
     entered.run(generator.close)
     assert kept.run(solwyn.current_run_context).id == rid
+    _drain_run_cleanups()
     if handle is not None:
         handle.finish()
 

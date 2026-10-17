@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from contextlib import ExitStack, contextmanager
 
 import pytest
 from test_otel_population import _raw_client, _response
@@ -20,13 +21,19 @@ from starlette.testclient import TestClient
 
 @pytest.mark.unit
 @pytest.mark.parametrize("outer", [False, True])
-def test_streaming_response_keeps_run_for_all_chunks_and_releases_its_lease(outer):
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_streaming_response_keeps_run_for_all_chunks_and_releases_its_lease(outer, wrapped):
     plane = FakeControlPlane()
     raw = _raw_client(False)
     raw.chat.completions.create.return_value = _response()
     client = plane.wrap(raw)
     parent_ids = []
     run_ids = []
+
+    @contextmanager
+    def stream_run():
+        with ExitStack() as stack:
+            yield stack.enter_context(solwyn.run("chunks"))
 
     class RequestRun:
         def __init__(self, app):
@@ -38,7 +45,7 @@ def test_streaming_response_keeps_run_for_all_chunks_and_releases_its_lease(oute
                 await self.app(scope, receive, send)
 
     def chunks():
-        with solwyn.run("chunks") as run_id:
+        with stream_run() if wrapped else solwyn.run("chunks") as run_id:
             run_ids.append(run_id)
             for _ in range(3):
                 client.chat.completions.create(model="gpt-5.5", messages=[], max_tokens=32)
