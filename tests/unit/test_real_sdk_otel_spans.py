@@ -1,0 +1,948 @@
+"""Hermetic span lifecycle tests with the optional OTel SDK/exporter."""
+
+from __future__ import annotations
+
+import asyncio
+import gc
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
+import pytest
+from conftest import VALID_API_KEY
+from test_otel_population import _budget, _raw_client, _response
+
+import solwyn
+from solwyn import _otel
+from solwyn._base import MediaSurfaceSpec
+from solwyn._types import ProviderName
+from solwyn.config import ProviderEntry, SolwynConfig
+from solwyn.testing import FakeControlPlane
+
+trace = pytest.importorskip("opentelemetry.trace")
+sdk = pytest.importorskip("opentelemetry.sdk.trace")
+export = pytest.importorskip("opentelemetry.sdk.trace.export")
+memory = pytest.importorskip("opentelemetry.sdk.trace.export.in_memory_span_exporter")
+
+_IDENTITY = {
+    "solwyn.call_id",
+    "solwyn.provider.requested",
+    "solwyn.model.requested",
+    "solwyn.budget.mode",
+}
+_BUDGET = {"solwyn.budget.allowed", "solwyn.lease_funded"}
+_ATTEMPT = {"solwyn.provider.served", "solwyn.model.served", "solwyn.attempt_index"}
+_DENIAL = {"solwyn.deny_source", "solwyn.denied_by_period"}
+
+
+@pytest.fixture
+def spans(monkeypatch):
+    provider = sdk.TracerProvider()
+    exporter = memory.InMemorySpanExporter()
+    provider.add_span_processor(export.SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("span-tests")
+    api = ModuleType("test_trace_api")
+    api.__dict__.update(vars(trace))
+    api.get_tracer = lambda *args, **kwargs: tracer
+    monkeypatch.setattr(_otel, "_trace_api", api)
+    monkeypatch.setattr(_otel, "_trace_api_resolved", True)
+    ends = Counter()
+    original_end = sdk.Span.end
+
+    def end(span, *args, **kwargs):
+        ends[span.get_span_context().span_id] += 1
+        return original_end(span, *args, **kwargs)
+
+    monkeypatch.setattr(sdk.Span, "end", end)
+    yield SimpleNamespace(
+        tracer=tracer,
+        api=api,
+        exporter=exporter,
+        ends=ends,
+        provider=provider,
+        calls=lambda: [s for s in exporter.get_finished_spans() if s.name == "solwyn.call"],
+    )
+    provider.shutdown()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value,expected", [("false", False), ("0", False), ("yes", True)])
+def test_span_config_environment_and_override(monkeypatch, value, expected):
+    monkeypatch.setenv("SOLWYN_OTEL_SPANS", value)
+    assert (
+        SolwynConfig(
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+            api_key=VALID_API_KEY,
+        ).otel_spans
+        is expected
+    )
+    assert SolwynConfig(
+        providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+        api_key=VALID_API_KEY,
+        otel_spans=not expected,
+    ).otel_spans is (not expected)
+
+
+@pytest.mark.unit
+def test_spans_default_off(monkeypatch):
+    monkeypatch.delenv("SOLWYN_OTEL_SPANS", raising=False)
+    assert (
+        SolwynConfig(
+            providers=[ProviderEntry(provider=ProviderName.OPENAI, model="gpt-5.5")],
+            api_key=VALID_API_KEY,
+        ).otel_spans
+        is False
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("media", [False, True], ids=["chat", "media"])
+@pytest.mark.parametrize(
+    "outcome", ["success", "error", "denial", "run_stop", "post_stop", "interrupt"]
+)
+async def test_call_span_lifecycle(spans, async_mode, media, outcome):
+    plane = FakeControlPlane()
+    raw = _raw_client(async_mode)
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
+
+    def dispatch(*args, **kwargs):
+        # This simulates independent provider instrumentation at its public seam.
+        with spans.tracer.start_as_current_span("provider.native"):
+            if outcome == "error":
+                raise ValueError("PRIVATE provider error")
+            if outcome == "interrupt":
+                raise asyncio.CancelledError() if async_mode else KeyboardInterrupt()
+        return _response()
+
+    raw.chat.completions.create.side_effect = dispatch
+    raw.embeddings.create.side_effect = dispatch
+
+    def check(*args, **kwargs):
+        with spans.tracer.start_as_current_span("budget.httpx"):
+            pass
+        if outcome == "post_stop":
+            from solwyn._run_control import mark_terminated
+
+            mark_terminated(kwargs["agent_run_id"], reason="manual_kill", source="server")
+        return _budget(denied=outcome == "denial")
+
+    expected_error = outcome != "success"
+    try:
+        with (
+            patch.object(
+                wrapper._solwyn_budget,
+                "check_budget",
+                new=(
+                    AsyncMock(side_effect=check)
+                    if async_mode
+                    else MagicMock(spec=[], side_effect=check)
+                ),
+            ),
+            spans.tracer.start_as_current_span("caller") as caller,
+            solwyn.run("PRIVATE run name", tags={"private": "tag"}) as run_id,
+        ):
+            caller_id = caller.get_span_context().span_id
+            if outcome == "run_stop":
+                from solwyn._run_control import mark_terminated
+
+                mark_terminated(run_id, reason="velocity:repeat_size", source="local_velocity")
+            try:
+                if media:
+                    result = wrapper._media_call(
+                        MediaSurfaceSpec(
+                            surface="embeddings",
+                            modality="embedding",
+                            extract_usage=lambda response: None,
+                            measure_request=lambda kwargs: None,
+                        ),
+                        model="gpt-5.5",
+                        input="PRIVATE prompt",
+                    )
+                else:
+                    result = wrapper.chat.completions.create(model="gpt-5.5", messages=[])
+                if async_mode:
+                    await result
+                assert not expected_error
+            except (Exception, KeyboardInterrupt, asyncio.CancelledError):
+                assert expected_error
+            assert trace.get_current_span() is caller
+    finally:
+        if async_mode:
+            await wrapper.close()
+        else:
+            wrapper.close()
+
+    assert len(spans.calls()) == 1
+    call = spans.calls()[0]
+    assert call.kind == trace.SpanKind.INTERNAL
+    assert call.parent.span_id == caller_id
+    assert spans.ends[call.context.span_id] == 1
+    assert call.status.status_code == (
+        trace.StatusCode.ERROR if expected_error else trace.StatusCode.OK
+    )
+    assert call.status.description is None
+    assert not call.events
+    for child in spans.exporter.get_finished_spans():
+        if child.name in {"provider.native", "budget.httpx"}:
+            assert child.parent.span_id == call.context.span_id
+    assert call.attributes["solwyn.agent_run_id"] == run_id
+    assert call.attributes["solwyn.provider.requested"] == "openai"
+    assert call.attributes["solwyn.model.requested"] == "gpt-5.5"
+    assert all(key.startswith("solwyn.") for key in call.attributes)
+    assert "PRIVATE" not in str(dict(call.attributes))
+    expected_keys = _IDENTITY | {"solwyn.agent_run_id"}
+    if outcome != "run_stop":
+        expected_keys |= _BUDGET
+    else:
+        expected_keys |= {"solwyn.budget.allowed"}
+    if outcome in {"run_stop", "post_stop", "denial"}:
+        expected_keys |= _DENIAL
+        assert call.attributes["solwyn.budget.allowed"] is False
+    else:
+        expected_keys |= _ATTEMPT
+    assert set(call.attributes) == expected_keys
+    assert bool(plane.ingested) is not (media and outcome == "interrupt")
+    assert all(
+        event.span_id == trace.format_span_id(call.context.span_id) for event in plane.ingested
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("terminal", ["normal", "close", "gc", "error", "interrupt"])
+async def test_stream_span_is_not_current_and_ends_once(spans, async_mode, terminal):
+    plane = FakeControlPlane()
+    raw = _raw_client(async_mode)
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
+
+    def chunks():
+        assert trace.get_current_span() is consumer
+        yield _response()
+        if terminal == "error":
+            raise ValueError("PRIVATE stream error")
+        if terminal == "interrupt":
+            raise asyncio.CancelledError() if async_mode else KeyboardInterrupt()
+
+    async def async_chunks():
+        for chunk in chunks():
+            yield chunk
+
+    raw.chat.completions.create.return_value = async_chunks() if async_mode else chunks()
+    try:
+        with spans.tracer.start_as_current_span("caller") as caller:
+            result = wrapper.chat.completions.create(model="gpt-5.5", messages=[], stream=True)
+            if async_mode:
+                result = await result
+            assert trace.get_current_span() is caller
+            assert not spans.calls()
+        with spans.tracer.start_as_current_span("consumer") as consumer:
+            if terminal == "gc":
+                del result
+                gc.collect()
+            elif terminal == "close":
+                if async_mode:
+                    await result.close()
+                    await result.close()
+                else:
+                    result.close()
+                    result.close()
+            else:
+                with (
+                    pytest.raises((ValueError, KeyboardInterrupt, asyncio.CancelledError))
+                    if terminal in {"error", "interrupt"}
+                    else nullcontext()
+                ):
+                    if async_mode:
+                        async for _ in result:
+                            assert trace.get_current_span() is consumer
+                    else:
+                        for _ in result:
+                            assert trace.get_current_span() is consumer
+                if async_mode:
+                    await result.close()
+                else:
+                    result.close()
+            assert trace.get_current_span() is consumer
+    finally:
+        if async_mode:
+            await wrapper.close()
+        else:
+            wrapper.close()
+    assert len(spans.calls()) == 1
+    call = spans.calls()[0]
+    assert spans.ends[call.context.span_id] == 1
+    assert not call.events
+    assert call.status.description is None
+    assert call.status.status_code == (
+        trace.StatusCode.ERROR if terminal in {"error", "interrupt", "gc"} else trace.StatusCode.OK
+    )
+    assert set(call.attributes) == _IDENTITY | _BUDGET | _ATTEMPT
+
+
+async def _close(wrapper, async_mode):
+    if async_mode:
+        await wrapper.close()
+    else:
+        wrapper.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("mode", ["off", "noop", "drop", "record_only", "absent"])
+@pytest.mark.parametrize("surface", ["chat", "stream", "media"])
+async def test_inactive_spans_preserve_caller_context_and_correlation(
+    spans, monkeypatch, async_mode, mode, surface
+):
+    sampling = pytest.importorskip("opentelemetry.sdk.trace.sampling")
+    plane = FakeControlPlane()
+    raw = _raw_client(async_mode)
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=mode != "off")
+    caller_context = None
+
+    def dispatch(*args, **kwargs):
+        assert trace.get_current_span().get_span_context() == caller_context
+        return _response()
+
+    raw.chat.completions.create.side_effect = dispatch
+    raw.embeddings.create.side_effect = dispatch
+    if surface == "stream":
+
+        def chunks():
+            yield _response()
+
+        async def async_chunks():
+            yield _response()
+
+        raw.chat.completions.create.side_effect = lambda **kwargs: (
+            async_chunks() if async_mode else chunks()
+        )
+
+    class RecordOnly(sampling.Sampler):
+        def should_sample(self, *args, **kwargs):
+            return sampling.SamplingResult(sampling.Decision.RECORD_ONLY)
+
+        def get_description(self):
+            return "record-only"
+
+    noop = trace.NoOpTracerProvider()
+    drop = sdk.TracerProvider(sampler=sampling.ALWAYS_OFF)
+    record_only = sdk.TracerProvider(sampler=RecordOnly())
+    if mode in {"noop", "drop", "record_only"}:
+        tracer = {"noop": noop, "drop": drop, "record_only": record_only}[mode].get_tracer("idle")
+        monkeypatch.setattr(spans.api, "get_tracer", lambda *args, **kwargs: tracer)
+    elif mode == "off":
+        monkeypatch.setattr(
+            spans.api, "get_tracer", MagicMock(spec=[], side_effect=AssertionError("disabled"))
+        )
+    else:
+        monkeypatch.setattr(_otel, "_trace_api", None)
+        monkeypatch.setattr(_otel, "_trace_api_resolved", True)
+
+    try:
+        with spans.tracer.start_as_current_span("caller") as caller:
+            caller_context = caller.get_span_context()
+            if surface == "media":
+                result = wrapper.embeddings.create(model="text-embedding-3-small", input="x")
+            else:
+                result = wrapper.chat.completions.create(
+                    model="gpt-5.5", messages=[], stream=surface == "stream"
+                )
+            if async_mode:
+                result = await result
+            if surface == "stream":
+                if async_mode:
+                    assert len([c async for c in result]) == 1
+                else:
+                    assert len(list(result)) == 1
+            assert trace.get_current_span() is caller
+    finally:
+        await _close(wrapper, async_mode)
+        drop.shutdown()
+        record_only.shutdown()
+    assert not spans.calls()
+    assert len(plane.ingested) == 1
+    event = plane.ingested[0]
+    assert event.span_id == (
+        None if mode == "absent" else trace.format_span_id(caller_context.span_id)
+    )
+    assert event.trace_id == (
+        None if mode == "absent" else trace.format_trace_id(caller_context.trace_id)
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("cross_provider", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "all_failed", "ambiguous"])
+async def test_failover_uses_one_span_for_all_attempts(
+    spans, async_mode, streaming, cross_provider, outcome
+):
+    plane = FakeControlPlane()
+    raw, fallback = _raw_client(async_mode), _raw_client(async_mode)
+    fallback_provider = "groq" if cross_provider else "openai"
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(
+        raw,
+        otel_spans=True,
+        provider="openai",
+        fallback=[(fallback, "fallback-model", {}, fallback_provider)],
+        failover_idempotency="always" if outcome == "ambiguous" else "safe",
+    )
+    parents = []
+
+    def primary_dispatch(**kwargs):
+        parents.append(trace.get_current_span().get_span_context())
+        raise (
+            httpx.ReadTimeout("PRIVATE timeout")
+            if outcome == "ambiguous"
+            else httpx.ConnectError("PRIVATE connection")
+        )
+
+    def fallback_dispatch(**kwargs):
+        parents.append(trace.get_current_span().get_span_context())
+        if outcome == "all_failed":
+            raise httpx.ConnectError("PRIVATE connection")
+
+        def chunks():
+            yield _response()
+
+        async def async_chunks():
+            yield _response()
+
+        return (async_chunks() if async_mode else chunks()) if streaming else _response()
+
+    raw.chat.completions.create.side_effect = primary_dispatch
+    fallback.chat.completions.create.side_effect = fallback_dispatch
+    try:
+        with pytest.raises(httpx.ConnectError) if outcome == "all_failed" else nullcontext():
+            result = wrapper.chat.completions.create(model="gpt-5.5", messages=[], stream=streaming)
+            if async_mode:
+                result = await result
+            if streaming:
+                assert not spans.calls()
+                if async_mode:
+                    assert len([c async for c in result]) == 1
+                else:
+                    assert len(list(result)) == 1
+    finally:
+        await _close(wrapper, async_mode)
+    assert len(spans.calls()) == 1
+    call = spans.calls()[0]
+    assert spans.ends[call.context.span_id] == 1
+    assert all(parent.span_id == call.context.span_id for parent in parents)
+    assert len(parents) == 2
+    assert set(call.attributes) == _IDENTITY | _BUDGET | _ATTEMPT | {"solwyn.failover.reason"}
+    assert call.attributes["solwyn.provider.served"] == fallback_provider
+    assert call.attributes["solwyn.model.served"] == "fallback-model"
+    assert call.attributes["solwyn.attempt_index"] == 1
+    assert call.attributes["solwyn.failover.reason"] == (
+        "primary_error" if cross_provider else "model_fallback"
+    )
+    assert not call.events
+    assert call.status.status_code == (
+        trace.StatusCode.ERROR if outcome == "all_failed" else trace.StatusCode.OK
+    )
+    assert call.status.description is None
+    assert len(plane.ingested) == 2
+    assert all(e.span_id == trace.format_span_id(call.context.span_id) for e in plane.ingested)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        "normal",
+        "close",
+        "gc",
+        "entered_gc",
+        "entry_error",
+        "entry_interrupt",
+        "wrap_error",
+        "stream_error",
+    ],
+)
+async def test_responses_manager_span_lifetime(spans, async_mode, terminal):
+    raw = _raw_client(async_mode)
+
+    def chunks():
+        yield _response()
+        if terminal == "stream_error":
+            raise ValueError("PRIVATE stream error")
+
+    async def async_chunks():
+        for chunk in chunks():
+            yield chunk
+
+    def enter():
+        with spans.tracer.start_as_current_span("native.responses"):
+            if terminal == "entry_error":
+                raise httpx.ReadTimeout("PRIVATE entry error")
+            if terminal == "entry_interrupt":
+                raise asyncio.CancelledError() if async_mode else GeneratorExit()
+        return async_chunks() if async_mode else chunks()
+
+    if async_mode:
+        manager = MagicMock(spec=["__aenter__", "__aexit__"])
+        manager.__aenter__ = AsyncMock(side_effect=enter)
+        manager.__aexit__ = AsyncMock(return_value=False)
+    else:
+        manager = MagicMock(spec=["__enter__", "__exit__"])
+        manager.__enter__.side_effect = enter
+        manager.__exit__.return_value = False
+    raw.responses = SimpleNamespace(stream=MagicMock(spec=[], return_value=manager))
+    plane = FakeControlPlane()
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(
+        raw, provider="openai", otel_spans=True
+    )
+    try:
+        with spans.tracer.start_as_current_span("caller"):
+            result = wrapper._intercepted_call(
+                _surface="responses",
+                _responses_leaf="stream",
+                _force_stream=True,
+                model="gpt-5.5",
+                input=[],
+            )
+            if async_mode:
+                result = await result
+            assert not spans.calls()
+        with spans.tracer.start_as_current_span("consumer") as consumer:
+            if terminal == "gc":
+                del result
+                gc.collect()
+            elif terminal == "close":
+                if async_mode:
+                    await result.close()
+                    await result.close()
+                else:
+                    result.close()
+                    result.close()
+            elif terminal == "entered_gc":
+                stream = await result.__aenter__() if async_mode else result.__enter__()
+                del result
+                gc.collect()
+                assert not spans.calls()  # Inner event stream now owns the span.
+                del stream
+                gc.collect()
+            else:
+                errors = (
+                    httpx.ReadTimeout,
+                    ValueError,
+                    RuntimeError,
+                    GeneratorExit,
+                    asyncio.CancelledError,
+                )
+                with (
+                    patch.object(
+                        wrapper._solwyn_runtimes[0].adapter,
+                        "create_stream_accumulator",
+                        side_effect=RuntimeError("PRIVATE wrapper"),
+                    )
+                    if terminal == "wrap_error"
+                    else nullcontext(),
+                    pytest.raises(errors) if terminal != "normal" else nullcontext(),
+                ):
+                    if async_mode:
+                        async with result as stream:
+                            assert trace.get_current_span() is consumer
+                            async for _ in stream:
+                                pass
+                    else:
+                        with result as stream:
+                            assert trace.get_current_span() is consumer
+                            list(stream)
+            assert trace.get_current_span() is consumer
+    finally:
+        await _close(wrapper, async_mode)
+    assert len(spans.calls()) == 1
+    call = spans.calls()[0]
+    assert spans.ends[call.context.span_id] == 1
+    assert call.status.status_code == (
+        trace.StatusCode.OK if terminal == "normal" else trace.StatusCode.ERROR
+    )
+    assert not call.events
+    assert call.status.description is None
+    assert set(call.attributes) == _IDENTITY | _BUDGET | _ATTEMPT
+    for child in spans.exporter.get_finished_spans():
+        if child.name == "native.responses":
+            assert child.parent.span_id == call.context.span_id
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("surface", ["chat", "media"])
+async def test_real_httpx_preflight_span_is_a_child(spans, async_mode, surface):
+    instrumentation = pytest.importorskip("opentelemetry.instrumentation.httpx")
+    plane = FakeControlPlane()
+    raw = _raw_client(async_mode)
+    raw.chat.completions.create.return_value = _response()
+    raw.embeddings.create.return_value = _response()
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
+    instrumentation.HTTPXClientInstrumentor.instrument_client(
+        wrapper._solwyn_budget._http,
+        tracer_provider=spans.provider,
+    )
+    try:
+        with spans.tracer.start_as_current_span("caller"):
+            if surface == "media":
+                result = wrapper.embeddings.create(model="text-embedding-3-small", input="x")
+            else:
+                result = wrapper.chat.completions.create(model="gpt-5.5", messages=[])
+            if async_mode:
+                await result
+    finally:
+        await _close(wrapper, async_mode)
+    call = spans.calls()[0]
+    http_spans = [s for s in spans.exporter.get_finished_spans() if s.kind == trace.SpanKind.CLIENT]
+    assert len(http_spans) == 1
+    assert http_spans[0].parent.span_id == call.context.span_id
+    assert http_spans[0].context.trace_id == call.context.trace_id
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("media", [False, True])
+@pytest.mark.parametrize("exception", [KeyboardInterrupt, asyncio.CancelledError, GeneratorExit])
+async def test_preflight_baseexception_ends_span(spans, async_mode, media, exception):
+    plane = FakeControlPlane()
+    raw = _raw_client(async_mode)
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
+    try:
+        with (
+            patch.object(
+                wrapper._solwyn_budget,
+                "check_budget",
+                new=(
+                    AsyncMock(side_effect=exception)
+                    if async_mode
+                    else MagicMock(spec=[], side_effect=exception)
+                ),
+            ),
+            pytest.raises(exception),
+        ):
+            result = (
+                wrapper.embeddings.create(model="text-embedding-3-small", input="x")
+                if media
+                else wrapper.chat.completions.create(model="gpt-5.5", messages=[])
+            )
+            if async_mode:
+                await result
+    finally:
+        await _close(wrapper, async_mode)
+    assert len(spans.calls()) == 1
+    call = spans.calls()[0]
+    assert spans.ends[call.context.span_id] == 1
+    assert call.status.status_code == trace.StatusCode.ERROR
+    assert not call.events
+    assert call.status.description is None
+    assert set(call.attributes) == _IDENTITY
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("failure", ["wrap", "finalize", "callback"])
+async def test_stream_bookkeeping_failure_ends_span(spans, async_mode, failure):
+    plane = FakeControlPlane()
+    raw = _raw_client(async_mode)
+
+    def chunks():
+        yield _response()
+
+    async def async_chunks():
+        yield _response()
+
+    raw.chat.completions.create.return_value = async_chunks() if async_mode else chunks()
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
+    try:
+        with (
+            patch.object(
+                wrapper._solwyn_runtimes[0].adapter,
+                "create_stream_accumulator",
+                side_effect=ValueError("PRIVATE wrap"),
+            )
+            if failure == "wrap"
+            else nullcontext(),
+            pytest.raises(ValueError) if failure == "wrap" else nullcontext(),
+        ):
+            result = wrapper.chat.completions.create(model="gpt-5.5", messages=[], stream=True)
+            if async_mode:
+                result = await result
+        if failure != "wrap":
+            if failure == "callback":
+                result._on_complete = (
+                    AsyncMock(side_effect=GeneratorExit)
+                    if async_mode
+                    else MagicMock(spec=[], side_effect=GeneratorExit)
+                )
+                target, name, exception = result, "_on_complete", GeneratorExit
+            else:
+                target, name, exception = result._accumulator, "finalize", ValueError
+            with patch.object(target, name, side_effect=exception), pytest.raises(exception):
+                if async_mode:
+                    await result.close()
+                else:
+                    result.close()
+            if async_mode:
+                await result.close()
+            else:
+                result.close()
+    finally:
+        await _close(wrapper, async_mode)
+    call = spans.calls()[0]
+    assert len(spans.calls()) == 1
+    assert spans.ends[call.context.span_id] == 1
+    assert call.status.status_code == trace.StatusCode.ERROR
+    assert not call.events
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_run_stop_during_stream_ends_with_error(spans, async_mode):
+    from solwyn._run_control import mark_terminated
+    from solwyn.exceptions import RunStoppedError
+
+    plane = FakeControlPlane()
+    raw = _raw_client(async_mode)
+
+    def chunks():
+        yield _response()
+
+    async def async_chunks():
+        yield _response()
+
+    raw.chat.completions.create.return_value = async_chunks() if async_mode else chunks()
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
+    try:
+        with solwyn.run("PRIVATE run") as run_id:
+            result = wrapper.chat.completions.create(model="gpt-5.5", messages=[], stream=True)
+            if async_mode:
+                result = await result
+            mark_terminated(run_id, reason="manual_kill", source="server")
+            with pytest.raises(RunStoppedError):
+                if async_mode:
+                    await result.__anext__()
+                else:
+                    next(result)
+            if async_mode:
+                await result.close()
+            else:
+                result.close()
+    finally:
+        await _close(wrapper, async_mode)
+    call = spans.calls()[0]
+    assert len(spans.calls()) == 1
+    assert spans.ends[call.context.span_id] == 1
+    assert call.status.status_code == trace.StatusCode.ERROR
+    assert call.attributes["solwyn.budget.allowed"] is False
+    assert call.attributes["solwyn.denied_by_period"] == "run_stopped"
+    assert not call.events
+
+
+@pytest.mark.unit
+def test_snapshot_is_captured_once_before_cross_thread_stream_consumption(spans, monkeypatch):
+    import threading
+
+    plane = FakeControlPlane()
+    raw = _raw_client(False)
+    raw.chat.completions.create.return_value = iter([_response()])
+    wrapper = plane.wrap(raw, otel_spans=True)
+    captures = []
+    capture_trace = _otel.capture_trace
+
+    def capture():
+        captures.append(threading.get_ident())
+        return capture_trace()
+
+    monkeypatch.setattr(_otel, "capture_trace", capture)
+    try:
+        with spans.tracer.start_as_current_span("caller") as caller:
+            result = wrapper.chat.completions.create(model="gpt-5.5", messages=[], stream=True)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                assert len(executor.submit(list, result).result(timeout=5)) == 1
+    finally:
+        wrapper.close()
+    call = spans.calls()[0]
+    assert captures == [threading.get_ident()]
+    event = plane.ingested[0]
+    assert event.trace_id == trace.format_trace_id(caller.get_span_context().trace_id)
+    assert event.span_id == trace.format_span_id(call.context.span_id)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("correlation", [False, True])
+async def test_nested_run_identity_and_independent_correlation_flag(spans, async_mode, correlation):
+    plane = FakeControlPlane()
+    raw = _raw_client(async_mode)
+    raw.chat.completions.create.return_value = _response()
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(
+        raw, otel_spans=True, trace_correlation=correlation
+    )
+    try:
+        with solwyn.run("PRIVATE parent") as parent, solwyn.run("PRIVATE child") as child:
+            with patch("solwyn._otel.capture_trace", wraps=_otel.capture_trace) as capture:
+                result = wrapper.chat.completions.create(model="gpt-5.5", messages=[])
+                if async_mode:
+                    await result
+            assert capture.call_count == (1 if correlation else 0)
+    finally:
+        await _close(wrapper, async_mode)
+    call = spans.calls()[0]
+    assert call.attributes["solwyn.agent_run_id"] == child
+    assert call.attributes["solwyn.parent_agent_run_id"] == parent
+    assert set(call.attributes) == _IDENTITY | _BUDGET | _ATTEMPT | {
+        "solwyn.agent_run_id",
+        "solwyn.parent_agent_run_id",
+    }
+    assert (plane.ingested[0].span_id is not None) is correlation
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("terminal", ["no_candidates", "deadline"])
+async def test_admitted_call_without_a_dispatch_ends_once(spans, async_mode, terminal):
+    from solwyn.client import Deadline
+    from solwyn.exceptions import ProviderUnavailableError
+
+    plane = FakeControlPlane()
+    raw = _raw_client(async_mode)
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(
+        raw,
+        otel_spans=True,
+        circuit_breaker_failure_threshold=1,
+    )
+    if terminal == "no_candidates":
+        wrapper._get_circuit_breaker("openai").record_failure()
+    try:
+        with (
+            patch.object(Deadline, "expired", return_value=True)
+            if terminal == "deadline"
+            else nullcontext(),
+            pytest.raises(ProviderUnavailableError),
+        ):
+            result = wrapper.chat.completions.create(model="gpt-5.5", messages=[])
+            if async_mode:
+                await result
+    finally:
+        await _close(wrapper, async_mode)
+    call = spans.calls()[0]
+    assert len(spans.calls()) == 1
+    assert spans.ends[call.context.span_id] == 1
+    assert set(call.attributes) == _IDENTITY | _BUDGET
+    assert call.status.status_code == trace.StatusCode.ERROR
+    assert not call.events
+    assert not plane.ingested
+    raw.chat.completions.create.assert_not_called()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_cost_routed_failure_followed_by_primary_has_no_stale_reason(spans, async_mode):
+    plane = FakeControlPlane(price_hints={"openai": 5.0, "groq": 1.0})
+    raw, fallback = _raw_client(async_mode), _raw_client(async_mode)
+    raw.chat.completions.create.return_value = _response()
+    fallback.chat.completions.create.side_effect = httpx.ConnectError("PRIVATE failure")
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(
+        raw,
+        provider="openai",
+        otel_spans=True,
+        selection_policy=solwyn.CostPolicy(),
+        fallback=[(fallback, "fallback-model", {}, "groq")],
+    )
+    try:
+        result = wrapper.chat.completions.create(model="gpt-5.5", messages=[])
+        if async_mode:
+            await result
+    finally:
+        await _close(wrapper, async_mode)
+    call = spans.calls()[0]
+    assert len(spans.calls()) == 1
+    assert len(plane.ingested) == 2
+    assert call.attributes["solwyn.provider.served"] == "openai"
+    assert call.attributes["solwyn.attempt_index"] == 0
+    assert set(call.attributes) == _IDENTITY | _BUDGET | _ATTEMPT
+    assert call.status.status_code == trace.StatusCode.OK
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_lease_funded_attribute_is_a_boolean_only(spans, async_mode):
+    plane = FakeControlPlane()
+    raw = _raw_client(async_mode)
+    raw.chat.completions.create.return_value = _response()
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
+    try:
+        with solwyn.run("PRIVATE lease"):
+            result = wrapper.chat.completions.create(model="gpt-5.5", messages=[])
+            if async_mode:
+                await result
+    finally:
+        await _close(wrapper, async_mode)
+    call = spans.calls()[0]
+    assert call.attributes["solwyn.lease_funded"] is True
+    assert plane.ingested[0].lease_id
+    assert set(call.attributes) == _IDENTITY | _BUDGET | _ATTEMPT | {"solwyn.agent_run_id"}
+
+
+@pytest.mark.unit
+def test_attribute_contract_is_closed():
+    assert (
+        _IDENTITY
+        | _BUDGET
+        | _ATTEMPT
+        | _DENIAL
+        | {
+            "solwyn.agent_run_id",
+            "solwyn.parent_agent_run_id",
+            "solwyn.failover.reason",
+        }
+    ) == _otel.CALL_SPAN_ATTRIBUTES
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_provider_stream_context_entry_failure_ends_span(spans, async_mode):
+    class BadEntry:
+        def __enter__(self):
+            raise ValueError("PRIVATE context entry")
+
+        async def __aenter__(self):
+            raise asyncio.CancelledError()
+
+    plane = FakeControlPlane()
+    raw = _raw_client(async_mode)
+    raw.chat.completions.create.return_value = BadEntry()
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
+    try:
+        result = wrapper.chat.completions.create(model="gpt-5.5", messages=[], stream=True)
+        if async_mode:
+            result = await result
+        with pytest.raises(asyncio.CancelledError if async_mode else ValueError):
+            if async_mode:
+                await result.__aenter__()
+            else:
+                result.__enter__()
+        assert len(spans.calls()) == 1
+        assert spans.calls()[0].status.status_code == trace.StatusCode.ERROR
+        assert spans.ends[spans.calls()[0].context.span_id] == 1
+    finally:
+        await _close(wrapper, async_mode)

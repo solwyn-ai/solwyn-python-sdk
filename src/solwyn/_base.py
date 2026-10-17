@@ -8,6 +8,7 @@ from this and add their own HTTP layer.
 from __future__ import annotations
 
 import contextlib
+import functools
 import inspect
 import logging
 import os
@@ -20,10 +21,11 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, NoReturn, TypedDict, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict
 
+from solwyn import _otel
 from solwyn._constants import FAILOVER_ERROR_CLASS_MAX_LENGTH, ORDINARY_TOKEN_COUNT_MAX
 from solwyn._lifecycle import register_fork_reset
 from solwyn._otel import _TraceSnapshot, _validated_trace
@@ -80,6 +82,38 @@ if TYPE_CHECKING:
     from solwyn._registry import ProviderRuntime
 
 logger = logging.getLogger(__name__)
+
+_CallMethod = TypeVar("_CallMethod", bound=Callable[..., Any])
+
+
+def _with_call_span(method: _CallMethod) -> _CallMethod:
+    """Own the entire call lifetime, including preflight and BaseException.
+
+    Streams explicitly transfer ownership before returning. Context attachment
+    remains a separate, tightly scoped operation at each I/O seam.
+    """
+    if inspect.iscoroutinefunction(method):
+
+        @functools.wraps(method)
+        async def async_call(self: _SolwynBase, *args: Any, **kwargs: Any) -> Any:
+            if not self._solwyn_config.otel_spans:
+                return await method(self, *args, **kwargs)
+            with _otel._start_call_span() as call_span:
+                kwargs["_call_span"] = call_span
+                return await method(self, *args, **kwargs)
+
+        return cast("_CallMethod", async_call)
+
+    @functools.wraps(method)
+    def sync_call(self: _SolwynBase, *args: Any, **kwargs: Any) -> Any:
+        if not self._solwyn_config.otel_spans:
+            return method(self, *args, **kwargs)
+        with _otel._start_call_span() as call_span:
+            kwargs["_call_span"] = call_span
+            return method(self, *args, **kwargs)
+
+    return cast("_CallMethod", sync_call)
+
 
 # Bounded rolling window of recent SUCCESS latencies kept per provider, and the
 # minimum sample count before observed_p50 reports a value. Until that many

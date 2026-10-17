@@ -1004,6 +1004,7 @@ def test_denial_fixture(solwyn_control_plane, solwyn_test_client):
 | `on_unmetered` | `SOLWYN_ON_UNMETERED` | `warn` | Handle untracked or unknown pre-call capabilities with `warn`, `raise`, or `allow` |
 | `report_untracked_surfaces` | `SOLWYN_REPORT_UNTRACKED_SURFACES` | `True` | Send optional structural advisory reports for unacknowledged `warn`/`allow` observations; set false to keep them local |
 | `trace_correlation` | `SOLWYN_TRACE_CORRELATION` | `True` | Include active OpenTelemetry trace identifiers in metadata events when available; set false to disable capture |
+| `otel_spans` | `SOLWYN_OTEL_SPANS` | `False` | Emit content-free `solwyn.call` spans through your application's OpenTelemetry tracing |
 | `acknowledge_untracked` | `SOLWYN_ACKNOWLEDGE_UNTRACKED` | empty | Exact terminal capability tokens; env format is comma-delimited |
 | `control_plane_failure_threshold` | `SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD` | `3` | Consecutive Solwyn API failures before local outage posture applies |
 | `control_plane_recovery_timeout` | `SOLWYN_CONTROL_PLANE_RECOVERY_TIMEOUT` | `30.0` | Seconds before probing the Solwyn API after its breaker opens |
@@ -1127,7 +1128,7 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `lease_id` | `str \| None` | Id of the budget lease that funded the call: an opaque server-minted token, the same id the call's confirmation carries. Present only on lease-funded calls; omitted for reservation-funded, cached, fail-open, uncounted, and denied calls |
 | `provider_region` | `str \| None` | Cloud region of the serving endpoint (Bedrock — pricing is per model and region); omitted for other providers |
 | `trace_id` | `str \| None` | Random OpenTelemetry trace identifier active when the call starts (32 lowercase hex characters) |
-| `span_id` | `str \| None` | Random OpenTelemetry caller span identifier at call start (16 lowercase hex characters) |
+| `span_id` | `str \| None` | Random OpenTelemetry span identifier at call start (16 lowercase hex characters): the caller's span by default, or the recording, sampled `solwyn.call` span when enabled |
 | `trace_sampled` | `bool \| None` | Whether that trace was sampled; an unsampled trace may be absent from your tracing backend |
 | `tags` | `object \| None` | Optional explicit customer-supplied tags from `solwyn.run(..., tags=...)` and `solwyn_tags=`. Never inferred from prompts or responses; omitted when empty or unset |
 | `deny_source` | `str \| None` | Structural denial source (`server`, sticky/local enforcement sources, or `aggregate_replay`) |
@@ -1142,16 +1143,54 @@ Optional fields are omitted entirely when unset (never `null`), so payloads for
 providers that do not use them are byte-identical to earlier releases.
 
 Trace correlation captures only these two random identifiers and the sampled
-flag, never content. It requires your application's configured tracer provider
-and an active, valid OpenTelemetry span; `solwyn[otel]` is only a convenience
-for installing the optional API. Solwyn creates no spans, and its own code
-never injects trace context, baggage, or tracestate. Your application's httpx
+flag, never content. With call spans disabled (the default), it requires your
+application's configured tracer provider and an active, valid OpenTelemetry
+span; `solwyn[otel]` is only a convenience for installing the optional API.
+Solwyn's own code never injects trace context, baggage, or tracestate. Your application's httpx
 auto-instrumentation may still add `traceparent` or `baggage` to Solwyn's
 control-plane requests, including budget checks in the caller's context.
 Disable capture with
 `Solwyn(client, trace_correlation=False)` (or `AsyncSolwyn`) or
 `SOLWYN_TRACE_CORRELATION=false`. Unset correlation fields are omitted entirely
 from payloads. Aggregated denial replays carry no trace because they span calls.
+
+Optional call spans are enabled with `Solwyn(client, otel_spans=True)` (or
+`AsyncSolwyn`) or `SOLWYN_OTEL_SPANS=true`. Configure your application's
+OpenTelemetry tracer provider and exporter first; installing `solwyn[otel]`
+alone does not export spans. Cold `import solwyn` never imports OpenTelemetry.
+
+Each intercepted chat or media call creates one `solwyn.call` span of kind
+`INTERNAL`, parented under the application's current span, or as a root when
+there is no parent. Instrumented budget preflight requests and native provider
+SDK spans are its children. All failover attempts share that call span. It is
+made current only in short scopes for the call-start snapshot, budget preflight,
+and provider dispatch (including deferred Responses manager entry), and is
+never current while application code iterates a returned stream. Streams keep
+the span open until completion, explicit close, failure, or garbage collection.
+
+The closed attribute allowlist is:
+
+- `solwyn.call_id`, `solwyn.agent_run_id`, `solwyn.parent_agent_run_id`
+- `solwyn.budget.allowed`, `solwyn.budget.mode`, `solwyn.deny_source`, `solwyn.denied_by_period`
+- `solwyn.provider.requested`, `solwyn.provider.served`, `solwyn.model.requested`, `solwyn.model.served`
+- `solwyn.failover.reason`, `solwyn.attempt_index`, `solwyn.lease_funded`
+
+Attributes appear when their values are known. Served provider/model and attempt
+index describe the final attempted hop, including a hop that fails. Completed
+calls and explicitly closed streams have status `OK`; denials, run stops,
+provider errors, interruptions, and garbage-collected abandonment have status
+`ERROR`. A Responses manager closed before entry also ends with `ERROR`.
+Solwyn call spans never carry cost, token usage, `gen_ai.*` attributes, run names,
+tags, prompt/response content, exception messages, or events. Native provider
+`gen_ai` spans remain the generation/usage signal, avoiding duplicate usage or
+cost accounting in tools such as Langfuse.
+
+With correlation enabled, metadata uses the `solwyn.call` span ID only when the
+new span has a valid context and is both recording and sampled. Otherwise it
+keeps exactly the caller snapshot and provider parentage used with spans off;
+Solwyn never makes an unexported child ID current. The trace ID is unchanged
+when there is an existing caller trace. `trace_correlation=False` independently
+disables metadata identifiers while leaving opted-in span export enabled.
 
 Token, output-bound, aggregate-count, pricing-basis, and non-token media
 quantities are each capped at 100,000,000 per event. Larger folded receipt

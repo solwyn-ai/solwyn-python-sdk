@@ -145,6 +145,8 @@ class SolwynConfig(BaseModel):
     report_untracked_surfaces: bool = True
     # Correlate events with an application's existing active OTel span.
     trace_correlation: bool = True
+    # Emit content-free Solwyn call spans through application-configured OTel.
+    otel_spans: bool = False
     # Breaker reports POST only when a provider's snapshot changed since the
     # last successful send, plus a periodic full-refresh heartbeat so the
     # dashboard's advisory view never goes stale silently.
@@ -199,6 +201,7 @@ class SolwynConfig(BaseModel):
             "breaker_reporting_enabled": "BREAKER_REPORTING_ENABLED",
             "report_untracked_surfaces": "REPORT_UNTRACKED_SURFACES",
             "trace_correlation": "TRACE_CORRELATION",
+            "otel_spans": "OTEL_SPANS",
             "breaker_report_heartbeat": "BREAKER_REPORT_HEARTBEAT",
             "reporter_max_send_attempts": "REPORTER_MAX_SEND_ATTEMPTS",
             "reporter_retry_backoff_base": "REPORTER_RETRY_BACKOFF_BASE",
@@ -221,6 +224,7 @@ class SolwynConfig(BaseModel):
                         "lease_enabled",
                         "report_untracked_surfaces",
                         "trace_correlation",
+                        "otel_spans",
                     }:
                         values[field] = env_val.lower() in ("true", "1", "yes")
                     else:

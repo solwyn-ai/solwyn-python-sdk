@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from solwyn._otel import CALL_SPAN_ATTRIBUTES
+
 SDK_SRC = Path(__file__).resolve().parents[2] / "src"
 
 
@@ -28,11 +30,25 @@ def _violations(source: str) -> list[int]:
             return f"{dotted(node.value)}.{node.attr}"
         return ""
 
-    def literal_solwyn_key(node: ast.expr | None) -> bool:
+    # Preserve method identity through simple local aliases, too.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Name, ast.Attribute)):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    aliases[target.id] = dotted(node.value)
+
+    def literal_solwyn_name(node: ast.expr | None) -> bool:
         return (
             isinstance(node, ast.Constant)
             and isinstance(node.value, str)
             and node.value.startswith("solwyn.")
+        )
+
+    def literal_solwyn_key(node: ast.expr | None) -> bool:
+        return (
+            literal_solwyn_name(node)
+            and isinstance(node, ast.Constant)
+            and node.value in CALL_SPAN_ATTRIBUTES
         )
 
     def literal_solwyn_attributes(node: ast.expr) -> bool:
@@ -61,6 +77,20 @@ def _violations(source: str) -> list[int]:
         method = dotted(node.func).rsplit(".", 1)[-1]
         if method in {"inject", "record_exception", "add_event"}:
             violations.append(node.lineno)
+        if method in {"start_span", "start_as_current_span", "update_name"}:
+            span_name = (
+                node.args[0]
+                if node.args
+                else next((kw.value for kw in node.keywords if kw.arg == "name"), None)
+            )
+            if not literal_solwyn_name(span_name):
+                violations.append(node.lineno)
+        if method == "Link" and (
+            len(node.args) > 1
+            or any(isinstance(arg, ast.Starred) for arg in node.args)
+            or any(kw.arg in {None, "attributes"} for kw in node.keywords)
+        ):
+            violations.append(node.lineno)
         attributes = [kw.value for kw in node.keywords if kw.arg == "attributes"]
         if method == "set_attributes":
             if node.args:
@@ -76,6 +106,7 @@ def _violations(source: str) -> list[int]:
             "set_attributes",
             "start_span",
             "start_as_current_span",
+            "update_name",
         } and any(kw.arg is None for kw in node.keywords):
             violations.append(node.lineno)
         if method == "set_attribute":
@@ -118,6 +149,24 @@ def test_otel_privacy_guard_covers_all_source_modules() -> None:
     "source",
     [
         "span.record_exception(exc)",
+        "tracer.start_span(name)",
+        "tracer.start_span(f'chat {prompt}')",
+        "tracer.start_span('provider.call')",
+        "tracer.start_as_current_span(name=prompt)",
+        "span.update_name(prompt)",
+        "span.update_name('provider.call')",
+        "span.update_name(**kwargs)",
+        "span.set_attribute('solwyn.unknown', prompt)",
+        "span.set_attributes({'solwyn.unknown': prompt})",
+        "tracer.start_span('solwyn.call', attributes={'solwyn.unknown': prompt})",
+        "Link(ctx, {'gen_ai.prompt': prompt})",
+        "Link(ctx, {'solwyn.call_id': call_id})",
+        "Link(ctx, attrs)",
+        "Link(ctx, attributes={})",
+        "from opentelemetry.trace import Link as L; L(ctx, attrs)",
+        "Link(*args)",
+        "s = span.set_attributes; s(attrs)",
+        "s = span.update_name; s(prompt)",
         "options = {'content_mode': 'content'}",
         "options = {'max_content_bytes': 20}",
         "options.content_mode = 'content'",
@@ -172,12 +221,13 @@ def test_otel_privacy_guard_rejects_forbidden_operations(source: str) -> None:
     "source",
     [
         "span.set_attribute('solwyn.call_id', call_id)",
-        "span.set_attribute(key='solwyn.provider', value=provider)",
-        "span.set_attributes({'solwyn.call_id': call_id, 'solwyn.provider': provider})",
-        "span.set_attributes(attributes={'solwyn.provider': provider})",
+        "span.set_attribute(key='solwyn.provider.served', value=provider)",
+        "span.set_attributes({'solwyn.call_id': call_id, 'solwyn.provider.served': provider})",
+        "span.set_attributes(attributes={'solwyn.provider.served': provider})",
         "span.set_attributes({})",
         "tracer.start_span('solwyn.call', attributes={'solwyn.call_id': call_id})",
-        "tracer.start_as_current_span('solwyn.call', attributes={'solwyn.provider': provider})",
+        "tracer.start_as_current_span('solwyn.call', "
+        "attributes={'solwyn.provider.served': provider})",
         "tracer.start_span('solwyn.call', context, kind, {'solwyn.call_id': call_id})",
         "span.set_status(Status(code, 'unavailable'))",
     ],
@@ -202,6 +252,26 @@ def test_event_builders_and_call_helpers_require_explicit_trace_threading() -> N
                 names = {arg.arg for arg in node.args.kwonlyargs}
                 if "agent_run" in names:
                     assert "trace" in names, node.lineno
+
+
+@pytest.mark.unit
+def test_span_context_scopes_disable_implicit_exception_capture() -> None:
+    count = 0
+    for path in SDK_SRC.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "use_span"
+            ):
+                continue
+            count += 1
+            # API positional flags: end_on_exit, exception capture, error status.
+            assert len(node.args) == 4, (path, node.lineno)
+            assert all(
+                isinstance(arg, ast.Constant) and arg.value is False for arg in node.args[1:]
+            )
+    assert count == 1
 
 
 @pytest.mark.unit
