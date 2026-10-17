@@ -298,6 +298,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         )
         self._inherit_tags = inherit_tags
         self._scope_id = id(self)
+        self._spans: dict[str, _otel._RunSpan] = {}
 
     def _enter(self) -> str:
         if _called_from_async_generator():
@@ -316,6 +317,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         activation = None
         token = None
         try:
+            self._spans[identity.run_id] = span
             activation = span.attach()
             token = _active_run.set(identity.active_value())
             _run_frames.set(
@@ -333,6 +335,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
                 )
             )
         except BaseException:
+            self._spans.pop(identity.run_id, None)
             if activation is not None:
                 activation.detach()
             if token is not None:
@@ -340,6 +343,16 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
             span.end(error=True)
             raise
         return identity.run_id
+
+    def _end_unframed_span(self, *, error: bool) -> None:
+        # A sync generator may exit in a fresh Context with none of its entry
+        # state. End only tracing here: attribution and lease release still
+        # require a visible frame, and this Context's OTel parent is unrelated.
+        try:
+            _, span = self._spans.popitem()
+        except KeyError:
+            return
+        span.end(error=error)
 
     def _exit(self, *, require_same_context: bool = False, error: bool = False) -> None:
         """Pop this scope's frame, and release the leases the run held.
@@ -357,9 +370,14 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
                     "RunHandle.finish() must be called in the same context where "
                     "start_run() created it"
                 )
+            self._end_unframed_span(error=error)
             return
         frame = frames[-1]
         if frame.scope_id != self._scope_id:
+            if not require_same_context and not any(
+                candidate.scope_id == self._scope_id for candidate in frames
+            ):
+                self._end_unframed_span(error=error)
             raise RuntimeError("solwyn.run scopes must exit in LIFO order")
         if require_same_context:
             try:
@@ -372,6 +390,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
             _run_frames.set(frames[:-1])
             if frame.span_activation is not None:
                 frame.span_activation.detach()
+            self._spans.pop(frame.run_id, None)
             return
         restore = False
         try:
@@ -394,6 +413,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
             try:
                 _surrender_run(frame.run_id)
             finally:
+                self._spans.pop(frame.run_id, None)
                 frame.span.end(error=error)
 
     def __enter__(self) -> str:
@@ -444,9 +464,11 @@ class RunHandle:
         self._finished = False
         self._active_activations = 0
         self._state_lock = Lock()
-        self._span = span or _otel._start_run_span(
-            run_id, identity.parent_run_id if identity is not None else None
-        )
+        if span is None:
+            span = _otel._start_run_span(
+                run_id, identity.parent_run_id if identity is not None else None
+            )
+        self._span = span
         self._span_finalizer = self._span.finalize_on_gc(self)
 
     @property

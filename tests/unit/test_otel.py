@@ -409,3 +409,53 @@ assert os.waitstatus_to_exitcode(status) == 0, status
         check=True,
         timeout=15,
     )
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not hasattr(__import__("os"), "fork"), reason="requires fork")
+@pytest.mark.parametrize("parent_enabled", [False, True])
+def test_run_span_opt_in_is_sticky_across_fork_with_a_held_lock(parent_enabled) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import os
+import signal
+import sys
+from threading import Event, Thread
+from solwyn import _otel
+
+os.environ.pop('SOLWYN_OTEL_SPANS', None)
+if sys.argv[1] == 'True':
+    os.environ['SOLWYN_OTEL_SPANS'] = 'true'
+    assert _otel._run_spans_enabled()
+    del os.environ['SOLWYN_OTEL_SPANS']
+
+held, release = Event(), Event()
+def hold():
+    with _otel._trace_api_lock:
+        held.set()
+        release.wait(timeout=10)
+thread = Thread(target=hold)
+thread.start()
+assert held.wait(timeout=5)
+pid = os.fork()
+if pid == 0:
+    signal.alarm(3)
+    if sys.argv[1] == 'False':
+        os.environ['SOLWYN_OTEL_SPANS'] = 'yes'
+        assert _otel._run_spans_enabled()
+        del os.environ['SOLWYN_OTEL_SPANS']
+    assert _otel._run_spans_enabled()
+    os._exit(0)
+release.set()
+thread.join(timeout=5)
+_, status = os.waitpid(pid, 0)
+assert os.waitstatus_to_exitcode(status) == 0, status
+""",
+            str(parent_enabled),
+        ],
+        check=True,
+        timeout=15,
+    )

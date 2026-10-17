@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import gc
-import weakref
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -41,7 +40,6 @@ _DENIAL = {"solwyn.deny_source", "solwyn.denied_by_period"}
 
 @pytest.fixture
 def spans(monkeypatch):
-    monkeypatch.setattr(_otel, "_run_span_clients", weakref.WeakValueDictionary())
     provider = sdk.TracerProvider()
     exporter = memory.InMemorySpanExporter()
     provider.add_span_processor(export.SimpleSpanProcessor(exporter))

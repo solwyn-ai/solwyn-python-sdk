@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, field_validator, model_validator
 
+from solwyn._env import _parse_bool
 from solwyn._lease import DEFAULT_OUTPUT_BOUND
 from solwyn._run import _copy_tags
 from solwyn._types import BudgetMode, ProviderEntry
@@ -230,7 +231,7 @@ class SolwynConfig(BaseModel):
                         "otel_spans",
                         "anthropic_conversation_id",
                     }:
-                        values[field] = env_val.lower() in ("true", "1", "yes")
+                        values[field] = _parse_bool(env_val)
                     else:
                         values[field] = env_val
 

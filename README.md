@@ -1219,11 +1219,14 @@ with status `ERROR` when an exception or interruption leaves the scope and
 `OK` otherwise. Run spans contain only `solwyn.agent_run_id` and, for child
 runs, `solwyn.parent_agent_run_id`.
 
-Run scopes are independent of clients, so their opt-in applies process-wide:
-set `SOLWYN_OTEL_SPANS=true`, or create a wrapper with `otel_spans=True` before
-entering the scope. While that wrapper remains alive, newly entered scopes and
-created handles emit run spans. Each client's call-span flag remains independent;
-a client with `otel_spans=False` can still make calls inside a traced run.
+Run scopes are independent of clients. Run-span opt-in is process-wide and
+sticky: the first wrapper constructed with `otel_spans=True`, or a truthy
+`SOLWYN_OTEL_SPANS` observed at run scope entry or handle creation, enables run
+spans for the rest of the process. Closing or collecting wrappers, clearing the
+environment flag, or constructing an opted-out wrapper does not reset it. Opt in
+before entering the first scope you want traced. Forked children inherit the
+opt-in. Each client's call-span flag remains independent; a client with
+`otel_spans=False` can still make calls inside a traced run.
 
 `start_run(...)` opens the same current run span until `handle.finish()`.
 `create_run(...)` creates one detached span, with its tracing parent captured
@@ -1235,7 +1238,11 @@ the span once; an exception leaving any activation marks the final status
 `ERROR`. An unfinished handle collected by GC also ends its span with `ERROR`;
 this tracing cleanup does not finish attribution or release leases. LangChain
 and CrewAI integrations inherit these spans through their existing detached
-run handles. Use explicit finish for deterministic completion.
+run handles. Their error callbacks finish runs outside an activation, so those
+runs export status `OK` unless an exception also left an activation. A
+`start_run` handle dropped without `finish()` gets its span ended by GC, but its
+run and ended span remain current in the creating context. Finish handles
+explicitly for deterministic completion and context cleanup.
 
 Each intercepted chat or media call creates one `solwyn.call` span of kind
 `INTERNAL`, parented under the current run or application span, or as a root when

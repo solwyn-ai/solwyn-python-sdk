@@ -21,10 +21,10 @@ from solwyn._constants import (
     TRACE_ID_HEX_LENGTH,
     TRACE_ID_PATTERN,
 )
+from solwyn._env import _parse_bool
 from solwyn.exceptions import RunStoppedError
 
 if TYPE_CHECKING:
-    from solwyn._base import _SolwynBase
     from solwyn.budget import BudgetCheckResult
 
 # Every emitter below uses literal keys. The AST firewall checks these literals
@@ -60,7 +60,7 @@ _trace_api_loading = False
 _call_tracer: Any = None
 _call_tracer_loading = False
 _NOOP_CONTEXT = nullcontext()
-_run_span_clients: weakref.WeakValueDictionary[int, _SolwynBase] = weakref.WeakValueDictionary()
+_run_spans_opted_in = False
 
 
 def _reset_after_fork() -> None:
@@ -118,20 +118,17 @@ def _get_call_tracer(trace: ModuleType) -> Any:
     return _call_tracer
 
 
-def _register_run_span_client(client: _SolwynBase) -> None:
-    """Let client-independent run scopes reuse a live client's existing opt-in."""
-    if client._solwyn_config.otel_spans:
-        with _trace_api_lock:
-            _run_span_clients[id(client)] = client
+def _enable_run_spans() -> None:
+    """Latch process-wide opt-in; fork repair keeps the value and replaces the lock."""
+    global _run_spans_opted_in
+    with _trace_api_lock:
+        _run_spans_opted_in = True
 
 
 def _run_spans_enabled() -> bool:
-    if os.environ.get("SOLWYN_OTEL_SPANS", "").lower() in ("true", "1", "yes"):
-        return True
-    if not _run_span_clients:
-        return False
-    with _trace_api_lock:
-        return any(client._solwyn_config.otel_spans for client in _run_span_clients.values())
+    if not _run_spans_opted_in and _parse_bool(os.environ.get("SOLWYN_OTEL_SPANS", "")):
+        _enable_run_spans()
+    return _run_spans_opted_in
 
 
 def _span_is_exportable(span: Any) -> bool:
@@ -224,7 +221,9 @@ class _RunSpan:
             error |= self._error
         try:
             self._span.set_status(
-                self._trace.StatusCode.ERROR if error else self._trace.StatusCode.OK
+                self._trace.Status(
+                    self._trace.StatusCode.ERROR if error else self._trace.StatusCode.OK
+                )
             )
         except Exception:
             pass
@@ -258,7 +257,7 @@ def _start_run_span(run_id: str, parent_run_id: str | None) -> _RunSpan:
     except BaseException as exc:
         if span is not None and trace is not None:
             with suppress(Exception):
-                span.set_status(trace.StatusCode.ERROR)
+                span.set_status(trace.Status(trace.StatusCode.ERROR))
         if not isinstance(exc, Exception):
             raise
     finally:

@@ -1065,7 +1065,8 @@ class _SolwynBase:
         # breaker creation) or _solwyn_signal_lock (latency window append) at fork
         # time; the child would inherit them held by a thread it doesn't have.
         register_fork_reset(self)
-        _otel._register_run_span_client(self)
+        if config.otel_spans:
+            _otel._enable_run_spans()
 
     def _validate_acknowledgments(self, raw_client: object) -> None:
         for token in sorted(self._solwyn_config.acknowledge_untracked):

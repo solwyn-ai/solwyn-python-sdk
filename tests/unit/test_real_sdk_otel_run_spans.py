@@ -9,6 +9,7 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from contextvars import copy_context
+from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -27,6 +28,7 @@ from solwyn.testing import FakeControlPlane
 trace = pytest.importorskip("opentelemetry.trace")
 context = pytest.importorskip("opentelemetry.context")
 sampling = pytest.importorskip("opentelemetry.sdk.trace.sampling")
+sdk = pytest.importorskip("opentelemetry.sdk.trace")
 
 
 @pytest.fixture(autouse=True)
@@ -34,7 +36,6 @@ def enabled(monkeypatch):
     from solwyn._run import _active_run, _run_frames
 
     monkeypatch.setenv("SOLWYN_OTEL_SPANS", "true")
-    monkeypatch.setattr(_otel, "_run_span_clients", weakref.WeakValueDictionary())
     active_token = _active_run.set(None)
     frames_token = _run_frames.set(())
     context_token = context.attach(context.Context())
@@ -317,6 +318,54 @@ def test_scope_exit_in_copied_context_restores_both_contexts(spans):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("terminal", ["normal", "exception", "close"])
+def test_generator_scope_ends_span_when_each_step_has_a_fresh_context(spans, terminal):
+    scope = solwyn.run("PRIVATE")
+
+    def chunks():
+        with scope as run_id:
+            yield run_id
+            yield 2
+            if terminal == "exception":
+                raise ValueError("PRIVATE")
+
+    generator = chunks()
+    base = copy_context()
+    entered = base.copy()
+    run_id = entered.run(next, generator)
+    assert base.copy().run(next, generator) == 2
+    assert not _runs(spans)
+    if terminal == "close":
+        base.copy().run(generator.close)
+    else:
+        with pytest.raises(ValueError if terminal == "exception" else StopIteration):
+            base.copy().run(next, generator)
+    assert len(_runs(spans)) == 1
+    _assert_run(spans, _runs(spans)[0], run_id, error=terminal != "normal")
+
+    # Cleaning up the still-visible original frame must not end the span again.
+    entered.run(scope.__exit__, None, None, None)
+    _assert_run(spans, _runs(spans)[0], run_id, error=terminal != "normal")
+
+
+@pytest.mark.unit
+def test_scope_without_its_frame_ends_span_and_preserves_unrelated_run(spans):
+    scope = solwyn.run("PRIVATE")
+    entered = copy_context()
+    run_id = entered.run(scope.__enter__)
+    with solwyn.run("PRIVATE unrelated") as unrelated_id:
+        unrelated_span = trace.get_current_span()
+        with pytest.raises(RuntimeError, match="LIFO"):
+            scope.__exit__(None, None, None)
+        assert solwyn.current_run_context().id == unrelated_id
+        assert trace.get_current_span() is unrelated_span
+        assert len(_runs(spans)) == 1
+        _assert_run(spans, _runs(spans)[0], run_id)
+    entered.run(scope.__exit__, None, None, None)
+    _assert_run(spans, _runs(spans)[0], run_id)
+
+
+@pytest.mark.unit
 def test_refused_started_handle_finish_keeps_span_open(spans):
     outer = solwyn.start_run("PRIVATE outer")
     outer_context = trace.get_current_span().get_span_context()
@@ -428,7 +477,42 @@ def test_disabled_runs_never_resolve_the_optional_api(monkeypatch):
 
 
 @pytest.mark.unit
-def test_opted_in_clients_are_not_retained_by_run_tracing(spans, monkeypatch):
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("enabled_by", ["client", "environment"])
+async def test_run_opt_in_is_sticky_after_wrapper_close_without_gc(
+    spans, monkeypatch, async_mode, enabled_by
+):
+    monkeypatch.delenv("SOLWYN_OTEL_SPANS", raising=False)
+    if enabled_by == "environment":
+        monkeypatch.setenv("SOLWYN_OTEL_SPANS", "yes")
+    plane = FakeControlPlane()
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(
+        _raw_client(async_mode), otel_spans=enabled_by == "client"
+    )
+    with solwyn.run("PRIVATE first"):
+        pass
+    if async_mode:
+        await wrapper.close()
+    else:
+        wrapper.close()
+    del wrapper
+    monkeypatch.setenv("SOLWYN_OTEL_SPANS", "false")
+
+    # A later opted-out wrapper must not undo the process-wide run-span opt-in.
+    wrapper = plane.wrap(_raw_client(False), otel_spans=False)
+    try:
+        with solwyn.run("PRIVATE next"):
+            pass
+        handle = solwyn.create_run("PRIVATE detached")
+        handle.finish()
+    finally:
+        wrapper.close()
+    assert len(_runs(spans)) == 3
+
+
+@pytest.mark.unit
+def test_run_opt_in_survives_wrapper_collection_without_retaining_it(spans, monkeypatch):
     monkeypatch.delenv("SOLWYN_OTEL_SPANS", raising=False)
     wrapper = FakeControlPlane().wrap(_raw_client(False), otel_spans=True)
     reference = weakref.ref(wrapper)
@@ -438,7 +522,7 @@ def test_opted_in_clients_are_not_retained_by_run_tracing(spans, monkeypatch):
     assert reference() is None
     with solwyn.run("PRIVATE"):
         pass
-    assert not _runs(spans)
+    assert len(_runs(spans)) == 1
 
 
 @pytest.mark.unit
@@ -510,3 +594,38 @@ def test_nonexportable_run_spans_preserve_caller_context(spans, monkeypatch, mod
             assert trace.get_current_span() is parent
         handle.finish()
     assert not _runs(spans)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("outcome", ["success", "error", "adoption_error"])
+def test_run_status_objects_are_portable_to_older_otel_sdks(spans, monkeypatch, outcome):
+    original_set_status = sdk.Span.set_status
+
+    def old_set_status(span, status):
+        if not isinstance(status, trace.Status):
+            raise TypeError("Status required")
+        return original_set_status(span, status)
+
+    monkeypatch.setattr(sdk.Span, "set_status", old_set_status)
+    if outcome == "adoption_error":
+        span = spans.tracer.start_span("solwyn.run")
+
+        def fail():
+            raise ValueError("PRIVATE")
+
+        monkeypatch.setattr(span, "is_recording", fail)
+        tracer = SimpleNamespace(start_span=lambda *args, **kwargs: span)
+        monkeypatch.setattr(spans.api, "get_tracer", lambda *args, **kwargs: tracer)
+    with (
+        pytest.raises(ValueError) if outcome == "error" else nullcontext(),
+        solwyn.run("PRIVATE"),
+    ):
+        if outcome == "error":
+            raise ValueError("PRIVATE")
+    run = _runs(spans)[0]
+    assert run.status.status_code == (
+        trace.StatusCode.OK if outcome == "success" else trace.StatusCode.ERROR
+    )
+    assert run.status.description is None
+    assert not run.events
+    assert spans.ends[run.context.span_id] == 1

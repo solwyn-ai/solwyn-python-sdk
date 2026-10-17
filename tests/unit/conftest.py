@@ -47,6 +47,14 @@ def patch_wrapper_local(wrapper: object, name: str, replacement: Any) -> Iterato
 
 
 @pytest.fixture(autouse=True)
+def _reset_process_run_span_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the process-wide tracing latch from leaking between tests."""
+    from solwyn import _otel
+
+    monkeypatch.setattr(_otel, "_run_spans_opted_in", False)
+
+
+@pytest.fixture(autouse=True)
 def _reset_process_run_control() -> Iterator[None]:
     """Keep exact and conservative process-wide stop state test-isolated."""
     from solwyn import _run_control

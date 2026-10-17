@@ -10,8 +10,9 @@ derived from git tags (hatch-vcs).
 ### Added
 
 - **Opt-in OpenTelemetry run spans.** The existing `otel_spans` option also
-  enables `solwyn.run` spans for run scopes and lifecycle handles. Detached
-  runs share one span across task/thread activations and end once at finish;
+  enables `solwyn.run` spans for run scopes and lifecycle handles. Run-span
+  opt-in stays enabled process-wide after the first opted-in wrapper or run.
+  Detached runs share one span across task/thread activations and end once at finish;
   application and provider-call spans inherit the active run's trace. Run
   attributes contain only run and parent-run IDs, never names, tags, content,
   or exception messages. Exceptions leaving a scope or activation mark the
