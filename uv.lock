@@ -4510,6 +4510,7 @@ together = [
 [package.dev-dependencies]
 dev = [
     { name = "opentelemetry-api" },
+    { name = "opentelemetry-instrumentation-httpx" },
     { name = "opentelemetry-sdk" },
     { name = "respx" },
 ]
@@ -4560,6 +4561,7 @@ provides-extras = ["all", "anthropic", "bedrock", "crewai", "dev", "google", "la
 [package.metadata.requires-dev]
 dev = [
     { name = "opentelemetry-api", specifier = ">=1.1.0,<2" },
+    { name = "opentelemetry-instrumentation-httpx", specifier = ">=0.42b0,<1" },
     { name = "opentelemetry-sdk", specifier = ">=1.1.0,<2" },
     { name = "respx", specifier = ">=0.21" },
 ]

@@ -154,6 +154,10 @@ class _CallSpan:
         self._deferred = False
         self._denied = False
         self._failover_reason: str | None = None
+        self._end_holds = 0
+        self._end_requested = False
+        self._error = False
+        self._run_stopped = False
 
     def __enter__(self) -> Self:
         return self
@@ -256,11 +260,36 @@ class _CallSpan:
         if self._span is not None:
             self._deferred = True
 
+    @contextmanager
+    def finishing(self) -> Iterator[None]:
+        """Keep completion open through nested provider close/exit cleanup.
+
+        Completion can request end before the provider finishes closing. Retain
+        only error/stop booleans until the outer cleanup returns; never retain
+        exceptions or make the span current during application cleanup.
+        """
+        if self._span is None:
+            yield
+            return
+        with self._lock:
+            self._end_holds += 1
+        try:
+            yield
+        except BaseException as exc:
+            self.end(error=True, exception=exc)
+            raise
+        finally:
+            with self._lock:
+                self._end_holds -= 1
+                end_requested = self._end_requested and self._end_holds == 0
+            if end_requested:
+                self.end()
+
     def finalize_on_gc(self, owner: object) -> weakref.finalize[..., object] | None:
         if self._span is None:
             return None
         finalizer = weakref.finalize(owner, self.end, error=True)
-        finalizer.atexit = False  # type: ignore[misc]
+        finalizer.atexit = False
         return finalizer
 
     def end(self, *, error: bool = False, exception: BaseException | None = None) -> None:
@@ -269,16 +298,19 @@ class _CallSpan:
         with self._lock:
             if self._ended:
                 return
+            self._run_stopped |= isinstance(exception, RunStoppedError)
+            self._error |= error or self._run_stopped
+            self._end_requested = True
+            if self._end_holds:
+                return
             self._ended = True
         try:
             if self._failover_reason is not None:
                 self._span.set_attribute("solwyn.failover.reason", self._failover_reason)
-            if isinstance(exception, RunStoppedError):
-                error = True
-                if not self._denied:
-                    self.denied(source="run_terminated", period="run_stopped")
+            if self._run_stopped and not self._denied:
+                self.denied(source="run_terminated", period="run_stopped")
             self._span.set_status(
-                self._trace.StatusCode.ERROR if error else self._trace.StatusCode.OK
+                self._trace.StatusCode.ERROR if self._error else self._trace.StatusCode.OK
             )
         except Exception:
             pass
@@ -293,6 +325,8 @@ _INACTIVE_CALL_SPAN = _CallSpan()
 def _start_call_span() -> _CallSpan:
     """Create a recording span only; never attach an unexported child ID."""
     span = None
+    trace = None
+    transferred = False
     try:
         trace = _get_trace_api()
         if trace is None:
@@ -300,10 +334,19 @@ def _start_call_span() -> _CallSpan:
         span = trace.get_tracer("solwyn").start_span("solwyn.call", kind=trace.SpanKind.INTERNAL)
         context = span.get_span_context()
         if span.is_recording() and context.is_valid and context.trace_flags.sampled:
-            return _CallSpan(span, trace)
-    except Exception:
-        pass
-    if span is not None:
-        with suppress(Exception):
-            span.end()
+            owner = _CallSpan(span, trace)
+            transferred = True
+            return owner
+    except BaseException as exc:
+        if span is not None and trace is not None:
+            with suppress(Exception):
+                span.set_status(trace.StatusCode.ERROR)
+        if not isinstance(exc, Exception):
+            raise
+    finally:
+        # An interrupt between start_span and ownership transfer must not strand
+        # a live span, even when a custom span's context/recording query raises.
+        if span is not None and not transferred:
+            with suppress(Exception):
+                span.end()
     return _INACTIVE_CALL_SPAN

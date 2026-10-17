@@ -946,3 +946,170 @@ async def test_provider_stream_context_entry_failure_ends_span(spans, async_mode
         assert spans.ends[spans.calls()[0].context.span_id] == 1
     finally:
         await _close(wrapper, async_mode)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("responses", [False, True])
+@pytest.mark.parametrize("terminal", ["close", "exit", "provider_exit"])
+@pytest.mark.parametrize(
+    "exception", [ValueError, KeyboardInterrupt, asyncio.CancelledError, GeneratorExit]
+)
+async def test_provider_cleanup_failure_ends_span_with_error(
+    spans, async_mode, responses, terminal, exception
+):
+    class Stream:
+        def __iter__(self):
+            return iter([])
+
+        async def __aiter__(self):
+            for _ in []:
+                yield _response()
+
+        def close(self):
+            if terminal != "provider_exit":
+                raise exception()
+
+        async def aclose(self):
+            if terminal != "provider_exit":
+                raise exception()
+
+        def __exit__(self, *args):
+            if terminal == "provider_exit":
+                raise exception()
+            return False
+
+        async def __aexit__(self, *args):
+            if terminal == "provider_exit":
+                raise exception()
+            return False
+
+    plane = FakeControlPlane()
+    raw = _raw_client(async_mode)
+    raw.chat.completions.create.return_value = Stream()
+    if async_mode:
+        manager = MagicMock(spec=["__aenter__", "__aexit__"])
+        manager.__aenter__ = AsyncMock(return_value=Stream())
+        manager.__aexit__ = AsyncMock(side_effect=exception)
+    else:
+        manager = MagicMock(spec=["__enter__", "__exit__"])
+        manager.__enter__.return_value = Stream()
+        manager.__exit__.side_effect = exception
+    raw.responses = SimpleNamespace(stream=MagicMock(spec=[], return_value=manager))
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(
+        raw, otel_spans=True, provider="openai"
+    )
+    try:
+        if responses:
+            result = wrapper._intercepted_call(
+                _surface="responses",
+                _responses_leaf="stream",
+                _force_stream=True,
+                model="gpt-5.5",
+                input=[],
+            )
+        else:
+            result = wrapper.chat.completions.create(model="gpt-5.5", messages=[], stream=True)
+        if async_mode:
+            result = await result
+        if responses:
+            if async_mode:
+                await result.__aenter__()
+            else:
+                result.__enter__()
+        # Direct __exit__ suppresses ordinary close errors by established policy;
+        # even those suppressed errors must still mark the span ERROR.
+        suppresses = terminal == "exit" and not responses and exception is ValueError
+        with nullcontext() if suppresses else pytest.raises(exception):
+            if terminal == "close":
+                if async_mode:
+                    await result.close()
+                else:
+                    result.close()
+            elif async_mode:
+                await result.__aexit__(None, None, None)
+            else:
+                result.__exit__(None, None, None)
+        assert len(spans.calls()) == 1
+        call = spans.calls()[0]
+        assert call.status.status_code == trace.StatusCode.ERROR
+        assert spans.ends[call.context.span_id] == 1
+        assert not call.events
+        assert call.status.description is None
+    finally:
+        await _close(wrapper, async_mode)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("method", ["get_span_context", "is_recording"])
+def test_interruption_while_adopting_span_still_ends_it(spans, monkeypatch, method):
+    span = spans.tracer.start_span("solwyn.call")
+    context = span.get_span_context()
+    original = getattr(span, method)
+
+    def interrupt():
+        # Restore before end/export so the observer can count the real end.
+        monkeypatch.setattr(span, method, original)
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(span, method, interrupt)
+    tracer = SimpleNamespace(start_span=MagicMock(spec=[], return_value=span))
+    monkeypatch.setattr(spans.api, "get_tracer", lambda *args: tracer)
+    with pytest.raises(KeyboardInterrupt):
+        _otel._start_call_span()
+    assert spans.ends[context.span_id] == 1
+    assert len(spans.calls()) == 1
+    assert spans.calls()[0].status.status_code == trace.StatusCode.ERROR
+    assert spans.calls()[0].status.description is None
+    assert not spans.calls()[0].events
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
+async def test_native_anthropic_span_is_a_child(spans, async_mode):
+    anthropic = pytest.importorskip("anthropic", minversion="1.14.0")
+    httpx2 = pytest.importorskip("httpx2")
+    response_body = {
+        "id": "msg_offline",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-sonnet-4-6",
+        "content": [{"type": "text", "text": "offline"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 3, "output_tokens": 2},
+    }
+    transport = httpx2.MockTransport(lambda request: httpx2.Response(200, json=response_body))
+    http = (httpx2.AsyncClient if async_mode else httpx2.Client)(transport=transport)
+    raw = (anthropic.AsyncAnthropic if async_mode else anthropic.Anthropic)(
+        api_key="offline",
+        http_client=http,
+        open_telemetry={"tracer_provider": spans.provider},
+    )
+    plane = FakeControlPlane()
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
+    try:
+        with spans.tracer.start_as_current_span("caller") as caller:
+            result = wrapper.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=4,
+                messages=[{"role": "user", "content": "offline"}],
+            )
+            if async_mode:
+                result = await result
+            assert result.usage.input_tokens == 3
+            assert trace.get_current_span() is caller
+    finally:
+        await _close(wrapper, async_mode)
+    call = spans.calls()[0]
+    native = [
+        s for s in spans.exporter.get_finished_spans() if s.name == "anthropic.messages.create"
+    ]
+    assert len(native) == 1
+    assert native[0].parent.span_id == call.context.span_id
+    assert call.parent.span_id == caller.get_span_context().span_id
+    assert plane.ingested[0].span_id == trace.format_span_id(call.context.span_id)
+    assert not call.events
+    assert set(call.attributes) == _IDENTITY | _BUDGET | _ATTEMPT
