@@ -14,7 +14,20 @@ from solwyn.testing import FakeControlPlane
 
 anthropic = pytest.importorskip("anthropic")
 httpx2 = pytest.importorskip("httpx2")
+trace = pytest.importorskip("opentelemetry.trace")
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _active_trace():
+    context = trace.SpanContext(
+        trace_id=0xABC,
+        span_id=0xDE,
+        is_remote=False,
+        trace_flags=trace.TraceFlags(trace.TraceFlags.SAMPLED),
+    )
+    with trace.use_span(trace.NonRecordingSpan(context)):
+        yield
 
 
 def _invalid_usage_events():
@@ -128,6 +141,9 @@ def _assert_receipt(plane, call_id, lease_id):
     assert errors[0].lease_id == lease_id
     assert errors[0].attempt_index == 0
     assert errors[0].input_tokens == errors[0].output_tokens == 0
+    assert errors[0].trace_id == "00000000000000000000000000000abc"
+    assert errors[0].span_id == "00000000000000de"
+    assert errors[0].trace_sampled is True
     assert not any(confirm.call_id == call_id for confirm in plane.confirms)
 
 

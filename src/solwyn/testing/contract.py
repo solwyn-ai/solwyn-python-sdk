@@ -882,3 +882,21 @@ def assert_receipt_ingest_contract(http: httpx.Client, api_key: str) -> None:
         _lease_tagged_success_event(),
         "lease-tagged success ingest",
     )
+
+
+def assert_trace_ingest_contract(http: httpx.Client, api_key: str) -> None:
+    """Assert that metadata ingestion accepts sampled and unsampled trace ids.
+
+    These fixtures use the ordinary event envelope, with fresh call ids so
+    ingest deduplication cannot hide a rejected trace field.
+    """
+    for sampled in (True, False):
+        event = MetadataEvent.model_validate(
+            {
+                **_lease_tagged_success_event().model_dump(mode="json"),
+                "trace_id": "0123456789abcdef0123456789abcdef",
+                "span_id": "0123456789abcdef",
+                "trace_sampled": sampled,
+            }
+        )
+        _post_receipt(http, api_key, event, "trace-correlated event ingest")

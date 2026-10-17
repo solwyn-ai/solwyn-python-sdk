@@ -7,8 +7,19 @@ derived from git tags (hatch-vcs).
 
 ## [Unreleased]
 
+### Added
+
+- **Optional OpenTelemetry trace correlation.** Events include the active
+  caller's trace ID, span ID, and sampled flag, including streaming, failover,
+  and denied calls. These identifiers never contain prompts or responses.
+  The OpenTelemetry API remains optional (`solwyn[otel]`); disable capture with
+  `trace_correlation=False` or `SOLWYN_TRACE_CORRELATION=false`.
+
 ### Changed
 
+- **Async background task context isolation.** Background reporting and budget
+  tasks no longer inherit the caller's context, so application instrumentation
+  no longer attributes their work to the first caller's trace.
 - **Anthropic SDK 1.15 support.** Coverage reports recognize the
   `open_telemetry` configuration. Newly guarded administration APIs include
   the `organization` tree and `beta.organization.analytics`,

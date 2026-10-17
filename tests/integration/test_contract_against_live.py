@@ -33,6 +33,7 @@ from solwyn.testing.contract import (
     assert_lease_contract,
     assert_receipt_ingest_contract,
     assert_run_control_contract,
+    assert_trace_ingest_contract,
 )
 
 _SCOPED_CAP_USD = 0.05
@@ -278,6 +279,12 @@ def test_shared_run_control_contract_against_live(api_url: str) -> None:
 
     with httpx.Client(base_url=credentials.api_url, timeout=15) as http:
         assert_run_control_contract(http, credentials.api_key, stopped_run_id=run_id)
+
+
+@pytest.mark.integration
+def test_shared_trace_ingest_contract_against_live(test_credentials: Credentials) -> None:
+    with httpx.Client(base_url=test_credentials.api_url, timeout=15) as http:
+        assert_trace_ingest_contract(http, test_credentials.api_key)
 
 
 @pytest.mark.integration

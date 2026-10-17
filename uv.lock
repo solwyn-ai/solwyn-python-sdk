@@ -4441,6 +4441,8 @@ dev = [
     { name = "google-generativeai" },
     { name = "mypy" },
     { name = "openai" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-sdk" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pyyaml" },
@@ -4457,12 +4459,17 @@ langchain = [
 openai = [
     { name = "openai" },
 ]
+otel = [
+    { name = "opentelemetry-api" },
+]
 together = [
     { name = "together" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-sdk" },
     { name = "respx" },
 ]
 frameworks = [
@@ -4493,6 +4500,9 @@ requires-dist = [
     { name = "openai", marker = "extra == 'all'", specifier = ">=2.0" },
     { name = "openai", marker = "extra == 'dev'", specifier = ">=2.0" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=2.0" },
+    { name = "opentelemetry-api", marker = "extra == 'dev'", specifier = ">=1.1.0,<2" },
+    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.1.0,<2" },
+    { name = "opentelemetry-sdk", marker = "extra == 'dev'", specifier = ">=1.1.0,<2" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
@@ -4503,10 +4513,14 @@ requires-dist = [
     { name = "together", marker = "extra == 'dev'", specifier = ">=2.0" },
     { name = "together", marker = "extra == 'together'", specifier = ">=2.0" },
 ]
-provides-extras = ["all", "anthropic", "bedrock", "crewai", "dev", "google", "langchain", "openai", "together"]
+provides-extras = ["all", "anthropic", "bedrock", "crewai", "dev", "google", "langchain", "openai", "otel", "together"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "respx", specifier = ">=0.21" }]
+dev = [
+    { name = "opentelemetry-api", specifier = ">=1.1.0,<2" },
+    { name = "opentelemetry-sdk", specifier = ">=1.1.0,<2" },
+    { name = "respx", specifier = ">=0.21" },
+]
 frameworks = [
     { name = "langchain-openai" },
     { name = "langgraph" },

@@ -94,6 +94,31 @@ def _only_fold(reporter: MetadataReporter | AsyncMetadataReporter):
     return next(iter(snapshot.values()))
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_different_traces_share_one_fold_and_replays_have_no_trace(async_mode: bool) -> None:
+    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY) if async_mode else _quiet_sync()
+    try:
+        for trace_id, span_id, sampled in [("1" * 32, "2" * 16, True), ("3" * 32, "4" * 16, False)]:
+            reporter._fold_or_count_event_drop(
+                _event(trace_id=trace_id, span_id=span_id, trace_sampled=sampled),
+                "overflow",
+            )
+        fold = _only_fold(reporter)
+        key = next(iter(reporter._receipt_fold_snapshot()))
+        replays = _build_receipt_replay_events(key, fold, "trace-fold-test")
+        assert sum(event.receipt_aggregate_count for event in replays) == 2
+        for event in replays:
+            assert event.trace_id is None
+            assert event.span_id is None
+            assert event.trace_sampled is None
+            assert not {"trace_id", "span_id", "trace_sampled"} & event.model_dump().keys()
+    finally:
+        reporter._seal_delivery()
+        if not async_mode:
+            reporter._http.close()
+
+
 class _GateAfterNthOwnershipRelease:
     """Test lock that pauses one named worker after an ownership transaction."""
 

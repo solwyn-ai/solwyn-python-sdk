@@ -1003,6 +1003,7 @@ def test_denial_fixture(solwyn_control_plane, solwyn_test_client):
 | `velocity_accel_factor` | `SOLWYN_VELOCITY_ACCEL_FACTOR` | `3.0` | Required current/prior one-minute call-count ratio |
 | `on_unmetered` | `SOLWYN_ON_UNMETERED` | `warn` | Handle untracked or unknown pre-call capabilities with `warn`, `raise`, or `allow` |
 | `report_untracked_surfaces` | `SOLWYN_REPORT_UNTRACKED_SURFACES` | `True` | Send optional structural advisory reports for unacknowledged `warn`/`allow` observations; set false to keep them local |
+| `trace_correlation` | `SOLWYN_TRACE_CORRELATION` | `True` | Include active OpenTelemetry trace identifiers in metadata events when available; set false to disable capture |
 | `acknowledge_untracked` | `SOLWYN_ACKNOWLEDGE_UNTRACKED` | empty | Exact terminal capability tokens; env format is comma-delimited |
 | `control_plane_failure_threshold` | `SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD` | `3` | Consecutive Solwyn API failures before local outage posture applies |
 | `control_plane_recovery_timeout` | `SOLWYN_CONTROL_PLANE_RECOVERY_TIMEOUT` | `30.0` | Seconds before probing the Solwyn API after its breaker opens |
@@ -1125,6 +1126,9 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `agent_run_name` | `str \| None` | Run name passed to `solwyn.run(...)`, if any |
 | `lease_id` | `str \| None` | Id of the budget lease that funded the call: an opaque server-minted token, the same id the call's confirmation carries. Present only on lease-funded calls; omitted for reservation-funded, cached, fail-open, uncounted, and denied calls |
 | `provider_region` | `str \| None` | Cloud region of the serving endpoint (Bedrock — pricing is per model and region); omitted for other providers |
+| `trace_id` | `str \| None` | Random OpenTelemetry trace identifier active when the call starts (32 lowercase hex characters) |
+| `span_id` | `str \| None` | Random OpenTelemetry caller span identifier at call start (16 lowercase hex characters) |
+| `trace_sampled` | `bool \| None` | Whether that trace was sampled; an unsampled trace may be absent from your tracing backend |
 | `tags` | `object \| None` | Optional explicit customer-supplied tags from `solwyn.run(..., tags=...)` and `solwyn_tags=`. Never inferred from prompts or responses; omitted when empty or unset |
 | `deny_source` | `str \| None` | Structural denial source (`server`, sticky/local enforcement sources, or `aggregate_replay`) |
 | `deny_reason` | `str \| None` | Bounded structural reason for a denied call; never derived from content |
@@ -1136,6 +1140,18 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 
 Optional fields are omitted entirely when unset (never `null`), so payloads for
 providers that do not use them are byte-identical to earlier releases.
+
+Trace correlation captures only these two random identifiers and the sampled
+flag, never content. It requires your application's configured tracer provider
+and an active, valid OpenTelemetry span; `solwyn[otel]` is only a convenience
+for installing the optional API. Solwyn creates no spans, and its own code
+never injects trace context, baggage, or tracestate. Your application's httpx
+auto-instrumentation may still add `traceparent` or `baggage` to Solwyn's
+control-plane requests, including budget checks in the caller's context.
+Disable capture with
+`Solwyn(client, trace_correlation=False)` (or `AsyncSolwyn`) or
+`SOLWYN_TRACE_CORRELATION=false`. Unset correlation fields are omitted entirely
+from payloads. Aggregated denial replays carry no trace because they span calls.
 
 Token, output-bound, aggregate-count, pricing-basis, and non-token media
 quantities are each capped at 100,000,000 per event. Larger folded receipt

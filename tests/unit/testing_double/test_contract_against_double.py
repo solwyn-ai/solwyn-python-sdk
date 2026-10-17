@@ -17,6 +17,7 @@ from solwyn.testing.contract import (
     assert_lease_contract,
     assert_receipt_ingest_contract,
     assert_run_control_contract,
+    assert_trace_ingest_contract,
 )
 
 _LEASE_UNAVAILABLE_MESSAGE = "Budget lease service temporarily unavailable; retry"
@@ -255,6 +256,18 @@ def test_shared_run_control_contract_against_double() -> None:
         assert_run_control_contract(http, plane.api_key, stopped_run_id=run_id)
 
     assert plane.stopped_runs == {run_id: "manual_kill"}
+
+
+@pytest.mark.unit
+def test_shared_trace_ingest_contract_against_double() -> None:
+    plane = FakeControlPlane()
+    with httpx.Client(transport=plane.transport, base_url=plane.api_url) as http:
+        assert_trace_ingest_contract(http, plane.api_key)
+    assert len(plane.ingested) == 2
+    assert [event.trace_sampled for event in plane.ingested] == [True, False]
+    for event in plane.ingested:
+        assert event.trace_id == "0123456789abcdef0123456789abcdef"
+        assert event.span_id == "0123456789abcdef"
 
 
 @pytest.mark.unit

@@ -15,6 +15,11 @@ HOLDER_ID_MAX_LENGTH = 64
 # Server-issued lease id, echoed back on every renew/surrender. Bounded
 # lock-step with core's lease schemas.
 LEASE_ID_MAX_LENGTH = 64
+# W3C trace identifiers use fixed-width, lowercase hexadecimal text.
+TRACE_ID_HEX_LENGTH = 32
+SPAN_ID_HEX_LENGTH = 16
+TRACE_ID_PATTERN = r"^[0-9a-f]{32}$"
+SPAN_ID_PATTERN = r"^[0-9a-f]{16}$"
 # Canonical lowercase RFC 4122 text form — the exact shape str(uuid.uuid4())
 # emits, which is the only shape the SDK has ever produced for a call_id. The
 # API pins the same regex (shared CALL_ID_PATTERN) because call_id is durable

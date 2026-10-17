@@ -11,6 +11,7 @@ Cloud API, so nothing here multiplies tokens by a price.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import ssl
 import threading
@@ -3675,7 +3676,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             close_epoch=close_epoch,
         )
         try:
-            task = loop.create_task(coroutine)
+            task = loop.create_task(coroutine, context=contextvars.Context())
         except Exception as exc:
             coroutine.close()
             logger.warning("lease.renew_dispatch_failed: %s", type(exc).__name__)
@@ -3843,7 +3844,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             # transfer its pool or pending initialization to another loop.
             raise RuntimeError("release HTTP pool belongs to another event loop")
         if initialization is None:
-            initialization = asyncio.create_task(self._initialize_release_client())
+            initialization = asyncio.create_task(
+                self._initialize_release_client(), context=contextvars.Context()
+            )
             self._release_http_task = initialization
         try:
             return await asyncio.shield(initialization)
@@ -3982,7 +3985,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         for _ in range(needed):
             coroutine = self._run_release_worker()
             try:
-                task = loop.create_task(coroutine)
+                task = loop.create_task(coroutine, context=contextvars.Context())
             except Exception as exc:
                 coroutine.close()
                 with self._state_lock:
@@ -4041,7 +4044,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 and not self._release_cleanup_task.cancelled()
             ):
                 self._release_cleanup_task.exception()
-            self._release_cleanup_task = asyncio.create_task(self._cleanup_releases())
+            self._release_cleanup_task = asyncio.create_task(
+                self._cleanup_releases(), context=contextvars.Context()
+            )
 
     async def _cleanup_releases(self) -> None:
         """Own post-deadline teardown without creating tasks from cancellation."""
@@ -4075,7 +4080,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             and self._release_http_task is not None
             and self._release_pool_closer is None
         ):
-            self._release_pool_closer = asyncio.create_task(self._close_release_pool())
+            self._release_pool_closer = asyncio.create_task(
+                self._close_release_pool(), context=contextvars.Context()
+            )
 
     async def _close_release_pool(self) -> None:
         initialization = self._release_http_task
