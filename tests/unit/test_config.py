@@ -942,6 +942,54 @@ class TestFailoverHopReadTimeout:
 
 
 @pytest.mark.unit
+class TestAnthropicConversationIdConfig:
+    def _config(self, **kwargs: object) -> SolwynConfig:
+        return SolwynConfig(
+            api_key=VALID_API_KEY,
+            providers=[ProviderEntry(provider=ProviderName.ANTHROPIC, model="claude-sonnet-5")],
+            **kwargs,
+        )
+
+    def test_disabled_by_default(self) -> None:
+        assert self._config().anthropic_conversation_id is False
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_constructor_flag(self, enabled: bool) -> None:
+        config = self._config(anthropic_conversation_id=enabled)
+
+        assert config.anthropic_conversation_id is enabled
+
+    @pytest.mark.parametrize(
+        ("env_val", "expected"),
+        [
+            ("true", True),
+            ("TRUE", True),
+            ("1", True),
+            ("yes", True),
+            ("false", False),
+            ("0", False),
+            ("no", False),
+        ],
+    )
+    def test_environment_boolean_coercion(
+        self, monkeypatch: pytest.MonkeyPatch, env_val: str, expected: bool
+    ) -> None:
+        monkeypatch.setenv("SOLWYN_ANTHROPIC_CONVERSATION_ID", env_val)
+
+        assert self._config().anthropic_conversation_id is expected
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_constructor_overrides_environment(
+        self, monkeypatch: pytest.MonkeyPatch, enabled: bool
+    ) -> None:
+        monkeypatch.setenv("SOLWYN_ANTHROPIC_CONVERSATION_ID", str(not enabled))
+
+        config = self._config(anthropic_conversation_id=enabled)
+
+        assert config.anthropic_conversation_id is enabled
+
+
+@pytest.mark.unit
 class TestUnmeteredPostureConfig:
     def _config(self, **kwargs: object) -> SolwynConfig:
         return SolwynConfig(

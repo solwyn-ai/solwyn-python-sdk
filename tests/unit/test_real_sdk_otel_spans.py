@@ -43,6 +43,14 @@ def spans(monkeypatch):
     provider = sdk.TracerProvider()
     exporter = memory.InMemorySpanExporter()
     provider.add_span_processor(export.SimpleSpanProcessor(exporter))
+    started_calls = []
+
+    class StartRecorder(sdk.SpanProcessor):
+        def on_start(self, span, parent_context=None):
+            if span.name == "solwyn.call":
+                started_calls.append(span)
+
+    provider.add_span_processor(StartRecorder())
     tracer = provider.get_tracer("span-tests")
     api = ModuleType("test_trace_api")
     api.__dict__.update(vars(trace))
@@ -63,6 +71,7 @@ def spans(monkeypatch):
         api=api,
         exporter=exporter,
         ends=ends,
+        started_calls=started_calls,
         provider=provider,
         calls=lambda: [s for s in exporter.get_finished_spans() if s.name == "solwyn.call"],
     )
@@ -110,6 +119,7 @@ async def test_call_span_lifecycle(spans, async_mode, media, outcome):
     plane = FakeControlPlane()
     raw = _raw_client(async_mode)
     wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
+    open_at_preflight = []
 
     def dispatch(*args, **kwargs):
         # This simulates independent provider instrumentation at its public seam.
@@ -123,7 +133,17 @@ async def test_call_span_lifecycle(spans, async_mode, media, outcome):
     raw.chat.completions.create.side_effect = dispatch
     raw.embeddings.create.side_effect = dispatch
 
+    def with_options(**kwargs):
+        with spans.tracer.start_as_current_span("provider.with_options"):
+            pass
+        return raw
+
+    raw.with_options.side_effect = with_options
+
     def check(*args, **kwargs):
+        open_at_preflight.append(
+            len(spans.started_calls) == 1 and spans.started_calls[0].is_recording()
+        )
         with spans.tracer.start_as_current_span("budget.httpx"):
             pass
         if outcome == "post_stop":
@@ -189,8 +209,11 @@ async def test_call_span_lifecycle(spans, async_mode, media, outcome):
     assert call.status.description is None
     assert not call.events
     for child in spans.exporter.get_finished_spans():
-        if child.name in {"provider.native", "budget.httpx"}:
+        if child.name in {"provider.native", "provider.with_options"}:
             assert child.parent.span_id == call.context.span_id
+        elif child.name == "budget.httpx":
+            assert child.parent.span_id == caller_id
+    assert open_at_preflight == ([] if outcome == "run_stop" else [True])
     assert call.attributes["solwyn.agent_run_id"] == run_id
     assert call.attributes["solwyn.provider.requested"] == "openai"
     assert call.attributes["solwyn.model.requested"] == "gpt-5.5"
@@ -284,6 +307,92 @@ async def test_stream_span_is_not_current_and_ends_once(spans, async_mode, termi
         trace.StatusCode.ERROR if terminal in {"error", "interrupt", "gc"} else trace.StatusCode.OK
     )
     assert set(call.attributes) == _IDENTITY | _BUDGET | _ATTEMPT
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("streaming", [False, True], ids=["message", "stream"])
+@pytest.mark.parametrize("correlation", [False, True], ids=["trace-off", "trace-on"])
+async def test_native_anthropic_conversation_span_is_a_child_of_call(
+    spans, async_mode, streaming, correlation
+):
+    from test_real_sdk_anthropic_conversation_id import (
+        _response as anthropic_response,
+    )
+    from test_real_sdk_anthropic_conversation_id import anthropic, httpx2
+
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return anthropic_response(request, streaming)
+
+    transport = httpx2.MockTransport(handler)
+    http = (httpx2.AsyncClient if async_mode else httpx2.Client)(transport=transport)
+    raw = (anthropic.AsyncAnthropic if async_mode else anthropic.Anthropic)(
+        api_key="offline",
+        http_client=http,
+        open_telemetry={"tracer_provider": spans.provider, "propagation": False},
+    )
+    original_options = dict(raw.open_telemetry)
+    plane = FakeControlPlane()
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(
+        raw,
+        otel_spans=True,
+        anthropic_conversation_id=True,
+        trace_correlation=correlation,
+        lease_enabled=False,
+    )
+    try:
+        with (
+            spans.tracer.start_as_current_span("caller") as caller,
+            solwyn.run("PRIVATE run") as run,
+        ):
+            result = wrapper.messages.create(
+                model="claude-sonnet-5",
+                max_tokens=16,
+                messages=[{"role": "user", "content": "offline"}],
+                stream=streaming,
+            )
+            if async_mode:
+                result = await result
+            if streaming:
+                if async_mode:
+                    assert [event.type async for event in result][-1] == "message_stop"
+                else:
+                    assert [event.type for event in result][-1] == "message_stop"
+            else:
+                assert result.usage.input_tokens == 10
+            assert trace.get_current_span() is caller
+    finally:
+        await _close(wrapper, async_mode)
+
+    assert len(spans.calls()) == 1
+    call = spans.calls()[0]
+    native = [
+        span
+        for span in spans.exporter.get_finished_spans()
+        if span.name == "anthropic.messages.create"
+    ]
+    assert len(native) == 1
+    assert native[0].parent == call.context
+    assert native[0].attributes["gen_ai.conversation.id"] == run
+    assert call.parent == caller.get_span_context()
+    assert call.attributes["solwyn.agent_run_id"] == run
+    assert set(call.attributes) == _IDENTITY | _BUDGET | _ATTEMPT | {"solwyn.agent_run_id"}
+    assert not any(key.startswith("gen_ai.") for key in call.attributes)
+    assert spans.ends[call.context.span_id] == 1
+    assert not call.events
+    assert raw.open_telemetry == original_options
+    assert len(plane.ingested) == 1
+    assert plane.ingested[0].span_id == (
+        trace.format_span_id(call.context.span_id) if correlation else None
+    )
+    assert len(requests) == 1
+    request = requests[0]
+    assert run not in str(request.headers) + str(request.url)
+    assert run.encode() not in request.content
 
 
 async def _close(wrapper, async_mode):
@@ -597,22 +706,25 @@ async def test_responses_manager_span_lifetime(spans, async_mode, terminal):
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_mode", [False, True])
-@pytest.mark.parametrize("surface", ["chat", "media"])
-async def test_real_httpx_preflight_span_is_a_child(spans, async_mode, surface):
+@pytest.mark.parametrize("surface", ["chat", "media", "responses"])
+async def test_real_httpx_preflight_preserves_caller_parent(spans, async_mode, surface):
     instrumentation = pytest.importorskip("opentelemetry.instrumentation.httpx")
     plane = FakeControlPlane()
     raw = _raw_client(async_mode)
     raw.chat.completions.create.return_value = _response()
     raw.embeddings.create.return_value = _response()
+    raw.responses = SimpleNamespace(create=raw.chat.completions.create)
     wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
     instrumentation.HTTPXClientInstrumentor.instrument_client(
         wrapper._solwyn_budget._http,
         tracer_provider=spans.provider,
     )
     try:
-        with spans.tracer.start_as_current_span("caller"):
+        with spans.tracer.start_as_current_span("caller") as caller:
             if surface == "media":
                 result = wrapper.embeddings.create(model="text-embedding-3-small", input="x")
+            elif surface == "responses":
+                result = wrapper._intercepted_call(_surface="responses", model="gpt-5.5", input=[])
             else:
                 result = wrapper.chat.completions.create(model="gpt-5.5", messages=[])
             if async_mode:
@@ -622,8 +734,29 @@ async def test_real_httpx_preflight_span_is_a_child(spans, async_mode, surface):
     call = spans.calls()[0]
     http_spans = [s for s in spans.exporter.get_finished_spans() if s.kind == trace.SpanKind.CLIENT]
     assert len(http_spans) == 1
-    assert http_spans[0].parent.span_id == call.context.span_id
+    assert http_spans[0].parent.span_id == caller.get_span_context().span_id
     assert http_spans[0].context.trace_id == call.context.trace_id
+
+
+@pytest.mark.unit
+def test_call_trace_snapshot_does_not_attach_span(spans, monkeypatch):
+    attachments = []
+    use_span = spans.api.use_span
+
+    def attach(span, *args, **kwargs):
+        attachments.append(span.get_span_context())
+        return use_span(span, *args, **kwargs)
+
+    monkeypatch.setattr(spans.api, "use_span", attach)
+    with (
+        spans.tracer.start_as_current_span("caller") as caller,
+        _otel._start_call_span() as owner,
+    ):
+        snapshot = owner.capture_trace()
+        assert snapshot.trace_id == trace.format_trace_id(caller.get_span_context().trace_id)
+        assert snapshot.span_id == trace.format_span_id(spans.started_calls[0].context.span_id)
+        assert trace.get_current_span() is caller
+    assert attachments == []
 
 
 @pytest.mark.unit
@@ -781,9 +914,9 @@ def test_snapshot_is_captured_once_before_cross_thread_stream_consumption(spans,
     captures = []
     capture_trace = _otel.capture_trace
 
-    def capture():
+    def capture(span=None):
         captures.append(threading.get_ident())
-        return capture_trace()
+        return capture_trace(span)
 
     monkeypatch.setattr(_otel, "capture_trace", capture)
     try:

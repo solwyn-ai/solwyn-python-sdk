@@ -580,6 +580,57 @@ Do not open `solwyn.run(...)` inside an async generator. Python runs the consume
 
 Tasks created with `asyncio.create_task(...)` inside a run capture that task's context. If the task keeps making LLM calls after the `with` block exits, those calls are still attributed to the captured run id. Use `asyncio.TaskGroup` or await spawned tasks before leaving the scope when attribution must end with the block.
 
+### Anthropic conversation IDs
+
+Set `anthropic_conversation_id=True` (or
+`SOLWYN_ANTHROPIC_CONVERSATION_ID=true`) to attach the active Solwyn run ID
+to Anthropic's native OpenTelemetry span as `gen_ai.conversation.id`.
+The flag defaults to `False`. Native spans require `anthropic>=1.14` and an
+application-configured tracer provider, set globally or on the Anthropic client.
+For example, using your existing `tracer_provider`:
+
+```python
+from anthropic import Anthropic
+from solwyn import Solwyn, run
+
+client = Solwyn(
+    Anthropic(open_telemetry={"tracer_provider": tracer_provider}),
+    api_key="sk_proj_...",
+    anthropic_conversation_id=True,
+)
+
+with run("nightly-batch") as run_id:
+    client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=256,
+        messages=[{"role": "user", "content": "Hello!"}],
+    )
+```
+
+Solwyn extends the **resolved mapping returned by `client.open_telemetry`**,
+preserving every other setting. Anthropic exposes this mapping even for
+`Anthropic()` and `Anthropic(open_telemetry=None)`, so those clients receive
+the run ID too. With `Anthropic(open_telemetry=False)`, the copied options
+receive the ID while tracing stays disabled and emits no span. Solwyn never
+constructs the option from scratch or changes nested tracing settings.
+
+A customer-configured `conversation_id` string is kept, including an empty
+string. Anthropic drops `conversation_id=None` when resolving its options,
+so Solwyn adds the active run ID in that case. Calls without an active run
+and other dialects are left alone. Older SDKs and variants with a missing,
+unreadable, or non-mapping public option are skipped without interrupting
+the provider call. Sync, async, and streaming calls use the same behavior;
+each Anthropic failover hop extends that client's own mapping.
+
+The added ID is an SDK-minted `run_<uuid4>`; run names and tags are not added.
+`conversation_id` stays local to the span and is **not sent to Anthropic**
+in HTTP headers or the request body.
+
+With `otel_spans=True` as well, the native `anthropic.messages.create` span is
+a child of `solwyn.call` and carries `gen_ai.conversation.id`. The Solwyn call
+span keeps its closed `solwyn.*` attribute allowlist and carries no `gen_ai.*`
+attributes.
+
 ### ThreadPoolExecutor
 
 `solwyn.run(...)` uses Python `contextvars`. Context propagates across asyncio tasks, but not into `ThreadPoolExecutor` workers. Use `solwyn.run_in_executor(...)` when submitting threaded work that should keep the active run tag:
@@ -1005,6 +1056,7 @@ def test_denial_fixture(solwyn_control_plane, solwyn_test_client):
 | `report_untracked_surfaces` | `SOLWYN_REPORT_UNTRACKED_SURFACES` | `True` | Send optional structural advisory reports for unacknowledged `warn`/`allow` observations; set false to keep them local |
 | `trace_correlation` | `SOLWYN_TRACE_CORRELATION` | `True` | Include active OpenTelemetry trace identifiers in metadata events when available; set false to disable capture |
 | `otel_spans` | `SOLWYN_OTEL_SPANS` | `False` | Emit content-free `solwyn.call` spans through your application's OpenTelemetry tracing |
+| `anthropic_conversation_id` | `SOLWYN_ANTHROPIC_CONVERSATION_ID` | `False` | Extend existing Anthropic telemetry options with the active run ID as a local span attribute |
 | `acknowledge_untracked` | `SOLWYN_ACKNOWLEDGE_UNTRACKED` | empty | Exact terminal capability tokens; env format is comma-delimited |
 | `control_plane_failure_threshold` | `SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD` | `3` | Consecutive Solwyn API failures before local outage posture applies |
 | `control_plane_recovery_timeout` | `SOLWYN_CONTROL_PLANE_RECOVERY_TIMEOUT` | `30.0` | Seconds before probing the Solwyn API after its breaker opens |
@@ -1161,12 +1213,13 @@ alone does not export spans. Cold `import solwyn` never imports OpenTelemetry.
 
 Each intercepted chat or media call creates one `solwyn.call` span of kind
 `INTERNAL`, parented under the application's current span, or as a root when
-there is no parent. Instrumented budget preflight requests and native provider
-SDK spans are its children. All failover attempts share that call span. It is
-made current only in short scopes for the call-start snapshot, budget preflight,
-and provider dispatch (including deferred Responses manager entry), and is
-never current while application code iterates a returned stream. Streams keep
-the span open until completion, explicit close, failure, or garbage collection.
+there is no parent. The span opens before budget preflight; instrumented budget
+requests retain the application's current parent. Native provider SDK spans are
+children of `solwyn.call`, and all failover attempts share that call span. It is
+made current only during provider dispatch, including `with_options(...)` and
+deferred Responses manager entry, and is never current while application code
+iterates a returned stream. Streams keep the span open until completion,
+explicit close, failure, or garbage collection.
 
 The closed attribute allowlist is:
 

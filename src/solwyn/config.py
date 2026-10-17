@@ -147,6 +147,8 @@ class SolwynConfig(BaseModel):
     trace_correlation: bool = True
     # Emit content-free Solwyn call spans through application-configured OTel.
     otel_spans: bool = False
+    # Extend existing Anthropic telemetry options with the active run's id.
+    anthropic_conversation_id: bool = False
     # Breaker reports POST only when a provider's snapshot changed since the
     # last successful send, plus a periodic full-refresh heartbeat so the
     # dashboard's advisory view never goes stale silently.
@@ -202,6 +204,7 @@ class SolwynConfig(BaseModel):
             "report_untracked_surfaces": "REPORT_UNTRACKED_SURFACES",
             "trace_correlation": "TRACE_CORRELATION",
             "otel_spans": "OTEL_SPANS",
+            "anthropic_conversation_id": "ANTHROPIC_CONVERSATION_ID",
             "breaker_report_heartbeat": "BREAKER_REPORT_HEARTBEAT",
             "reporter_max_send_attempts": "REPORTER_MAX_SEND_ATTEMPTS",
             "reporter_retry_backoff_base": "REPORTER_RETRY_BACKOFF_BASE",
@@ -225,6 +228,7 @@ class SolwynConfig(BaseModel):
                         "report_untracked_surfaces",
                         "trace_correlation",
                         "otel_spans",
+                        "anthropic_conversation_id",
                     }:
                         values[field] = env_val.lower() in ("true", "1", "yes")
                     else:

@@ -142,13 +142,13 @@ def _validated_trace(snapshot: _TraceSnapshot | None) -> _TraceSnapshot | None:
     return None
 
 
-def capture_trace() -> _TraceSnapshot | None:
-    """Snapshot an existing valid span, or return None when tracing is idle."""
+def capture_trace(span: Any = None) -> _TraceSnapshot | None:
+    """Snapshot a supplied or current valid span without attaching a context."""
     try:
         trace = _get_trace_api()
         if trace is None:
             return None
-        context = trace.get_current_span().get_span_context()
+        context = (span if span is not None else trace.get_current_span()).get_span_context()
         if not context.is_valid:
             return None
         return _validated_trace(
@@ -192,7 +192,7 @@ class _CallSpan:
 
     @contextmanager
     def current(self) -> Iterator[None]:
-        """Attach only for preflight/dispatch; never across a stream return."""
+        """Attach only for provider dispatch; never across a stream return."""
         if self._span is None:
             yield
             return
@@ -213,8 +213,7 @@ class _CallSpan:
         # caller's original context, including an existing non-recording parent.
         if self._span is None:
             return capture_trace()
-        with self.current():
-            return capture_trace()
+        return capture_trace(self._span)
 
     def identify(
         self,

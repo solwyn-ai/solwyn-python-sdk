@@ -1758,6 +1758,38 @@ class _SolwynBase:
             cost_routed=cost_routed,
         )
 
+    def _extra_client_options(
+        self, runtime: ProviderRuntime, *, run_id: str | None
+    ) -> dict[str, Any]:
+        """Copy-extend this candidate's existing public Anthropic telemetry option.
+
+        Static inspection excludes synthesized attributes and arbitrary descriptors.
+        A builtin property uses its public getter (the Anthropic SDK's API); a
+        failing getter simply leaves dispatch unchanged. Nested options stay opaque.
+        """
+        if (
+            not self._solwyn_config.anthropic_conversation_id
+            or run_id is None
+            or runtime.adapter.dialect != "anthropic"
+        ):
+            return {}
+        missing = object()
+        try:
+            option = inspect.getattr_static(runtime.sdk_client, "open_telemetry", missing)
+            if option is missing:
+                return {}
+            if type(option) is property:
+                if option.fget is None:
+                    return {}
+                option = option.fget(runtime.sdk_client)
+            elif inspect.getattr_static(type(option), "__get__", missing) is not missing:
+                return {}
+            if not isinstance(option, Mapping) or "conversation_id" in option:
+                return {}
+            return {"open_telemetry": {**option, "conversation_id": run_id}}
+        except Exception:
+            return {}
+
     def _build_metadata_event(
         self,
         *,
