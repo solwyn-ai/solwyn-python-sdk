@@ -67,6 +67,14 @@ derived from git tags (hatch-vcs).
   change pinned `CoverageFingerprint` values when upgrading from Solwyn 0.8.0,
   where the paths were `unknown`.
 
+### Fixed
+
+- **Timeout configuration reads in strict mode.** Reading `client.timeout` on
+  wrapped OpenAI, Anthropic, Azure OpenAI, Together, and OpenAI-compatible clients
+  now preserves numeric, `None`, and timeout-object values without raising
+  `UntrackedSpendSurfaceError`, including raw clients copied with
+  `with_options(timeout=...)` before wrapping.
+
 ### Tests
 
 - **Control-plane overload.** Two unit tests pin the breaker semantics of a
