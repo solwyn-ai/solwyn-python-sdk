@@ -246,7 +246,10 @@ def _start_run_span(run_id: str, parent_run_id: str | None) -> _RunSpan:
         trace = _get_trace_api()
         if trace is None:
             return _INACTIVE_RUN_SPAN
-        span = trace.get_tracer("solwyn").start_span("solwyn.run", kind=trace.SpanKind.INTERNAL)
+        tracer = _get_call_tracer(trace)
+        if tracer is None:
+            return _INACTIVE_RUN_SPAN
+        span = tracer.start_span("solwyn.run", kind=trace.SpanKind.INTERNAL)
         if _span_is_exportable(span):
             span.set_attribute("solwyn.agent_run_id", run_id)
             if parent_run_id is not None:

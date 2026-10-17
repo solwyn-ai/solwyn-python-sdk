@@ -1275,7 +1275,9 @@ def test_status_objects_are_portable_to_older_otel_sdks(spans, monkeypatch, outc
 
 
 @pytest.mark.unit
-def test_call_tracer_is_cached_with_version_and_reset_after_fork(spans, monkeypatch):
+@pytest.mark.parametrize("first", ["call", "run"])
+def test_call_and_run_spans_share_versioned_tracer_and_reset_after_fork(spans, monkeypatch, first):
+    monkeypatch.setenv("SOLWYN_OTEL_SPANS", "true")
     lookups = []
 
     def get_tracer(name, instrumenting_library_version=None):
@@ -1284,16 +1286,24 @@ def test_call_tracer_is_cached_with_version_and_reset_after_fork(spans, monkeypa
 
     monkeypatch.setattr(spans.api, "get_tracer", get_tracer)
 
-    def call(_):
-        _otel._start_call_span().end()
+    def start(kind):
+        if kind == "run":
+            _otel._start_run_span("run-tracer-cache", None).end()
+        else:
+            _otel._start_call_span().end()
 
+    start(first)
     with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(call, range(12)))
+        list(pool.map(start, ["call", "run"] * 6))
     assert lookups == [("solwyn", solwyn.__version__)]
-    assert len(spans.calls()) == 12
-    assert all(s.instrumentation_scope.version == solwyn.__version__ for s in spans.calls())
+    finished = spans.exporter.get_finished_spans()
+    assert len(finished) == 13
+    assert {s.name for s in finished} == {"solwyn.call", "solwyn.run"}
+    assert all(s.instrumentation_scope.name == "solwyn" for s in finished)
+    assert all(s.instrumentation_scope.version == solwyn.__version__ for s in finished)
     _otel._reset_after_fork()
-    _otel._start_call_span().end()
+    start("run")
+    start("call")
     assert lookups == [("solwyn", solwyn.__version__), ("solwyn", solwyn.__version__)]
 
 
@@ -1303,12 +1313,15 @@ def test_call_tracer_resolution_can_reenter_without_recursion(spans, monkeypatch
 
     def get_tracer(*args, **kwargs):
         nested.append(_otel._start_call_span())
+        nested.append(_otel._start_run_span("run-tracer-reentry", None))
         return spans.tracer
 
     monkeypatch.setattr(spans.api, "get_tracer", get_tracer)
+    monkeypatch.setenv("SOLWYN_OTEL_SPANS", "true")
     _otel._start_call_span().end()
-    assert nested == [_otel._INACTIVE_CALL_SPAN]
+    assert nested == [_otel._INACTIVE_CALL_SPAN, _otel._INACTIVE_RUN_SPAN]
     assert len(spans.calls()) == 1
+    assert all(s.name != "solwyn.run" for s in spans.exporter.get_finished_spans())
 
 
 @pytest.mark.unit
