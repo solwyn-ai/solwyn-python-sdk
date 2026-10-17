@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextvars
 import dataclasses
 import enum
 import logging
@@ -3117,7 +3118,7 @@ class AsyncMetadataReporter(_ReporterBase):
         if self._flush_task is not None and not self._flush_task.done():
             return
         self._shutdown_event = asyncio.Event()
-        self._flush_task = asyncio.create_task(self._flush_loop())
+        self._flush_task = asyncio.create_task(self._flush_loop(), context=contextvars.Context())
 
     def _notify_untracked_observation(self) -> None:
         """Start/wake advisory delivery without awaiting or doing network I/O."""
@@ -3260,7 +3261,10 @@ class AsyncMetadataReporter(_ReporterBase):
         # in-hand item before re-raising — the seal below counts it, or a
         # cancelled close leaves it queued for the lifecycle rescue.
         await self._await_within(
-            asyncio.ensure_future(self._flush_remaining(deadline=deadline, final=True)), deadline
+            asyncio.create_task(
+                self._flush_remaining(deadline=deadline, final=True), context=contextvars.Context()
+            ),
+            deadline,
         )
         # Seal delivery: refuse enqueues from here on and claim any straggler a
         # producer thread appended after the final drain passed its queue
@@ -3604,6 +3608,7 @@ class AsyncMetadataReporter(_ReporterBase):
         task = asyncio.create_task(
             self._flush_breaker_reports(deadline=deadline, force=force),
             name="solwyn-breaker-reporter",
+            context=contextvars.Context(),
         )
         self._breaker_task = task
         return task
@@ -3665,6 +3670,7 @@ class AsyncMetadataReporter(_ReporterBase):
         task = asyncio.create_task(
             self._flush_untracked_reports(deadline=deadline),
             name="solwyn-untracked-surface-reporter",
+            context=contextvars.Context(),
         )
 
         def _continue_if_due(_completed: asyncio.Task[None]) -> None:

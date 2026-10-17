@@ -1125,6 +1125,9 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `agent_run_name` | `str \| None` | Run name passed to `solwyn.run(...)`, if any |
 | `lease_id` | `str \| None` | Id of the budget lease that funded the call: an opaque server-minted token, the same id the call's confirmation carries. Present only on lease-funded calls; omitted for reservation-funded, cached, fail-open, uncounted, and denied calls |
 | `provider_region` | `str \| None` | Cloud region of the serving endpoint (Bedrock — pricing is per model and region); omitted for other providers |
+| `trace_id` | `str \| None` | Random OpenTelemetry trace identifier active when the call starts (32 lowercase hex characters) |
+| `span_id` | `str \| None` | Random OpenTelemetry caller span identifier at call start (16 lowercase hex characters) |
+| `trace_sampled` | `bool \| None` | Whether that trace was sampled; an unsampled trace may be absent from your tracing backend |
 | `tags` | `object \| None` | Optional explicit customer-supplied tags from `solwyn.run(..., tags=...)` and `solwyn_tags=`. Never inferred from prompts or responses; omitted when empty or unset |
 | `deny_source` | `str \| None` | Structural denial source (`server`, sticky/local enforcement sources, or `aggregate_replay`) |
 | `deny_reason` | `str \| None` | Bounded structural reason for a denied call; never derived from content |
@@ -1136,6 +1139,15 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 
 Optional fields are omitted entirely when unset (never `null`), so payloads for
 providers that do not use them are byte-identical to earlier releases.
+
+Trace correlation captures only these two random identifiers and the sampled
+flag, never content, and only when your application already has an active,
+valid OpenTelemetry span. Install `solwyn[otel]` if your application does not
+already provide the optional OpenTelemetry API. Solwyn creates no spans and
+does not forward baggage or tracestate. Disable capture with
+`Solwyn(client, trace_correlation=False)` (or `AsyncSolwyn`) or
+`SOLWYN_TRACE_CORRELATION=false`. Unset correlation fields are omitted entirely
+from payloads. Aggregated denial replays carry no trace because they span calls.
 
 Token, output-bound, aggregate-count, pricing-basis, and non-token media
 quantities are each capped at 100,000,000 per event. Larger folded receipt

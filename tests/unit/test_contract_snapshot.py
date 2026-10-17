@@ -313,6 +313,9 @@ EXPECTED_METADATA_FIELDS = {
     "velocity_flags",
     "receipt_aggregate_count",
     "receipt_pricing_input_tokens",
+    "trace_id",
+    "span_id",
+    "trace_sampled",
 }
 
 

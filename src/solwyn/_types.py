@@ -39,9 +39,13 @@ from solwyn._constants import (
     PROVIDER_REGION_MAX_LENGTH,
     SERVICE_TIER_MAX_LENGTH,
     SIGNED_BIGINT_MAX,
+    SPAN_ID_HEX_LENGTH,
+    SPAN_ID_PATTERN,
     TAG_KEY_MAX_LENGTH,
     TAG_VALUE_MAX_LENGTH,
     TAGS_MAX_KEYS,
+    TRACE_ID_HEX_LENGTH,
+    TRACE_ID_PATTERN,
 )
 from solwyn._token_details import TokenDetails
 
@@ -466,6 +470,22 @@ class MetadataEvent(BaseModel):
             "LEASE_ID_MAX_LENGTH exactly as LeaseGrantResponse.lease_id, its source (D7)."
         ),
     )
+    trace_id: str | None = Field(
+        default=None,
+        max_length=TRACE_ID_HEX_LENGTH,
+        pattern=TRACE_ID_PATTERN,
+        description="Random OTel trace identifier active at call start; never content.",
+    )
+    span_id: str | None = Field(
+        default=None,
+        max_length=SPAN_ID_HEX_LENGTH,
+        pattern=SPAN_ID_PATTERN,
+        description="Random OTel caller span identifier at call start; requires trace_id.",
+    )
+    trace_sampled: bool | None = Field(
+        default=None,
+        description="OTel sampled flag at call start; requires trace_id.",
+    )
     provider_region: str | None = Field(
         default=None,
         max_length=PROVIDER_REGION_MAX_LENGTH,
@@ -524,6 +544,16 @@ class MetadataEvent(BaseModel):
             "card for a homogeneous aggregate receipt. Requires receipt_aggregate_count."
         ),
     )
+
+    @model_validator(mode="after")
+    def _validate_trace_context(self) -> MetadataEvent:
+        if self.trace_id == "0" * TRACE_ID_HEX_LENGTH:
+            raise ValueError("trace_id must not be all zeros")
+        if self.span_id == "0" * SPAN_ID_HEX_LENGTH:
+            raise ValueError("span_id must not be all zeros")
+        if self.trace_id is None and (self.span_id is not None or self.trace_sampled is not None):
+            raise ValueError("span_id and trace_sampled require trace_id")
+        return self
 
     @model_validator(mode="after")
     def _pricing_basis_requires_aggregate(self) -> MetadataEvent:

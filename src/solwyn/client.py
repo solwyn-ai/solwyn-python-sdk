@@ -34,6 +34,7 @@ from typing import Any, Literal, NamedTuple, NoReturn, cast
 import httpx
 from pydantic import ValidationError
 
+from solwyn import _otel
 from solwyn._base import (
     MediaSurfaceSpec,
     _AttemptContext,
@@ -48,6 +49,7 @@ from solwyn._control_plane_transport import (
     require_dual_transport,
     require_sync_transport,
 )
+from solwyn._otel import _TraceSnapshot
 from solwyn._privacy import (
     estimate_content_length,
     estimate_responses_content_length,
@@ -184,6 +186,7 @@ def _report_budget_denial(
     *,
     budget: BudgetCheckResult,
     agent_run: _RunContextSnapshot,
+    trace: _TraceSnapshot | None = None,
     model: str,
     provider: str,
     input_tokens: int,
@@ -208,6 +211,7 @@ def _report_budget_denial(
                 is_model_fallback=False,
                 call_id=call_id,
                 agent_run=agent_run,
+                trace=trace,
                 provider_region=provider_region,
                 modality=modality,
                 media_usage=media_usage,
@@ -233,6 +237,7 @@ def _raise_run_stopped(
     *,
     termination: RunTermination,
     agent_run: _RunContextSnapshot,
+    trace: _TraceSnapshot | None = None,
     model: str,
     provider: str,
     input_tokens: int,
@@ -261,6 +266,7 @@ def _raise_run_stopped(
                 is_model_fallback=False,
                 call_id=call_id,
                 agent_run=agent_run,
+                trace=trace,
                 provider_region=provider_region,
                 modality=modality,
                 media_usage=media_usage,
@@ -290,6 +296,7 @@ def _observe_run_control(
     client: Solwyn | AsyncSolwyn,
     *,
     agent_run: _RunContextSnapshot,
+    trace: _TraceSnapshot | None = None,
     model: str,
     provider: str,
     input_tokens: int,
@@ -310,6 +317,7 @@ def _observe_run_control(
             client,
             termination=termination,
             agent_run=agent_run,
+            trace=trace,
             model=model,
             provider=provider,
             input_tokens=input_tokens,
@@ -352,6 +360,7 @@ def _observe_run_control(
         client,
         termination=termination,
         agent_run=agent_run,
+        trace=trace,
         model=model,
         provider=provider,
         input_tokens=input_tokens,
@@ -370,6 +379,7 @@ def _postcheck_run_control(
     *,
     budget: BudgetCheckResult,
     agent_run: _RunContextSnapshot,
+    trace: _TraceSnapshot | None = None,
     model: str,
     provider: str,
     input_tokens: int,
@@ -427,6 +437,7 @@ def _postcheck_run_control(
         client,
         termination=termination,
         agent_run=agent_run,
+        trace=trace,
         model=model,
         provider=provider,
         input_tokens=input_tokens,
@@ -698,6 +709,7 @@ def _settle_stream_failure(
     is_model_fallback: bool,
     call_id: str,
     agent_run: _RunContextSnapshot,
+    trace: _TraceSnapshot | None = None,
     record_breaker_failure: bool,
     possibly_succeeded: bool | None,
     failover_error_class: str | None = None,
@@ -731,6 +743,7 @@ def _settle_stream_failure(
             call_id=call_id,
             possibly_succeeded=possibly_succeeded,
             agent_run=agent_run,
+            trace=trace,
             provider_region=provider_region,
             lease_id=_settlement_keys(budget)[1],
         )
@@ -748,6 +761,7 @@ def _settle_stream_wrap_failure(
     is_model_fallback: bool,
     call_id: str,
     agent_run: _RunContextSnapshot,
+    trace: _TraceSnapshot | None = None,
     exc: Exception,
 ) -> None:
     """Reconcile a dispatched stream whose Solwyn wrapper could not be built.
@@ -770,6 +784,7 @@ def _settle_stream_wrap_failure(
             is_model_fallback=is_model_fallback,
             call_id=call_id,
             agent_run=agent_run,
+            trace=trace,
             record_breaker_failure=False,
             possibly_succeeded=True,
             failover_error_class=type(exc).__name__,
@@ -789,6 +804,7 @@ def _make_stream_error_handler(
     is_model_fallback: bool,
     call_id: str,
     agent_run: _RunContextSnapshot,
+    trace: _TraceSnapshot | None = None,
     admission: CircuitBreakerAdmission | None = None,
     provider_failure: bool = True,
 ) -> Callable[[BaseException], None]:
@@ -813,6 +829,7 @@ def _make_stream_error_handler(
             is_model_fallback=is_model_fallback,
             call_id=call_id,
             agent_run=agent_run,
+            trace=trace,
             record_breaker_failure=provider_failure and isinstance(_exc, Exception),
             possibly_succeeded=True,
             # Ordinary established errors historically omitted this wire field.
@@ -839,6 +856,7 @@ def _make_stream_entry_error_handler(
     is_model_fallback: bool,
     call_id: str,
     agent_run: _RunContextSnapshot,
+    trace: _TraceSnapshot | None = None,
     admission: CircuitBreakerAdmission | None = None,
 ) -> Callable[[BaseException], None]:
     """Build the reconciliation callback for a stream that never established.
@@ -873,6 +891,7 @@ def _make_stream_entry_error_handler(
             is_model_fallback=is_model_fallback,
             call_id=call_id,
             agent_run=agent_run,
+            trace=trace,
             record_breaker_failure=isinstance(exc, Exception) and disp is not Disposition.FAIL_FAST,
             possibly_succeeded=True if disp is Disposition.POST_SEND_AMBIGUOUS else None,
             failover_error_class=type(exc).__name__,
@@ -920,6 +939,7 @@ def _make_async_stream_error_handler(
     is_model_fallback: bool,
     call_id: str,
     agent_run: _RunContextSnapshot,
+    trace: _TraceSnapshot | None = None,
     admission: CircuitBreakerAdmission | None = None,
     provider_failure: bool = True,
 ) -> Callable[[BaseException], Awaitable[None]]:
@@ -933,6 +953,7 @@ def _make_async_stream_error_handler(
         is_model_fallback=is_model_fallback,
         call_id=call_id,
         agent_run=agent_run,
+        trace=trace,
         admission=admission,
         provider_failure=provider_failure,
     )
@@ -954,6 +975,7 @@ def _make_async_stream_entry_error_handler(
     is_model_fallback: bool,
     call_id: str,
     agent_run: _RunContextSnapshot,
+    trace: _TraceSnapshot | None = None,
     admission: CircuitBreakerAdmission | None = None,
 ) -> Callable[[BaseException], Awaitable[None]]:
     sync_handler = _make_stream_entry_error_handler(
@@ -966,6 +988,7 @@ def _make_async_stream_entry_error_handler(
         is_model_fallback=is_model_fallback,
         call_id=call_id,
         agent_run=agent_run,
+        trace=trace,
         admission=admission,
     )
 
@@ -2271,6 +2294,7 @@ class Solwyn(_SolwynBase):
             kwargs.pop("solwyn_tags", None),
             default_tags=self._solwyn_config.tags,
         )
+        trace = _otel.capture_trace() if self._solwyn_config.trace_correlation else None
         requested_model = cast(str, kwargs["model"])
         call_id = str(uuid.uuid4())
         runtime = self._solwyn_runtimes[0]
@@ -2288,6 +2312,7 @@ class Solwyn(_SolwynBase):
         pending_velocity_rule, velocity_flags = _observe_run_control(
             self,
             agent_run=agent_run,
+            trace=trace,
             model=requested_model,
             provider=provider,
             input_tokens=est_in,
@@ -2326,6 +2351,7 @@ class Solwyn(_SolwynBase):
             self,
             budget=budget,
             agent_run=agent_run,
+            trace=trace,
             model=requested_model,
             provider=provider,
             input_tokens=est_in,
@@ -2351,6 +2377,7 @@ class Solwyn(_SolwynBase):
                 self,
                 budget=budget,
                 agent_run=agent_run,
+                trace=trace,
                 model=requested_model,
                 provider=provider,
                 input_tokens=est_in,
@@ -2415,6 +2442,7 @@ class Solwyn(_SolwynBase):
                         failover_error_class=type(exc).__name__,
                         call_id=call_id,
                         agent_run=agent_run,
+                        trace=trace,
                         provider_region=provider_region,
                         lease_id=_settlement_keys(budget)[1],
                     )
@@ -2511,6 +2539,7 @@ class Solwyn(_SolwynBase):
             call_id=call_id,
             service_tier=service_tier,
             agent_run=agent_run,
+            trace=trace,
             provider_region=provider_region,
             modality=spec.modality,
             media_usage=media_usage,
@@ -2536,6 +2565,7 @@ class Solwyn(_SolwynBase):
             kwargs.pop("solwyn_tags", None),
             default_tags=self._solwyn_config.tags,
         )
+        trace = _otel.capture_trace() if self._solwyn_config.trace_correlation else None
         requested_model = cast(str, kwargs["model"])
         # One reconciliation join key per intercepted call: threaded into
         # every served-provider metadata event AND its confirm so the Cloud API
@@ -2636,6 +2666,7 @@ class Solwyn(_SolwynBase):
         pending_velocity_rule, velocity_flags = _observe_run_control(
             self,
             agent_run=agent_run,
+            trace=trace,
             model=requested_model,
             provider=primary.adapter.name,
             input_tokens=est_in,
@@ -2674,6 +2705,7 @@ class Solwyn(_SolwynBase):
             self,
             budget=budget,
             agent_run=agent_run,
+            trace=trace,
             model=requested_model,
             provider=primary.adapter.name,
             input_tokens=est_in,
@@ -2701,6 +2733,7 @@ class Solwyn(_SolwynBase):
                 self,
                 budget=budget,
                 agent_run=agent_run,
+                trace=trace,
                 model=requested_model,
                 provider=primary.adapter.name,
                 input_tokens=est_in,
@@ -2967,6 +3000,7 @@ class Solwyn(_SolwynBase):
                                     call_id=call_id,
                                     possibly_succeeded=True if possibly_succeeded else None,
                                     agent_run=agent_run,
+                                    trace=trace,
                                     provider_region=_safe_extract_region(rt),
                                     lease_id=_settlement_keys(budget)[1],
                                 )
@@ -3032,6 +3066,7 @@ class Solwyn(_SolwynBase):
                             is_model_fallback=is_model_fallback,
                             call_id=call_id,
                             agent_run=agent_run,
+                            trace=trace,
                             admission=admission,
                         )
                         # The manager sends its request in __enter__, AFTER this
@@ -3047,6 +3082,7 @@ class Solwyn(_SolwynBase):
                             is_model_fallback=is_model_fallback,
                             call_id=call_id,
                             agent_run=agent_run,
+                            trace=trace,
                             admission=admission,
                         )
                         wrapped = _SyncResponsesStreamManagerWrapper(
@@ -3063,6 +3099,7 @@ class Solwyn(_SolwynBase):
                                 cost_routed=selection.cost_routed and not primary_reached,
                                 call_id=call_id,
                                 agent_run=agent_run,
+                                trace=trace,
                                 estimated_input_tokens=est_in,
                                 estimate_empty_usage=True,
                                 velocity_flags=velocity_flags,
@@ -3083,6 +3120,7 @@ class Solwyn(_SolwynBase):
                                 is_model_fallback=is_model_fallback,
                                 call_id=call_id,
                                 agent_run=agent_run,
+                                trace=trace,
                                 admission=admission,
                                 provider_failure=False,
                             ),
@@ -3112,6 +3150,7 @@ class Solwyn(_SolwynBase):
                             cost_routed=selection.cost_routed and not primary_reached,
                             call_id=call_id,
                             agent_run=agent_run,
+                            trace=trace,
                             estimated_input_tokens=est_in,
                             estimate_empty_usage=_surface == "responses",
                             termination_handle=termination_handle,
@@ -3134,6 +3173,7 @@ class Solwyn(_SolwynBase):
                             is_model_fallback=is_model_fallback,
                             call_id=call_id,
                             agent_run=agent_run,
+                            trace=trace,
                             exc=exc,
                         )
                         raise
@@ -3226,6 +3266,7 @@ class Solwyn(_SolwynBase):
                     call_id=call_id,
                     service_tier=service_tier,
                     agent_run=agent_run,
+                    trace=trace,
                     provider_region=provider_region,
                     velocity_flags=velocity_flags,
                     lease_id=lease_id,
@@ -3272,6 +3313,7 @@ class Solwyn(_SolwynBase):
                             is_model_fallback=is_model_fallback,
                             call_id=call_id,
                             agent_run=agent_run,
+                            trace=trace,
                             record_breaker_failure=False,
                             possibly_succeeded=True if usage_unknown else None,
                             failover_error_class=type(exc).__name__,
@@ -3300,6 +3342,7 @@ class Solwyn(_SolwynBase):
         primary_errored: bool,
         call_id: str,
         agent_run: _RunContextSnapshot,
+        trace: _TraceSnapshot | None = None,
         termination_handle: _TerminationHandle | None,
         estimated_input_tokens: int = 0,
         estimate_empty_usage: bool = False,
@@ -3398,6 +3441,7 @@ class Solwyn(_SolwynBase):
                 call_id=call_id,
                 service_tier=service_tier,
                 agent_run=agent_run,
+                trace=trace,
                 provider_region=provider_region,
                 velocity_flags=velocity_flags,
                 lease_id=lease_id,
@@ -3418,6 +3462,7 @@ class Solwyn(_SolwynBase):
                 is_model_fallback=is_model_fallback,
                 call_id=call_id,
                 agent_run=agent_run,
+                trace=trace,
                 admission=admission,
             )
 
@@ -3462,6 +3507,7 @@ class Solwyn(_SolwynBase):
                     is_model_fallback=is_model_fallback,
                     call_id=call_id,
                     agent_run=agent_run,
+                    trace=trace,
                     admission=admission,
                     provider_failure=False,
                 ),
@@ -3942,6 +3988,7 @@ class AsyncSolwyn(_SolwynBase):
             kwargs.pop("solwyn_tags", None),
             default_tags=self._solwyn_config.tags,
         )
+        trace = _otel.capture_trace() if self._solwyn_config.trace_correlation else None
         requested_model = cast(str, kwargs["model"])
         call_id = str(uuid.uuid4())
         runtime = self._solwyn_runtimes[0]
@@ -3956,6 +4003,7 @@ class AsyncSolwyn(_SolwynBase):
         pending_velocity_rule, velocity_flags = _observe_run_control(
             self,
             agent_run=agent_run,
+            trace=trace,
             model=requested_model,
             provider=provider,
             input_tokens=est_in,
@@ -3982,6 +4030,7 @@ class AsyncSolwyn(_SolwynBase):
             self,
             budget=budget,
             agent_run=agent_run,
+            trace=trace,
             model=requested_model,
             provider=provider,
             input_tokens=est_in,
@@ -4007,6 +4056,7 @@ class AsyncSolwyn(_SolwynBase):
                 self,
                 budget=budget,
                 agent_run=agent_run,
+                trace=trace,
                 model=requested_model,
                 provider=provider,
                 input_tokens=est_in,
@@ -4065,6 +4115,7 @@ class AsyncSolwyn(_SolwynBase):
                         failover_error_class=type(exc).__name__,
                         call_id=call_id,
                         agent_run=agent_run,
+                        trace=trace,
                         provider_region=provider_region,
                         lease_id=_settlement_keys(budget)[1],
                     )
@@ -4154,6 +4205,7 @@ class AsyncSolwyn(_SolwynBase):
             call_id=call_id,
             service_tier=service_tier,
             agent_run=agent_run,
+            trace=trace,
             provider_region=provider_region,
             modality=spec.modality,
             media_usage=media_usage,
@@ -4179,6 +4231,7 @@ class AsyncSolwyn(_SolwynBase):
             kwargs.pop("solwyn_tags", None),
             default_tags=self._solwyn_config.tags,
         )
+        trace = _otel.capture_trace() if self._solwyn_config.trace_correlation else None
         requested_model = cast(str, kwargs["model"])
         # One reconciliation join key per intercepted call: see the sync
         # _intercepted_call for the join/dedup contract.
@@ -4248,6 +4301,7 @@ class AsyncSolwyn(_SolwynBase):
         pending_velocity_rule, velocity_flags = _observe_run_control(
             self,
             agent_run=agent_run,
+            trace=trace,
             model=requested_model,
             provider=primary.adapter.name,
             input_tokens=est_in,
@@ -4286,6 +4340,7 @@ class AsyncSolwyn(_SolwynBase):
             self,
             budget=budget,
             agent_run=agent_run,
+            trace=trace,
             model=requested_model,
             provider=primary.adapter.name,
             input_tokens=est_in,
@@ -4310,6 +4365,7 @@ class AsyncSolwyn(_SolwynBase):
                 self,
                 budget=budget,
                 agent_run=agent_run,
+                trace=trace,
                 model=requested_model,
                 provider=primary.adapter.name,
                 input_tokens=est_in,
@@ -4567,6 +4623,7 @@ class AsyncSolwyn(_SolwynBase):
                                     call_id=call_id,
                                     possibly_succeeded=True if possibly_succeeded else None,
                                     agent_run=agent_run,
+                                    trace=trace,
                                     provider_region=_safe_extract_region(rt),
                                     lease_id=_settlement_keys(budget)[1],
                                 )
@@ -4631,6 +4688,7 @@ class AsyncSolwyn(_SolwynBase):
                             is_model_fallback=is_model_fallback,
                             call_id=call_id,
                             agent_run=agent_run,
+                            trace=trace,
                             admission=admission,
                         )
                         # The manager sends its request in __aenter__, AFTER this
@@ -4646,6 +4704,7 @@ class AsyncSolwyn(_SolwynBase):
                             is_model_fallback=is_model_fallback,
                             call_id=call_id,
                             agent_run=agent_run,
+                            trace=trace,
                             admission=admission,
                         )
                         wrapped = _AsyncResponsesStreamManagerWrapper(
@@ -4662,6 +4721,7 @@ class AsyncSolwyn(_SolwynBase):
                                 cost_routed=selection.cost_routed and not primary_reached,
                                 call_id=call_id,
                                 agent_run=agent_run,
+                                trace=trace,
                                 estimated_input_tokens=est_in,
                                 estimate_empty_usage=True,
                                 velocity_flags=velocity_flags,
@@ -4682,6 +4742,7 @@ class AsyncSolwyn(_SolwynBase):
                                 is_model_fallback=is_model_fallback,
                                 call_id=call_id,
                                 agent_run=agent_run,
+                                trace=trace,
                                 admission=admission,
                                 provider_failure=False,
                             ),
@@ -4711,6 +4772,7 @@ class AsyncSolwyn(_SolwynBase):
                             cost_routed=selection.cost_routed and not primary_reached,
                             call_id=call_id,
                             agent_run=agent_run,
+                            trace=trace,
                             estimated_input_tokens=est_in,
                             estimate_empty_usage=_surface == "responses",
                             termination_handle=termination_handle,
@@ -4733,6 +4795,7 @@ class AsyncSolwyn(_SolwynBase):
                             is_model_fallback=is_model_fallback,
                             call_id=call_id,
                             agent_run=agent_run,
+                            trace=trace,
                             exc=exc,
                         )
                         raise
@@ -4824,6 +4887,7 @@ class AsyncSolwyn(_SolwynBase):
                     call_id=call_id,
                     service_tier=service_tier,
                     agent_run=agent_run,
+                    trace=trace,
                     provider_region=provider_region,
                     velocity_flags=velocity_flags,
                     lease_id=lease_id,
@@ -4869,6 +4933,7 @@ class AsyncSolwyn(_SolwynBase):
                             is_model_fallback=is_model_fallback,
                             call_id=call_id,
                             agent_run=agent_run,
+                            trace=trace,
                             record_breaker_failure=False,
                             possibly_succeeded=True if usage_unknown else None,
                             failover_error_class=type(exc).__name__,
@@ -4897,6 +4962,7 @@ class AsyncSolwyn(_SolwynBase):
         primary_errored: bool,
         call_id: str,
         agent_run: _RunContextSnapshot,
+        trace: _TraceSnapshot | None = None,
         termination_handle: _TerminationHandle | None,
         estimated_input_tokens: int = 0,
         estimate_empty_usage: bool = False,
@@ -4993,6 +5059,7 @@ class AsyncSolwyn(_SolwynBase):
                 call_id=call_id,
                 service_tier=service_tier,
                 agent_run=agent_run,
+                trace=trace,
                 provider_region=provider_region,
                 velocity_flags=velocity_flags,
                 lease_id=lease_id,
@@ -5013,6 +5080,7 @@ class AsyncSolwyn(_SolwynBase):
                 is_model_fallback=is_model_fallback,
                 call_id=call_id,
                 agent_run=agent_run,
+                trace=trace,
                 admission=admission,
             )
 
@@ -5054,6 +5122,7 @@ class AsyncSolwyn(_SolwynBase):
                     is_model_fallback=is_model_fallback,
                     call_id=call_id,
                     agent_run=agent_run,
+                    trace=trace,
                     admission=admission,
                     provider_failure=False,
                 ),

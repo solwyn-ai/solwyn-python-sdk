@@ -26,6 +26,7 @@ from pydantic import BaseModel, ConfigDict
 
 from solwyn._constants import FAILOVER_ERROR_CLASS_MAX_LENGTH, ORDINARY_TOKEN_COUNT_MAX
 from solwyn._lifecycle import register_fork_reset
+from solwyn._otel import _TraceSnapshot
 from solwyn._routing import (
     CostPolicy,
     HealthBasedPolicy,
@@ -1746,6 +1747,7 @@ class _SolwynBase:
         sdk_instance_id: str | None = None,
         timestamp: datetime | None = None,
         agent_run: _RunContextSnapshot | None = None,
+        trace: _TraceSnapshot | None = None,
         provider_region: str | None = None,
         modality: Modality = "text",
         media_usage: MediaUsage | None = None,
@@ -1802,6 +1804,9 @@ class _SolwynBase:
             agent_run_id=agent_run_id,
             parent_agent_run_id=parent_agent_run_id,
             agent_run_name=agent_run_name,
+            trace_id=trace.trace_id if trace is not None else None,
+            span_id=trace.span_id if trace is not None else None,
+            trace_sampled=trace.trace_sampled if trace is not None else None,
             call_id=call_id,
             provider_region=provider_region,
             tags=tags,
@@ -1835,6 +1840,7 @@ class _SolwynBase:
         call_id: str,
         possibly_succeeded: bool | None = None,
         agent_run: _RunContextSnapshot | None = None,
+        trace: _TraceSnapshot | None = None,
         provider_region: str | None = None,
         lease_id: str | None = None,
     ) -> MetadataEvent:
@@ -1868,6 +1874,7 @@ class _SolwynBase:
             call_id=call_id,
             possibly_succeeded=possibly_succeeded,
             agent_run=agent_run,
+            trace=trace,
             provider_region=provider_region,
             lease_id=lease_id,
         )

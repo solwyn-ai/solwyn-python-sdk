@@ -143,6 +143,8 @@ class SolwynConfig(BaseModel):
     # Advisory reporting defaults on because silence is the failure mode;
     # disable only when optional control-plane egress must be zero.
     report_untracked_surfaces: bool = True
+    # Correlate events with an application's existing active OTel span.
+    trace_correlation: bool = True
     # Breaker reports POST only when a provider's snapshot changed since the
     # last successful send, plus a periodic full-refresh heartbeat so the
     # dashboard's advisory view never goes stale silently.
@@ -196,6 +198,7 @@ class SolwynConfig(BaseModel):
             "reporter_max_in_flight": "REPORTER_MAX_IN_FLIGHT",
             "breaker_reporting_enabled": "BREAKER_REPORTING_ENABLED",
             "report_untracked_surfaces": "REPORT_UNTRACKED_SURFACES",
+            "trace_correlation": "TRACE_CORRELATION",
             "breaker_report_heartbeat": "BREAKER_REPORT_HEARTBEAT",
             "reporter_max_send_attempts": "REPORTER_MAX_SEND_ATTEMPTS",
             "reporter_retry_backoff_base": "REPORTER_RETRY_BACKOFF_BASE",
@@ -217,6 +220,7 @@ class SolwynConfig(BaseModel):
                         "breaker_reporting_enabled",
                         "lease_enabled",
                         "report_untracked_surfaces",
+                        "trace_correlation",
                     }:
                         values[field] = env_val.lower() in ("true", "1", "yes")
                     else:
