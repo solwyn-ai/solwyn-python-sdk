@@ -326,7 +326,7 @@ The "never sent" entries above describe Solwyn's own injection policy. A `stream
 
 ## Media surfaces
 
-Beyond chat, Solwyn tracks the non-text surfaces that spend money. Each rides the same budget-check → provider call → confirm lifecycle as a chat call, tagged with its modality (`embedding`, `image`, `audio`, `video`) so Solwyn Cloud's PricingService prices it on the right card. There is no cross-provider failover for these surfaces — an embedding vector or a generated image isn't interchangeable across providers.
+Beyond chat, Solwyn tracks these billed API surfaces. Each rides the same budget-check → provider call → confirm lifecycle as a chat call, tagged with its modality (`text`, `embedding`, `image`, `audio`, `video`) for pricing. Decisions and media calls use the primary provider without model or provider failover.
 
 | Surface | OpenAI dialect (native + compatible) | Google (Gemini) |
 |---------|--------------------------------------|-----------------|
@@ -336,17 +336,39 @@ Beyond chat, Solwyn tracks the non-text surfaces that spend money. Each rides th
 | Audio — speech (TTS) | `client.audio.speech.create` | — |
 | Video | `client.videos.create` (Sora) | `client.models.generate_videos` (Veo) |
 | Responses | Native OpenAI + Azure OpenAI: `client.responses.create` / `.parse` / `.stream` | — |
+| Decisions | Native OpenAI only: `client.decisions.create` (`openai>=3.26`) | — |
 
 Billable quantities are read from the response's usage block where it exists (gpt-image token buckets, whisper duration) and derived from the request where a provider reports none — image counts from `n=`, TTS character counts from `input=`, video seconds from the request. Whatever the SDK can't observe stays `None`, and the call is tracked **unpriced** rather than settled at a silent $0. Only lengths, counts, durations, and variant selectors are ever measured — never the media itself.
 
 **Posture notes.**
 
+- **OpenAI Decisions uses text metering.** `decisions.create(...)` is budget-checked
+  on sync and async native OpenAI clients. Provider usage supplies input, output,
+  cache-read, cache-write, and reasoning token counts; missing or zeroed usage
+  falls back to a length estimate marked `token_details.is_estimated=True`.
+  Preflight counts text in `input` and question instructions, choices, and score
+  levels; image content contributes no estimated text tokens. Unmeasured output
+  retains its reserved lease bound, as do ambiguous failures or interruptions
+  after dispatch. Pass `model`, `input`, and `questions` as
+  top-level arguments; metering-field overrides and `stream` in `extra_body` are
+  refused before dispatch. The OpenAI `DecisionsToolRunner` and async twin meter
+  every API call when their `run(...)` method receives the Solwyn-wrapped client.
 - **Whisper needs a JSON `response_format` to be priced.** `whisper-1` reports its billable duration only under a JSON response format. A non-JSON `response_format` (`text` / `srt` / `vtt`) carries no usage, so the call is tracked unpriced with a one-time hint to pass `response_format="json"` (or `"verbose_json"`) for priced tracking.
 - **`gpt-4o-mini-tts` is untracked.** Token-billed TTS models publish no usage metadata, so their audio-output tokens are unobservable. Rather than settle a silent $0, the call follows the configured untracked posture (under the default `warn`, it passes through after a one-time warning with no budget check or cost event).
 - **`audio.translations` is untracked.** The translations sub-surface isn't intercepted yet, so it follows the same configured posture.
 
 ## Strict coverage controls
 
+- **OpenAI Decisions:** Native `decisions.create` no longer needs an
+  acknowledgment. Remove `decisions.create` from `acknowledge_untracked` on
+  native OpenAI clients: a stale token now raises `ConfigurationError`, including
+  when the acknowledgment list is shared with Azure or compatible clients.
+  Azure OpenAI and compatible providers retain their unmetered posture and exact
+  `decisions.create` token. Raw/streaming response
+  mirrors retain their separate exact-token guards. The read-only
+  `admin.organization.usage.decisions` endpoint reports historical organization
+  usage; it remains unmetered, requires its own exact acknowledgment in strict
+  mode, and never produces a settlement.
 - **OpenAI Responses:** Native OpenAI and Azure OpenAI
   `responses.create(...)`, `responses.parse(...)`, and the
   `responses.stream(...)` context-manager helper are budget-metered for sync
@@ -461,8 +483,8 @@ audit_client = Solwyn(
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
     guarded_namespaces="sha256:e3edd2abe9714eeab5344630a736407879cbcca27adace00b33bcf6f4aa3451a",
-    tracked="sha256:586f19c33f350871240a3498fbfa255c9759bec35e1285a8fccfeb937ec68148",
-    untracked="sha256:a5a720220b574d60d5362be2da73a09fe214ed4767f34879b0d35d2024493373",
+    tracked="sha256:a36c56e2099daf5e86aea8e925500ffc6792cb33d5dce377af742cbdd1e8c776",
+    untracked="sha256:261a7560c9b522ffe74db934f54e6546376b51c0834669f73afc23b5a8744147",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     scoped_escapes="sha256:a4f9670a680f5f35c1b64068a208f0eb14859ab845e34e33e7bf9febb9421815",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",

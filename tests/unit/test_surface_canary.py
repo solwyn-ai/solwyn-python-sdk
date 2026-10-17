@@ -597,6 +597,23 @@ def test_real_sdk_graph_has_no_unknown_ambiguous_or_shape_drifted_paths(
     assert first
     assert [row.path for row in first] == sorted(row.path for row in first)
     assert len({row.path for row in first}) == len(first)
+    if shape_key in {"openai_native_sync", "openai_native_async"}:
+        by_path = {row.path: row for row in first}
+        if "decisions.create" in by_path:  # Absent below openai 3.26.
+            from solwyn._surfaces import SURFACE_RULES
+
+            rules = {rule.rule_id: rule for rule in SURFACE_RULES}
+            create = rules[by_path["decisions.create"].rule_id]
+            assert create.kind is SurfaceKind.METERED
+            assert create.usage_basis is UsageBasis.PROVIDER_OR_ESTIMATE
+            for path in (
+                "decisions.with_raw_response.create",
+                "decisions.with_streaming_response.create",
+            ):
+                assert rules[by_path[path].rule_id].kind is SurfaceKind.UNMETERED_SPEND
+            report_path = "admin.organization.usage.decisions"
+            if report_path in by_path:  # The report was added after Decisions create.
+                assert rules[by_path[report_path].rule_id].kind is SurfaceKind.UNMETERED_SPEND
 
 
 @pytest.mark.unit
