@@ -1456,7 +1456,14 @@ def test_exact_inert_provider_configuration_is_safe_but_raw_callables_are_not() 
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("context_tuple", _DECLARED_CONTEXT_TUPLES[:12])
+@pytest.mark.parametrize(
+    "context_tuple",
+    [
+        context_tuple
+        for context_tuple in _DECLARED_CONTEXT_TUPLES
+        if SurfaceContext(*context_tuple).dialect in {"openai", "anthropic"}
+    ],
+)
 def test_timeout_accepts_configuration_values_without_admitting_callables_or_other_descriptors(
     context_tuple: tuple[str, str, str, str],
 ) -> None:

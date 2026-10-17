@@ -605,6 +605,8 @@ async def test_timeout_configuration_is_accessible_in_strict_mode(
     # Arrange: exercise every timeout-bearing real client variant, without sockets.
     capture = _capture_module()
     sdk = pytest.importorskip(capture.import_name_for_shape(shape_key))
+    if timeout_case == "httpx" and sdk.Timeout is not httpx.Timeout:
+        pytest.skip("SDK uses a different Timeout type; covered by native_timeout")
     shape = capture._SHAPES_BY_KEY[shape_key]
     client_name = {"openai": "OpenAI", "anthropic": "Anthropic", "together": "Together"}[
         shape.distribution

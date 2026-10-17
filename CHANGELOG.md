@@ -72,7 +72,8 @@ derived from git tags (hatch-vcs).
 - **Timeout configuration reads in strict mode.** Reading `client.timeout` on
   wrapped OpenAI, Anthropic, Azure OpenAI, Together, and OpenAI-compatible clients
   now preserves numeric, `None`, and timeout-object values without raising
-  `UntrackedSpendSurfaceError`, including clients configured with `with_options`.
+  `UntrackedSpendSurfaceError`, including raw clients copied with
+  `with_options(timeout=...)` before wrapping.
 
 ### Tests
 
