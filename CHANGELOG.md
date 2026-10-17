@@ -14,6 +14,12 @@ derived from git tags (hatch-vcs).
   and denied calls. These identifiers never contain prompts or responses.
   The OpenTelemetry API remains optional (`solwyn[otel]`); disable capture with
   `trace_correlation=False` or `SOLWYN_TRACE_CORRELATION=false`.
+- **Opt-in Anthropic conversation IDs.** Set `anthropic_conversation_id=True`
+  or `SOLWYN_ANTHROPIC_CONVERSATION_ID=true` to correlate native Anthropic
+  OpenTelemetry spans with the active Solwyn agent run. The SDK only extends
+  an existing `open_telemetry` mapping and preserves customer settings and
+  conversation IDs. The generated run ID stays on the span and is never sent
+  to Anthropic. Available with `anthropic>=1.14`; disabled by default.
 
 ### Changed
 

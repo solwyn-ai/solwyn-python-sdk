@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -41,7 +42,7 @@ def _violations(source: str) -> list[int]:
         return isinstance(node, ast.Dict) and all(literal_solwyn_key(key) for key in node.keys)
 
     violations = []
-    banned = {"record_exception", "content_mode", "max_content_bytes"}
+    banned = re.compile(r"\b(?:record_exception|content_mode|max_content_bytes)\b")
     for node in ast.walk(tree):
         name = (
             node.id
@@ -54,7 +55,7 @@ def _violations(source: str) -> list[int]:
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
             else None
         )
-        if name is not None and any(part in banned for part in name.split(".")):
+        if name is not None and banned.search(name):
             violations.append(node.lineno)
         if not isinstance(node, ast.Call):
             continue
@@ -121,6 +122,13 @@ def test_otel_privacy_guard_covers_all_source_modules() -> None:
         "options = {'content_mode': 'content'}",
         "options = {'max_content_bytes': 20}",
         "options.content_mode = 'content'",
+        "client.with_options(content_mode='content')",
+        "options['content_mode'] = 'content'",
+        "options.max_content_bytes = 1",
+        "content_mode = 'content'",
+        "getattr(options, 'max_content_bytes')",
+        "options = {'traces.content_mode': 'content'}",
+        "options = {'traces/content_mode': 'content'}",
         "from opentelemetry import propagate; propagate.inject(headers)",
         "from opentelemetry.propagate import inject as send; send(headers)",
         "import opentelemetry.propagate as p; p.inject(headers)",

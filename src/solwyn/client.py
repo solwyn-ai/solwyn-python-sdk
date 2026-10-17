@@ -2200,6 +2200,7 @@ class Solwyn(_SolwynBase):
         surface: str = "chat",
         responses_leaf: str = "create",
         on_dispatch: Callable[[], None] | None = None,
+        extra_client_options: Mapping[str, Any] | None = None,
     ) -> Any:
         """Dispatch one hop to the runtime's SDK client. Pure I/O - no metrics.
 
@@ -2216,6 +2217,7 @@ class Solwyn(_SolwynBase):
             client = client.with_options(
                 timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
+                **(extra_client_options or {}),
             )
         if surface == "responses":
             prepare = _responses_preparer(runtime.adapter)
@@ -2254,6 +2256,7 @@ class Solwyn(_SolwynBase):
         timeout: float,
         read_timeout: float,
         max_retries: int,
+        extra_client_options: Mapping[str, Any] | None = None,
     ) -> Any:
         """Dispatch one media hop to the runtime's SDK client. Pure I/O — no metrics.
 
@@ -2269,6 +2272,7 @@ class Solwyn(_SolwynBase):
             client = client.with_options(
                 timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
+                **(extra_client_options or {}),
             )
         method, call_kwargs = _media_prepare(
             runtime.adapter, surface, client, kwargs, timeout=read_timeout, max_retries=max_retries
@@ -2423,6 +2427,7 @@ class Solwyn(_SolwynBase):
                 timeout=_hop_connect_slice(deadline, 1),
                 read_timeout=tuning.failover_hop_read_timeout,
                 max_retries=0,
+                extra_client_options=self._extra_client_options(runtime, run_id=agent_run[0]),
             )
         except Exception as exc:
             # Nothing will settle this call: hand any lease reservation back
@@ -2857,6 +2862,7 @@ class Solwyn(_SolwynBase):
                 # this breaker's single HALF_OPEN probe slot, free it before the error
                 # propagates so the provider is not stranded HALF_OPEN with no probe.
                 try:
+                    extra_client_options = self._extra_client_options(rt, run_id=agent_run[0])
                     if _surface == "responses":
                         call_kwargs = dict(request_semantics)
                         served_model = requested_model
@@ -2916,6 +2922,7 @@ class Solwyn(_SolwynBase):
                             surface=_surface,
                             responses_leaf=_responses_leaf,
                             on_dispatch=mark_dispatched,
+                            extra_client_options=extra_client_options,
                         )
                         if (
                             is_streaming
@@ -3900,6 +3907,7 @@ class AsyncSolwyn(_SolwynBase):
         surface: str = "chat",
         responses_leaf: str = "create",
         on_dispatch: Callable[[], None] | None = None,
+        extra_client_options: Mapping[str, Any] | None = None,
     ) -> Any:
         """Dispatch one hop to the runtime's async SDK client. Pure I/O.
 
@@ -3916,6 +3924,7 @@ class AsyncSolwyn(_SolwynBase):
             client = client.with_options(
                 timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
+                **(extra_client_options or {}),
             )
         if surface == "responses":
             prepare = _responses_preparer(runtime.adapter)
@@ -3954,6 +3963,7 @@ class AsyncSolwyn(_SolwynBase):
         timeout: float,
         read_timeout: float,
         max_retries: int,
+        extra_client_options: Mapping[str, Any] | None = None,
     ) -> Any:
         """Dispatch one media hop to the runtime's async SDK client. Pure I/O.
 
@@ -3969,6 +3979,7 @@ class AsyncSolwyn(_SolwynBase):
             client = client.with_options(
                 timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
+                **(extra_client_options or {}),
             )
         method, call_kwargs = _media_prepare(
             runtime.adapter, surface, client, kwargs, timeout=read_timeout, max_retries=max_retries
@@ -4096,6 +4107,7 @@ class AsyncSolwyn(_SolwynBase):
                 timeout=_hop_connect_slice(deadline, 1),
                 read_timeout=tuning.failover_hop_read_timeout,
                 max_retries=0,
+                extra_client_options=self._extra_client_options(runtime, run_id=agent_run[0]),
             )
         except Exception as exc:
             # Nothing will settle this call: hand any lease reservation back
@@ -4486,6 +4498,7 @@ class AsyncSolwyn(_SolwynBase):
                 # this breaker's single HALF_OPEN probe slot, free it before the error
                 # propagates so the provider is not stranded HALF_OPEN with no probe.
                 try:
+                    extra_client_options = self._extra_client_options(rt, run_id=agent_run[0])
                     if _surface == "responses":
                         call_kwargs = dict(request_semantics)
                         served_model = requested_model
@@ -4545,6 +4558,7 @@ class AsyncSolwyn(_SolwynBase):
                             surface=_surface,
                             responses_leaf=_responses_leaf,
                             on_dispatch=mark_dispatched,
+                            extra_client_options=extra_client_options,
                         )
                         if (
                             is_streaming
