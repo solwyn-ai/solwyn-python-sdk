@@ -386,20 +386,28 @@ def test_detached_activation_non_lifo_exit_is_retryable() -> None:
 
 
 @pytest.mark.unit
-def test_detached_activation_copied_context_exit_is_soft_and_owner_can_pop() -> None:
+@pytest.mark.parametrize("copied_after_entry", [False, True])
+def test_detached_activation_foreign_exit_is_retryable(copied_after_entry) -> None:
     handle = solwyn.create_run("agent:Worker")
     owner_context = copy_context()
 
     def activate_in_owner() -> None:
+        foreign_context = copy_context()
         activation = handle.activate()
         activation.__enter__()
         # Copy after entry so the foreign context contains the frame but not
         # the ContextVar token's owning Context.
-        foreign_context = copy_context()
+        if copied_after_entry:
+            foreign_context = copy_context()
 
-        foreign_context.run(activation.__exit__, None, None, None)
+        with pytest.raises(RuntimeError, match="same context"):
+            foreign_context.run(activation.__exit__, None, None, None)
+        with pytest.raises(RuntimeError, match="activations are still active"):
+            handle.finish()
 
-        assert foreign_context.run(solwyn.current_run_context).id is None
+        assert foreign_context.run(solwyn.current_run_context).id == (
+            handle.run_id if copied_after_entry else None
+        )
         assert solwyn.current_run_context().id == handle.run_id
         activation.__exit__(None, None, None)
         assert solwyn.current_run_context().id is None

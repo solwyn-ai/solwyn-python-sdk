@@ -22,6 +22,7 @@ from solwyn._constants import (
     TRACE_ID_PATTERN,
 )
 from solwyn._env import _parse_bool
+from solwyn._lifecycle import register_fork_reset
 from solwyn.exceptions import RunStoppedError
 
 if TYPE_CHECKING:
@@ -162,12 +163,26 @@ class _RunSpanActivation:
 class _RunSpan:
     """One run span shared by all activations, ended once without exception data."""
 
-    def __init__(self, span: Any = None, trace: ModuleType | None = None) -> None:
+    def __init__(
+        self,
+        span: Any = None,
+        trace: ModuleType | None = None,
+        *,
+        parent_context: Any = None,
+    ) -> None:
         self._span = span
         self._trace = trace
-        self._lock = Lock()
+        self._parent_context = parent_context
+        # A generator finalizer can end or fail this same run span while an
+        # ordinary span operation on this thread holds its lock.
+        self._lock = RLock()
         self._ended = False
         self._error = False
+        if span is not None:
+            register_fork_reset(self)
+
+    def _reset_after_fork_in_child(self) -> None:
+        self._lock = RLock()
 
     def attach(self) -> _RunSpanActivation | None:
         if self._span is None or self._trace is None:
@@ -235,6 +250,18 @@ class _RunSpan:
 _INACTIVE_RUN_SPAN = _RunSpan()
 
 
+def _fallback_parent_context(trace: ModuleType, parent: _RunSpan | None) -> Any:
+    """Keep an in-step application parent; replace an inherited driver parent."""
+    if parent is None or parent._span is None:
+        return None
+    current = trace.get_current_span().get_span_context()
+    # Only immutable span identifiers/flags are read or retained, never the
+    # application's span object, attributes, events, or other context values.
+    if current.is_valid and current != parent._parent_context:
+        return None
+    return trace.set_span_in_context(parent._span)
+
+
 def _start_run_span(
     run_id: str, parent_run_id: str | None, *, parent: _RunSpan | None = None
 ) -> _RunSpan:
@@ -251,17 +278,14 @@ def _start_run_span(
         tracer = _get_call_tracer(trace)
         if tracer is None:
             return _INACTIVE_RUN_SPAN
-        parent_context = (
-            trace.set_span_in_context(parent._span)
-            if parent is not None and parent._span is not None
-            else None
-        )
+        parent_context = _fallback_parent_context(trace, parent)
+        parent_span_context = trace.get_current_span(parent_context).get_span_context()
         span = tracer.start_span("solwyn.run", kind=trace.SpanKind.INTERNAL, context=parent_context)
         if _span_is_exportable(span):
             span.set_attribute("solwyn.agent_run_id", run_id)
             if parent_run_id is not None:
                 span.set_attribute("solwyn.parent_agent_run_id", parent_run_id)
-            owner = _RunSpan(span, trace)
+            owner = _RunSpan(span, trace, parent_context=parent_span_context)
             transferred = True
             return owner
     except BaseException as exc:
@@ -518,11 +542,7 @@ def _start_call_span(*, parent: _RunSpan | None = None) -> _CallSpan:
         tracer = _get_call_tracer(trace)
         if tracer is None:
             return _INACTIVE_CALL_SPAN
-        parent_context = (
-            trace.set_span_in_context(parent._span)
-            if parent is not None and parent._span is not None
-            else None
-        )
+        parent_context = _fallback_parent_context(trace, parent)
         span = tracer.start_span(
             "solwyn.call", kind=trace.SpanKind.INTERNAL, context=parent_context
         )

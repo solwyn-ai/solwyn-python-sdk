@@ -448,7 +448,7 @@ def test_without_frame_introspection_shared_scope_does_not_guess_the_exiting_run
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
-@pytest.mark.parametrize("held_lock", ["registry", "scope", "record"])
+@pytest.mark.parametrize("held_lock", ["registry", "scope", "record", "handle"])
 def test_forked_child_can_resolve_and_close_run_with_inherited_locks_held(held_lock):
     subprocess.run(
         [
@@ -465,7 +465,8 @@ from solwyn import _run
 
 released = []
 _run._surrender_run = released.append
-scope = solwyn.run('chunks')
+handle = solwyn.create_run('chunks') if sys.argv[1] == 'handle' else None
+scope = handle.activate() if handle else solwyn.run('chunks')
 def chunks():
     with scope as rid:
         yield rid
@@ -477,8 +478,9 @@ rid = entered.run(next, generator)
 record = entered.run(_run._run_frames.get)[-1].record
 lock = {
     'registry': _run._generator_runs_lock,
-    'scope': scope._records_lock,
+    'scope': getattr(scope, '_records_lock', None),
     'record': record.lock,
+    'handle': handle._state_lock if handle else None,
 }[sys.argv[1]]
 held, release = Event(), Event()
 def hold():
@@ -493,12 +495,16 @@ if pid == 0:
     signal.alarm(2)
     assert solwyn.current_run_context().id is None
     base.copy().run(generator.close)
+    if handle:
+        handle.finish()
     assert released == [rid]
     os._exit(0)
 release.set()
 thread.join(5)
 _, status = os.waitpid(pid, 0)
 base.copy().run(generator.close)
+if handle:
+    handle.finish()
 assert os.waitstatus_to_exitcode(status) == 0, status
 """,
             held_lock,

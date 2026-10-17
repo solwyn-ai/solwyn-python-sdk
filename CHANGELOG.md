@@ -97,6 +97,13 @@ derived from git tags (hatch-vcs).
   activations can exit across yields and then finish normally. Threads started
   inside a step do not inherit a run recovered from the generator's stack;
   explicitly activate a detached handle in that work.
+  `start_run()` handles can also finish from their owning sync generator in a
+  later step, and calls inside an application span retain that tracing parent.
+- Abandoned cyclic sync streams no longer deadlock other requests during
+  garbage collection. Invalid generator scope exits retire their run before
+  the frame address can be reused. Helpers built with `@contextmanager` retain
+  ordinary copied-context and outliving-task attribution, and ordinary
+  detached activations keep their retryable wrong-context exit error.
 
 - **Timeout configuration reads in strict mode.** Reading `client.timeout` on
   wrapped OpenAI, Anthropic, Azure OpenAI, Together, and OpenAI-compatible clients
