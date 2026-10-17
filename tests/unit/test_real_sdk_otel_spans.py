@@ -168,6 +168,7 @@ async def test_call_span_lifecycle(spans, async_mode, media, outcome):
             solwyn.run("PRIVATE run name", tags={"private": "tag"}) as run_id,
         ):
             caller_id = caller.get_span_context().span_id
+            run_span = trace.get_current_span()
             if outcome == "run_stop":
                 from solwyn._run_control import mark_terminated
 
@@ -191,7 +192,7 @@ async def test_call_span_lifecycle(spans, async_mode, media, outcome):
                 assert not expected_error
             except (Exception, KeyboardInterrupt, asyncio.CancelledError):
                 assert expected_error
-            assert trace.get_current_span() is caller
+            assert trace.get_current_span() is run_span
     finally:
         if async_mode:
             await wrapper.close()
@@ -201,7 +202,9 @@ async def test_call_span_lifecycle(spans, async_mode, media, outcome):
     assert len(spans.calls()) == 1
     call = spans.calls()[0]
     assert call.kind == trace.SpanKind.INTERNAL
-    assert call.parent.span_id == caller_id
+    assert call.parent.span_id == run_span.get_span_context().span_id
+    run = next(s for s in spans.exporter.get_finished_spans() if s.name == "solwyn.run")
+    assert run.parent.span_id == caller_id
     assert spans.ends[call.context.span_id] == 1
     assert call.status.status_code == (
         trace.StatusCode.ERROR if expected_error else trace.StatusCode.OK
@@ -209,10 +212,8 @@ async def test_call_span_lifecycle(spans, async_mode, media, outcome):
     assert call.status.description is None
     assert not call.events
     for child in spans.exporter.get_finished_spans():
-        if child.name in {"provider.native", "provider.with_options"}:
+        if child.name in {"provider.native", "provider.with_options", "budget.httpx"}:
             assert child.parent.span_id == call.context.span_id
-        elif child.name == "budget.httpx":
-            assert child.parent.span_id == caller_id
     assert open_at_preflight == ([] if outcome == "run_stop" else [True])
     assert call.attributes["solwyn.agent_run_id"] == run_id
     assert call.attributes["solwyn.provider.requested"] == "openai"
@@ -349,6 +350,7 @@ async def test_native_anthropic_conversation_span_is_a_child_of_call(
             spans.tracer.start_as_current_span("caller") as caller,
             solwyn.run("PRIVATE run") as run,
         ):
+            run_span = trace.get_current_span()
             result = wrapper.messages.create(
                 model="claude-sonnet-5",
                 max_tokens=16,
@@ -364,7 +366,7 @@ async def test_native_anthropic_conversation_span_is_a_child_of_call(
                     assert [event.type for event in result][-1] == "message_stop"
             else:
                 assert result.usage.input_tokens == 10
-            assert trace.get_current_span() is caller
+            assert trace.get_current_span() is run_span
     finally:
         await _close(wrapper, async_mode)
 
@@ -378,7 +380,8 @@ async def test_native_anthropic_conversation_span_is_a_child_of_call(
     assert len(native) == 1
     assert native[0].parent == call.context
     assert native[0].attributes["gen_ai.conversation.id"] == run
-    assert call.parent == caller.get_span_context()
+    assert call.parent == run_span.get_span_context()
+    assert run_span.parent == caller.get_span_context()
     assert call.attributes["solwyn.agent_run_id"] == run
     assert set(call.attributes) == _IDENTITY | _BUDGET | _ATTEMPT | {"solwyn.agent_run_id"}
     assert not any(key.startswith("gen_ai.") for key in call.attributes)
@@ -466,7 +469,7 @@ async def test_inactive_spans_preserve_caller_context_and_correlation(
     monkeypatch.setattr(client, "_success_failover_reason", reasons)
 
     try:
-        with spans.tracer.start_as_current_span("caller") as caller:
+        with spans.tracer.start_as_current_span("caller") as caller, solwyn.run("PRIVATE run"):
             caller_context = caller.get_span_context()
             if surface == "media":
                 result = wrapper.embeddings.create(model="text-embedding-3-small", input="x")
@@ -490,6 +493,7 @@ async def test_inactive_spans_preserve_caller_context_and_correlation(
         drop.shutdown()
         record_only.shutdown()
     assert not spans.calls()
+    assert all(s.name != "solwyn.run" for s in spans.exporter.get_finished_spans())
     assert len(plane.ingested) == 1
     event = plane.ingested[0]
     assert event.span_id == (
@@ -707,20 +711,26 @@ async def test_responses_manager_span_lifetime(spans, async_mode, terminal):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_mode", [False, True])
 @pytest.mark.parametrize("surface", ["chat", "media", "responses"])
-async def test_real_httpx_preflight_preserves_caller_parent(spans, async_mode, surface):
+@pytest.mark.parametrize("spans_enabled", [False, True], ids=["spans-off", "spans-on"])
+@pytest.mark.parametrize("correlation", [False, True], ids=["trace-off", "trace-on"])
+async def test_real_httpx_preflight_span_is_a_child(
+    spans, async_mode, surface, spans_enabled, correlation
+):
     instrumentation = pytest.importorskip("opentelemetry.instrumentation.httpx")
     plane = FakeControlPlane()
     raw = _raw_client(async_mode)
     raw.chat.completions.create.return_value = _response()
     raw.embeddings.create.return_value = _response()
     raw.responses = SimpleNamespace(create=raw.chat.completions.create)
-    wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
-    instrumentation.HTTPXClientInstrumentor.instrument_client(
-        wrapper._solwyn_budget._http,
-        tracer_provider=spans.provider,
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(
+        raw, otel_spans=spans_enabled, trace_correlation=correlation
     )
-    try:
-        with spans.tracer.start_as_current_span("caller") as caller:
+    for http_client in (wrapper._solwyn_budget._http, wrapper._solwyn_reporter._http):
+        instrumentation.HTTPXClientInstrumentor.instrument_client(
+            http_client, tracer_provider=spans.provider
+        )
+    with spans.tracer.start_as_current_span("caller") as caller:
+        try:
             if surface == "media":
                 result = wrapper.embeddings.create(model="text-embedding-3-small", input="x")
             elif surface == "responses":
@@ -729,13 +739,30 @@ async def test_real_httpx_preflight_preserves_caller_parent(spans, async_mode, s
                 result = wrapper.chat.completions.create(model="gpt-5.5", messages=[])
             if async_mode:
                 await result
-    finally:
-        await _close(wrapper, async_mode)
-    call = spans.calls()[0]
+            assert trace.get_current_span() is caller
+        finally:
+            # Closing under the caller also exercises the reporter's isolated
+            # final flush, rather than masking context leaks by exiting first.
+            await _close(wrapper, async_mode)
+        assert trace.get_current_span() is caller
+    assert len(spans.calls()) == int(spans_enabled)
+    call_parent = spans.calls()[0].context if spans_enabled else caller.get_span_context()
     http_spans = [s for s in spans.exporter.get_finished_spans() if s.kind == trace.SpanKind.CLIENT]
-    assert len(http_spans) == 1
-    assert http_spans[0].parent.span_id == caller.get_span_context().span_id
-    assert http_spans[0].context.trace_id == call.context.trace_id
+    preflight = [
+        s
+        for s in http_spans
+        if s.attributes.get("url.full", s.attributes.get("http.url", "")).endswith("/budgets/check")
+    ]
+    background = [s for s in http_spans if s not in preflight]
+    assert len(preflight) == 1
+    assert preflight[0].parent == call_parent
+    assert preflight[0].context.trace_id == call_parent.trace_id
+    assert len(plane.confirms) == len(plane.ingested) == 1
+    assert len(background) >= 2  # Confirmation and metadata ingestion.
+    assert all(s.parent is None for s in background)
+    event = plane.ingested[0]
+    assert event.span_id == (trace.format_span_id(call_parent.span_id) if correlation else None)
+    assert event.trace_id == (trace.format_trace_id(call_parent.trace_id) if correlation else None)
 
 
 @pytest.mark.unit
@@ -1248,7 +1275,9 @@ def test_status_objects_are_portable_to_older_otel_sdks(spans, monkeypatch, outc
 
 
 @pytest.mark.unit
-def test_call_tracer_is_cached_with_version_and_reset_after_fork(spans, monkeypatch):
+@pytest.mark.parametrize("first", ["call", "run"])
+def test_call_and_run_spans_share_versioned_tracer_and_reset_after_fork(spans, monkeypatch, first):
+    monkeypatch.setenv("SOLWYN_OTEL_SPANS", "true")
     lookups = []
 
     def get_tracer(name, instrumenting_library_version=None):
@@ -1257,16 +1286,24 @@ def test_call_tracer_is_cached_with_version_and_reset_after_fork(spans, monkeypa
 
     monkeypatch.setattr(spans.api, "get_tracer", get_tracer)
 
-    def call(_):
-        _otel._start_call_span().end()
+    def start(kind):
+        if kind == "run":
+            _otel._start_run_span("run-tracer-cache", None).end()
+        else:
+            _otel._start_call_span().end()
 
+    start(first)
     with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(call, range(12)))
+        list(pool.map(start, ["call", "run"] * 6))
     assert lookups == [("solwyn", solwyn.__version__)]
-    assert len(spans.calls()) == 12
-    assert all(s.instrumentation_scope.version == solwyn.__version__ for s in spans.calls())
+    finished = spans.exporter.get_finished_spans()
+    assert len(finished) == 13
+    assert {s.name for s in finished} == {"solwyn.call", "solwyn.run"}
+    assert all(s.instrumentation_scope.name == "solwyn" for s in finished)
+    assert all(s.instrumentation_scope.version == solwyn.__version__ for s in finished)
     _otel._reset_after_fork()
-    _otel._start_call_span().end()
+    start("run")
+    start("call")
     assert lookups == [("solwyn", solwyn.__version__), ("solwyn", solwyn.__version__)]
 
 
@@ -1276,18 +1313,22 @@ def test_call_tracer_resolution_can_reenter_without_recursion(spans, monkeypatch
 
     def get_tracer(*args, **kwargs):
         nested.append(_otel._start_call_span())
+        nested.append(_otel._start_run_span("run-tracer-reentry", None))
         return spans.tracer
 
     monkeypatch.setattr(spans.api, "get_tracer", get_tracer)
+    monkeypatch.setenv("SOLWYN_OTEL_SPANS", "true")
     _otel._start_call_span().end()
-    assert nested == [_otel._INACTIVE_CALL_SPAN]
+    assert nested == [_otel._INACTIVE_CALL_SPAN, _otel._INACTIVE_RUN_SPAN]
     assert len(spans.calls()) == 1
+    assert all(s.name != "solwyn.run" for s in spans.exporter.get_finished_spans())
 
 
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_mode", [False, True])
-async def test_native_anthropic_span_is_a_child(spans, async_mode):
+@pytest.mark.parametrize("run_scope", [False, True])
+async def test_native_anthropic_span_is_a_child(spans, async_mode, run_scope):
     anthropic = pytest.importorskip("anthropic", minversion="1.14.0")
     httpx2 = pytest.importorskip("httpx2")
     response_body = {
@@ -1310,7 +1351,11 @@ async def test_native_anthropic_span_is_a_child(spans, async_mode):
     plane = FakeControlPlane()
     wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
     try:
-        with spans.tracer.start_as_current_span("caller") as caller:
+        with (
+            spans.tracer.start_as_current_span("caller") as caller,
+            solwyn.run("PRIVATE run") if run_scope else nullcontext() as run_id,
+        ):
+            active_span = trace.get_current_span()
             result = wrapper.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4,
@@ -1319,7 +1364,7 @@ async def test_native_anthropic_span_is_a_child(spans, async_mode):
             if async_mode:
                 result = await result
             assert result.usage.input_tokens == 3
-            assert trace.get_current_span() is caller
+            assert trace.get_current_span() is active_span
     finally:
         await _close(wrapper, async_mode)
     call = spans.calls()[0]
@@ -1328,7 +1373,14 @@ async def test_native_anthropic_span_is_a_child(spans, async_mode):
     ]
     assert len(native) == 1
     assert native[0].parent.span_id == call.context.span_id
-    assert call.parent.span_id == caller.get_span_context().span_id
+    assert call.parent.span_id == active_span.get_span_context().span_id
+    if run_scope:
+        run = next(s for s in spans.exporter.get_finished_spans() if s.name == "solwyn.run")
+        assert run.parent.span_id == caller.get_span_context().span_id
+        assert dict(run.attributes) == {"solwyn.agent_run_id": run_id}
+        assert spans.ends[run.context.span_id] == 1
     assert plane.ingested[0].span_id == trace.format_span_id(call.context.span_id)
     assert not call.events
-    assert set(call.attributes) == _IDENTITY | _BUDGET | _ATTEMPT
+    assert set(call.attributes) == (
+        _IDENTITY | _BUDGET | _ATTEMPT | ({"solwyn.agent_run_id"} if run_scope else set())
+    )

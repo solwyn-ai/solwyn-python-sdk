@@ -2363,18 +2363,19 @@ class Solwyn(_SolwynBase):
         #    unbilled-model media call proceeds untracked rather than being denied;
         #    fail-open is intentional here — Solwyn never blocks a call just because
         #    it cannot yet price it.
-        budget = self._solwyn_budget.check_budget(
-            estimated_input_tokens=est_in,
-            model=requested_model,
-            provider=provider,
-            timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
-            modality=spec.modality,
-            estimated_media=estimated_media,
-            agent_run_id=agent_run[0],
-            tags=agent_run[2],
-            call_id=call_id,
-            estimated_output_bound=estimated_output_bound,
-        )
+        with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
+            budget = self._solwyn_budget.check_budget(
+                estimated_input_tokens=est_in,
+                model=requested_model,
+                provider=provider,
+                timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
+                modality=spec.modality,
+                estimated_media=estimated_media,
+                agent_run_id=agent_run[0],
+                tags=agent_run[2],
+                call_id=call_id,
+                estimated_output_bound=estimated_output_bound,
+            )
         _call_span.budget(budget)
         _postcheck_run_control(
             self,
@@ -2720,33 +2721,34 @@ class Solwyn(_SolwynBase):
             provider_region=provider_region,
             estimated_output_bound=estimated_output_bound,
         )
-        if _surface == "responses":
-            budget = self._solwyn_budget.check_budget(
-                estimated_input_tokens=est_in,
-                model=requested_model,
-                provider=primary.adapter.name,
-                fallback_providers=fallback_providers,
-                fallback_models=fallback_models,
-                timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
-                modality="text",
-                agent_run_id=agent_run[0],
-                tags=agent_run[2],
-                call_id=call_id,
-                estimated_output_bound=estimated_output_bound,
-            )
-        else:
-            budget = self._solwyn_budget.check_budget(
-                estimated_input_tokens=est_in,
-                model=requested_model,
-                provider=primary.adapter.name,
-                fallback_providers=fallback_providers,
-                fallback_models=fallback_models,
-                timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
-                agent_run_id=agent_run[0],
-                tags=agent_run[2],
-                call_id=call_id,
-                estimated_output_bound=estimated_output_bound,
-            )
+        with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
+            if _surface == "responses":
+                budget = self._solwyn_budget.check_budget(
+                    estimated_input_tokens=est_in,
+                    model=requested_model,
+                    provider=primary.adapter.name,
+                    fallback_providers=fallback_providers,
+                    fallback_models=fallback_models,
+                    timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
+                    modality="text",
+                    agent_run_id=agent_run[0],
+                    tags=agent_run[2],
+                    call_id=call_id,
+                    estimated_output_bound=estimated_output_bound,
+                )
+            else:
+                budget = self._solwyn_budget.check_budget(
+                    estimated_input_tokens=est_in,
+                    model=requested_model,
+                    provider=primary.adapter.name,
+                    fallback_providers=fallback_providers,
+                    fallback_models=fallback_models,
+                    timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
+                    agent_run_id=agent_run[0],
+                    tags=agent_run[2],
+                    call_id=call_id,
+                    estimated_output_bound=estimated_output_bound,
+                )
         _call_span.budget(budget)
         _postcheck_run_control(
             self,
@@ -4105,18 +4107,19 @@ class AsyncSolwyn(_SolwynBase):
             media_usage=estimated_media,
         )
 
-        budget = await self._solwyn_budget.check_budget(
-            estimated_input_tokens=est_in,
-            model=requested_model,
-            provider=provider,
-            timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
-            modality=spec.modality,
-            estimated_media=estimated_media,
-            agent_run_id=agent_run[0],
-            tags=agent_run[2],
-            call_id=call_id,
-            estimated_output_bound=estimated_output_bound,
-        )
+        with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
+            budget = await self._solwyn_budget.check_budget(
+                estimated_input_tokens=est_in,
+                model=requested_model,
+                provider=provider,
+                timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
+                modality=spec.modality,
+                estimated_media=estimated_media,
+                agent_run_id=agent_run[0],
+                tags=agent_run[2],
+                call_id=call_id,
+                estimated_output_bound=estimated_output_bound,
+            )
         _call_span.budget(budget)
         _postcheck_run_control(
             self,
@@ -4418,33 +4421,34 @@ class AsyncSolwyn(_SolwynBase):
             provider_region=provider_region,
             estimated_output_bound=estimated_output_bound,
         )
-        if _surface == "responses":
-            budget = await self._solwyn_budget.check_budget(
-                estimated_input_tokens=est_in,
-                model=requested_model,
-                provider=primary.adapter.name,
-                fallback_providers=fallback_providers,
-                fallback_models=fallback_models,
-                timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
-                modality="text",
-                agent_run_id=agent_run[0],
-                tags=agent_run[2],
-                call_id=call_id,
-                estimated_output_bound=estimated_output_bound,
-            )
-        else:
-            budget = await self._solwyn_budget.check_budget(
-                estimated_input_tokens=est_in,
-                model=requested_model,
-                provider=primary.adapter.name,
-                fallback_providers=fallback_providers,
-                fallback_models=fallback_models,
-                timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
-                agent_run_id=agent_run[0],
-                tags=agent_run[2],
-                call_id=call_id,
-                estimated_output_bound=estimated_output_bound,
-            )
+        with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
+            if _surface == "responses":
+                budget = await self._solwyn_budget.check_budget(
+                    estimated_input_tokens=est_in,
+                    model=requested_model,
+                    provider=primary.adapter.name,
+                    fallback_providers=fallback_providers,
+                    fallback_models=fallback_models,
+                    timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
+                    modality="text",
+                    agent_run_id=agent_run[0],
+                    tags=agent_run[2],
+                    call_id=call_id,
+                    estimated_output_bound=estimated_output_bound,
+                )
+            else:
+                budget = await self._solwyn_budget.check_budget(
+                    estimated_input_tokens=est_in,
+                    model=requested_model,
+                    provider=primary.adapter.name,
+                    fallback_providers=fallback_providers,
+                    fallback_models=fallback_models,
+                    timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
+                    agent_run_id=agent_run[0],
+                    tags=agent_run[2],
+                    call_id=call_id,
+                    estimated_output_bound=estimated_output_bound,
+                )
         _call_span.budget(budget)
         _postcheck_run_control(
             self,

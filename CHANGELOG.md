@@ -9,14 +9,25 @@ derived from git tags (hatch-vcs).
 
 ### Added
 
+- **Opt-in OpenTelemetry run spans.** The existing `otel_spans` option also
+  enables `solwyn.run` spans for run scopes and lifecycle handles. Run-span
+  opt-in stays enabled process-wide after the first opted-in wrapper or run.
+  Detached runs share one span across task/thread activations and end once at finish;
+  application and provider-call spans inherit the active run's trace. Run
+  attributes contain only run and parent-run IDs, never names, tags, content,
+  or exception messages. Exceptions leaving a scope or activation mark the
+  run as failed, and garbage collection ends abandoned handle spans.
+
 - **Opt-in OpenTelemetry call spans.** Enable `otel_spans=True` or
   `SOLWYN_OTEL_SPANS=true` to emit a `solwyn.call` span around budget preflight,
   provider dispatch, failover, and stream lifetime. The closed `solwyn.*`
   attribute allowlist contains call, routing, and budget metadata, never cost,
   token usage, content, tags, or exception messages. Trace correlation uses the
   call span only when it is recording and sampled; idle tracing preserves the
-  caller's context. Only provider dispatch runs with the call span current;
-  budget requests retain the application's current parent.
+  caller's context. Budget checks and provider dispatch run with the call span
+  current, so instrumented budget requests and native provider spans nest
+  beneath it. Background confirmations and reporting keep an isolated context;
+  the call span is never current during application stream iteration.
 
 - **Optional OpenTelemetry trace correlation.** Events include the active
   caller's trace ID, span ID, and sampled flag, including streaming, failover,

@@ -1,4 +1,4 @@
-"""Optional, sans-I/O trace correlation and content-free call spans.
+"""Optional, sans-I/O trace correlation and content-free call/run spans.
 
 Importing Solwyn never imports OpenTelemetry. Customer spans are read only via
 their context; attributes and events are never read, even on our own spans.
@@ -21,6 +21,7 @@ from solwyn._constants import (
     TRACE_ID_HEX_LENGTH,
     TRACE_ID_PATTERN,
 )
+from solwyn._env import _parse_bool
 from solwyn.exceptions import RunStoppedError
 
 if TYPE_CHECKING:
@@ -46,6 +47,9 @@ CALL_SPAN_ATTRIBUTES = frozenset(
         "solwyn.lease_funded",
     }
 )
+RUN_SPAN_ATTRIBUTES = frozenset({"solwyn.agent_run_id", "solwyn.parent_agent_run_id"})
+SPAN_ATTRIBUTES = CALL_SPAN_ATTRIBUTES | RUN_SPAN_ATTRIBUTES
+SPAN_NAMES = frozenset({"solwyn.call", "solwyn.run"})
 
 _trace_id_pattern = re.compile(TRACE_ID_PATTERN)
 _span_id_pattern = re.compile(SPAN_ID_PATTERN)
@@ -56,6 +60,7 @@ _trace_api_loading = False
 _call_tracer: Any = None
 _call_tracer_loading = False
 _NOOP_CONTEXT = nullcontext()
+_run_spans_opted_in = False
 
 
 def _reset_after_fork() -> None:
@@ -111,6 +116,158 @@ def _get_call_tracer(trace: ModuleType) -> Any:
                 finally:
                     _call_tracer_loading = False
     return _call_tracer
+
+
+def _enable_run_spans() -> None:
+    """Latch process-wide opt-in; fork repair keeps the value and replaces the lock."""
+    global _run_spans_opted_in
+    with _trace_api_lock:
+        _run_spans_opted_in = True
+
+
+def _run_spans_enabled() -> bool:
+    if not _run_spans_opted_in and _parse_bool(os.environ.get("SOLWYN_OTEL_SPANS", "")):
+        _enable_run_spans()
+    return _run_spans_opted_in
+
+
+def _span_is_exportable(span: Any) -> bool:
+    """Never adopt or propagate an allocated but unexported child identifier."""
+    context = span.get_span_context()
+    return bool(span.is_recording() and context.is_valid and context.trace_flags.sampled)
+
+
+class _RunSpanActivation:
+    """One context-local attachment, independent of the logical run's lifetime."""
+
+    def __init__(self, api: ModuleType, token: Any, prior: Any) -> None:
+        self._api = api
+        self._token = token
+        self._prior = prior
+
+    def detach(self, *, restore: bool = False) -> None:
+        # A copied-context finalizer cannot reset the original token. Restore
+        # its prior context just like the run ContextVar fallback. Also handle
+        # custom OTel runtimes whose detach raises rather than swallowing it.
+        if not restore:
+            try:
+                self._api.detach(self._token)
+                return
+            except BaseException:
+                pass
+        with suppress(BaseException):
+            self._api.attach(self._prior)
+
+
+class _RunSpan:
+    """One run span shared by all activations, ended once without exception data."""
+
+    def __init__(self, span: Any = None, trace: ModuleType | None = None) -> None:
+        self._span = span
+        self._trace = trace
+        self._lock = Lock()
+        self._ended = False
+        self._error = False
+
+    def attach(self) -> _RunSpanActivation | None:
+        if self._span is None or self._trace is None:
+            return None
+        api = None
+        prior = None
+        token = None
+        transferred = False
+        try:
+            from opentelemetry import context
+
+            api = context
+            prior = context.get_current()
+            token = context.attach(self._trace.set_span_in_context(self._span))
+            activation = _RunSpanActivation(context, token, prior)
+            transferred = True
+            return activation
+        except Exception:
+            return None
+        finally:
+            # An interrupt can land after attach mutates the context, before
+            # its token/owner reaches the scope. Retire any token we obtained
+            # and restore the saved context even when attach never returned.
+            if not transferred and api is not None:
+                if token is not None:
+                    with suppress(BaseException):
+                        api.detach(token)
+                if prior is not None:
+                    with suppress(BaseException):
+                        api.attach(prior)
+
+    def failed(self) -> None:
+        if self._span is not None:
+            with self._lock:
+                self._error = True
+
+    def finalize_on_gc(self, owner: object) -> weakref.finalize[..., object] | None:
+        if self._span is None:
+            return None
+        finalizer = weakref.finalize(owner, self.end, error=True)
+        finalizer.atexit = False
+        return finalizer
+
+    def end(self, *, error: bool = False) -> None:
+        if self._span is None or self._trace is None:
+            return
+        with self._lock:
+            if self._ended:
+                return
+            self._ended = True
+            error |= self._error
+        try:
+            self._span.set_status(
+                self._trace.Status(
+                    self._trace.StatusCode.ERROR if error else self._trace.StatusCode.OK
+                )
+            )
+        except Exception:
+            pass
+        finally:
+            with suppress(Exception):
+                self._span.end()
+
+
+_INACTIVE_RUN_SPAN = _RunSpan()
+
+
+def _start_run_span(run_id: str, parent_run_id: str | None) -> _RunSpan:
+    """Create a detached run span only when opted in and eligible for export."""
+    if not _run_spans_enabled():
+        return _INACTIVE_RUN_SPAN
+    span = None
+    trace = None
+    transferred = False
+    try:
+        trace = _get_trace_api()
+        if trace is None:
+            return _INACTIVE_RUN_SPAN
+        tracer = _get_call_tracer(trace)
+        if tracer is None:
+            return _INACTIVE_RUN_SPAN
+        span = tracer.start_span("solwyn.run", kind=trace.SpanKind.INTERNAL)
+        if _span_is_exportable(span):
+            span.set_attribute("solwyn.agent_run_id", run_id)
+            if parent_run_id is not None:
+                span.set_attribute("solwyn.parent_agent_run_id", parent_run_id)
+            owner = _RunSpan(span, trace)
+            transferred = True
+            return owner
+    except BaseException as exc:
+        if span is not None and trace is not None:
+            with suppress(Exception):
+                span.set_status(trace.Status(trace.StatusCode.ERROR))
+        if not isinstance(exc, Exception):
+            raise
+    finally:
+        if span is not None and not transferred:
+            with suppress(Exception):
+                span.end()
+    return _INACTIVE_RUN_SPAN
 
 
 class _TraceSnapshot(NamedTuple):
@@ -192,7 +349,7 @@ class _CallSpan:
 
     @contextmanager
     def current(self) -> Iterator[None]:
-        """Attach only for provider dispatch; never across a stream return."""
+        """Attach only for budget checks and dispatch; never across a stream return."""
         if self._span is None:
             yield
             return
@@ -355,8 +512,7 @@ def _start_call_span() -> _CallSpan:
         if tracer is None:
             return _INACTIVE_CALL_SPAN
         span = tracer.start_span("solwyn.call", kind=trace.SpanKind.INTERNAL)
-        context = span.get_span_context()
-        if span.is_recording() and context.is_valid and context.trace_flags.sampled:
+        if _span_is_exportable(span):
             owner = _CallSpan(span, trace)
             transferred = True
             return owner

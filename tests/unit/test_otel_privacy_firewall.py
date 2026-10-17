@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from solwyn._otel import CALL_SPAN_ATTRIBUTES
+from solwyn._otel import SPAN_ATTRIBUTES, SPAN_NAMES
 
 SDK_SRC = Path(__file__).resolve().parents[2] / "src"
 
@@ -42,15 +42,11 @@ def _violations(source: str) -> list[int]:
         return (
             isinstance(node, ast.Constant)
             and isinstance(node.value, str)
-            and node.value.startswith("solwyn.")
+            and node.value in SPAN_NAMES
         )
 
     def literal_solwyn_key(node: ast.expr | None) -> bool:
-        return (
-            literal_solwyn_name(node)
-            and isinstance(node, ast.Constant)
-            and node.value in CALL_SPAN_ATTRIBUTES
-        )
+        return isinstance(node, ast.Constant) and node.value in SPAN_ATTRIBUTES
 
     def literal_solwyn_attributes(node: ast.expr) -> bool:
         # Dict expansion has a None key, so even a partial literal cannot hide
@@ -158,6 +154,9 @@ def test_otel_privacy_guard_covers_all_source_modules() -> None:
         "span.update_name('provider.call')",
         "span.update_name(**kwargs)",
         "span.set_attribute('solwyn.unknown', prompt)",
+        "span.set_attribute('solwyn.agent_run_name', name)",
+        "span.set_attribute('solwyn.tags', tags)",
+        "tracer.start_span('solwyn.unknown')",
         "span.set_attributes({'solwyn.unknown': prompt})",
         "tracer.start_span('solwyn.call', attributes={'solwyn.unknown': prompt})",
         "Link(ctx, {'gen_ai.prompt': prompt})",
@@ -234,6 +233,8 @@ def test_otel_privacy_guard_rejects_forbidden_operations(source: str) -> None:
         "span.set_attributes(attributes={'solwyn.provider.served': provider})",
         "span.set_attributes({})",
         "tracer.start_span('solwyn.call', attributes={'solwyn.call_id': call_id})",
+        "tracer.start_span('solwyn.run', attributes={'solwyn.agent_run_id': run_id})",
+        "span.set_attribute('solwyn.parent_agent_run_id', parent_id)",
         "tracer.start_as_current_span('solwyn.call', "
         "attributes={'solwyn.provider.served': provider})",
         "tracer.start_span('solwyn.call', context, kind, {'solwyn.call_id': call_id})",
