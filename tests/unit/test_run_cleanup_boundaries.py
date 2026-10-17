@@ -256,3 +256,52 @@ assert not thread_errors, thread_errors
         text=True,
         timeout=15,
     )
+
+
+@pytest.mark.parametrize("wrapper", ["sync", "async", "sync_manager", "async_manager"])
+def test_stream_termination_finalizer_cannot_reenter_the_run_control_lock(wrapper):
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import gc, sys
+from unittest.mock import MagicMock
+from solwyn import _run_control
+from solwyn._lifecycle import _drain_run_cleanups
+from solwyn.providers._accumulator import StreamUsageAccumulator
+from solwyn.stream import (SyncStreamWrapper, AsyncStreamWrapper,
+    _SyncResponsesStreamManagerWrapper, _AsyncResponsesStreamManagerWrapper)
+gc.disable()
+handle = _run_control._acquire_termination_handle('stream')
+def done(*args):
+    pass
+async def async_done(*args):
+    pass
+kind = sys.argv[1]
+if kind.endswith('manager'):
+    cls = (_SyncResponsesStreamManagerWrapper if kind == 'sync_manager'
+           else _AsyncResponsesStreamManagerWrapper)
+    callback = done if kind == 'sync_manager' else async_done
+    stream = cls(None, done, on_error=callback, on_entry_error=callback,
+                 on_abandoned_before_entry=callback, abort_release=handle.release)
+else:
+    cls = SyncStreamWrapper if kind == 'sync' else AsyncStreamWrapper
+    callback = done if kind == 'sync' else async_done
+    stream = cls(None, MagicMock(spec=StreamUsageAccumulator), callback, callback,
+                 abort_release=handle.release)
+stream._stream = stream
+del stream
+with _run_control._STATE.lock:
+    gc.collect()
+_drain_run_cleanups()
+assert handle.released
+assert not _run_control._STATE.active_handles
+""",
+            wrapper,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )

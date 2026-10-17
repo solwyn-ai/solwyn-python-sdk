@@ -290,7 +290,8 @@ def test_shared_scope_without_introspection_does_not_retain_ambiguous_records(mo
     assert not scope._open_runs
 
 
-def test_started_generator_finish_refusal_unregisters_until_owner_retries():
+@pytest.mark.parametrize("copied", [False, True])
+def test_started_generator_finish_refusal_unregisters_until_owner_retries(copied):
     def chunks():
         handle = solwyn.start_run("started")
         try:
@@ -302,8 +303,10 @@ def test_started_generator_finish_refusal_unregisters_until_owner_retries():
     entered = copy_context()
     handle = entered.run(next, generator)
     try:
+        refused = entered.copy() if copied else copy_context()
         with pytest.raises(RuntimeError, match="same context"):
-            copy_context().run(handle.finish)
+            refused.run(handle.finish)
+        assert refused.run(solwyn.current_run_context).id == (handle.run_id if copied else None)
         assert id(generator.gi_frame) not in _run._generator_runs
     finally:
         entered.run(generator.close)

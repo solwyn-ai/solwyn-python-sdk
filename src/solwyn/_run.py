@@ -266,6 +266,14 @@ def _register_generator(record: _OpenRun) -> None:
         )
 
 
+def _queue_unregister_record(record: _OpenRun) -> None:
+    key = record.owner_key
+    if key is not None:
+        for _, reference in _generator_runs.get(key[0], ()):
+            if reference() is record:
+                _dead_generator_runs.append((key, reference))
+
+
 def _retire_later(
     record: _OpenRun, callback: Callable[[], None], *, retire: bool = True, surrender: bool = False
 ) -> None:
@@ -275,11 +283,7 @@ def _retire_later(
     record.closing = True
     if surrender and record.surrender_claim.pop(None, False):
         _queue_run_surrender(record.run_id)
-    key = record.owner_key
-    if key is not None:
-        for _, reference in _generator_runs.get(key[0], ()):
-            if reference() is record:
-                _dead_generator_runs.append((key, reference))
+    _queue_unregister_record(record)
     _defer_run_cleanup(callback)
 
 
@@ -972,6 +976,7 @@ class RunHandle:
                         _active_run.reset(matching.token)
                     except (ValueError, RuntimeError) as exc:
                         if not owner_executing:
+                            _queue_unregister_record(record)
                             raise RuntimeError(
                                 "RunHandle.finish() must be called in the same context where "
                                 "start_run() created it"

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
+from solwyn._lifecycle import _drain_run_cleanups
 from solwyn._token_details import TokenDetails
 from solwyn.providers._accumulator import StreamUsageAccumulator
 
@@ -1853,6 +1854,7 @@ class TestSyncResponsesStreamManagerLifecycle:
 
         del wrapper
         gc.collect()
+        _drain_run_cleanups()
 
         abort_release.assert_called_once_with()
 
@@ -2059,6 +2061,7 @@ class TestAsyncResponsesStreamManagerLifecycle:
 
         del wrapper
         gc.collect()
+        _drain_run_cleanups()
 
         abort_release.assert_called_once_with()
 

@@ -18,11 +18,32 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any, Self, cast
 
+from solwyn._lifecycle import _defer_run_cleanup, _ensure_run_cleanup_worker
 from solwyn._otel import _INACTIVE_CALL_SPAN, _NOOP_CONTEXT, _CallSpan
 from solwyn._token_details import TokenDetails
 from solwyn.providers._accumulator import StreamUsageAccumulator
 
 logger = logging.getLogger(__name__)
+
+
+class _AbortHandleFinalizer:
+    """Keep explicit releases synchronous and GC releases outside SDK locks."""
+
+    def __init__(self, owner: object, release: Callable[[], None]) -> None:
+        _ensure_run_cleanup_worker()
+        self._release = release
+        self._finalizer = weakref.finalize(owner, _defer_run_cleanup, release)
+
+    @property
+    def alive(self) -> bool:
+        return self._finalizer.alive
+
+    def __call__(self) -> None:
+        if self._finalizer.detach() is not None:
+            self._release()
+
+    def detach(self) -> None:
+        self._finalizer.detach()
 
 
 class SyncStreamWrapper:
@@ -81,7 +102,7 @@ class SyncStreamWrapper:
         self._chunk_translator = chunk_translator
         self._abort_check = abort_check
         self._abort_finalizer = (
-            weakref.finalize(self, abort_release) if abort_release is not None else None
+            _AbortHandleFinalizer(self, abort_release) if abort_release is not None else None
         )
         self._abort_exc: Exception | None = None
         self._start_time = time.monotonic()
@@ -304,7 +325,7 @@ class AsyncStreamWrapper:
         self._chunk_translator = chunk_translator
         self._abort_check = abort_check
         self._abort_finalizer = (
-            weakref.finalize(self, abort_release) if abort_release is not None else None
+            _AbortHandleFinalizer(self, abort_release) if abort_release is not None else None
         )
         self._abort_exc: Exception | None = None
         self._start_time = time.monotonic()
@@ -582,7 +603,7 @@ class _SyncResponsesStreamManagerWrapper:
         self._on_entry_error = on_entry_error
         self._on_abandoned_before_entry = on_abandoned_before_entry
         self._abort_finalizer = (
-            weakref.finalize(self, abort_release) if abort_release is not None else None
+            _AbortHandleFinalizer(self, abort_release) if abort_release is not None else None
         )
         self._stream: SyncStreamWrapper | None = None
         self._pre_entry_settled = False
@@ -772,7 +793,7 @@ class _AsyncResponsesStreamManagerWrapper:
         self._on_entry_error = on_entry_error
         self._on_abandoned_before_entry = on_abandoned_before_entry
         self._abort_finalizer = (
-            weakref.finalize(self, abort_release) if abort_release is not None else None
+            _AbortHandleFinalizer(self, abort_release) if abort_release is not None else None
         )
         self._stream: AsyncStreamWrapper | None = None
         self._pre_entry_settled = False
