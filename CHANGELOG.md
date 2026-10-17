@@ -89,6 +89,15 @@ derived from git tags (hatch-vcs).
 
 ### Fixed
 
+- Runs entered inside sync generators streamed by frameworks that step each
+  chunk in a fresh context, such as Starlette/FastAPI `StreamingResponse`, now
+  attribute every call to the correct run and parent, release their budget lease
+  when the scope exits, and no longer raise when an outer run is active. Run
+  stops and call-span parentage also follow the generator's run. Detached handle
+  activations can exit across yields and then finish normally. Threads started
+  inside a step do not inherit a run recovered from the generator's stack;
+  explicitly activate a detached handle in that work.
+
 - **Timeout configuration reads in strict mode.** Reading `client.timeout` on
   wrapped OpenAI, Anthropic, Azure OpenAI, Together, and OpenAI-compatible clients
   now preserves numeric, `None`, and timeout-object values without raising

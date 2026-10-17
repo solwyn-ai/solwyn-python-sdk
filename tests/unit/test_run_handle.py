@@ -386,7 +386,7 @@ def test_detached_activation_non_lifo_exit_is_retryable() -> None:
 
 
 @pytest.mark.unit
-def test_detached_activation_wrong_context_exit_is_retryable() -> None:
+def test_detached_activation_copied_context_exit_is_soft_and_owner_can_pop() -> None:
     handle = solwyn.create_run("agent:Worker")
     owner_context = copy_context()
 
@@ -397,9 +397,9 @@ def test_detached_activation_wrong_context_exit_is_retryable() -> None:
         # the ContextVar token's owning Context.
         foreign_context = copy_context()
 
-        with pytest.raises(RuntimeError, match="same context"):
-            foreign_context.run(activation.__exit__, None, None, None)
+        foreign_context.run(activation.__exit__, None, None, None)
 
+        assert foreign_context.run(solwyn.current_run_context).id is None
         assert solwyn.current_run_context().id == handle.run_id
         activation.__exit__(None, None, None)
         assert solwyn.current_run_context().id is None

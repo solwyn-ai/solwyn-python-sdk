@@ -36,7 +36,7 @@ from solwyn._routing import (
     RoutingRequest,
     SelectionPolicy,
 )
-from solwyn._run import _capture_run_context, _RunContextSnapshot
+from solwyn._run import _capture_run_context, _fallback_run_span, _RunContextSnapshot
 from solwyn._surface_graph import (
     _descriptor_category,
     _return_shape,
@@ -98,7 +98,7 @@ def _with_call_span(method: _CallMethod) -> _CallMethod:
         async def async_call(self: _SolwynBase, *args: Any, **kwargs: Any) -> Any:
             if not self._solwyn_config.otel_spans:
                 return await method(self, *args, **kwargs)
-            with _otel._start_call_span() as call_span:
+            with _otel._start_call_span(parent=_fallback_run_span()) as call_span:
                 kwargs["_call_span"] = call_span
                 return await method(self, *args, **kwargs)
 
@@ -108,7 +108,7 @@ def _with_call_span(method: _CallMethod) -> _CallMethod:
     def sync_call(self: _SolwynBase, *args: Any, **kwargs: Any) -> Any:
         if not self._solwyn_config.otel_spans:
             return method(self, *args, **kwargs)
-        with _otel._start_call_span() as call_span:
+        with _otel._start_call_span(parent=_fallback_run_span()) as call_span:
             kwargs["_call_span"] = call_span
             return method(self, *args, **kwargs)
 

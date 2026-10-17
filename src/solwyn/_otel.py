@@ -235,7 +235,9 @@ class _RunSpan:
 _INACTIVE_RUN_SPAN = _RunSpan()
 
 
-def _start_run_span(run_id: str, parent_run_id: str | None) -> _RunSpan:
+def _start_run_span(
+    run_id: str, parent_run_id: str | None, *, parent: _RunSpan | None = None
+) -> _RunSpan:
     """Create a detached run span only when opted in and eligible for export."""
     if not _run_spans_enabled():
         return _INACTIVE_RUN_SPAN
@@ -249,7 +251,12 @@ def _start_run_span(run_id: str, parent_run_id: str | None) -> _RunSpan:
         tracer = _get_call_tracer(trace)
         if tracer is None:
             return _INACTIVE_RUN_SPAN
-        span = tracer.start_span("solwyn.run", kind=trace.SpanKind.INTERNAL)
+        parent_context = (
+            trace.set_span_in_context(parent._span)
+            if parent is not None and parent._span is not None
+            else None
+        )
+        span = tracer.start_span("solwyn.run", kind=trace.SpanKind.INTERNAL, context=parent_context)
         if _span_is_exportable(span):
             span.set_attribute("solwyn.agent_run_id", run_id)
             if parent_run_id is not None:
@@ -499,7 +506,7 @@ class _CallSpan:
 _INACTIVE_CALL_SPAN = _CallSpan()
 
 
-def _start_call_span() -> _CallSpan:
+def _start_call_span(*, parent: _RunSpan | None = None) -> _CallSpan:
     """Create a recording span only; never attach an unexported child ID."""
     span = None
     trace = None
@@ -511,7 +518,14 @@ def _start_call_span() -> _CallSpan:
         tracer = _get_call_tracer(trace)
         if tracer is None:
             return _INACTIVE_CALL_SPAN
-        span = tracer.start_span("solwyn.call", kind=trace.SpanKind.INTERNAL)
+        parent_context = (
+            trace.set_span_in_context(parent._span)
+            if parent is not None and parent._span is not None
+            else None
+        )
+        span = tracer.start_span(
+            "solwyn.call", kind=trace.SpanKind.INTERNAL, context=parent_context
+        )
         if _span_is_exportable(span):
             owner = _CallSpan(span, trace)
             transferred = True

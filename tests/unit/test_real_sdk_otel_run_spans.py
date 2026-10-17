@@ -355,14 +355,76 @@ def test_scope_without_its_frame_ends_span_and_preserves_unrelated_run(spans):
     run_id = entered.run(scope.__enter__)
     with solwyn.run("PRIVATE unrelated") as unrelated_id:
         unrelated_span = trace.get_current_span()
-        with pytest.raises(RuntimeError, match="LIFO"):
-            scope.__exit__(None, None, None)
+        scope.__exit__(None, None, None)
         assert solwyn.current_run_context().id == unrelated_id
         assert trace.get_current_span() is unrelated_span
         assert len(_runs(spans)) == 1
         _assert_run(spans, _runs(spans)[0], run_id)
     entered.run(scope.__exit__, None, None, None)
     _assert_run(spans, _runs(spans)[0], run_id)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("outer", [False, True])
+@pytest.mark.parametrize("terminal", ["exhaustion", "exception", "close", "gc"])
+def test_fresh_context_calls_remain_children_of_run_and_end_once(spans, outer, terminal):
+    plane = FakeControlPlane()
+    raw = _raw_client(False)
+    raw.chat.completions.create.return_value = _response()
+    wrapper = plane.wrap(raw, otel_spans=True)
+
+    def chunks():
+        with solwyn.run("chunks") as run_id:
+            for _ in range(3):
+                wrapper.chat.completions.create(model="gpt-5.5", messages=[])
+                yield run_id
+            if terminal == "exception":
+                raise ValueError("stream failed")
+
+    try:
+        with solwyn.run("request") if outer else nullcontext() as parent_id:
+            base = copy_context()
+            generator = chunks()
+            run_ids = [base.copy().run(next, generator) for _ in range(3)]
+            if terminal in {"exhaustion", "exception"}:
+                with pytest.raises(ValueError if terminal == "exception" else StopIteration):
+                    base.copy().run(next, generator)
+            elif terminal == "close":
+                base.copy().run(generator.close)
+            else:
+                ref = weakref.ref(generator)
+                del generator
+                gc.collect()
+                assert ref() is None
+            run = next(s for s in _runs(spans) if s.attributes["solwyn.agent_run_id"] == run_ids[0])
+            _assert_run(spans, run, run_ids[0], parent_id=parent_id, error=terminal != "exhaustion")
+            assert len(spans.calls()) == 3
+            assert all(call.parent.span_id == run.context.span_id for call in spans.calls())
+            assert all(call.context.trace_id == run.context.trace_id for call in spans.calls())
+    finally:
+        wrapper.close()
+
+
+@pytest.mark.unit
+def test_shared_generator_scope_closes_its_own_span_and_keeps_other_run_open(spans):
+    scope = solwyn.run("shared")
+
+    def chunks():
+        with scope as run_id:
+            yield run_id
+            yield solwyn.current_run_context().id
+
+    base = copy_context()
+    first, second = chunks(), chunks()
+    first_id = base.copy().run(next, first)
+    second_id = base.copy().run(next, second)
+    base.copy().run(first.close)
+    assert len(_runs(spans)) == 1
+    _assert_run(spans, _runs(spans)[0], first_id, error=True)
+    assert base.copy().run(next, second) == second_id
+    base.copy().run(second.close)
+    assert len(_runs(spans)) == 2
+    _assert_run(spans, _runs(spans)[1], second_id, error=True)
 
 
 @pytest.mark.unit
@@ -415,6 +477,26 @@ def test_interrupted_detached_activation_is_retryable(spans):
         pass
     handle.finish()
     _assert_run(spans, _runs(spans)[0], handle.run_id)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("detached", [False, True])
+def test_interrupted_record_registration_retires_owned_lifetime(spans, detached):
+    handle = solwyn.create_run("detached") if detached else None
+    scope = handle.activate() if detached else solwyn.run("scoped")
+    with (
+        patch("solwyn._run.register_fork_reset", side_effect=KeyboardInterrupt()),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        scope.__enter__()
+    assert solwyn.current_run_context().id is None
+    if handle is not None:
+        with handle.activate():
+            pass
+        handle.finish()
+    assert len(_runs(spans)) == 1
+    run = _runs(spans)[0]
+    _assert_run(spans, run, run.attributes["solwyn.agent_run_id"], error=not detached)
 
 
 @pytest.mark.unit
