@@ -6,10 +6,12 @@ import importlib.util
 import json
 import socket
 from collections.abc import Mapping
+from contextlib import AsyncExitStack
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import httpx
 import pytest
 import yaml
 from conftest import VALID_API_KEY
@@ -48,6 +50,12 @@ OPENAI_SHAPES = {
     "openai_native_sync",
     "openai_together_async",
     "openai_together_sync",
+}
+TIMEOUT_SHAPES = OPENAI_SHAPES | {
+    "anthropic_async",
+    "anthropic_sync",
+    "together_native_async",
+    "together_native_sync",
 }
 
 
@@ -580,6 +588,74 @@ def test_bedrock_inventory_unions_public_and_service_model_operations(shape_key:
     assert rows["invoke_model"]["return_shape"] == "callable"
     assert report["service_model_operations"] == sorted(report["service_model_operations"])
     assert "invoke_model" in report["service_model_operations"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape_key", sorted(TIMEOUT_SHAPES))
+@pytest.mark.parametrize(
+    "timeout_case", ["default", "float", "int", "none", "httpx", "native_timeout", "not_given"]
+)
+@pytest.mark.parametrize("construction", ["constructor", "with_options"])
+async def test_timeout_configuration_is_accessible_in_strict_mode(
+    shape_key: str,
+    timeout_case: str,
+    construction: str,
+) -> None:
+    # Arrange: exercise every timeout-bearing real client variant, without sockets.
+    capture = _capture_module()
+    sdk = pytest.importorskip(capture.import_name_for_shape(shape_key))
+    shape = capture._SHAPES_BY_KEY[shape_key]
+    client_name = {"openai": "OpenAI", "anthropic": "Anthropic", "together": "Together"}[
+        shape.distribution
+    ]
+    kwargs: dict[str, Any] = {"api_key": "sk-test"}
+    if shape.variant == "azure":
+        client_name = "AzureOpenAI"
+        kwargs.update(api_version="2024-06-01", azure_endpoint="https://example.openai.azure.com")
+    elif shape.variant == "generic_compatible":
+        kwargs["base_url"] = "https://provider.invalid/v1"
+    elif shape.variant == "openai_compatible":
+        kwargs["base_url"] = "https://api.together.xyz/v1"
+    if shape.mode == "async":
+        client_name = "Async" + client_name
+    client_type = getattr(sdk, client_name)
+    timeouts = {
+        "float": 20.0,
+        "int": 20,
+        "none": None,
+        "httpx": httpx.Timeout(20.0),
+        "native_timeout": sdk.Timeout(20.0),
+        "not_given": sdk.NOT_GIVEN,
+    }
+    options = {} if timeout_case == "default" else {"timeout": timeouts[timeout_case]}
+
+    with capture._deny_socket_access() as counter:
+        async with AsyncExitStack() as stack:
+            raw = client_type(**kwargs, **(options if construction == "constructor" else {}))
+            if shape.mode == "async":
+                stack.push_async_callback(raw.close)
+            else:
+                stack.callback(raw.close)
+            if construction == "with_options":
+                raw = raw.with_options(**options)
+            wrapper = (AsyncSolwyn if shape.mode == "async" else Solwyn)(
+                raw,
+                api_key=VALID_API_KEY,
+                on_unmetered="raise",
+                report_untracked_surfaces=False,
+            )
+            if shape.mode == "async":
+                stack.push_async_callback(wrapper.close)
+            else:
+                stack.callback(wrapper.close)
+
+            # Act / Assert: safe reads preserve the provider's exact value.
+            if timeout_case not in {"default", "not_given"}:
+                assert raw.timeout is timeouts[timeout_case]
+            assert wrapper.timeout is raw.timeout
+
+    assert counter.attempts == 0
 
 
 @pytest.mark.unit

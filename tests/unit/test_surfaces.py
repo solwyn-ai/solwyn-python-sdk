@@ -1456,6 +1456,31 @@ def test_exact_inert_provider_configuration_is_safe_but_raw_callables_are_not() 
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("context_tuple", _DECLARED_CONTEXT_TUPLES[:12])
+def test_timeout_accepts_configuration_values_without_admitting_callables_or_other_descriptors(
+    context_tuple: tuple[str, str, str, str],
+) -> None:
+    # Arrange
+    context = SurfaceContext(*context_tuple)
+    rule = resolve_surface_rule(context=context, path="timeout", source=SurfaceSource.RAW)
+
+    # Act / Assert: only Anthropic has reviewed both attribute and property forms.
+    assert rule is not None and rule.kind is SurfaceKind.INFRASTRUCTURE
+    for return_shape in ("none", "scalar", "resource"):
+        assert rule.accepts_shape(AttributeShape("attribute", return_shape))
+        assert rule.accepts_shape(AttributeShape("property", return_shape)) is (
+            context.provider == "anthropic"
+        )
+    assert rule.accepts_shape(AttributeShape("property", "unevaluated_descriptor")) is (
+        context.provider == "anthropic"
+    )
+    for descriptor in ("attribute", "property", "function", "cached_property"):
+        assert not rule.accepts_shape(AttributeShape(descriptor, "callable"))
+    for descriptor in ("cached_property", "data_descriptor", "non_data_descriptor"):
+        assert not rule.accepts_shape(AttributeShape(descriptor, "unevaluated_descriptor"))
+
+
+@pytest.mark.unit
 def test_safe_descriptor_rows_pin_the_evaluated_attribute_shape() -> None:
     evaluated_shapes = {
         "auth_headers": "mapping",
@@ -1465,7 +1490,6 @@ def test_safe_descriptor_rows_pin_the_evaluated_attribute_shape() -> None:
         "model_name": "scalar",
         "open_telemetry": "mapping",
         "qs": "resource",
-        "timeout": "resource",
         "user_agent": "scalar",
         "vertexai": "scalar",
     }
