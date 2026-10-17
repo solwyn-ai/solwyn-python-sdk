@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import os
 import re
+import time
 import weakref
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
+from functools import partial
 from threading import Lock, RLock
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
@@ -22,6 +24,11 @@ from solwyn._constants import (
     TRACE_ID_PATTERN,
 )
 from solwyn._env import _parse_bool
+from solwyn._lifecycle import (
+    _defer_run_span_cleanup,
+    _prepare_run_cleanup,
+    register_fork_reset,
+)
 from solwyn.exceptions import RunStoppedError
 
 if TYPE_CHECKING:
@@ -162,12 +169,26 @@ class _RunSpanActivation:
 class _RunSpan:
     """One run span shared by all activations, ended once without exception data."""
 
-    def __init__(self, span: Any = None, trace: ModuleType | None = None) -> None:
+    def __init__(
+        self,
+        span: Any = None,
+        trace: ModuleType | None = None,
+        *,
+        parent_context: Any = None,
+    ) -> None:
         self._span = span
         self._trace = trace
-        self._lock = Lock()
+        self._parent_context = parent_context
+        # A generator finalizer can end or fail this same run span while an
+        # ordinary span operation on this thread holds its lock.
+        self._lock = RLock()
         self._ended = False
         self._error = False
+        if span is not None:
+            register_fork_reset(self)
+
+    def _reset_after_fork_in_child(self) -> None:
+        self._lock = RLock()
 
     def attach(self) -> _RunSpanActivation | None:
         if self._span is None or self._trace is None:
@@ -201,17 +222,27 @@ class _RunSpan:
 
     def failed(self) -> None:
         if self._span is not None:
-            with self._lock:
-                self._error = True
+            # Sticky flag: publishing failure must also be safe from a GC
+            # finalizer while a span operation holds its lock.
+            self._error = True
+
+    def end_later(self, *, error: bool = False, end_time: int | None = None) -> None:
+        if self._span is not None:
+            if end_time is None:
+                end_time = time.time_ns()
+            _defer_run_span_cleanup(partial(self.end, error=error, end_time=end_time))
 
     def finalize_on_gc(self, owner: object) -> weakref.finalize[..., object] | None:
         if self._span is None:
             return None
-        finalizer = weakref.finalize(owner, self.end, error=True)
+        _prepare_run_cleanup()
+        # SDK and exporter/processor locks may already be held by the thread
+        # invoking cyclic GC. Weakref finalizers only hand off work.
+        finalizer = weakref.finalize(owner, self.end_later, error=True)
         finalizer.atexit = False
         return finalizer
 
-    def end(self, *, error: bool = False) -> None:
+    def end(self, *, error: bool = False, end_time: int | None = None) -> None:
         if self._span is None or self._trace is None:
             return
         with self._lock:
@@ -229,13 +260,30 @@ class _RunSpan:
             pass
         finally:
             with suppress(Exception):
-                self._span.end()
+                if end_time is None:
+                    self._span.end()
+                else:
+                    self._span.end(end_time=end_time)
 
 
 _INACTIVE_RUN_SPAN = _RunSpan()
 
 
-def _start_run_span(run_id: str, parent_run_id: str | None) -> _RunSpan:
+def _fallback_parent_context(trace: ModuleType, parent: _RunSpan | None) -> Any:
+    """Keep an in-step application parent; replace an inherited driver parent."""
+    if parent is None or parent._span is None:
+        return None
+    current = trace.get_current_span().get_span_context()
+    # Only immutable span identifiers/flags are read or retained, never the
+    # application's span object, attributes, events, or other context values.
+    if current.is_valid and current != parent._parent_context:
+        return None
+    return trace.set_span_in_context(parent._span)
+
+
+def _start_run_span(
+    run_id: str, parent_run_id: str | None, *, parent: _RunSpan | None = None
+) -> _RunSpan:
     """Create a detached run span only when opted in and eligible for export."""
     if not _run_spans_enabled():
         return _INACTIVE_RUN_SPAN
@@ -249,12 +297,14 @@ def _start_run_span(run_id: str, parent_run_id: str | None) -> _RunSpan:
         tracer = _get_call_tracer(trace)
         if tracer is None:
             return _INACTIVE_RUN_SPAN
-        span = tracer.start_span("solwyn.run", kind=trace.SpanKind.INTERNAL)
+        parent_context = _fallback_parent_context(trace, parent)
+        parent_span_context = trace.get_current_span(parent_context).get_span_context()
+        span = tracer.start_span("solwyn.run", kind=trace.SpanKind.INTERNAL, context=parent_context)
         if _span_is_exportable(span):
             span.set_attribute("solwyn.agent_run_id", run_id)
             if parent_run_id is not None:
                 span.set_attribute("solwyn.parent_agent_run_id", parent_run_id)
-            owner = _RunSpan(span, trace)
+            owner = _RunSpan(span, trace, parent_context=parent_span_context)
             transferred = True
             return owner
     except BaseException as exc:
@@ -499,7 +549,7 @@ class _CallSpan:
 _INACTIVE_CALL_SPAN = _CallSpan()
 
 
-def _start_call_span() -> _CallSpan:
+def _start_call_span(*, parent: _RunSpan | None = None) -> _CallSpan:
     """Create a recording span only; never attach an unexported child ID."""
     span = None
     trace = None
@@ -511,7 +561,10 @@ def _start_call_span() -> _CallSpan:
         tracer = _get_call_tracer(trace)
         if tracer is None:
             return _INACTIVE_CALL_SPAN
-        span = tracer.start_span("solwyn.call", kind=trace.SpanKind.INTERNAL)
+        parent_context = _fallback_parent_context(trace, parent)
+        span = tracer.start_span(
+            "solwyn.call", kind=trace.SpanKind.INTERNAL, context=parent_context
+        )
         if _span_is_exportable(span):
             owner = _CallSpan(span, trace)
             transferred = True

@@ -19,13 +19,16 @@ import atexit
 import collections
 import dataclasses
 import enum
+import gc
 import logging
 import os
 import threading
 import time
 import weakref
+from _thread import start_new_thread
 from collections.abc import Callable
 from contextlib import suppress
+from queue import SimpleQueue
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
 import httpx
@@ -143,6 +146,169 @@ _fork_registered = False
 # Budget enforcers holding PJ-2 leases. Held weakly, like the reporters: a
 # closed enforcer has already surrendered and drops out on its own.
 _LIVE_LEASE_HOLDERS: weakref.WeakSet[_BudgetEnforcerBase] = weakref.WeakSet()
+_LEASE_HOLDER_REFS: tuple[weakref.ReferenceType[_BudgetEnforcerBase], ...] = ()
+
+# GC callbacks run on the collecting thread. A depth, rather than a global
+# boolean, also handles nested notifications without treating other threads'
+# ordinary exits as finalizers. Never inspect gc.get_objects() or frame locals.
+_run_gc_state = threading.local()
+
+
+def _track_run_gc(phase: str, info: dict[str, int]) -> None:
+    depth = getattr(_run_gc_state, "depth", 0)
+    _run_gc_state.depth = depth + 1 if phase == "start" else max(0, depth - 1)
+
+
+gc.callbacks.append(_track_run_gc)
+
+
+def _run_gc_active() -> bool:
+    return bool(getattr(_run_gc_state, "depth", 0))
+
+
+# A generator/weakref finalizer can run inside ANY SDK critical section. Its
+# handoff takes no SDK lock and invokes no logger, exporter, or enforcer.
+# SimpleQueue.put is documented as reentrant in CPython, including __del__ and
+# weakref callbacks. Durable deques retain even an in-progress callback across
+# fork; the SimpleQueues wake workers with blocking get(), never polling.
+_run_cleanups: collections.deque[Callable[[], None]] = collections.deque()
+_run_span_cleanups: collections.deque[Callable[[], None]] = collections.deque()
+_run_cleanup_lock = threading.RLock()
+_run_span_cleanup_lock = threading.RLock()
+_run_cleanup_wakeup: SimpleQueue[None] = SimpleQueue()
+_run_span_cleanup_wakeup: SimpleQueue[None] = SimpleQueue()
+_run_cleanup_start_claim = {None: True}
+_run_span_cleanup_start_claim = {None: True}
+_run_cleanup_worker: threading.Thread | None = None
+
+
+def _defer_run_cleanup(callback: Callable[[], None]) -> None:
+    _run_cleanups.append(callback)
+    _run_cleanup_wakeup.put(None)
+    _ensure_run_cleanup_worker()
+
+
+def _defer_run_span_cleanup(callback: Callable[[], None]) -> None:
+    _run_span_cleanups.append(callback)
+    _run_span_cleanup_wakeup.put(None)
+    _start_run_worker(spans=True)
+
+
+def _drain_run_cleanups(*, blocking: bool = True) -> None:
+    """Only scope bookkeeping; bounded entry points never join another drain."""
+    if not _run_cleanup_lock.acquire(blocking=blocking):
+        return
+    try:
+        while _run_cleanups:
+            # Retain the in-progress callback across fork. Every callback's
+            # bookkeeping is idempotent, including a partially closed record.
+            callback = _run_cleanups[0]
+            with suppress(BaseException):
+                callback()
+            _run_cleanups.popleft()
+    finally:
+        _run_cleanup_lock.release()
+
+
+def _drain_run_span_cleanups(*, blocking: bool = True) -> None:
+    """Drain exports separately so a slow exporter cannot block bookkeeping."""
+    if not _run_span_cleanup_lock.acquire(blocking=blocking):
+        return
+    try:
+        while _run_span_cleanups:
+            callback = _run_span_cleanups[0]
+            with suppress(BaseException):
+                callback()
+            _run_span_cleanups.popleft()
+    finally:
+        _run_span_cleanup_lock.release()
+
+
+_RUN_SPAN_DRAIN_TIMEOUT_S = 1.0
+
+
+def _flush_run_span_cleanups() -> None:
+    """Wait boundedly for queued exports, never execute an exporter inline."""
+    if not _run_span_cleanups:
+        return
+    completed = threading.Event()
+    process_id = os.getpid()
+
+    def complete() -> None:
+        # A child cannot inherit authority to complete a parent's wait, nor
+        # acquire an Event lock that another parent thread may have held.
+        if os.getpid() == process_id:
+            completed.set()
+
+    _defer_run_span_cleanup(complete)
+    completed.wait(_RUN_SPAN_DRAIN_TIMEOUT_S)
+
+
+def _queue_run_surrender(agent_run_id: str) -> None:
+    """Finalizer-safe handoff; each holder fences it before its next grant."""
+    for reference in _LEASE_HOLDER_REFS:
+        holder = reference()
+        if holder is not None:
+            holder._pending_run_surrenders.append(agent_run_id)
+    _run_cleanup_wakeup.put(None)
+    _ensure_run_cleanup_worker()
+
+
+def _drain_run_surrenders(*, blocking: bool = False) -> None:
+    for reference in _LEASE_HOLDER_REFS:
+        holder = reference()
+        if holder is not None:
+            with suppress(Exception):
+                holder._drain_pending_run_surrenders(blocking=blocking)
+
+
+def _prepare_run_cleanup() -> None:
+    """Arm shutdown on ordinary entry; no worker exists until work is deferred."""
+    _ensure_atexit_registered()
+
+
+def _ensure_run_cleanup_worker() -> None:
+    _start_run_worker(spans=False)
+
+
+def _start_run_worker(*, spans: bool) -> None:
+    claim = _run_span_cleanup_start_claim if spans else _run_cleanup_start_claim
+    if not claim.pop(None, False):
+        return
+
+    def drain() -> None:
+        global _run_cleanup_worker
+        wakeup = _run_span_cleanup_wakeup if spans else _run_cleanup_wakeup
+        worker = threading.current_thread()
+        worker.name = "solwyn-run-spans" if spans else "solwyn-run-cleanup"
+        if not spans:
+            _run_cleanup_worker = worker
+        while True:
+            wakeup.get()
+            if spans:
+                _drain_run_span_cleanups()
+            else:
+                # Wait only on this worker, outside the bookkeeping lock.
+                # A single nonblocking attempt could strand an idle
+                # stream's surrender after its collector drops the lock.
+                _drain_run_surrenders(blocking=True)
+                _drain_run_cleanups()
+                _drain_run_surrenders(blocking=True)
+
+    try:
+        # Thread.start() waits for bootstrap and takes threading's own locks;
+        # GC may interrupt a thread already holding those locks. The low-level
+        # C primitive starts a daemon without waiting or entering Python
+        # threading locks on the finalizer's thread. Thread registration/name
+        # setup happens on the worker itself. The atomic pop also tolerates
+        # reentrant GC. This also works during atexit on CPython 3.11-3.13,
+        # when threading.Thread.start() can refuse new threads.
+        start_new_thread(drain, ())
+    except BaseException:
+        # During interpreter teardown threads may be refused. Keep the work
+        # queued for the exit hook (or a later ordinary entry / close).
+        claim[None] = True
+
 
 _EXIT_BATCH_SIZE = 50
 
@@ -182,11 +348,28 @@ def register_fork_reset(obj: _ForkResettable) -> None:
 
 def _run_fork_resets() -> None:
     """Run every registered object's child-side reset; guard each individually."""
+    global _run_cleanup_lock, _run_cleanup_worker, _run_span_cleanup_lock, _run_gc_state
+    global _run_cleanup_wakeup, _run_span_cleanup_wakeup
+    global _run_cleanup_start_claim, _run_span_cleanup_start_claim
+    _run_cleanup_lock = threading.RLock()
+    _run_span_cleanup_lock = threading.RLock()
+    _run_gc_state = threading.local()
+    _run_cleanup_wakeup = SimpleQueue()
+    _run_span_cleanup_wakeup = SimpleQueue()
+    _run_cleanup_start_claim = {None: True}
+    _run_span_cleanup_start_claim = {None: True}
+    _run_cleanup_worker = None
     for obj in list(_FORK_RESETTABLE):
         try:
             obj._reset_after_fork_in_child()
         except Exception as exc:
             _log_warning("lifecycle.fork_reset_failed: exc_type=%s", type(exc).__name__)
+    if _run_cleanups:
+        _run_cleanup_wakeup.put(None)
+        _ensure_run_cleanup_worker()
+    if _run_span_cleanups:
+        _run_span_cleanup_wakeup.put(None)
+        _start_run_worker(spans=True)
 
 
 def _ensure_atexit_registered() -> None:
@@ -251,7 +434,15 @@ def register_async_reporter(reporter: AsyncMetadataReporter) -> None:
 def register_lease_holder(enforcer: _BudgetEnforcerBase) -> None:
     """Track a budget enforcer so its held leases are released at exit."""
     _ensure_atexit_registered()
-    _LIVE_LEASE_HOLDERS.add(enforcer)
+    global _LEASE_HOLDER_REFS
+    with _registry_lock:
+        _LIVE_LEASE_HOLDERS.add(enforcer)
+        # Finalizers read this immutable weak snapshot without iterating a
+        # WeakSet that concurrent client construction may resize.
+        _LEASE_HOLDER_REFS = (
+            *(reference for reference in _LEASE_HOLDER_REFS if reference() is not None),
+            weakref.ref(enforcer),
+        )
 
 
 def _surrender_run(agent_run_id: str) -> None:
@@ -1110,6 +1301,9 @@ def _drop_all(
 
 def _exit_flush_all() -> None:
     """The single atexit hook: flush every still-open live reporter."""
+    _drain_run_cleanups()
+    _flush_run_span_cleanups()
+    _drain_run_surrenders()
     for sync_reporter in list(_LIVE_SYNC_REPORTERS):
         try:
             # _shutdown means stop REQUESTED, _delivery_closed is the EARLY

@@ -898,6 +898,15 @@ def test_sync_pool_teardown_retains_worker_slot_until_late_grants_can_progress(
             for caller in callers:
                 caller.join(2)
                 assert not caller.is_alive()
+            # Caller completion only registers the release workers; it does
+            # not guarantee they have claimed their queued items yet. Wait
+            # for that transition before checking the three available slots.
+            claim_deadline = time.monotonic() + 2
+            while time.monotonic() < claim_deadline:
+                with enforcer._state_lock:
+                    if len(enforcer._releases_owed) <= 1:
+                        break
+                time.sleep(0.001)
             # Teardown is still underlying worker work. Its slot cannot be
             # lent to a fifth worker waiting for this same pool lock.
             assert old_worker.is_alive()

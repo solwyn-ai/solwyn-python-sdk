@@ -598,9 +598,40 @@ Use `solwyn.current_run_context()` to read the active `RunContext(id, name, tags
 
 Works the same with `async with` and is safe across concurrent asyncio tasks — each task sees only its own active run. Calls made outside a `solwyn.run(...)` scope are still tracked; the API groups them into `_auto-{sdk_instance_id}-{YYYY-MM-DD}` using the event's UTC timestamp.
 
+Runs opened in synchronous generators keep their attribution across yields,
+including when Starlette/FastAPI `StreamingResponse` steps each chunk in a fresh
+context on a worker thread. This also works through `@contextmanager` helpers,
+`ExitStack`, and delegating `__enter__` / `__exit__` methods. Every call uses the
+generator's run and recorded parent. Normal scope exit releases its budget lease
+and ends its run span synchronously, including shared-context `for` loops.
+Generator finalization, exits during garbage collection, and exits from a
+foreign context defer cleanup to a background worker; the span keeps the
+timestamp recorded at exit. Client close and interpreter exit drain pending
+cleanup, with a bounded wait for span export. Driver calls between steps keep
+the driver's context. Threads or executors started inside a step do not inherit a run
+recovered from the generator's stack; use a detached run handle and explicitly
+activate it in that work. A plain `for` loop sharing one context continues to
+see the generator's run in its loop body. Recovery follows the executing owner
+frame, up to 256 stack frames. A plain function that opens and closes a run
+within one call keeps ordinary context scoping.
+
+`start_run(...).finish()` normally requires the context that opened the run.
+A run opened directly in a sync generator can also finish from that generator
+in a later fresh-context step. Detached activations, including those wrapped in
+context managers, can span yields and then finish normally. For separate
+callbacks, tasks, or threads, use `create_run()` and `handle.activate()`;
+ordinary activations must exit in the context where they entered.
+
 Do not open `solwyn.run(...)` inside an async generator. Python runs the consumer's `async for` body in the same context after a generator `yield`, so an inner generator scope would leak into customer code. The SDK rejects that pattern at scope entry. Open the scope in the consumer, or await the generator entirely inside an outer run scope.
 
-Tasks created with `asyncio.create_task(...)` inside a run capture that task's context. If the task keeps making LLM calls after the `with` block exits, those calls are still attributed to the captured run id. Use `asyncio.TaskGroup` or await spawned tasks before leaving the scope when attribution must end with the block.
+Tasks created with `asyncio.create_task(...)` inside an ordinary run scope,
+including helpers built with `@contextmanager`, capture that task's context.
+If the task keeps making LLM calls after the `with` block exits, those calls are
+still attributed to the captured run id. The same applies to copied contexts
+when a generator exits in its entry context. A generator closed in a different
+context retires its run in all copied step contexts. Use `asyncio.TaskGroup` or
+await spawned tasks before leaving the scope when attribution must end with
+the block.
 
 ### Anthropic conversation IDs
 
@@ -1234,17 +1265,24 @@ OpenTelemetry tracer provider and exporter first; installing `solwyn[otel]`
 alone does not export spans. Cold `import solwyn` never imports OpenTelemetry.
 
 `solwyn.run(...)` opens an `INTERNAL` span named literally `solwyn.run` at scope
-entry and keeps it current for the scope's body. Application spans and
+entry and keeps it current in that context. Application spans and
 `solwyn.call` spans nest beneath it; nested runs carry the parent run ID and
-follow the current tracing parent. The span ends once on sync or async exit,
-with status `ERROR` when an exception or interruption leaves the scope and
-`OK` otherwise. Run spans contain only `solwyn.agent_run_id` and, for child
-runs, `solwyn.parent_agent_run_id`.
+follow the current tracing parent. In fresh-context generator steps, calls and
+nested runs use the recovered run span unless a valid current application span
+differs from the tracing parent captured at run entry; that application span
+takes precedence, including spans opened inside the step. The span ends once,
+synchronously on normal sync or async exit and on explicit handle finish,
+including finish callbacks inside generators. Generator finalization,
+garbage collection, and foreign-context exits hand cleanup to a background
+worker with the end timestamp recorded at exit; client close and interpreter
+exit drain pending cleanup, with a bounded wait for span export. The status is
+`ERROR` when an exception or interruption leaves the scope and `OK` otherwise.
+Run spans contain only
+`solwyn.agent_run_id` and, for child runs, `solwyn.parent_agent_run_id`.
 
-Create a fresh `solwyn.run(...)` scope object per use. Sharing one scope object
-concurrently across generators stepped in fresh contexts is unsupported: an
-exit without its original run frame cannot identify which pending run ended.
-Use detached run handles to share a run identity across tasks or threads.
+Reusing a `solwyn.run(...)` scope object creates an independent run for each
+entry, including concurrent generators stepped in fresh contexts. Use detached
+run handles to share a run identity across tasks or threads.
 
 Run scopes are independent of clients. Run-span opt-in is process-wide and
 sticky: the first wrapper constructed with `otel_spans=True`, or a truthy

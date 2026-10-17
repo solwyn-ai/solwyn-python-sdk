@@ -44,7 +44,12 @@ from solwyn._lease import (
     LeaseDecision,
     LeaseLedger,
 )
-from solwyn._lifecycle import register_fork_reset, register_lease_holder
+from solwyn._lifecycle import (
+    _drain_run_cleanups,
+    _flush_run_span_cleanups,
+    register_fork_reset,
+    register_lease_holder,
+)
 from solwyn._read_only_key import handle_read_only_key_error
 from solwyn._run_control import clear_termination_if
 from solwyn._token_details import TokenDetails
@@ -298,6 +303,10 @@ class _BudgetEnforcerBase:
         # The async subclass inherits this lock via base-class methods but
         # contention cannot occur — the event loop serializes coroutines.
         self._state_lock = threading.Lock()
+
+        # Finalizers only append; the next normal entry folds these under the
+        # state lock before any admission can reuse an ended run's lease.
+        self._pending_run_surrenders: deque[str] = deque()
 
         # Legacy-path outage tally (tokens only — the SDK never prices a
         # call). Every fail-open admission made while the control plane is
@@ -1918,6 +1927,26 @@ class _BudgetEnforcerBase:
             self._lease.discard(agent_run_id)
         self._dispatch_owed_releases()
 
+    def _drain_pending_run_surrenders(self, *, blocking: bool = True) -> None:
+        """Fold finalizer handoffs under normal ledger serialization."""
+        if not self._pending_run_surrenders:
+            return
+        if not self._state_lock.acquire(blocking=blocking):
+            return
+        had_pending = False
+        try:
+            while self._pending_run_surrenders:
+                agent_run_id = self._pending_run_surrenders.popleft()
+                if not self._closed:
+                    request = self._lease.build_surrender_request(agent_run_id)
+                    self._owe_release_locked(agent_run_id, request)
+                    self._lease.discard(agent_run_id)
+                    had_pending |= request is not None
+        finally:
+            self._state_lock.release()
+        if had_pending:
+            self._dispatch_owed_releases()
+
     def _dispatch_owed_releases(self) -> None:
         """Post every parked release off the caller's thread.
 
@@ -1930,6 +1959,12 @@ class _BudgetEnforcerBase:
 
     def _begin_close(self) -> list[LeaseSurrenderRequest] | None:
         """Fence and atomically drain state before any shutdown wait."""
+        # No enforcer lock is held here. Finish queued scope/handle bookkeeping
+        # before sealing leases. Tracing stays on its worker with a bounded
+        # barrier: even an exporter that stalls cannot prevent lease close.
+        _drain_run_cleanups(blocking=False)
+        _flush_run_span_cleanups()
+        self._drain_pending_run_surrenders()
         with self._state_lock:
             if self._closed:
                 return None
@@ -2503,6 +2538,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         - Cloud unreachable + fail_open=False: return allowed=False
           (deny_source="local_enforcement", deny_reason="control_plane_unreachable")
         """
+        self._drain_pending_run_surrenders()
         lease_call_id: str | None = None
         lease_claim_token: int | None = None
         if (
@@ -3223,6 +3259,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         self._release_tls_waiter: asyncio.Future[ssl.SSLContext] | None = None
         self._release_pool_closer: asyncio.Task[None] | None = None
         self._release_cleanup_task: asyncio.Task[None] | None = None
+        self._run_cleanup_loop: asyncio.AbstractEventLoop | None = None
         register_fork_reset(self)
         register_lease_holder(self)
 
@@ -3259,6 +3296,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         self._release_tls_waiter = None
         self._release_pool_closer = None
         self._release_cleanup_task = None
+        self._run_cleanup_loop = None
 
     async def check_budget(
         self,
@@ -3277,6 +3315,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         estimated_output_bound: int | None = None,
     ) -> BudgetCheckResult:
         """Async version of budget check. See BudgetEnforcer.check_budget."""
+        self._run_cleanup_loop = asyncio.get_running_loop()
+        self._drain_pending_run_surrenders()
         lease_call_id: str | None = None
         lease_claim_token: int | None = None
         if (
@@ -3971,7 +4011,12 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            return  # Off-loop scope exit stays bounded and fenced until startup/exit.
+            owner_loop = self._run_cleanup_loop
+            if owner_loop is not None and not owner_loop.is_closed():
+                with suppress(RuntimeError):
+                    owner_loop.call_soon_threadsafe(self._dispatch_owed_releases)
+            return
+        self._run_cleanup_loop = loop
         current = asyncio.current_task()
         if current is not None and current.cancelling():
             # In particular, asyncio.run's cancel-all snapshot must not spawn

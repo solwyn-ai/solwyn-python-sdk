@@ -45,6 +45,8 @@ dev = [
     # here AND in [dependency-groups] dev: CI installs `pip install -e ".[dev]"`
     # (this extra); local `uv sync` reads the dependency group.
     "respx>=0.21",
+    # Test-only sync StreamingResponse context propagation regression.
+    "starlette>=0.40",
     # Test-only native-span exporters; keep these in both dev lists as well.
     "opentelemetry-api>=1.1.0,<2",
     "opentelemetry-sdk>=1.1.0,<2",
@@ -135,6 +137,7 @@ conflicts = [
 [dependency-groups]
 dev = [
     "respx>=0.21",
+    "starlette>=0.40",
     "opentelemetry-api>=1.1.0,<2",
     "opentelemetry-sdk>=1.1.0,<2",
     "opentelemetry-instrumentation-httpx>=0.42b0,<1",
