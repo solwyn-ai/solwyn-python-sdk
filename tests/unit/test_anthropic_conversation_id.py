@@ -16,7 +16,6 @@ import pytest
 
 import solwyn
 from solwyn._base import MediaSurfaceSpec
-from solwyn._run import _capture_run_context
 from solwyn._token_details import TokenDetails
 from solwyn.testing import FakeControlPlane
 
@@ -301,9 +300,9 @@ async def test_magicmock_synthesized_attribute_is_skipped(
     runtime = wrapper._solwyn_runtimes[0]
 
     try:
-        with solwyn.run("test"):
+        with solwyn.run("test") as run_id:
             options = wrapper._extra_client_options(
-                replace(runtime, sdk_client=mock), agent_run=_capture_run_context()
+                replace(runtime, sdk_client=mock), run_id=run_id
             )
         assert options == {}
         assert "open_telemetry" not in vars(mock)

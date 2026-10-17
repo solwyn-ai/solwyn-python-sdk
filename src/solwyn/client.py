@@ -2427,7 +2427,7 @@ class Solwyn(_SolwynBase):
                 timeout=_hop_connect_slice(deadline, 1),
                 read_timeout=tuning.failover_hop_read_timeout,
                 max_retries=0,
-                extra_client_options=self._extra_client_options(runtime, agent_run=agent_run),
+                extra_client_options=self._extra_client_options(runtime, run_id=agent_run[0]),
             )
         except Exception as exc:
             # Nothing will settle this call: hand any lease reservation back
@@ -2862,7 +2862,7 @@ class Solwyn(_SolwynBase):
                 # this breaker's single HALF_OPEN probe slot, free it before the error
                 # propagates so the provider is not stranded HALF_OPEN with no probe.
                 try:
-                    extra_client_options = self._extra_client_options(rt, agent_run=agent_run)
+                    extra_client_options = self._extra_client_options(rt, run_id=agent_run[0])
                     if _surface == "responses":
                         call_kwargs = dict(request_semantics)
                         served_model = requested_model
@@ -4107,7 +4107,7 @@ class AsyncSolwyn(_SolwynBase):
                 timeout=_hop_connect_slice(deadline, 1),
                 read_timeout=tuning.failover_hop_read_timeout,
                 max_retries=0,
-                extra_client_options=self._extra_client_options(runtime, agent_run=agent_run),
+                extra_client_options=self._extra_client_options(runtime, run_id=agent_run[0]),
             )
         except Exception as exc:
             # Nothing will settle this call: hand any lease reservation back
@@ -4498,7 +4498,7 @@ class AsyncSolwyn(_SolwynBase):
                 # this breaker's single HALF_OPEN probe slot, free it before the error
                 # propagates so the provider is not stranded HALF_OPEN with no probe.
                 try:
-                    extra_client_options = self._extra_client_options(rt, agent_run=agent_run)
+                    extra_client_options = self._extra_client_options(rt, run_id=agent_run[0])
                     if _surface == "responses":
                         call_kwargs = dict(request_semantics)
                         served_model = requested_model

@@ -1725,7 +1725,7 @@ class _SolwynBase:
         )
 
     def _extra_client_options(
-        self, runtime: ProviderRuntime, *, agent_run: _RunContextSnapshot
+        self, runtime: ProviderRuntime, *, run_id: str | None
     ) -> dict[str, Any]:
         """Copy-extend this candidate's existing public Anthropic telemetry option.
 
@@ -1733,7 +1733,6 @@ class _SolwynBase:
         A builtin property uses its public getter (the Anthropic SDK's API); a
         failing getter simply leaves dispatch unchanged. Nested options stay opaque.
         """
-        run_id = agent_run[0]
         if (
             not self._solwyn_config.anthropic_conversation_id
             or run_id is None

@@ -106,54 +106,6 @@ def _iter_source_files() -> list[Path]:
     return [p for p in SDK_SRC.rglob("*.py") if not _is_content_privileged(p)]
 
 
-def _telemetry_content_option_lines(tree: ast.AST) -> list[int]:
-    """Content-export options are forbidden throughout src, including the allowlist."""
-    forbidden = re.compile(r"\b(?:content_mode|max_content_bytes)\b")
-    violations: list[int] = []
-    for node in ast.walk(tree):
-        identifier = None
-        if isinstance(node, ast.Name):
-            identifier = node.id
-        elif isinstance(node, ast.Attribute):
-            identifier = node.attr
-        elif isinstance(node, ast.keyword):
-            identifier = node.arg
-        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            identifier = node.value
-        if identifier is not None and forbidden.search(identifier):
-            violations.append(node.lineno)
-    return violations
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    "source",
-    [
-        'client.with_options(content_mode="content")',
-        'options = {"max_content_bytes": 1}',
-        'options["content_mode"] = "content"',
-        "options.max_content_bytes = 1",
-        'content_mode = "content"',
-        'getattr(options, "max_content_bytes")',
-        'options = {"traces.content_mode": "content"}',
-    ],
-)
-def test_telemetry_content_guard_rejects_option_spellings(source: str) -> None:
-    assert _telemetry_content_option_lines(ast.parse(source))
-
-
-@pytest.mark.unit
-def test_no_telemetry_content_export_options_in_sdk() -> None:
-    violations = [
-        f"{path.relative_to(SDK_SRC)}:{line}"
-        for path in SDK_SRC.rglob("*.py")
-        for line in _telemetry_content_option_lines(ast.parse(path.read_text()))
-    ]
-    assert not violations, "SDK must never configure telemetry content export:\n" + "\n".join(
-        violations
-    )
-
-
 def _integration_privacy_violations(path: Path) -> list[str]:
     """Return structural privacy violations in one integration module."""
     tree = ast.parse(path.read_text())

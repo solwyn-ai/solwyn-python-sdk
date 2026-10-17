@@ -75,6 +75,7 @@ def _response(request: Any, streaming: bool) -> Any:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize("streaming", [False, True], ids=["message", "stream"])
+@pytest.mark.parametrize("trace_correlation", [False, True], ids=["trace-off", "trace-on"])
 @pytest.mark.parametrize(
     ("configuration", "customer_conversation"),
     [
@@ -91,6 +92,7 @@ def _response(request: Any, streaming: bool) -> Any:
 async def test_native_span_conversation_id_never_reaches_provider_request(
     is_async: bool,
     streaming: bool,
+    trace_correlation: bool,
     configuration: str,
     customer_conversation: str | None,
     monkeypatch: pytest.MonkeyPatch,
@@ -152,9 +154,18 @@ async def test_native_span_conversation_id_never_reaches_provider_request(
     monkeypatch.setattr(provider, "with_options", capture_options)
     plane = FakeControlPlane()
     wrap = plane.wrap_async if is_async else plane.wrap
-    wrapper = wrap(provider, anthropic_conversation_id=True, lease_enabled=False)
+    wrapper = wrap(
+        provider,
+        anthropic_conversation_id=True,
+        trace_correlation=trace_correlation,
+        lease_enabled=False,
+    )
     try:
-        with solwyn.run("private run name", tags={"private": "private tag"}) as run_id:
+        with (
+            tracer_provider.get_tracer(__name__).start_as_current_span("caller") as caller_span,
+            solwyn.run("private run name", tags={"private": "private tag"}) as run_id,
+        ):
+            caller_context = caller_span.get_span_context()
             response = wrapper.messages.create(
                 model="claude-sonnet-5",
                 messages=[{"role": "user", "content": "hi"}],
@@ -170,6 +181,7 @@ async def test_native_span_conversation_id_never_reaches_provider_request(
                     assert [event.type for event in response][-1] == "message_stop"
             else:
                 assert response.content[0].text == "ok"
+            assert otel_api.get_current_span() is caller_span
 
         spans = [
             span
@@ -178,10 +190,11 @@ async def test_native_span_conversation_id_never_reaches_provider_request(
         ]
         expected_id = run_id if customer_conversation is None else customer_conversation
         if configuration == "disabled":
-            assert exporter.get_finished_spans() == ()
+            assert spans == []
         else:
             assert len(spans) == 1
             assert spans[0].attributes["gen_ai.conversation.id"] == expected_id
+            assert spans[0].parent == caller_context
         assert len(seen_options) == 1
         if customer_conversation is not None:
             assert "open_telemetry" not in seen_options[0]
@@ -206,3 +219,13 @@ async def test_native_span_conversation_id_never_reaches_provider_request(
         else:
             wrapper.close()
         tracer_provider.shutdown()
+
+    assert len(plane.ingested) == 1
+    event = plane.ingested[0]
+    assert event.agent_run_id == run_id
+    if trace_correlation:
+        assert event.trace_id == otel_api.format_trace_id(caller_context.trace_id)
+        assert event.span_id == otel_api.format_span_id(caller_context.span_id)
+        assert event.trace_sampled == caller_context.trace_flags.sampled
+    else:
+        assert (event.trace_id, event.span_id, event.trace_sampled) == (None, None, None)
