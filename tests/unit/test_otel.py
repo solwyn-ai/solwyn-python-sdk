@@ -64,7 +64,9 @@ def _event(**overrides: object) -> MetadataEvent:
 
 
 @pytest.mark.unit
-def test_cold_import_does_not_load_opentelemetry() -> None:
+@pytest.mark.parametrize("spans_enabled", ["false", "true"])
+def test_cold_import_does_not_load_opentelemetry(monkeypatch, spans_enabled) -> None:
+    monkeypatch.setenv("SOLWYN_OTEL_SPANS", spans_enabled)
     subprocess.run(
         [
             sys.executable,

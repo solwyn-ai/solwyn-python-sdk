@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import weakref
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -40,6 +41,7 @@ _DENIAL = {"solwyn.deny_source", "solwyn.denied_by_period"}
 
 @pytest.fixture
 def spans(monkeypatch):
+    monkeypatch.setattr(_otel, "_run_span_clients", weakref.WeakValueDictionary())
     provider = sdk.TracerProvider()
     exporter = memory.InMemorySpanExporter()
     provider.add_span_processor(export.SimpleSpanProcessor(exporter))
@@ -168,6 +170,7 @@ async def test_call_span_lifecycle(spans, async_mode, media, outcome):
             solwyn.run("PRIVATE run name", tags={"private": "tag"}) as run_id,
         ):
             caller_id = caller.get_span_context().span_id
+            run_span = trace.get_current_span()
             if outcome == "run_stop":
                 from solwyn._run_control import mark_terminated
 
@@ -191,7 +194,7 @@ async def test_call_span_lifecycle(spans, async_mode, media, outcome):
                 assert not expected_error
             except (Exception, KeyboardInterrupt, asyncio.CancelledError):
                 assert expected_error
-            assert trace.get_current_span() is caller
+            assert trace.get_current_span() is run_span
     finally:
         if async_mode:
             await wrapper.close()
@@ -201,7 +204,9 @@ async def test_call_span_lifecycle(spans, async_mode, media, outcome):
     assert len(spans.calls()) == 1
     call = spans.calls()[0]
     assert call.kind == trace.SpanKind.INTERNAL
-    assert call.parent.span_id == caller_id
+    assert call.parent.span_id == run_span.get_span_context().span_id
+    run = next(s for s in spans.exporter.get_finished_spans() if s.name == "solwyn.run")
+    assert run.parent.span_id == caller_id
     assert spans.ends[call.context.span_id] == 1
     assert call.status.status_code == (
         trace.StatusCode.ERROR if expected_error else trace.StatusCode.OK
@@ -466,7 +471,7 @@ async def test_inactive_spans_preserve_caller_context_and_correlation(
     monkeypatch.setattr(client, "_success_failover_reason", reasons)
 
     try:
-        with spans.tracer.start_as_current_span("caller") as caller:
+        with spans.tracer.start_as_current_span("caller") as caller, solwyn.run("PRIVATE run"):
             caller_context = caller.get_span_context()
             if surface == "media":
                 result = wrapper.embeddings.create(model="text-embedding-3-small", input="x")
@@ -490,6 +495,7 @@ async def test_inactive_spans_preserve_caller_context_and_correlation(
         drop.shutdown()
         record_only.shutdown()
     assert not spans.calls()
+    assert all(s.name != "solwyn.run" for s in spans.exporter.get_finished_spans())
     assert len(plane.ingested) == 1
     event = plane.ingested[0]
     assert event.span_id == (
@@ -1287,7 +1293,8 @@ def test_call_tracer_resolution_can_reenter_without_recursion(spans, monkeypatch
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_mode", [False, True])
-async def test_native_anthropic_span_is_a_child(spans, async_mode):
+@pytest.mark.parametrize("run_scope", [False, True])
+async def test_native_anthropic_span_is_a_child(spans, async_mode, run_scope):
     anthropic = pytest.importorskip("anthropic", minversion="1.14.0")
     httpx2 = pytest.importorskip("httpx2")
     response_body = {
@@ -1310,7 +1317,11 @@ async def test_native_anthropic_span_is_a_child(spans, async_mode):
     plane = FakeControlPlane()
     wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
     try:
-        with spans.tracer.start_as_current_span("caller") as caller:
+        with (
+            spans.tracer.start_as_current_span("caller") as caller,
+            solwyn.run("PRIVATE run") if run_scope else nullcontext() as run_id,
+        ):
+            active_span = trace.get_current_span()
             result = wrapper.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4,
@@ -1319,7 +1330,7 @@ async def test_native_anthropic_span_is_a_child(spans, async_mode):
             if async_mode:
                 result = await result
             assert result.usage.input_tokens == 3
-            assert trace.get_current_span() is caller
+            assert trace.get_current_span() is active_span
     finally:
         await _close(wrapper, async_mode)
     call = spans.calls()[0]
@@ -1328,7 +1339,14 @@ async def test_native_anthropic_span_is_a_child(spans, async_mode):
     ]
     assert len(native) == 1
     assert native[0].parent.span_id == call.context.span_id
-    assert call.parent.span_id == caller.get_span_context().span_id
+    assert call.parent.span_id == active_span.get_span_context().span_id
+    if run_scope:
+        run = next(s for s in spans.exporter.get_finished_spans() if s.name == "solwyn.run")
+        assert run.parent.span_id == caller.get_span_context().span_id
+        assert dict(run.attributes) == {"solwyn.agent_run_id": run_id}
+        assert spans.ends[run.context.span_id] == 1
     assert plane.ingested[0].span_id == trace.format_span_id(call.context.span_id)
     assert not call.events
-    assert set(call.attributes) == _IDENTITY | _BUDGET | _ATTEMPT
+    assert set(call.attributes) == (
+        _IDENTITY | _BUDGET | _ATTEMPT | ({"solwyn.agent_run_id"} if run_scope else set())
+    )

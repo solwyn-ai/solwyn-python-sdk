@@ -145,7 +145,7 @@ class SolwynConfig(BaseModel):
     report_untracked_surfaces: bool = True
     # Correlate events with an application's existing active OTel span.
     trace_correlation: bool = True
-    # Emit content-free Solwyn call spans through application-configured OTel.
+    # Emit content-free Solwyn call/run spans through application-configured OTel.
     otel_spans: bool = False
     # Extend existing Anthropic telemetry options with the active run's id.
     anthropic_conversation_id: bool = False

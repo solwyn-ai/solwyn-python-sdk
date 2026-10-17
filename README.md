@@ -1055,7 +1055,7 @@ def test_denial_fixture(solwyn_control_plane, solwyn_test_client):
 | `on_unmetered` | `SOLWYN_ON_UNMETERED` | `warn` | Handle untracked or unknown pre-call capabilities with `warn`, `raise`, or `allow` |
 | `report_untracked_surfaces` | `SOLWYN_REPORT_UNTRACKED_SURFACES` | `True` | Send optional structural advisory reports for unacknowledged `warn`/`allow` observations; set false to keep them local |
 | `trace_correlation` | `SOLWYN_TRACE_CORRELATION` | `True` | Include active OpenTelemetry trace identifiers in metadata events when available; set false to disable capture |
-| `otel_spans` | `SOLWYN_OTEL_SPANS` | `False` | Emit content-free `solwyn.call` spans through your application's OpenTelemetry tracing |
+| `otel_spans` | `SOLWYN_OTEL_SPANS` | `False` | Emit content-free `solwyn.call` and `solwyn.run` spans through your application's OpenTelemetry tracing |
 | `anthropic_conversation_id` | `SOLWYN_ANTHROPIC_CONVERSATION_ID` | `False` | Extend existing Anthropic telemetry options with the active run ID as a local span attribute |
 | `acknowledge_untracked` | `SOLWYN_ACKNOWLEDGE_UNTRACKED` | empty | Exact terminal capability tokens; env format is comma-delimited |
 | `control_plane_failure_threshold` | `SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD` | `3` | Consecutive Solwyn API failures before local outage posture applies |
@@ -1195,7 +1195,7 @@ Optional fields are omitted entirely when unset (never `null`), so payloads for
 providers that do not use them are byte-identical to earlier releases.
 
 Trace correlation captures only these two random identifiers and the sampled
-flag, never content. With call spans disabled (the default), it requires your
+flag, never content. With Solwyn spans disabled (the default), it requires your
 application's configured tracer provider and an active, valid OpenTelemetry
 span; `solwyn[otel]` is only a convenience for installing the optional API.
 Solwyn's own code never injects trace context, baggage, or tracestate. Your application's httpx
@@ -1206,13 +1206,39 @@ Disable capture with
 `SOLWYN_TRACE_CORRELATION=false`. Unset correlation fields are omitted entirely
 from payloads. Aggregated denial replays carry no trace because they span calls.
 
-Optional call spans are enabled with `Solwyn(client, otel_spans=True)` (or
+Optional call and run spans are enabled with `Solwyn(client, otel_spans=True)` (or
 `AsyncSolwyn`) or `SOLWYN_OTEL_SPANS=true`. Configure your application's
 OpenTelemetry tracer provider and exporter first; installing `solwyn[otel]`
 alone does not export spans. Cold `import solwyn` never imports OpenTelemetry.
 
+`solwyn.run(...)` opens an `INTERNAL` span named literally `solwyn.run` at scope
+entry and keeps it current for the scope's body. Application spans and
+`solwyn.call` spans nest beneath it; nested runs carry the parent run ID and
+follow the current tracing parent. The span ends once on sync or async exit,
+with status `ERROR` when an exception or interruption leaves the scope and
+`OK` otherwise. Run spans contain only `solwyn.agent_run_id` and, for child
+runs, `solwyn.parent_agent_run_id`.
+
+Run scopes are independent of clients, so their opt-in applies process-wide:
+set `SOLWYN_OTEL_SPANS=true`, or create a wrapper with `otel_spans=True` before
+entering the scope. While that wrapper remains alive, newly entered scopes and
+created handles emit run spans. Each client's call-span flag remains independent;
+a client with `otel_spans=False` can still make calls inside a traced run.
+
+`start_run(...)` opens the same current run span until `handle.finish()`.
+`create_run(...)` creates one detached span, with its tracing parent captured
+at creation, and leaves the current span unchanged. Every `handle.activate()`
+attaches that same span with a fresh context token, restoring the previous
+span on exit without ending the run. This works across tasks and threads,
+including overlapping activations. After all activations exit, `finish()` ends
+the span once; an exception leaving any activation marks the final status
+`ERROR`. An unfinished handle collected by GC also ends its span with `ERROR`;
+this tracing cleanup does not finish attribution or release leases. LangChain
+and CrewAI integrations inherit these spans through their existing detached
+run handles. Use explicit finish for deterministic completion.
+
 Each intercepted chat or media call creates one `solwyn.call` span of kind
-`INTERNAL`, parented under the application's current span, or as a root when
+`INTERNAL`, parented under the current run or application span, or as a root when
 there is no parent. The span opens before budget preflight; instrumented budget
 requests retain the application's current parent. Native provider SDK spans are
 children of `solwyn.call`, and all failover attempts share that call span. It is
@@ -1221,7 +1247,7 @@ deferred Responses manager entry, and is never current while application code
 iterates a returned stream. Streams keep the span open until completion,
 explicit close, failure, or garbage collection.
 
-The closed attribute allowlist is:
+The closed call-span attribute allowlist is:
 
 - `solwyn.call_id`, `solwyn.agent_run_id`, `solwyn.parent_agent_run_id`
 - `solwyn.budget.allowed`, `solwyn.budget.mode`, `solwyn.deny_source`, `solwyn.denied_by_period`
@@ -1233,15 +1259,17 @@ index describe the final attempted hop, including a hop that fails. Completed
 calls and explicitly closed streams have status `OK`; denials, run stops,
 provider errors, interruptions, and garbage-collected abandonment have status
 `ERROR`. A Responses manager closed before entry also ends with `ERROR`.
-Solwyn call spans never carry cost, token usage, `gen_ai.*` attributes, run names,
-tags, prompt/response content, exception messages, or events. Native provider
+Solwyn call and run spans never carry cost, token usage, `gen_ai.*` attributes,
+run names, tags, prompt/response content, exception messages, or events. Native provider
 `gen_ai` spans remain the generation/usage signal, avoiding duplicate usage or
 cost accounting in tools such as Langfuse.
 
-With correlation enabled, metadata uses the `solwyn.call` span ID only when the
-new span has a valid context and is both recording and sampled. Otherwise it
-keeps exactly the caller snapshot and provider parentage used with spans off;
-Solwyn never makes an unexported child ID current. The trace ID is unchanged
+With correlation enabled, metadata captures the current trace once at call start:
+the `solwyn.call` span when enabled, or the run/application span otherwise.
+Solwyn adopts a new call or run span only when it has a valid context and is
+both recording and sampled. Otherwise it keeps the caller snapshot and provider
+parentage used with spans off. Solwyn never makes an unexported child ID current.
+The trace ID is unchanged
 when there is an existing caller trace. `trace_correlation=False` independently
 disables metadata identifiers while leaving opted-in span export enabled.
 

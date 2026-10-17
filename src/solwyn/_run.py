@@ -42,6 +42,7 @@ from threading import Lock
 from types import FrameType, TracebackType
 from typing import NamedTuple, ParamSpec, TypeVar
 
+from solwyn import _otel
 from solwyn._constants import (
     AGENT_RUN_NAME_MAX_LENGTH,
     TAG_KEY_MAX_LENGTH,
@@ -100,6 +101,8 @@ class _RunFrame:
     parent_run_id: str | None
     token: Token[tuple[str, str, dict[str, str] | None] | None]
     prior_active: tuple[str, str, dict[str, str] | None] | None
+    span: _otel._RunSpan
+    span_activation: _otel._RunSpanActivation | None
 
 
 _run_frames: ContextVar[tuple[_RunFrame, ...]] = ContextVar("solwyn_run_frames", default=())
@@ -309,22 +312,36 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
             self._tags,
             inherit_tags=self._inherit_tags,
         )
-        token = _active_run.set(identity.active_value())
-        _run_frames.set(
-            (
-                *frames,
-                _RunFrame(
-                    scope_id=self._scope_id,
-                    run_id=identity.run_id,
-                    parent_run_id=identity.parent_run_id,
-                    token=token,
-                    prior_active=prior_active,
-                ),
+        span = _otel._start_run_span(identity.run_id, identity.parent_run_id)
+        activation = None
+        token = None
+        try:
+            activation = span.attach()
+            token = _active_run.set(identity.active_value())
+            _run_frames.set(
+                (
+                    *frames,
+                    _RunFrame(
+                        scope_id=self._scope_id,
+                        run_id=identity.run_id,
+                        parent_run_id=identity.parent_run_id,
+                        token=token,
+                        prior_active=prior_active,
+                        span=span,
+                        span_activation=activation,
+                    ),
+                )
             )
-        )
+        except BaseException:
+            if activation is not None:
+                activation.detach()
+            if token is not None:
+                _active_run.reset(token)
+            span.end(error=True)
+            raise
         return identity.run_id
 
-    def _exit(self, *, require_same_context: bool = False) -> None:
+    def _exit(self, *, require_same_context: bool = False, error: bool = False) -> None:
         """Pop this scope's frame, and release the leases the run held.
 
         The release is the run's own (``frame.run_id``), never a nested or
@@ -353,7 +370,10 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
                     "start_run() created it"
                 ) from exc
             _run_frames.set(frames[:-1])
+            if frame.span_activation is not None:
+                frame.span_activation.detach()
             return
+        restore = False
         try:
             _active_run.reset(frame.token)
         except ValueError:
@@ -363,11 +383,18 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
             # the finalizer context as a best effort; entering inside async
             # generators is rejected to prevent contaminating the consumer.
             _active_run.set(frame.prior_active)
+            restore = True
         finally:
             _run_frames.set(frames[:-1])
-        # The run is over — including when the block is leaving on an
-        # exception. Hand its float back instead of holding it to the deadline.
-        _surrender_run(frame.run_id)
+        try:
+            if frame.span_activation is not None:
+                frame.span_activation.detach(restore=restore)
+        finally:
+            # Cleanup ownership survives an interruption during deactivation.
+            try:
+                _surrender_run(frame.run_id)
+            finally:
+                frame.span.end(error=error)
 
     def __enter__(self) -> str:
         return self._enter()
@@ -378,7 +405,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self._exit()
+        self._exit(error=exc_type is not None)
 
     async def __aenter__(self) -> str:
         return self._enter()
@@ -389,7 +416,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self._exit()
+        self._exit(error=exc_type is not None)
 
 
 class RunHandle:
@@ -407,6 +434,7 @@ class RunHandle:
         run_id: str,
         *,
         identity: _RunIdentity | None = None,
+        span: _otel._RunSpan | None = None,
     ) -> None:
         if (scope is None) == (identity is None):
             raise RuntimeError("run handle requires exactly one scope or detached identity")
@@ -416,6 +444,10 @@ class RunHandle:
         self._finished = False
         self._active_activations = 0
         self._state_lock = Lock()
+        self._span = span or _otel._start_run_span(
+            run_id, identity.parent_run_id if identity is not None else None
+        )
+        self._span_finalizer = self._span.finalize_on_gc(self)
 
     @property
     def run_id(self) -> str:
@@ -442,7 +474,12 @@ class RunHandle:
             if self._scope is not None:
                 self._scope._exit(require_same_context=True)
             self._finished = True
-        _surrender_run(self._run_id)
+        try:
+            _surrender_run(self._run_id)
+        finally:
+            self._span.end()
+            if self._span_finalizer is not None:
+                self._span_finalizer.detach()
 
     def activate(self) -> _RunActivation:
         """Bind a detached logical identity in the caller's context."""
@@ -483,7 +520,9 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
         identity = self._handle._reserve_activation()
         prior_active = _active_run.get()
         token: Token[tuple[str, str, dict[str, str] | None] | None] | None = None
+        activation = None
         try:
+            activation = self._handle._span.attach()
             token = _active_run.set(identity.active_value())
             _run_frames.set(
                 (
@@ -494,10 +533,14 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
                         parent_run_id=identity.parent_run_id,
                         token=token,
                         prior_active=prior_active,
+                        span=self._handle._span,
+                        span_activation=activation,
                     ),
                 )
             )
         except BaseException:
+            if activation is not None:
+                activation.detach()
             if token is not None:
                 _active_run.reset(token)
             self._handle._release_activation()
@@ -505,7 +548,7 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
         self._entered = True
         return identity.run_id
 
-    def _exit(self) -> None:
+    def _exit(self, *, error: bool = False) -> None:
         frames = _run_frames.get()
         matching_index = next(
             (index for index, frame in enumerate(frames) if frame.scope_id == self._scope_id),
@@ -525,8 +568,14 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
                 "RunHandle activation must exit in the same context where it was entered"
             ) from exc
         _run_frames.set(frames[:-1])
-        self._handle._release_activation()
-        self._entered = False
+        try:
+            if frame.span_activation is not None:
+                frame.span_activation.detach()
+        finally:
+            if error:
+                frame.span.failed()
+            self._handle._release_activation()
+            self._entered = False
 
     def __enter__(self) -> str:
         if self._entered:
@@ -539,7 +588,7 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self._exit()
+        self._exit(error=exc_type is not None)
 
     async def __aenter__(self) -> str:
         return self.__enter__()
@@ -550,7 +599,7 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self._exit()
+        self._exit(error=exc_type is not None)
 
 
 def start_run(
@@ -561,7 +610,8 @@ def start_run(
 ) -> RunHandle:
     """Open a run scope for begin/end-shaped framework callbacks."""
     scope = _RunScope(name, tags, inherit_tags=inherit_tags)
-    return RunHandle(scope, scope._enter())
+    run_id = scope._enter()
+    return RunHandle(scope, run_id, span=_run_frames.get()[-1].span)
 
 
 def create_run(
