@@ -345,9 +345,15 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         return identity.run_id
 
     def _end_unframed_span(self, *, error: bool) -> None:
-        # A sync generator may exit in a fresh Context with none of its entry
-        # state. End only tracing here: attribution and lease release still
-        # require a visible frame, and this Context's OTel parent is unrelated.
+        """End tracing when a generator exits without its original run frame.
+
+        Create a fresh ``solwyn.run(...)`` scope object per use. Sharing one
+        scope concurrently across generators stepped in fresh contexts leaves
+        this fallback unable to identify which pending run exited.
+
+        Attribution and lease release still require a visible frame; this
+        context's OTel parent is unrelated and must remain untouched.
+        """
         try:
             _, span = self._spans.popitem()
         except KeyError:

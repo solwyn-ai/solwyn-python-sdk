@@ -1219,6 +1219,11 @@ with status `ERROR` when an exception or interruption leaves the scope and
 `OK` otherwise. Run spans contain only `solwyn.agent_run_id` and, for child
 runs, `solwyn.parent_agent_run_id`.
 
+Create a fresh `solwyn.run(...)` scope object per use. Sharing one scope object
+concurrently across generators stepped in fresh contexts is unsupported: an
+exit without its original run frame cannot identify which pending run ended.
+Use detached run handles to share a run identity across tasks or threads.
+
 Run scopes are independent of clients. Run-span opt-in is process-wide and
 sticky: the first wrapper constructed with `otel_spans=True`, or a truthy
 `SOLWYN_OTEL_SPANS` observed at run scope entry or handle creation, enables run
