@@ -4468,6 +4468,8 @@ together = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-sdk" },
     { name = "respx" },
 ]
 frameworks = [
@@ -4514,7 +4516,11 @@ requires-dist = [
 provides-extras = ["all", "anthropic", "bedrock", "crewai", "dev", "google", "langchain", "openai", "otel", "together"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "respx", specifier = ">=0.21" }]
+dev = [
+    { name = "opentelemetry-api", specifier = ">=1.1.0,<2" },
+    { name = "opentelemetry-sdk", specifier = ">=1.1.0,<2" },
+    { name = "respx", specifier = ">=0.21" },
+]
 frameworks = [
     { name = "langchain-openai" },
     { name = "langgraph" },

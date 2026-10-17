@@ -133,6 +133,8 @@ conflicts = [
 [dependency-groups]
 dev = [
     "respx>=0.21",
+    "opentelemetry-api>=1.1.0,<2",
+    "opentelemetry-sdk>=1.1.0,<2",
 ]
 frameworks = [
     "langchain-openai",
