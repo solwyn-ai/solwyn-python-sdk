@@ -5,12 +5,16 @@ from __future__ import annotations
 import importlib.util
 import json
 import socket
+from collections.abc import Mapping
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
 import pytest
 import yaml
+from conftest import VALID_API_KEY
+
+from solwyn import AsyncSolwyn, Solwyn
 
 ROOT = Path(__file__).parents[2]
 FINGERPRINT_PATH = ROOT / "tests" / "provider_surface_fingerprints.json"
@@ -507,6 +511,11 @@ def test_real_sdk_inventory_is_offline_deterministic_and_content_free(
                 "realtime.calls.create",
                 "realtime.calls.with_raw_response.reject",
                 "realtime.calls.with_streaming_response.accept",
+                "decisions.create",
+                "audio.voices.create",
+                "realtime.translations.client_secrets.create",
+                "beta.agents.sessions.traces.list",
+                "beta.agents.sessions.turns.items.list",
             },
         ),
         (
@@ -527,6 +536,13 @@ def test_real_sdk_inventory_is_offline_deterministic_and_content_free(
                 "code_interpreter.execute",
                 "evals.create",
                 "videos.create",
+                "beta.jig.rollback",
+                "clusters.create",
+                "clusters.storage.create",
+                "post_training.operations.forward_backward",
+                "post_training.operations.sample",
+                "post_training.prepare_for_fp4_inference.create",
+                "projects.list",
             },
         ),
         (
@@ -564,6 +580,38 @@ def test_bedrock_inventory_unions_public_and_service_model_operations(shape_key:
     assert rows["invoke_model"]["return_shape"] == "callable"
     assert report["service_model_operations"] == sorted(report["service_model_operations"])
     assert "invoke_model" in report["service_model_operations"]
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape_key", ["anthropic_sync", "anthropic_async"])
+async def test_anthropic_tracing_configuration_is_accessible_in_strict_mode(
+    shape_key: str,
+) -> None:
+    capture = _capture_module()
+    pytest.importorskip(capture.import_name_for_shape(shape_key))
+    shape = capture._SHAPES_BY_KEY[shape_key]
+
+    with capture._deny_socket_access() as counter:
+        async with capture._client_for(shape) as raw:
+            if not hasattr(type(raw), "open_telemetry"):
+                pytest.skip("Anthropic SDK predates native OpenTelemetry")
+            wrapper = (AsyncSolwyn if shape.mode == "async" else Solwyn)(
+                raw,
+                api_key=VALID_API_KEY,
+                on_unmetered="raise",
+                report_untracked_surfaces=False,
+            )
+            try:
+                assert isinstance(wrapper.open_telemetry, Mapping)
+                assert wrapper.timeout is raw.timeout
+            finally:
+                if isinstance(wrapper, AsyncSolwyn):
+                    await wrapper.close()
+                else:
+                    wrapper.close()
+
+    assert counter.attempts == 0
 
 
 @pytest.mark.unit
@@ -623,7 +671,9 @@ def test_structural_interval_catalog_covers_floor_breakpoints_and_latest() -> No
         "openai-admin",
         "openai-content-provenance",
     } <= by_family["openai"]
-    assert {"anthropic-parse", "anthropic-stable-files-skills"} <= by_family["anthropic"]
+    assert {"anthropic-parse", "anthropic-stable-files-skills", "anthropic-otel"} <= (
+        by_family["anthropic"]
+    )
     assert {"google-file-search", "google-webhooks"} <= by_family["google-genai"]
     assert {"bedrock-async-invoke", "bedrock-bidirectional", "bedrock-count-tokens"} <= (
         by_family["bedrock"]

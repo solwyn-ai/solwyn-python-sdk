@@ -242,9 +242,9 @@ def register_async_reporter(reporter: AsyncMetadataReporter) -> None:
         reporter._receipt_fold_state,
         reporter._sdk_instance_id,
     )
-    # Documented writable property; typeshed models finalize with __slots__
-    # only, so mypy rejects the assignment it cannot see.
-    finalizer.atexit = False  # type: ignore[misc]
+    # Documented writable property; some typeshed versions reject assignment.
+    # Keep this local suppression valid with either representation.
+    finalizer.atexit = False  # type: ignore[misc, unused-ignore]
     reporter._finalizer = finalizer
 
 

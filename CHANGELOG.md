@@ -9,23 +9,46 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
-- **Surface canary admits the late-September openai and google-genai
-  namespaces.** openai 3.17.0 added `safety.cases` (case retrieval) and
-  `admin.organization.external_storage` (external-storage configuration
-  create/retrieve/list/validate/delete); google-genai 2.25.0 added the
-  `voices` / `aio.voices` catalog (create/get/list/delete). Neither is a model
-  call nor changes a response shape the SDK reads, so every path is classified
-  by precedent (`safety.alerts`, `admin.organization.certificates`,
-  `environments`): 106 rules, 0 removed, 0 changed — 4 guarded namespaces, 20
-  operations as `unmetered_spend` with exact acknowledgment tokens, 80
-  raw/streaming mirrors at `raw_response` scope, and the two `sdk_configuration`
-  properties at `resource` scope. openai 3.18 and 3.19 add only model
-  identifiers and client fixes; the surface graph is unchanged from 3.17.
-  Latest fingerprints, the ten moved per-context digests and the README strict
-  fingerprint (now audited against `openai==3.19.2`; `tracked`, `unknown`,
-  `blocked`, `unsupported`, `conditional` and `safe` are byte-identical) are
-  refreshed. Runtime behaviour for existing surfaces is unchanged; before this
-  change these paths resolved to `unknown` and followed `on_unmetered`.
+- **Anthropic SDK 1.15 support.** Coverage reports recognize the
+  `open_telemetry` configuration. Newly guarded administration APIs include
+  the `organization` tree and `beta.organization.analytics`,
+  `beta.organization.plugins`, `beta.organization.plugin_marketplaces`,
+  `beta.organization.rbac_groups`, `beta.organization.rbac_roles`,
+  `beta.organization.spend_limits`, and
+  `beta.organization.telemetry_destinations` (including workspace assignments).
+  Their operations remain unmetered, follow `on_unmetered`, and require exact
+  acknowledgment tokens in strict mode. Provider SDK minimum versions are
+  unchanged, and Anthropic versions below 1.14 retain their existing behavior.
+- **Provider version documentation.** The README lists supported SDK floors,
+  tested breakpoints, and latest tested versions, and clarifies that unset
+  optional metadata fields are omitted entirely from transmitted payloads.
+- **OpenAI SDK 3.33 support.** Coverage reports recognize `decisions`,
+  `audio.voices`, `realtime.translations.client_secrets`,
+  `beta.agents.environments`, `beta.agents.environments.files`,
+  `beta.agents.sessions.artifacts`, `beta.agents.sessions.traces`,
+  `beta.agents.sessions.turns.items`, `beta.agents.vaults`,
+  `admin.organization.projects.api_keys`, `admin.organization.usage`,
+  `safety.cases`, and `admin.organization.external_storage`. These operations
+  remain unmetered and require their exact acknowledgment tokens in strict
+  mode. Raw and streaming response helpers retain their separate acknowledgment
+  scope. Coverage fingerprints are refreshed for these admissions.
+- **Together SDK 2.41 support.** Coverage reports recognize `beta.jig`
+  revision history and `beta.jig.rollback`, `clusters` (including
+  `clusters.remediations` and `clusters.storage`), `post_training.sessions`,
+  `post_training.operations`, `post_training.checkpoints`,
+  `post_training.prepare_for_fp4_inference`, `post_training.model_resources`,
+  `post_training.supported_models`, and `projects`. Deployment rollback,
+  cluster provisioning, training, and sampling can incur provider charges
+  that Solwyn does not meter; they follow `on_unmetered` and are refused in
+  strict mode unless explicitly acknowledged.
+- **Google GenAI SDK 2.31 support.** Coverage reports recognize the
+  `voices` / `aio.voices` catalog introduced in google-genai 2.25
+  (create/get/list/delete) as guarded namespaces with unmetered operations
+  that require exact acknowledgment tokens in strict mode. Their
+  `sdk_configuration` properties use the `resource` acknowledgment scope;
+  raw and streaming response helpers use `raw_response`. These admissions
+  change pinned `CoverageFingerprint` values when upgrading from Solwyn 0.8.0,
+  where the paths were `unknown`.
 
 ### Tests
 

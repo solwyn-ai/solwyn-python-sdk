@@ -23,6 +23,27 @@ pip install solwyn[openai]
 
 Other OpenAI-compatible endpoints (Groq, OpenRouter, vLLM, …) ride the `openai` extra. Together can use that path too; `solwyn[together]` supplies its native SDK instead.
 
+### Supported provider SDK versions
+
+| Provider SDK | Declared floor | Tested breakpoints (including floor) | Latest tested |
+|---|---|---|---|
+| `openai` | `openai>=2.0` | `openai==2.0.0`, `openai==2.2.0`, `openai==2.21.0`, `openai==2.34.0`, `openai==2.52.0` | `openai==3.33.0` |
+| `anthropic` | `anthropic>=0.50` | `anthropic==0.50.0`, `anthropic==0.80.0`, `anthropic==1.0.0`, `anthropic==1.14.0` | `anthropic==1.15.0` |
+| `together` | `together>=2.0` | `together==2.0.0` | `together==2.41.0` |
+| `google-genai` | `google-genai>=1.0` | `google-genai==1.0.0`, `google-genai==1.60.0`, `google-genai==2.0.0` | `google-genai==2.31.0` |
+| `google-generativeai` | `google-generativeai>=0.8.5` | `google-generativeai==0.8.5` | `google-generativeai==0.8.6` |
+| `bedrock` | `boto3>=1.34` | `aioboto3==13.0.0`, `aioboto3==13.4.0`, `aioboto3==15.0.0`, `aioboto3==15.5.0` | `boto3==1.43.68`, `aioboto3==15.5.0` |
+
+Floors come from the install extras in `pyproject.toml`; the legacy
+`google-generativeai` floor is declared in the dev extra, and that SDK must be
+installed separately. Breakpoints come from the surface canary's interval
+catalog. Latest tested versions come from the development lock and surface
+inventory; Bedrock's async lanes install `aioboto3` with its compatible `boto3`.
+
+Anthropic versions below 1.14 remain fully supported with no behavior change.
+`opentelemetry-api` is optional and never installed directly by Solwyn
+(Anthropic 1.14+ brings it as its own dependency).
+
 ## Quick Start
 
 ```python
@@ -413,7 +434,8 @@ turn an unsupported adapter surface into a supported one.
 
 The surface contract is verified against pinned structural breakpoints per
 provider (see `tests/provider_surface_intervals.json`): floor, named
-breakpoints, and latest. Versions between tested breakpoints may expose
+breakpoints, and latest, as listed in the [supported provider SDK versions
+table](#supported-provider-sdk-versions). Versions between tested breakpoints may expose
 surfaces we have not classified; those resolve as `unknown` and follow
 `on_unmetered`.
 
@@ -425,7 +447,7 @@ dispatch behavior and includes provider-chain usage guarantees.
 
 For CI, pin an independently reviewed literal fingerprint. This example is the
 exhaustive strict, unacknowledged fingerprint exercised against
-`openai==3.19.2` by this repository's real-client test:
+`openai==3.33.0` by this repository's real-client test:
 
 ```python
 from openai import OpenAI
@@ -438,11 +460,11 @@ audit_client = Solwyn(
 )
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
-    guarded_namespaces="sha256:670fde76b090b2e80747845b79afcb9d27d652ed7e372a9840494dbc6e25b318",
+    guarded_namespaces="sha256:e3edd2abe9714eeab5344630a736407879cbcca27adace00b33bcf6f4aa3451a",
     tracked="sha256:586f19c33f350871240a3498fbfa255c9759bec35e1285a8fccfeb937ec68148",
-    untracked="sha256:80f9592734f2199b402a9927f536a2bd1f93b6ae057161368a12d45da9a0b346",
+    untracked="sha256:a5a720220b574d60d5362be2da73a09fe214ed4767f34879b0d35d2024493373",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    scoped_escapes="sha256:ba85dac29a65ce08541be530f0b32c20bbf7d006e330e0257e2adf8abdcdc574",
+    scoped_escapes="sha256:a4f9670a680f5f35c1b64068a208f0eb14859ab845e34e33e7bf9febb9421815",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     unsupported="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     conditional="sha256:ce837f71d1fc97849872c5d0f86b0b1f26e1bc4e46a29c3b1b8004bf4b9bcb77",
@@ -1112,16 +1134,15 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `receipt_aggregate_count` | `int \| None` | Number of denied receipts represented by a content-free aggregate replay |
 | `receipt_pricing_input_tokens` | `int \| None` | Original per-call input-token count used to select the pricing card for a homogeneous aggregate replay; omitted for ordinary and legacy events |
 
+Optional fields are omitted entirely when unset (never `null`), so payloads for
+providers that do not use them are byte-identical to earlier releases.
+
 Token, output-bound, aggregate-count, pricing-basis, and non-token media
 quantities are each capped at 100,000,000 per event. Larger folded receipt
 totals replay as multiple pricing-compatible events without changing their
 exact totals or turning an unknown media quantity into zero.
 
 **The SDK never captures, logs, or transmits prompts or responses.** Explicit customer-supplied tags are outside this zero-content guarantee and are transmitted as provided. Prompt and response privacy is enforced by [structural tests](tests/unit/test_privacy_firewall.py) and the [privacy module](src/solwyn/_privacy.py).
-
-## Release Compatibility
-
-Wire-contract changes are API-first: Solwyn Cloud must accept new fields and enum values before an SDK release ships them. As of the current release line the Cloud API accepts the full wire contract — the `modality` discriminator, the `media_usage` quantities (image counts, media durations, character counts, and resolution/quality selectors), the image and audio `token_details` buckets, the Bedrock and OpenAI-compatible `provider` values, `provider_region`, bounded `tags`, `service_tier` on budget confirms, `token_details.is_estimated`, 2048-char model identifiers, `lease_id` on metadata events, and per-event ingest dispositions. Optional fields are omitted entirely (never `null`) when unset, so payloads for providers that don't use them are byte-identical to earlier releases.
 
 ## Requirements
 
