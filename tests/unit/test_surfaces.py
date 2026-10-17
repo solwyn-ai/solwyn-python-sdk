@@ -937,6 +937,130 @@ def test_realtime_calls_children_have_exact_operation_and_raw_response_scopes() 
         _assert_raw_response_family(context, "realtime.calls", operations)
 
 
+def _assert_exact_guarded_family(
+    context: SurfaceContext,
+    base: str,
+    operations: set[str],
+    *,
+    raw_operations: set[str] | None = None,
+) -> None:
+    namespace = resolve_surface_rule(context=context, path=base, source=SurfaceSource.RAW)
+    assert namespace is not None and namespace.kind is SurfaceKind.NAMESPACE
+    assert namespace.acknowledgment_token is None
+    assert namespace.expected_shapes == (AttributeShape("cached_property", "resource"),)
+    for operation in operations:
+        _assert_unmetered_operation(context, f"{base}.{operation}")
+    mirrored = operations if raw_operations is None else raw_operations
+    _assert_raw_response_family(context, base, mirrored)
+
+    segments = base.split(".")
+    for helper in ("with_raw_response", "with_streaming_response"):
+        for index in range(len(segments)):
+            prefix = ".".join([*segments[:index], helper, *segments[index:]])
+            for suffix in ("", *(f".{operation}" for operation in mirrored)):
+                path = prefix + suffix
+                rule = resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW)
+                assert rule is not None and rule.kind is SurfaceKind.UNMETERED_SPEND
+                assert rule.capability_scope is CapabilityScope.RAW_RESPONSE
+                assert rule.acknowledgment_token == path
+                assert rule.selectors == namespace.selectors
+                expected = (
+                    AttributeShape("cached_property", "resource")
+                    if suffix == ""
+                    else AttributeShape("function", "callable")
+                )
+                assert rule.expected_shapes == (expected,)
+            for operation in operations - mirrored:
+                assert (
+                    resolve_surface_rule(
+                        context=context, path=f"{prefix}.{operation}", source=SurfaceSource.RAW
+                    )
+                    is None
+                )
+
+    for path in (f"{base}.future_operation", f"with_raw_response.{base}.future_operation"):
+        assert resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW) is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("provider", ["openai", "azure_openai", "openai_compatible", "together"])
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_openai_333_operations_and_mirrors_remain_exact_untracked_surfaces(
+    provider: str, mode: str
+) -> None:
+    # Decisions, voice creation, credentials, hosted environments and their
+    # administrative helpers are outside the SDK's metered dispatch paths.
+    context = SurfaceContext(provider, "openai", "openai_sdk", mode)
+    families = {
+        "admin.organization.projects.api_keys": {"update"},
+        "admin.organization.usage": {"decisions"},
+        "audio.voices": {"create"},
+        "beta.agents.environments": {"create", "list"},
+        "beta.agents.environments.files": {"prepare", "prepare_directory", "upload"},
+        "beta.agents.sessions.artifacts": {"for_result"},
+        "beta.agents.sessions.traces": {"list"},
+        "beta.agents.sessions.turns.items": {"list"},
+        "beta.agents.vaults": {"update"},
+        "decisions": {"create"},
+        "realtime.translations": set(),
+        "realtime.translations.client_secrets": {"create"},
+    }
+    for base, operations in families.items():
+        # These convenience helpers have no HTTP raw/streaming counterparts.
+        raw_operations = (
+            set()
+            if base in {"beta.agents.environments.files", "beta.agents.sessions.artifacts"}
+            else operations
+        )
+        _assert_exact_guarded_family(context, base, operations, raw_operations=raw_operations)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_together_241_operations_and_mirrors_remain_exact_untracked_surfaces(mode: str) -> None:
+    # Rollback reapplies deployed pods; clusters provision GPUs/storage; training
+    # and sampling consume compute. Even their read helpers remain unmetered.
+    context = SurfaceContext("together", "openai", "native_together", mode)
+    families = {
+        "beta.jig": {"list_revisions", "retrieve_revision", "rollback"},
+        "clusters": {"create", "retrieve", "update", "list", "delete", "list_regions"},
+        "clusters.remediations": {"create", "retrieve", "list", "approve", "cancel", "reject"},
+        "clusters.storage": {"create", "retrieve", "update", "list", "delete"},
+        "post_training": set(),
+        "post_training.sessions": {"create", "retrieve", "update", "list", "stop"},
+        "post_training.operations": {
+            "create_inference_checkpoint",
+            "create_training_checkpoint",
+            "custom_forward_backward",
+            "forward_backward",
+            "optim_step",
+            "retrieve_custom_forward_backward",
+            "retrieve_forward_backward",
+            "retrieve_inference_checkpoint",
+            "retrieve_optim_step",
+            "retrieve_sample",
+            "retrieve_training_checkpoint",
+            "retrieve_weights_sync",
+            "sample",
+            "weights_sync",
+        },
+        "post_training.checkpoints": {"retrieve", "list", "download"},
+        "post_training.prepare_for_fp4_inference": {
+            "create",
+            "retrieve",
+            "list",
+            "cancel",
+            "estimate_cost",
+            "list_events",
+        },
+        "post_training.model_resources": {"create", "retrieve", "list", "estimate_cost", "stop"},
+        "post_training.supported_models": {"get"},
+        "projects": {"list"},
+    }
+    for base, operations in families.items():
+        _assert_exact_guarded_family(context, base, operations)
+
+
 @pytest.mark.unit
 @pytest.mark.parametrize("context", [ANTHROPIC_SYNC, ANTHROPIC_ASYNC])
 def test_anthropic_open_telemetry_is_metadata_without_an_escape_token(

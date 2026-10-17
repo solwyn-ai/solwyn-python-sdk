@@ -20,23 +20,20 @@ derived from git tags (hatch-vcs).
   tested breakpoints, and latest tested versions, and clarifies that unset
   optional metadata fields are omitted entirely from transmitted payloads.
 
-- **Surface canary admits the late-September openai and google-genai
-  namespaces.** openai 3.17.0 added `safety.cases` (case retrieval) and
-  `admin.organization.external_storage` (external-storage configuration
-  create/retrieve/list/validate/delete); google-genai 2.25.0 added the
-  `voices` / `aio.voices` catalog (create/get/list/delete). Neither is a model
-  call nor changes a response shape the SDK reads, so every path is classified
-  by precedent (`safety.alerts`, `admin.organization.certificates`,
-  `environments`): 106 rules, 0 removed, 0 changed — 4 guarded namespaces, 20
-  operations as `unmetered_spend` with exact acknowledgment tokens, 80
-  raw/streaming mirrors at `raw_response` scope, and the two `sdk_configuration`
-  properties at `resource` scope. openai 3.18 and 3.19 add only model
-  identifiers and client fixes; the surface graph is unchanged from 3.17.
-  Latest fingerprints, the ten moved per-context digests and the README strict
-  fingerprint (now audited against `openai==3.19.2`; `tracked`, `unknown`,
-  `blocked`, `unsupported`, `conditional` and `safe` are byte-identical) are
-  refreshed. Runtime behaviour for existing surfaces is unchanged; before this
-  change these paths resolved to `unknown` and followed `on_unmetered`.
+- **OpenAI SDK 3.33 support.** Coverage reports recognize Decisions, voice
+  creation, realtime translation credentials, agent environment and session
+  helpers, API-key updates, usage reporting, safety-case retrieval, and
+  external-storage administration. These operations remain unmetered and
+  require their exact acknowledgment tokens in strict mode. Raw and streaming
+  response helpers retain their separate acknowledgment scope.
+- **Together SDK 2.41 support.** Coverage reports recognize Jig deployment
+  revision history and rollback, GPU clusters and storage, post-training
+  sessions and operations, and the project catalog. Deployment rollback,
+  cluster provisioning, training, and sampling can incur provider charges
+  that Solwyn does not meter; they follow `on_unmetered` and are refused in
+  strict mode unless explicitly acknowledged.
+- **Google GenAI SDK 2.31 compatibility.** The existing guarded voice catalog
+  and other reviewed capabilities retain their behavior with this version.
 
 ### Tests
 

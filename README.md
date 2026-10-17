@@ -27,10 +27,10 @@ Other OpenAI-compatible endpoints (Groq, OpenRouter, vLLM, …) ride the `openai
 
 | Provider SDK | Declared floor | Tested breakpoints (including floor) | Latest tested |
 |---|---|---|---|
-| `openai` | `openai>=2.0` | `openai==2.0.0`, `openai==2.2.0`, `openai==2.21.0`, `openai==2.34.0`, `openai==2.52.0` | `openai==3.19.2` |
+| `openai` | `openai>=2.0` | `openai==2.0.0`, `openai==2.2.0`, `openai==2.21.0`, `openai==2.34.0`, `openai==2.52.0` | `openai==3.33.0` |
 | `anthropic` | `anthropic>=0.50` | `anthropic==0.50.0`, `anthropic==0.80.0`, `anthropic==1.0.0`, `anthropic==1.14.0` | `anthropic==1.15.0` |
-| `together` | `together>=2.0` | `together==2.0.0` | `together==2.35.0` |
-| `google-genai` | `google-genai>=1.0` | `google-genai==1.0.0`, `google-genai==1.60.0`, `google-genai==2.0.0` | `google-genai==2.25.0` |
+| `together` | `together>=2.0` | `together==2.0.0` | `together==2.41.0` |
+| `google-genai` | `google-genai>=1.0` | `google-genai==1.0.0`, `google-genai==1.60.0`, `google-genai==2.0.0` | `google-genai==2.31.0` |
 | `google-generativeai` | `google-generativeai>=0.8.5` | `google-generativeai==0.8.5` | `google-generativeai==0.8.6` |
 | `bedrock` | `boto3>=1.34` | `aioboto3==13.0.0`, `aioboto3==13.4.0`, `aioboto3==15.0.0`, `aioboto3==15.5.0` | `boto3==1.43.68`, `aioboto3==15.5.0` |
 
@@ -447,7 +447,7 @@ dispatch behavior and includes provider-chain usage guarantees.
 
 For CI, pin an independently reviewed literal fingerprint. This example is the
 exhaustive strict, unacknowledged fingerprint exercised against
-`openai==3.19.2` by this repository's real-client test:
+`openai==3.33.0` by this repository's real-client test:
 
 ```python
 from openai import OpenAI
@@ -460,11 +460,11 @@ audit_client = Solwyn(
 )
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
-    guarded_namespaces="sha256:670fde76b090b2e80747845b79afcb9d27d652ed7e372a9840494dbc6e25b318",
+    guarded_namespaces="sha256:e3edd2abe9714eeab5344630a736407879cbcca27adace00b33bcf6f4aa3451a",
     tracked="sha256:586f19c33f350871240a3498fbfa255c9759bec35e1285a8fccfeb937ec68148",
-    untracked="sha256:80f9592734f2199b402a9927f536a2bd1f93b6ae057161368a12d45da9a0b346",
+    untracked="sha256:a5a720220b574d60d5362be2da73a09fe214ed4767f34879b0d35d2024493373",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    scoped_escapes="sha256:ba85dac29a65ce08541be530f0b32c20bbf7d006e330e0257e2adf8abdcdc574",
+    scoped_escapes="sha256:a4f9670a680f5f35c1b64068a208f0eb14859ab845e34e33e7bf9febb9421815",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     unsupported="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     conditional="sha256:ce837f71d1fc97849872c5d0f86b0b1f26e1bc4e46a29c3b1b8004bf4b9bcb77",

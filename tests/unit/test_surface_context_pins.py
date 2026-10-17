@@ -21,35 +21,35 @@ ROOT = Path(__file__).parents[2]
 
 DECLARED_CONTEXT_DIGESTS: dict[tuple[str, str, str, str], str] = {
     ("openai", "openai", "openai_sdk", "sync"): (
-        "sha256:c7e9b6409ec9c14b213b6cb671fec6a5ba311f3772753dba7750d5b4d0cf868c"
-    ),  # 3973 rules
+        "sha256:cbbbc5b7187f16ebb1619c78a6c1239a5cb589308c5e6847b26e25954a1ccc80"
+    ),  # 4121 rules
     ("openai", "openai", "openai_sdk", "async"): (
-        "sha256:c7e9b6409ec9c14b213b6cb671fec6a5ba311f3772753dba7750d5b4d0cf868c"
-    ),  # 3973 rules
+        "sha256:cbbbc5b7187f16ebb1619c78a6c1239a5cb589308c5e6847b26e25954a1ccc80"
+    ),  # 4121 rules
     ("azure_openai", "openai", "openai_sdk", "sync"): (
-        "sha256:ca0f89c2d6f643fc4f9e95ed058e8a598a6fb491d637cb2172d74b8fa446ce7e"
-    ),  # 3971 rules
+        "sha256:dabd33a6e7040b91dd97f706287e61a2889cbfe983af256bfa2daf120cae5f90"
+    ),  # 4119 rules
     ("azure_openai", "openai", "openai_sdk", "async"): (
-        "sha256:ca0f89c2d6f643fc4f9e95ed058e8a598a6fb491d637cb2172d74b8fa446ce7e"
-    ),  # 3971 rules
+        "sha256:dabd33a6e7040b91dd97f706287e61a2889cbfe983af256bfa2daf120cae5f90"
+    ),  # 4119 rules
     ("openai_compatible", "openai", "openai_sdk", "sync"): (
-        "sha256:7c488f4bdd1274483dc84c198be3d30b8a0ecfdacad0e8921cde14bceb9ea5c5"
-    ),  # 3967 rules
+        "sha256:aaac7228256d2ddd3c775a245759900c3b7c2e90f34c859ac4212b455b8a4366"
+    ),  # 4115 rules
     ("openai_compatible", "openai", "openai_sdk", "async"): (
-        "sha256:7c488f4bdd1274483dc84c198be3d30b8a0ecfdacad0e8921cde14bceb9ea5c5"
-    ),  # 3967 rules
+        "sha256:aaac7228256d2ddd3c775a245759900c3b7c2e90f34c859ac4212b455b8a4366"
+    ),  # 4115 rules
     ("together", "openai", "openai_sdk", "sync"): (
-        "sha256:7c488f4bdd1274483dc84c198be3d30b8a0ecfdacad0e8921cde14bceb9ea5c5"
-    ),  # 3967 rules
+        "sha256:aaac7228256d2ddd3c775a245759900c3b7c2e90f34c859ac4212b455b8a4366"
+    ),  # 4115 rules
     ("together", "openai", "openai_sdk", "async"): (
-        "sha256:7c488f4bdd1274483dc84c198be3d30b8a0ecfdacad0e8921cde14bceb9ea5c5"
-    ),  # 3967 rules
+        "sha256:aaac7228256d2ddd3c775a245759900c3b7c2e90f34c859ac4212b455b8a4366"
+    ),  # 4115 rules
     ("together", "openai", "native_together", "sync"): (
-        "sha256:90a108346ce58ff96b4befc4345a03b03ddd5143ac65cda713080b562887f228"
-    ),  # 1464 rules
+        "sha256:271d3826e69ec30d6f949c68943e0a8808d20408e6dbc5b438f04237984ce7f1"
+    ),  # 1906 rules
     ("together", "openai", "native_together", "async"): (
-        "sha256:90a108346ce58ff96b4befc4345a03b03ddd5143ac65cda713080b562887f228"
-    ),  # 1464 rules
+        "sha256:271d3826e69ec30d6f949c68943e0a8808d20408e6dbc5b438f04237984ce7f1"
+    ),  # 1906 rules
     ("anthropic", "anthropic", "anthropic_sdk", "sync"): (
         "sha256:c06845dc45d4db627fcdfc2b26505adfdf2ae551961cde822ee45af31f4bc3e8"
     ),  # 3631 rules
