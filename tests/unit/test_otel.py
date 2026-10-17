@@ -331,3 +331,79 @@ def test_trace_correlation_defaults_on(monkeypatch: pytest.MonkeyPatch) -> None:
         ).trace_correlation
         is True
     )
+
+
+@pytest.mark.unit
+def test_optional_import_can_reenter_trace_capture_without_deadlock() -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import importlib.abc
+import importlib.util
+import sys
+from types import SimpleNamespace
+from solwyn import _otel
+
+class Loader(importlib.abc.Loader):
+    def create_module(self, spec):
+        return None
+    def exec_module(self, module):
+        # Simulate an entry-point plugin calling a wrapped client during import.
+        assert _otel.capture_trace() is None
+        module.trace = SimpleNamespace(get_current_span=lambda: SimpleNamespace(
+            get_span_context=lambda: SimpleNamespace(is_valid=False)
+        ))
+class Finder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'opentelemetry':
+            return importlib.util.spec_from_loader(fullname, Loader())
+sys.meta_path.insert(0, Finder())
+assert _otel.capture_trace() is None
+assert _otel._trace_api_resolved
+assert not _otel._trace_api_loading
+""",
+        ],
+        check=True,
+        timeout=10,
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not hasattr(__import__("os"), "fork"), reason="requires fork")
+def test_optional_import_lock_is_reset_in_forked_child() -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import os
+import signal
+from threading import Event, Thread
+from solwyn import _otel
+
+held, release = Event(), Event()
+def hold():
+    with _otel._trace_api_lock:
+        _otel._trace_api_loading = True
+        held.set()
+        release.wait(timeout=10)
+thread = Thread(target=hold)
+thread.start()
+assert held.wait(timeout=5)
+pid = os.fork()
+if pid == 0:
+    signal.alarm(3)
+    assert _otel.capture_trace() is None
+    assert _otel._trace_api_resolved
+    os._exit(0)
+release.set()
+thread.join(timeout=5)
+_, status = os.waitpid(pid, 0)
+assert os.waitstatus_to_exitcode(status) == 0, status
+""",
+        ],
+        check=True,
+        timeout=15,
+    )

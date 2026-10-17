@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic_core import PydanticUndefined
 
+from solwyn._otel import _INACTIVE_CALL_SPAN, _CallSpan
 from solwyn._run import current_run
 from solwyn._types import (
     BreakerStateReport,
@@ -189,6 +190,7 @@ class _TestingSolwyn(Solwyn):
         _force_stream: bool = False,
         _surface: str = "chat",
         _responses_leaf: str = "create",
+        _call_span: _CallSpan = _INACTIVE_CALL_SPAN,
         **kwargs: object,
     ) -> Any:
         _validate_testing_model(kwargs.get("model"))
@@ -198,12 +200,19 @@ class _TestingSolwyn(Solwyn):
             _force_stream=_force_stream,
             _surface=_surface,
             _responses_leaf=_responses_leaf,
+            _call_span=_call_span,
             **kwargs,
         )
 
-    def _media_call(self, spec: MediaSurfaceSpec, **kwargs: object) -> Any:
+    def _media_call(
+        self,
+        spec: MediaSurfaceSpec,
+        *,
+        _call_span: _CallSpan = _INACTIVE_CALL_SPAN,
+        **kwargs: object,
+    ) -> Any:
         _validate_testing_model(kwargs.get("model"))
-        return super()._media_call(spec, **kwargs)
+        return super()._media_call(spec, _call_span=_call_span, **kwargs)
 
 
 class _TestingAsyncSolwyn(AsyncSolwyn):
@@ -213,6 +222,7 @@ class _TestingAsyncSolwyn(AsyncSolwyn):
         _force_stream: bool = False,
         _surface: str = "chat",
         _responses_leaf: str = "create",
+        _call_span: _CallSpan = _INACTIVE_CALL_SPAN,
         **kwargs: object,
     ) -> Any:
         _validate_testing_model(kwargs.get("model"))
@@ -222,12 +232,19 @@ class _TestingAsyncSolwyn(AsyncSolwyn):
             _force_stream=_force_stream,
             _surface=_surface,
             _responses_leaf=_responses_leaf,
+            _call_span=_call_span,
             **kwargs,
         )
 
-    async def _media_call(self, spec: MediaSurfaceSpec, **kwargs: object) -> Any:
+    async def _media_call(
+        self,
+        spec: MediaSurfaceSpec,
+        *,
+        _call_span: _CallSpan = _INACTIVE_CALL_SPAN,
+        **kwargs: object,
+    ) -> Any:
         _validate_testing_model(kwargs.get("model"))
-        return await super()._media_call(spec, **kwargs)
+        return await super()._media_call(spec, _call_span=_call_span, **kwargs)
 
 
 @dataclass(slots=True, eq=False)

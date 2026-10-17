@@ -1770,9 +1770,16 @@ class TestSyncReceiptFolding:
 
     @pytest.mark.parametrize("denied", [True, False])
     def test_close_never_observes_a_gap_during_settlement_deadline_disposition(
-        self, *, denied: bool
+        self, monkeypatch: pytest.MonkeyPatch, *, denied: bool
     ) -> None:
         reporter = _quiet_sync(batch_size=1)
+        # A folded denial is replayed during close. Keep its send from racing
+        # real DNS/network latency against the one-second shutdown deadline.
+        monkeypatch.setattr(
+            reporter._http,
+            "post",
+            MagicMock(spec=[], side_effect=httpx.ConnectError("down")),
+        )
         values: dict[str, object] = {
             "call_id": call_uuid(f"atomic-settlement-deadline-{denied}"),
             "agent_run_id": "atomic-deadline-run",

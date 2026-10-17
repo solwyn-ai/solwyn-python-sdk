@@ -6,9 +6,11 @@ import asyncio
 import gc
 import logging
 import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from solwyn._token_details import TokenDetails
@@ -2291,3 +2293,284 @@ class TestStreamingSettlementAttribution:
         assert event.agent_run_name == "stream-agent"
         solwyn._solwyn_reporter._http.close()
         solwyn._solwyn_budget._http.close()
+
+
+class _BillingStream:
+    """Provider boundary with measured usage and independently failing seams."""
+
+    def __init__(self, terminal: str, exception: type[BaseException], responses: bool):
+        self.terminal = terminal
+        self.exception = exception
+        self.pulled = False
+        usage = SimpleNamespace(input_tokens=12, output_tokens=4)
+        self.chunk = (
+            SimpleNamespace(type="response.completed", response=SimpleNamespace(usage=usage))
+            if responses
+            else SimpleNamespace(usage=SimpleNamespace(prompt_tokens=12, completion_tokens=4))
+        )
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self.pulled:
+            self.pulled = True
+            return self.chunk
+        if self.terminal == "iteration":
+            raise self.exception()
+        raise StopIteration
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+    def __enter__(self):
+        if self.terminal == "entry":
+            raise self.exception("provider entry")
+        return self
+
+    async def __aenter__(self):
+        return self.__enter__()
+
+    def __exit__(self, *args):
+        if self.terminal == "exit":
+            self.terminal = "closed"
+            raise self.exception()
+        return False
+
+    async def __aexit__(self, *args):
+        return self.__exit__(*args)
+
+    def close(self):
+        pass
+
+    async def aclose(self):
+        pass
+
+
+@pytest.fixture
+def billing_otel(monkeypatch):
+    """A recording OTel boundary; billing tests also run without the OTel SDK."""
+    from solwyn import _otel
+
+    api = MagicMock(spec=["get_tracer", "use_span", "Status", "StatusCode", "SpanKind"])
+    span = MagicMock(
+        spec=["get_span_context", "is_recording", "set_attribute", "set_status", "end"]
+    )
+    span.get_span_context.return_value = SimpleNamespace(
+        is_valid=True, trace_flags=SimpleNamespace(sampled=True)
+    )
+    span.is_recording.return_value = True
+    tracer = MagicMock(spec=["start_span"])
+    tracer.start_span.return_value = span
+    api.get_tracer.return_value = tracer
+    api.use_span.side_effect = lambda *args: nullcontext()
+    monkeypatch.setattr(_otel, "_trace_api", api)
+    monkeypatch.setattr(_otel, "_trace_api_resolved", True)
+    monkeypatch.setattr(_otel, "_call_tracer", None, raising=False)
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("otel_spans", [False, True], ids=["spans-off", "spans-on"])
+@pytest.mark.parametrize("responses", [False, True], ids=["direct", "responses-manager"])
+@pytest.mark.parametrize(
+    "exception", [KeyboardInterrupt, GeneratorExit, SystemExit, asyncio.CancelledError]
+)
+@pytest.mark.parametrize(
+    "async_mode,terminal,status",
+    [
+        (False, "iteration", "success"),
+        (True, "iteration", "error"),
+        (False, "body", "success"),
+        (True, "body", "error"),
+        (False, "exit", "success"),
+        (True, "exit", "success"),
+    ],
+)
+async def test_stream_interrupt_billing_matches_main(
+    billing_otel, monkeypatch, async_mode, terminal, status, exception, responses, otel_spans
+):
+    from test_otel_population import _raw_client
+
+    from solwyn.testing import FakeControlPlane
+
+    raw = _raw_client(async_mode)
+    source = _BillingStream(terminal, exception, responses)
+    raw.chat.completions.create.return_value = source
+    raw.responses = SimpleNamespace(stream=MagicMock(spec=[], return_value=source))
+    plane = FakeControlPlane()
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(
+        raw, otel_spans=otel_spans, trace_correlation=False, budget_check_cache_ttl=0
+    )
+    settlements, events = [], []
+    monkeypatch.setattr(
+        wrapper._solwyn_reporter,
+        "report_settlement",
+        lambda confirm, event: settlements.append((confirm, event)),
+    )
+    monkeypatch.setattr(wrapper._solwyn_reporter, "report", events.append)
+    try:
+        result = (
+            wrapper._intercepted_call(
+                _surface="responses", _responses_leaf="stream", model="gpt-5.5", input=[]
+            )
+            if responses
+            else wrapper.chat.completions.create(model="gpt-5.5", messages=[], stream=True)
+        )
+        if async_mode:
+            result = await result
+        with pytest.raises(exception):
+            if async_mode:
+                async with result as stream:
+                    await anext(stream)
+                    if terminal == "iteration":
+                        await anext(stream)
+                    elif terminal == "body":
+                        raise exception()
+            else:
+                with result as stream:
+                    next(stream)
+                    if terminal == "iteration":
+                        next(stream)
+                    elif terminal == "body":
+                        raise exception()
+        # Cleanup is idempotent and must not replace either billing disposition.
+        if async_mode:
+            await result.close()
+        else:
+            result.close()
+        state = wrapper._get_circuit_breaker("openai").get_state()
+        assert state.failure_count == 0
+        if status == "success":
+            assert len(settlements) == 1
+            confirm, event = settlements[0]
+            assert (confirm.token_details.input_tokens, confirm.token_details.output_tokens) == (
+                12,
+                4,
+            )
+            assert (event.input_tokens, event.output_tokens, event.status.value) == (
+                12,
+                4,
+                "success",
+            )
+            assert event.possibly_succeeded is None
+            assert event.failover_error_class is None
+            assert not events
+            assert state.success_count == 0
+        else:
+            assert not settlements
+            assert len(events) == 1
+            event = events[0]
+            assert (event.input_tokens, event.output_tokens, event.status.value) == (0, 0, "error")
+            assert event.possibly_succeeded is True
+            assert event.failover_error_class == exception.__name__
+            assert state.success_count == 0
+    finally:
+        if async_mode:
+            await wrapper.close()
+        else:
+            wrapper.close()
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("otel_spans", [False, True], ids=["spans-off", "spans-on"])
+@pytest.mark.parametrize("responses", [False, True], ids=["direct", "responses-manager"])
+@pytest.mark.parametrize("async_mode", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "exception,failure_count,possibly_succeeded",
+    [
+        (ValueError, 0, None),
+        (httpx.ConnectError, 1, None),
+        (KeyboardInterrupt, 0, True),
+        (GeneratorExit, 0, True),
+        (SystemExit, 0, True),
+        (asyncio.CancelledError, 0, True),
+    ],
+)
+async def test_stream_entry_failure_billing_matches_main(
+    billing_otel,
+    monkeypatch,
+    async_mode,
+    exception,
+    failure_count,
+    possibly_succeeded,
+    responses,
+    otel_spans,
+):
+    from test_otel_population import _raw_client
+
+    from solwyn.testing import FakeControlPlane
+
+    raw = _raw_client(async_mode)
+    source = _BillingStream("entry", exception, responses)
+    raw.chat.completions.create.return_value = source
+    raw.responses = SimpleNamespace(stream=MagicMock(spec=[], return_value=source))
+    plane = FakeControlPlane()
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(
+        raw, otel_spans=otel_spans, trace_correlation=False, budget_check_cache_ttl=0
+    )
+    settlements, events = [], []
+    monkeypatch.setattr(
+        wrapper._solwyn_reporter,
+        "report_settlement",
+        lambda confirm, event: settlements.append((confirm, event)),
+    )
+    monkeypatch.setattr(wrapper._solwyn_reporter, "report", events.append)
+    try:
+        result = (
+            wrapper._intercepted_call(
+                _surface="responses", _responses_leaf="stream", model="gpt-5.5", input=[]
+            )
+            if responses
+            else wrapper.chat.completions.create(model="gpt-5.5", messages=[], stream=True)
+        )
+        if async_mode:
+            result = await result
+        with pytest.raises(exception):
+            if async_mode:
+                await result.__aenter__()
+            else:
+                result.__enter__()
+        state = wrapper._get_circuit_breaker("openai").get_state()
+        assert (state.failure_count, state.success_count) == (failure_count if responses else 0, 0)
+        assert not settlements
+        if responses:
+            assert len(events) == 1
+            assert events[0].status.value == "error"
+            assert events[0].possibly_succeeded is possibly_succeeded
+            assert events[0].failover_error_class == exception.__name__
+        else:
+            # Direct-stream context entry historically leaves settlement to close.
+            assert not events
+        if async_mode:
+            await result.close()
+        else:
+            result.close()
+        if responses:
+            assert not settlements
+            assert len(events) == 1
+        else:
+            assert len(settlements) == 1
+            confirm, event = settlements[0]
+            assert (confirm.token_details.input_tokens, confirm.token_details.output_tokens) == (
+                0,
+                0,
+            )
+            assert (event.input_tokens, event.output_tokens, event.status.value) == (
+                0,
+                0,
+                "success",
+            )
+            assert not events
+    finally:
+        if async_mode:
+            await wrapper.close()
+        else:
+            wrapper.close()

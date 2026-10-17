@@ -18,6 +18,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any, Self, cast
 
+from solwyn._otel import _INACTIVE_CALL_SPAN, _NOOP_CONTEXT, _CallSpan
 from solwyn._token_details import TokenDetails
 from solwyn.providers._accumulator import StreamUsageAccumulator
 
@@ -65,8 +66,11 @@ class SyncStreamWrapper:
         *,
         abort_check: Callable[[], Exception | None] | None = None,
         abort_release: Callable[[], None] | None = None,
+        call_span: _CallSpan = _INACTIVE_CALL_SPAN,
         on_finalize_error: Callable[[BaseException], None] | None = None,
     ) -> None:
+        self._call_span = call_span
+        self._span_finalizer = call_span.finalize_on_gc(self)
         self._stream = stream
         self._iterator: Iterator[Any] | None = None
         self._pending_chunks: deque[Any] = deque()
@@ -100,27 +104,34 @@ class SyncStreamWrapper:
             if self._settled:
                 return
             self._settled = True
-        self._release_abort_handle()
-        elapsed_ms = (time.monotonic() - self._start_time) * 1000
+        failed = True
         try:
-            token_details = self._accumulator.finalize()
-        except BaseException as exc:
-            # We already won settlement. Finalization is bookkeeping, not a
-            # health verdict; retire ownership even when no usage can be built.
+            self._release_abort_handle()
+            elapsed_ms = (time.monotonic() - self._start_time) * 1000
             try:
-                self._on_finalize_error(exc)
-            except BaseException as cleanup_exc:
-                logger.warning("stream.finalize_cleanup_failed: %s", type(cleanup_exc).__name__)
-            raise
-        try:
-            self._on_complete(token_details, elapsed_ms)
-        except Exception as cb_exc:
-            # Log only the CALLBACK failure's class name — never a traceback
-            # (which would capture the live exception context, possibly a provider
-            # mid-stream exception whose str() embeds streamed content; fix [D]).
-            logger.warning(
-                "on_complete raised during stream settlement; suppressing (%s)",
-                type(cb_exc).__name__,
+                token_details = self._accumulator.finalize()
+            except BaseException as exc:
+                # We already won settlement. Finalization is bookkeeping, not a
+                # health verdict; retire ownership even when no usage can be built.
+                try:
+                    self._on_finalize_error(exc)
+                except BaseException as cleanup_exc:
+                    logger.warning("stream.finalize_cleanup_failed: %s", type(cleanup_exc).__name__)
+                raise
+            try:
+                self._on_complete(token_details, elapsed_ms)
+                failed = False
+            except Exception as cb_exc:
+                # Log only the CALLBACK failure's class name — never a traceback
+                # (which would capture the live exception context, possibly a provider
+                # mid-stream exception whose str() embeds streamed content; fix [D]).
+                logger.warning(
+                    "on_complete raised during stream settlement; suppressing (%s)",
+                    type(cb_exc).__name__,
+                )
+        finally:
+            self._call_span.end(
+                error=failed or self._abort_exc is not None, exception=self._abort_exc
             )
 
     def _settle_error(self, exc: BaseException) -> None:
@@ -129,16 +140,19 @@ class SyncStreamWrapper:
             if self._settled:
                 return
             self._settled = True
-        self._release_abort_handle()
         try:
-            self._on_error(exc)
-        except Exception as cb_exc:
-            # Structural-only log of the CALLBACK failure; never a traceback (which,
-            # during error settlement, holds the provider exception ``exc``; fix [D]).
-            logger.warning(
-                "on_error raised during stream settlement; suppressing (%s)",
-                type(cb_exc).__name__,
-            )
+            self._release_abort_handle()
+            try:
+                self._on_error(exc)
+            except Exception as cb_exc:
+                # Structural-only log of the CALLBACK failure; never a traceback (which,
+                # during error settlement, holds the provider exception ``exc``; fix [D]).
+                logger.warning(
+                    "on_error raised during stream settlement; suppressing (%s)",
+                    type(cb_exc).__name__,
+                )
+        finally:
+            self._call_span.end(error=True, exception=exc)
 
     def _release_abort_handle(self) -> None:
         finalizer = self._abort_finalizer
@@ -186,6 +200,11 @@ class SyncStreamWrapper:
                     raise
                 self._settle_error(exc)
                 raise
+            except BaseException as exc:
+                # Observe interruption without changing sync billing: close or
+                # context exit still confirms whatever usage was measured.
+                self._call_span.end(error=True, exception=exc)
+                raise
         return self._pending_chunks.popleft()
 
     def __iter__(self) -> Iterator[Any]:
@@ -200,31 +219,43 @@ class SyncStreamWrapper:
         times; well-behaved stream implementations are idempotent.
         Called automatically by __exit__ if the stream wasn't fully consumed.
         """
-        self._settle()
-        if hasattr(self._stream, "close"):
-            self._stream.close()
+        with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT:
+            self._settle()
+            if hasattr(self._stream, "close"):
+                self._stream.close()
 
     def __enter__(self) -> Self:
-        if hasattr(self._stream, "__enter__"):
-            self._stream.__enter__()
+        try:
+            if hasattr(self._stream, "__enter__"):
+                self._stream.__enter__()
+        except BaseException as exc:
+            self._call_span.end(error=True, exception=exc)
+            raise
         return self
 
     def __exit__(self, *args: object) -> bool | None:
-        try:
-            # self.close() now settles AND forwards to inner close().
-            # Broad except is intentional: callback/provider-close failures
-            # must not mask the application exception propagating through
-            # __exit__ (if any).
-            self.close()
-        except Exception as cb_exc:
-            # Structural-only: log the suppressed callback class, never a traceback
-            # (fix [D]).
-            logger.warning(
-                "on_complete raised during __exit__; suppressing (%s)", type(cb_exc).__name__
-            )
-        if hasattr(self._stream, "__exit__"):
-            return cast("bool | None", self._stream.__exit__(*args))
-        return False
+        with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT:
+            try:
+                # self.close() now settles AND forwards to inner close().
+                # Broad except is intentional: callback/provider-close failures
+                # must not mask the application exception propagating through
+                # __exit__ (if any).
+                if (
+                    len(args) > 1
+                    and isinstance(args[1], BaseException)
+                    and not isinstance(args[1], Exception)
+                ):
+                    self._call_span.end(error=True, exception=args[1])
+                self.close()
+            except Exception as cb_exc:
+                # Structural-only: log the suppressed callback class, never a traceback
+                # (fix [D]).
+                logger.warning(
+                    "on_complete raised during __exit__; suppressing (%s)", type(cb_exc).__name__
+                )
+            if hasattr(self._stream, "__exit__"):
+                return cast("bool | None", self._stream.__exit__(*args))
+            return False
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._stream, name)
@@ -258,8 +289,11 @@ class AsyncStreamWrapper:
         *,
         abort_check: Callable[[], Exception | None] | None = None,
         abort_release: Callable[[], None] | None = None,
+        call_span: _CallSpan = _INACTIVE_CALL_SPAN,
         on_finalize_error: Callable[[BaseException], Awaitable[None]] | None = None,
     ) -> None:
+        self._call_span = call_span
+        self._span_finalizer = call_span.finalize_on_gc(self)
         self._stream = stream
         self._iterator: AsyncIterator[Any] | None = None
         self._pending_chunks: deque[Any] = deque()
@@ -283,23 +317,30 @@ class AsyncStreamWrapper:
         if self._settled:
             return
         self._settled = True
-        self._release_abort_handle()
-        elapsed_ms = (time.monotonic() - self._start_time) * 1000
+        failed = True
         try:
-            token_details = self._accumulator.finalize()
-        except BaseException as exc:
+            self._release_abort_handle()
+            elapsed_ms = (time.monotonic() - self._start_time) * 1000
             try:
-                await self._on_finalize_error(exc)
-            except BaseException as cleanup_exc:
-                logger.warning("stream.finalize_cleanup_failed: %s", type(cleanup_exc).__name__)
-            raise
-        try:
-            await self._on_complete(token_details, elapsed_ms)
-        except Exception as cb_exc:
-            # Structural-only log of the CALLBACK failure; never a traceback (fix [D]).
-            logger.warning(
-                "on_complete raised during async stream settlement; suppressing (%s)",
-                type(cb_exc).__name__,
+                token_details = self._accumulator.finalize()
+            except BaseException as exc:
+                try:
+                    await self._on_finalize_error(exc)
+                except BaseException as cleanup_exc:
+                    logger.warning("stream.finalize_cleanup_failed: %s", type(cleanup_exc).__name__)
+                raise
+            try:
+                await self._on_complete(token_details, elapsed_ms)
+                failed = False
+            except Exception as cb_exc:
+                # Structural-only log of the CALLBACK failure; never a traceback (fix [D]).
+                logger.warning(
+                    "on_complete raised during async stream settlement; suppressing (%s)",
+                    type(cb_exc).__name__,
+                )
+        finally:
+            self._call_span.end(
+                error=failed or self._abort_exc is not None, exception=self._abort_exc
             )
 
     async def _settle_error(self, exc: BaseException) -> None:
@@ -307,16 +348,19 @@ class AsyncStreamWrapper:
         if self._settled:
             return
         self._settled = True
-        self._release_abort_handle()
         try:
-            await self._on_error(exc)
-        except Exception as cb_exc:
-            # Structural-only log; never a traceback (which holds provider ``exc``
-            # during error settlement; fix [D]).
-            logger.warning(
-                "on_error raised during async stream settlement; suppressing (%s)",
-                type(cb_exc).__name__,
-            )
+            self._release_abort_handle()
+            try:
+                await self._on_error(exc)
+            except Exception as cb_exc:
+                # Structural-only log; never a traceback (which holds provider ``exc``
+                # during error settlement; fix [D]).
+                logger.warning(
+                    "on_error raised during async stream settlement; suppressing (%s)",
+                    type(cb_exc).__name__,
+                )
+        finally:
+            self._call_span.end(error=True, exception=exc)
 
     def _release_abort_handle(self) -> None:
         finalizer = self._abort_finalizer
@@ -381,51 +425,57 @@ class AsyncStreamWrapper:
         Forwarding to the inner stream is also safe if called multiple times;
         well-behaved stream implementations are idempotent.
         """
-        async with self._close_lock:
-            if self._cleanup_complete:
-                return
-            await self._settle()
-            if hasattr(self._stream, "aclose"):
-                await self._stream.aclose()
-            elif hasattr(self._stream, "close"):
-                close_result = self._stream.close()
-                if inspect.isawaitable(close_result):
-                    await close_result
-            self._cleanup_complete = True
+        with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT:
+            async with self._close_lock:
+                if self._cleanup_complete:
+                    return
+                await self._settle()
+                if hasattr(self._stream, "aclose"):
+                    await self._stream.aclose()
+                elif hasattr(self._stream, "close"):
+                    close_result = self._stream.close()
+                    if inspect.isawaitable(close_result):
+                        await close_result
+                self._cleanup_complete = True
 
     async def aclose(self) -> None:
         """Support the async-iterator cleanup protocol."""
         await self.close()
 
     async def __aenter__(self) -> Self:
-        if hasattr(self._stream, "__aenter__"):
-            await self._stream.__aenter__()
+        try:
+            if hasattr(self._stream, "__aenter__"):
+                await self._stream.__aenter__()
+        except BaseException as exc:
+            self._call_span.end(error=True, exception=exc)
+            raise
         return self
 
     async def __aexit__(self, *args: object) -> bool | None:
-        try:
-            if (
-                len(args) > 1
-                and isinstance(args[1], BaseException)
-                and not isinstance(args[1], Exception)
-            ):
-                # Cancellation may arrive in the caller's context body, rather
-                # than in __anext__. It still has no measured usage or verdict.
-                await self._settle_error(args[1])
-            # self.close() now settles AND forwards to inner aclose()/close().
-            # Broad except is intentional: callback/provider-close failures
-            # must not mask the application exception propagating through
-            # __aexit__ (if any).
-            await self.close()
-        except Exception as cb_exc:
-            # Structural-only: log the suppressed callback class, never a traceback
-            # (fix [D]).
-            logger.warning(
-                "on_complete raised during __aexit__; suppressing (%s)", type(cb_exc).__name__
-            )
-        if hasattr(self._stream, "__aexit__"):
-            return cast("bool | None", await self._stream.__aexit__(*args))
-        return False
+        with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT:
+            try:
+                if (
+                    len(args) > 1
+                    and isinstance(args[1], BaseException)
+                    and not isinstance(args[1], Exception)
+                ):
+                    # Cancellation may arrive in the caller's context body, rather
+                    # than in __anext__. It still has no measured usage or verdict.
+                    await self._settle_error(args[1])
+                # self.close() now settles AND forwards to inner aclose()/close().
+                # Broad except is intentional: callback/provider-close failures
+                # must not mask the application exception propagating through
+                # __aexit__ (if any).
+                await self.close()
+            except Exception as cb_exc:
+                # Structural-only: log the suppressed callback class, never a traceback
+                # (fix [D]).
+                logger.warning(
+                    "on_complete raised during __aexit__; suppressing (%s)", type(cb_exc).__name__
+                )
+            if hasattr(self._stream, "__aexit__"):
+                return cast("bool | None", await self._stream.__aexit__(*args))
+            return False
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._stream, name)
@@ -522,7 +572,10 @@ class _SyncResponsesStreamManagerWrapper:
         on_entry_error: Callable[[BaseException], None],
         on_abandoned_before_entry: Callable[[], None],
         abort_release: Callable[[], None] | None = None,
+        call_span: _CallSpan = _INACTIVE_CALL_SPAN,
     ) -> None:
+        self._call_span = call_span
+        self._span_finalizer = call_span.finalize_on_gc(self)
         self._manager = manager
         self._wrap_stream = wrap_stream
         self._on_error = on_error
@@ -541,6 +594,8 @@ class _SyncResponsesStreamManagerWrapper:
         if self._stream is None:
             self._stream = self._wrap_stream(source)
             self._detach_abort_handle()
+            if self._span_finalizer is not None:
+                self._span_finalizer.detach()
         return self._stream
 
     def _release_abort_handle(self) -> None:
@@ -573,7 +628,10 @@ class _SyncResponsesStreamManagerWrapper:
                 type(settlement_exc).__name__,
             )
         finally:
-            self._release_abort_handle()
+            try:
+                self._release_abort_handle()
+            finally:
+                self._call_span.end(error=True, exception=exc)
 
     def _settle_entry_error(self, exc: BaseException) -> None:
         """The provider request failed in ``__enter__``: classify it."""
@@ -591,7 +649,10 @@ class _SyncResponsesStreamManagerWrapper:
         try:
             self._on_abandoned_before_entry()
         finally:
-            self._release_abort_handle()
+            try:
+                self._release_abort_handle()
+            finally:
+                self._call_span.end(error=True)
 
     def _close_failed_entry(self, exc: BaseException) -> None:
         try:
@@ -612,7 +673,8 @@ class _SyncResponsesStreamManagerWrapper:
                 raise RuntimeError("Responses stream manager is already entered")
             self._state = "entering"
             try:
-                source = self._manager.__enter__()
+                with self._call_span.current() if self._call_span.active else _NOOP_CONTEXT:
+                    source = self._manager.__enter__()
             except BaseException as exc:
                 self._state = "closed"
                 self._settle_entry_error(exc)
@@ -633,7 +695,7 @@ class _SyncResponsesStreamManagerWrapper:
             return entered_stream
 
     def _finish(self, args: tuple[object, ...]) -> bool | None:
-        with self._lock:
+        with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT, self._lock:
             if self._state == "closed":
                 return False
             self._state = "closed"
@@ -642,6 +704,12 @@ class _SyncResponsesStreamManagerWrapper:
             settlement_error: BaseException | None = None
             try:
                 if self._dispatched:
+                    if (
+                        len(args) > 1
+                        and isinstance(args[1], BaseException)
+                        and not isinstance(args[1], Exception)
+                    ):
+                        self._call_span.end(error=True, exception=args[1])
                     self._wrapped_stream()._settle()
                 else:
                     self._release_before_entry()
@@ -651,6 +719,7 @@ class _SyncResponsesStreamManagerWrapper:
             try:
                 result = cast("bool | None", self._manager.__exit__(*args))
             except BaseException as exc:
+                self._call_span.end(error=True, exception=exc)
                 if original_exception:
                     logger.warning(
                         "Responses manager close raised during __exit__; suppressing (%s)",
@@ -693,7 +762,10 @@ class _AsyncResponsesStreamManagerWrapper:
         on_entry_error: Callable[[BaseException], Awaitable[None]],
         on_abandoned_before_entry: Callable[[], Awaitable[None]],
         abort_release: Callable[[], None] | None = None,
+        call_span: _CallSpan = _INACTIVE_CALL_SPAN,
     ) -> None:
+        self._call_span = call_span
+        self._span_finalizer = call_span.finalize_on_gc(self)
         self._manager = manager
         self._wrap_stream = wrap_stream
         self._on_error = on_error
@@ -712,6 +784,8 @@ class _AsyncResponsesStreamManagerWrapper:
         if self._stream is None:
             self._stream = self._wrap_stream(source)
             self._detach_abort_handle()
+            if self._span_finalizer is not None:
+                self._span_finalizer.detach()
         return self._stream
 
     def _release_abort_handle(self) -> None:
@@ -748,7 +822,10 @@ class _AsyncResponsesStreamManagerWrapper:
                 type(settlement_exc).__name__,
             )
         finally:
-            self._release_abort_handle()
+            try:
+                self._release_abort_handle()
+            finally:
+                self._call_span.end(error=True, exception=exc)
 
     async def _settle_entry_error(self, exc: BaseException) -> None:
         """The provider request failed in ``__aenter__``: classify it."""
@@ -766,7 +843,10 @@ class _AsyncResponsesStreamManagerWrapper:
         try:
             await self._on_abandoned_before_entry()
         finally:
-            self._release_abort_handle()
+            try:
+                self._release_abort_handle()
+            finally:
+                self._call_span.end(error=True)
 
     async def _close_failed_entry(self, exc: BaseException) -> None:
         try:
@@ -785,7 +865,8 @@ class _AsyncResponsesStreamManagerWrapper:
                 raise RuntimeError("Responses stream manager is already entered")
             self._state = "entering"
             try:
-                source = await self._manager.__aenter__()
+                with self._call_span.current() if self._call_span.active else _NOOP_CONTEXT:
+                    source = await self._manager.__aenter__()
             except BaseException as exc:
                 self._state = "closed"
                 await self._settle_entry_error(exc)
@@ -806,53 +887,55 @@ class _AsyncResponsesStreamManagerWrapper:
             return entered_stream
 
     async def _finish(self, args: tuple[object, ...]) -> bool | None:
-        async with self._lock:
-            if self._state == "closed":
-                return False
-            # Cancellation releases the lock. Keep cleanup retryable until the
-            # provider manager has actually finished closing its connection.
-            self._state = "closing"
-            original_exception = bool(args and args[0] is not None)
+        with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT:
+            async with self._lock:
+                if self._state == "closed":
+                    return False
+                # Cancellation releases the lock. Keep cleanup retryable until the
+                # provider manager has actually finished closing its connection.
+                self._state = "closing"
+                original_exception = bool(args and args[0] is not None)
 
-            settlement_error: BaseException | None = None
-            try:
-                if self._dispatched:
-                    if (
-                        len(args) > 1
-                        and isinstance(args[1], BaseException)
-                        and not isinstance(args[1], Exception)
-                    ):
-                        await self._wrapped_stream()._settle_error(args[1])
+                settlement_error: BaseException | None = None
+                try:
+                    if self._dispatched:
+                        if (
+                            len(args) > 1
+                            and isinstance(args[1], BaseException)
+                            and not isinstance(args[1], Exception)
+                        ):
+                            await self._wrapped_stream()._settle_error(args[1])
+                        else:
+                            await self._wrapped_stream()._settle()
                     else:
-                        await self._wrapped_stream()._settle()
-                else:
-                    await self._release_before_entry()
-            except BaseException as exc:
-                settlement_error = exc
+                        await self._release_before_entry()
+                except BaseException as exc:
+                    settlement_error = exc
 
-            try:
-                result = cast("bool | None", await self._manager.__aexit__(*args))
-            except BaseException as exc:
-                if original_exception:
-                    logger.warning(
-                        "Responses manager close raised during __aexit__; suppressing (%s)",
-                        type(exc).__name__,
-                    )
-                    result = False
+                try:
+                    result = cast("bool | None", await self._manager.__aexit__(*args))
+                except BaseException as exc:
+                    self._call_span.end(error=True, exception=exc)
+                    if original_exception:
+                        logger.warning(
+                            "Responses manager close raised during __aexit__; suppressing (%s)",
+                            type(exc).__name__,
+                        )
+                        result = False
+                    else:
+                        raise
                 else:
-                    raise
-            else:
-                self._state = "closed"
+                    self._state = "closed"
 
-            if settlement_error is not None:
-                if original_exception:
-                    logger.warning(
-                        "Responses stream settlement raised during __aexit__; suppressing (%s)",
-                        type(settlement_error).__name__,
-                    )
-                else:
-                    raise settlement_error
-            return result
+                if settlement_error is not None:
+                    if original_exception:
+                        logger.warning(
+                            "Responses stream settlement raised during __aexit__; suppressing (%s)",
+                            type(settlement_error).__name__,
+                        )
+                    else:
+                        raise settlement_error
+                return result
 
     async def close(self) -> None:
         """Reconcile once (settle, or release if never entered) and close."""

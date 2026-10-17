@@ -9,6 +9,15 @@ derived from git tags (hatch-vcs).
 
 ### Added
 
+- **Opt-in OpenTelemetry call spans.** Enable `otel_spans=True` or
+  `SOLWYN_OTEL_SPANS=true` to emit a `solwyn.call` span around budget preflight,
+  provider dispatch, failover, and stream lifetime. The closed `solwyn.*`
+  attribute allowlist contains call, routing, and budget metadata, never cost,
+  token usage, content, tags, or exception messages. Trace correlation uses the
+  call span only when it is recording and sampled; idle tracing preserves the
+  caller's context. Only provider dispatch runs with the call span current;
+  budget requests retain the application's current parent.
+
 - **Optional OpenTelemetry trace correlation.** Events include the active
   caller's trace ID, span ID, and sampled flag, including streaming, failover,
   and denied calls. These identifiers never contain prompts or responses.

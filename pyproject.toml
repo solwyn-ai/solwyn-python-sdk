@@ -48,6 +48,7 @@ dev = [
     # Test-only native-span exporters; keep these in both dev lists as well.
     "opentelemetry-api>=1.1.0,<2",
     "opentelemetry-sdk>=1.1.0,<2",
+    "opentelemetry-instrumentation-httpx>=0.42b0,<1",
     # Test-only provider SDKs. Two sanctioned uses: the integration harness
     # constructs real wrapped clients against the fake provider server, and
     # tests/unit/test_real_sdk_*.py validate duck-typed detection/extraction
@@ -136,6 +137,7 @@ dev = [
     "respx>=0.21",
     "opentelemetry-api>=1.1.0,<2",
     "opentelemetry-sdk>=1.1.0,<2",
+    "opentelemetry-instrumentation-httpx>=0.42b0,<1",
 ]
 frameworks = [
     "langchain-openai",

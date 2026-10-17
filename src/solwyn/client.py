@@ -43,6 +43,7 @@ from solwyn._base import (
     _normalized_openai_output_cap_layer,
     _responses_output_bound,
     _SolwynBase,
+    _with_call_span,
 )
 from solwyn._control_plane_transport import (
     ControlPlaneTransport,
@@ -238,6 +239,7 @@ def _raise_run_stopped(
     termination: RunTermination,
     agent_run: _RunContextSnapshot,
     trace: _TraceSnapshot | None = None,
+    call_span: _otel._CallSpan = _otel._INACTIVE_CALL_SPAN,
     model: str,
     provider: str,
     input_tokens: int,
@@ -250,6 +252,7 @@ def _raise_run_stopped(
     media_usage: MediaUsage | None = None,
 ) -> NoReturn:
     """Report one content-free denied event, then raise the stored stop."""
+    call_span.denied(source=deny_source, period="run_stopped")
     run_id = agent_run[0]
     if run_id is None:
         raise RuntimeError("run termination gate requires an active run")
@@ -297,6 +300,7 @@ def _observe_run_control(
     *,
     agent_run: _RunContextSnapshot,
     trace: _TraceSnapshot | None = None,
+    call_span: _otel._CallSpan = _otel._INACTIVE_CALL_SPAN,
     model: str,
     provider: str,
     input_tokens: int,
@@ -318,6 +322,7 @@ def _observe_run_control(
             termination=termination,
             agent_run=agent_run,
             trace=trace,
+            call_span=call_span,
             model=model,
             provider=provider,
             input_tokens=input_tokens,
@@ -361,6 +366,7 @@ def _observe_run_control(
         termination=termination,
         agent_run=agent_run,
         trace=trace,
+        call_span=call_span,
         model=model,
         provider=provider,
         input_tokens=input_tokens,
@@ -380,6 +386,7 @@ def _postcheck_run_control(
     budget: BudgetCheckResult,
     agent_run: _RunContextSnapshot,
     trace: _TraceSnapshot | None = None,
+    call_span: _otel._CallSpan = _otel._INACTIVE_CALL_SPAN,
     model: str,
     provider: str,
     input_tokens: int,
@@ -438,6 +445,7 @@ def _postcheck_run_control(
         termination=termination,
         agent_run=agent_run,
         trace=trace,
+        call_span=call_span,
         model=model,
         provider=provider,
         input_tokens=input_tokens,
@@ -2279,7 +2287,14 @@ class Solwyn(_SolwynBase):
         )
         return method(**call_kwargs)
 
-    def _media_call(self, spec: MediaSurfaceSpec, **kwargs: object) -> Any:
+    @_with_call_span
+    def _media_call(
+        self,
+        spec: MediaSurfaceSpec,
+        *,
+        _call_span: _otel._CallSpan = _otel._INACTIVE_CALL_SPAN,
+        **kwargs: object,
+    ) -> Any:
         """Lean lifecycle for a non-chat media surface (embeddings/images/audio/video).
 
         estimate -> budget check -> provider call -> extract/measure -> confirm +
@@ -2298,11 +2313,19 @@ class Solwyn(_SolwynBase):
             kwargs.pop("solwyn_tags", None),
             default_tags=self._solwyn_config.tags,
         )
-        trace = _otel.capture_trace() if self._solwyn_config.trace_correlation else None
+        trace = _call_span.capture_trace() if self._solwyn_config.trace_correlation else None
         requested_model = cast(str, kwargs["model"])
         call_id = str(uuid.uuid4())
         runtime = self._solwyn_runtimes[0]
         provider = runtime.adapter.name
+        _call_span.identify(
+            call_id=call_id,
+            agent_run_id=agent_run[0],
+            parent_agent_run_id=agent_run[3],
+            provider=provider,
+            model=requested_model,
+            budget_mode=self._solwyn_config.budget_mode.value,
+        )
         deadline = Deadline(self._solwyn_config.failover_total_timeout)
 
         # 1. Estimate quantities (length/config-only; never materializes content).
@@ -2317,6 +2340,7 @@ class Solwyn(_SolwynBase):
             self,
             agent_run=agent_run,
             trace=trace,
+            call_span=_call_span,
             model=requested_model,
             provider=provider,
             input_tokens=est_in,
@@ -2351,11 +2375,13 @@ class Solwyn(_SolwynBase):
             call_id=call_id,
             estimated_output_bound=estimated_output_bound,
         )
+        _call_span.budget(budget)
         _postcheck_run_control(
             self,
             budget=budget,
             agent_run=agent_run,
             trace=trace,
+            call_span=_call_span,
             model=requested_model,
             provider=provider,
             input_tokens=est_in,
@@ -2420,15 +2446,19 @@ class Solwyn(_SolwynBase):
         #    with the chat error path) then re-raised unchanged (drop-in contract).
         start = time.monotonic()
         try:
-            response = self._media_dispatch(
-                runtime,
-                spec.surface,
-                kwargs,
-                timeout=_hop_connect_slice(deadline, 1),
-                read_timeout=tuning.failover_hop_read_timeout,
-                max_retries=0,
-                extra_client_options=self._extra_client_options(runtime, run_id=agent_run[0]),
-            )
+            extra_client_options = self._extra_client_options(runtime, run_id=agent_run[0])
+            if _call_span.active:
+                _call_span.attempt(provider, requested_model, 0)
+            with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
+                response = self._media_dispatch(
+                    runtime,
+                    spec.surface,
+                    kwargs,
+                    timeout=_hop_connect_slice(deadline, 1),
+                    read_timeout=tuning.failover_hop_read_timeout,
+                    max_retries=0,
+                    extra_client_options=extra_client_options,
+                )
         except Exception as exc:
             # Nothing will settle this call: hand any lease reservation back
             # rather than stranding the local draw until the ledger's 900s
@@ -2557,12 +2587,14 @@ class Solwyn(_SolwynBase):
             self._solwyn_reporter.report(event)
         return response
 
+    @_with_call_span
     def _intercepted_call(
         self,
         *,
         _force_stream: bool = False,
         _surface: str = "chat",
         _responses_leaf: str = "create",
+        _call_span: _otel._CallSpan = _otel._INACTIVE_CALL_SPAN,
         **kwargs: object,
     ) -> Any:
         """Core interception logic: the classified candidate walk."""
@@ -2570,13 +2602,21 @@ class Solwyn(_SolwynBase):
             kwargs.pop("solwyn_tags", None),
             default_tags=self._solwyn_config.tags,
         )
-        trace = _otel.capture_trace() if self._solwyn_config.trace_correlation else None
+        trace = _call_span.capture_trace() if self._solwyn_config.trace_correlation else None
         requested_model = cast(str, kwargs["model"])
         # One reconciliation join key per intercepted call: threaded into
         # every served-provider metadata event AND its confirm so the Cloud API
         # can join them (and dedup cache-hit / abandoned-stream spend).
         call_id = str(uuid.uuid4())
         primary = self._solwyn_runtimes[0]
+        _call_span.identify(
+            call_id=call_id,
+            agent_run_id=agent_run[0],
+            parent_agent_run_id=agent_run[3],
+            provider=primary.adapter.name,
+            model=requested_model,
+            budget_mode=self._solwyn_config.budget_mode.value,
+        )
         if _surface == "responses" and _responses_preparer(primary.adapter) is None:
             raise UnsupportedSurfaceError(
                 surface=f"responses.{_responses_leaf}", provider=primary.adapter.name
@@ -2672,6 +2712,7 @@ class Solwyn(_SolwynBase):
             self,
             agent_run=agent_run,
             trace=trace,
+            call_span=_call_span,
             model=requested_model,
             provider=primary.adapter.name,
             input_tokens=est_in,
@@ -2706,11 +2747,13 @@ class Solwyn(_SolwynBase):
                 call_id=call_id,
                 estimated_output_bound=estimated_output_bound,
             )
+        _call_span.budget(budget)
         _postcheck_run_control(
             self,
             budget=budget,
             agent_run=agent_run,
             trace=trace,
+            call_span=_call_span,
             model=requested_model,
             provider=primary.adapter.name,
             input_tokens=est_in,
@@ -2906,24 +2949,37 @@ class Solwyn(_SolwynBase):
                         # Preparers have not sent anything. Dispatch marks the
                         # boundary after them, just before invoking the provider.
                         usage_unknown = False
-                        response = self._sync_dispatch(
-                            rt,
-                            call_kwargs,
-                            is_streaming=is_streaming,
-                            # Per-hop bounds (PJ-8/R7): connect/pool get a
-                            # shrinking slice of the remaining FAILOVER window so a
-                            # pre-send hang cannot eat the whole budget; read/write
-                            # get the decoupled hop read bound (a read timeout is
-                            # POST_SEND_AMBIGUOUS - never failover - so the chain
-                            # deadline must not cut legitimate slow generations).
-                            timeout=_hop_connect_slice(deadline, len(candidates) - idx),
-                            read_timeout=tuning.failover_hop_read_timeout,
-                            max_retries=0,
-                            surface=_surface,
-                            responses_leaf=_responses_leaf,
-                            on_dispatch=mark_dispatched,
-                            extra_client_options=extra_client_options,
-                        )
+                        if _call_span.active:
+                            _call_span.attempt(
+                                provider,
+                                served_model,
+                                chain_index,
+                                reason=_success_failover_reason(
+                                    is_provider_fallback=is_provider_fallback,
+                                    is_model_fallback=is_model_fallback,
+                                    primary_errored=primary_errored,
+                                    cost_routed=selection.cost_routed and not primary_reached,
+                                ),
+                            )
+                        with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
+                            response = self._sync_dispatch(
+                                rt,
+                                call_kwargs,
+                                is_streaming=is_streaming,
+                                # Per-hop bounds (PJ-8/R7): connect/pool get a
+                                # shrinking slice of the remaining FAILOVER window so a
+                                # pre-send hang cannot eat the whole budget; read/write
+                                # get the decoupled hop read bound (a read timeout is
+                                # POST_SEND_AMBIGUOUS - never failover - so the chain
+                                # deadline must not cut legitimate slow generations).
+                                timeout=_hop_connect_slice(deadline, len(candidates) - idx),
+                                read_timeout=tuning.failover_hop_read_timeout,
+                                max_retries=0,
+                                surface=_surface,
+                                responses_leaf=_responses_leaf,
+                                on_dispatch=mark_dispatched,
+                                extra_client_options=extra_client_options,
+                            )
                         if (
                             is_streaming
                             and _client_shape(rt.sdk_client, rt.adapter.dialect) == "google_genai"
@@ -2937,7 +2993,8 @@ class Solwyn(_SolwynBase):
                             # establishment failure eligible for failover. Key this to
                             # the SERVED runtime shape so fallback hops behave correctly.
                             # The buffered modern first chunk is replayed by the wrapper.
-                            response = _materialize_stream(response)
+                            with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
+                                response = _materialize_stream(response)
                     except Exception as exc:
                         disp = classify_exception(exc)
                         # In particular, a rejected 429 followed by Retry-After
@@ -3107,6 +3164,7 @@ class Solwyn(_SolwynBase):
                                 call_id=call_id,
                                 agent_run=agent_run,
                                 trace=trace,
+                                call_span=_call_span,
                                 estimated_input_tokens=est_in,
                                 estimate_empty_usage=True,
                                 velocity_flags=velocity_flags,
@@ -3117,6 +3175,7 @@ class Solwyn(_SolwynBase):
                             # The manager's own handler fires only when WRAPPING fails after
                             # its stream opened: SDK-side, so the same possibly-succeeded
                             # receipt but no provider-health verdict (mirrors the direct path).
+                            call_span=_call_span,
                             on_error=_make_stream_error_handler(
                                 self,
                                 rt,
@@ -3143,6 +3202,7 @@ class Solwyn(_SolwynBase):
                         )
                         termination_handle_transferred = True
                         probe_to_release = None  # manager now owns entry/close disposition
+                        _call_span.defer()
                         return wrapped
                     try:
                         wrapped = self._wrap_stream(
@@ -3158,6 +3218,7 @@ class Solwyn(_SolwynBase):
                             call_id=call_id,
                             agent_run=agent_run,
                             trace=trace,
+                            call_span=_call_span,
                             estimated_input_tokens=est_in,
                             estimate_empty_usage=_surface == "responses",
                             termination_handle=termination_handle,
@@ -3186,6 +3247,7 @@ class Solwyn(_SolwynBase):
                         raise
                     termination_handle_transferred = True
                     probe_to_release = None  # live stream owns its eventual verdict
+                    _call_span.defer()
                     return wrapped
                 cb.record_success()
                 probe_to_release = None
@@ -3350,6 +3412,7 @@ class Solwyn(_SolwynBase):
         call_id: str,
         agent_run: _RunContextSnapshot,
         trace: _TraceSnapshot | None = None,
+        call_span: _otel._CallSpan = _otel._INACTIVE_CALL_SPAN,
         termination_handle: _TerminationHandle | None,
         estimated_input_tokens: int = 0,
         estimate_empty_usage: bool = False,
@@ -3495,6 +3558,7 @@ class Solwyn(_SolwynBase):
                 accumulator,
                 on_complete,
                 on_error,
+                call_span=call_span,
                 chunk_translator=chunk_translator,
                 abort_check=(
                     functools.partial(_stream_abort_exception, termination_handle)
@@ -3986,7 +4050,14 @@ class AsyncSolwyn(_SolwynBase):
         )
         return await method(**call_kwargs)
 
-    async def _media_call(self, spec: MediaSurfaceSpec, **kwargs: object) -> Any:
+    @_with_call_span
+    async def _media_call(
+        self,
+        spec: MediaSurfaceSpec,
+        *,
+        _call_span: _otel._CallSpan = _otel._INACTIVE_CALL_SPAN,
+        **kwargs: object,
+    ) -> Any:
         """Async lean lifecycle for a non-chat media surface.
 
         Mirror of the sync ``_media_call``: estimate -> budget check -> provider
@@ -3999,11 +4070,19 @@ class AsyncSolwyn(_SolwynBase):
             kwargs.pop("solwyn_tags", None),
             default_tags=self._solwyn_config.tags,
         )
-        trace = _otel.capture_trace() if self._solwyn_config.trace_correlation else None
+        trace = _call_span.capture_trace() if self._solwyn_config.trace_correlation else None
         requested_model = cast(str, kwargs["model"])
         call_id = str(uuid.uuid4())
         runtime = self._solwyn_runtimes[0]
         provider = runtime.adapter.name
+        _call_span.identify(
+            call_id=call_id,
+            agent_run_id=agent_run[0],
+            parent_agent_run_id=agent_run[3],
+            provider=provider,
+            model=requested_model,
+            budget_mode=self._solwyn_config.budget_mode.value,
+        )
         deadline = Deadline(self._solwyn_config.failover_total_timeout)
 
         char_count = estimate_content_length(kwargs)
@@ -4015,6 +4094,7 @@ class AsyncSolwyn(_SolwynBase):
             self,
             agent_run=agent_run,
             trace=trace,
+            call_span=_call_span,
             model=requested_model,
             provider=provider,
             input_tokens=est_in,
@@ -4037,11 +4117,13 @@ class AsyncSolwyn(_SolwynBase):
             call_id=call_id,
             estimated_output_bound=estimated_output_bound,
         )
+        _call_span.budget(budget)
         _postcheck_run_control(
             self,
             budget=budget,
             agent_run=agent_run,
             trace=trace,
+            call_span=_call_span,
             model=requested_model,
             provider=provider,
             input_tokens=est_in,
@@ -4100,15 +4182,19 @@ class AsyncSolwyn(_SolwynBase):
 
         start = time.monotonic()
         try:
-            response = await self._media_dispatch(
-                runtime,
-                spec.surface,
-                kwargs,
-                timeout=_hop_connect_slice(deadline, 1),
-                read_timeout=tuning.failover_hop_read_timeout,
-                max_retries=0,
-                extra_client_options=self._extra_client_options(runtime, run_id=agent_run[0]),
-            )
+            extra_client_options = self._extra_client_options(runtime, run_id=agent_run[0])
+            if _call_span.active:
+                _call_span.attempt(provider, requested_model, 0)
+            with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
+                response = await self._media_dispatch(
+                    runtime,
+                    spec.surface,
+                    kwargs,
+                    timeout=_hop_connect_slice(deadline, 1),
+                    read_timeout=tuning.failover_hop_read_timeout,
+                    max_retries=0,
+                    extra_client_options=extra_client_options,
+                )
         except Exception as exc:
             # Nothing will settle this call: hand any lease reservation back
             # rather than stranding the local draw until the ledger's 900s
@@ -4230,12 +4316,14 @@ class AsyncSolwyn(_SolwynBase):
             self._solwyn_reporter.report(event)
         return response
 
+    @_with_call_span
     async def _intercepted_call(
         self,
         *,
         _force_stream: bool = False,
         _surface: str = "chat",
         _responses_leaf: str = "create",
+        _call_span: _otel._CallSpan = _otel._INACTIVE_CALL_SPAN,
         **kwargs: object,
     ) -> Any:
         """Async core interception logic: the classified candidate walk."""
@@ -4243,12 +4331,20 @@ class AsyncSolwyn(_SolwynBase):
             kwargs.pop("solwyn_tags", None),
             default_tags=self._solwyn_config.tags,
         )
-        trace = _otel.capture_trace() if self._solwyn_config.trace_correlation else None
+        trace = _call_span.capture_trace() if self._solwyn_config.trace_correlation else None
         requested_model = cast(str, kwargs["model"])
         # One reconciliation join key per intercepted call: see the sync
         # _intercepted_call for the join/dedup contract.
         call_id = str(uuid.uuid4())
         primary = self._solwyn_runtimes[0]
+        _call_span.identify(
+            call_id=call_id,
+            agent_run_id=agent_run[0],
+            parent_agent_run_id=agent_run[3],
+            provider=primary.adapter.name,
+            model=requested_model,
+            budget_mode=self._solwyn_config.budget_mode.value,
+        )
         if _surface == "responses" and _responses_preparer(primary.adapter) is None:
             raise UnsupportedSurfaceError(
                 surface=f"responses.{_responses_leaf}", provider=primary.adapter.name
@@ -4314,6 +4410,7 @@ class AsyncSolwyn(_SolwynBase):
             self,
             agent_run=agent_run,
             trace=trace,
+            call_span=_call_span,
             model=requested_model,
             provider=primary.adapter.name,
             input_tokens=est_in,
@@ -4348,11 +4445,13 @@ class AsyncSolwyn(_SolwynBase):
                 call_id=call_id,
                 estimated_output_bound=estimated_output_bound,
             )
+        _call_span.budget(budget)
         _postcheck_run_control(
             self,
             budget=budget,
             agent_run=agent_run,
             trace=trace,
+            call_span=_call_span,
             model=requested_model,
             provider=primary.adapter.name,
             input_tokens=est_in,
@@ -4542,24 +4641,37 @@ class AsyncSolwyn(_SolwynBase):
                         # Preparers have not sent anything. Dispatch marks the
                         # boundary after them, just before invoking the provider.
                         usage_unknown = False
-                        response = await self._async_dispatch(
-                            rt,
-                            call_kwargs,
-                            is_streaming=is_streaming,
-                            # Per-hop bounds (PJ-8/R7): connect/pool get a
-                            # shrinking slice of the remaining FAILOVER window so a
-                            # pre-send hang cannot eat the whole budget; read/write
-                            # get the decoupled hop read bound (a read timeout is
-                            # POST_SEND_AMBIGUOUS - never failover - so the chain
-                            # deadline must not cut legitimate slow generations).
-                            timeout=_hop_connect_slice(deadline, len(candidates) - idx),
-                            read_timeout=tuning.failover_hop_read_timeout,
-                            max_retries=0,
-                            surface=_surface,
-                            responses_leaf=_responses_leaf,
-                            on_dispatch=mark_dispatched,
-                            extra_client_options=extra_client_options,
-                        )
+                        if _call_span.active:
+                            _call_span.attempt(
+                                provider,
+                                served_model,
+                                chain_index,
+                                reason=_success_failover_reason(
+                                    is_provider_fallback=is_provider_fallback,
+                                    is_model_fallback=is_model_fallback,
+                                    primary_errored=primary_errored,
+                                    cost_routed=selection.cost_routed and not primary_reached,
+                                ),
+                            )
+                        with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
+                            response = await self._async_dispatch(
+                                rt,
+                                call_kwargs,
+                                is_streaming=is_streaming,
+                                # Per-hop bounds (PJ-8/R7): connect/pool get a
+                                # shrinking slice of the remaining FAILOVER window so a
+                                # pre-send hang cannot eat the whole budget; read/write
+                                # get the decoupled hop read bound (a read timeout is
+                                # POST_SEND_AMBIGUOUS - never failover - so the chain
+                                # deadline must not cut legitimate slow generations).
+                                timeout=_hop_connect_slice(deadline, len(candidates) - idx),
+                                read_timeout=tuning.failover_hop_read_timeout,
+                                max_retries=0,
+                                surface=_surface,
+                                responses_leaf=_responses_leaf,
+                                on_dispatch=mark_dispatched,
+                                extra_client_options=extra_client_options,
+                            )
                         if (
                             is_streaming
                             and _client_shape(rt.sdk_client, rt.adapter.dialect) == "google_genai"
@@ -4569,7 +4681,8 @@ class AsyncSolwyn(_SolwynBase):
                             # shape keeps fallback hops correct; legacy
                             # google.generativeai has no async client and its sync
                             # response wrapper establishes eagerly during dispatch.
-                            response = await _materialize_stream_async(response)
+                            with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
+                                response = await _materialize_stream_async(response)
                     except Exception as exc:
                         disp = classify_exception(exc)
                         # In particular, a rejected 429 followed by Retry-After
@@ -4736,6 +4849,7 @@ class AsyncSolwyn(_SolwynBase):
                                 call_id=call_id,
                                 agent_run=agent_run,
                                 trace=trace,
+                                call_span=_call_span,
                                 estimated_input_tokens=est_in,
                                 estimate_empty_usage=True,
                                 velocity_flags=velocity_flags,
@@ -4746,6 +4860,7 @@ class AsyncSolwyn(_SolwynBase):
                             # The manager's own handler fires only when WRAPPING fails after
                             # its stream opened: SDK-side, so the same possibly-succeeded
                             # receipt but no provider-health verdict (mirrors the direct path).
+                            call_span=_call_span,
                             on_error=_make_async_stream_error_handler(
                                 self,
                                 rt,
@@ -4772,6 +4887,7 @@ class AsyncSolwyn(_SolwynBase):
                         )
                         termination_handle_transferred = True
                         probe_to_release = None
+                        _call_span.defer()
                         return wrapped
                     try:
                         wrapped = self._wrap_stream_async(
@@ -4787,6 +4903,7 @@ class AsyncSolwyn(_SolwynBase):
                             call_id=call_id,
                             agent_run=agent_run,
                             trace=trace,
+                            call_span=_call_span,
                             estimated_input_tokens=est_in,
                             estimate_empty_usage=_surface == "responses",
                             termination_handle=termination_handle,
@@ -4815,6 +4932,7 @@ class AsyncSolwyn(_SolwynBase):
                         raise
                     termination_handle_transferred = True
                     probe_to_release = None
+                    _call_span.defer()
                     return wrapped
                 cb.record_success()
                 probe_to_release = None
@@ -4977,6 +5095,7 @@ class AsyncSolwyn(_SolwynBase):
         call_id: str,
         agent_run: _RunContextSnapshot,
         trace: _TraceSnapshot | None = None,
+        call_span: _otel._CallSpan = _otel._INACTIVE_CALL_SPAN,
         termination_handle: _TerminationHandle | None,
         estimated_input_tokens: int = 0,
         estimate_empty_usage: bool = False,
@@ -5117,6 +5236,7 @@ class AsyncSolwyn(_SolwynBase):
                 accumulator,
                 on_complete,
                 on_error,
+                call_span=call_span,
                 chunk_translator=chunk_translator,
                 abort_check=(
                     functools.partial(_stream_abort_exception, termination_handle)
