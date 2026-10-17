@@ -585,9 +585,9 @@ Tasks created with `asyncio.create_task(...)` inside a run capture that task's c
 Set `anthropic_conversation_id=True` (or
 `SOLWYN_ANTHROPIC_CONVERSATION_ID=true`) to attach the active Solwyn run ID
 to Anthropic's native OpenTelemetry span as `gen_ai.conversation.id`.
-The flag defaults to `False` and requires `anthropic>=1.14` and an
-application-configured tracer provider. For example, using your existing
-`tracer_provider`:
+The flag defaults to `False`. Native spans require `anthropic>=1.14` and an
+application-configured tracer provider, set globally or on the Anthropic client.
+For example, using your existing `tracer_provider`:
 
 ```python
 from anthropic import Anthropic
@@ -607,15 +607,20 @@ with run("nightly-batch") as run_id:
     )
 ```
 
-Solwyn only extends the client's **existing `open_telemetry` mapping**,
-preserving every other setting. It never constructs that option from scratch
-or changes nested tracing settings. An existing `conversation_id` is always
-kept, including an explicit `None` or empty string. Calls without an active
-run, other dialects, missing options (including older SDKs and variants that
-lack the option), `False`/`None`, and non-mapping values are left alone. An
-unreadable public property is skipped without interrupting the provider call.
-Sync, async, and streaming calls use the same behavior; each Anthropic
-failover hop extends that client's own mapping.
+Solwyn extends the **resolved mapping returned by `client.open_telemetry`**,
+preserving every other setting. Anthropic exposes this mapping even for
+`Anthropic()` and `Anthropic(open_telemetry=None)`, so those clients receive
+the run ID too. With `Anthropic(open_telemetry=False)`, the copied options
+receive the ID while tracing stays disabled and emits no span. Solwyn never
+constructs the option from scratch or changes nested tracing settings.
+
+A customer-configured `conversation_id` string is kept, including an empty
+string. Anthropic drops `conversation_id=None` when resolving its options,
+so Solwyn adds the active run ID in that case. Calls without an active run
+and other dialects are left alone. Older SDKs and variants with a missing,
+unreadable, or non-mapping public option are skipped without interrupting
+the provider call. Sync, async, and streaming calls use the same behavior;
+each Anthropic failover hop extends that client's own mapping.
 
 The added ID is an SDK-minted `run_<uuid4>`; run names and tags are not added.
 `conversation_id` stays local to the span and is **not sent to Anthropic**

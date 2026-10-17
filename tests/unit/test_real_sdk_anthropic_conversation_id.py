@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import json
+import os
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -12,10 +15,20 @@ import solwyn
 from solwyn.testing import FakeControlPlane
 
 anthropic = pytest.importorskip("anthropic", minversion="1.14.0")
-httpx2 = pytest.importorskip("httpx2")
-otel_trace = pytest.importorskip("opentelemetry.sdk.trace")
-otel_export = pytest.importorskip("opentelemetry.sdk.trace.export")
-otel_memory = pytest.importorskip("opentelemetry.sdk.trace.export.in_memory_span_exporter")
+
+
+def _test_dependency(name: str) -> ModuleType:
+    # Once Anthropic supports telemetry, missing dev dependencies must fail CI.
+    if os.environ.get("CI"):
+        return importlib.import_module(name)
+    return pytest.importorskip(name)
+
+
+httpx2 = _test_dependency("httpx2")
+otel_api = _test_dependency("opentelemetry.trace")
+otel_trace = _test_dependency("opentelemetry.sdk.trace")
+otel_export = _test_dependency("opentelemetry.sdk.trace.export")
+otel_memory = _test_dependency("opentelemetry.sdk.trace.export.in_memory_span_exporter")
 
 
 def _message() -> dict[str, Any]:
@@ -62,13 +75,39 @@ def _response(request: Any, streaming: bool) -> Any:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize("streaming", [False, True], ids=["message", "stream"])
-@pytest.mark.parametrize("customer_conversation", [False, True], ids=["run-id", "customer-id"])
+@pytest.mark.parametrize(
+    ("configuration", "customer_conversation"),
+    [
+        ("mapping", None),
+        ("customer-id", "customer-conversation"),
+        ("customer-empty", ""),
+        ("customer-none", None),
+        ("default", None),
+        ("none", None),
+        ("disabled", None),
+    ],
+    ids=["run-id", "customer-id", "customer-empty", "customer-none", "default", "none", "disabled"],
+)
 async def test_native_span_conversation_id_never_reaches_provider_request(
-    is_async: bool, streaming: bool, customer_conversation: bool, monkeypatch: pytest.MonkeyPatch
+    is_async: bool,
+    streaming: bool,
+    configuration: str,
+    customer_conversation: str | None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     exporter = otel_memory.InMemorySpanExporter()
     tracer_provider = otel_trace.TracerProvider()
     tracer_provider.add_span_processor(otel_export.SimpleSpanProcessor(exporter))
+    # Default/None clients use the application's global provider. Patch its
+    # public lookup so each case uses a real provider without global registration.
+    monkeypatch.setattr(otel_api, "get_tracer_provider", lambda: tracer_provider)
+    for name in (
+        "ANTHROPIC_OPEN_TELEMETRY",
+        "ANTHROPIC_OPEN_TELEMETRY_PROPAGATION",
+        "ANTHROPIC_OPEN_TELEMETRY_TRACES_CONTENT_MODE",
+        "ANTHROPIC_OPEN_TELEMETRY_TRACES_MAX_CONTENT_BYTES",
+    ):
+        monkeypatch.delenv(name, raising=False)
     seen_requests: list[Any] = []
     seen_options: list[dict[str, Any]] = []
 
@@ -76,7 +115,7 @@ async def test_native_span_conversation_id_never_reaches_provider_request(
         seen_requests.append(request)
         return _response(request, streaming)
 
-    # Anthropic 1.15 uses httpx2; its MockTransport is the provider's own
+    # Anthropic 1.14+ uses httpx2; its MockTransport is the provider's own
     # in-memory HTTP seam, with no socket or global httpx aliasing.
     http_client_type = httpx2.AsyncClient if is_async else httpx2.Client
     provider_type = anthropic.AsyncAnthropic if is_async else anthropic.Anthropic
@@ -85,13 +124,20 @@ async def test_native_span_conversation_id_never_reaches_provider_request(
         "propagation": False,
         "traces": {"content_mode": "metadata_only", "max_content_bytes": 128},
     }
-    if customer_conversation:
-        options["conversation_id"] = "customer-conversation"
+    if configuration in {"customer-id", "customer-empty", "customer-none"}:
+        options["conversation_id"] = customer_conversation
+    constructor_options: dict[str, Any] = {}
+    if configuration == "none":
+        constructor_options["open_telemetry"] = None
+    elif configuration == "disabled":
+        constructor_options["open_telemetry"] = False
+    elif configuration != "default":
+        constructor_options["open_telemetry"] = options
     provider = provider_type(
         api_key="sk-ant-test",
         max_retries=0,
-        open_telemetry=options,
         http_client=http_client_type(transport=httpx2.MockTransport(handler)),
+        **constructor_options,
     )
     # Pin the public property path against a genuine SDK client, rather than
     # shadowing its descriptor with a synthetic instance attribute.
@@ -130,15 +176,19 @@ async def test_native_span_conversation_id_never_reaches_provider_request(
             for span in exporter.get_finished_spans()
             if span.name == "anthropic.messages.create"
         ]
-        assert len(spans) == 1
-        expected_id = "customer-conversation" if customer_conversation else run_id
-        assert spans[0].attributes["gen_ai.conversation.id"] == expected_id
+        expected_id = run_id if customer_conversation is None else customer_conversation
+        if configuration == "disabled":
+            assert exporter.get_finished_spans() == ()
+        else:
+            assert len(spans) == 1
+            assert spans[0].attributes["gen_ai.conversation.id"] == expected_id
         assert len(seen_options) == 1
-        if customer_conversation:
+        if customer_conversation is not None:
             assert "open_telemetry" not in seen_options[0]
         else:
             assert seen_options[0]["open_telemetry"] == {**original, "conversation_id": run_id}
-            assert seen_options[0]["open_telemetry"]["tracer_provider"] is tracer_provider
+            if "tracer_provider" in original:
+                assert seen_options[0]["open_telemetry"]["tracer_provider"] is tracer_provider
         assert provider.open_telemetry == original
         assert len(seen_requests) == 1
         request = seen_requests[0]
@@ -146,7 +196,9 @@ async def test_native_span_conversation_id_never_reaches_provider_request(
             json.dumps(dict(request.headers)).encode() + request.content + str(request.url).encode()
         )
         assert b"conversation_id" not in wire
-        assert expected_id.encode() not in wire
+        assert b"open_telemetry" not in wire
+        if expected_id:
+            assert expected_id.encode() not in wire
         assert run_id.encode() not in wire
     finally:
         if is_async:

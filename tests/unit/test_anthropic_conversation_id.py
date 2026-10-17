@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Iterator, Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 from types import MappingProxyType, SimpleNamespace
@@ -143,6 +144,72 @@ class _Descriptor:
     def __get__(self, instance: object, owner: type | None = None) -> object:
         self.calls += 1
         raise RuntimeError("must not evaluate this descriptor")
+
+
+class _RaisingMapping(Mapping[str, object]):
+    def __init__(self, failure: str) -> None:
+        self.failure = failure
+
+    def __contains__(self, key: object) -> bool:
+        if self.failure == "contains":
+            raise RuntimeError("unreadable mapping membership")
+        return False
+
+    def __iter__(self) -> Iterator[str]:
+        if self.failure == "iter":
+            raise RuntimeError("unreadable mapping keys")
+        return iter(("tracer_provider",))
+
+    def __getitem__(self, key: str) -> object:
+        if self.failure == "getitem":
+            raise RuntimeError("unreadable mapping value")
+        return None
+
+    def __len__(self) -> int:
+        return 1
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("surface", ["chat", "media"])
+@pytest.mark.parametrize("failure", ["contains", "iter", "getitem"])
+async def test_unreadable_mapping_does_not_interrupt_provider_dispatch(
+    is_async: bool, surface: str, failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _client(is_async, _RaisingMapping(failure))
+    wrapper = _wrap(client, is_async, anthropic_conversation_id=True)
+
+    def prepare_media_call(self: object, surface: str, client: Any, kwargs: Any, **_: Any) -> Any:
+        return client.messages.create, kwargs
+
+    if surface == "media":
+        monkeypatch.setattr(
+            type(wrapper._solwyn_runtimes[0].adapter),
+            "prepare_media_call",
+            prepare_media_call,
+            raising=False,
+        )
+    try:
+        with solwyn.run("test"):
+            if surface == "media":
+                spec = MediaSurfaceSpec(
+                    surface="embeddings",
+                    modality="embedding",
+                    extract_usage=lambda _: TokenDetails(input_tokens=10),
+                    measure_request=lambda _: None,
+                )
+                response = await _await_if_needed(
+                    wrapper._media_call(spec, model="claude-sonnet-5")
+                )
+            else:
+                response = await _call(wrapper)
+        assert response.usage.input_tokens == 10
+        assert client.with_options.call_count == 1
+        assert "open_telemetry" not in client.with_options.call_args.kwargs
+        client.messages.create.assert_called_once()
+    finally:
+        await _await_if_needed(wrapper.close())
 
 
 @pytest.mark.unit

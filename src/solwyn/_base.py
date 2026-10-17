@@ -1741,21 +1741,21 @@ class _SolwynBase:
         ):
             return {}
         missing = object()
-        option = inspect.getattr_static(runtime.sdk_client, "open_telemetry", missing)
-        if option is missing:
-            return {}
-        if type(option) is property:
-            if option.fget is None:
+        try:
+            option = inspect.getattr_static(runtime.sdk_client, "open_telemetry", missing)
+            if option is missing:
                 return {}
-            try:
+            if type(option) is property:
+                if option.fget is None:
+                    return {}
                 option = option.fget(runtime.sdk_client)
-            except Exception:
+            elif inspect.getattr_static(type(option), "__get__", missing) is not missing:
                 return {}
-        elif inspect.getattr_static(type(option), "__get__", missing) is not missing:
+            if not isinstance(option, Mapping) or "conversation_id" in option:
+                return {}
+            return {"open_telemetry": {**option, "conversation_id": run_id}}
+        except Exception:
             return {}
-        if not isinstance(option, Mapping) or "conversation_id" in option:
-            return {}
-        return {"open_telemetry": {**option, "conversation_id": run_id}}
 
     def _build_metadata_event(
         self,
