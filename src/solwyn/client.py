@@ -2359,7 +2359,7 @@ class Solwyn(_SolwynBase):
         #    unbilled-model media call proceeds untracked rather than being denied;
         #    fail-open is intentional here — Solwyn never blocks a call just because
         #    it cannot yet price it.
-        with _call_span.current():
+        with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
             budget = self._solwyn_budget.check_budget(
                 estimated_input_tokens=est_in,
                 model=requested_model,
@@ -2443,8 +2443,9 @@ class Solwyn(_SolwynBase):
         #    with the chat error path) then re-raised unchanged (drop-in contract).
         start = time.monotonic()
         try:
-            _call_span.attempt(provider, requested_model, 0)
-            with _call_span.current():
+            if _call_span.active:
+                _call_span.attempt(provider, requested_model, 0)
+            with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
                 response = self._media_dispatch(
                     runtime,
                     spec.surface,
@@ -2715,7 +2716,7 @@ class Solwyn(_SolwynBase):
             estimated_output_bound=estimated_output_bound,
         )
         if _surface == "responses":
-            with _call_span.current():
+            with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
                 budget = self._solwyn_budget.check_budget(
                     estimated_input_tokens=est_in,
                     model=requested_model,
@@ -2730,7 +2731,7 @@ class Solwyn(_SolwynBase):
                     estimated_output_bound=estimated_output_bound,
                 )
         else:
-            with _call_span.current():
+            with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
                 budget = self._solwyn_budget.check_budget(
                     estimated_input_tokens=est_in,
                     model=requested_model,
@@ -2944,18 +2945,19 @@ class Solwyn(_SolwynBase):
                         # Preparers have not sent anything. Dispatch marks the
                         # boundary after them, just before invoking the provider.
                         usage_unknown = False
-                        _call_span.attempt(
-                            provider,
-                            served_model,
-                            chain_index,
-                            reason=_success_failover_reason(
-                                is_provider_fallback=is_provider_fallback,
-                                is_model_fallback=is_model_fallback,
-                                primary_errored=primary_errored,
-                                cost_routed=selection.cost_routed and not primary_reached,
-                            ),
-                        )
-                        with _call_span.current():
+                        if _call_span.active:
+                            _call_span.attempt(
+                                provider,
+                                served_model,
+                                chain_index,
+                                reason=_success_failover_reason(
+                                    is_provider_fallback=is_provider_fallback,
+                                    is_model_fallback=is_model_fallback,
+                                    primary_errored=primary_errored,
+                                    cost_routed=selection.cost_routed and not primary_reached,
+                                ),
+                            )
+                        with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
                             response = self._sync_dispatch(
                                 rt,
                                 call_kwargs,
@@ -2986,7 +2988,7 @@ class Solwyn(_SolwynBase):
                             # establishment failure eligible for failover. Key this to
                             # the SERVED runtime shape so fallback hops behave correctly.
                             # The buffered modern first chunk is replayed by the wrapper.
-                            with _call_span.current():
+                            with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
                                 response = _materialize_stream(response)
                     except Exception as exc:
                         disp = classify_exception(exc)
@@ -4094,7 +4096,7 @@ class AsyncSolwyn(_SolwynBase):
             media_usage=estimated_media,
         )
 
-        with _call_span.current():
+        with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
             budget = await self._solwyn_budget.check_budget(
                 estimated_input_tokens=est_in,
                 model=requested_model,
@@ -4172,8 +4174,9 @@ class AsyncSolwyn(_SolwynBase):
 
         start = time.monotonic()
         try:
-            _call_span.attempt(provider, requested_model, 0)
-            with _call_span.current():
+            if _call_span.active:
+                _call_span.attempt(provider, requested_model, 0)
+            with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
                 response = await self._media_dispatch(
                     runtime,
                     spec.surface,
@@ -4406,7 +4409,7 @@ class AsyncSolwyn(_SolwynBase):
             estimated_output_bound=estimated_output_bound,
         )
         if _surface == "responses":
-            with _call_span.current():
+            with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
                 budget = await self._solwyn_budget.check_budget(
                     estimated_input_tokens=est_in,
                     model=requested_model,
@@ -4421,7 +4424,7 @@ class AsyncSolwyn(_SolwynBase):
                     estimated_output_bound=estimated_output_bound,
                 )
         else:
-            with _call_span.current():
+            with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
                 budget = await self._solwyn_budget.check_budget(
                     estimated_input_tokens=est_in,
                     model=requested_model,
@@ -4629,18 +4632,19 @@ class AsyncSolwyn(_SolwynBase):
                         # Preparers have not sent anything. Dispatch marks the
                         # boundary after them, just before invoking the provider.
                         usage_unknown = False
-                        _call_span.attempt(
-                            provider,
-                            served_model,
-                            chain_index,
-                            reason=_success_failover_reason(
-                                is_provider_fallback=is_provider_fallback,
-                                is_model_fallback=is_model_fallback,
-                                primary_errored=primary_errored,
-                                cost_routed=selection.cost_routed and not primary_reached,
-                            ),
-                        )
-                        with _call_span.current():
+                        if _call_span.active:
+                            _call_span.attempt(
+                                provider,
+                                served_model,
+                                chain_index,
+                                reason=_success_failover_reason(
+                                    is_provider_fallback=is_provider_fallback,
+                                    is_model_fallback=is_model_fallback,
+                                    primary_errored=primary_errored,
+                                    cost_routed=selection.cost_routed and not primary_reached,
+                                ),
+                            )
+                        with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
                             response = await self._async_dispatch(
                                 rt,
                                 call_kwargs,
@@ -4667,7 +4671,7 @@ class AsyncSolwyn(_SolwynBase):
                             # shape keeps fallback hops correct; legacy
                             # google.generativeai has no async client and its sync
                             # response wrapper establishes eagerly during dispatch.
-                            with _call_span.current():
+                            with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
                                 response = await _materialize_stream_async(response)
                     except Exception as exc:
                         disp = classify_exception(exc)

@@ -49,6 +49,7 @@ def spans(monkeypatch):
     api.get_tracer = lambda *args, **kwargs: tracer
     monkeypatch.setattr(_otel, "_trace_api", api)
     monkeypatch.setattr(_otel, "_trace_api_resolved", True)
+    monkeypatch.setattr(_otel, "_call_tracer", None, raising=False)
     ends = Counter()
     original_end = sdk.Span.end
 
@@ -345,6 +346,16 @@ async def test_inactive_spans_preserve_caller_context_and_correlation(
         monkeypatch.setattr(_otel, "_trace_api", None)
         monkeypatch.setattr(_otel, "_trace_api_resolved", True)
 
+    def unexpected_context(*args, **kwargs):
+        raise AssertionError("inactive spans must use the shared empty context")
+
+    monkeypatch.setattr(_otel._CallSpan, "current", unexpected_context)
+    monkeypatch.setattr(_otel._CallSpan, "finishing", unexpected_context)
+    from solwyn import client
+
+    reasons = MagicMock(spec=[], side_effect=client._success_failover_reason)
+    monkeypatch.setattr(client, "_success_failover_reason", reasons)
+
     try:
         with spans.tracer.start_as_current_span("caller") as caller:
             caller_context = caller.get_span_context()
@@ -361,6 +372,9 @@ async def test_inactive_spans_preserve_caller_context_and_correlation(
                     assert len([c async for c in result]) == 1
                 else:
                     assert len(list(result)) == 1
+                    result.close()
+                if async_mode:
+                    await result.close()
             assert trace.get_current_span() is caller
     finally:
         await _close(wrapper, async_mode)
@@ -375,6 +389,8 @@ async def test_inactive_spans_preserve_caller_context_and_correlation(
     assert event.trace_id == (
         None if mode == "absent" else trace.format_trace_id(caller_context.trace_id)
     )
+    # The receipt still computes its reason once; no span-only computation.
+    assert reasons.call_count == (0 if surface == "media" else 1)
 
 
 @pytest.mark.unit
@@ -711,7 +727,8 @@ async def test_stream_bookkeeping_failure_ends_span(spans, async_mode, failure):
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_mode", [False, True])
-async def test_run_stop_during_stream_ends_with_error(spans, async_mode):
+@pytest.mark.parametrize("source", ["server", "local_velocity"])
+async def test_run_stop_during_stream_ends_with_error(spans, async_mode, source):
     from solwyn._run_control import mark_terminated
     from solwyn.exceptions import RunStoppedError
 
@@ -731,7 +748,7 @@ async def test_run_stop_during_stream_ends_with_error(spans, async_mode):
             result = wrapper.chat.completions.create(model="gpt-5.5", messages=[], stream=True)
             if async_mode:
                 result = await result
-            mark_terminated(run_id, reason="manual_kill", source="server")
+            mark_terminated(run_id, reason="manual_kill", source=source)
             with pytest.raises(RunStoppedError):
                 if async_mode:
                     await result.__anext__()
@@ -747,8 +764,9 @@ async def test_run_stop_during_stream_ends_with_error(spans, async_mode):
     assert len(spans.calls()) == 1
     assert spans.ends[call.context.span_id] == 1
     assert call.status.status_code == trace.StatusCode.ERROR
-    assert call.attributes["solwyn.budget.allowed"] is False
-    assert call.attributes["solwyn.denied_by_period"] == "run_stopped"
+    assert call.attributes["solwyn.budget.allowed"] is True
+    assert "solwyn.deny_source" not in call.attributes
+    assert "solwyn.denied_by_period" not in call.attributes
     assert not call.events
 
 
@@ -1055,7 +1073,7 @@ def test_interruption_while_adopting_span_still_ends_it(spans, monkeypatch, meth
 
     monkeypatch.setattr(span, method, interrupt)
     tracer = SimpleNamespace(start_span=MagicMock(spec=[], return_value=span))
-    monkeypatch.setattr(spans.api, "get_tracer", lambda *args: tracer)
+    monkeypatch.setattr(spans.api, "get_tracer", lambda *args, **kwargs: tracer)
     with pytest.raises(KeyboardInterrupt):
         _otel._start_call_span()
     assert spans.ends[context.span_id] == 1
@@ -1063,6 +1081,74 @@ def test_interruption_while_adopting_span_still_ends_it(spans, monkeypatch, meth
     assert spans.calls()[0].status.status_code == trace.StatusCode.ERROR
     assert spans.calls()[0].status.description is None
     assert not spans.calls()[0].events
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("outcome", ["success", "error", "adoption_error"])
+def test_status_objects_are_portable_to_older_otel_sdks(spans, monkeypatch, outcome):
+    original_set_status = sdk.Span.set_status
+
+    def old_set_status(span, status):
+        # SDK <1.12 requires Status and cannot safely export a bare StatusCode.
+        if not isinstance(status, trace.Status):
+            raise TypeError("Status required")
+        return original_set_status(span, status)
+
+    monkeypatch.setattr(sdk.Span, "set_status", old_set_status)
+    if outcome == "adoption_error":
+        span = spans.tracer.start_span("solwyn.call")
+
+        def fail():
+            raise ValueError()
+
+        monkeypatch.setattr(span, "is_recording", fail)
+        tracer = SimpleNamespace(start_span=MagicMock(spec=[], return_value=span))
+        monkeypatch.setattr(spans.api, "get_tracer", lambda *args, **kwargs: tracer)
+    owner = _otel._start_call_span()
+    owner.end(error=outcome == "error")
+    call = spans.calls()[0]
+    assert call.status.status_code == (
+        trace.StatusCode.OK if outcome == "success" else trace.StatusCode.ERROR
+    )
+    assert call.status.description is None
+    assert not call.events
+
+
+@pytest.mark.unit
+def test_call_tracer_is_cached_with_version_and_reset_after_fork(spans, monkeypatch):
+    lookups = []
+
+    def get_tracer(name, instrumenting_library_version=None):
+        lookups.append((name, instrumenting_library_version))
+        return spans.provider.get_tracer(name, instrumenting_library_version)
+
+    monkeypatch.setattr(spans.api, "get_tracer", get_tracer)
+
+    def call(_):
+        _otel._start_call_span().end()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(call, range(12)))
+    assert lookups == [("solwyn", solwyn.__version__)]
+    assert len(spans.calls()) == 12
+    assert all(s.instrumentation_scope.version == solwyn.__version__ for s in spans.calls())
+    _otel._reset_after_fork()
+    _otel._start_call_span().end()
+    assert lookups == [("solwyn", solwyn.__version__), ("solwyn", solwyn.__version__)]
+
+
+@pytest.mark.unit
+def test_call_tracer_resolution_can_reenter_without_recursion(spans, monkeypatch):
+    nested = []
+
+    def get_tracer(*args, **kwargs):
+        nested.append(_otel._start_call_span())
+        return spans.tracer
+
+    monkeypatch.setattr(spans.api, "get_tracer", get_tracer)
+    _otel._start_call_span().end()
+    assert nested == [_otel._INACTIVE_CALL_SPAN]
+    assert len(spans.calls()) == 1
 
 
 @pytest.mark.unit

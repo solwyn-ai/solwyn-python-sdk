@@ -10,7 +10,7 @@ import os
 import re
 import weakref
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager, suppress
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from threading import Lock, RLock
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
@@ -53,12 +53,17 @@ _trace_api: ModuleType | None = None
 _trace_api_resolved = False
 _trace_api_lock = RLock()
 _trace_api_loading = False
+_call_tracer: Any = None
+_call_tracer_loading = False
+_NOOP_CONTEXT = nullcontext()
 
 
 def _reset_after_fork() -> None:
-    global _trace_api_lock, _trace_api_loading
+    global _trace_api_lock, _trace_api_loading, _call_tracer, _call_tracer_loading
     _trace_api_lock = RLock()
     _trace_api_loading = False
+    _call_tracer = None
+    _call_tracer_loading = False
 
 
 if hasattr(os, "register_at_fork"):
@@ -86,6 +91,26 @@ def _get_trace_api() -> ModuleType | None:
                     _trace_api_loading = False
                 _trace_api_resolved = True
     return _trace_api
+
+
+def _get_call_tracer(trace: ModuleType) -> Any:
+    """Cache even a proxy tracer; guard provider callbacks against re-entry."""
+    global _call_tracer, _call_tracer_loading
+    if _call_tracer is None:
+        with _trace_api_lock:
+            if _call_tracer is None:
+                if _call_tracer_loading:
+                    return None
+                _call_tracer_loading = True
+                try:
+                    from solwyn import __version__
+
+                    _call_tracer = trace.get_tracer(
+                        "solwyn", instrumenting_library_version=__version__
+                    )
+                finally:
+                    _call_tracer_loading = False
+    return _call_tracer
 
 
 class _TraceSnapshot(NamedTuple):
@@ -147,17 +172,16 @@ class _CallSpan:
     """
 
     def __init__(self, span: Any = None, trace: ModuleType | None = None) -> None:
+        self.active = span is not None
         self._span = span
         self._trace = trace
         self._lock = Lock()
         self._ended = False
         self._deferred = False
-        self._denied = False
         self._failover_reason: str | None = None
         self._end_holds = 0
         self._end_requested = False
         self._error = False
-        self._run_stopped = False
 
     def __enter__(self) -> Self:
         return self
@@ -220,7 +244,6 @@ class _CallSpan:
         if self._span is None:
             return
         try:
-            self._denied = not budget.allowed
             self._span.set_attribute("solwyn.budget.allowed", budget.allowed)
             self._span.set_attribute("solwyn.budget.mode", budget.mode.value)
             self._span.set_attribute("solwyn.lease_funded", bool(getattr(budget, "lease_id", None)))
@@ -235,7 +258,6 @@ class _CallSpan:
         if self._span is None:
             return
         try:
-            self._denied = True
             self._span.set_attribute("solwyn.budget.allowed", False)
             self._span.set_attribute("solwyn.deny_source", source)
             self._span.set_attribute("solwyn.denied_by_period", period)
@@ -265,7 +287,7 @@ class _CallSpan:
         """Keep completion open through nested provider close/exit cleanup.
 
         Completion can request end before the provider finishes closing. Retain
-        only error/stop booleans until the outer cleanup returns; never retain
+        only an error flag until the outer cleanup returns; never retain
         exceptions or make the span current during application cleanup.
         """
         if self._span is None:
@@ -298,8 +320,7 @@ class _CallSpan:
         with self._lock:
             if self._ended:
                 return
-            self._run_stopped |= isinstance(exception, RunStoppedError)
-            self._error |= error or self._run_stopped
+            self._error |= error or isinstance(exception, RunStoppedError)
             self._end_requested = True
             if self._end_holds:
                 return
@@ -307,10 +328,10 @@ class _CallSpan:
         try:
             if self._failover_reason is not None:
                 self._span.set_attribute("solwyn.failover.reason", self._failover_reason)
-            if self._run_stopped and not self._denied:
-                self.denied(source="run_terminated", period="run_stopped")
             self._span.set_status(
-                self._trace.StatusCode.ERROR if self._error else self._trace.StatusCode.OK
+                self._trace.Status(
+                    self._trace.StatusCode.ERROR if self._error else self._trace.StatusCode.OK
+                )
             )
         except Exception:
             pass
@@ -331,7 +352,10 @@ def _start_call_span() -> _CallSpan:
         trace = _get_trace_api()
         if trace is None:
             return _INACTIVE_CALL_SPAN
-        span = trace.get_tracer("solwyn").start_span("solwyn.call", kind=trace.SpanKind.INTERNAL)
+        tracer = _get_call_tracer(trace)
+        if tracer is None:
+            return _INACTIVE_CALL_SPAN
+        span = tracer.start_span("solwyn.call", kind=trace.SpanKind.INTERNAL)
         context = span.get_span_context()
         if span.is_recording() and context.is_valid and context.trace_flags.sampled:
             owner = _CallSpan(span, trace)
@@ -340,7 +364,7 @@ def _start_call_span() -> _CallSpan:
     except BaseException as exc:
         if span is not None and trace is not None:
             with suppress(Exception):
-                span.set_status(trace.StatusCode.ERROR)
+                span.set_status(trace.Status(trace.StatusCode.ERROR))
         if not isinstance(exc, Exception):
             raise
     finally:

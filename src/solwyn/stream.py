@@ -18,7 +18,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any, Self, cast
 
-from solwyn._otel import _INACTIVE_CALL_SPAN, _CallSpan
+from solwyn._otel import _INACTIVE_CALL_SPAN, _NOOP_CONTEXT, _CallSpan
 from solwyn._token_details import TokenDetails
 from solwyn.providers._accumulator import StreamUsageAccumulator
 
@@ -195,10 +195,15 @@ class SyncStreamWrapper:
             except StopIteration:
                 self._settle()
                 raise
-            except BaseException as exc:
+            except Exception as exc:
                 if self._latched_abort() is exc:
                     raise
                 self._settle_error(exc)
+                raise
+            except BaseException as exc:
+                # Observe interruption without changing sync billing: close or
+                # context exit still confirms whatever usage was measured.
+                self._call_span.end(error=True, exception=exc)
                 raise
         return self._pending_chunks.popleft()
 
@@ -214,7 +219,7 @@ class SyncStreamWrapper:
         times; well-behaved stream implementations are idempotent.
         Called automatically by __exit__ if the stream wasn't fully consumed.
         """
-        with self._call_span.finishing():
+        with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT:
             self._settle()
             if hasattr(self._stream, "close"):
                 self._stream.close()
@@ -224,12 +229,12 @@ class SyncStreamWrapper:
             if hasattr(self._stream, "__enter__"):
                 self._stream.__enter__()
         except BaseException as exc:
-            self._settle_error(exc)
+            self._call_span.end(error=True, exception=exc)
             raise
         return self
 
     def __exit__(self, *args: object) -> bool | None:
-        with self._call_span.finishing():
+        with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT:
             try:
                 # self.close() now settles AND forwards to inner close().
                 # Broad except is intentional: callback/provider-close failures
@@ -240,7 +245,7 @@ class SyncStreamWrapper:
                     and isinstance(args[1], BaseException)
                     and not isinstance(args[1], Exception)
                 ):
-                    self._settle_error(args[1])
+                    self._call_span.end(error=True, exception=args[1])
                 self.close()
             except Exception as cb_exc:
                 # Structural-only: log the suppressed callback class, never a traceback
@@ -420,7 +425,7 @@ class AsyncStreamWrapper:
         Forwarding to the inner stream is also safe if called multiple times;
         well-behaved stream implementations are idempotent.
         """
-        with self._call_span.finishing():
+        with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT:
             async with self._close_lock:
                 if self._cleanup_complete:
                     return
@@ -442,12 +447,12 @@ class AsyncStreamWrapper:
             if hasattr(self._stream, "__aenter__"):
                 await self._stream.__aenter__()
         except BaseException as exc:
-            await self._settle_error(exc)
+            self._call_span.end(error=True, exception=exc)
             raise
         return self
 
     async def __aexit__(self, *args: object) -> bool | None:
-        with self._call_span.finishing():
+        with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT:
             try:
                 if (
                     len(args) > 1
@@ -668,7 +673,7 @@ class _SyncResponsesStreamManagerWrapper:
                 raise RuntimeError("Responses stream manager is already entered")
             self._state = "entering"
             try:
-                with self._call_span.current():
+                with self._call_span.current() if self._call_span.active else _NOOP_CONTEXT:
                     source = self._manager.__enter__()
             except BaseException as exc:
                 self._state = "closed"
@@ -690,7 +695,7 @@ class _SyncResponsesStreamManagerWrapper:
             return entered_stream
 
     def _finish(self, args: tuple[object, ...]) -> bool | None:
-        with self._call_span.finishing(), self._lock:
+        with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT, self._lock:
             if self._state == "closed":
                 return False
             self._state = "closed"
@@ -704,9 +709,8 @@ class _SyncResponsesStreamManagerWrapper:
                         and isinstance(args[1], BaseException)
                         and not isinstance(args[1], Exception)
                     ):
-                        self._wrapped_stream()._settle_error(args[1])
-                    else:
-                        self._wrapped_stream()._settle()
+                        self._call_span.end(error=True, exception=args[1])
+                    self._wrapped_stream()._settle()
                 else:
                     self._release_before_entry()
             except BaseException as exc:
@@ -861,7 +865,7 @@ class _AsyncResponsesStreamManagerWrapper:
                 raise RuntimeError("Responses stream manager is already entered")
             self._state = "entering"
             try:
-                with self._call_span.current():
+                with self._call_span.current() if self._call_span.active else _NOOP_CONTEXT:
                     source = await self._manager.__aenter__()
             except BaseException as exc:
                 self._state = "closed"
@@ -883,7 +887,7 @@ class _AsyncResponsesStreamManagerWrapper:
             return entered_stream
 
     async def _finish(self, args: tuple[object, ...]) -> bool | None:
-        with self._call_span.finishing():
+        with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT:
             async with self._lock:
                 if self._state == "closed":
                     return False
