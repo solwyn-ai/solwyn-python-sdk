@@ -346,7 +346,7 @@ class _CallSpan:
 
     @contextmanager
     def current(self) -> Iterator[None]:
-        """Attach only for provider dispatch; never across a stream return."""
+        """Attach only for budget checks and dispatch; never across a stream return."""
         if self._span is None:
             yield
             return

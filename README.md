@@ -1246,13 +1246,14 @@ explicitly for deterministic completion and context cleanup.
 
 Each intercepted chat or media call creates one `solwyn.call` span of kind
 `INTERNAL`, parented under the current run or application span, or as a root when
-there is no parent. The span opens before budget preflight; instrumented budget
-requests retain the application's current parent. Native provider SDK spans are
-children of `solwyn.call`, and all failover attempts share that call span. It is
-made current only during provider dispatch, including `with_options(...)` and
-deferred Responses manager entry, and is never current while application code
-iterates a returned stream. Streams keep the span open until completion,
-explicit close, failure, or garbage collection.
+there is no parent. Instrumented budget preflight requests and native provider
+SDK spans are children of `solwyn.call`, and all failover attempts share that
+call span. It is made current only during the budget check and provider
+dispatch, including `with_options(...)` and deferred Responses manager entry,
+and is never current while application code iterates a returned stream.
+Background confirmations and reporting run in an isolated context. Streams
+keep the span open until completion, explicit close, failure, or garbage
+collection.
 
 The closed call-span attribute allowlist is:
 

@@ -212,10 +212,8 @@ async def test_call_span_lifecycle(spans, async_mode, media, outcome):
     assert call.status.description is None
     assert not call.events
     for child in spans.exporter.get_finished_spans():
-        if child.name in {"provider.native", "provider.with_options"}:
+        if child.name in {"provider.native", "provider.with_options", "budget.httpx"}:
             assert child.parent.span_id == call.context.span_id
-        elif child.name == "budget.httpx":
-            assert child.parent.span_id == caller_id
     assert open_at_preflight == ([] if outcome == "run_stop" else [True])
     assert call.attributes["solwyn.agent_run_id"] == run_id
     assert call.attributes["solwyn.provider.requested"] == "openai"
@@ -352,6 +350,7 @@ async def test_native_anthropic_conversation_span_is_a_child_of_call(
             spans.tracer.start_as_current_span("caller") as caller,
             solwyn.run("PRIVATE run") as run,
         ):
+            run_span = trace.get_current_span()
             result = wrapper.messages.create(
                 model="claude-sonnet-5",
                 max_tokens=16,
@@ -367,7 +366,7 @@ async def test_native_anthropic_conversation_span_is_a_child_of_call(
                     assert [event.type for event in result][-1] == "message_stop"
             else:
                 assert result.usage.input_tokens == 10
-            assert trace.get_current_span() is caller
+            assert trace.get_current_span() is run_span
     finally:
         await _close(wrapper, async_mode)
 
@@ -381,7 +380,8 @@ async def test_native_anthropic_conversation_span_is_a_child_of_call(
     assert len(native) == 1
     assert native[0].parent == call.context
     assert native[0].attributes["gen_ai.conversation.id"] == run
-    assert call.parent == caller.get_span_context()
+    assert call.parent == run_span.get_span_context()
+    assert run_span.parent == caller.get_span_context()
     assert call.attributes["solwyn.agent_run_id"] == run
     assert set(call.attributes) == _IDENTITY | _BUDGET | _ATTEMPT | {"solwyn.agent_run_id"}
     assert not any(key.startswith("gen_ai.") for key in call.attributes)
@@ -711,20 +711,26 @@ async def test_responses_manager_span_lifetime(spans, async_mode, terminal):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_mode", [False, True])
 @pytest.mark.parametrize("surface", ["chat", "media", "responses"])
-async def test_real_httpx_preflight_preserves_caller_parent(spans, async_mode, surface):
+@pytest.mark.parametrize("spans_enabled", [False, True], ids=["spans-off", "spans-on"])
+@pytest.mark.parametrize("correlation", [False, True], ids=["trace-off", "trace-on"])
+async def test_real_httpx_preflight_span_is_a_child(
+    spans, async_mode, surface, spans_enabled, correlation
+):
     instrumentation = pytest.importorskip("opentelemetry.instrumentation.httpx")
     plane = FakeControlPlane()
     raw = _raw_client(async_mode)
     raw.chat.completions.create.return_value = _response()
     raw.embeddings.create.return_value = _response()
     raw.responses = SimpleNamespace(create=raw.chat.completions.create)
-    wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw, otel_spans=True)
-    instrumentation.HTTPXClientInstrumentor.instrument_client(
-        wrapper._solwyn_budget._http,
-        tracer_provider=spans.provider,
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(
+        raw, otel_spans=spans_enabled, trace_correlation=correlation
     )
-    try:
-        with spans.tracer.start_as_current_span("caller") as caller:
+    for http_client in (wrapper._solwyn_budget._http, wrapper._solwyn_reporter._http):
+        instrumentation.HTTPXClientInstrumentor.instrument_client(
+            http_client, tracer_provider=spans.provider
+        )
+    with spans.tracer.start_as_current_span("caller") as caller:
+        try:
             if surface == "media":
                 result = wrapper.embeddings.create(model="text-embedding-3-small", input="x")
             elif surface == "responses":
@@ -733,13 +739,30 @@ async def test_real_httpx_preflight_preserves_caller_parent(spans, async_mode, s
                 result = wrapper.chat.completions.create(model="gpt-5.5", messages=[])
             if async_mode:
                 await result
-    finally:
-        await _close(wrapper, async_mode)
-    call = spans.calls()[0]
+            assert trace.get_current_span() is caller
+        finally:
+            # Closing under the caller also exercises the reporter's isolated
+            # final flush, rather than masking context leaks by exiting first.
+            await _close(wrapper, async_mode)
+        assert trace.get_current_span() is caller
+    assert len(spans.calls()) == int(spans_enabled)
+    call_parent = spans.calls()[0].context if spans_enabled else caller.get_span_context()
     http_spans = [s for s in spans.exporter.get_finished_spans() if s.kind == trace.SpanKind.CLIENT]
-    assert len(http_spans) == 1
-    assert http_spans[0].parent.span_id == caller.get_span_context().span_id
-    assert http_spans[0].context.trace_id == call.context.trace_id
+    preflight = [
+        s
+        for s in http_spans
+        if s.attributes.get("url.full", s.attributes.get("http.url", "")).endswith("/budgets/check")
+    ]
+    background = [s for s in http_spans if s not in preflight]
+    assert len(preflight) == 1
+    assert preflight[0].parent == call_parent
+    assert preflight[0].context.trace_id == call_parent.trace_id
+    assert len(plane.confirms) == len(plane.ingested) == 1
+    assert len(background) >= 2  # Confirmation and metadata ingestion.
+    assert all(s.parent is None for s in background)
+    event = plane.ingested[0]
+    assert event.span_id == (trace.format_span_id(call_parent.span_id) if correlation else None)
+    assert event.trace_id == (trace.format_trace_id(call_parent.trace_id) if correlation else None)
 
 
 @pytest.mark.unit
