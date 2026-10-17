@@ -9,31 +9,46 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
-- **Anthropic SDK 1.15 support.** Coverage reports and strict mode recognize
-  the `open_telemetry` configuration and the organization telemetry-destination
-  API, including workspace assignments. The newly exposed organization
-  administration APIs use guarded namespaces and exact acknowledgment tokens;
-  these operations remain unmetered and follow `on_unmetered`. Provider SDK
-  minimum versions are unchanged, and Anthropic versions below 1.14 retain
-  their existing behavior.
+- **Anthropic SDK 1.15 support.** Coverage reports recognize the
+  `open_telemetry` configuration. Newly guarded administration APIs include
+  the `organization` tree and `beta.organization.analytics`,
+  `beta.organization.plugins`, `beta.organization.plugin_marketplaces`,
+  `beta.organization.rbac_groups`, `beta.organization.rbac_roles`,
+  `beta.organization.spend_limits`, and
+  `beta.organization.telemetry_destinations` (including workspace assignments).
+  Their operations remain unmetered, follow `on_unmetered`, and require exact
+  acknowledgment tokens in strict mode. Provider SDK minimum versions are
+  unchanged, and Anthropic versions below 1.14 retain their existing behavior.
 - **Provider version documentation.** The README lists supported SDK floors,
   tested breakpoints, and latest tested versions, and clarifies that unset
   optional metadata fields are omitted entirely from transmitted payloads.
-
-- **OpenAI SDK 3.33 support.** Coverage reports recognize Decisions, voice
-  creation, realtime translation credentials, agent environment and session
-  helpers, API-key updates, usage reporting, safety-case retrieval, and
-  external-storage administration. These operations remain unmetered and
-  require their exact acknowledgment tokens in strict mode. Raw and streaming
-  response helpers retain their separate acknowledgment scope.
-- **Together SDK 2.41 support.** Coverage reports recognize Jig deployment
-  revision history and rollback, GPU clusters and storage, post-training
-  sessions and operations, and the project catalog. Deployment rollback,
+- **OpenAI SDK 3.33 support.** Coverage reports recognize `decisions`,
+  `audio.voices`, `realtime.translations.client_secrets`,
+  `beta.agents.environments`, `beta.agents.environments.files`,
+  `beta.agents.sessions.artifacts`, `beta.agents.sessions.traces`,
+  `beta.agents.sessions.turns.items`, `beta.agents.vaults`,
+  `admin.organization.projects.api_keys`, `admin.organization.usage`,
+  `safety.cases`, and `admin.organization.external_storage`. These operations
+  remain unmetered and require their exact acknowledgment tokens in strict
+  mode. Raw and streaming response helpers retain their separate acknowledgment
+  scope. Coverage fingerprints are refreshed for these admissions.
+- **Together SDK 2.41 support.** Coverage reports recognize `beta.jig`
+  revision history and `beta.jig.rollback`, `clusters` (including
+  `clusters.remediations` and `clusters.storage`), `post_training.sessions`,
+  `post_training.operations`, `post_training.checkpoints`,
+  `post_training.prepare_for_fp4_inference`, `post_training.model_resources`,
+  `post_training.supported_models`, and `projects`. Deployment rollback,
   cluster provisioning, training, and sampling can incur provider charges
   that Solwyn does not meter; they follow `on_unmetered` and are refused in
   strict mode unless explicitly acknowledged.
-- **Google GenAI SDK 2.31 compatibility.** The existing guarded voice catalog
-  and other reviewed capabilities retain their behavior with this version.
+- **Google GenAI SDK 2.31 support.** Coverage reports recognize the
+  `voices` / `aio.voices` catalog introduced in google-genai 2.25
+  (create/get/list/delete) as guarded namespaces with unmetered operations
+  that require exact acknowledgment tokens in strict mode. Their
+  `sdk_configuration` properties use the `resource` acknowledgment scope;
+  raw and streaming response helpers use `raw_response`. These admissions
+  change pinned `CoverageFingerprint` values when upgrading from Solwyn 0.8.0,
+  where the paths were `unknown`.
 
 ### Tests
 
