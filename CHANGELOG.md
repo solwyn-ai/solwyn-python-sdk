@@ -17,6 +17,9 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **Async background task context isolation.** Background reporting and budget
+  tasks no longer inherit the caller's context, so application instrumentation
+  no longer attributes their work to the first caller's trace.
 - **Anthropic SDK 1.15 support.** Coverage reports recognize the
   `open_telemetry` configuration. Newly guarded administration APIs include
   the `organization` tree and `beta.organization.analytics`,

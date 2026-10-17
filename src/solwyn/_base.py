@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict
 
 from solwyn._constants import FAILOVER_ERROR_CLASS_MAX_LENGTH, ORDINARY_TOKEN_COUNT_MAX
 from solwyn._lifecycle import register_fork_reset
-from solwyn._otel import _TraceSnapshot
+from solwyn._otel import _TraceSnapshot, _validated_trace
 from solwyn._routing import (
     CostPolicy,
     HealthBasedPolicy,
@@ -1780,6 +1780,7 @@ class _SolwynBase:
         agent_run_id, agent_run_name, tags, parent_agent_run_id = (
             _capture_run_context() if agent_run is None else agent_run
         )
+        trace = _validated_trace(trace)
         return MetadataEvent(
             model=model,
             provider=ProviderName(provider),

@@ -1003,6 +1003,7 @@ def test_denial_fixture(solwyn_control_plane, solwyn_test_client):
 | `velocity_accel_factor` | `SOLWYN_VELOCITY_ACCEL_FACTOR` | `3.0` | Required current/prior one-minute call-count ratio |
 | `on_unmetered` | `SOLWYN_ON_UNMETERED` | `warn` | Handle untracked or unknown pre-call capabilities with `warn`, `raise`, or `allow` |
 | `report_untracked_surfaces` | `SOLWYN_REPORT_UNTRACKED_SURFACES` | `True` | Send optional structural advisory reports for unacknowledged `warn`/`allow` observations; set false to keep them local |
+| `trace_correlation` | `SOLWYN_TRACE_CORRELATION` | `True` | Include active OpenTelemetry trace identifiers in metadata events when available; set false to disable capture |
 | `acknowledge_untracked` | `SOLWYN_ACKNOWLEDGE_UNTRACKED` | empty | Exact terminal capability tokens; env format is comma-delimited |
 | `control_plane_failure_threshold` | `SOLWYN_CONTROL_PLANE_FAILURE_THRESHOLD` | `3` | Consecutive Solwyn API failures before local outage posture applies |
 | `control_plane_recovery_timeout` | `SOLWYN_CONTROL_PLANE_RECOVERY_TIMEOUT` | `30.0` | Seconds before probing the Solwyn API after its breaker opens |
@@ -1141,10 +1142,13 @@ Optional fields are omitted entirely when unset (never `null`), so payloads for
 providers that do not use them are byte-identical to earlier releases.
 
 Trace correlation captures only these two random identifiers and the sampled
-flag, never content, and only when your application already has an active,
-valid OpenTelemetry span. Install `solwyn[otel]` if your application does not
-already provide the optional OpenTelemetry API. Solwyn creates no spans and
-does not forward baggage or tracestate. Disable capture with
+flag, never content. It requires your application's configured tracer provider
+and an active, valid OpenTelemetry span; `solwyn[otel]` is only a convenience
+for installing the optional API. Solwyn creates no spans, and its own code
+never injects trace context, baggage, or tracestate. Your application's httpx
+auto-instrumentation may still add `traceparent` or `baggage` to Solwyn's
+control-plane requests, including budget checks in the caller's context.
+Disable capture with
 `Solwyn(client, trace_correlation=False)` (or `AsyncSolwyn`) or
 `SOLWYN_TRACE_CORRELATION=false`. Unset correlation fields are omitted entirely
 from payloads. Aggregated denial replays carry no trace because they span calls.

@@ -28,6 +28,18 @@ def _violations(source: str) -> list[int]:
             return f"{dotted(node.value)}.{node.attr}"
         return ""
 
+    def literal_solwyn_key(node: ast.expr | None) -> bool:
+        return (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value.startswith("solwyn.")
+        )
+
+    def literal_solwyn_attributes(node: ast.expr) -> bool:
+        # Dict expansion has a None key, so even a partial literal cannot hide
+        # arbitrary attributes behind **attrs.
+        return isinstance(node, ast.Dict) and all(literal_solwyn_key(key) for key in node.keys)
+
     violations = []
     banned = {"record_exception", "content_mode", "max_content_bytes"}
     for node in ast.walk(tree):
@@ -46,10 +58,27 @@ def _violations(source: str) -> list[int]:
             violations.append(node.lineno)
         if not isinstance(node, ast.Call):
             continue
-        target = dotted(node.func)
-        if target.endswith("propagate.inject"):
+        method = dotted(node.func).rsplit(".", 1)[-1]
+        if method in {"inject", "record_exception", "add_event"}:
             violations.append(node.lineno)
-        if target.rsplit(".", 1)[-1] == "set_attribute":
+        attributes = [kw.value for kw in node.keywords if kw.arg == "attributes"]
+        if method == "set_attributes":
+            if node.args:
+                attributes.append(node.args[0])
+            elif not attributes:
+                violations.append(node.lineno)
+        if method in {"start_span", "start_as_current_span"} and len(node.args) > 3:
+            attributes.append(node.args[3])
+        if any(not literal_solwyn_attributes(value) for value in attributes):
+            violations.append(node.lineno)
+        if method in {
+            "set_attribute",
+            "set_attributes",
+            "start_span",
+            "start_as_current_span",
+        } and any(kw.arg is None for kw in node.keywords):
+            violations.append(node.lineno)
+        if method == "set_attribute":
             key = (
                 node.args[0]
                 if node.args
@@ -58,13 +87,9 @@ def _violations(source: str) -> list[int]:
                     None,
                 )
             )
-            if not (
-                isinstance(key, ast.Constant)
-                and isinstance(key.value, str)
-                and key.value.startswith("solwyn.")
-            ):
+            if not literal_solwyn_key(key):
                 violations.append(node.lineno)
-        if target.rsplit(".", 1)[-1] in {"set_status", "Status"}:
+        if method in {"set_status", "Status"}:
             description = (
                 node.args[1]
                 if len(node.args) > 1
@@ -99,6 +124,12 @@ def test_otel_privacy_guard_covers_all_source_modules() -> None:
         "from opentelemetry import propagate; propagate.inject(headers)",
         "from opentelemetry.propagate import inject as send; send(headers)",
         "import opentelemetry.propagate as p; p.inject(headers)",
+        "propagate.get_global_textmap().inject(headers)",
+        "TraceContextTextMapPropagator().inject(headers)",
+        "W3CBaggagePropagator().inject(headers)",
+        "custom_propagator.inject(headers)",
+        "from custom_propagator import inject as send; send(headers)",
+        "from opentelemetry.trace import record_exception as record; record(exc)",
         "span.set_attribute(key, value)",
         "span.set_attribute('gen_ai.prompt', value)",
         "span.set_attribute(key='customer.tags', value=tags)",
@@ -107,6 +138,29 @@ def test_otel_privacy_guard_covers_all_source_modules() -> None:
         "span.set_status(Status(StatusCode.ERROR, description=str(exc)))",
         "from opentelemetry.trace import Status as S; span.set_status(S(code, str(exc)))",
         "set_attribute('customer.tags', tags)",
+        "span.set_attributes({'gen_ai.prompt': prompt})",
+        "span.set_attributes(attrs)",
+        "span.set_attributes({key: value})",
+        "span.set_attributes({'solwyn.call_id': call_id, **attrs})",
+        "span.set_attributes(attributes=attrs)",
+        "span.set_attributes(attributes={'customer.tags': tags})",
+        "span.set_attributes(**kwargs)",
+        "span.set_attributes([('solwyn.call_id', call_id)])",
+        "tracer.start_span('x', attributes={'gen_ai.prompt': prompt})",
+        "tracer.start_as_current_span('x', attributes={'gen_ai.prompt': prompt})",
+        "tracer.start_span('x', attributes=attrs)",
+        "tracer.start_as_current_span('x', attributes=attrs)",
+        "tracer.start_span('x', attributes={key: value})",
+        "tracer.start_span('x', attributes={'solwyn.call_id': call_id, **attrs})",
+        "tracer.start_span('x', **kwargs)",
+        "tracer.start_as_current_span('x', **kwargs)",
+        "tracer.start_span('x', context, kind, {'gen_ai.prompt': prompt})",
+        "tracer.start_as_current_span('x', context, kind, attrs)",
+        "Span(attributes={'gen_ai.prompt': prompt})",
+        "span.add_event('x', attributes={'gen_ai.prompt': prompt})",
+        "span.add_event('x', attributes=attrs)",
+        "span.add_event('solwyn.call', attributes={'solwyn.call_id': call_id})",
+        "span.add_event('x')",
     ],
 )
 def test_otel_privacy_guard_rejects_forbidden_operations(source: str) -> None:
@@ -114,10 +168,22 @@ def test_otel_privacy_guard_rejects_forbidden_operations(source: str) -> None:
 
 
 @pytest.mark.unit
-def test_otel_privacy_guard_accepts_literal_solwyn_attribute_names() -> None:
-    assert not _violations("span.set_attribute('solwyn.call_id', call_id)")
-    assert not _violations("span.set_attribute(key='solwyn.provider', value=provider)")
-    assert not _violations("span.set_status(Status(code, 'unavailable'))")
+@pytest.mark.parametrize(
+    "source",
+    [
+        "span.set_attribute('solwyn.call_id', call_id)",
+        "span.set_attribute(key='solwyn.provider', value=provider)",
+        "span.set_attributes({'solwyn.call_id': call_id, 'solwyn.provider': provider})",
+        "span.set_attributes(attributes={'solwyn.provider': provider})",
+        "span.set_attributes({})",
+        "tracer.start_span('solwyn.call', attributes={'solwyn.call_id': call_id})",
+        "tracer.start_as_current_span('solwyn.call', attributes={'solwyn.provider': provider})",
+        "tracer.start_span('solwyn.call', context, kind, {'solwyn.call_id': call_id})",
+        "span.set_status(Status(code, 'unavailable'))",
+    ],
+)
+def test_otel_privacy_guard_accepts_literal_solwyn_attribute_names(source: str) -> None:
+    assert not _violations(source)
 
 
 @pytest.mark.unit

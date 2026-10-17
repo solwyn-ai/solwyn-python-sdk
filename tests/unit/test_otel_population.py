@@ -271,6 +271,58 @@ async def test_every_outcome_uses_one_call_start_snapshot(async_mode: bool, outc
 @pytest.mark.unit
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("surface", ["chat", "stream", "media"])
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        ("1" * 33, "2" * 16, True),
+        ("1" * 32, "0" * 16, True),
+        ("1" * 32, "2" * 16, "true"),
+    ],
+    ids=["malformed-trace", "malformed-span", "malformed-sampled"],
+)
+async def test_malformed_snapshot_preserves_response_and_settlement(
+    async_mode: bool, surface: str, snapshot: tuple[object, object, object]
+) -> None:
+    from solwyn._otel import _TraceSnapshot
+
+    plane = FakeControlPlane()
+    raw = _raw_client(async_mode)
+    response = _response()
+    raw.chat.completions.create.return_value = (
+        (_chunks() if async_mode else iter([response])) if surface == "stream" else response
+    )
+    raw.embeddings.create.return_value = response
+    wrapper = (plane.wrap_async if async_mode else plane.wrap)(raw)
+    try:
+        with patch("solwyn._otel.capture_trace", return_value=_TraceSnapshot(*snapshot)):
+            if surface == "media":
+                result = wrapper.embeddings.create(model="text-embedding-3-small", input="x")
+            else:
+                result = wrapper.chat.completions.create(
+                    model="gpt-5.5", messages=[], stream=surface == "stream"
+                )
+            if async_mode:
+                result = await result
+            if surface == "stream":
+                if async_mode:
+                    assert len([chunk async for chunk in result]) == 1
+                else:
+                    assert list(result) == [response]
+            else:
+                assert result is response
+    finally:
+        if async_mode:
+            await wrapper.close()
+        else:
+            wrapper.close()
+    assert len(plane.ingested) == len(plane.confirms) == 1
+    assert {"trace_id", "span_id", "trace_sampled"}.isdisjoint(plane.ingested[0].model_dump())
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+@pytest.mark.parametrize("async_mode", [False, True])
 @pytest.mark.parametrize("media", [False, True])
 async def test_disabled_correlation_never_captures(async_mode: bool, media: bool) -> None:
     plane = FakeControlPlane()
