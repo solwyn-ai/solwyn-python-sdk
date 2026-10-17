@@ -44,7 +44,12 @@ from solwyn._lease import (
     LeaseDecision,
     LeaseLedger,
 )
-from solwyn._lifecycle import register_fork_reset, register_lease_holder
+from solwyn._lifecycle import (
+    _drain_run_cleanups,
+    _flush_run_span_cleanups,
+    register_fork_reset,
+    register_lease_holder,
+)
 from solwyn._read_only_key import handle_read_only_key_error
 from solwyn._run_control import clear_termination_if
 from solwyn._token_details import TokenDetails
@@ -1954,6 +1959,11 @@ class _BudgetEnforcerBase:
 
     def _begin_close(self) -> list[LeaseSurrenderRequest] | None:
         """Fence and atomically drain state before any shutdown wait."""
+        # No enforcer lock is held here. Finish queued scope/handle bookkeeping
+        # before sealing leases. Tracing stays on its worker with a bounded
+        # barrier: even an exporter that stalls cannot prevent lease close.
+        _drain_run_cleanups(blocking=False)
+        _flush_run_span_cleanups()
         self._drain_pending_run_surrenders()
         with self._state_lock:
             if self._closed:

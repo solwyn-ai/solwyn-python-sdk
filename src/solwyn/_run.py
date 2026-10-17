@@ -36,6 +36,7 @@ from __future__ import annotations
 import inspect
 import os
 import sys
+import time
 import unicodedata
 import uuid
 import warnings
@@ -66,8 +67,9 @@ from solwyn._constants import (
 from solwyn._lifecycle import (
     _defer_run_cleanup,
     _drain_run_cleanups,
-    _ensure_run_cleanup_worker,
+    _prepare_run_cleanup,
     _queue_run_surrender,
+    _run_gc_active,
     _surrender_run,
     register_fork_reset,
 )
@@ -128,7 +130,6 @@ class _OpenRun:
     closing: bool = False
     retired: bool = False
     generator_owned: bool = False
-    finalizer_sensitive: bool = False
     # dict.pop is an atomic once-claim on supported CPython versions and never
     # waits for a lock that may already be held by the GC-triggering thread.
     surrender_claim: dict[None, bool] = field(default_factory=lambda: {None: True})
@@ -185,21 +186,15 @@ if hasattr(os, "register_at_fork"):
 
 
 def _owner_key() -> _OwnerKey:
-    return _owner_details()[0]
-
-
-def _owner_details() -> tuple[_OwnerKey, bool]:
     frame = None
-    sensitive = False
     try:
-        frame = sys._getframe(2)
+        frame = sys._getframe(1)
         for _ in range(256):
             if frame is None:
                 break
             if frame.f_globals.get("__name__") == __name__:
                 frame = frame.f_back
                 continue
-            sensitive |= bool(frame.f_code.co_flags & inspect.CO_GENERATOR)
             # A delegating manager does not own its caller's streaming scope.
             # Skip contextlib-driven helper generators symmetrically on entry
             # and exit, including ExitStack's unwind. Stop at the first ordinary
@@ -220,10 +215,10 @@ def _owner_details() -> tuple[_OwnerKey, bool]:
             if helper or machinery:
                 frame = frame.f_back
                 continue
-            return (id(frame), frame.f_code), sensitive
-        return None, sensitive
+            return id(frame), frame.f_code
+        return None
     except (AttributeError, ValueError):
-        return None, sensitive
+        return None
     finally:
         del frame
 
@@ -255,7 +250,6 @@ def _register_generator(record: _OpenRun) -> None:
     key = record.owner_key
     if key is None or not key[1].co_flags & inspect.CO_GENERATOR:
         return
-    _ensure_run_cleanup_worker()
     record.generator_owned = True
     reference = weakref.ref(record, lambda ref: _dead_generator_runs.append((key, ref)))
     _drain_generator_runs()
@@ -591,25 +585,20 @@ def _called_from_async_generator() -> bool:
         del frame
 
 
-def _called_from_sync_generator(*, helper_exit: bool = False) -> bool:
-    """finish() may be called by a helper after GeneratorExit was handled."""
-    frame = None
-    try:
-        frame = sys._getframe(2)
-        for _ in range(256):
-            if frame is None:
-                break
-            if frame.f_code.co_flags & inspect.CO_GENERATOR:
-                return not helper_exit or (
-                    frame.f_back is not None
-                    and frame.f_back.f_code is _GeneratorContextManager.__exit__.__code__
-                )
-            frame = frame.f_back
-    except (AttributeError, ValueError):
-        pass
-    finally:
-        del frame
-    return False
+def _unsafe_run_cleanup(*, finalizing: bool = False, foreign: bool = False) -> bool:
+    """Only finalizers and foreign exits need to avoid synchronous callouts.
+
+    GeneratorExit can be refcount finalization inside an SDK critical section;
+    cyclic GC can also reach normal-looking exits after user code catches it.
+    Foreign/invisible bindings cannot establish ordinary entry/exit ownership.
+    A visible normal exhaustion, exception, or framework finish callback is
+    ordinary application execution: no interrupted SDK operation holds a lock
+    on this thread. Merely having a generator on the stack is safe.
+    """
+    if finalizing or foreign or _run_gc_active():
+        return True
+    exception = getattr(sys, "exception", None)
+    return exception is not None and isinstance(exception(), GeneratorExit)
 
 
 class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
@@ -641,6 +630,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         # Cyclic GC can close another generator using this shared scope while
         # this thread is already looking up, adding, or forgetting a record.
         self._records_lock = RLock()
+        _prepare_run_cleanup()
         register_fork_reset(self)
 
     def _reset_after_fork_in_child(self) -> None:
@@ -666,12 +656,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         activation = None
         token = None
         try:
-            key, sensitive = _owner_details()
-            record = _OpenRun(
-                identity, identity.active_value(), span, key, finalizer_sensitive=sensitive
-            )
-            if sensitive:
-                _ensure_run_cleanup_worker()
+            record = _OpenRun(identity, identity.active_value(), span, _owner_key())
             register_fork_reset(record)
             with self._records_lock:
                 if record.owner_key is None:
@@ -751,7 +736,13 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
                 self._open_runs.pop(record.owner_key, None)
 
     def _close(
-        self, record: _OpenRun, *, error: bool, retire: bool = False, deferred: bool = False
+        self,
+        record: _OpenRun,
+        *,
+        error: bool,
+        retire: bool = False,
+        deferred: bool = False,
+        end_time: int | None = None,
     ) -> None:
         claimed = _close_record(record, retire=retire)
         try:
@@ -762,7 +753,7 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
             self._forget(record)
             with suppress(BaseException):
                 if deferred:
-                    record.span.end_later(error=error)
+                    record.span.end_later(error=error, end_time=end_time)
                 elif claimed:
                     record.span.end(error=error)
 
@@ -792,7 +783,14 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
             if record is not None:
                 _retire_later(
                     record,
-                    partial(self._close, record, error=error, retire=True, deferred=True),
+                    partial(
+                        self._close,
+                        record,
+                        error=error,
+                        retire=True,
+                        deferred=True,
+                        end_time=time.time_ns(),
+                    ),
                     surrender=True,
                 )
             return
@@ -806,7 +804,12 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
                     _retire_later(
                         matching.record,
                         partial(
-                            self._close, matching.record, error=True, retire=True, deferred=True
+                            self._close,
+                            matching.record,
+                            error=True,
+                            retire=True,
+                            deferred=True,
+                            end_time=time.time_ns(),
                         ),
                         surrender=True,
                     )
@@ -835,14 +838,16 @@ class _RunScope(AbstractContextManager[str], AbstractAsyncContextManager[str]):
         try:
             retire = _pop_frame(matching, frames)
         finally:
-            normal_helper = not matching.record.generator_owned and _called_from_sync_generator(
-                helper_exit=True
-            )
-            if (finalizing or matching.record.finalizer_sensitive) and not normal_helper:
+            if _unsafe_run_cleanup(finalizing=finalizing, foreign=retire):
                 _retire_later(
                     matching.record,
                     partial(
-                        self._close, matching.record, error=error, retire=retire, deferred=True
+                        self._close,
+                        matching.record,
+                        error=error,
+                        retire=retire,
+                        deferred=True,
+                        end_time=time.time_ns(),
                     ),
                     retire=retire,
                     surrender=True,
@@ -902,7 +907,7 @@ class RunHandle:
         self._activations: dict[int, _OpenRun | None] = {}
         # GC of an abandoned activation can re-enter this handle's count lock.
         self._state_lock = RLock()
-        _ensure_run_cleanup_worker()
+        _prepare_run_cleanup()
         if span is None:
             span = _otel._start_run_span(
                 run_id,
@@ -949,11 +954,7 @@ class RunHandle:
             (frame for frame in reversed(_run_frames.get()) if frame.record is record), None
         )
         owner_executing = record is not None and _executing_owner(record)
-        sensitive = record is not None and record.finalizer_sensitive and matching is not None
-        normal_helper = (
-            record is None or not record.generator_owned
-        ) and _called_from_sync_generator(helper_exit=True)
-        if owner_executing or ((sensitive or _called_from_sync_generator()) and not normal_helper):
+        if _unsafe_run_cleanup(foreign=owner_executing and matching is None):
             if self._finished or self._finish_pending:
                 raise RuntimeError(f"run handle {self._run_id!r} already finished")
             if self._has_live_activations():
@@ -988,16 +989,19 @@ class RunHandle:
                     raise RuntimeError(f"run handle {self._run_id!r} already finished")
                 self._finish_pending = True
                 _retire_later(
-                    record, partial(self._complete_deferred_finish, record), surrender=True
+                    record,
+                    partial(self._complete_deferred_finish, record, time.time_ns()),
+                    surrender=True,
                 )
             else:
                 if not self._finish_claim.pop(None, False):
                     raise RuntimeError(f"run handle {self._run_id!r} already finished")
                 self._finish_pending = True
+                end_time = time.time_ns()
                 _queue_run_surrender(self._run_id)
-                _defer_run_cleanup(partial(self._complete_deferred_finish, None))
+                _defer_run_cleanup(partial(self._complete_deferred_finish, None, end_time))
             return
-        _drain_run_cleanups()
+        _drain_run_cleanups(blocking=False)
         with self._state_lock:
             if self._finished or self._finish_pending:
                 raise RuntimeError(f"run handle {self._run_id!r} already finished")
@@ -1013,6 +1017,17 @@ class RunHandle:
             except BaseException:
                 self._finish_claim[None] = True
                 raise
+            if record is not None and record.retired:
+                # A copied context can expose the frame but not its token.
+                # The scope has restored that binding; lease/export callouts
+                # still take the foreign-exit handoff with this end time.
+                self._finish_pending = True
+                _retire_later(
+                    record,
+                    partial(self._complete_deferred_finish, record, time.time_ns()),
+                    surrender=True,
+                )
+                return
             self._finished = True
         try:
             if record is None or record.surrender_claim.pop(None, False):
@@ -1022,7 +1037,7 @@ class RunHandle:
             if self._span_finalizer is not None:
                 self._span_finalizer.detach()
 
-    def _complete_deferred_finish(self, record: _OpenRun | None) -> None:
+    def _complete_deferred_finish(self, record: _OpenRun | None, end_time: int) -> None:
         with self._state_lock:
             if not self._finished and self._has_live_activations():
                 self._finish_pending = False
@@ -1032,7 +1047,7 @@ class RunHandle:
                 _close_record(record, retire=True)
                 self._scope._forget(record)
             self._finished = True
-        self._span.end_later()
+        self._span.end_later(end_time=end_time)
         if self._span_finalizer is not None:
             self._span_finalizer.detach()
 
@@ -1084,16 +1099,12 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
         token: Token[tuple[str, str, dict[str, str] | None] | None] | None = None
         activation = None
         try:
-            key, sensitive = _owner_details()
             record = _OpenRun(
                 identity,
                 identity.active_value(),
                 self._handle._span,
-                key,
-                finalizer_sensitive=sensitive,
+                _owner_key(),
             )
-            if sensitive:
-                _ensure_run_cleanup_worker()
             self._handle._activations[self._scope_id] = record
             self._record = record
             register_fork_reset(record)
@@ -1168,10 +1179,7 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
         try:
             _pop_frame(frames[-1], frames, restore=retire)
         finally:
-            normal_helper = not frames[-1].record.generator_owned and _called_from_sync_generator(
-                helper_exit=True
-            )
-            if (finalizing or frames[-1].record.finalizer_sensitive) and not normal_helper:
+            if _unsafe_run_cleanup(finalizing=finalizing, foreign=retire):
                 _retire_later(
                     frames[-1].record,
                     partial(self._deactivate, frames[-1].record, error=error, retire=retire),
@@ -1189,7 +1197,11 @@ class _RunActivation(AbstractContextManager[str], AbstractAsyncContextManager[st
             self._entered = False
 
     def __enter__(self) -> str:
-        _drain_run_cleanups()
+        # A generator's finally may bind a handle while GC interrupted an SDK
+        # critical section. Even a try-acquired drain could execute a callback
+        # that needs that same lock, so skip it entirely during finalization.
+        if not _unsafe_run_cleanup():
+            _drain_run_cleanups(blocking=False)
         if self._entered:
             raise RuntimeError("RunHandle activation is already entered")
         return self._enter()

@@ -602,9 +602,13 @@ Runs opened in synchronous generators keep their attribution across yields,
 including when Starlette/FastAPI `StreamingResponse` steps each chunk in a fresh
 context on a worker thread. This also works through `@contextmanager` helpers,
 `ExitStack`, and delegating `__enter__` / `__exit__` methods. Every call uses the
-generator's run and recorded parent, and scope exit releases its budget lease
-and ends its run span once. Driver calls between steps keep the driver's
-context. Threads or executors started inside a step do not inherit a run
+generator's run and recorded parent. Normal scope exit releases its budget lease
+and ends its run span synchronously, including shared-context `for` loops.
+Generator finalization, exits during garbage collection, and exits from a
+foreign context defer cleanup to a background worker; the span keeps the
+timestamp recorded at exit. Client close and interpreter exit drain pending
+cleanup, with a bounded wait for span export. Driver calls between steps keep
+the driver's context. Threads or executors started inside a step do not inherit a run
 recovered from the generator's stack; use a detached run handle and explicitly
 activate it in that work. A plain `for` loop sharing one context continues to
 see the generator's run in its loop body. Recovery follows the executing owner
@@ -1266,9 +1270,14 @@ entry and keeps it current in that context. Application spans and
 follow the current tracing parent. In fresh-context generator steps, calls and
 nested runs use the recovered run span unless a valid current application span
 differs from the tracing parent captured at run entry; that application span
-takes precedence, including spans opened inside the step. The span ends once
-on sync or async exit, with status `ERROR` when an exception or interruption
-leaves the scope and `OK` otherwise. Run spans contain only
+takes precedence, including spans opened inside the step. The span ends once,
+synchronously on normal sync or async exit and on explicit handle finish,
+including finish callbacks inside generators. Generator finalization,
+garbage collection, and foreign-context exits hand cleanup to a background
+worker with the end timestamp recorded at exit; client close and interpreter
+exit drain pending cleanup, with a bounded wait for span export. The status is
+`ERROR` when an exception or interruption leaves the scope and `OK` otherwise.
+Run spans contain only
 `solwyn.agent_run_id` and, for child runs, `solwyn.parent_agent_run_id`.
 
 Reusing a `solwyn.run(...)` scope object creates an independent run for each

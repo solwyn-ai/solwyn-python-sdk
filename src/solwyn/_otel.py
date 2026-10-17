@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 import weakref
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
@@ -25,7 +26,7 @@ from solwyn._constants import (
 from solwyn._env import _parse_bool
 from solwyn._lifecycle import (
     _defer_run_span_cleanup,
-    _ensure_run_cleanup_worker,
+    _prepare_run_cleanup,
     register_fork_reset,
 )
 from solwyn.exceptions import RunStoppedError
@@ -225,21 +226,23 @@ class _RunSpan:
             # finalizer while a span operation holds its lock.
             self._error = True
 
-    def end_later(self, *, error: bool = False) -> None:
+    def end_later(self, *, error: bool = False, end_time: int | None = None) -> None:
         if self._span is not None:
-            _defer_run_span_cleanup(partial(self.end, error=error))
+            if end_time is None:
+                end_time = time.time_ns()
+            _defer_run_span_cleanup(partial(self.end, error=error, end_time=end_time))
 
     def finalize_on_gc(self, owner: object) -> weakref.finalize[..., object] | None:
         if self._span is None:
             return None
-        _ensure_run_cleanup_worker()
+        _prepare_run_cleanup()
         # SDK and exporter/processor locks may already be held by the thread
         # invoking cyclic GC. Weakref finalizers only hand off work.
-        finalizer = weakref.finalize(owner, _defer_run_span_cleanup, partial(self.end, error=True))
+        finalizer = weakref.finalize(owner, self.end_later, error=True)
         finalizer.atexit = False
         return finalizer
 
-    def end(self, *, error: bool = False) -> None:
+    def end(self, *, error: bool = False, end_time: int | None = None) -> None:
         if self._span is None or self._trace is None:
             return
         with self._lock:
@@ -257,7 +260,10 @@ class _RunSpan:
             pass
         finally:
             with suppress(Exception):
-                self._span.end()
+                if end_time is None:
+                    self._span.end()
+                else:
+                    self._span.end(end_time=end_time)
 
 
 _INACTIVE_RUN_SPAN = _RunSpan()

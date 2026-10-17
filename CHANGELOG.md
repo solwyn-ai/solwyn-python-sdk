@@ -16,7 +16,12 @@ derived from git tags (hatch-vcs).
   application and provider-call spans inherit the active run's trace. Run
   attributes contain only run and parent-run IDs, never names, tags, content,
   or exception messages. Exceptions leaving a scope or activation mark the
-  run as failed, and garbage collection ends abandoned handle spans.
+  run as failed, and garbage collection ends abandoned handle spans. Normal
+  exits and explicit finish callbacks end spans synchronously, including
+  shared-context generator loops. Deferred finalizer and foreign-context
+  cleanup preserves the exit timestamp and drains at client or interpreter
+  shutdown. Call spans in fresh-context generator steps follow the recovered
+  run, while application spans retain tracing precedence.
 
 - **Opt-in OpenTelemetry call spans.** Enable `otel_spans=True` or
   `SOLWYN_OTEL_SPANS=true` to emit a `solwyn.call` span around budget preflight,
@@ -103,8 +108,7 @@ derived from git tags (hatch-vcs).
   attribute every call to the correct run and parent, including runs and
   detached handle activations wrapped in context managers or `ExitStack`.
   Scope exit releases the run's budget lease without raising when an outer run
-  is active. Run stops and call spans follow the generator's run; calls inside
-  an application span retain that tracing parent. Activations can exit across
+  is active. Run stops follow the generator's run. Activations can exit across
   yields and then finish normally, and `start_run()` handles can finish from
   their owning generator in a later step. Recovery follows up to 256 stack
   frames. Threads started inside a recovered step need an explicit detached

@@ -18,7 +18,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any, Self, cast
 
-from solwyn._lifecycle import _defer_run_cleanup, _ensure_run_cleanup_worker
+from solwyn._lifecycle import _defer_run_cleanup, _prepare_run_cleanup
 from solwyn._otel import _INACTIVE_CALL_SPAN, _NOOP_CONTEXT, _CallSpan
 from solwyn._token_details import TokenDetails
 from solwyn.providers._accumulator import StreamUsageAccumulator
@@ -30,7 +30,7 @@ class _AbortHandleFinalizer:
     """Keep explicit releases synchronous and GC releases outside SDK locks."""
 
     def __init__(self, owner: object, release: Callable[[], None]) -> None:
-        _ensure_run_cleanup_worker()
+        _prepare_run_cleanup()
         self._release = release
         self._finalizer = weakref.finalize(owner, _defer_run_cleanup, release)
 
