@@ -476,7 +476,8 @@ class OpenAIAdapter:
     ) -> tuple[Callable[..., Any], dict[str, Any]]:
         """Per-surface dispatch seam for non-chat media surfaces.
 
-        Embeddings route to ``client.embeddings.create``; images route to
+        Decisions route to ``client.decisions.create``; embeddings route to
+        ``client.embeddings.create``; images route to
         ``client.images.generate`` / ``.edit``; audio routes to
         ``client.audio.transcriptions.create`` (or ``.speech.create`` when the op
         marker selects it); video routes to ``client.videos.create`` (Sora) — the
@@ -489,6 +490,8 @@ class OpenAIAdapter:
         """
         if surface == "embeddings":
             return client.embeddings.create, dict(kwargs)
+        if surface == "decisions":
+            return client.decisions.create, dict(kwargs)
         if surface == "images":
             return _prepare_image_media_call(client, kwargs)
         if surface == "audio":

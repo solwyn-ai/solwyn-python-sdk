@@ -1150,6 +1150,66 @@ class TestEstimateEmbeddingInputTokens:
         assert result == len(secret) // 4  # 39 // 4 -> 9, content unrecoverable
 
 
+@pytest.mark.unit
+class TestEstimateDecisionsContentLength:
+    def test_string_input_and_all_question_text_are_lengths_only(self) -> None:
+        request = {
+            "input": "a" * 40,
+            "questions": [
+                {"type": "predicate", "instructions": "b" * 8, "name": "ignored"},
+                {
+                    "type": "choice",
+                    "instructions": "c" * 12,
+                    "choices": [
+                        {"value": "d" * 4, "description": "e" * 8},
+                        {"value": True, "description": "f" * 4},
+                    ],
+                },
+                {
+                    "type": "score",
+                    "instructions": "g" * 8,
+                    "levels": [{"label": "h" * 4, "description": "i" * 12}],
+                },
+            ],
+            "safety_identifier": "ignored",
+            "prompt_cache_key": "ignored",
+        }
+
+        result = privacy.estimate_decisions_content_length(request)
+
+        assert type(result) is int
+        assert result == 100
+
+    @pytest.mark.parametrize("input_container", [list, tuple], ids=["list", "tuple"])
+    def test_message_parts_count_text_and_ignore_images(self, input_container) -> None:
+        request = {
+            "input": input_container(
+                [
+                    {"role": "user", "content": "a" * 20},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "b" * 12},
+                            {"type": "input_image", "image_url": "SECRET-IMAGE-URL" * 100},
+                        ],
+                    },
+                ]
+            ),
+            "questions": [{"type": "predicate", "instructions": "c" * 8}],
+        }
+
+        assert privacy.estimate_decisions_content_length(request) == 40
+
+    @pytest.mark.parametrize("kwargs", [{}, {"input": "", "questions": []}, {"input": [None]}])
+    def test_unmeasurable_input_does_not_fabricate_tokens(self, kwargs) -> None:
+        assert privacy.estimate_decisions_content_length(kwargs) == 0
+
+    def test_iterators_are_not_consumed_before_provider_dispatch(self) -> None:
+        questions = iter([{"type": "predicate", "instructions": "secret"}])
+        assert privacy.estimate_decisions_content_length({"questions": questions}) == 0
+        assert next(questions)["instructions"] == "secret"
+
+
 # --------------------------------------------------------------------------- #
 # Images request recognizer — config values only, content-free                #
 # --------------------------------------------------------------------------- #
