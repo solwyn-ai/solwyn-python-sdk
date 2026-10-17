@@ -29,6 +29,7 @@ from solwyn import _otel
 from solwyn._constants import FAILOVER_ERROR_CLASS_MAX_LENGTH, ORDINARY_TOKEN_COUNT_MAX
 from solwyn._lifecycle import register_fork_reset
 from solwyn._otel import _TraceSnapshot, _validated_trace
+from solwyn._privacy import estimate_content_length
 from solwyn._routing import (
     CostPolicy,
     HealthBasedPolicy,
@@ -77,6 +78,7 @@ from solwyn.exceptions import (
     UnsupportedSurfaceError,
     UntrackedSpendSurfaceError,
 )
+from solwyn.providers._errors import Disposition, classify_exception
 
 if TYPE_CHECKING:
     from solwyn._registry import ProviderRuntime
@@ -718,7 +720,7 @@ def _effective_output_bound(
 class MediaSurfaceSpec:
     """Per-surface wiring for the ``_media_call`` lifecycle.
 
-    A non-chat media surface (embeddings, images, audio, video) is fully
+    A non-chat surface (decisions, embeddings, images, audio, video) is fully
     described here, so the lifecycle stays surface-agnostic and a new surface
     is added by constructing one of these — never by editing the lifecycle:
 
@@ -735,6 +737,11 @@ class MediaSurfaceSpec:
       when the response reports none (request-side measurement lives in
       ``solwyn._privacy``). Returns None when the quantity is
       unobservable.
+    - ``estimate_input_length``: pre-flight request character count. Defaults to
+      the shared content recognizer; surfaces with other input shapes supply a
+      length-only privacy helper.
+    - ``response_model``: use the response's structural model identifier for
+      settlement when supplied; otherwise retain the requested model.
     - ``measure_media``: OPTIONAL non-token quantity channel. Derives the
       settled ``MediaUsage`` (image counts, media seconds, character counts,
       variant selectors) from the REQUEST and RESPONSE for a per-unit priced
@@ -760,6 +767,46 @@ class MediaSurfaceSpec:
     measure_request: Callable[[dict[str, Any]], TokenDetails | None]
     measure_media: Callable[[dict[str, Any], Any], MediaUsage | None] | None = None
     estimate_media: Callable[[dict[str, Any]], MediaUsage | None] | None = None
+    estimate_input_length: Callable[[dict[str, Any]], int] = estimate_content_length
+    response_model: bool = False
+
+    def settled_model(self, response: Any, requested_model: str) -> str:
+        """Resolve structural model attribution without losing a paid response."""
+        if self.response_model:
+            try:
+                model = getattr(response, "model", None)
+                if isinstance(model, str) and model:
+                    return model
+            except Exception:
+                pass
+        return requested_model
+
+    def usage_unmeasured(self, token_details: TokenDetails | None) -> bool:
+        """Text estimates cannot prove output spend; retain the lease's bound."""
+        return self.modality == "text" and (token_details is None or token_details.is_estimated)
+
+    def dispatched_spend_unknown(self, exc: BaseException, *, dispatched: bool) -> bool:
+        """Text leases retain authority for ambiguous dispatch errors and interrupts."""
+        if self.modality != "text" or not dispatched:
+            return False
+        return (
+            not isinstance(exc, Exception)
+            or classify_exception(exc) is Disposition.POST_SEND_AMBIGUOUS
+        )
+
+
+def _validate_decisions_kwargs(kwargs: Mapping[str, object]) -> None:
+    """Keep OpenAI extra-body precedence from bypassing Decisions metering."""
+    extra_body = kwargs.get("extra_body")
+    if (
+        isinstance(extra_body, Mapping)
+        and {"model", "input", "questions", "stream"} & extra_body.keys()
+    ):
+        raise ConfigurationError(
+            "Pass Decisions model, input, and questions as top-level arguments; "
+            "metering fields and stream are not supported in extra_body.",
+            field="extra_body",
+        )
 
 
 class _AttemptContext(BaseModel):

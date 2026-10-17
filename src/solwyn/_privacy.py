@@ -762,6 +762,42 @@ def estimate_responses_content_length(kwargs: dict[str, Any]) -> int:
     return total
 
 
+def estimate_decisions_content_length(kwargs: dict[str, Any]) -> int:
+    """Count Decisions input and question text without retaining any content.
+
+    Messages share the Responses text-part shape; image URLs/bytes contribute
+    no text length. Question instructions, choice values/descriptions, and score
+    labels/descriptions are measured by length only. Opaque names and cache/safety
+    identifiers are ignored. Only reusable list/tuple containers are walked so
+    estimation never consumes an iterator before the provider SDK receives it.
+    """
+    total = estimate_responses_content_length({"input": kwargs.get("input")})
+    questions = kwargs.get("questions")
+    if not isinstance(questions, (list, tuple)):
+        return total
+    for question in questions:
+        if not isinstance(question, dict):
+            continue
+        instructions = question.get("instructions")
+        if isinstance(instructions, str):
+            total += len(instructions)
+        for key, fields in (
+            ("choices", ("value", "description")),
+            ("levels", ("label", "description")),
+        ):
+            options = question.get(key)
+            if not isinstance(options, (list, tuple)):
+                continue
+            for option in options:
+                if not isinstance(option, dict):
+                    continue
+                for field in fields:
+                    text = option.get(field)
+                    if isinstance(text, str):
+                        total += len(text)
+    return total
+
+
 def estimate_tokens_from_length(char_count: int, provider: str) -> int:
     """Convert a character count to a token estimate using per-provider ratios.
 

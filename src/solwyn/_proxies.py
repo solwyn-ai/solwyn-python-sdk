@@ -10,9 +10,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-from solwyn._base import MediaSurfaceSpec
+from solwyn._base import MediaSurfaceSpec, _validate_decisions_kwargs
 from solwyn._privacy import (
     estimate_content_length,
+    estimate_decisions_content_length,
     estimate_embedding_input_tokens,
     estimate_tokens_from_length,
     measure_google_image_media,
@@ -29,6 +30,7 @@ from solwyn.providers.openai import (
     _AUDIO_OP_KEY,
     _IMAGE_OP_KEY,
     _extract_image_usage,
+    _extract_openai_usage,
     _extract_transcription_usage,
     _is_untracked_tts_model,
     _measure_transcription_media,
@@ -52,6 +54,42 @@ def _bedrock_internal_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     renamed = dict(kwargs)
     renamed["model"] = renamed.pop("modelId")
     return renamed
+
+
+# ---------------------------------------------------------------------------
+# Decisions surface (native OpenAI only, billed as text)
+# ---------------------------------------------------------------------------
+
+
+def _extract_decision_usage(response: Any) -> TokenDetails | None:
+    """Read Responses-shaped usage; missing/zeroed usage takes the estimate tier."""
+    details = _extract_openai_usage(response)
+    return details if details.total_tokens > 0 else None
+
+
+def _measure_decision_request(kwargs: dict[str, Any]) -> TokenDetails:
+    """Marked length estimate, including the heuristic floor for unreadable text.
+
+    Image-only input or iterator questions may expose no measurable text. Keep
+    a settlement at the estimate tier so the text lifecycle can retain the
+    reserved output bound rather than leaving the call unsettled.
+    """
+    length = estimate_decisions_content_length(kwargs)
+    return TokenDetails(
+        input_tokens=estimate_tokens_from_length(length, "openai"), is_estimated=True
+    )
+
+
+def _decisions_spec() -> MediaSurfaceSpec:
+    """Meter Decisions through the primary-only lifecycle using text pricing."""
+    return MediaSurfaceSpec(
+        surface="decisions",
+        modality="text",
+        extract_usage=_extract_decision_usage,
+        measure_request=_measure_decision_request,
+        estimate_input_length=estimate_decisions_content_length,
+        response_model=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +623,27 @@ class _SyncChatProxy:
         )
 
 
+class _SyncDecisionsProxy:
+    """Meter native Decisions create; guard all other provider resource access."""
+
+    def __init__(self, solwyn: Solwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _decisions_spec()
+
+    def create(self, **kwargs: Any) -> Any:
+        self._solwyn._enforce_explicit_surface("decisions.create", source=SurfaceSource.WRAPPER)
+        _validate_decisions_kwargs(kwargs)
+        return self._solwyn._media_call(self._spec, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._solwyn_client.decisions,
+            name=name,
+            path=f"decisions.{name}",
+            source=SurfaceSource.RAW,
+        )
+
+
 class _SyncEmbeddingsProxy:
     """Proxy for client.embeddings that routes create() through the media lifecycle.
 
@@ -1021,6 +1080,27 @@ class _AsyncChatProxy:
             f"'chat.{name}' is not supported. "
             f"The Solwyn chat proxy is OpenAI-dialect-specific; Anthropic uses "
             f"'messages' and Google uses 'models'."
+        )
+
+
+class _AsyncDecisionsProxy:
+    """Async Decisions create uses the same primary-only settlement lifecycle."""
+
+    def __init__(self, solwyn: AsyncSolwyn) -> None:
+        self._solwyn = solwyn
+        self._spec = _decisions_spec()
+
+    async def create(self, **kwargs: Any) -> Any:
+        self._solwyn._enforce_explicit_surface("decisions.create", source=SurfaceSource.WRAPPER)
+        _validate_decisions_kwargs(kwargs)
+        return await self._solwyn._media_call(self._spec, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._solwyn_client.decisions,
+            name=name,
+            path=f"decisions.{name}",
+            source=SurfaceSource.RAW,
         )
 
 

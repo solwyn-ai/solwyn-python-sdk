@@ -64,6 +64,7 @@ from solwyn._privacy import (
 from solwyn._proxies import (
     _AsyncAudioProxy,
     _AsyncChatProxy,
+    _AsyncDecisionsProxy,
     _AsyncEmbeddingsProxy,
     _AsyncImagesProxy,
     _AsyncMessagesProxy,
@@ -74,6 +75,7 @@ from solwyn._proxies import (
     _reject_responses_background,
     _SyncAudioProxy,
     _SyncChatProxy,
+    _SyncDecisionsProxy,
     _SyncEmbeddingsProxy,
     _SyncImagesProxy,
     _SyncMessagesProxy,
@@ -2029,6 +2031,21 @@ class Solwyn(_SolwynBase):
         )
 
     @functools.cached_property
+    def decisions(self) -> Any:
+        """Meter native OpenAI Decisions; other providers retain their raw posture."""
+        if (
+            self._solwyn_adapter.name == "openai"
+            and self._inspect_static_attribute(self._solwyn_client, "decisions") is not None
+        ):
+            return _SyncDecisionsProxy(self)
+        return self._resolve_public_attribute(
+            self._solwyn_client,
+            name="decisions",
+            path="decisions",
+            source=SurfaceSource.RAW,
+        )
+
+    @functools.cached_property
     def embeddings(self) -> _SyncEmbeddingsProxy:
         """Return a proxy that routes embeddings.create() through the media lifecycle.
 
@@ -2265,6 +2282,7 @@ class Solwyn(_SolwynBase):
         read_timeout: float,
         max_retries: int,
         extra_client_options: Mapping[str, Any] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> Any:
         """Dispatch one media hop to the runtime's SDK client. Pure I/O — no metrics.
 
@@ -2285,6 +2303,8 @@ class Solwyn(_SolwynBase):
         method, call_kwargs = _media_prepare(
             runtime.adapter, surface, client, kwargs, timeout=read_timeout, max_retries=max_retries
         )
+        if on_dispatch is not None:
+            on_dispatch()
         return method(**call_kwargs)
 
     @_with_call_span
@@ -2331,7 +2351,7 @@ class Solwyn(_SolwynBase):
         # 1. Estimate quantities (length/config-only; never materializes content).
         #    Token estimate from request length; media estimate (non-token
         #    quantities like image count) from the spec's request-derived hook.
-        char_count = estimate_content_length(kwargs)
+        char_count = spec.estimate_input_length(kwargs)
         est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
         estimated_media = _safe_estimate_media(spec, kwargs)
         estimated_output_bound = None
@@ -2446,6 +2466,12 @@ class Solwyn(_SolwynBase):
         # 4. Provider call — PRIMARY only. A dispatch error is reported (parity
         #    with the chat error path) then re-raised unchanged (drop-in contract).
         start = time.monotonic()
+        dispatched = False
+
+        def mark_dispatched() -> None:
+            nonlocal dispatched
+            dispatched = True
+
         try:
             extra_client_options = self._extra_client_options(runtime, run_id=agent_run[0])
             if _call_span.active:
@@ -2459,15 +2485,20 @@ class Solwyn(_SolwynBase):
                     read_timeout=tuning.failover_hop_read_timeout,
                     max_retries=0,
                     extra_client_options=extra_client_options,
+                    on_dispatch=mark_dispatched,
                 )
-        except Exception as exc:
-            # Nothing will settle this call: hand any lease reservation back
-            # rather than stranding the local draw until the ledger's 900s
-            # age-out (the server's hold expires separately on its own TTL).
-            self._solwyn_budget.release_reservation(
-                call_id,
-                lease_claim_token=_lease_claim_token(budget),
-            )
+        except BaseException as exc:
+            if not isinstance(exc, Exception) and spec.modality != "text":
+                raise
+            possibly_succeeded = spec.dispatched_spend_unknown(exc, dispatched=dispatched)
+            if possibly_succeeded:
+                self._solwyn_budget.abandon_reservation(
+                    call_id, lease_claim_token=_lease_claim_token(budget)
+                )
+            else:
+                self._solwyn_budget.release_reservation(
+                    call_id, lease_claim_token=_lease_claim_token(budget)
+                )
             try:
                 self._solwyn_reporter.report(
                     self._build_error_event(
@@ -2477,6 +2508,7 @@ class Solwyn(_SolwynBase):
                         is_model_fallback=False,
                         failover_error_class=type(exc).__name__,
                         call_id=call_id,
+                        possibly_succeeded=True if possibly_succeeded else None,
                         agent_run=agent_run,
                         trace=trace,
                         provider_region=provider_region,
@@ -2533,6 +2565,7 @@ class Solwyn(_SolwynBase):
         #    When only media is observed, a zeroed TokenDetails carries the
         #    confirm's required token field.
         service_tier = _safe_extract_service_tier(runtime, response)
+        settled_model = spec.settled_model(response, requested_model)
         confirm = None
         reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
         if (reservation_id or lease_id) and (token_details is not None or media_usage is not None):
@@ -2540,7 +2573,7 @@ class Solwyn(_SolwynBase):
                 reservation_id=reservation_id,
                 lease_id=lease_id,
                 lease_claim_token=lease_claim_token,
-                model=requested_model,
+                model=settled_model,
                 token_details=token_details if token_details is not None else TokenDetails(),
                 provider=provider,
                 is_provider_fallback=False,
@@ -2549,6 +2582,7 @@ class Solwyn(_SolwynBase):
                 service_tier=service_tier,
                 modality=spec.modality,
                 media_usage=media_usage,
+                usage_unmeasured=spec.usage_unmeasured(token_details),
             )
         if not (reservation_id or lease_id):
             # A legacy fail-open admission (no key to confirm against): replace its
@@ -2563,7 +2597,7 @@ class Solwyn(_SolwynBase):
                 ),
             )
         event = self._build_metadata_event(
-            model=requested_model,
+            model=settled_model,
             provider=provider,
             input_tokens=token_details.input_tokens if token_details is not None else 0,
             output_tokens=token_details.output_tokens if token_details is not None else 0,
@@ -3831,6 +3865,21 @@ class AsyncSolwyn(_SolwynBase):
         )
 
     @functools.cached_property
+    def decisions(self) -> Any:
+        """Meter native OpenAI Decisions; other providers retain their raw posture."""
+        if (
+            self._solwyn_adapter.name == "openai"
+            and self._inspect_static_attribute(self._solwyn_client, "decisions") is not None
+        ):
+            return _AsyncDecisionsProxy(self)
+        return self._resolve_public_attribute(
+            self._solwyn_client,
+            name="decisions",
+            path="decisions",
+            source=SurfaceSource.RAW,
+        )
+
+    @functools.cached_property
     def embeddings(self) -> _AsyncEmbeddingsProxy:
         """Return an async proxy that routes embeddings.create() through the media lifecycle.
 
@@ -4030,6 +4079,7 @@ class AsyncSolwyn(_SolwynBase):
         read_timeout: float,
         max_retries: int,
         extra_client_options: Mapping[str, Any] | None = None,
+        on_dispatch: Callable[[], None] | None = None,
     ) -> Any:
         """Dispatch one media hop to the runtime's async SDK client. Pure I/O.
 
@@ -4050,6 +4100,8 @@ class AsyncSolwyn(_SolwynBase):
         method, call_kwargs = _media_prepare(
             runtime.adapter, surface, client, kwargs, timeout=read_timeout, max_retries=max_retries
         )
+        if on_dispatch is not None:
+            on_dispatch()
         return await method(**call_kwargs)
 
     @_with_call_span
@@ -4087,7 +4139,7 @@ class AsyncSolwyn(_SolwynBase):
         )
         deadline = Deadline(self._solwyn_config.failover_total_timeout)
 
-        char_count = estimate_content_length(kwargs)
+        char_count = spec.estimate_input_length(kwargs)
         est_in = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
         estimated_media = _safe_estimate_media(spec, kwargs)
         estimated_output_bound = None
@@ -4184,6 +4236,12 @@ class AsyncSolwyn(_SolwynBase):
             )
 
         start = time.monotonic()
+        dispatched = False
+
+        def mark_dispatched() -> None:
+            nonlocal dispatched
+            dispatched = True
+
         try:
             extra_client_options = self._extra_client_options(runtime, run_id=agent_run[0])
             if _call_span.active:
@@ -4197,15 +4255,20 @@ class AsyncSolwyn(_SolwynBase):
                     read_timeout=tuning.failover_hop_read_timeout,
                     max_retries=0,
                     extra_client_options=extra_client_options,
+                    on_dispatch=mark_dispatched,
                 )
-        except Exception as exc:
-            # Nothing will settle this call: hand any lease reservation back
-            # rather than stranding the local draw until the ledger's 900s
-            # age-out (the server's hold expires separately on its own TTL).
-            self._solwyn_budget.release_reservation(
-                call_id,
-                lease_claim_token=_lease_claim_token(budget),
-            )
+        except BaseException as exc:
+            if not isinstance(exc, Exception) and spec.modality != "text":
+                raise
+            possibly_succeeded = spec.dispatched_spend_unknown(exc, dispatched=dispatched)
+            if possibly_succeeded:
+                self._solwyn_budget.abandon_reservation(
+                    call_id, lease_claim_token=_lease_claim_token(budget)
+                )
+            else:
+                self._solwyn_budget.release_reservation(
+                    call_id, lease_claim_token=_lease_claim_token(budget)
+                )
             try:
                 self._solwyn_reporter.report(
                     self._build_error_event(
@@ -4215,6 +4278,7 @@ class AsyncSolwyn(_SolwynBase):
                         is_model_fallback=False,
                         failover_error_class=type(exc).__name__,
                         call_id=call_id,
+                        possibly_succeeded=True if possibly_succeeded else None,
                         agent_run=agent_run,
                         trace=trace,
                         provider_region=provider_region,
@@ -4264,6 +4328,7 @@ class AsyncSolwyn(_SolwynBase):
         # + streaming). Confirm fires when EITHER basis is observable; skipped
         # only when both are None. See the sync mirror.
         service_tier = _safe_extract_service_tier(runtime, response)
+        settled_model = spec.settled_model(response, requested_model)
         confirm = None
         reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
         if (reservation_id or lease_id) and (token_details is not None or media_usage is not None):
@@ -4271,7 +4336,7 @@ class AsyncSolwyn(_SolwynBase):
                 reservation_id=reservation_id,
                 lease_id=lease_id,
                 lease_claim_token=lease_claim_token,
-                model=requested_model,
+                model=settled_model,
                 token_details=token_details if token_details is not None else TokenDetails(),
                 provider=provider,
                 is_provider_fallback=False,
@@ -4280,6 +4345,7 @@ class AsyncSolwyn(_SolwynBase):
                 service_tier=service_tier,
                 modality=spec.modality,
                 media_usage=media_usage,
+                usage_unmeasured=spec.usage_unmeasured(token_details),
             )
         if not (reservation_id or lease_id):
             # A legacy fail-open admission (no key to confirm against): replace its
@@ -4294,7 +4360,7 @@ class AsyncSolwyn(_SolwynBase):
                 ),
             )
         event = self._build_metadata_event(
-            model=requested_model,
+            model=settled_model,
             provider=provider,
             input_tokens=token_details.input_tokens if token_details is not None else 0,
             output_tokens=token_details.output_tokens if token_details is not None else 0,

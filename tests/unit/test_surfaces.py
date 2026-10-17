@@ -988,8 +988,8 @@ def _assert_exact_guarded_family(
 def test_openai_333_operations_and_mirrors_remain_exact_untracked_surfaces(
     provider: str, mode: str
 ) -> None:
-    # Decisions, voice creation, credentials, hosted environments and their
-    # administrative helpers are outside the SDK's metered dispatch paths.
+    # The admin Decisions usage endpoint is a historical report, never a model
+    # call. Voice creation, credentials, and hosted environments also stay raw.
     context = SurfaceContext(provider, "openai", "openai_sdk", mode)
     families = {
         "admin.organization.projects.api_keys": {"update"},
@@ -1001,10 +1001,11 @@ def test_openai_333_operations_and_mirrors_remain_exact_untracked_surfaces(
         "beta.agents.sessions.traces": {"list"},
         "beta.agents.sessions.turns.items": {"list"},
         "beta.agents.vaults": {"update"},
-        "decisions": {"create"},
         "realtime.translations": set(),
         "realtime.translations.client_secrets": {"create"},
     }
+    if provider != "openai":
+        families["decisions"] = {"create"}
     for base, operations in families.items():
         # These convenience helpers have no HTTP raw/streaming counterparts.
         raw_operations = (
@@ -1013,6 +1014,42 @@ def test_openai_333_operations_and_mirrors_remain_exact_untracked_surfaces(
             else operations
         )
         _assert_exact_guarded_family(context, base, operations, raw_operations=raw_operations)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "provider", ["openai", "azure_openai", "openai_compatible", "together", "groq"]
+)
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_decisions_metering_is_native_only_with_separate_raw_and_report_scopes(provider, mode):
+    context = SurfaceContext(provider, "openai", "openai_sdk", mode)
+    rule = resolve_surface_rule(context=context, path="decisions.create", source=SurfaceSource.RAW)
+    assert rule is not None
+    if provider == "openai":
+        assert rule.kind is SurfaceKind.METERED
+        assert rule.source is SurfaceSource.BOTH
+        assert rule.usage_basis is UsageBasis.PROVIDER_OR_ESTIMATE
+        assert rule.acknowledgment_token is None
+        assert (
+            resolve_surface_rule(
+                context=context, path="decisions.create", source=SurfaceSource.WRAPPER
+            )
+            is rule
+        )
+    else:
+        assert rule.kind is SurfaceKind.UNMETERED_SPEND
+        assert rule.acknowledgment_token == "decisions.create"
+    for path in (
+        "decisions.with_raw_response.create",
+        "decisions.with_streaming_response.create",
+        "with_raw_response.decisions.create",
+        "with_streaming_response.decisions.create",
+        "admin.organization.usage.decisions",
+    ):
+        raw = resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW)
+        assert raw is not None
+        assert raw.kind is SurfaceKind.UNMETERED_SPEND
+        assert raw.acknowledgment_token == path
 
 
 @pytest.mark.unit

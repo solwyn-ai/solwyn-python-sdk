@@ -43,6 +43,13 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **OpenAI Decisions metering.** Native `decisions.create(...)` calls now have
+  budget enforcement and token-usage settlement on sync and async clients
+  (`openai>=3.26`). Remove the now-invalid `decisions.create` acknowledgment
+  token on native OpenAI clients. Azure OpenAI, compatible providers, and
+  raw/streaming response mirrors retain their unmetered posture. The read-only
+  `admin.organization.usage.decisions` historical usage report remains
+  unmetered and requires its separate exact acknowledgment in strict mode.
 - **Async background task context isolation.** Background reporting and budget
   tasks no longer inherit the caller's context, so application instrumentation
   no longer attributes their work to the first caller's trace.
@@ -59,12 +66,12 @@ derived from git tags (hatch-vcs).
 - **Provider version documentation.** The README lists supported SDK floors,
   tested breakpoints, and latest tested versions, and clarifies that unset
   optional metadata fields are omitted entirely from transmitted payloads.
-- **OpenAI SDK 3.33 support.** Coverage reports recognize `decisions`,
+- **OpenAI SDK 3.33 support.** Coverage reports recognize
   `audio.voices`, `realtime.translations.client_secrets`,
   `beta.agents.environments`, `beta.agents.environments.files`,
   `beta.agents.sessions.artifacts`, `beta.agents.sessions.traces`,
   `beta.agents.sessions.turns.items`, `beta.agents.vaults`,
-  `admin.organization.projects.api_keys`, `admin.organization.usage`,
+  `admin.organization.projects.api_keys`, `admin.organization.usage.decisions`,
   `safety.cases`, and `admin.organization.external_storage`. These operations
   remain unmetered and require their exact acknowledgment tokens in strict
   mode. Raw and streaming response helpers retain their separate acknowledgment
