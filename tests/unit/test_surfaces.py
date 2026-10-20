@@ -1183,6 +1183,12 @@ def test_anthropic_open_telemetry_is_metadata_without_an_escape_token(
             "beta.organization.spend_limits.increase_requests",
             {"approve", "deny", "list", "retrieve"},
         ),
+        ("beta.organization.workspaces.rate_limits", {"list", "update"}),
+        (
+            "beta.user_profiles",
+            {"create", "create_enrollment_url", "delete", "list", "retrieve", "update"},
+        ),
+        ("beta.user_profiles.action_urls", {"create"}),
         ("organization", {"retrieve"}),
         ("organization.api_keys", {"list", "retrieve", "update"}),
         ("organization.compliance_settings", {"retrieve", "update"}),
@@ -1201,11 +1207,13 @@ def test_anthropic_open_telemetry_is_metadata_without_an_escape_token(
         ("organization.users", {"list", "remove", "retrieve", "update"}),
         ("organization.workspaces", {"archive", "create", "list", "retrieve", "update"}),
         ("organization.workspaces.members", {"add", "list", "remove", "retrieve", "update"}),
-        ("organization.workspaces.rate_limits", {"list"}),
+        ("organization.workspaces.rate_limits", {"list", "update"}),
         (
             "organization.workspaces.service_accounts",
             {"add", "list", "remove", "retrieve", "update"},
         ),
+        ("user_profiles", {"create", "delete", "list", "retrieve", "update"}),
+        ("user_profiles.action_urls", {"create"}),
     ],
 )
 def test_anthropic_organization_administration_has_exact_guarded_operations_and_mirrors(

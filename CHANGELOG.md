@@ -88,6 +88,15 @@ derived from git tags (hatch-vcs).
   `realtime.connect`: unmetered, following `on_unmetered`, and requiring its
   exact acknowledgment token in strict mode. It has no raw or streaming
   response helpers. Coverage fingerprints are refreshed for this admission.
+- **Anthropic SDK 1.16 support.** Coverage reports recognize the new
+  administration APIs: the top-level `user_profiles` resource,
+  `user_profiles.action_urls` and `beta.user_profiles.action_urls`,
+  `beta.user_profiles.delete`, and `workspaces.rate_limits.update` under both
+  `organization` and `beta.organization`. They are classified like their
+  existing sibling administration operations: unmetered, following
+  `on_unmetered`, and requiring exact acknowledgment tokens in strict mode,
+  with raw and streaming response helpers in their separate acknowledgment
+  scope. Coverage fingerprints are refreshed for this admission.
 - **Together SDK 2.41 support.** Coverage reports recognize `beta.jig`
   revision history and `beta.jig.rollback`, `clusters` (including
   `clusters.remediations` and `clusters.storage`), `post_training.sessions`,
