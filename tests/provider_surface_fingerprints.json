@@ -77,17 +77,17 @@
       "distributions": [
         {
           "name": "anthropic",
-          "version": "1.15.0"
+          "version": "1.16.0"
         }
       ],
       "mode": "async",
-      "namespace_count": 850,
-      "observation_count": 3606,
+      "namespace_count": 871,
+      "observation_count": 3695,
       "provider": "anthropic",
       "service_model_operation_count": 0,
       "shape_key": "anthropic_async",
       "structural_interval": "latest",
-      "structure_sha256": "d05b6916b27a0459cf416551959ca557a923d255fdd44b64830676ecbab78562",
+      "structure_sha256": "1993cddb1112a9ff43f595aae2563e8c60142eb110a6987165f6d6c58d8255b5",
       "variant": "native"
     },
     {
@@ -167,17 +167,17 @@
       "distributions": [
         {
           "name": "anthropic",
-          "version": "1.15.0"
+          "version": "1.16.0"
         }
       ],
       "mode": "sync",
-      "namespace_count": 850,
-      "observation_count": 3603,
+      "namespace_count": 871,
+      "observation_count": 3692,
       "provider": "anthropic",
       "service_model_operation_count": 0,
       "shape_key": "anthropic_sync",
       "structural_interval": "latest",
-      "structure_sha256": "0f99178fad7bb0bf0ba81009e346b54a620d64b4c21e334f2e49983d7ae403ef",
+      "structure_sha256": "e78fcc8c3d22d7c7ce0681d631790dcd9104a1a0360a9ae0060f3e6b84bb92f3",
       "variant": "native"
     },
     {
