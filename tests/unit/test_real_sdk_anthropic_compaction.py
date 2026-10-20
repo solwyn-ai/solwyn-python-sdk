@@ -501,6 +501,7 @@ def aws_profile(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> str:
         "AWS_SESSION_TOKEN",
         "AWS_PROFILE",
         "AWS_DEFAULT_PROFILE",
+        "AWS_BEARER_TOKEN_BEDROCK",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials))
