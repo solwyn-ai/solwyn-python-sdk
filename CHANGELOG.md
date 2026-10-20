@@ -83,6 +83,11 @@ derived from git tags (hatch-vcs).
   remain unmetered and require their exact acknowledgment tokens in strict
   mode. Raw and streaming response helpers retain their separate acknowledgment
   scope. Coverage fingerprints are refreshed for these admissions.
+- **OpenAI SDK 3.35 support.** Coverage reports recognize the realtime
+  translation websocket, `realtime.translations.connect`, classified like
+  `realtime.connect`: unmetered, following `on_unmetered`, and requiring its
+  exact acknowledgment token in strict mode. It has no raw or streaming
+  response helpers. Coverage fingerprints are refreshed for this admission.
 - **Together SDK 2.41 support.** Coverage reports recognize `beta.jig`
   revision history and `beta.jig.rollback`, `clusters` (including
   `clusters.remediations` and `clusters.storage`), `post_training.sessions`,
