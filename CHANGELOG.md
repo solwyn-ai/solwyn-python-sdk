@@ -139,6 +139,11 @@ derived from git tags (hatch-vcs).
 
 ### Fixed
 
+- Wrapped `AnthropicBedrock` and `AnthropicBedrockMantle` clients (sync and
+  async) now keep the caller's `http_client` on every provider call, and
+  `AnthropicBedrock` also keeps its `aws_profile`. Previously a call through
+  a client configured with a named AWS profile could fail to resolve
+  credentials, and a custom transport or proxy was bypassed.
 - Runs entered inside sync generators streamed by frameworks that step each
   chunk in a fresh context, such as Starlette/FastAPI `StreamingResponse`, now
   attribute every call to the correct run and parent, including runs and

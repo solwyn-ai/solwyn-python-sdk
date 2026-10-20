@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -481,34 +480,102 @@ def test_platform_clients_meter_beta_messages_create(factory: Callable[[Any], An
     assert _settled(plane)["compaction_input_tokens"] == expected["compaction_input_tokens"]
 
 
-def test_bedrock_platform_client_routes_beta_messages_create(
-    monkeypatch: pytest.MonkeyPatch,
+_AWS_PROFILE = "solwyn-test"
+_AWS_PROFILE_KEY_ID = "AKIDSOLWYNPROFILE"
+
+
+@pytest.fixture
+def aws_profile(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> str:
+    """A named AWS profile in isolated config files, with no ambient credentials."""
+    pytest.importorskip("botocore")
+    credentials = tmp_path / "credentials"
+    credentials.write_text(
+        f"[{_AWS_PROFILE}]\naws_access_key_id = {_AWS_PROFILE_KEY_ID}\n"
+        "aws_secret_access_key = secret\n"
+    )
+    config = tmp_path / "config"
+    config.write_text(f"[profile {_AWS_PROFILE}]\nregion = us-east-1\n")
+    for name in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_DEFAULT_PROFILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(credentials))
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(config))
+    return _AWS_PROFILE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("beta", [True, False], ids=["beta-messages", "messages"])
+async def test_bedrock_hop_keeps_the_callers_aws_profile_and_transport(
+    aws_profile: str, is_async: bool, beta: bool
 ) -> None:
-    # Bedrock signs with AWS credentials, so dispatch is stubbed at the
-    # per-hop client seam; the returned object is the real beta type.
+    # anthropic's Bedrock copy() drops aws_profile and http_client; the real
+    # with_options() runs here, so the hop must still sign with the named
+    # profile and reach the caller's transport.
     usage, iterations, expected = _THRESHOLD
-    beta_message = anthropic.types.beta.BetaMessage.model_validate(
-        _message({**usage, "iterations": iterations})
-    )
-    calls: list[dict[str, Any]] = []
+    seen: list[Any] = []
+    handler = _handler(seen, usage, iterations)
+    if is_async:
+        provider: Any = anthropic.AsyncAnthropicBedrock(
+            aws_profile=aws_profile,
+            aws_region="us-east-1",
+            max_retries=0,
+            http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+        )
+    else:
+        provider = anthropic.AnthropicBedrock(
+            aws_profile=aws_profile,
+            aws_region="us-east-1",
+            max_retries=0,
+            http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+        )
+    plane = FakeControlPlane()
+    wrap = plane.wrap_async if is_async else plane.wrap
+    wrapper: Any = wrap(provider, lease_enabled=False)
+    kwargs: dict[str, Any] = {
+        "model": "claude-sonnet-5",
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    if beta:
+        response = wrapper.beta.messages.create(betas=[_THRESHOLD_BETA], **kwargs)
+    else:
+        response = wrapper.messages.create(**kwargs)
+    if is_async:
+        response = await response
+    await _close(wrapper, is_async)
+    assert type(response).__name__ == ("BetaMessage" if beta else "Message")
+    assert len(seen) == 1
+    assert f"Credential={_AWS_PROFILE_KEY_ID}/" in seen[0].headers["authorization"]
+    if beta:
+        assert json.loads(seen[0].content)["anthropic_beta"] == [_THRESHOLD_BETA]
+        assert _settled(plane)["compaction_output_tokens"] == expected["compaction_output_tokens"]
+    else:
+        assert len(plane.ingested) == 1
 
-    def create(**kwargs: Any) -> Any:
-        calls.append(kwargs)
-        return beta_message
 
-    provider = anthropic.AnthropicBedrock(
-        aws_region="us-east-1", aws_access_key="a", aws_secret_key="b", max_retries=0
+def test_bedrock_mantle_hop_keeps_the_callers_transport() -> None:
+    usage, iterations, expected = _THRESHOLD
+    seen: list[Any] = []
+    transport = httpx2.MockTransport(_handler(seen, usage, iterations))
+    provider = anthropic.AnthropicBedrockMantle(
+        aws_region="us-east-1",
+        api_key="key",
+        max_retries=0,
+        http_client=httpx2.Client(transport=transport),
     )
-    hop_client = SimpleNamespace(beta=SimpleNamespace(messages=SimpleNamespace(create=create)))
-    monkeypatch.setattr(provider, "with_options", lambda **_: hop_client)
     plane = FakeControlPlane()
     with plane.wrap(provider, lease_enabled=False) as wrapper:
-        response = wrapper.beta.messages.create(
+        wrapper.beta.messages.create(
             model="claude-sonnet-5",
             max_tokens=8,
             messages=[{"role": "user", "content": "hi"}],
             betas=[_THRESHOLD_BETA],
         )
-    assert response is beta_message
-    assert calls[0]["betas"] == [_THRESHOLD_BETA]
-    assert _settled(plane)["compaction_output_tokens"] == expected["compaction_output_tokens"]
+    assert len(seen) == 1
+    assert _settled(plane)["compaction_input_tokens"] == expected["compaction_input_tokens"]

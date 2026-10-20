@@ -1305,6 +1305,36 @@ def _hop_client_timeout(client: object, connect_slice: float, read_timeout: floa
     return native_timeout
 
 
+def _hop_client_options(client: object) -> dict[str, Any]:
+    """Configuration an anthropic platform client's ``with_options`` would drop.
+
+    anthropic's Bedrock and Bedrock Mantle clients rebuild themselves in
+    ``copy()`` without the original ``http_client`` (a custom transport, proxy
+    or connection pool), and Bedrock also without ``aws_profile``, so a hop
+    copy would bypass the caller's transport or sign with default AWS
+    credentials. Forwarding the original client is what the base Anthropic
+    ``copy()`` already does (``http_client or self._client``), so it is a
+    no-op for the platform clients that keep it. Scoped to classes defined
+    under ``anthropic.lib`` and read statically, so other clients'
+    ``with_options`` calls are unchanged.
+    """
+    if not any(cls.__module__.startswith("anthropic.lib.") for cls in type(client).__mro__):
+        return {}
+    options: dict[str, Any] = {}
+    http_client = inspect.getattr_static(client, "_client", None)
+    if http_client is not None:
+        options["http_client"] = http_client
+    aws_profile = inspect.getattr_static(client, "aws_profile", None)
+    if isinstance(aws_profile, str):
+        try:
+            parameters = inspect.signature(client.with_options).parameters  # type: ignore[attr-defined]
+        except (TypeError, ValueError):
+            return options
+        if "aws_profile" not in parameters and "_extra_kwargs" in parameters:
+            options["_extra_kwargs"] = {"aws_profile": aws_profile}
+    return options
+
+
 class Deadline:
     """A monotonic FAILOVER-WINDOW deadline.
 
@@ -2299,6 +2329,7 @@ class Solwyn(_SolwynBase):
             client = client.with_options(
                 timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
+                **_hop_client_options(client),
                 **(extra_client_options or {}),
             )
         if surface == "responses":
@@ -2367,6 +2398,7 @@ class Solwyn(_SolwynBase):
             client = client.with_options(
                 timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
+                **_hop_client_options(client),
                 **(extra_client_options or {}),
             )
         method, call_kwargs = _media_prepare(
@@ -4138,6 +4170,7 @@ class AsyncSolwyn(_SolwynBase):
             client = client.with_options(
                 timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
+                **_hop_client_options(client),
                 **(extra_client_options or {}),
             )
         if surface == "responses":
@@ -4206,6 +4239,7 @@ class AsyncSolwyn(_SolwynBase):
             client = client.with_options(
                 timeout=_hop_client_timeout(client, timeout, read_timeout),
                 max_retries=max_retries,
+                **_hop_client_options(client),
                 **(extra_client_options or {}),
             )
         method, call_kwargs = _media_prepare(
