@@ -179,6 +179,15 @@ class TokenDetails(BaseModel):
                 "compaction_input_tokens must include compaction_cached_input_tokens, "
                 "compaction_cache_creation_5m_tokens, and compaction_cache_creation_1h_tokens"
             )
+        # The non-compaction remainder must satisfy the whole-call cache
+        # invariant on its own: its uncached input cannot go negative.
+        cache_total = (
+            self.cached_input_tokens + self.cache_creation_5m_tokens + self.cache_creation_1h_tokens
+        )
+        if (self.compaction_input_tokens - compaction_cache_total) > (
+            self.input_tokens - cache_total
+        ):
+            raise ValueError("uncached input_tokens must include the uncached compaction input")
         return self
 
     @property

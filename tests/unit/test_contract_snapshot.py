@@ -1100,6 +1100,12 @@ class TestWireModelDumpSnapshots:
         with pytest.raises(ValidationError, match="compaction_input_tokens must include"):
             TokenDetails(**{**kwargs, "compaction_input_tokens": 29})
 
+    def test_token_details_compaction_remainder_uncached_cannot_go_negative(self) -> None:
+        # Mirrors Core: every parent bound holds, but all 100 input tokens are
+        # cache reads while the compaction share claims 50 of them as uncached.
+        with pytest.raises(ValidationError, match="uncached compaction input"):
+            TokenDetails(input_tokens=100, cached_input_tokens=100, compaction_input_tokens=50)
+
     @pytest.mark.parametrize("field", sorted(EXPECTED_COMPACTION_FIELDS))
     def test_token_details_compaction_fields_carry_the_ordinary_token_ceiling(
         self, field: str
