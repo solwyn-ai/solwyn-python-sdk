@@ -477,27 +477,25 @@ def test_report_comparison_emits_dead_rule_advisories(
 
 
 @pytest.mark.unit
-def test_provider_matrix_checks_each_generated_report_against_the_contract() -> None:
+def test_provider_matrix_retains_interval_reports_even_after_failures() -> None:
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     workflow_data = yaml.safe_load(workflow)
     inventory_steps = workflow_data["jobs"]["provider-surface-inventory"]["steps"]
-    verification_steps = [
+    batch_steps = [
         step
         for step in inventory_steps
-        if step.get("name") == "Verify generated surfaces are classified"
+        if "scripts/run_provider_surface_intervals.py" in step.get("run", "")
     ]
 
-    assert len(verification_steps) == 1
-    assert verification_steps[0]["if"] == "always()"
-    run_command = verification_steps[0]["run"]
+    assert len(batch_steps) == 1
+    run_command = batch_steps[0]["run"]
     command_tokens = shlex.split(run_command)
     assert command_tokens == [
         "python",
-        "scripts/export_surface_contract.py",
-        "--check",
-        "--output",
-        "build/surface_contract/surface-classification.json",
-        "--reports-dir",
+        "scripts/run_provider_surface_intervals.py",
+        "--intervals-json",
+        "$SURFACE_INTERVALS",
+        "--output-dir",
         "build/provider_surface_inventory",
     ]
 
@@ -505,10 +503,8 @@ def test_provider_matrix_checks_each_generated_report_against_the_contract() -> 
         step for step in inventory_steps if step.get("name") == "Upload provider surface inventory"
     ]
     assert len(upload_steps) == 1
-    assert set(upload_steps[0]["with"]["path"].splitlines()) == {
-        "build/provider_surface_inventory",
-        "build/surface_contract/surface-classification.json",
-    }
+    assert upload_steps[0]["if"] == "always()"
+    assert upload_steps[0]["with"]["path"] == "build/provider_surface_inventory"
 
 
 @pytest.mark.unit

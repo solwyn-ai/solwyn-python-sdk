@@ -3,6 +3,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
   schedule:
     - cron: "0 6 * * 1"  # Monday 06:00 UTC: catch provider latest-SDK drift on our schedule, not a contributor's
@@ -10,9 +11,16 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # Only PR revisions share a group. Other events have a unique group per run.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
-    if: github.event_name != 'schedule'
+    if: >-
+      github.event_name != 'schedule' &&
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -34,6 +42,7 @@ jobs:
           --ignore=tests/integration/frameworks
 
   provider-surface-matrix:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.catalog.outputs.matrix }}
@@ -43,14 +52,23 @@ jobs:
           persist-credentials: false
       - id: catalog
         run: |
-          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
-            matrix=$(jq -c '{include: [.include[] | select(.interval == "latest")]}' tests/provider_surface_intervals.json)
-          else
-            matrix=$(jq -c '{include: .include}' tests/provider_surface_intervals.json)
-          fi
+          intervals=$(jq -c --arg event "$GITHUB_EVENT_NAME" '
+            [.include[] | select($event != "schedule" or .interval == "latest")]
+          ' tests/provider_surface_intervals.json)
+          echo "Selected provider surface intervals ($GITHUB_EVENT_NAME):"
+          jq -r '.[] | "\(.family)/\(.interval) (\(.packages))"' <<< "$intervals"
+          # Round-robin batches keep both the full and latest-only catalogs balanced.
+          matrix=$(jq -cn --argjson intervals "$intervals" '
+            {include: [range(0; 3) as $shard | {
+              shard: ($shard + 1),
+              intervals: [$intervals | to_entries[] | select(.key % 3 == $shard) | .value]
+            } | select(.intervals | length > 0)]}
+          ')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
   provider-surface-inventory:
+    name: provider-surface-inventory (${{ matrix.shard }})
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     needs: provider-surface-matrix
     runs-on: ubuntu-latest
     strategy:
@@ -63,48 +81,27 @@ jobs:
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
         with:
           python-version: "3.12"
-      - run: python -m pip install -e .
-      - run: >-
-          python -m pip install --upgrade
-          "pytest>=8.0"
-          "pytest-asyncio>=0.24"
-          "pyyaml>=6.0"
-          "${{ matrix.packages }}"
-      - run: >-
-          python scripts/capture_surface_inventory.py
-          --check
-          --interval "${{ matrix.interval }}"
-          --family "${{ matrix.family }}"
+      - name: Check provider surface intervals in isolated environments
+        run: >-
+          python scripts/run_provider_surface_intervals.py
+          --intervals-json "$SURFACE_INTERVALS"
           --output-dir build/provider_surface_inventory
         env:
-          AWS_EC2_METADATA_DISABLED: "true"
-      - name: Verify generated surfaces are classified
-        if: always()
-        run: >-
-          python scripts/export_surface_contract.py
-          --check
-          --output build/surface_contract/surface-classification.json
-          --reports-dir build/provider_surface_inventory
-      - run: python -m pytest tests/unit/test_surface_canary.py -v --tb=short
-        if: always()
-        env:
-          AWS_EC2_METADATA_DISABLED: "true"
-          SOLWYN_SURFACE_CANARY_FAMILY: ${{ matrix.family }}
+          SURFACE_INTERVALS: ${{ toJSON(matrix.intervals) }}
       - name: Upload provider surface inventory
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: provider-surface-${{ matrix.family }}-${{ matrix.interval }}
-          path: |
-            build/provider_surface_inventory
-            build/surface_contract/surface-classification.json
+          name: provider-surface-${{ matrix.shard }}
+          path: build/provider_surface_inventory
           if-no-files-found: error
           retention-days: 7
 
   integration:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      contains(github.event.pull_request.labels.*.name, 'run-integration')
+      (github.event_name != 'pull_request' || !github.event.pull_request.draft) &&
+      (github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-integration'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
