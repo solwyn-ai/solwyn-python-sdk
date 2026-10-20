@@ -57,11 +57,15 @@ jobs:
           ' tests/provider_surface_intervals.json)
           echo "Selected provider surface intervals ($GITHUB_EVENT_NAME):"
           jq -r '.[] | "\(.family)/\(.interval) (\(.packages))"' <<< "$intervals"
-          # Round-robin batches keep both the full and latest-only catalogs balanced.
-          matrix=$(jq -cn --argjson intervals "$intervals" '
-            {include: [range(0; 3) as $shard | {
+          # Keep normal batches over a minute; six weekly intervals share one runner.
+          shards=3
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            shards=1
+          fi
+          matrix=$(jq -cn --argjson intervals "$intervals" --argjson shards "$shards" '
+            {include: [range(0; $shards) as $shard | {
               shard: ($shard + 1),
-              intervals: [$intervals | to_entries[] | select(.key % 3 == $shard) | .value]
+              intervals: [$intervals | to_entries[] | select(.key % $shards == $shard) | .value]
             } | select(.intervals | length > 0)]}
           ')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
