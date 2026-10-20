@@ -75,6 +75,7 @@ jobs:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     needs: provider-surface-matrix
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.provider-surface-matrix.outputs.matrix) }}

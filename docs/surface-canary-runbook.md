@@ -1,14 +1,18 @@
 # Red surface canary / provider drift runbook
 
-A `provider-surface-inventory` matrix job (or the Monday scheduled run) is red.
+A `provider-surface-inventory` shard job (or the Monday scheduled run) is red.
 An unclassified provider surface is NOT a user emergency: at runtime it resolves
 to `unknown` and follows `on_unmetered` (default `warn`). Red CI is the gate
 doing its job.
 
 ## 1. Identify what drifted
 
-- Open the failing job and download its artifact (`provider-surface-<family>-<interval>`).
-- Read the failing step, in order of information:
+- Open the failing shard job and find the `::error::Failed provider surface intervals: …`
+  line to identify the failing intervals and stages, including any `(timeout)` failures.
+- Download its shard artifact (`provider-surface-<shard>`). Each interval's reports are
+  under `<family>/<interval>/{inventory,surface_contract}/`.
+- Open the failing interval's `::group::` log section and read its stage output,
+  in order of information:
   - `capture --check` → `fingerprint drift: <shape>@<interval>` — structure changed.
   - `export --check --reports-dir` → `no reviewed raw rule for '<path>' ...` — the actionable line: an exact new/changed path.
   - canary → `SurfaceCanaryError ... during shape_drift|unknown_classification` — a reviewed rule no longer matches reality.

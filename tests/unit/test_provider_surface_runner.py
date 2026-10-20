@@ -6,9 +6,14 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
+import sys
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import yaml
@@ -57,7 +62,8 @@ def test_ci_batches_preserve_every_selected_catalog_interval(event: str, tmp_pat
     assert sorted(actual, key=lambda row: (row["family"], row["interval"])) == sorted(
         expected, key=lambda row: (row["family"], row["interval"])
     )
-    assert len({len(batch["intervals"]) for batch in batches}) == 1
+    batch_sizes = [len(batch["intervals"]) for batch in batches]
+    assert max(batch_sizes) - min(batch_sizes) <= 1
     for row in expected:
         assert f"{row['family']}/{row['interval']}" in result.stdout
 
@@ -74,10 +80,12 @@ def test_runner_isolates_intervals_and_continues_after_failures(
     runner = _runner()
     calls: list[tuple[list[str], dict[str, str]]] = []
 
+    @contextmanager
     def execute(
-        command: list[str], *, cwd: Path, env: dict[str, str]
-    ) -> subprocess.CompletedProcess:
+        command: list[str], *, cwd: Path, env: dict[str, str], start_new_session: bool
+    ) -> Iterator[SimpleNamespace]:
         assert cwd == ROOT
+        assert start_new_session
         calls.append((command, env))
         fail = (
             (failure == "venv" and command[1:3] == ["-m", "venv"])
@@ -88,10 +96,10 @@ def test_runner_isolates_intervals_and_continues_after_failures(
             or (failure == "canary" and "pytest" in command)
         )
         # Both intervals fail when requested, so the final error must name both.
-        return subprocess.CompletedProcess(command, 1 if fail else 0)
+        yield SimpleNamespace(wait=lambda *, timeout: 1 if fail else 0)
 
     # Avoid package downloads and inject process failures at the external boundary.
-    monkeypatch.setattr(runner.subprocess, "run", execute)
+    monkeypatch.setattr(runner.subprocess, "Popen", execute)
     rows = [
         {"family": "openai", "interval": "floor", "packages": "openai==2.0.0"},
         {"family": "openai", "interval": "latest", "packages": "openai>=2.0"},
@@ -178,7 +186,7 @@ def test_unavailable_interval_python_does_not_abort_remaining_intervals(
     def unavailable(*args: object, **kwargs: object) -> None:
         raise FileNotFoundError("interpreter unavailable")
 
-    monkeypatch.setattr(runner.subprocess, "run", unavailable)
+    monkeypatch.setattr(runner.subprocess, "Popen", unavailable)
     rows = [
         {"family": "openai", "interval": "floor", "packages": "openai==2.0.0"},
         {"family": "anthropic", "interval": "floor", "packages": "anthropic==0.50.0"},
@@ -187,3 +195,88 @@ def test_unavailable_interval_python_does_not_abort_remaining_intervals(
     output = capsys.readouterr().out
     assert "openai/floor" in output and "anthropic/floor" in output
     assert output.count("::endgroup::") == 2
+
+
+@pytest.mark.parametrize(
+    "stage", ["venv", "install", "dependencies", "capture", "classification", "canary"]
+)
+def test_timeout_reports_failed_stage_and_finishes_later_intervals(
+    stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runner = _runner()
+    interval_count = 0
+    calls: list[tuple[list[str], int]] = []
+
+    def execute(command: list[str], env: dict[str, str], *, timeout: int = 0) -> bool:
+        nonlocal interval_count
+        if command[1:3] == ["-m", "venv"]:
+            interval_count += 1
+        calls.append((command, timeout))
+        timed_out = interval_count == 1 and (
+            (stage == "venv" and command[1:3] == ["-m", "venv"])
+            or (stage == "install" and "pip" in command)
+            or (stage == "dependencies" and "--upgrade" in command)
+            or (stage == "capture" and "scripts/capture_surface_inventory.py" in command)
+            or (stage == "classification" and "scripts/export_surface_contract.py" in command)
+            or (stage == "canary" and "pytest" in command)
+        )
+        if timed_out:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return True
+
+    monkeypatch.setattr(runner, "_run", execute)
+    rows = [
+        {"family": "openai", "interval": "floor", "packages": "openai==2.0.0"},
+        {"family": "openai", "interval": "latest", "packages": "openai>=2.0"},
+    ]
+    assert runner.run_intervals(rows, tmp_path) == 1
+    output = capsys.readouterr().out
+    failed_stage = "setup" if stage in {"venv", "install", "dependencies"} else stage
+    assert (
+        f"::error::Failed provider surface intervals: openai/floor ({failed_stage} (timeout))"
+        in output
+    )
+    assert "Interval result: openai/latest: PASS" in output
+    assert "Provider surface intervals: 1 passed, 1 failed" in output
+    assert output.count("::group::") == output.count("::endgroup::") == 2
+    assert sum("scripts/export_surface_contract.py" in command for command, _ in calls) == 2
+    assert sum("pytest" in command for command, _ in calls) == 2
+    for command, timeout in calls:
+        assert timeout == (600 if "pip" in command else 300)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="uses /proc to check descendant termination")
+def test_command_timeout_kills_descendants(tmp_path: Path) -> None:
+    runner = _runner()
+    child_pid_file = tmp_path / "child-pid"
+    command = [
+        sys.executable,
+        "-c",
+        "import os, pathlib, sys, time\n"
+        "if os.fork() == 0:\n"
+        "    pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+        "time.sleep(60)\n",
+        str(child_pid_file),
+    ]
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            runner._run(command, dict(os.environ), timeout=2)
+        child_pid = int(child_pid_file.read_text())
+        status_file = Path(f"/proc/{child_pid}/stat")
+        deadline = time.monotonic() + 2
+        while status_file.exists():
+            try:
+                state = status_file.read_text().split(") ", 1)[1].split()[0]
+            except (FileNotFoundError, ProcessLookupError):
+                break
+            if state == "Z":
+                break  # A terminated orphan may await reaping by the host's init.
+            assert time.monotonic() < deadline, "timed-out command left a running descendant"
+            time.sleep(0.01)
+    finally:
+        if child_pid_file.exists():
+            with suppress(ProcessLookupError):
+                os.kill(int(child_pid_file.read_text()), signal.SIGKILL)

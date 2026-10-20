@@ -4,24 +4,55 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).parents[1]
+PIP_TIMEOUT_SECONDS = 600
+CHECK_TIMEOUT_SECONDS = 300
 
 
-def _run(command: list[str], env: dict[str, str]) -> bool:
+def _run(command: list[str], env: dict[str, str], *, timeout: int) -> bool:
     print(f"$ {shlex.join(command)}", flush=True)
     try:
-        return subprocess.run(command, cwd=ROOT, env=env).returncode == 0
+        with subprocess.Popen(command, cwd=ROOT, env=env, start_new_session=True) as process:
+            try:
+                return process.wait(timeout=timeout) == 0
+            except subprocess.TimeoutExpired:
+                # pip may spawn build backends; terminate the whole group before cleanup.
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+                raise
     except OSError as exc:
         print(f"Could not run command: {exc}", flush=True)
         return False
+
+
+def _check(
+    stage: str,
+    command: list[str],
+    env: dict[str, str],
+    failed_checks: list[str],
+    *,
+    timeout: int = CHECK_TIMEOUT_SECONDS,
+) -> bool:
+    try:
+        if _run(command, env, timeout=timeout):
+            return True
+    except subprocess.TimeoutExpired:
+        print(f"{stage} timed out after {timeout} seconds", flush=True)
+        failed_checks.append(f"{stage} (timeout)")
+        return False
+    failed_checks.append(stage)
+    return False
 
 
 def run_intervals(intervals: list[dict[str, str]], output_dir: Path) -> int:
@@ -36,6 +67,7 @@ def run_intervals(intervals: list[dict[str, str]], output_dir: Path) -> int:
             "AWS_EC2_METADATA_DISABLED": "true",
             "SOLWYN_SURFACE_CANARY_FAMILY": family,
         }
+
         print(f"::group::{label} ({row['packages']})", flush=True)
         try:
             # Nothing installed for one interval can satisfy another interval's imports.
@@ -43,41 +75,46 @@ def run_intervals(intervals: list[dict[str, str]], output_dir: Path) -> int:
                 venv = Path(temporary_dir) / "venv"
                 python = str(venv / "bin" / "python")
                 setup_commands = [
-                    [sys.executable, "-m", "venv", str(venv)],
-                    [python, "-m", "pip", "install", "-e", "."],
-                    [
-                        python,
-                        "-m",
-                        "pip",
-                        "install",
-                        "--upgrade",
-                        "pytest>=8.0",
-                        "pytest-asyncio>=0.24",
-                        "pyyaml>=6.0",
-                        row["packages"],
-                    ],
+                    ([sys.executable, "-m", "venv", str(venv)], CHECK_TIMEOUT_SECONDS),
+                    ([python, "-m", "pip", "install", "-e", "."], PIP_TIMEOUT_SECONDS),
+                    (
+                        [
+                            python,
+                            "-m",
+                            "pip",
+                            "install",
+                            "--upgrade",
+                            "pytest>=8.0",
+                            "pytest-asyncio>=0.24",
+                            "pyyaml>=6.0",
+                            row["packages"],
+                        ],
+                        PIP_TIMEOUT_SECONDS,
+                    ),
                 ]
-                for command in setup_commands:
-                    if not _run(command, env):
-                        failed_checks.append("setup")
+                for command, timeout in setup_commands:
+                    if not _check("setup", command, env, failed_checks, timeout=timeout):
                         break
-                if not failed_checks and not _run(
-                    [
-                        python,
-                        "scripts/capture_surface_inventory.py",
-                        "--check",
-                        "--interval",
-                        interval,
-                        "--family",
-                        family,
-                        "--output-dir",
-                        str(reports / "inventory"),
-                    ],
-                    env,
-                ):
-                    failed_checks.append("capture")
+                if not failed_checks:
+                    _check(
+                        "capture",
+                        [
+                            python,
+                            "scripts/capture_surface_inventory.py",
+                            "--check",
+                            "--interval",
+                            interval,
+                            "--family",
+                            family,
+                            "--output-dir",
+                            str(reports / "inventory"),
+                        ],
+                        env,
+                        failed_checks,
+                    )
                 # Mirror the old always() steps, even after setup or capture fails.
-                if not _run(
+                _check(
+                    "classification",
                     [
                         python,
                         "scripts/export_surface_contract.py",
@@ -88,9 +125,10 @@ def run_intervals(intervals: list[dict[str, str]], output_dir: Path) -> int:
                         str(reports / "inventory"),
                     ],
                     env,
-                ):
-                    failed_checks.append("classification")
-                if not _run(
+                    failed_checks,
+                )
+                _check(
+                    "canary",
                     [
                         python,
                         "-m",
@@ -100,8 +138,8 @@ def run_intervals(intervals: list[dict[str, str]], output_dir: Path) -> int:
                         "--tb=short",
                     ],
                     env,
-                ):
-                    failed_checks.append("canary")
+                    failed_checks,
+                )
         finally:
             print("::endgroup::", flush=True)
         if failed_checks:
