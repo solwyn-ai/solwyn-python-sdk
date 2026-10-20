@@ -614,6 +614,25 @@ def test_real_sdk_graph_has_no_unknown_ambiguous_or_shape_drifted_paths(
             report_path = "admin.organization.usage.decisions"
             if report_path in by_path:  # The report was added after Decisions create.
                 assert rules[by_path[report_path].rule_id].kind is SurfaceKind.UNMETERED_SPEND
+    if shape_key.startswith("anthropic"):
+        by_path = {row.path: row for row in first}
+        if "beta.messages.create" in by_path:
+            from solwyn._surfaces import SURFACE_RULES
+
+            rules = {rule.rule_id: rule for rule in SURFACE_RULES}
+            create = rules[by_path["beta.messages.create"].rule_id]
+            assert create.kind is SurfaceKind.METERED
+            assert create.usage_basis is UsageBasis.PROVIDER
+            for path in (
+                "beta.messages.stream",
+                "beta.messages.parse",
+                "beta.messages.tool_runner",
+                "beta.messages.count_tokens",
+                "beta.messages.with_raw_response.create",
+                "beta.messages.with_streaming_response.create",
+            ):
+                if path in by_path:
+                    assert rules[by_path[path].rule_id].kind is SurfaceKind.UNMETERED_SPEND
 
 
 @pytest.mark.unit

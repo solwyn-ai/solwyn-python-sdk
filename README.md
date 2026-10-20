@@ -141,6 +141,18 @@ client = Solwyn(Anthropic(), api_key="sk_proj_...")
 response = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1024, messages=[...])
 ```
 
+`client.beta.messages.create(...)` is metered the same way, streaming or not, so
+beta features such as [server-side compaction](https://platform.claude.com/docs/en/build-with-claude/compaction-threshold)
+are budget-checked and settled. Compaction tokens, which Anthropic reports only
+in `usage.iterations`, are added to the settled input, output, and cache counts
+and broken out in `token_details` (see [Data Transparency](#data-transparency)).
+Beta request fields (`betas`, `context_management`, `compaction`, ...) pass
+through untouched and are never recorded. A beta call fails over only to other
+Anthropic entries in the `fallback=` chain, never to a different provider:
+beta-only fields have no equivalent elsewhere. The other beta Messages helpers
+(`beta.messages.stream`, `.parse`, `.tool_runner`, `.count_tokens`, and batches)
+remain unmetered and follow `on_unmetered`, like their non-beta counterparts.
+
 ### Google Gemini
 
 ```python
@@ -359,6 +371,10 @@ Billable quantities are read from the response's usage block where it exists (gp
 
 ## Strict coverage controls
 
+- **Anthropic beta Messages:** `beta.messages.create` no longer needs an
+  acknowledgment. Remove it from `acknowledge_untracked`: a stale token now
+  raises `ConfigurationError`. Every other `beta.messages` leaf and its
+  raw/streaming response mirrors keep their exact acknowledgment tokens.
 - **OpenAI Decisions:** Native `decisions.create` no longer needs an
   acknowledgment. Remove `decisions.create` from `acknowledge_untracked` on
   native OpenAI clients: a stale token now raises `ConfigurationError`, including
@@ -1221,7 +1237,7 @@ The SDK sends a `MetadataEvent` after each LLM call. This is everything it trans
 | `modality` | `str` | Call modality (`text`, `image`, `audio`, `video`, `embedding`); `text` for chat, `embedding` for embeddings calls |
 | `input_tokens` | `int` | Input token count |
 | `output_tokens` | `int` | Output token count |
-| `token_details` | `object` | Breakdown: cached, reasoning, audio, and image token buckets; `is_estimated` flags length-based estimates when a provider reports no usage |
+| `token_details` | `object` | Breakdown: cached, reasoning, audio, and image token buckets; `is_estimated` flags length-based estimates when a provider reports no usage. Anthropic server-side compaction adds `compaction_input_tokens`, `compaction_cached_input_tokens`, `compaction_cache_creation_5m_tokens`, `compaction_cache_creation_1h_tokens`, and `compaction_output_tokens`: token counts already included in the matching totals, each omitted when zero |
 | `media_usage` | `object \| None` | Non-token billable quantities for media calls — image counts, media durations in seconds, TTS character counts — plus `resolution`/`quality` variant selectors. Each quantity is `None` when the SDK can't observe it (never a zero-as-default), and the whole object is omitted for text/chat calls |
 | `latency_ms` | `float` | Call duration in milliseconds |
 | `status` | `str` | `success`, `error`, or `budget_denied` |

@@ -48,6 +48,28 @@ derived from git tags (hatch-vcs).
 
 ### Changed
 
+- **Anthropic beta Messages metering.** `client.beta.messages.create(...)` now
+  has budget enforcement and token-usage settlement on sync and async
+  Anthropic clients, streaming and non-streaming, including the Bedrock,
+  Vertex, and Foundry platform clients. Beta request fields such as `betas`,
+  `context_management`, and `compaction` pass through unchanged and are never
+  recorded. Failover for a beta call stays on Anthropic: it can fall back to
+  another Anthropic model in your `fallback=` chain but never crosses to a
+  different provider, so cross-provider entries are skipped for these calls.
+  Remove the now-invalid `beta.messages.create` acknowledgment token: a stale
+  token raises `ConfigurationError`. `beta.messages.stream`, `.parse`,
+  `.tool_runner`, `.count_tokens`, batches, and raw/streaming response
+  mirrors keep their unmetered posture, matching their non-beta counterparts.
+- **Anthropic server-side compaction is counted.** Compaction usage, which
+  Anthropic reports only in `usage.iterations` and excludes from the
+  top-level usage fields, is now added to the settled input, output, and
+  cache token counts for streaming and non-streaming calls. `token_details`
+  also carries the compaction share as `compaction_input_tokens`,
+  `compaction_cached_input_tokens`, `compaction_cache_creation_5m_tokens`,
+  `compaction_cache_creation_1h_tokens`, and `compaction_output_tokens`; each
+  key is omitted when zero, so calls without compaction send the same payload
+  as before. Anthropic streams also settle the cumulative input and cache
+  counts reported on the final `message_delta` event.
 - **OpenAI Decisions metering.** Native `decisions.create(...)` calls now have
   budget enforcement and token-usage settlement on sync and async clients
   (`openai>=3.26`). Settlement uses the requested model even when the response
@@ -117,6 +139,11 @@ derived from git tags (hatch-vcs).
 
 ### Fixed
 
+- Wrapped `AnthropicBedrock` and `AnthropicBedrockMantle` clients (sync and
+  async) now keep the caller's `http_client` on every provider call, and
+  `AnthropicBedrock` also keeps its `aws_profile`. Previously a call through
+  a client configured with a named AWS profile could fail to resolve
+  credentials, and a custom transport or proxy was bypassed.
 - Runs entered inside sync generators streamed by frameworks that step each
   chunk in a fresh context, such as Starlette/FastAPI `StreamingResponse`, now
   attribute every call to the correct run and parent, including runs and

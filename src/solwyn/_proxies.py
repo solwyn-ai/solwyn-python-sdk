@@ -875,6 +875,48 @@ class _SyncVideosProxy:
         )
 
 
+class _SyncAnthropicBetaProxy:
+    """Proxy for Anthropic ``client.beta``: only ``messages.create`` is metered."""
+
+    def __init__(self, solwyn: Solwyn) -> None:
+        self._solwyn = solwyn
+        self.messages = _SyncBetaMessagesProxy(solwyn)
+
+    def __getattr__(self, name: str) -> Any:
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._solwyn_client.beta,
+            name=name,
+            path=f"beta.{name}",
+            source=SurfaceSource.RAW,
+        )
+
+
+class _SyncBetaMessagesProxy:
+    """Proxy for Anthropic ``client.beta.messages`` that intercepts create().
+
+    Beta request fields (``betas``, ``context_management``, ``compaction``,
+    ...) pass through untouched; only token counts are read back. The other
+    beta Messages helpers (``stream``, ``parse``, ``tool_runner``,
+    ``count_tokens``, ``batches``) keep the raw posture of their non-beta
+    counterparts.
+    """
+
+    def __init__(self, solwyn: Solwyn) -> None:
+        self._solwyn = solwyn
+
+    def create(self, **kwargs: Any) -> Any:
+        self._solwyn._enforce_explicit_surface("beta.messages.create", source=SurfaceSource.WRAPPER)
+        return self._solwyn._intercepted_call(_surface="beta_messages", **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._solwyn_client.beta.messages,
+            name=name,
+            path=f"beta.messages.{name}",
+            source=SurfaceSource.RAW,
+        )
+
+
 class _SyncMessagesProxy:
     """Proxy for client.messages that intercepts create().
 
@@ -1289,6 +1331,48 @@ class _AsyncVideosProxy:
             self._solwyn._solwyn_client.videos,
             name=name,
             path=f"videos.{name}",
+            source=SurfaceSource.RAW,
+        )
+
+
+class _AsyncAnthropicBetaProxy:
+    """Proxy for Anthropic ``client.beta``: only ``messages.create`` is metered."""
+
+    def __init__(self, solwyn: AsyncSolwyn) -> None:
+        self._solwyn = solwyn
+        self.messages = _AsyncBetaMessagesProxy(solwyn)
+
+    def __getattr__(self, name: str) -> Any:
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._solwyn_client.beta,
+            name=name,
+            path=f"beta.{name}",
+            source=SurfaceSource.RAW,
+        )
+
+
+class _AsyncBetaMessagesProxy:
+    """Proxy for Anthropic ``client.beta.messages`` that intercepts create().
+
+    Beta request fields (``betas``, ``context_management``, ``compaction``,
+    ...) pass through untouched; only token counts are read back. The other
+    beta Messages helpers (``stream``, ``parse``, ``tool_runner``,
+    ``count_tokens``, ``batches``) keep the raw posture of their non-beta
+    counterparts.
+    """
+
+    def __init__(self, solwyn: AsyncSolwyn) -> None:
+        self._solwyn = solwyn
+
+    async def create(self, **kwargs: Any) -> Any:
+        self._solwyn._enforce_explicit_surface("beta.messages.create", source=SurfaceSource.WRAPPER)
+        return await self._solwyn._intercepted_call(_surface="beta_messages", **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return self._solwyn._resolve_public_attribute(
+            self._solwyn._solwyn_client.beta.messages,
+            name=name,
+            path=f"beta.messages.{name}",
             source=SurfaceSource.RAW,
         )
 

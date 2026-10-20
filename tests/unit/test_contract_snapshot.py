@@ -218,7 +218,16 @@ EXPECTED_PROVIDER_NAMES = {
 # MetadataEvent.token_details) — its field set is contract too. is_estimated is
 # omit-when-False on the wire: only estimation-fallback payloads carry it, so
 # provider-reported payloads stay byte-identical and the Cloud API must accept
-# the key BEFORE any SDK release that can emit it (API-first deploy).
+# the key BEFORE any SDK release that can emit it (API-first deploy). The
+# compaction_* subsets follow the same omit-when-0 rule: only calls that ran
+# Anthropic server-side compaction carry them.
+EXPECTED_COMPACTION_FIELDS = {
+    "compaction_input_tokens",
+    "compaction_cached_input_tokens",
+    "compaction_cache_creation_5m_tokens",
+    "compaction_cache_creation_1h_tokens",
+    "compaction_output_tokens",
+}
 EXPECTED_TOKEN_DETAILS_FIELDS = {
     "input_tokens",
     "output_tokens",
@@ -233,6 +242,7 @@ EXPECTED_TOKEN_DETAILS_FIELDS = {
     "tool_use_input_tokens",
     "image_input_tokens",
     "image_output_tokens",
+    *EXPECTED_COMPACTION_FIELDS,
     "is_estimated",
 }
 
@@ -969,7 +979,9 @@ class TestWireModelDumpSnapshots:
         # provider's payload is byte-identical to the pre-is_estimated wire.
         dumped = TokenDetails(input_tokens=10, output_tokens=5).model_dump(mode="json")
         assert "is_estimated" not in dumped
-        assert set(dumped) == EXPECTED_TOKEN_DETAILS_FIELDS - {"is_estimated"}
+        assert set(dumped) == (
+            EXPECTED_TOKEN_DETAILS_FIELDS - {"is_estimated"} - EXPECTED_COMPACTION_FIELDS
+        )
 
     def test_token_details_estimated_dump_includes_is_estimated(self) -> None:
         # The estimation fallback fired: the degradation marker MUST serialize.
@@ -977,7 +989,7 @@ class TestWireModelDumpSnapshots:
             mode="json"
         )
         assert dumped["is_estimated"] is True
-        assert set(dumped) == EXPECTED_TOKEN_DETAILS_FIELDS
+        assert set(dumped) == EXPECTED_TOKEN_DETAILS_FIELDS - EXPECTED_COMPACTION_FIELDS
 
     def test_confirm_with_default_token_details_carries_no_is_estimated_key(self) -> None:
         # The deployment-ordering guarantee, enforced on the EXACT dump mode the
@@ -996,6 +1008,111 @@ class TestWireModelDumpSnapshots:
         # Same guarantee on the metadata-event wire (the other embedding).
         ev = _metadata_event(token_details=TokenDetails(input_tokens=10, output_tokens=5))
         assert "is_estimated" not in ev.model_dump(mode="json")["token_details"]
+
+    def test_token_details_without_compaction_is_byte_identical_to_prior_wire(self) -> None:
+        # Every compaction_* key is omitted at 0, so a payload without
+        # server-side compaction serializes exactly as it did before the
+        # fields existed (pinned literal: key order and values).
+        details = TokenDetails(
+            input_tokens=120,
+            output_tokens=30,
+            cached_input_tokens=50,
+            cache_creation_5m_tokens=20,
+            cache_creation_1h_tokens=10,
+        )
+        assert details.model_dump_json() == (
+            '{"input_tokens":120,"output_tokens":30,"cached_input_tokens":50,'
+            '"cache_creation_5m_tokens":20,"cache_creation_1h_tokens":10,'
+            '"reasoning_tokens":0,"audio_input_tokens":0,"audio_output_tokens":0,'
+            '"accepted_prediction_tokens":0,"rejected_prediction_tokens":0,'
+            '"tool_use_input_tokens":0,"image_input_tokens":0,"image_output_tokens":0}'
+        )
+        for nested in (
+            _confirm(token_details=details).model_dump(mode="json")["token_details"],
+            _metadata_event(token_details=details).model_dump(mode="json")["token_details"],
+        ):
+            assert not EXPECTED_COMPACTION_FIELDS & set(nested)
+
+    def test_token_details_serializes_only_nonzero_compaction_fields(self) -> None:
+        details = TokenDetails(
+            input_tokens=203_000,
+            output_tokens=4_500,
+            cached_input_tokens=198_000,
+            cache_creation_5m_tokens=2_500,
+            compaction_input_tokens=180_000,
+            compaction_cached_input_tokens=178_000,
+            compaction_output_tokens=3_500,
+        )
+        dumped = details.model_dump(mode="json")
+        assert dumped["compaction_input_tokens"] == 180_000
+        assert dumped["compaction_cached_input_tokens"] == 178_000
+        assert dumped["compaction_output_tokens"] == 3_500
+        assert "compaction_cache_creation_5m_tokens" not in dumped
+        assert "compaction_cache_creation_1h_tokens" not in dumped
+        assert "is_estimated" not in dumped
+        # The wire keys sit after the existing fields, in declaration order.
+        assert list(dumped)[-3:] == [
+            "compaction_input_tokens",
+            "compaction_cached_input_tokens",
+            "compaction_output_tokens",
+        ]
+        nested = _confirm(token_details=details).model_dump(mode="json")["token_details"]
+        assert nested == dumped
+        assert TokenDetails.model_validate(dumped) == details
+
+    @pytest.mark.parametrize(
+        ("field", "parent"),
+        [
+            ("compaction_input_tokens", "input_tokens"),
+            ("compaction_cached_input_tokens", "cached_input_tokens"),
+            ("compaction_cache_creation_5m_tokens", "cache_creation_5m_tokens"),
+            ("compaction_cache_creation_1h_tokens", "cache_creation_1h_tokens"),
+            ("compaction_output_tokens", "output_tokens"),
+        ],
+    )
+    def test_token_details_compaction_subset_must_fit_its_parent(
+        self, field: str, parent: str
+    ) -> None:
+        parents = {
+            "input_tokens": 100,
+            "output_tokens": 100,
+            "cached_input_tokens": 30,
+            "cache_creation_5m_tokens": 30,
+            "cache_creation_1h_tokens": 30,
+        }
+        valid = {**parents, "compaction_input_tokens": 10, field: 10}
+        assert getattr(TokenDetails(**valid), field) == 10
+        with pytest.raises(ValidationError, match=f"{parent} must include {field}"):
+            TokenDetails(**{**valid, parent: 9})
+
+    def test_token_details_compaction_cache_must_fit_compaction_input(self) -> None:
+        kwargs = {
+            "input_tokens": 1_000,
+            "cached_input_tokens": 500,
+            "cache_creation_5m_tokens": 200,
+            "cache_creation_1h_tokens": 200,
+            "compaction_input_tokens": 30,
+            "compaction_cached_input_tokens": 10,
+            "compaction_cache_creation_5m_tokens": 10,
+            "compaction_cache_creation_1h_tokens": 10,
+        }
+        assert TokenDetails(**kwargs).compaction_input_tokens == 30
+        with pytest.raises(ValidationError, match="compaction_input_tokens must include"):
+            TokenDetails(**{**kwargs, "compaction_input_tokens": 29})
+
+    def test_token_details_compaction_remainder_uncached_cannot_go_negative(self) -> None:
+        # Mirrors Core: every parent bound holds, but all 100 input tokens are
+        # cache reads while the compaction share claims 50 of them as uncached.
+        with pytest.raises(ValidationError, match="uncached compaction input"):
+            TokenDetails(input_tokens=100, cached_input_tokens=100, compaction_input_tokens=50)
+
+    @pytest.mark.parametrize("field", sorted(EXPECTED_COMPACTION_FIELDS))
+    def test_token_details_compaction_fields_carry_the_ordinary_token_ceiling(
+        self, field: str
+    ) -> None:
+        schema = TokenDetails.model_json_schema()["properties"][field]
+        assert schema["minimum"] == 0
+        assert schema["maximum"] == wire_constants.ORDINARY_TOKEN_COUNT_MAX
 
     def test_confirm_provider_region_omitted_when_none_present_when_set(self) -> None:
         # Mirror of test_metadata_provider_region_omitted_when_none_present_when_set:
