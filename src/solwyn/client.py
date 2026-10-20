@@ -28,7 +28,15 @@ import math
 import sys
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator, Mapping
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from typing import Any, Literal, NamedTuple, NoReturn, cast
 
 import httpx
@@ -62,6 +70,7 @@ from solwyn._privacy import (
     prepare_legacy_google_translation_source_kwargs,
 )
 from solwyn._proxies import (
+    _AsyncAnthropicBetaProxy,
     _AsyncAudioProxy,
     _AsyncChatProxy,
     _AsyncDecisionsProxy,
@@ -73,6 +82,7 @@ from solwyn._proxies import (
     _AsyncVideosProxy,
     _bedrock_internal_kwargs,
     _reject_responses_background,
+    _SyncAnthropicBetaProxy,
     _SyncAudioProxy,
     _SyncChatProxy,
     _SyncDecisionsProxy,
@@ -591,6 +601,33 @@ def _responses_preparer(adapter: object) -> _ResponsesPreparer | None:
     if not callable(prepare) or not getattr(adapter, "supports_responses", True):
         return None
     return cast("_ResponsesPreparer", prepare)
+
+
+_BETA_MESSAGES_SURFACE = "beta_messages"
+
+
+def _beta_messages_preparer(adapter: object) -> _ResponsesPreparer | None:
+    """Return the adapter's Anthropic beta Messages seam, if it has one."""
+    prepare = getattr(adapter, "prepare_beta_messages_call", None)
+    return cast("_ResponsesPreparer", prepare) if callable(prepare) else None
+
+
+def _beta_messages_runtimes(
+    runtimes: Sequence[ProviderRuntime], primary: ProviderRuntime
+) -> list[ProviderRuntime]:
+    """Runtimes eligible to serve a beta Messages call: same provider, beta seam.
+
+    Beta-only request fields (``betas``, ``context_management``,
+    ``compaction``, ...) have no translation subset and the non-beta
+    ``messages.create`` rejects them, so a beta call never crosses to another
+    provider or dialect. Same-provider model fallbacks remain eligible.
+    """
+    return [
+        r
+        for r in runtimes
+        if r.entry.provider == primary.entry.provider
+        and _beta_messages_preparer(r.adapter) is not None
+    ]
 
 
 def _responses_is_streaming(
@@ -2116,6 +2153,26 @@ class Solwyn(_SolwynBase):
         )
 
     @functools.cached_property
+    def beta(self) -> Any:
+        """Anthropic: ``client.beta.messages.create()`` goes through interception.
+
+        Other beta resources (and every non-Anthropic ``beta`` namespace)
+        retain their guarded raw posture. Cached: the dialect is fixed at
+        construction.
+        """
+        if (
+            self._solwyn_dialect == "anthropic"
+            and self._inspect_static_attribute(self._solwyn_client, "beta") is not None
+        ):
+            return _SyncAnthropicBetaProxy(self)
+        return self._resolve_public_attribute(
+            self._solwyn_client,
+            name="beta",
+            path="beta",
+            source=SurfaceSource.RAW,
+        )
+
+    @functools.cached_property
     def models(self) -> Any:
         """google-genai: client.models generation goes through interception.
 
@@ -2261,13 +2318,25 @@ class Solwyn(_SolwynBase):
             if on_dispatch is not None:
                 on_dispatch()
             return method(**call_kwargs)
-        method, call_kwargs = runtime.adapter.prepare_call(
-            client,
-            cast("dict[str, Any]", kwargs),
-            is_streaming=is_streaming,
-            timeout=read_timeout,
-            max_retries=max_retries,
-        )
+        if surface == _BETA_MESSAGES_SURFACE:
+            prepare_beta = _beta_messages_preparer(runtime.adapter)
+            if prepare_beta is None:
+                raise UnsupportedSurfaceError(
+                    surface="beta.messages.create", provider=runtime.adapter.name
+                )
+            method, call_kwargs = prepare_beta(
+                client,
+                cast("dict[str, Any]", kwargs),
+                is_streaming=is_streaming,
+            )
+        else:
+            method, call_kwargs = runtime.adapter.prepare_call(
+                client,
+                cast("dict[str, Any]", kwargs),
+                is_streaming=is_streaming,
+                timeout=read_timeout,
+                max_retries=max_retries,
+            )
         if on_dispatch is not None:
             on_dispatch()
         return method(**call_kwargs)
@@ -2655,6 +2724,10 @@ class Solwyn(_SolwynBase):
             raise UnsupportedSurfaceError(
                 surface=f"responses.{_responses_leaf}", provider=primary.adapter.name
             )
+        if _surface == _BETA_MESSAGES_SURFACE and _beta_messages_preparer(primary.adapter) is None:
+            raise UnsupportedSurfaceError(
+                surface="beta.messages.create", provider=primary.adapter.name
+            )
         # Deadline starts here — it encompasses the budget pre-flight.
         deadline = Deadline(self._solwyn_config.failover_total_timeout)
 
@@ -2723,8 +2796,13 @@ class Solwyn(_SolwynBase):
                 self._solwyn_config.lease_output_bound_default,
             )
         else:
-            fallback_providers = [r.entry.provider.value for r in self._solwyn_runtimes[1:]]
-            fallback_models = [r.entry.model for r in self._solwyn_runtimes[1:]]
+            fallback_runtimes = (
+                _beta_messages_runtimes(self._solwyn_runtimes[1:], primary)
+                if _surface == _BETA_MESSAGES_SURFACE
+                else self._solwyn_runtimes[1:]
+            )
+            fallback_providers = [r.entry.provider.value for r in fallback_runtimes]
+            fallback_models = [r.entry.model for r in fallback_runtimes]
             estimated_output_bound = max(
                 _legacy_google_candidate_output_bound(
                     primary=primary,
@@ -2864,6 +2942,8 @@ class Solwyn(_SolwynBase):
             candidates = [
                 c for c in candidates if c is primary and _responses_preparer(c.adapter) is not None
             ]
+        elif _surface == _BETA_MESSAGES_SURFACE:
+            candidates = _beta_messages_runtimes(candidates, primary)
         if not candidates:
             self._solwyn_budget.release_reservation(
                 call_id,
@@ -3945,6 +4025,26 @@ class AsyncSolwyn(_SolwynBase):
         )
 
     @functools.cached_property
+    def beta(self) -> Any:
+        """Anthropic: ``client.beta.messages.create()`` goes through interception.
+
+        Other beta resources (and every non-Anthropic ``beta`` namespace)
+        retain their guarded raw posture. Cached: the dialect is fixed at
+        construction.
+        """
+        if (
+            self._solwyn_dialect == "anthropic"
+            and self._inspect_static_attribute(self._solwyn_client, "beta") is not None
+        ):
+            return _AsyncAnthropicBetaProxy(self)
+        return self._resolve_public_attribute(
+            self._solwyn_client,
+            name="beta",
+            path="beta",
+            source=SurfaceSource.RAW,
+        )
+
+    @functools.cached_property
     def models(self) -> Any:
         """google-genai: client.models generation goes through interception.
 
@@ -4057,13 +4157,25 @@ class AsyncSolwyn(_SolwynBase):
             if on_dispatch is not None:
                 on_dispatch()
             return await method(**call_kwargs)
-        method, call_kwargs = runtime.adapter.prepare_call(
-            client,
-            cast("dict[str, Any]", kwargs),
-            is_streaming=is_streaming,
-            timeout=read_timeout,
-            max_retries=max_retries,
-        )
+        if surface == _BETA_MESSAGES_SURFACE:
+            prepare_beta = _beta_messages_preparer(runtime.adapter)
+            if prepare_beta is None:
+                raise UnsupportedSurfaceError(
+                    surface="beta.messages.create", provider=runtime.adapter.name
+                )
+            method, call_kwargs = prepare_beta(
+                client,
+                cast("dict[str, Any]", kwargs),
+                is_streaming=is_streaming,
+            )
+        else:
+            method, call_kwargs = runtime.adapter.prepare_call(
+                client,
+                cast("dict[str, Any]", kwargs),
+                is_streaming=is_streaming,
+                timeout=read_timeout,
+                max_retries=max_retries,
+            )
         if on_dispatch is not None:
             on_dispatch()
         return await method(**call_kwargs)
@@ -4416,6 +4528,10 @@ class AsyncSolwyn(_SolwynBase):
             raise UnsupportedSurfaceError(
                 surface=f"responses.{_responses_leaf}", provider=primary.adapter.name
             )
+        if _surface == _BETA_MESSAGES_SURFACE and _beta_messages_preparer(primary.adapter) is None:
+            raise UnsupportedSurfaceError(
+                surface="beta.messages.create", provider=primary.adapter.name
+            )
         deadline = Deadline(self._solwyn_config.failover_total_timeout)
 
         request_semantics = kwargs
@@ -4464,8 +4580,13 @@ class AsyncSolwyn(_SolwynBase):
                 self._solwyn_config.lease_output_bound_default,
             )
         else:
-            fallback_providers = [r.entry.provider.value for r in self._solwyn_runtimes[1:]]
-            fallback_models = [r.entry.model for r in self._solwyn_runtimes[1:]]
+            fallback_runtimes = (
+                _beta_messages_runtimes(self._solwyn_runtimes[1:], primary)
+                if _surface == _BETA_MESSAGES_SURFACE
+                else self._solwyn_runtimes[1:]
+            )
+            fallback_providers = [r.entry.provider.value for r in fallback_runtimes]
+            fallback_models = [r.entry.model for r in fallback_runtimes]
             estimated_output_bound = _effective_output_bound(
                 primary=primary,
                 runtimes=self._solwyn_runtimes,
@@ -4589,6 +4710,8 @@ class AsyncSolwyn(_SolwynBase):
             candidates = [
                 c for c in candidates if c is primary and _responses_preparer(c.adapter) is not None
             ]
+        elif _surface == _BETA_MESSAGES_SURFACE:
+            candidates = _beta_messages_runtimes(candidates, primary)
         if not candidates:
             self._solwyn_budget.release_reservation(
                 call_id,

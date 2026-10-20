@@ -1077,6 +1077,48 @@ def test_decisions_metering_is_native_only_with_separate_raw_and_report_scopes(p
 
 @pytest.mark.unit
 @pytest.mark.parametrize("mode", ["sync", "async"])
+def test_anthropic_beta_messages_create_is_metered_and_other_beta_leaves_stay_raw(
+    mode: str,
+) -> None:
+    context = SurfaceContext("anthropic", "anthropic", "anthropic_sdk", mode)
+    create = resolve_surface_rule(
+        context=context, path="beta.messages.create", source=SurfaceSource.RAW
+    )
+    ga_create = resolve_surface_rule(
+        context=context, path="messages.create", source=SurfaceSource.RAW
+    )
+    assert create is not None
+    assert ga_create is not None
+    assert create.kind is SurfaceKind.METERED
+    assert create.source is SurfaceSource.BOTH
+    assert create.usage_basis is UsageBasis.PROVIDER
+    assert create.acknowledgment_token is None
+    assert create.to_data() | {"id": None, "surface": None, "token": None} == (
+        ga_create.to_data() | {"id": None, "surface": None, "token": None}
+    )
+    assert (
+        resolve_surface_rule(
+            context=context, path="beta.messages.create", source=SurfaceSource.WRAPPER
+        )
+        is create
+    )
+    for path in (
+        "beta.messages.stream",
+        "beta.messages.parse",
+        "beta.messages.tool_runner",
+        "beta.messages.count_tokens",
+        "beta.messages.batches.create",
+        "beta.messages.with_raw_response.create",
+        "beta.messages.with_streaming_response.create",
+    ):
+        raw = resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW)
+        assert raw is not None, path
+        assert raw.kind is SurfaceKind.UNMETERED_SPEND, path
+        assert raw.acknowledgment_token == path
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["sync", "async"])
 def test_together_241_operations_and_mirrors_remain_exact_untracked_surfaces(mode: str) -> None:
     # Rollback reapplies deployed pods; clusters provision GPUs/storage; training
     # and sampling consume compute. Even their read helpers remain unmetered.
