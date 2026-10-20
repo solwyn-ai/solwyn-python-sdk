@@ -27,7 +27,7 @@ Other OpenAI-compatible endpoints (Groq, OpenRouter, vLLM, …) ride the `openai
 
 | Provider SDK | Declared floor | Tested breakpoints (including floor) | Latest tested |
 |---|---|---|---|
-| `openai` | `openai>=2.0` | `openai==2.0.0`, `openai==2.2.0`, `openai==2.21.0`, `openai==2.34.0`, `openai==2.52.0` | `openai==3.33.0` |
+| `openai` | `openai>=2.0` | `openai==2.0.0`, `openai==2.2.0`, `openai==2.21.0`, `openai==2.34.0`, `openai==2.52.0` | `openai==3.35.1` |
 | `anthropic` | `anthropic>=0.50` | `anthropic==0.50.0`, `anthropic==0.80.0`, `anthropic==1.0.0`, `anthropic==1.14.0` | `anthropic==1.15.0` |
 | `together` | `together>=2.0` | `together==2.0.0` | `together==2.41.0` |
 | `google-genai` | `google-genai>=1.0` | `google-genai==1.0.0`, `google-genai==1.60.0`, `google-genai==2.0.0` | `google-genai==2.31.0` |
@@ -469,7 +469,7 @@ dispatch behavior and includes provider-chain usage guarantees.
 
 For CI, pin an independently reviewed literal fingerprint. This example is the
 exhaustive strict, unacknowledged fingerprint exercised against
-`openai==3.33.0` by this repository's real-client test:
+`openai==3.35.1` by this repository's real-client test:
 
 ```python
 from openai import OpenAI
@@ -484,7 +484,7 @@ audit_client = Solwyn(
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
     guarded_namespaces="sha256:e3edd2abe9714eeab5344630a736407879cbcca27adace00b33bcf6f4aa3451a",
     tracked="sha256:a36c56e2099daf5e86aea8e925500ffc6792cb33d5dce377af742cbdd1e8c776",
-    untracked="sha256:261a7560c9b522ffe74db934f54e6546376b51c0834669f73afc23b5a8744147",
+    untracked="sha256:fdce28f78652383973d274e27f132bf17055f05361c199c97daa11f739810fa6",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     scoped_escapes="sha256:a4f9670a680f5f35c1b64068a208f0eb14859ab845e34e33e7bf9febb9421815",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",

@@ -1017,6 +1017,33 @@ def test_openai_333_operations_and_mirrors_remain_exact_untracked_surfaces(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("provider", ["openai", "azure_openai", "openai_compatible", "together"])
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_openai_335_realtime_translations_connect_matches_realtime_connect(
+    provider: str, mode: str
+) -> None:
+    # A realtime translation websocket session, like realtime.connect: an exact
+    # unmetered operation with no HTTP raw/streaming counterpart.
+    context = SurfaceContext(provider, "openai", "openai_sdk", mode)
+    _assert_unmetered_operation(context, "realtime.translations.connect")
+    connect = resolve_surface_rule(
+        context=context, path="realtime.translations.connect", source=SurfaceSource.RAW
+    )
+    precedent = resolve_surface_rule(
+        context=context, path="realtime.connect", source=SurfaceSource.RAW
+    )
+    assert connect is not None and precedent is not None
+    assert connect.selectors == precedent.selectors
+    for path in (
+        "realtime.translations.with_raw_response.connect",
+        "realtime.translations.with_streaming_response.connect",
+        "realtime.with_raw_response.translations.connect",
+        "with_raw_response.realtime.translations.connect",
+    ):
+        assert resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW) is None
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "provider", ["openai", "azure_openai", "openai_compatible", "together", "groq"]
 )
