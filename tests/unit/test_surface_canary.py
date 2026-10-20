@@ -626,10 +626,10 @@ def test_canary_is_required_by_local_and_structural_interval_gates() -> None:
     workflow = yaml.safe_load(workflow_text)
     provider_steps = workflow["jobs"]["provider-surface-inventory"]["steps"]
     provider_commands = "\n".join(str(step.get("run", "")) for step in provider_steps)
-    canary_steps = [
+    batch_steps = [
         step
         for step in provider_steps
-        if "tests/unit/test_surface_canary.py" in str(step.get("run", ""))
+        if "scripts/run_provider_surface_intervals.py" in str(step.get("run", ""))
     ]
     standard_test_steps = str(workflow["jobs"]["test"]["steps"])
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
@@ -640,11 +640,9 @@ def test_canary_is_required_by_local_and_structural_interval_gates() -> None:
     source = Path(__file__).read_text(encoding="utf-8")
 
     # Assert
-    assert "pytest tests/unit/test_surface_canary.py" in provider_commands
-    assert "pyyaml>=6.0" in provider_commands
-    assert len(canary_steps) == 1
-    assert canary_steps[0]["if"] == "always()"
-    assert canary_steps[0]["env"][CANARY_FAMILY_ENV] == "${{ matrix.family }}"
+    assert "--intervals-json" in provider_commands
+    assert len(batch_steps) == 1
+    assert batch_steps[0]["env"]["SURFACE_INTERVALS"] == "${{ toJSON(matrix.intervals) }}"
     assert workflow["permissions"] == {"contents": "read"}
     assert "aioboto3" not in standard_test_steps
     assert "--ignore=tests/unit/test_surface_canary.py" in standard_test_steps
