@@ -136,6 +136,31 @@ derived from git tags (hatch-vcs).
   raw and streaming response helpers use `raw_response`. These admissions
   change pinned `CoverageFingerprint` values when upgrading from Solwyn 0.8.0,
   where the paths were `unknown`.
+- **OpenAI SDK 3.37 support.** Coverage reports recognize
+  `audio.voice_consents` (create, retrieve, update, list, delete), classified
+  like `audio.voices`: a guarded namespace whose operations are unmetered,
+  follow `on_unmetered`, and require exact acknowledgment tokens in strict
+  mode, with raw and streaming response helpers in their separate
+  acknowledgment scope. Coverage fingerprints are refreshed for this admission.
+- **Anthropic SDK 2.3 support.** Anthropic 2.x needs no wrapper change: beta
+  Messages metering and compaction settlement work unchanged now that the
+  SDK no longer sends a `?beta=true` query. Coverage reports recognize
+  `beta.messages.thread`, whose server-held thread turns Solwyn cannot budget
+  or settle, so it is unmetered, follows `on_unmetered`, and requires its
+  exact acknowledgment token in strict mode. The new administration APIs
+  `beta.organization.webhooks`, `beta.organization.claude_tag`, and
+  `beta.organization.analytics.cost` / `.usage` are classified like their
+  sibling administration operations. Coverage fingerprints are refreshed for
+  this admission.
+- **Together SDK 3.0 support.** Together 3.0 promotes `beta.endpoints`,
+  `beta.models`, and `beta.organization` to the top-level `endpoints`,
+  `models`, and `organization` resources. Each promoted path is classified
+  exactly like its `beta.*` predecessor, and the new `organization.usage.costs`
+  report is unmetered. Native `Together` / `AsyncTogether` chat completions
+  stay metered on 3.0's new inference host and base URL. The surface canary
+  keeps `together==2.41.0` as a tested breakpoint, so the 2.x `beta.*`
+  classifications stay covered. Coverage fingerprints are refreshed for this
+  admission.
 
 ### Fixed
 

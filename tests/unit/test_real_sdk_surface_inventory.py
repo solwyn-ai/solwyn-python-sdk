@@ -527,6 +527,7 @@ def test_real_sdk_inventory_is_offline_deterministic_and_content_free(
                 "realtime.translations.client_secrets.create",
                 "beta.agents.sessions.traces.list",
                 "beta.agents.sessions.turns.items.list",
+                "audio.voice_consents.create",
             },
         ),
         (
@@ -538,13 +539,15 @@ def test_real_sdk_inventory_is_offline_deterministic_and_content_free(
                 "beta.environments.work.ack",
                 "beta.environments.work.with_raw_response.update",
                 "beta.environments.work.with_streaming_response.poll",
+                "beta.messages.thread",
+                "beta.organization.webhooks.create",
+                "beta.organization.claude_tag.slack_channels.create",
             },
         ),
         (
             "together_native_sync",
             {
                 "rerank.create",
-                "code_interpreter.execute",
                 "evals.create",
                 "videos.create",
                 "beta.jig.rollback",
@@ -554,6 +557,9 @@ def test_real_sdk_inventory_is_offline_deterministic_and_content_free(
                 "post_training.operations.sample",
                 "post_training.prepare_for_fp4_inference.create",
                 "projects.list",
+                "endpoints.rollouts.create",
+                "models.create",
+                "organization.usage.costs.list",
             },
         ),
         (
