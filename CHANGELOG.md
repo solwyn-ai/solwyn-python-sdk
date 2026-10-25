@@ -5,7 +5,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
-## [Unreleased]
+## [0.9.0] - 2026-10-25
+
+The SDK now meters Anthropic `beta.messages.create` and OpenAI
+`decisions.create`, and counts Anthropic server-side compaction in settled
+token usage. A new opt-in OpenTelemetry layer correlates metadata events with
+the caller's active trace and can emit content-free `solwyn.call` and
+`solwyn.run` spans. Runs stepped by fresh-context generators such as
+Starlette `StreamingResponse` keep their attribution, wrapped Anthropic Bedrock
+clients keep the caller's transport and AWS profile, and strict mode no longer
+refuses `client.timeout` reads. The SDK is tested against the new anthropic
+2.x and together 3.x majors, and the surface canary admits openai 3.33
+through 3.37, anthropic 1.15 through 2.3, together 2.41 and 3.0, and
+google-genai 2.31. Ships #88 through #102.
+
+Wire-contract change is API-first: Solwyn Cloud accepts the `compaction_*`
+`token_details` keys and the optional `trace_id` / `span_id` / `trace_sampled`
+metadata fields before this SDK releases.
 
 ### Added
 
