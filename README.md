@@ -27,12 +27,12 @@ Other OpenAI-compatible endpoints (Groq, OpenRouter, vLLM, …) ride the `openai
 
 | Provider SDK | Declared floor | Tested breakpoints (including floor) | Latest tested |
 |---|---|---|---|
-| `openai` | `openai>=2.0` | `openai==2.0.0`, `openai==2.2.0`, `openai==2.21.0`, `openai==2.34.0`, `openai==2.52.0` | `openai==3.35.1` |
-| `anthropic` | `anthropic>=0.50` | `anthropic==0.50.0`, `anthropic==0.80.0`, `anthropic==1.0.0`, `anthropic==1.14.0` | `anthropic==1.16.0` |
-| `together` | `together>=2.0` | `together==2.0.0` | `together==2.41.0` |
-| `google-genai` | `google-genai>=1.0` | `google-genai==1.0.0`, `google-genai==1.60.0`, `google-genai==2.0.0` | `google-genai==2.31.0` |
+| `openai` | `openai>=2.0` | `openai==2.0.0`, `openai==2.2.0`, `openai==2.21.0`, `openai==2.34.0`, `openai==2.52.0` | `openai==3.37.0` |
+| `anthropic` | `anthropic>=0.50` | `anthropic==0.50.0`, `anthropic==0.80.0`, `anthropic==1.0.0`, `anthropic==1.14.0` | `anthropic==2.3.0` |
+| `together` | `together>=2.0` | `together==2.0.0`, `together==2.41.0` | `together==3.0.0` |
+| `google-genai` | `google-genai>=1.0` | `google-genai==1.0.0`, `google-genai==1.60.0`, `google-genai==2.0.0` | `google-genai==2.33.0` |
 | `google-generativeai` | `google-generativeai>=0.8.5` | `google-generativeai==0.8.5` | `google-generativeai==0.8.6` |
-| `bedrock` | `boto3>=1.34` | `aioboto3==13.0.0`, `aioboto3==13.4.0`, `aioboto3==15.0.0`, `aioboto3==15.5.0` | `boto3==1.43.68`, `aioboto3==15.5.0` |
+| `bedrock` | `boto3>=1.34` | `aioboto3==13.0.0`, `aioboto3==13.4.0`, `aioboto3==15.0.0`, `aioboto3==15.5.0` | `boto3==1.43.118`, `aioboto3==15.5.0` |
 
 Floors come from the install extras in `pyproject.toml`; the legacy
 `google-generativeai` floor is declared in the dev extra, and that SDK must be
@@ -485,7 +485,7 @@ dispatch behavior and includes provider-chain usage guarantees.
 
 For CI, pin an independently reviewed literal fingerprint. This example is the
 exhaustive strict, unacknowledged fingerprint exercised against
-`openai==3.35.1` by this repository's real-client test:
+`openai==3.37.0` by this repository's real-client test:
 
 ```python
 from openai import OpenAI
@@ -498,11 +498,11 @@ audit_client = Solwyn(
 )
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
-    guarded_namespaces="sha256:e3edd2abe9714eeab5344630a736407879cbcca27adace00b33bcf6f4aa3451a",
+    guarded_namespaces="sha256:9ea13020464d009b7857e0eb04e31c392d28fa8491fec545b309e37e83dce13b",
     tracked="sha256:a36c56e2099daf5e86aea8e925500ffc6792cb33d5dce377af742cbdd1e8c776",
-    untracked="sha256:fdce28f78652383973d274e27f132bf17055f05361c199c97daa11f739810fa6",
+    untracked="sha256:59bce56e917e7bd253adb77b8d83406fa5f5d1d5cb8b040d42ff9b42d053286c",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    scoped_escapes="sha256:a4f9670a680f5f35c1b64068a208f0eb14859ab845e34e33e7bf9febb9421815",
+    scoped_escapes="sha256:4d53dc944ec1aa82d6a9fd5876b3007da89dc453bf4f71b3b81c195882c704d9",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     unsupported="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     conditional="sha256:ce837f71d1fc97849872c5d0f86b0b1f26e1bc4e46a29c3b1b8004bf4b9bcb77",

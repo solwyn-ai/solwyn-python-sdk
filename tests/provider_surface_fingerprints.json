@@ -77,17 +77,17 @@
       "distributions": [
         {
           "name": "anthropic",
-          "version": "1.16.0"
+          "version": "2.3.0"
         }
       ],
       "mode": "async",
-      "namespace_count": 871,
-      "observation_count": 3695,
+      "namespace_count": 957,
+      "observation_count": 4020,
       "provider": "anthropic",
       "service_model_operation_count": 0,
       "shape_key": "anthropic_async",
       "structural_interval": "latest",
-      "structure_sha256": "1993cddb1112a9ff43f595aae2563e8c60142eb110a6987165f6d6c58d8255b5",
+      "structure_sha256": "f1b19c5a479f2b79509f33c5b2fe3e6308d6f2fd32d486a77fe9881b985c6d93",
       "variant": "native"
     },
     {
@@ -167,17 +167,17 @@
       "distributions": [
         {
           "name": "anthropic",
-          "version": "1.16.0"
+          "version": "2.3.0"
         }
       ],
       "mode": "sync",
-      "namespace_count": 871,
-      "observation_count": 3692,
+      "namespace_count": 957,
+      "observation_count": 4017,
       "provider": "anthropic",
       "service_model_operation_count": 0,
       "shape_key": "anthropic_sync",
       "structural_interval": "latest",
-      "structure_sha256": "e78fcc8c3d22d7c7ce0681d631790dcd9104a1a0360a9ae0060f3e6b84bb92f3",
+      "structure_sha256": "1bee24ae9884c3085d2585a3cf557103e1e0b788ac8a0492961910d50bd5a365",
       "variant": "native"
     },
     {
@@ -203,17 +203,17 @@
       "distributions": [
         {
           "name": "openai",
-          "version": "3.35.1"
+          "version": "3.37.0"
         }
       ],
       "mode": "async",
-      "namespace_count": 1017,
-      "observation_count": 4106,
+      "namespace_count": 1024,
+      "observation_count": 4148,
       "provider": "azure_openai",
       "service_model_operation_count": 0,
       "shape_key": "azure_openai_async",
       "structural_interval": "latest",
-      "structure_sha256": "c69b752be6ccc18998015f16b9b0282cb3c220dd9b7783cd8b824a458618f2ba",
+      "structure_sha256": "80d5d75e2be81d29d0a4acf9e6f7fbc5e940acf343aee99f36da696d452adeaf",
       "variant": "azure"
     },
     {
@@ -311,17 +311,17 @@
       "distributions": [
         {
           "name": "openai",
-          "version": "3.35.1"
+          "version": "3.37.0"
         }
       ],
       "mode": "sync",
-      "namespace_count": 1017,
-      "observation_count": 4106,
+      "namespace_count": 1024,
+      "observation_count": 4148,
       "provider": "azure_openai",
       "service_model_operation_count": 0,
       "shape_key": "azure_openai_sync",
       "structural_interval": "latest",
-      "structure_sha256": "f5dd500b4ae09d2855ee0ab94453a08c7a539c5ea8331c8911c9c9b74e4291b2",
+      "structure_sha256": "dba72bea805936ade3f68cb1ff9cb2dac99dcf539cf75d516c965631e4b9aafe",
       "variant": "azure"
     },
     {
@@ -715,7 +715,7 @@
       "distributions": [
         {
           "name": "google-genai",
-          "version": "2.31.0"
+          "version": "2.33.0"
         }
       ],
       "mode": "async",
@@ -787,7 +787,7 @@
       "distributions": [
         {
           "name": "google-genai",
-          "version": "2.31.0"
+          "version": "2.33.0"
         }
       ],
       "mode": "sync",
@@ -859,17 +859,17 @@
       "distributions": [
         {
           "name": "openai",
-          "version": "3.35.1"
+          "version": "3.37.0"
         }
       ],
       "mode": "async",
-      "namespace_count": 1017,
-      "observation_count": 4106,
+      "namespace_count": 1024,
+      "observation_count": 4148,
       "provider": "openai_compatible",
       "service_model_operation_count": 0,
       "shape_key": "openai_compatible_async",
       "structural_interval": "latest",
-      "structure_sha256": "94166d3fab8f8f63909b6da34e43c50acefa9faf058e4dafb9d0130381481417",
+      "structure_sha256": "8f25e49da413c793929c05b96b13559bc39cc5e5605ce438d606178ef3eff17e",
       "variant": "generic_compatible"
     },
     {
@@ -967,17 +967,17 @@
       "distributions": [
         {
           "name": "openai",
-          "version": "3.35.1"
+          "version": "3.37.0"
         }
       ],
       "mode": "sync",
-      "namespace_count": 1017,
-      "observation_count": 4106,
+      "namespace_count": 1024,
+      "observation_count": 4148,
       "provider": "openai_compatible",
       "service_model_operation_count": 0,
       "shape_key": "openai_compatible_sync",
       "structural_interval": "latest",
-      "structure_sha256": "b663704cf9fc2ae5708c0ac050c279efb6f56d355dee4497f4409812af18c2cd",
+      "structure_sha256": "0c5e5d1674ebfbaf1c5f9c776457f34aea4cd06f0e2006355026c1fe8b93dca7",
       "variant": "generic_compatible"
     },
     {
@@ -1075,17 +1075,17 @@
       "distributions": [
         {
           "name": "openai",
-          "version": "3.35.1"
+          "version": "3.37.0"
         }
       ],
       "mode": "async",
-      "namespace_count": 1017,
-      "observation_count": 4106,
+      "namespace_count": 1024,
+      "observation_count": 4148,
       "provider": "openai",
       "service_model_operation_count": 0,
       "shape_key": "openai_native_async",
       "structural_interval": "latest",
-      "structure_sha256": "2033a9350365cc0eea90392329566aaa41ef6bba26f346f33ceed9dd061720bf",
+      "structure_sha256": "5be8a88926041b4ccf3b789e3058f8ac674f74df2781518d0321d1d56d0681f0",
       "variant": "native"
     },
     {
@@ -1183,17 +1183,17 @@
       "distributions": [
         {
           "name": "openai",
-          "version": "3.35.1"
+          "version": "3.37.0"
         }
       ],
       "mode": "sync",
-      "namespace_count": 1017,
-      "observation_count": 4106,
+      "namespace_count": 1024,
+      "observation_count": 4148,
       "provider": "openai",
       "service_model_operation_count": 0,
       "shape_key": "openai_native_sync",
       "structural_interval": "latest",
-      "structure_sha256": "ce17fd57f7252db8f3e09f0fb8569a331efe0e640d13465095d1c789ea68ed4a",
+      "structure_sha256": "2d89a75a975e68ec2a5bee818c60261ba66121cbf16fd34afb300387f46dd2b3",
       "variant": "native"
     },
     {
@@ -1291,17 +1291,17 @@
       "distributions": [
         {
           "name": "openai",
-          "version": "3.35.1"
+          "version": "3.37.0"
         }
       ],
       "mode": "async",
-      "namespace_count": 1017,
-      "observation_count": 4106,
+      "namespace_count": 1024,
+      "observation_count": 4148,
       "provider": "together",
       "service_model_operation_count": 0,
       "shape_key": "openai_together_async",
       "structural_interval": "latest",
-      "structure_sha256": "3d2698a1846dd93f9a240581488338e782023c22e4a1cd3977c0102810e33cba",
+      "structure_sha256": "174b7da085dbb121c777925f291035152576015b03700c10cad3d5c1ac6cb539",
       "variant": "openai_compatible"
     },
     {
@@ -1399,17 +1399,17 @@
       "distributions": [
         {
           "name": "openai",
-          "version": "3.35.1"
+          "version": "3.37.0"
         }
       ],
       "mode": "sync",
-      "namespace_count": 1017,
-      "observation_count": 4106,
+      "namespace_count": 1024,
+      "observation_count": 4148,
       "provider": "together",
       "service_model_operation_count": 0,
       "shape_key": "openai_together_sync",
       "structural_interval": "latest",
-      "structure_sha256": "d2d11dc0e529c49e908cef1683be2c790ef13e46e0f571233e9ab591da15c146",
+      "structure_sha256": "1f8f83ab911c1e08a94fab65e103f6e89378c9c149a44a21024cc5579934543b",
       "variant": "openai_compatible"
     },
     {
@@ -1507,6 +1507,24 @@
       "distributions": [
         {
           "name": "together",
+          "version": "3.0.0"
+        }
+      ],
+      "mode": "async",
+      "namespace_count": 306,
+      "observation_count": 1495,
+      "provider": "together",
+      "service_model_operation_count": 0,
+      "shape_key": "together_native_async",
+      "structural_interval": "latest",
+      "structure_sha256": "4ddf38d81eb2967132102048738659a79f2acf56ea7ea573a1a3393b5d10d5ab",
+      "variant": "native"
+    },
+    {
+      "client_shape": "native_together",
+      "distributions": [
+        {
+          "name": "together",
           "version": "2.41.0"
         }
       ],
@@ -1516,8 +1534,8 @@
       "provider": "together",
       "service_model_operation_count": 0,
       "shape_key": "together_native_async",
-      "structural_interval": "latest",
-      "structure_sha256": "bd8538547c1039ac3d162dfbf9eed5365954357ea53d00ba31899f97fc8750ea",
+      "structural_interval": "together-beta-resources",
+      "structure_sha256": "53f9d5a2d7b3385d8ae4110472094e7c597e15ea0c20adf41351ca9b0f2fafae",
       "variant": "native"
     },
     {
@@ -1543,6 +1561,24 @@
       "distributions": [
         {
           "name": "together",
+          "version": "3.0.0"
+        }
+      ],
+      "mode": "sync",
+      "namespace_count": 306,
+      "observation_count": 1495,
+      "provider": "together",
+      "service_model_operation_count": 0,
+      "shape_key": "together_native_sync",
+      "structural_interval": "latest",
+      "structure_sha256": "aa11574905f35d6c38a00378fe13a77aa8d97ba1f0204f81c857de1a5362b60b",
+      "variant": "native"
+    },
+    {
+      "client_shape": "native_together",
+      "distributions": [
+        {
+          "name": "together",
           "version": "2.41.0"
         }
       ],
@@ -1552,8 +1588,8 @@
       "provider": "together",
       "service_model_operation_count": 0,
       "shape_key": "together_native_sync",
-      "structural_interval": "latest",
-      "structure_sha256": "c835b8d5f350cb8fae9c1fac70dee8c3fe0d0689e04be52944d98bc66872c08e",
+      "structural_interval": "together-beta-resources",
+      "structure_sha256": "6f78e89460a1dd2a7052a85bc97bd5eceb27de2a1362a5d2dbe6dd19cb8eb415",
       "variant": "native"
     }
   ],

@@ -228,8 +228,8 @@ async def test_beta_messages_create_settles_compaction_iterations(
     # The beta request reached the provider untouched.
     assert len(seen) == 1
     request = seen[0]
+    # anthropic 2.3 stopped sending ``?beta=true``; the header marks the beta call.
     assert request.url.path == "/v1/messages"
-    assert request.url.params.get("beta") == "true"
     assert request.headers["anthropic-beta"] == beta
     body = json.loads(request.content)
     for key, value in request_fields.items():
@@ -428,7 +428,7 @@ def test_beta_call_fails_over_to_same_provider_model_on_the_beta_surface() -> No
     assert len(primary_seen) == 1
     assert len(fallback_seen) == 1
     request = fallback_seen[0]
-    assert request.url.params.get("beta") == "true"
+    assert request.url.path == "/v1/messages"
     assert request.headers["anthropic-beta"] == _ON_DEMAND_BETA
     body = json.loads(request.content)
     assert body["model"] == "claude-haiku-5"

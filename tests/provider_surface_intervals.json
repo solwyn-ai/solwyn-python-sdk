@@ -15,6 +15,7 @@
     {"family": "anthropic", "interval": "latest", "packages": "anthropic>=0.50"},
 
     {"family": "together", "interval": "floor", "packages": "together==2.0.0"},
+    {"family": "together", "interval": "together-beta-resources", "packages": "together==2.41.0"},
     {"family": "together", "interval": "latest", "packages": "together>=2.0"},
 
     {"family": "google-genai", "interval": "floor", "packages": "google-genai==1.0.0"},
