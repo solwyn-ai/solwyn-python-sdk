@@ -539,22 +539,14 @@ _OUTPUT_CAP_KEYS = frozenset(
 _EXTRA_BODY_BOUND_KEYS = frozenset(
     {"max_tokens", "max_completion_tokens", "n", "enable_thinking", "thinking_budget"}
 )
-# Bedrock additionalModelRequestFields keys that would set a cap or a count
-# outside inferenceConfig, where Solwyn cannot hold them to the bound.
-_BEDROCK_OVERRIDE_KEYS = frozenset(
-    {
-        "max_tokens",
-        "maxTokens",
-        "max_gen_len",
-        "max_new_tokens",
-        "max_output_tokens",
-        "maxOutputTokens",
-        "n",
-        "candidate_count",
-        "candidateCount",
-        "num_return_sequences",
-    }
-)
+# Under hard_deny a body extension may carry ONLY keys the bound accounts for
+# (or that cannot change output length or the model). Anything else, `model`
+# included, is refused: an allowlist, because blocklists missed aliases.
+_OPENAI_EXTRA_BODY_ALLOWED = frozenset({"max_tokens", "max_completion_tokens", "n"})
+_QWEN_EXTRA_BODY_ALLOWED = _OPENAI_EXTRA_BODY_ALLOWED | {"enable_thinking", "thinking_budget"}
+_ANTHROPIC_EXTRA_BODY_ALLOWED = frozenset({"max_tokens"})
+# Anthropic-style thinking: the API requires budget_tokens < maxTokens.
+_BEDROCK_MODEL_FIELDS_ALLOWED = frozenset({"thinking"})
 _GOOGLE_CAP_KEYS = ("max_output_tokens", "maxOutputTokens")
 _GOOGLE_COUNT_KEYS = ("candidate_count", "candidateCount")
 # First Azure OpenAI api-version that accepts max_completion_tokens.
@@ -650,9 +642,10 @@ _OUTPUT_BOUND_HINTS: dict[OutputBoundReason, str] = {
         "does not include reasoning. Set a positive thinking budget, turn reasoning off, "
         "or use a non-reasoning model."
     ),
-    "client_body_override": (
-        "Move output limits out of body overrides, provider options, or "
-        "additionalModelRequestFields and into the request's own cap parameters."
+    "unsupported_override": (
+        "Remove keys Solwyn cannot account for from request body extensions (body "
+        "overrides, provider options, extraBody, or additionalModelRequestFields), "
+        "and set output limits with the request's own cap parameters."
     ),
     "azure_api_version": (
         "Set max_tokens or max_completion_tokens on the call, or use an Azure OpenAI "
@@ -665,8 +658,17 @@ _OUTPUT_BOUND_HINTS: dict[OutputBoundReason, str] = {
 }
 
 
-def _merged_body(kwargs: dict[str, object], *, strict: bool) -> dict[str, object]:
-    """The body the OpenAI and Anthropic SDKs send: extra_body keys win."""
+def _merged_body(
+    kwargs: dict[str, object],
+    *,
+    strict: bool,
+    allowed: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    """The body the OpenAI and Anthropic SDKs send: extra_body keys win.
+
+    Strict mode also enforces the hard_deny allowlist: an extra_body key
+    outside ``allowed`` (which these SDKs send verbatim) refuses the call.
+    """
     extra = kwargs.get("extra_body")
     if extra is None:
         return kwargs
@@ -674,6 +676,8 @@ def _merged_body(kwargs: dict[str, object], *, strict: bool) -> dict[str, object
         if strict:
             raise _UnboundableOutput("malformed_cap_container")
         return kwargs
+    if strict and not allowed.issuperset(extra):
+        raise _UnboundableOutput("unsupported_override")
     return {**kwargs, **extra}
 
 
@@ -700,7 +704,10 @@ def _reasoning_outside_cap(
     only and has no reasoning budget, so a reasoning model cannot be bounded.
     """
     if provider == ProviderName.XAI.value:
-        if strict and "non-reasoning" not in model:
+        effective_model = body.get("model")
+        if not isinstance(effective_model, str):
+            effective_model = model
+        if strict and "non-reasoning" not in effective_model:
             raise _UnboundableOutput("reasoning_without_budget")
         return 0
     if provider != ProviderName.QWEN.value:
@@ -743,12 +750,17 @@ def _google_bound_native(*layers: dict[str, object]) -> dict[str, object]:
         return {}
 
 
-def _google_body_override(http_options: object) -> bool:
-    """True when Google http_options.extra_body rewrites the generation config."""
-    extra = _nested_value(http_options, "extra_body")
-    return isinstance(extra, dict) and any(
-        key in extra for key in ("generationConfig", "generation_config")
-    )
+def _google_body_extension(http_options: object) -> bool:
+    """True when Google http_options carries a non-empty request body extension.
+
+    google-genai merges ``extra_body`` into the serialized request after
+    normalizing its keys, so no key in it can be read safely: under hard_deny
+    any content refuses, whatever its spelling.
+    """
+    extra = _nested_value(http_options, "extra_body", "extraBody")
+    # google-genai validates extra_body as a dict or None, so a non-empty
+    # mapping is the only shape that can reach the wire.
+    return isinstance(extra, Mapping) and len(extra) > 0
 
 
 def _hop_output_capacity(
@@ -773,7 +785,12 @@ def _hop_output_capacity(
     count = 1
     reasoning = 0
     if dialect == ProviderName.OPENAI.value:
-        body = _merged_body(kwargs, strict=strict)
+        allowed = (
+            _QWEN_EXTRA_BODY_ALLOWED
+            if provider == ProviderName.QWEN.value
+            else _OPENAI_EXTRA_BODY_ALLOWED
+        )
+        body = _merged_body(kwargs, strict=strict, allowed=allowed)
         caps = [
             value
             for value in (
@@ -786,15 +803,16 @@ def _hop_output_capacity(
         count = _candidate_count(body.get("n"), strict=strict)
         reasoning = _reasoning_outside_cap(provider, model, body, strict=strict)
     elif dialect == ProviderName.ANTHROPIC.value:
-        cap = _positive_output_cap(_merged_body(kwargs, strict=strict).get("max_tokens"))
+        body = _merged_body(kwargs, strict=strict, allowed=_ANTHROPIC_EXTRA_BODY_ALLOWED)
+        cap = _positive_output_cap(body.get("max_tokens"))
     elif dialect == ProviderName.GOOGLE.value:
         config = kwargs.get("config")
         if config is not None and not _is_config_container(config):
             if strict:
                 raise _UnboundableOutput("malformed_cap_container")
             config = None
-        if strict and _google_body_override(_nested_value(config, "http_options", "httpOptions")):
-            raise _UnboundableOutput("client_body_override")
+        if strict and _google_body_extension(_nested_value(config, "http_options", "httpOptions")):
+            raise _UnboundableOutput("unsupported_override")
         cap = _dialect_output_cap(dialect, {**kwargs, "config": config})
         count = _candidate_count(_nested_value(config, *_GOOGLE_COUNT_KEYS), strict=strict)
     elif dialect == ProviderName.BEDROCK.value:
@@ -804,8 +822,11 @@ def _hop_output_capacity(
                 raise _UnboundableOutput("malformed_cap_container")
             inference = None
         fields = kwargs.get("additionalModelRequestFields")
-        if strict and isinstance(fields, dict) and not _BEDROCK_OVERRIDE_KEYS.isdisjoint(fields):
-            raise _UnboundableOutput("client_body_override")
+        if strict and fields is not None:
+            if not isinstance(fields, dict):
+                raise _UnboundableOutput("malformed_cap_container")
+            if not _BEDROCK_MODEL_FIELDS_ALLOWED.issuperset(fields):
+                raise _UnboundableOutput("unsupported_override")
         cap = _nested_output_cap(inference, "maxTokens")
     if cap is None:
         if strict:
@@ -1158,6 +1179,8 @@ def _final_output_capacity(
 ) -> int:
     """Most output the final hop request can produce, or raise ``_UnboundableOutput``."""
     if surface == "responses":
+        # Nothing in a Responses body extension is folded into the bound.
+        _merged_body(kwargs, strict=True)
         cap = _positive_output_cap(kwargs.get("max_output_tokens"))
         if cap is None:
             raise _UnboundableOutput("bound_exceeded")
@@ -1175,8 +1198,8 @@ def _final_output_capacity(
             options = getattr(
                 getattr(runtime.sdk_client, "_api_client", None), "_http_options", None
             )
-            if _google_body_override(options):
-                raise _UnboundableOutput("client_body_override")
+            if _google_body_extension(options):
+                raise _UnboundableOutput("unsupported_override")
     return _hop_output_capacity(
         dialect, runtime.adapter.name, model, view, default_bound=0, strict=True
     )

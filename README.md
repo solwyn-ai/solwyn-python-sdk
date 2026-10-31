@@ -766,9 +766,23 @@ stops. `error.reason` is one of:
 | `malformed_cap_container` | Google `config`, Bedrock `inferenceConfig` or `extra_body` is not an object |
 | `malformed_candidate_count` | `n` or `candidate_count` is set but not a positive integer |
 | `reasoning_without_budget` | Qwen thinking (on by default) without a positive `thinking_budget`, or an xAI reasoning model (its cap excludes reasoning and it has no budget) |
-| `client_body_override` | Google `http_options.extra_body.generationConfig` (per request or on the client), or a cap or count key in Bedrock `additionalModelRequestFields` |
+| `unsupported_override` | A body extension carries a key Solwyn cannot account for (see below) |
 | `azure_api_version` | An uncapped Azure OpenAI call on an api-version older than 2024-09-01, which has no `max_completion_tokens` |
 | `bound_exceeded` | Any other request whose possible output exceeds the priced bound |
+
+Body extensions are allowlisted. On a `hard_deny` admission a request body
+extension may carry only keys the bound accounts for:
+
+- OpenAI-style `extra_body`: `max_tokens`, `max_completion_tokens` and `n`,
+  plus `enable_thinking` and `thinking_budget` for Qwen.
+- Anthropic `extra_body`: `max_tokens`.
+- Responses `extra_body`, and Google `http_options.extra_body` (per request or
+  on the client): nothing.
+- Bedrock `additionalModelRequestFields`: `thinking` (Anthropic models require
+  its budget to stay below `maxTokens`).
+
+Any other key, including `model`, refuses the call with
+`unsupported_override`.
 
 `error.hint` says how to fix the request. All of this applies only when Solwyn
 itself admitted the call under `hard_deny` (a check allow, or a lease whose

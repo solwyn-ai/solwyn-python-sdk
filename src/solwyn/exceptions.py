@@ -213,7 +213,7 @@ OutputBoundReason = Literal[
     "malformed_cap_container",
     "malformed_candidate_count",
     "reasoning_without_budget",
-    "client_body_override",
+    "unsupported_override",
     "azure_api_version",
     "bound_exceeded",
 ]

@@ -439,7 +439,7 @@ class TestGoogle:
                 config={"max_output_tokens": 100, "http_options": override},
             )
 
-        _refused(caught, "client_body_override")
+        _refused(caught, "unsupported_override")
         assert wire.bodies == []
 
     def test_request_body_override_is_sent_on_alert_only(self) -> None:
@@ -454,7 +454,7 @@ class TestGoogle:
 
         assert wire.bodies[0]["generationConfig"] == {"maxOutputTokens": 9000}
 
-    def test_client_body_override_is_refused(self) -> None:
+    def test_client_body_extension_is_refused(self) -> None:
         wire, plane = _Wire(_GEMINI_BODY), FakeControlPlane()
         client = _google(wire, extra_body={"generationConfig": {"maxOutputTokens": 9000}})
         with (
@@ -463,7 +463,7 @@ class TestGoogle:
         ):
             solwyn.models.generate_content(model="gemini-2.5-pro", contents="hi")
 
-        _refused(caught, "client_body_override")
+        _refused(caught, "unsupported_override")
         assert wire.bodies == []
 
     @pytest.mark.parametrize("config", [17, []])
@@ -522,7 +522,7 @@ class TestBedrock:
                 additionalModelRequestFields={"max_tokens": 9000},
             )
 
-        _refused(caught, "client_body_override")
+        _refused(caught, "unsupported_override")
 
     def test_thinking_budget_inside_max_tokens_is_sent(self) -> None:
         client, stubber = self._client()
@@ -554,3 +554,233 @@ class TestBedrock:
 
         stubber.assert_no_pending_responses()
         assert _bound(plane) == 2000
+
+
+@pytest.mark.unit
+class TestBodyExtensionAllowlist:
+    """Under hard_deny a body extension may carry only keys the bound accounts for."""
+
+    @pytest.mark.parametrize(
+        "http_options",
+        [
+            {"extraBody": {"generationConfig": {"maxOutputTokens": 9000, "candidateCount": 3}}},
+            {"extraBody": {"generation_config": {"maxOutputTokens": 9000}}},
+            {"extra_body": {"GenerationConfig": {"maxOutputTokens": 9000}}},
+            {"extra_body": {"labels": {"team": "a"}}},
+        ],
+    )
+    def test_google_request_extension_is_refused_in_any_spelling(
+        self, http_options: dict[str, Any]
+    ) -> None:
+        wire, plane = _Wire(_GEMINI_BODY), FakeControlPlane()
+        with (
+            plane.wrap(_google(wire), lease_enabled=False) as solwyn,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.models.generate_content(
+                model="gemini-2.5-pro",
+                contents="hi",
+                config={"max_output_tokens": 100, "http_options": http_options},
+            )
+
+        _refused(caught, "unsupported_override")
+        assert wire.bodies == []
+
+    def test_google_client_extension_with_any_key_is_refused(self) -> None:
+        wire, plane = _Wire(_GEMINI_BODY), FakeControlPlane()
+        client = _google(wire, extra_body={"labels": {"team": "a"}})
+        with (
+            plane.wrap(client, lease_enabled=False) as solwyn,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.models.generate_content(
+                model="gemini-2.5-pro", contents="hi", config={"max_output_tokens": 100}
+            )
+
+        _refused(caught, "unsupported_override")
+        assert wire.bodies == []
+
+    @pytest.mark.asyncio
+    async def test_async_google_request_extension_is_refused(self) -> None:
+        genai = pytest.importorskip("google.genai")
+        from google.genai import types
+
+        from solwyn.client import AsyncSolwyn
+
+        wire = _Wire(_GEMINI_BODY)
+        client = genai.Client(
+            api_key="k",
+            http_options=types.HttpOptions(
+                httpx_async_client=httpx.AsyncClient(
+                    transport=httpx.MockTransport(wire.async_handler)
+                )
+            ),
+        )
+        plane = FakeControlPlane()
+        solwyn = AsyncSolwyn(
+            client,
+            api_key=plane.api_key,
+            api_url=plane.api_url,
+            control_plane_transport=plane.transport,
+            budget_check_cache_ttl=0,
+            lease_enabled=False,
+        )
+        try:
+            with pytest.raises(OutputBoundUnenforceableError) as caught:
+                await solwyn.models.generate_content(
+                    model="gemini-2.5-pro",
+                    contents="hi",
+                    config={
+                        "max_output_tokens": 100,
+                        "http_options": {
+                            "extraBody": {"generationConfig": {"maxOutputTokens": 9000}}
+                        },
+                    },
+                )
+        finally:
+            await solwyn.close()
+
+        _refused(caught, "unsupported_override")
+        assert wire.bodies == []
+
+    def test_model_override_in_extra_body_is_refused(self) -> None:
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane()
+        with (
+            plane.wrap(_openai(wire, XAI_URL), lease_enabled=False) as solwyn,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.chat.completions.create(
+                model="grok-4-fast-non-reasoning",
+                messages=MESSAGES,
+                max_tokens=100,
+                extra_body={"model": "grok-4"},
+            )
+
+        _refused(caught, "unsupported_override")
+        assert wire.bodies == []
+
+    @pytest.mark.asyncio
+    async def test_async_model_override_in_extra_body_is_refused(self) -> None:
+        openai = pytest.importorskip("openai")
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane()
+        client = openai.AsyncOpenAI(
+            api_key="sk-test",
+            base_url=XAI_URL,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(wire.async_handler)),
+            max_retries=0,
+        )
+        async with plane.wrap_async(client, lease_enabled=False) as solwyn:
+            with pytest.raises(OutputBoundUnenforceableError) as caught:
+                await solwyn.chat.completions.create(
+                    model="grok-4-fast-non-reasoning",
+                    messages=MESSAGES,
+                    max_tokens=100,
+                    extra_body={"model": "grok-4"},
+                )
+
+        _refused(caught, "unsupported_override")
+        assert wire.bodies == []
+
+    @pytest.mark.parametrize("key", ["top_k", "Max_Tokens", "reasoning"])
+    def test_unknown_openai_extra_body_key_is_refused(self, key: str) -> None:
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane()
+        with (
+            plane.wrap(_openai(wire), lease_enabled=False) as solwyn,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-4o", messages=MESSAGES, max_tokens=100, extra_body={key: 1}
+            )
+
+        _refused(caught, "unsupported_override")
+        assert wire.bodies == []
+
+    def test_qwen_thinking_keys_are_allowed_but_not_elsewhere(self) -> None:
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane()
+        thinking = {"enable_thinking": True, "thinking_budget": 1000}
+        with plane.wrap(_openai(wire, QWEN_URL), lease_enabled=False) as solwyn:
+            solwyn.chat.completions.create(
+                model="qwen3.5-plus", messages=MESSAGES, max_tokens=100, extra_body=thinking
+            )
+        assert wire.bodies[0]["thinking_budget"] == 1000
+
+        other, plane = _Wire(_CHAT_BODY), FakeControlPlane()
+        with (
+            plane.wrap(_openai(other), lease_enabled=False) as solwyn,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-4o", messages=MESSAGES, max_tokens=100, extra_body=thinking
+            )
+        _refused(caught, "unsupported_override")
+        assert other.bodies == []
+
+    def test_unknown_extra_body_key_is_sent_on_alert_only(self) -> None:
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane(mode="alert_only")
+        with plane.wrap(_openai(wire, XAI_URL), lease_enabled=False) as solwyn:
+            solwyn.chat.completions.create(
+                model="grok-4-fast-non-reasoning",
+                messages=MESSAGES,
+                max_tokens=100,
+                extra_body={"model": "grok-4"},
+            )
+
+        assert wire.bodies[0]["model"] == "grok-4"
+
+    def test_unknown_responses_extra_body_key_is_refused(self) -> None:
+        wire = _Wire(
+            {
+                "id": "r",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "gpt-5.5",
+                "output": [],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                    "input_tokens_details": {"cached_tokens": 0},
+                    "output_tokens_details": {"reasoning_tokens": 0},
+                },
+            }
+        )
+        plane = FakeControlPlane()
+        with (
+            plane.wrap(_openai(wire), lease_enabled=False) as solwyn,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.responses.create(
+                model="gpt-5.5", input="hi", max_output_tokens=100, extra_body={"vendor": 1}
+            )
+
+        _refused(caught, "unsupported_override")
+        assert wire.bodies == []
+
+    @pytest.mark.parametrize("fields", [{"top_k": 5}, {"anthropic_beta": ["x"]}, []])
+    def test_bedrock_model_fields_outside_the_allowlist_are_refused(self, fields: object) -> None:
+        boto3 = pytest.importorskip("boto3")
+        from botocore.stub import Stubber
+
+        client = boto3.client(
+            "bedrock-runtime",
+            region_name="us-east-1",
+            aws_access_key_id="testing",
+            aws_secret_access_key="testing",
+        )
+        stubber = Stubber(client)
+        plane = FakeControlPlane()
+        with (
+            plane.wrap(client, lease_enabled=False) as solwyn,
+            stubber,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.converse(
+                modelId="anthropic.claude",
+                messages=[{"role": "user", "content": [{"text": "hi"}]}],
+                inferenceConfig={"maxTokens": 100},
+                additionalModelRequestFields=fields,
+            )
+
+        reason = "malformed_cap_container" if fields == [] else "unsupported_override"
+        _refused(caught, reason)

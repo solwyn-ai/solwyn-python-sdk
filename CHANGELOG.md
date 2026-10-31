@@ -66,11 +66,17 @@ unreachable control plane.
   any provider I/O, when its output cannot be bounded or exceeds the priced
   bound. Reasons: `malformed_cap_container`, `malformed_candidate_count`,
   `reasoning_without_budget` (Qwen thinking without a budget, xAI reasoning
-  models), `client_body_override` (Google `http_options.extra_body` that
-  rewrites the generation config, per request or on the client; cap or count
-  keys in Bedrock `additionalModelRequestFields`), `azure_api_version` (an
-  uncapped call on an api-version before 2024-09-01), and `bound_exceeded`.
-  The reservation is released and the failover chain stops.
+  models), `unsupported_override`, `azure_api_version` (an uncapped call on an
+  api-version before 2024-09-01), and `bound_exceeded`. The reservation is
+  released and the failover chain stops.
+- **Body extensions are allowlisted under `hard_deny`.** A request body
+  extension may carry only keys the bound accounts for: OpenAI-style
+  `extra_body` `max_tokens`, `max_completion_tokens` and `n` (plus Qwen
+  `enable_thinking` and `thinking_budget`), Anthropic `extra_body`
+  `max_tokens`, and Bedrock `additionalModelRequestFields` `thinking`.
+  Responses `extra_body` and Google `http_options.extra_body` (per request or
+  on the client) may carry nothing. Any other key, including `model`, refuses
+  the call with `unsupported_override`. Nothing changes outside `hard_deny`.
 - **`BudgetCheckResult.hard_deny_admitted`** (default `False`) records whether
   the call was admitted under `hard_deny` by Solwyn's own authority.
 
