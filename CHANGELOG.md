@@ -99,6 +99,18 @@ unreachable control plane.
   the xAI rule. Set `provider=` explicitly to opt out.
 - **`BudgetCheckResult.hard_deny_admitted`** (default `False`) records whether
   the call was admitted under `hard_deny` by Solwyn's own authority.
+- **OpenAI SDK 3.42 support.** Coverage reports recognize
+  `admin.organization.external_keys` (create, retrieve, list, delete,
+  validate), `beta.agents.automations` (create, retrieve, update, list,
+  delete, pause, resume) with its `invocations` (create, retrieve, list), and
+  `audio.voices.delete`. Each is classified like its siblings: a guarded
+  namespace whose operations are unmetered, follow `on_unmetered`, and require
+  exact acknowledgment tokens in strict mode, with raw and streaming response
+  helpers in their separate acknowledgment scope. An automation invocation
+  starts a server-side agent run that Solwyn cannot budget or settle, like
+  `beta.agents.sessions`, so a `hard_deny` budget does not cover it; set
+  `on_unmetered="raise"` to refuse it. Coverage fingerprints are refreshed for
+  this admission.
 
 ### Fixed
 

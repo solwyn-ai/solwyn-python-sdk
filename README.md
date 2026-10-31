@@ -27,7 +27,7 @@ Other OpenAI-compatible endpoints (Groq, OpenRouter, vLLM, …) ride the `openai
 
 | Provider SDK | Declared floor | Tested breakpoints (including floor) | Latest tested |
 |---|---|---|---|
-| `openai` | `openai>=2.0` | `openai==2.0.0`, `openai==2.2.0`, `openai==2.21.0`, `openai==2.34.0`, `openai==2.52.0` | `openai==3.37.0` |
+| `openai` | `openai>=2.0` | `openai==2.0.0`, `openai==2.2.0`, `openai==2.21.0`, `openai==2.34.0`, `openai==2.52.0` | `openai==3.42.0` |
 | `anthropic` | `anthropic>=0.50` | `anthropic==0.50.0`, `anthropic==0.80.0`, `anthropic==1.0.0`, `anthropic==1.14.0` | `anthropic==2.3.0` |
 | `together` | `together>=2.0` | `together==2.0.0`, `together==2.41.0` | `together==3.0.0` |
 | `google-genai` | `google-genai>=1.0` | `google-genai==1.0.0`, `google-genai==1.60.0`, `google-genai==2.0.0` | `google-genai==2.33.0` |
@@ -485,7 +485,7 @@ dispatch behavior and includes provider-chain usage guarantees.
 
 For CI, pin an independently reviewed literal fingerprint. This example is the
 exhaustive strict, unacknowledged fingerprint exercised against
-`openai==3.37.0` by this repository's real-client test:
+`openai==3.42.0` by this repository's real-client test:
 
 ```python
 from openai import OpenAI
@@ -498,11 +498,11 @@ audit_client = Solwyn(
 )
 
 OPENAI_STRICT_FINGERPRINT = CoverageFingerprint(
-    guarded_namespaces="sha256:9ea13020464d009b7857e0eb04e31c392d28fa8491fec545b309e37e83dce13b",
+    guarded_namespaces="sha256:cc50d96bb09e43e5ab4ab037307a27b94b165587ee4df5b7b73ed0654f9cd16d",
     tracked="sha256:a36c56e2099daf5e86aea8e925500ffc6792cb33d5dce377af742cbdd1e8c776",
-    untracked="sha256:59bce56e917e7bd253adb77b8d83406fa5f5d1d5cb8b040d42ff9b42d053286c",
+    untracked="sha256:9518cfa1e28fd9868f116814c5d02a8b78805e632d2687bd1b5100ca9bdc4f84",
     unknown="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
-    scoped_escapes="sha256:4d53dc944ec1aa82d6a9fd5876b3007da89dc453bf4f71b3b81c195882c704d9",
+    scoped_escapes="sha256:3690bc2aae88e49dfcd82a903754879e2fedad7469ea9e0f262b6e744295590b",
     blocked="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     unsupported="sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     conditional="sha256:ce837f71d1fc97849872c5d0f86b0b1f26e1bc4e46a29c3b1b8004bf4b9bcb77",
