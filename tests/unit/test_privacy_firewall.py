@@ -461,6 +461,7 @@ def test_output_bound_helpers_return_only_scalars_and_keep_inputs() -> None:
     assert secret not in repr(fields)
 
 
+@pytest.mark.unit
 def test_google_translation_source_normalizes_string_contents_ephemerally() -> None:
     kwargs = {
         "contents": "Hello",

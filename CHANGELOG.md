@@ -5,7 +5,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
-## [0.10.0] - Unreleased
+## [0.10.0] - 2026-10-31
 
 A `hard_deny` budget now bounds a call's output, not only its input. Every
 per-call budget check sends the call's output bound. On a `hard_deny` project,
