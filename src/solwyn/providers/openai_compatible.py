@@ -161,9 +161,11 @@ COMPAT_PROFILES: tuple[CompatProfile, ...] = (
             "dashscope-intl.aliyuncs.com",
             "dashscope-us.aliyuncs.com",
         ),
-        # Current Model Studio workspace endpoints:
-        # {WorkspaceId}.{region}.maas.aliyuncs.com/compatible-mode/v1.
-        host_suffixes=(".maas.aliyuncs.com",),
+        # Model Studio base URLs (help.aliyun.com/en/model-studio/base-url):
+        # regional shared hosts such as cn-hongkong.dashscope.aliyuncs.com
+        # and coding.dashscope.aliyuncs.com, and workspace, trial and token
+        # plan hosts under {name}.{region}.maas.aliyuncs.com.
+        host_suffixes=(".dashscope.aliyuncs.com", ".maas.aliyuncs.com"),
         model_prefixes=("qwen", "qwq-", "qvq-"),
     ),
     # Z.ai: live probe verified include_usage support on 2026-07-09.

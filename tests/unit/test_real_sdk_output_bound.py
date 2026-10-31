@@ -1035,15 +1035,26 @@ class _AnthropicWire:
     ``fail_first`` answers the first request with a 500.
     """
 
-    def __init__(self, *, refuse_first: bool = False, fail_first: bool = False) -> None:
+    def __init__(
+        self, *, refuse_first: bool = False, fail_first: bool = False, slow: bool = False
+    ) -> None:
         self.bodies: list[dict[str, Any]] = []
         self.refuse_first = refuse_first
         self.fail_first = fail_first
+        # Hold each request open so concurrent sends genuinely overlap.
+        self.slow = slow
 
     def handler(self, request: Any) -> Any:
-        httpx2 = pytest.importorskip("httpx2")
         body = json.loads(request.content)
         self.bodies.append(body)
+        if self.slow:
+            import time
+
+            time.sleep(0.2)
+        return self._respond(request, body)
+
+    def _respond(self, request: Any, body: dict[str, Any]) -> Any:
+        httpx2 = pytest.importorskip("httpx2")
         first = len(self.bodies) == 1
         if first and self.fail_first:
             return httpx2.Response(
@@ -1073,7 +1084,14 @@ class _AnthropicWire:
         return httpx2.Response(200, request=request, json=message)
 
     async def async_handler(self, request: Any) -> Any:
-        return self.handler(request)
+        if not self.slow:
+            return self.handler(request)
+        import asyncio
+
+        body = json.loads(request.content)
+        self.bodies.append(body)
+        await asyncio.sleep(0.05)
+        return self._respond(request, body)
 
     def client(self, *, is_async: bool = False, middleware: Any = None) -> Any:
         anthropic = pytest.importorskip("anthropic")
@@ -1143,7 +1161,11 @@ class TestAnthropicGenerationLoops:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("is_async", [False, True])
-    async def test_refusal_fallback_middleware_cannot_generate_twice(self, is_async: bool) -> None:
+    async def test_native_fallback_middleware_is_refused_before_any_request(
+        self, is_async: bool
+    ) -> None:
+        # The middleware pins the fallback in a shared BetaFallbackState, so
+        # even a later call's FIRST request could be the 9000-token fallback.
         anthropic = pytest.importorskip("anthropic")
         wire, plane = _AnthropicWire(refuse_first=True), FakeControlPlane()
         middleware = [anthropic.BetaRefusalFallbackMiddleware(_FALLBACK)]
@@ -1151,11 +1173,54 @@ class TestAnthropicGenerationLoops:
             wire.client(is_async=is_async, middleware=middleware), lease_enabled=False
         )
         try:
-            with (
-                anthropic.BetaFallbackState(),
-                pytest.raises(OutputBoundUnenforceableError) as caught,
-            ):
-                result = wrapper.beta.messages.create(
+            with anthropic.BetaFallbackState():
+                for _ in range(2):
+                    with pytest.raises(OutputBoundUnenforceableError) as caught:
+                        result = wrapper.beta.messages.create(
+                            model="claude-fable-5", messages=MESSAGES, max_tokens=100
+                        )
+                        if is_async:
+                            await result
+                    _refused(caught, "multi_generation_loop")
+        finally:
+            if is_async:
+                await wrapper.close()
+            else:
+                wrapper.close()
+
+        assert wire.bodies == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize(
+        ("rewrite", "reason"),
+        [
+            ({"model": "claude-opus-4-8"}, "unsupported_override"),
+            ({"max_tokens": 9000}, "bound_exceeded"),
+            ({"fallbacks": _FALLBACK}, "multi_generation_loop"),
+        ],
+    )
+    async def test_first_request_rewritten_by_middleware_is_refused(
+        self, is_async: bool, rewrite: dict[str, Any], reason: str
+    ) -> None:
+        wire, plane = _AnthropicWire(), FakeControlPlane()
+
+        def rewritten(request: Any) -> Any:
+            return request.copy(body={**request.json, **rewrite})
+
+        def sync_rewriter(request: Any, call_next: Any) -> Any:
+            return call_next(rewritten(request))
+
+        async def async_rewriter(request: Any, call_next: Any) -> Any:
+            return await call_next(rewritten(request))
+
+        middleware = [async_rewriter if is_async else sync_rewriter]
+        wrapper = (plane.wrap_async if is_async else plane.wrap)(
+            wire.client(is_async=is_async, middleware=middleware), lease_enabled=False
+        )
+        try:
+            with pytest.raises(OutputBoundUnenforceableError) as caught:
+                result = wrapper.messages.create(
                     model="claude-fable-5", messages=MESSAGES, max_tokens=100
                 )
                 if is_async:
@@ -1166,12 +1231,49 @@ class TestAnthropicGenerationLoops:
             else:
                 wrapper.close()
 
+        _refused(caught, reason)
+        assert wire.bodies == []
+
+    @pytest.mark.asyncio
+    async def test_concurrent_async_sends_cannot_both_generate(self) -> None:
+        import asyncio
+
+        wire, plane = _AnthropicWire(slow=True), FakeControlPlane()
+
+        async def hedge(request: Any, call_next: Any) -> Any:
+            first, _second = await asyncio.gather(call_next(request), call_next(request))
+            return first
+
+        async with plane.wrap_async(
+            wire.client(is_async=True, middleware=[hedge]), lease_enabled=False
+        ) as solwyn:
+            with pytest.raises(OutputBoundUnenforceableError) as caught:
+                await solwyn.messages.create(
+                    model="claude-fable-5", messages=MESSAGES, max_tokens=100
+                )
+
         _refused(caught, "multi_generation_loop")
-        # The refused first answer was paid; the 9000-token resend never left.
         assert len(wire.bodies) == 1
-        assert plane.confirms == []
-        receipts = [event for event in plane.ingested if event.status.value == "error"]
-        assert receipts and receipts[-1].possibly_succeeded is True
+
+    def test_concurrent_sync_sends_cannot_both_generate(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        wire, plane = _AnthropicWire(slow=True), FakeControlPlane()
+
+        def hedge(request: Any, call_next: Any) -> Any:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(call_next, request) for _ in range(2)]
+                results = [future.result() for future in futures]
+            return results[0]
+
+        with (
+            plane.wrap(wire.client(middleware=[hedge]), lease_enabled=False) as solwyn,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.messages.create(model="claude-fable-5", messages=MESSAGES, max_tokens=100)
+
+        _refused(caught, "multi_generation_loop")
+        assert len(wire.bodies) == 1
 
     def test_retry_after_a_failed_attempt_still_passes(self) -> None:
         wire, plane = _AnthropicWire(fail_first=True), FakeControlPlane()
@@ -1225,3 +1327,127 @@ class TestCurrentProviderHosts:
 
         _refused(caught, "reasoning_without_budget")
         assert caught.value.provider == "xai"
+
+
+UNKNOWN_URL = "https://llm.internal.example/v1"
+
+
+@pytest.mark.unit
+class TestModelFamilyReasoning:
+    """Under hard_deny an adapter with no reasoning rule classifies the model id."""
+
+    @pytest.mark.parametrize(
+        "host",
+        [
+            "cn-hongkong.dashscope.aliyuncs.com",
+            "coding.dashscope.aliyuncs.com",
+            "trial.cn-hongkong.maas.aliyuncs.com",
+        ],
+    )
+    def test_documented_alibaba_hosts_are_qwen(self, host: str) -> None:
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane()
+        with (
+            plane.wrap(
+                _openai(wire, f"https://{host}/compatible-mode/v1"), lease_enabled=False
+            ) as solwyn,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.chat.completions.create(model="qwen3.8-max", messages=MESSAGES, max_tokens=100)
+
+        _refused(caught, "reasoning_without_budget")
+        assert caught.value.provider == "qwen"
+        assert wire.bodies == []
+
+    @pytest.mark.parametrize(
+        ("base_url", "model", "provider"),
+        [
+            (UNKNOWN_URL, "qwen3.8-max", "openai_compatible"),
+            (UNKNOWN_URL, "QwQ-32B", "openai_compatible"),
+            ("https://dashscope.aliyuncs.com.evil.example/v1", "qwen3.8-max", "openai_compatible"),
+            ("https://api.together.xyz/v1", "Qwen/Qwen3-235B-A22B", "together"),
+            (UNKNOWN_URL, "grok-4", "openai_compatible"),
+            ("https://openrouter.ai/api/v1", "x-ai/grok-4", "openrouter"),
+        ],
+    )
+    def test_family_model_on_a_host_without_a_rule_is_refused(
+        self, base_url: str, model: str, provider: str
+    ) -> None:
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane()
+        with (
+            plane.wrap(_openai(wire, base_url), lease_enabled=False) as solwyn,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.chat.completions.create(model=model, messages=MESSAGES, max_tokens=100)
+
+        _refused(caught, "reasoning_without_budget")
+        assert caught.value.provider == provider
+        assert "set the provider explicitly" in caught.value.hint
+        assert wire.bodies == []
+
+    def test_qwen_model_on_unknown_host_with_a_budget_is_priced_and_sent(self) -> None:
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane()
+        with plane.wrap(_openai(wire, UNKNOWN_URL), lease_enabled=False) as solwyn:
+            solwyn.chat.completions.create(
+                model="qwen3.8-max",
+                messages=MESSAGES,
+                max_tokens=100,
+                extra_body={"thinking_budget": 2000},
+            )
+
+        assert _bound(plane) == 2100
+        assert wire.bodies[0]["thinking_budget"] == 2000
+
+    @pytest.mark.parametrize("model", ["qwen3.8-max", "grok-4"])
+    def test_explicit_pin_opts_out_of_model_classification(self, model: str) -> None:
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane()
+        with plane.wrap(
+            _openai(wire, UNKNOWN_URL), lease_enabled=False, provider="openai_compatible"
+        ) as solwyn:
+            solwyn.chat.completions.create(model=model, messages=MESSAGES)
+
+        assert _bound(plane) == DEFAULT_OUTPUT_BOUND
+        assert wire.bodies[0]["max_tokens"] == DEFAULT_OUTPUT_BOUND
+
+    @pytest.mark.parametrize(
+        ("model", "extra"),
+        [
+            ("qwen3.8-max", {"enable_thinking": False}),
+            ("x-ai/grok-4-fast-non-reasoning", {}),
+            ("llama-3.3-70b", {}),
+        ],
+    )
+    def test_bounded_or_non_family_models_are_sent(self, model: str, extra: dict[str, Any]) -> None:
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane()
+        with plane.wrap(_openai(wire, UNKNOWN_URL), lease_enabled=False) as solwyn:
+            solwyn.chat.completions.create(
+                model=model, messages=MESSAGES, max_tokens=100, extra_body=extra or None
+            )
+
+        assert _bound(plane) == 100
+        assert wire.bodies[0]["max_tokens"] == 100
+
+    def test_alert_only_sends_a_qwen_model_as_built(self) -> None:
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane(mode="alert_only")
+        with plane.wrap(_openai(wire, UNKNOWN_URL), lease_enabled=False) as solwyn:
+            solwyn.chat.completions.create(model="qwen3.8-max", messages=MESSAGES)
+
+        assert "max_tokens" not in wire.bodies[0]
+
+    @pytest.mark.asyncio
+    async def test_async_qwen_model_on_unknown_host_is_refused(self) -> None:
+        openai = pytest.importorskip("openai")
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane()
+        client = openai.AsyncOpenAI(
+            api_key="sk-test",
+            base_url="https://cn-hongkong.dashscope.aliyuncs.com/compatible-mode/v1",
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(wire.async_handler)),
+            max_retries=0,
+        )
+        async with plane.wrap_async(client, lease_enabled=False) as solwyn:
+            with pytest.raises(OutputBoundUnenforceableError) as caught:
+                await solwyn.chat.completions.create(
+                    model="qwen3.8-max", messages=MESSAGES, max_tokens=100
+                )
+
+        _refused(caught, "reasoning_without_budget")
+        assert wire.bodies == []

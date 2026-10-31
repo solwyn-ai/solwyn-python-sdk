@@ -3095,6 +3095,11 @@ class Solwyn(_SolwynBase):
                         # hop: catches loops inside the provider SDK itself.
                         if generation_guard is None:
                             generation_guard = _OneGenerationGuard(rt.adapter.name)
+                        generation_guard.expect(
+                            provider=rt.adapter.name,
+                            model=served_model,
+                            bound=min(estimated_output_bound, ORDINARY_TOKEN_COUNT_MAX),
+                        )
                         extra_client_options = _guarded_client_options(
                             rt, extra_client_options, generation_guard, is_async=False
                         )
@@ -4897,6 +4902,11 @@ class AsyncSolwyn(_SolwynBase):
                         # hop: catches loops inside the provider SDK itself.
                         if generation_guard is None:
                             generation_guard = _OneGenerationGuard(rt.adapter.name)
+                        generation_guard.expect(
+                            provider=rt.adapter.name,
+                            model=served_model,
+                            bound=min(estimated_output_bound, ORDINARY_TOKEN_COUNT_MAX),
+                        )
                         extra_client_options = _guarded_client_options(
                             rt, extra_client_options, generation_guard, is_async=True
                         )

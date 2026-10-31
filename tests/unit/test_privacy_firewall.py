@@ -435,6 +435,32 @@ def test_google_shape_merge_preserves_caller_precedence_and_inputs() -> None:
 
 
 @pytest.mark.unit
+def test_output_bound_helpers_return_only_scalars_and_keep_inputs() -> None:
+    """The WS-13 bound readers see request content but return none of it."""
+    secret = "SECRET-PROMPT-TEXT"
+    config = {"system_instruction": secret, "max_output_tokens": 100, "candidateCount": 2}
+    kwargs = {"contents": secret, "config": config}
+    view = privacy.google_output_bound_view(kwargs)
+    assert view == {"config": {"max_output_tokens": 100, "candidateCount": 2}}
+    assert secret not in repr(view)
+    assert config == {"system_instruction": secret, "max_output_tokens": 100, "candidateCount": 2}
+
+    aliased = {"maxOutputTokens": 0, "system_instruction": secret}
+    capped = privacy.with_google_output_cap(
+        {"contents": secret, "config": aliased}, 50, target_shape="google_genai"
+    )
+    assert capped["config"] == {"system_instruction": secret, "max_output_tokens": 50}
+    assert aliased == {"maxOutputTokens": 0, "system_instruction": secret}
+
+    request = SimpleNamespace(
+        json={"model": "m", "max_tokens": 5, "messages": [{"role": "user", "content": secret}]},
+        options=SimpleNamespace(extra_json={"max_tokens": 7, "system": secret}),
+    )
+    fields = privacy.outgoing_request_bound_fields(request)
+    assert fields == {"model": "m", "max_tokens": 7}
+    assert secret not in repr(fields)
+
+
 def test_google_translation_source_normalizes_string_contents_ephemerally() -> None:
     kwargs = {
         "contents": "Hello",

@@ -33,6 +33,7 @@ from solwyn._privacy import (
     estimate_content_length,
     google_output_bound_view,
     normalize_google_generate_content_kwargs,
+    outgoing_request_bound_fields,
     prepare_legacy_google_metering_kwargs,
     with_google_output_cap,
 )
@@ -640,7 +641,8 @@ _OUTPUT_BOUND_HINTS: dict[OutputBoundReason, str] = {
     "reasoning_without_budget": (
         "Reasoning is enabled with no reasoning budget, and this provider's output cap "
         "does not include reasoning. Set a positive thinking budget, turn reasoning off, "
-        "or use a non-reasoning model."
+        "or use a non-reasoning model. If your provider counts reasoning inside the "
+        "output cap, set the provider explicitly."
     ),
     "unsupported_override": (
         "Remove keys Solwyn cannot account for from request body extensions (body "
@@ -698,24 +700,62 @@ def _candidate_count(value: object, *, strict: bool) -> int:
     return count
 
 
+# Providers whose reasoning semantics the bound already models by name.
+_REASONING_RULE_PROVIDERS = frozenset(
+    {
+        ProviderName.OPENAI.value,
+        ProviderName.AZURE_OPENAI.value,
+        ProviderName.QWEN.value,
+        ProviderName.XAI.value,
+    }
+)
+
+
+def _reasoning_family(
+    provider: str, model: str, body: dict[str, object], *, pinned: bool
+) -> str | None:
+    """The reasoning rule a hop follows: ``"qwen"``, ``"xai"`` or None.
+
+    Qwen and xAI follow their own rule. Any other auto-detected adapter (a
+    generic, local or other named host) is classified by its model id, since a
+    host Solwyn does not recognize can still serve a Qwen or Grok model whose
+    reasoning sits outside the cap. The id's last ``/`` segment, lowercased,
+    is matched, so vendor prefixes (``Qwen/``, ``x-ai/``) do not hide it. An
+    explicit provider pin opts out: the caller asserts the host's semantics.
+    """
+    if provider == ProviderName.QWEN.value:
+        return "qwen"
+    if provider == ProviderName.XAI.value:
+        return "xai"
+    if pinned or provider in _REASONING_RULE_PROVIDERS:
+        return None
+    effective = body.get("model")
+    name = (effective if isinstance(effective, str) else model).rsplit("/", 1)[-1].lower()
+    if name.startswith(("qwen", "qwq")):
+        return "qwen"
+    if name.startswith("grok"):
+        return "xai"
+    return None
+
+
 def _reasoning_outside_cap(
-    provider: str, model: str, body: dict[str, object], *, strict: bool
+    family: str | None, model: str, body: dict[str, object], *, strict: bool
 ) -> int:
-    """Reasoning tokens a provider generates beyond its output cap.
+    """Reasoning tokens a hop generates beyond its output cap.
 
     Qwen's ``max_tokens`` excludes thinking, and thinking is on by default:
     unless ``enable_thinking`` is False the call can also spend its whole
     ``thinking_budget``, which must be set. xAI's cap covers visible output
     only and has no reasoning budget, so a reasoning model cannot be bounded.
     """
-    if provider == ProviderName.XAI.value:
+    if family == "xai":
         effective_model = body.get("model")
         if not isinstance(effective_model, str):
             effective_model = model
         if strict and "non-reasoning" not in effective_model:
             raise _UnboundableOutput("reasoning_without_budget")
         return 0
-    if provider != ProviderName.QWEN.value:
+    if family != "qwen":
         return 0
     if body.get("enable_thinking") is False:
         return 0
@@ -785,6 +825,7 @@ def _hop_output_capacity(
     *,
     default_bound: int,
     strict: bool,
+    pinned: bool = False,
 ) -> int:
     """Most output tokens one dialect-shaped hop request can produce.
 
@@ -799,11 +840,16 @@ def _hop_output_capacity(
     count = 1
     reasoning = 0
     if dialect == ProviderName.OPENAI.value:
-        allowed = (
-            _QWEN_EXTRA_BODY_ALLOWED
-            if provider == ProviderName.QWEN.value
-            else _OPENAI_EXTRA_BODY_ALLOWED
+        # The family is read from the raw extension view: a `model` key there
+        # is refused by the allowlist under strict, so it cannot pick a rule.
+        extension = kwargs.get("extra_body")
+        family = _reasoning_family(
+            provider,
+            model,
+            {**kwargs, **extension} if isinstance(extension, dict) else kwargs,
+            pinned=pinned,
         )
+        allowed = _QWEN_EXTRA_BODY_ALLOWED if family == "qwen" else _OPENAI_EXTRA_BODY_ALLOWED
         body = _merged_body(kwargs, strict=strict, allowed=allowed)
         caps = [
             value
@@ -815,7 +861,7 @@ def _hop_output_capacity(
         ]
         cap = max(caps) if caps else None
         count = _candidate_count(body.get("n"), strict=strict)
-        reasoning = _reasoning_outside_cap(provider, model, body, strict=strict)
+        reasoning = _reasoning_outside_cap(family, model, body, strict=strict)
     elif dialect == ProviderName.ANTHROPIC.value:
         # Server-side fallbacks generate again, at their own max_tokens, when
         # the primary model refuses. Checked before the allowlist, in either
@@ -976,6 +1022,7 @@ def _effective_output_bound(
                 native,
                 default_bound=default_bound,
                 strict=False,
+                pinned=runtime.provider_pinned,
             )
         elif primary.adapter.dialect == runtime.adapter.dialect:
             target_name = runtime.adapter.name
@@ -1013,6 +1060,7 @@ def _effective_output_bound(
                 native,
                 default_bound=default_bound,
                 strict=False,
+                pinned=runtime.provider_pinned,
             )
         else:
             source_defaults = _source_output_cap_defaults(
@@ -1055,6 +1103,7 @@ def _effective_output_bound(
                 source_native,
                 default_bound=default_bound,
                 strict=False,
+                pinned=primary.provider_pinned,
             )
 
         bounds.append(capacity)
@@ -1224,7 +1273,13 @@ def _final_output_capacity(
             if _google_body_extension(options):
                 raise _UnboundableOutput("unsupported_override")
     return _hop_output_capacity(
-        dialect, runtime.adapter.name, model, view, default_bound=0, strict=True
+        dialect,
+        runtime.adapter.name,
+        model,
+        view,
+        default_bound=0,
+        strict=True,
+        pinned=runtime.provider_pinned,
     )
 
 
@@ -1271,42 +1326,73 @@ def _single_google_generation(kwargs: dict[str, object]) -> dict[str, object]:
 
 
 class _OneGenerationGuard:
-    """Anthropic client middleware: at most one 2xx generation per hard_deny call.
+    """Anthropic client middleware: at most one generation per hard_deny call.
 
     Appended innermost to each hop's derived client
     (``with_options(middleware=[*client.middleware, guard])``), it sees every
-    HTTP attempt the SDK makes, including requests other middleware issues
-    (``BetaRefusalFallbackMiddleware`` resends at the fallback's own cap).
-    After one 2xx response, any further request in the same admitted call is
-    refused before it is sent. Retries after a non-2xx response or a
-    connection error pass: they produced no output. One guard serves every
-    hop of a call; the SDK propagates the refusal as-is, without retrying.
+    HTTP attempt the SDK makes, including requests other middleware issues.
+    On EVERY send, the first included, it checks the effective outgoing
+    request: the model the hop was admitted for, an output cap within the
+    reserved bound, and no server-side fallbacks. It then claims the call's
+    single generation slot atomically before any I/O, so concurrent sends
+    (hedging middleware, threads) cannot both pass. A non-2xx response or a
+    connection error frees the slot for a retry; a 2xx keeps it, and any
+    later send is refused before it leaves. One guard serves every hop of a
+    call; the SDK propagates a refusal as-is, without retrying.
     """
 
     def __init__(self, provider: str) -> None:
         self._provider = provider
+        self._lock = threading.Lock()
+        self._in_flight = False
         self.succeeded = False
+        self._model: str | None = None
+        self._bound = 0
 
-    def _before_send(self) -> None:
-        if self.succeeded:
-            raise OutputBoundUnenforceableError(
-                provider=self._provider,
-                reason="multi_generation_loop",
-                hint=_OUTPUT_BOUND_HINTS["multi_generation_loop"],
-            )
+    def expect(self, *, provider: str, model: str, bound: int) -> None:
+        """Set the hop the next sends belong to."""
+        with self._lock:
+            self._provider = provider
+            self._model = model
+            self._bound = bound
 
-    def _after_response(self, response: object) -> None:
+    def _refuse(self, reason: OutputBoundReason) -> NoReturn:
+        raise OutputBoundUnenforceableError(
+            provider=self._provider, reason=reason, hint=_OUTPUT_BOUND_HINTS[reason]
+        )
+
+    def _claim(self, request: object) -> None:
+        fields = outgoing_request_bound_fields(request)
+        with self._lock:
+            if self.succeeded or self._in_flight:
+                self._refuse("multi_generation_loop")
+            if _present(fields.get("fallbacks")):
+                self._refuse("multi_generation_loop")
+            model = fields.get("model")
+            if isinstance(model, str) and model != self._model:
+                self._refuse("unsupported_override")
+            cap = _positive_output_cap(fields.get("max_tokens"))
+            if cap is None or cap > self._bound:
+                self._refuse("bound_exceeded")
+            self._in_flight = True
+
+    def _settle(self, response: object | None) -> None:
         status = getattr(response, "status_code", None)
-        if isinstance(status, int) and 200 <= status < 300:
-            self.succeeded = True
+        with self._lock:
+            self._in_flight = False
+            if isinstance(status, int) and 200 <= status < 300:
+                self.succeeded = True
 
     def sync_middleware(self) -> Callable[[Any, Callable[[Any], Any]], Any]:
         """The guard as a sync middleware callable."""
 
         def solwyn_one_generation_guard(request: Any, call_next: Callable[[Any], Any]) -> Any:
-            self._before_send()
-            response = call_next(request)
-            self._after_response(response)
+            self._claim(request)
+            response = None
+            try:
+                response = call_next(request)
+            finally:
+                self._settle(response)
             return response
 
         return solwyn_one_generation_guard
@@ -1315,12 +1401,35 @@ class _OneGenerationGuard:
         """The guard as an async middleware callable."""
 
         async def solwyn_one_generation_guard(request: Any, call_next: Callable[[Any], Any]) -> Any:
-            self._before_send()
-            response = await call_next(request)
-            self._after_response(response)
+            self._claim(request)
+            response = None
+            try:
+                response = await call_next(request)
+            finally:
+                self._settle(response)
             return response
 
         return solwyn_one_generation_guard
+
+
+def _native_fallback_middleware(client: object) -> bool:
+    """True when an Anthropic client carries the SDK's own fallback middleware.
+
+    ``BetaRefusalFallbackMiddleware`` resends at the fallback's cap and pins
+    the fallback in a shared ``BetaFallbackState``, so a later call's FIRST
+    request can already be the fallback. No per-call bound can hold that.
+    """
+    middleware = getattr(client, "middleware", None)
+    if not isinstance(middleware, tuple):
+        return False
+    return any(
+        "Fallback" in type(entry).__name__
+        and (
+            (module := getattr(type(entry), "__module__", "")) == "anthropic"
+            or module.startswith("anthropic.")
+        )
+        for entry in middleware
+    )
 
 
 def _guarded_client_options(
@@ -1365,6 +1474,10 @@ def _hard_deny_hop_request(
     """
     reason: OutputBoundReason
     try:
+        if runtime.adapter.dialect == ProviderName.ANTHROPIC.value and _native_fallback_middleware(
+            runtime.sdk_client
+        ):
+            raise _UnboundableOutput("multi_generation_loop")
         capped = _with_default_output_cap(
             runtime=runtime,
             model=model,

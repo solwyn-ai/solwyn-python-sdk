@@ -18,6 +18,7 @@ If you add a new helper here, add a corresponding enforcement test.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, NoReturn
 
 from solwyn._types import MediaUsage
@@ -568,6 +569,27 @@ def merge_google_generate_content_kwargs(
     if saw_config:
         merged[config_key] = merged_config
     return merged
+
+
+_OUTGOING_BOUND_KEYS = ("model", "max_tokens", "fallbacks")
+
+
+def outgoing_request_bound_fields(request: object) -> dict[str, Any]:
+    """Read only the model, output cap and fallbacks of an outgoing SDK request.
+
+    For the anthropic middleware view (``APIRequest``): its JSON body merged
+    with ``extra_json`` exactly as the SDK builds the wire body. The body also
+    carries messages, so the read stays in this content-privileged module and
+    returns scalars only.
+    """
+    body = getattr(request, "json", None)
+    extra = getattr(getattr(request, "options", None), "extra_json", None)
+    merged: dict[str, Any] = {}
+    if isinstance(body, Mapping):
+        merged.update(body)
+    if isinstance(extra, Mapping):
+        merged.update(extra)
+    return {key: merged[key] for key in _OUTGOING_BOUND_KEYS if key in merged}
 
 
 _GOOGLE_BOUND_CONFIG_KEYS = (

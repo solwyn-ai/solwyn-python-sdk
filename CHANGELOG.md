@@ -82,14 +82,21 @@ unreachable control plane.
   continuation and automatic function calling (both on by default in
   google-genai) are turned off when unset and refused with
   `multi_generation_loop` when turned on. Anthropic `fallbacks` are refused
-  the same way. Anthropic clients get an innermost Solwyn middleware for the
-  call that allows one 2xx generation request; a further request (for example
-  from `BetaRefusalFallbackMiddleware`) is refused before it is sent, with a
+  the same way, as are clients carrying `BetaRefusalFallbackMiddleware`.
+  Anthropic clients get an innermost Solwyn middleware for the call: on every
+  send it checks the outgoing model, cap and fallbacks, then claims the call's
+  single generation slot before any I/O, so overlapping sends cannot both go
+  out. A request after a 2xx response is refused before it is sent, with a
   `possibly_succeeded` receipt and the reservation kept at its bound. Retries
   after a failed attempt still pass.
-- **Current Qwen and xAI endpoints are detected.** Model Studio workspace
-  hosts (`*.maas.aliyuncs.com`) are Qwen, and regional hosts (`*.api.x.ai`)
-  are xAI, so their reasoning rules apply.
+- **Current Qwen and xAI endpoints are detected.** Every Model Studio base URL
+  (`*.dashscope.aliyuncs.com`, including Hong Kong and the Coding Plan, and
+  `*.maas.aliyuncs.com` workspace, trial and token plan hosts) is Qwen, and
+  regional hosts (`*.api.x.ai`) are xAI, so their reasoning rules apply.
+- **Qwen and Grok models are recognized on any host.** Under `hard_deny`, an
+  auto-detected provider without its own reasoning rule classifies the model
+  id (the last `/` segment): `qwen*` and `qwq*` follow the Qwen rule, `grok*`
+  the xAI rule. Set `provider=` explicitly to opt out.
 - **`BudgetCheckResult.hard_deny_admitted`** (default `False`) records whether
   the call was admitted under `hard_deny` by Solwyn's own authority.
 
