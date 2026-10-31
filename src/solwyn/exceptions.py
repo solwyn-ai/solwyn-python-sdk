@@ -215,6 +215,7 @@ OutputBoundReason = Literal[
     "reasoning_without_budget",
     "unsupported_override",
     "azure_api_version",
+    "multi_generation_loop",
     "bound_exceeded",
 ]
 

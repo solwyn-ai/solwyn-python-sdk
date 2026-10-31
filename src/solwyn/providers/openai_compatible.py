@@ -128,6 +128,8 @@ COMPAT_PROFILES: tuple[CompatProfile, ...] = (
     CompatProfile(
         name="xai",
         hosts=("api.x.ai",),
+        # Regional endpoints: <region>.api.x.ai (eu-west-1.api.x.ai, us.api.x.ai).
+        host_suffixes=(".api.x.ai",),
         model_prefixes=("grok-",),
         supports_include_usage=False,
     ),
@@ -159,6 +161,9 @@ COMPAT_PROFILES: tuple[CompatProfile, ...] = (
             "dashscope-intl.aliyuncs.com",
             "dashscope-us.aliyuncs.com",
         ),
+        # Current Model Studio workspace endpoints:
+        # {WorkspaceId}.{region}.maas.aliyuncs.com/compatible-mode/v1.
+        host_suffixes=(".maas.aliyuncs.com",),
         model_prefixes=("qwen", "qwq-", "qvq-"),
     ),
     # Z.ai: live probe verified include_usage support on 2026-07-09.

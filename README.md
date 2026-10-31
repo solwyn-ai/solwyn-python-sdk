@@ -767,6 +767,7 @@ stops. `error.reason` is one of:
 | `malformed_candidate_count` | `n` or `candidate_count` is set but not a positive integer |
 | `reasoning_without_budget` | Qwen thinking (on by default) without a positive `thinking_budget`, or an xAI reasoning model (its cap excludes reasoning and it has no budget) |
 | `unsupported_override` | A body extension carries a key Solwyn cannot account for (see below) |
+| `multi_generation_loop` | The provider SDK could generate more than once inside the call: Google automatic continuation or automatic function calling turned on explicitly, Anthropic `fallbacks`, or Anthropic middleware that resends after a successful response |
 | `azure_api_version` | An uncapped Azure OpenAI call on an api-version older than 2024-09-01, which has no `max_completion_tokens` |
 | `bound_exceeded` | Any other request whose possible output exceeds the priced bound |
 
@@ -783,6 +784,16 @@ extension may carry only keys the bound accounts for:
 
 Any other key, including `model`, refuses the call with
 `unsupported_override`.
+
+A `hard_deny` call makes exactly one model generation. Google automatic
+continuation and automatic function calling are turned off when you have not
+set them (both are SDK-side options, so the request body is unchanged), and
+refused when you turned them on. Anthropic `fallbacks` are refused. Anthropic
+clients also get an innermost Solwyn middleware for the call that allows one
+successful (2xx) generation request: a further request after it (for example
+from `BetaRefusalFallbackMiddleware`) is refused before it is sent, and the
+first generation's reservation is kept. Retries after a failed attempt still
+pass.
 
 `error.hint` says how to fix the request. All of this applies only when Solwyn
 itself admitted the call under `hard_deny` (a check allow, or a lease whose
@@ -802,6 +813,16 @@ Known limitations:
   Fireworks.
 - A Qwen thinking-only model that ignores `enable_thinking=False` can still
   reason past the bound.
+- The one-generation middleware covers Anthropic clients only. google-genai
+  and the OpenAI SDK have no per-call transport hook, so Google relies on the
+  continuation and function-calling rules above, and the OpenAI-style metered
+  paths have no internal generation loop. Bedrock Converse makes one request
+  per call. Code you own that rewrites requests (a custom httpx transport or
+  event hook, a boto3 event handler) is out of scope.
+- Reasoning rules follow the detected provider. Qwen and xAI models served
+  through another gateway follow that gateway's rules.
+- Anthropic `context_management` compaction through the typed beta parameter
+  is not proven to stay within `max_tokens` and is not checked.
 
 ### Run-scoped leases
 

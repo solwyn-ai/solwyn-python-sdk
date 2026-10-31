@@ -651,6 +651,11 @@ _OUTPUT_BOUND_HINTS: dict[OutputBoundReason, str] = {
         "Set max_tokens or max_completion_tokens on the call, or use an Azure OpenAI "
         "api-version that supports max_completion_tokens."
     ),
+    "multi_generation_loop": (
+        "This call lets the provider SDK generate more than once (automatic "
+        "continuation or automatic function calling). Turn those off for this call, "
+        "or run the loop yourself so Solwyn checks each generation."
+    ),
     "bound_exceeded": (
         "Set the output cap and candidate count on the call itself so the request "
         "fits the output bound Solwyn priced."
@@ -720,6 +725,15 @@ def _reasoning_outside_cap(
             raise _UnboundableOutput("reasoning_without_budget")
         return 0
     return budget
+
+
+def _present(value: object) -> bool:
+    """True for a set option; None, an empty list and SDK omit sentinels are unset."""
+    if value is None:
+        return False
+    if isinstance(value, (list, tuple, dict)) and not value:
+        return False
+    return type(value).__name__ not in ("NotGiven", "Omit")
 
 
 def _is_config_container(value: object) -> bool:
@@ -803,6 +817,15 @@ def _hop_output_capacity(
         count = _candidate_count(body.get("n"), strict=strict)
         reasoning = _reasoning_outside_cap(provider, model, body, strict=strict)
     elif dialect == ProviderName.ANTHROPIC.value:
+        # Server-side fallbacks generate again, at their own max_tokens, when
+        # the primary model refuses. Checked before the allowlist, in either
+        # channel, so the reason names the loop.
+        extra = kwargs.get("extra_body")
+        if strict and (
+            _present(kwargs.get("fallbacks"))
+            or (isinstance(extra, dict) and _present(extra.get("fallbacks")))
+        ):
+            raise _UnboundableOutput("multi_generation_loop")
         body = _merged_body(kwargs, strict=strict, allowed=_ANTHROPIC_EXTRA_BODY_ALLOWED)
         cap = _positive_output_cap(body.get("max_tokens"))
     elif dialect == ProviderName.GOOGLE.value:
@@ -1205,6 +1228,125 @@ def _final_output_capacity(
     )
 
 
+_GOOGLE_CONTINUATION_KEYS = ("automatic_continuation", "automaticContinuation")
+_GOOGLE_AFC_KEYS = ("automatic_function_calling", "automaticFunctionCalling")
+
+
+def _google_afc_disabled(afc: object) -> bool:
+    """True when an automatic function calling config turns AFC off."""
+    if _nested_value(afc, "disable") is True:
+        return True
+    calls = _nested_value(afc, "maximum_remote_calls", "maximumRemoteCalls")
+    return isinstance(calls, int) and not isinstance(calls, bool) and calls <= 0
+
+
+def _single_google_generation(kwargs: dict[str, object]) -> dict[str, object]:
+    """Hold a modern Google call to exactly one model generation.
+
+    google-genai loops inside one call: automatic continuation (on by default)
+    resends the request while the response ends with CONTINUATION, and
+    automatic function calling (on by default for callable or MCP tools)
+    generates again after each tool call. Each generation can spend the whole
+    cap, so one reservation cannot bound them. Unset options are turned off
+    (both are SDK-local and never serialized); an explicitly enabled loop
+    refuses. ``kwargs`` is already normalized, so ``config`` is a mapping.
+    """
+    config = kwargs.get("config")
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        raise _UnboundableOutput("malformed_cap_container")
+    continuation = _nested_value(config, *_GOOGLE_CONTINUATION_KEYS)
+    if continuation is not None and continuation is not False:
+        raise _UnboundableOutput("multi_generation_loop")
+    afc = _nested_value(config, *_GOOGLE_AFC_KEYS)
+    if afc is not None and not _google_afc_disabled(afc):
+        raise _UnboundableOutput("multi_generation_loop")
+    single = dict(config)
+    if continuation is None:
+        single["automatic_continuation"] = False
+    if afc is None:
+        single["automatic_function_calling"] = {"disable": True}
+    return {**kwargs, "config": single}
+
+
+class _OneGenerationGuard:
+    """Anthropic client middleware: at most one 2xx generation per hard_deny call.
+
+    Appended innermost to each hop's derived client
+    (``with_options(middleware=[*client.middleware, guard])``), it sees every
+    HTTP attempt the SDK makes, including requests other middleware issues
+    (``BetaRefusalFallbackMiddleware`` resends at the fallback's own cap).
+    After one 2xx response, any further request in the same admitted call is
+    refused before it is sent. Retries after a non-2xx response or a
+    connection error pass: they produced no output. One guard serves every
+    hop of a call; the SDK propagates the refusal as-is, without retrying.
+    """
+
+    def __init__(self, provider: str) -> None:
+        self._provider = provider
+        self.succeeded = False
+
+    def _before_send(self) -> None:
+        if self.succeeded:
+            raise OutputBoundUnenforceableError(
+                provider=self._provider,
+                reason="multi_generation_loop",
+                hint=_OUTPUT_BOUND_HINTS["multi_generation_loop"],
+            )
+
+    def _after_response(self, response: object) -> None:
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int) and 200 <= status < 300:
+            self.succeeded = True
+
+    def sync_middleware(self) -> Callable[[Any, Callable[[Any], Any]], Any]:
+        """The guard as a sync middleware callable."""
+
+        def solwyn_one_generation_guard(request: Any, call_next: Callable[[Any], Any]) -> Any:
+            self._before_send()
+            response = call_next(request)
+            self._after_response(response)
+            return response
+
+        return solwyn_one_generation_guard
+
+    def async_middleware(self) -> Callable[[Any, Callable[[Any], Any]], Any]:
+        """The guard as an async middleware callable."""
+
+        async def solwyn_one_generation_guard(request: Any, call_next: Callable[[Any], Any]) -> Any:
+            self._before_send()
+            response = await call_next(request)
+            self._after_response(response)
+            return response
+
+        return solwyn_one_generation_guard
+
+
+def _guarded_client_options(
+    runtime: ProviderRuntime,
+    options: dict[str, Any],
+    guard: _OneGenerationGuard,
+    *,
+    is_async: bool,
+) -> dict[str, Any]:
+    """Add the one-generation guard to a hop's derived Anthropic client options.
+
+    Only clients exposing the SDK's middleware API (a ``middleware`` tuple and
+    ``with_options``) take it; the caller's own middleware stays outermost.
+    """
+    client = runtime.sdk_client
+    if runtime.adapter.dialect != ProviderName.ANTHROPIC.value or not hasattr(
+        client, "with_options"
+    ):
+        return options
+    existing = getattr(client, "middleware", None)
+    if not isinstance(existing, tuple):
+        return options
+    middleware = guard.async_middleware() if is_async else guard.sync_middleware()
+    return {**options, "middleware": (*existing, middleware)}
+
+
 def _hard_deny_hop_request(
     *,
     runtime: ProviderRuntime,
@@ -1230,6 +1372,11 @@ def _hard_deny_hop_request(
             surface=surface,
             default_bound=default_bound,
         )
+        if (
+            runtime.adapter.dialect == ProviderName.GOOGLE.value
+            and _client_shape(runtime.sdk_client, runtime.adapter.dialect) != "google_generativeai"
+        ):
+            capped = _single_google_generation(capped)
         capacity = _final_output_capacity(
             runtime=runtime, model=model, kwargs=capped, surface=surface
         )

@@ -611,14 +611,15 @@ class TestBodyExtensionAllowlist:
         client = genai.Client(
             api_key="k",
             http_options=types.HttpOptions(
+                httpx_client=httpx.Client(transport=httpx.MockTransport(wire.handler)),
                 httpx_async_client=httpx.AsyncClient(
                     transport=httpx.MockTransport(wire.async_handler)
-                )
+                ),
             ),
         )
         plane = FakeControlPlane()
         solwyn = AsyncSolwyn(
-            client,
+            client.aio,
             api_key=plane.api_key,
             api_url=plane.api_url,
             control_plane_transport=plane.transport,
@@ -784,3 +785,443 @@ class TestBodyExtensionAllowlist:
 
         reason = "malformed_cap_container" if fields == [] else "unsupported_override"
         _refused(caught, reason)
+
+
+def _get_weather(city: str) -> str:
+    """Report the weather (an AFC-callable test tool)."""
+    return f"sunny in {city}"
+
+
+class _LoopingGemini:
+    """google-genai wire double whose first response invites another generation.
+
+    ``kind="continuation"`` ends the first response with CONTINUATION and a
+    token, so automatic continuation would resend the request. ``kind="afc"``
+    answers with a function call, so automatic function calling would run the
+    tool and generate again. Every later response stops.
+    """
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self.bodies: list[dict[str, Any]] = []
+
+    def _response(self) -> dict[str, Any]:
+        first = len(self.bodies) == 1
+        if first and self.kind == "afc":
+            parts: list[dict[str, Any]] = [
+                {"functionCall": {"name": "_get_weather", "args": {"city": "Oslo"}}}
+            ]
+        else:
+            parts = [{"text": "ok"}]
+        candidate: dict[str, Any] = {
+            "content": {"parts": parts, "role": "model"},
+            "finishReason": "CONTINUATION" if first and self.kind == "continuation" else "STOP",
+        }
+        if first and self.kind == "continuation":
+            candidate["continuationToken"] = "dG9rZW4="
+        return {
+            "candidates": [candidate],
+            "usageMetadata": {
+                "promptTokenCount": 1,
+                "candidatesTokenCount": 100,
+                "totalTokenCount": 101,
+            },
+        }
+
+    def handler(self, request: Any) -> Any:
+        self.bodies.append(json.loads(request.content or b"{}"))
+        body = self._response()
+        if "alt=sse" in str(request.url):
+            return httpx.Response(
+                200,
+                text=f"data: {json.dumps(body)}\n\n",
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(200, json=body)
+
+    async def async_handler(self, request: Any) -> Any:
+        return self.handler(request)
+
+    def client(self) -> Any:
+        genai = pytest.importorskip("google.genai")
+        from google.genai import types
+
+        # Both transports are mocked whatever the caller's mode: AsyncSolwyn
+        # may dispatch a genai.Client through its sync path, and a missing
+        # mock would reach the real network.
+        options = types.HttpOptions(
+            httpx_client=httpx.Client(transport=httpx.MockTransport(self.handler)),
+            httpx_async_client=httpx.AsyncClient(transport=httpx.MockTransport(self.async_handler)),
+        )
+        return genai.Client(api_key="k", http_options=options)
+
+
+def _async_google_wrapper(plane: FakeControlPlane, client: Any) -> Any:
+    from solwyn.client import AsyncSolwyn
+
+    return AsyncSolwyn(
+        client.aio,
+        api_key=plane.api_key,
+        api_url=plane.api_url,
+        control_plane_transport=plane.transport,
+        budget_check_cache_ttl=0,
+        lease_enabled=False,
+    )
+
+
+@pytest.mark.unit
+class TestGoogleSingleGeneration:
+    """Under hard_deny a Google call makes exactly one model generation."""
+
+    def _config(self, kind: str, **extra: Any) -> dict[str, Any]:
+        config: dict[str, Any] = {"max_output_tokens": 100, **extra}
+        if kind == "afc":
+            config["tools"] = [_get_weather]
+        return config
+
+    @pytest.mark.parametrize("kind", ["continuation", "afc"])
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_default_loop_is_turned_off(self, kind: str, streaming: bool) -> None:
+        provider, plane = _LoopingGemini(kind), FakeControlPlane()
+        with plane.wrap(provider.client(), lease_enabled=False) as solwyn:
+            if streaming:
+                list(
+                    solwyn.models.generate_content_stream(
+                        model="gemini-2.5-pro", contents="hi", config=self._config(kind)
+                    )
+                )
+            else:
+                solwyn.models.generate_content(
+                    model="gemini-2.5-pro", contents="hi", config=self._config(kind)
+                )
+
+        assert _bound(plane) == 100
+        assert len(provider.bodies) == 1
+        assert provider.bodies[0]["generationConfig"] == {"maxOutputTokens": 100}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["continuation", "afc"])
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_async_default_loop_is_turned_off(self, kind: str, streaming: bool) -> None:
+        provider, plane = _LoopingGemini(kind), FakeControlPlane()
+        solwyn = _async_google_wrapper(plane, provider.client())
+        try:
+            if streaming:
+                stream = await solwyn.models.generate_content_stream(
+                    model="gemini-2.5-pro", contents="hi", config=self._config(kind)
+                )
+                _ = [chunk async for chunk in stream]
+            else:
+                await solwyn.models.generate_content(
+                    model="gemini-2.5-pro", contents="hi", config=self._config(kind)
+                )
+        finally:
+            await solwyn.close()
+
+        assert _bound(plane) == 100
+        assert len(provider.bodies) == 1
+
+    @pytest.mark.parametrize(
+        ("kind", "extra"),
+        [
+            ("continuation", {"automatic_continuation": True}),
+            ("continuation", {"automaticContinuation": True}),
+            ("afc", {"automatic_function_calling": {"disable": False}}),
+            ("afc", {"automatic_function_calling": {"maximum_remote_calls": 3}}),
+        ],
+    )
+    def test_explicitly_enabled_loop_is_refused(self, kind: str, extra: dict[str, Any]) -> None:
+        provider, plane = _LoopingGemini(kind), FakeControlPlane()
+        with (
+            plane.wrap(provider.client(), lease_enabled=False) as solwyn,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.models.generate_content(
+                model="gemini-2.5-pro", contents="hi", config=self._config(kind, **extra)
+            )
+
+        _refused(caught, "multi_generation_loop")
+        assert provider.bodies == []
+
+    @pytest.mark.asyncio
+    async def test_async_explicitly_enabled_loop_is_refused(self) -> None:
+        provider, plane = _LoopingGemini("continuation"), FakeControlPlane()
+        solwyn = _async_google_wrapper(plane, provider.client())
+        try:
+            with pytest.raises(OutputBoundUnenforceableError) as caught:
+                await solwyn.models.generate_content(
+                    model="gemini-2.5-pro",
+                    contents="hi",
+                    config=self._config("continuation", automatic_continuation=True),
+                )
+        finally:
+            await solwyn.close()
+
+        _refused(caught, "multi_generation_loop")
+        assert provider.bodies == []
+
+    @pytest.mark.parametrize(
+        ("kind", "extra"),
+        [
+            ("continuation", {"automatic_continuation": False}),
+            ("afc", {"automatic_function_calling": {"disable": True}}),
+            ("afc", {"automatic_function_calling": {"maximum_remote_calls": 0}}),
+        ],
+    )
+    def test_explicitly_disabled_loop_is_sent_once(self, kind: str, extra: dict[str, Any]) -> None:
+        provider, plane = _LoopingGemini(kind), FakeControlPlane()
+        with plane.wrap(provider.client(), lease_enabled=False) as solwyn:
+            solwyn.models.generate_content(
+                model="gemini-2.5-pro", contents="hi", config=self._config(kind, **extra)
+            )
+
+        assert len(provider.bodies) == 1
+
+    @pytest.mark.parametrize("kind", ["continuation", "afc"])
+    def test_alert_only_keeps_the_sdk_loop(self, kind: str) -> None:
+        provider, plane = _LoopingGemini(kind), FakeControlPlane(mode="alert_only")
+        with plane.wrap(provider.client(), lease_enabled=False) as solwyn:
+            solwyn.models.generate_content(
+                model="gemini-2.5-pro", contents="hi", config=self._config(kind)
+            )
+
+        assert len(provider.bodies) == 2
+
+
+def _anthropic_sse(data: dict[str, Any]) -> str:
+    start = {
+        **data,
+        "content": [],
+        "stop_reason": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+    events = [
+        ("message_start", {"type": "message_start", "message": start}),
+        (
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+        ),
+        (
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "ok"},
+            },
+        ),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        (
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": data["stop_reason"], "stop_sequence": None},
+                "usage": data["usage"],
+            },
+        ),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    return "".join(f"event: {kind}\ndata: {json.dumps(event)}\n\n" for kind, event in events)
+
+
+class _AnthropicWire:
+    """anthropic 2.x (httpx2) wire double.
+
+    ``refuse_first`` answers the first request with a 200 refusal, which makes
+    ``BetaRefusalFallbackMiddleware`` resend at its fallback's cap.
+    ``fail_first`` answers the first request with a 500.
+    """
+
+    def __init__(self, *, refuse_first: bool = False, fail_first: bool = False) -> None:
+        self.bodies: list[dict[str, Any]] = []
+        self.refuse_first = refuse_first
+        self.fail_first = fail_first
+
+    def handler(self, request: Any) -> Any:
+        httpx2 = pytest.importorskip("httpx2")
+        body = json.loads(request.content)
+        self.bodies.append(body)
+        first = len(self.bodies) == 1
+        if first and self.fail_first:
+            return httpx2.Response(
+                500,
+                request=request,
+                json={"type": "error", "error": {"type": "api_error", "message": "x"}},
+            )
+        refused = first and self.refuse_first
+        message: dict[str, Any] = {
+            "id": f"msg_{len(self.bodies)}",
+            "type": "message",
+            "role": "assistant",
+            "model": body["model"],
+            "content": [] if refused else [{"type": "text", "text": "ok"}],
+            "stop_reason": "refusal" if refused else "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 0 if refused else 50},
+        }
+        if refused:
+            message["stop_details"] = {"type": "refusal", "category": "cyber", "explanation": "x"}
+        if body.get("stream"):
+            return httpx2.Response(
+                200,
+                request=request,
+                text=_anthropic_sse(message),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx2.Response(200, request=request, json=message)
+
+    async def async_handler(self, request: Any) -> Any:
+        return self.handler(request)
+
+    def client(self, *, is_async: bool = False, middleware: Any = None) -> Any:
+        anthropic = pytest.importorskip("anthropic")
+        httpx2 = pytest.importorskip("httpx2")
+        options: dict[str, Any] = {"api_key": "k", "max_retries": 0}
+        if middleware is not None:
+            options["middleware"] = middleware
+        if is_async:
+            return anthropic.AsyncAnthropic(
+                http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(self.async_handler)),
+                **options,
+            )
+        return anthropic.Anthropic(
+            http_client=httpx2.Client(transport=httpx2.MockTransport(self.handler)), **options
+        )
+
+
+_FALLBACK = [{"model": "claude-opus-4-8", "max_tokens": 9000}]
+
+
+@pytest.mark.unit
+class TestAnthropicGenerationLoops:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_server_side_fallbacks_are_refused(self, is_async: bool, streaming: bool) -> None:
+        wire, plane = _AnthropicWire(), FakeControlPlane()
+        wrapper = (plane.wrap_async if is_async else plane.wrap)(
+            wire.client(is_async=is_async), lease_enabled=False
+        )
+        try:
+            with pytest.raises(OutputBoundUnenforceableError) as caught:
+                result = wrapper.beta.messages.create(
+                    model="claude-fable-5",
+                    messages=MESSAGES,
+                    max_tokens=100,
+                    stream=streaming,
+                    betas=["server-side-fallback-2026-07-01"],
+                    fallbacks=_FALLBACK,
+                )
+                if is_async:
+                    await result
+        finally:
+            if is_async:
+                await wrapper.close()
+            else:
+                wrapper.close()
+
+        _refused(caught, "multi_generation_loop")
+        assert wire.bodies == []
+
+    def test_fallbacks_in_extra_body_name_the_loop(self) -> None:
+        wire, plane = _AnthropicWire(), FakeControlPlane()
+        with (
+            plane.wrap(wire.client(), lease_enabled=False) as solwyn,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.messages.create(
+                model="claude-fable-5",
+                messages=MESSAGES,
+                max_tokens=100,
+                extra_body={"fallbacks": _FALLBACK},
+            )
+
+        _refused(caught, "multi_generation_loop")
+        assert wire.bodies == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    async def test_refusal_fallback_middleware_cannot_generate_twice(self, is_async: bool) -> None:
+        anthropic = pytest.importorskip("anthropic")
+        wire, plane = _AnthropicWire(refuse_first=True), FakeControlPlane()
+        middleware = [anthropic.BetaRefusalFallbackMiddleware(_FALLBACK)]
+        wrapper = (plane.wrap_async if is_async else plane.wrap)(
+            wire.client(is_async=is_async, middleware=middleware), lease_enabled=False
+        )
+        try:
+            with (
+                anthropic.BetaFallbackState(),
+                pytest.raises(OutputBoundUnenforceableError) as caught,
+            ):
+                result = wrapper.beta.messages.create(
+                    model="claude-fable-5", messages=MESSAGES, max_tokens=100
+                )
+                if is_async:
+                    await result
+        finally:
+            if is_async:
+                await wrapper.close()
+            else:
+                wrapper.close()
+
+        _refused(caught, "multi_generation_loop")
+        # The refused first answer was paid; the 9000-token resend never left.
+        assert len(wire.bodies) == 1
+        assert plane.confirms == []
+        receipts = [event for event in plane.ingested if event.status.value == "error"]
+        assert receipts and receipts[-1].possibly_succeeded is True
+
+    def test_retry_after_a_failed_attempt_still_passes(self) -> None:
+        wire, plane = _AnthropicWire(fail_first=True), FakeControlPlane()
+
+        def retry_once(request: Any, call_next: Any) -> Any:
+            response = call_next(request)
+            return call_next(request) if response.status_code >= 500 else response
+
+        with plane.wrap(wire.client(middleware=[retry_once]), lease_enabled=False) as solwyn:
+            solwyn.messages.create(model="claude-fable-5", messages=MESSAGES, max_tokens=100)
+
+        assert len(wire.bodies) == 2
+
+    def test_alert_only_keeps_the_middleware_loop(self) -> None:
+        anthropic = pytest.importorskip("anthropic")
+        wire, plane = _AnthropicWire(refuse_first=True), FakeControlPlane(mode="alert_only")
+        middleware = [anthropic.BetaRefusalFallbackMiddleware(_FALLBACK)]
+        with (
+            plane.wrap(wire.client(middleware=middleware), lease_enabled=False) as solwyn,
+            anthropic.BetaFallbackState(),
+        ):
+            solwyn.beta.messages.create(model="claude-fable-5", messages=MESSAGES, max_tokens=100)
+
+        assert [body["max_tokens"] for body in wire.bodies] == [100, 9000]
+
+
+@pytest.mark.unit
+class TestCurrentProviderHosts:
+    @pytest.mark.parametrize("region", ["ap-southeast-1", "cn-beijing", "us-east-1"])
+    def test_qwen_workspace_host_is_qwen(self, region: str) -> None:
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane()
+        base_url = f"https://ws-123.{region}.maas.aliyuncs.com/compatible-mode/v1"
+        with (
+            plane.wrap(_openai(wire, base_url), lease_enabled=False) as solwyn,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.chat.completions.create(model="qwen3.8-max", messages=MESSAGES, max_tokens=100)
+
+        _refused(caught, "reasoning_without_budget")
+        assert caught.value.provider == "qwen"
+        assert wire.bodies == []
+
+    @pytest.mark.parametrize("host", ["eu-west-1.api.x.ai", "us.api.x.ai"])
+    def test_xai_regional_host_is_xai(self, host: str) -> None:
+        wire, plane = _Wire(_CHAT_BODY), FakeControlPlane()
+        with (
+            plane.wrap(_openai(wire, f"https://{host}/v1"), lease_enabled=False) as solwyn,
+            pytest.raises(OutputBoundUnenforceableError) as caught,
+        ):
+            solwyn.chat.completions.create(model="grok-4", messages=MESSAGES, max_tokens=100)
+
+        _refused(caught, "reasoning_without_budget")
+        assert caught.value.provider == "xai"

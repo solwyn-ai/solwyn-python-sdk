@@ -48,9 +48,11 @@ from solwyn._base import (
     _AttemptContext,
     _client_shape,
     _effective_output_bound,
+    _guarded_client_options,
     _hard_deny_hop_request,
     _merge_openai_cap_layers,
     _normalized_openai_output_cap_layer,
+    _OneGenerationGuard,
     _responses_output_bound,
     _SolwynBase,
     _with_call_span,
@@ -128,6 +130,7 @@ from solwyn.config import SolwynConfig
 from solwyn.exceptions import (
     BudgetExceededError,
     ConfigurationError,
+    OutputBoundUnenforceableError,
     ProviderUnavailableError,
     RunStoppedError,
     UnsupportedSurfaceError,
@@ -3014,6 +3017,7 @@ class Solwyn(_SolwynBase):
 
             # 5. Walk the candidates.
             failed_providers: set[str] = set()
+            generation_guard: _OneGenerationGuard | None = None
             last_exc: Exception | None = None
             # Fix [A]: did the PRIMARY runtime get attempted-and-error in this
             # walk? Drives the cross-provider success reason (PRIMARY_ERROR if the
@@ -3087,6 +3091,13 @@ class Solwyn(_SolwynBase):
                             default_bound=self._solwyn_config.lease_output_bound_default,
                             reserved_bound=min(estimated_output_bound, ORDINARY_TOKEN_COUNT_MAX),
                         )
+                        # One 2xx generation per admitted call, shared by every
+                        # hop: catches loops inside the provider SDK itself.
+                        if generation_guard is None:
+                            generation_guard = _OneGenerationGuard(rt.adapter.name)
+                        extra_client_options = _guarded_client_options(
+                            rt, extra_client_options, generation_guard, is_async=False
+                        )
                 except Exception:
                     cb.release_probe(admission)
                     probe_to_release = None
@@ -3159,7 +3170,12 @@ class Solwyn(_SolwynBase):
                             with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
                                 response = _materialize_stream(response)
                     except Exception as exc:
-                        disp = classify_exception(exc)
+                        # The one-generation guard refused a follow-up request
+                        # after a paid 2xx: request-shaped (no failover, no
+                        # health verdict), but the first generation's usage is
+                        # unknown, so the reservation keeps its bound.
+                        loop_refused = isinstance(exc, OutputBoundUnenforceableError)
+                        disp = Disposition.FAIL_FAST if loop_refused else classify_exception(exc)
                         # In particular, a rejected 429 followed by Retry-After
                         # sleep holds the probe but has no paid work to refund.
                         usage_unknown = disp is Disposition.POST_SEND_AMBIGUOUS
@@ -3205,7 +3221,7 @@ class Solwyn(_SolwynBase):
                         # A correctly-not-failed-over post-send-ambiguous abort
                         # emits an ERROR event with possibly_succeeded=True so the Cloud API
                         # can reconcile the (possibly-landed, never-confirmed) reservation.
-                        possibly_succeeded = (
+                        possibly_succeeded = loop_refused or (
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
                         try:
@@ -3238,6 +3254,12 @@ class Solwyn(_SolwynBase):
                             logger.warning(
                                 "call.error_receipt_failed: %s", type(receipt_exc).__name__
                             )
+                        if disp is Disposition.FAIL_FAST and loop_refused:
+                            self._solwyn_budget.abandon_reservation(
+                                call_id,
+                                lease_claim_token=_lease_claim_token(budget),
+                            )
+                            raise
                         if disp is Disposition.FAIL_FAST:
                             self._solwyn_budget.release_reservation(
                                 call_id,
@@ -4797,6 +4819,7 @@ class AsyncSolwyn(_SolwynBase):
 
             # 5. Walk the candidates.
             failed_providers: set[str] = set()
+            generation_guard: _OneGenerationGuard | None = None
             last_exc: Exception | None = None
             # Fix [A]: did the PRIMARY runtime get attempted-and-error in this
             # walk? Drives the cross-provider success reason (PRIMARY_ERROR if the
@@ -4870,6 +4893,13 @@ class AsyncSolwyn(_SolwynBase):
                             default_bound=self._solwyn_config.lease_output_bound_default,
                             reserved_bound=min(estimated_output_bound, ORDINARY_TOKEN_COUNT_MAX),
                         )
+                        # One 2xx generation per admitted call, shared by every
+                        # hop: catches loops inside the provider SDK itself.
+                        if generation_guard is None:
+                            generation_guard = _OneGenerationGuard(rt.adapter.name)
+                        extra_client_options = _guarded_client_options(
+                            rt, extra_client_options, generation_guard, is_async=True
+                        )
                 except Exception:
                     cb.release_probe(admission)
                     probe_to_release = None
@@ -4938,7 +4968,12 @@ class AsyncSolwyn(_SolwynBase):
                             with _call_span.current() if _call_span.active else _otel._NOOP_CONTEXT:
                                 response = await _materialize_stream_async(response)
                     except Exception as exc:
-                        disp = classify_exception(exc)
+                        # The one-generation guard refused a follow-up request
+                        # after a paid 2xx: request-shaped (no failover, no
+                        # health verdict), but the first generation's usage is
+                        # unknown, so the reservation keeps its bound.
+                        loop_refused = isinstance(exc, OutputBoundUnenforceableError)
+                        disp = Disposition.FAIL_FAST if loop_refused else classify_exception(exc)
                         # In particular, a rejected 429 followed by Retry-After
                         # sleep holds the probe but has no paid work to refund.
                         usage_unknown = disp is Disposition.POST_SEND_AMBIGUOUS
@@ -4982,7 +5017,7 @@ class AsyncSolwyn(_SolwynBase):
                         # A correctly-not-failed-over post-send-ambiguous abort
                         # emits an ERROR event with possibly_succeeded=True so the Cloud API
                         # can reconcile the (possibly-landed, never-confirmed) reservation.
-                        possibly_succeeded = (
+                        possibly_succeeded = loop_refused or (
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
                         try:
@@ -5015,6 +5050,12 @@ class AsyncSolwyn(_SolwynBase):
                             logger.warning(
                                 "call.error_receipt_failed: %s", type(receipt_exc).__name__
                             )
+                        if disp is Disposition.FAIL_FAST and loop_refused:
+                            self._solwyn_budget.abandon_reservation(
+                                call_id,
+                                lease_claim_token=_lease_claim_token(budget),
+                            )
+                            raise
                         if disp is Disposition.FAIL_FAST:
                             self._solwyn_budget.release_reservation(
                                 call_id,

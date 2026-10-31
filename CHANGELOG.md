@@ -66,8 +66,9 @@ unreachable control plane.
   any provider I/O, when its output cannot be bounded or exceeds the priced
   bound. Reasons: `malformed_cap_container`, `malformed_candidate_count`,
   `reasoning_without_budget` (Qwen thinking without a budget, xAI reasoning
-  models), `unsupported_override`, `azure_api_version` (an uncapped call on an
-  api-version before 2024-09-01), and `bound_exceeded`. The reservation is
+  models), `unsupported_override`, `multi_generation_loop`,
+  `azure_api_version` (an uncapped call on an api-version before 2024-09-01),
+  and `bound_exceeded`. The reservation is
   released and the failover chain stops.
 - **Body extensions are allowlisted under `hard_deny`.** A request body
   extension may carry only keys the bound accounts for: OpenAI-style
@@ -77,6 +78,18 @@ unreachable control plane.
   Responses `extra_body` and Google `http_options.extra_body` (per request or
   on the client) may carry nothing. Any other key, including `model`, refuses
   the call with `unsupported_override`. Nothing changes outside `hard_deny`.
+- **A `hard_deny` call makes exactly one model generation.** Google automatic
+  continuation and automatic function calling (both on by default in
+  google-genai) are turned off when unset and refused with
+  `multi_generation_loop` when turned on. Anthropic `fallbacks` are refused
+  the same way. Anthropic clients get an innermost Solwyn middleware for the
+  call that allows one 2xx generation request; a further request (for example
+  from `BetaRefusalFallbackMiddleware`) is refused before it is sent, with a
+  `possibly_succeeded` receipt and the reservation kept at its bound. Retries
+  after a failed attempt still pass.
+- **Current Qwen and xAI endpoints are detected.** Model Studio workspace
+  hosts (`*.maas.aliyuncs.com`) are Qwen, and regional hosts (`*.api.x.ai`)
+  are xAI, so their reasoning rules apply.
 - **`BudgetCheckResult.hard_deny_admitted`** (default `False`) records whether
   the call was admitted under `hard_deny` by Solwyn's own authority.
 
@@ -96,6 +109,12 @@ unreachable control plane.
   Fireworks.
 - A Qwen thinking-only model that ignores `enable_thinking=False` can still
   reason past the bound.
+- The one-generation middleware covers Anthropic clients only: google-genai
+  and the OpenAI SDK have no per-call transport hook. Google relies on the
+  continuation and function-calling rules, and the OpenAI-style metered paths
+  have no internal generation loop.
+- Anthropic compaction through the typed beta `context_management` parameter
+  is not proven to stay within `max_tokens` and is not checked.
 
 ## [0.9.0] - 2026-10-25
 
