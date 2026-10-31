@@ -5,6 +5,98 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
+## [0.10.0] - Unreleased
+
+A `hard_deny` budget now bounds a call's output, not only its input. Every
+per-call budget check sends the call's output bound. On a `hard_deny` project,
+a request with no output cap is sent to the provider with one, so a single
+call can no longer spend far past the cap. Before this, one uncapped or
+large-cap call on an expensive reasoning model could pass a $1 cap and spend
+several dollars. Nothing changes on `alert_only` projects.
+
+Wire-contract change is API-first: Solwyn Cloud must accept
+`estimated_output_bound` on `POST /api/v1/budgets/check` before this SDK
+releases. An older API rejects the field with a 422, which the SDK treats as an
+unreachable control plane.
+
+### Changed
+
+- **On `hard_deny` projects, uncapped calls are capped at
+  `lease_output_bound_default`** (4096 by default, configurable), because an
+  unbounded call cannot honestly be held to a hard cap. Set your own cap to
+  choose a different limit. The cap goes in the dialect's own field:
+  `max_completion_tokens` or `max_tokens` for OpenAI-dialect providers (by the
+  same model rule as the existing key rewrite), `max_completion_tokens` for
+  every Azure OpenAI deployment (a deployment name says nothing about the
+  model), `max_output_tokens` for Responses, `max_tokens` for Anthropic,
+  `config.max_output_tokens` for Google (`generation_config` for the legacy
+  SDK, after its constructor defaults), and `inferenceConfig.maxTokens` for
+  Bedrock. It is added only when Solwyn admitted the call under `hard_deny`: a
+  check allow in `hard_deny` mode (live or from the allow cache), or a
+  lease-funded call whose lease posture was `hard_deny` when its tokens were
+  reserved. An `alert_only` admission, a fail-open or outage admission, or an
+  uncounted expired-lease admission sends the request exactly as the caller
+  built it. An explicit positive cap is always sent as is. A zero, negative or
+  non-integer cap counts as no cap.
+- **Azure OpenAI keeps a caller's `max_completion_tokens`.** It was rewritten
+  to the weaker `max_tokens` when the deployment name did not look like a
+  reasoning model. When layers disagree, only the cap key of the highest layer
+  that sets one is sent.
+
+### Added
+
+- **`estimated_output_bound` on the per-call budget check.** The check carries
+  the same bound the lease path reserves: for each configured provider hop, its
+  output cap (else `lease_output_bound_default`) plus any reasoning the
+  provider generates outside the cap, times its candidate count (`n`, Google
+  `candidate_count`), and the largest across the chain. Caps are read the way
+  the request is sent: OpenAI and Anthropic `extra_body` over named arguments,
+  Google defaults merged field by field, and Google `generation_config` and
+  camelCase aliases. Qwen's `thinking_budget` is added unless
+  `enable_thinking` is False. It is sent on every text check, in every mode.
+  The API prices the reservation as input plus that many output tokens at the
+  model's output rate, so in `hard_deny` a call whose bound would overrun the
+  remaining budget is refused before the provider is called. Media checks omit
+  the field. A direct `check_budget` caller that passes no bound on a text
+  check sends the default, exactly as the lease ledger reserves it. The bound
+  is part of the allow-cache cohort.
+- **`OutputBoundUnenforceableError`** (`code="output_bound_unenforceable"`,
+  with `provider`, `reason` and `hint`). On a `hard_deny` admission, Solwyn
+  checks the request the provider would receive and refuses it locally, before
+  any provider I/O, when its output cannot be bounded or exceeds the priced
+  bound. Reasons: `malformed_cap_container`, `malformed_candidate_count`,
+  `reasoning_without_budget` (Qwen thinking without a budget, xAI reasoning
+  models), `unsupported_override`, `azure_api_version` (an uncapped call on an
+  api-version before 2024-09-01), and `bound_exceeded`. The reservation is
+  released and the failover chain stops.
+- **Body extensions are allowlisted under `hard_deny`.** A request body
+  extension may carry only keys the bound accounts for: OpenAI-style
+  `extra_body` `max_tokens`, `max_completion_tokens` and `n` (plus Qwen
+  `enable_thinking` and `thinking_budget`), Anthropic `extra_body`
+  `max_tokens`, and Bedrock `additionalModelRequestFields` `thinking`.
+  Responses `extra_body` and Google `http_options.extra_body` (per request or
+  on the client) may carry nothing. Any other key, including `model`, refuses
+  the call with `unsupported_override`. Nothing changes outside `hard_deny`.
+- **`BudgetCheckResult.hard_deny_admitted`** (default `False`) records whether
+  the call was admitted under `hard_deny` by Solwyn's own authority.
+
+### Fixed
+
+- **The allow cache no longer admits a larger call on a smaller call's allow.**
+  The output bound is now part of the cached cohort, so an allow priced for a
+  100-token cap cannot admit a 10,000-token call inside the cache window.
+
+### Known limitations
+
+- A scoped `hard_deny` rule (for example a tag or run cap) on an `alert_only`
+  project is not visible in the check's mode. Its uncapped calls are not
+  capped, so they can still overshoot that rule by one call.
+- Reasoning is treated as inside the cap for every provider except Qwen and
+  xAI. That is unverified for DeepSeek, Groq, Mistral, Z.ai, Perplexity and
+  Fireworks.
+- A Qwen thinking-only model that ignores `enable_thinking=False` can still
+  reason past the bound.
+
 ## [0.9.0] - 2026-10-25
 
 The SDK now meters Anthropic `beta.messages.create` and OpenAI

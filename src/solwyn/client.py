@@ -48,11 +48,14 @@ from solwyn._base import (
     _AttemptContext,
     _client_shape,
     _effective_output_bound,
+    _hard_deny_hop_request,
+    _merge_openai_cap_layers,
     _normalized_openai_output_cap_layer,
     _responses_output_bound,
     _SolwynBase,
     _with_call_span,
 )
+from solwyn._constants import ORDINARY_TOKEN_COUNT_MAX
 from solwyn._control_plane_transport import (
     ControlPlaneTransport,
     require_dual_transport,
@@ -1702,11 +1705,11 @@ def _build_hop_kwargs(
                     layer,
                 )
 
-            merged_kwargs = {
-                **_native_target_layer(provider_global_defaults),
-                **_native_target_layer(provider_entry_defaults),
-                **_native_target_layer(provider_kwargs),
-            }
+            merged_kwargs = _merge_openai_cap_layers(
+                _native_target_layer(provider_global_defaults),
+                _native_target_layer(provider_entry_defaults),
+                _native_target_layer(provider_kwargs),
+            )
         if is_primary:
             return merged_kwargs
         return {**merged_kwargs, "model": rt.entry.model}
@@ -1760,11 +1763,11 @@ def _build_hop_kwargs(
                 layer,
             )
 
-        normalized: dict[str, object] = {
-            **_fallback_target_layer(provider_global_defaults),
-            **_fallback_target_layer(provider_entry_defaults),
-            **_fallback_target_layer(provider_kwargs),
-        }
+        normalized: dict[str, object] = _merge_openai_cap_layers(
+            _fallback_target_layer(provider_global_defaults),
+            _fallback_target_layer(provider_entry_defaults),
+            _fallback_target_layer(provider_kwargs),
+        )
         passthrough = {
             key: value for key, value in normalized.items() if key not in _ENDPOINT_SCOPED_KEYS
         }
@@ -1794,11 +1797,11 @@ def _build_hop_kwargs(
                 layer,
             )
 
-        source_kwargs: dict[str, object] = {
-            **_source_layer(provider_global_defaults),
-            **_source_layer(source_defaults),
-            **_source_layer(provider_kwargs),
-        }
+        source_kwargs: dict[str, object] = _merge_openai_cap_layers(
+            _source_layer(provider_global_defaults),
+            _source_layer(source_defaults),
+            _source_layer(provider_kwargs),
+        )
     elif source_dialect == ProviderName.GOOGLE.value:
         # The canonical translator's Google schema is the modern ``config=``
         # shape. Normalize each source layer before its precedence merge so a
@@ -3071,6 +3074,19 @@ class Solwyn(_SolwynBase):
                             call_kwargs = rt.adapter.prepare_streaming(
                                 call_kwargs, cross_provider=is_provider_fallback
                             )
+                    # Under hard_deny the pre-flight priced this call at its
+                    # output bound: cap an uncapped hop at the default, and
+                    # refuse locally if the final request could still spend
+                    # more. Any other admission sends the request as built.
+                    if getattr(budget, "hard_deny_admitted", False) is True:
+                        call_kwargs = _hard_deny_hop_request(
+                            runtime=rt,
+                            model=served_model,
+                            kwargs=call_kwargs,
+                            surface=_surface,
+                            default_bound=self._solwyn_config.lease_output_bound_default,
+                            reserved_bound=min(estimated_output_bound, ORDINARY_TOKEN_COUNT_MAX),
+                        )
                 except Exception:
                     cb.release_probe(admission)
                     probe_to_release = None
@@ -4841,6 +4857,19 @@ class AsyncSolwyn(_SolwynBase):
                             call_kwargs = rt.adapter.prepare_streaming(
                                 call_kwargs, cross_provider=is_provider_fallback
                             )
+                    # Under hard_deny the pre-flight priced this call at its
+                    # output bound: cap an uncapped hop at the default, and
+                    # refuse locally if the final request could still spend
+                    # more. Any other admission sends the request as built.
+                    if getattr(budget, "hard_deny_admitted", False) is True:
+                        call_kwargs = _hard_deny_hop_request(
+                            runtime=rt,
+                            model=served_model,
+                            kwargs=call_kwargs,
+                            surface=_surface,
+                            default_bound=self._solwyn_config.lease_output_bound_default,
+                            reserved_bound=min(estimated_output_bound, ORDINARY_TOKEN_COUNT_MAX),
+                        )
                 except Exception:
                     cb.release_probe(admission)
                     probe_to_release = None

@@ -644,6 +644,19 @@ class BudgetCheckRequest(BaseModel):
             "unchanged."
         ),
     )
+    estimated_output_bound: int | None = Field(
+        default=None,
+        ge=0,
+        le=ORDINARY_TOKEN_COUNT_MAX,
+        description=(
+            "Maximum output tokens the pending call can produce: the largest "
+            "explicit cap across the configured chain, or the SDK's default bound "
+            "for an uncapped hop (sent to the provider as its cap when the call "
+            "is admitted under hard_deny). The server prices "
+            "the reservation as input plus this bound at the output rate. None "
+            "for media checks, and omitted from the wire when None."
+        ),
+    )
     fallback_providers: list[ProviderName] = Field(
         default_factory=list,
         description="Configured failover providers, in attempt order (chain hint)",

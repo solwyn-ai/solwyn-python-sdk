@@ -29,7 +29,13 @@ from solwyn import _otel
 from solwyn._constants import FAILOVER_ERROR_CLASS_MAX_LENGTH, ORDINARY_TOKEN_COUNT_MAX
 from solwyn._lifecycle import register_fork_reset
 from solwyn._otel import _TraceSnapshot, _validated_trace
-from solwyn._privacy import estimate_content_length
+from solwyn._privacy import (
+    estimate_content_length,
+    google_output_bound_view,
+    normalize_google_generate_content_kwargs,
+    prepare_legacy_google_metering_kwargs,
+    with_google_output_cap,
+)
 from solwyn._routing import (
     CostPolicy,
     HealthBasedPolicy,
@@ -75,8 +81,11 @@ from solwyn.circuit_breaker import CircuitBreaker, CircuitBreakerState
 from solwyn.config import SolwynConfig
 from solwyn.exceptions import (
     ConfigurationError,
+    OutputBoundReason,
+    OutputBoundUnenforceableError,
     UnsupportedSurfaceError,
     UntrackedSpendSurfaceError,
+    UntranslatableRequestError,
 )
 from solwyn.providers._errors import Disposition, classify_exception
 
@@ -520,12 +529,32 @@ _OUTPUT_CAP_KEYS = frozenset(
         "max_output_tokens",
         "config",
         "inferenceConfig",
+        "n",
+        "extra_body",
+        "generation_config",
     }
 )
+# The only extra_body fields that change how much output a call can produce.
+# The OpenAI and Anthropic SDKs merge extra_body over named arguments.
+_EXTRA_BODY_BOUND_KEYS = frozenset(
+    {"max_tokens", "max_completion_tokens", "n", "enable_thinking", "thinking_budget"}
+)
+# Under hard_deny a body extension may carry ONLY keys the bound accounts for
+# (or that cannot change output length or the model). Anything else, `model`
+# included, is refused: an allowlist, because blocklists missed aliases.
+_OPENAI_EXTRA_BODY_ALLOWED = frozenset({"max_tokens", "max_completion_tokens", "n"})
+_QWEN_EXTRA_BODY_ALLOWED = _OPENAI_EXTRA_BODY_ALLOWED | {"enable_thinking", "thinking_budget"}
+_ANTHROPIC_EXTRA_BODY_ALLOWED = frozenset({"max_tokens"})
+# Anthropic-style thinking: the API requires budget_tokens < maxTokens.
+_BEDROCK_MODEL_FIELDS_ALLOWED = frozenset({"thinking"})
+_GOOGLE_CAP_KEYS = ("max_output_tokens", "maxOutputTokens")
+_GOOGLE_COUNT_KEYS = ("candidate_count", "candidateCount")
+# First Azure OpenAI api-version that accepts max_completion_tokens.
+_AZURE_MAX_COMPLETION_TOKENS_SINCE = "2024-09-01"
 _OUTPUT_CAP_KEYS_BY_DIALECT = {
     ProviderName.OPENAI.value: frozenset({"max_tokens", "max_completion_tokens"}),
     ProviderName.ANTHROPIC.value: frozenset({"max_tokens"}),
-    ProviderName.GOOGLE.value: frozenset({"config", "max_output_tokens"}),
+    ProviderName.GOOGLE.value: frozenset({"config", "generation_config", "max_output_tokens"}),
     ProviderName.BEDROCK.value: frozenset({"inferenceConfig"}),
 }
 
@@ -537,15 +566,23 @@ def _positive_output_cap(value: object) -> int | None:
     return None
 
 
-def _nested_output_cap(value: object, key: str) -> int | None:
-    """Read one cap from a dict or SDK config object without copying config.
+def _nested_value(value: object, *keys: str) -> object:
+    """Read the first present scalar among ``keys`` from a dict or SDK object.
 
     Google config objects may also carry a system instruction, and Bedrock
     request dictionaries carry messages beside ``inferenceConfig``. Reading
     only the named scalar keeps lease sizing outside content-privileged code.
     """
-    nested = value.get(key) if isinstance(value, dict) else getattr(value, key, None)
-    return _positive_output_cap(nested)
+    for key in keys:
+        nested = value.get(key) if isinstance(value, dict) else getattr(value, key, None)
+        if nested is not None:
+            return nested
+    return None
+
+
+def _nested_output_cap(value: object, *keys: str) -> int | None:
+    """Read one cap from a dict or SDK config object without copying config."""
+    return _positive_output_cap(_nested_value(value, *keys))
 
 
 def _responses_output_bound(kwargs: dict[str, object], default_bound: int) -> int:
@@ -560,7 +597,7 @@ def _responses_output_bound(kwargs: dict[str, object], default_bound: int) -> in
 def _dialect_output_cap(dialect: str, kwargs: dict[str, object]) -> int | None:
     """Return the effective native cap in one dialect-shaped kwargs mapping."""
     if dialect == ProviderName.GOOGLE.value:
-        nested = _nested_output_cap(kwargs.get("config"), "max_output_tokens")
+        nested = _nested_output_cap(kwargs.get("config"), *_GOOGLE_CAP_KEYS)
         return nested or _positive_output_cap(kwargs.get("max_output_tokens"))
     if dialect == ProviderName.BEDROCK.value:
         return _nested_output_cap(kwargs.get("inferenceConfig"), "maxTokens")
@@ -575,7 +612,227 @@ def _dialect_output_cap(dialect: str, kwargs: dict[str, object]) -> int | None:
 
 def _output_cap_params(params: dict[str, Any]) -> dict[str, object]:
     """Copy only structural cap fields, never request content."""
-    return {key: value for key, value in params.items() if key in _OUTPUT_CAP_KEYS}
+    copied = {key: value for key, value in params.items() if key in _OUTPUT_CAP_KEYS}
+    extra = copied.get("extra_body")
+    if isinstance(extra, dict):
+        copied["extra_body"] = {
+            key: value for key, value in extra.items() if key in _EXTRA_BODY_BOUND_KEYS
+        }
+    return copied
+
+
+class _UnboundableOutput(Exception):
+    """Internal: a hop's possible output cannot be held to a bound."""
+
+    def __init__(self, reason: OutputBoundReason) -> None:
+        super().__init__(reason)
+        self.reason: OutputBoundReason = reason
+
+
+_OUTPUT_BOUND_HINTS: dict[OutputBoundReason, str] = {
+    "malformed_cap_container": (
+        "Pass the request's output settings (Google config, Bedrock inferenceConfig, "
+        "or a request body extension) as an object so Solwyn can read the output cap."
+    ),
+    "malformed_candidate_count": (
+        "Set the candidate count (n or candidateCount) to a positive integer, or leave it unset."
+    ),
+    "reasoning_without_budget": (
+        "Reasoning is enabled with no reasoning budget, and this provider's output cap "
+        "does not include reasoning. Set a positive thinking budget, turn reasoning off, "
+        "or use a non-reasoning model."
+    ),
+    "unsupported_override": (
+        "Remove keys Solwyn cannot account for from request body extensions (body "
+        "overrides, provider options, extraBody, or additionalModelRequestFields), "
+        "and set output limits with the request's own cap parameters."
+    ),
+    "azure_api_version": (
+        "Set max_tokens or max_completion_tokens on the call, or use an Azure OpenAI "
+        "api-version that supports max_completion_tokens."
+    ),
+    "bound_exceeded": (
+        "Set the output cap and candidate count on the call itself so the request "
+        "fits the output bound Solwyn priced."
+    ),
+}
+
+
+def _merged_body(
+    kwargs: dict[str, object],
+    *,
+    strict: bool,
+    allowed: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    """The body the OpenAI and Anthropic SDKs send: extra_body keys win.
+
+    Strict mode also enforces the hard_deny allowlist: an extra_body key
+    outside ``allowed`` (which these SDKs send verbatim) refuses the call.
+    """
+    extra = kwargs.get("extra_body")
+    if extra is None:
+        return kwargs
+    if not isinstance(extra, dict):
+        if strict:
+            raise _UnboundableOutput("malformed_cap_container")
+        return kwargs
+    if strict and not allowed.issuperset(extra):
+        raise _UnboundableOutput("unsupported_override")
+    return {**kwargs, **extra}
+
+
+def _candidate_count(value: object, *, strict: bool) -> int:
+    """How many candidates one request generates; absent means one."""
+    if value is None:
+        return 1
+    count = _positive_output_cap(value)
+    if count is None:
+        if strict:
+            raise _UnboundableOutput("malformed_candidate_count")
+        return 1
+    return count
+
+
+def _reasoning_outside_cap(
+    provider: str, model: str, body: dict[str, object], *, strict: bool
+) -> int:
+    """Reasoning tokens a provider generates beyond its output cap.
+
+    Qwen's ``max_tokens`` excludes thinking, and thinking is on by default:
+    unless ``enable_thinking`` is False the call can also spend its whole
+    ``thinking_budget``, which must be set. xAI's cap covers visible output
+    only and has no reasoning budget, so a reasoning model cannot be bounded.
+    """
+    if provider == ProviderName.XAI.value:
+        effective_model = body.get("model")
+        if not isinstance(effective_model, str):
+            effective_model = model
+        if strict and "non-reasoning" not in effective_model:
+            raise _UnboundableOutput("reasoning_without_budget")
+        return 0
+    if provider != ProviderName.QWEN.value:
+        return 0
+    if body.get("enable_thinking") is False:
+        return 0
+    budget = _positive_output_cap(body.get("thinking_budget"))
+    if budget is None:
+        if strict:
+            raise _UnboundableOutput("reasoning_without_budget")
+        return 0
+    return budget
+
+
+def _is_config_container(value: object) -> bool:
+    """True for a mapping or an SDK config object; False for scalars and arrays."""
+    if isinstance(value, dict):
+        return True
+    if isinstance(value, (str, bytes, list, tuple, int, float, bool)):
+        return False
+    return isinstance(getattr(value, "__dict__", None), dict)
+
+
+_GOOGLE_REQUEST_CAP_KEYS = ("config", "generation_config", "max_output_tokens")
+
+
+def _google_bound_native(*layers: dict[str, object]) -> dict[str, object]:
+    """Google cap fields merged across layers exactly as dispatch merges them.
+
+    Lenient: a shape dispatch would refuse sizes at the default, because that
+    call never reaches a provider.
+    """
+    google_layers = [
+        {key: value for key, value in layer.items() if key in _GOOGLE_REQUEST_CAP_KEYS}
+        for layer in layers
+    ]
+    try:
+        return google_output_bound_view(*google_layers)
+    except UntranslatableRequestError:
+        return {}
+
+
+def _google_body_extension(http_options: object) -> bool:
+    """True when Google http_options carries a non-empty request body extension.
+
+    google-genai merges ``extra_body`` into the serialized request after
+    normalizing its keys, so no key in it can be read safely: under hard_deny
+    any content refuses, whatever its spelling.
+    """
+    extra = _nested_value(http_options, "extra_body", "extraBody")
+    # google-genai validates extra_body as a dict or None, so a non-empty
+    # mapping is the only shape that can reach the wire.
+    return isinstance(extra, Mapping) and len(extra) > 0
+
+
+def _hop_output_capacity(
+    dialect: str,
+    provider: str,
+    model: str,
+    kwargs: dict[str, object],
+    *,
+    default_bound: int,
+    strict: bool,
+) -> int:
+    """Most output tokens one dialect-shaped hop request can produce.
+
+    ``(cap + reasoning outside the cap) x candidate count``. Lenient sizing
+    (``strict=False``) prices the budget check: a missing cap counts as
+    ``default_bound`` and a malformed field falls back to one candidate and no
+    extra reasoning, because the strict pre-send check refuses those later.
+    Strict mode raises ``_UnboundableOutput`` instead, and treats a missing cap
+    as unbounded.
+    """
+    cap: int | None = None
+    count = 1
+    reasoning = 0
+    if dialect == ProviderName.OPENAI.value:
+        allowed = (
+            _QWEN_EXTRA_BODY_ALLOWED
+            if provider == ProviderName.QWEN.value
+            else _OPENAI_EXTRA_BODY_ALLOWED
+        )
+        body = _merged_body(kwargs, strict=strict, allowed=allowed)
+        caps = [
+            value
+            for value in (
+                _positive_output_cap(body.get("max_completion_tokens")),
+                _positive_output_cap(body.get("max_tokens")),
+            )
+            if value is not None
+        ]
+        cap = max(caps) if caps else None
+        count = _candidate_count(body.get("n"), strict=strict)
+        reasoning = _reasoning_outside_cap(provider, model, body, strict=strict)
+    elif dialect == ProviderName.ANTHROPIC.value:
+        body = _merged_body(kwargs, strict=strict, allowed=_ANTHROPIC_EXTRA_BODY_ALLOWED)
+        cap = _positive_output_cap(body.get("max_tokens"))
+    elif dialect == ProviderName.GOOGLE.value:
+        config = kwargs.get("config")
+        if config is not None and not _is_config_container(config):
+            if strict:
+                raise _UnboundableOutput("malformed_cap_container")
+            config = None
+        if strict and _google_body_extension(_nested_value(config, "http_options", "httpOptions")):
+            raise _UnboundableOutput("unsupported_override")
+        cap = _dialect_output_cap(dialect, {**kwargs, "config": config})
+        count = _candidate_count(_nested_value(config, *_GOOGLE_COUNT_KEYS), strict=strict)
+    elif dialect == ProviderName.BEDROCK.value:
+        inference = kwargs.get("inferenceConfig")
+        if inference is not None and not isinstance(inference, dict):
+            if strict:
+                raise _UnboundableOutput("malformed_cap_container")
+            inference = None
+        fields = kwargs.get("additionalModelRequestFields")
+        if strict and fields is not None:
+            if not isinstance(fields, dict):
+                raise _UnboundableOutput("malformed_cap_container")
+            if not _BEDROCK_MODEL_FIELDS_ALLOWED.issuperset(fields):
+                raise _UnboundableOutput("unsupported_override")
+        cap = _nested_output_cap(inference, "maxTokens")
+    if cap is None:
+        if strict:
+            raise _UnboundableOutput("bound_exceeded")
+        cap = default_bound
+    return (cap + reasoning) * count
 
 
 def _source_output_cap_defaults(
@@ -599,12 +856,37 @@ def _normalized_openai_output_cap_layer(
     ) and _openai_uses_max_completion_tokens(model)
     if requires_modern_key:
         return _with_openai_completion_token_key(provider, model, params)
+    if provider == ProviderName.AZURE_OPENAI.value:
+        # An Azure model is a deployment name the caller chose, so it says
+        # nothing about the model family. Never weaken a caller's
+        # max_completion_tokens (which counts reasoning) to max_tokens.
+        return params
     if "max_completion_tokens" not in params:
         return params
     normalized = dict(params)
     value = normalized.pop("max_completion_tokens")
     normalized["max_tokens"] = value
     return normalized
+
+
+_OPENAI_CAP_KEYS = ("max_tokens", "max_completion_tokens")
+
+
+def _merge_openai_cap_layers(*layers: dict[str, object]) -> dict[str, object]:
+    """Merge normalized OpenAI-dialect layers so only one cap key survives.
+
+    Each layer is already normalized to its target's key, but an Azure layer
+    keeps the caller's own key. When a higher layer sets either cap key, it
+    replaces every lower layer's cap, so a default max_tokens can never ride
+    beside a per-call max_completion_tokens.
+    """
+    merged: dict[str, object] = {}
+    for layer in layers:
+        if any(key in layer for key in _OPENAI_CAP_KEYS):
+            for key in _OPENAI_CAP_KEYS:
+                merged.pop(key, None)
+        merged.update(layer)
+    return merged
 
 
 def _effective_output_bound(
@@ -621,7 +903,9 @@ def _effective_output_bound(
     content: call kwargs beat entry defaults, which beat global defaults;
     same-dialect compatibility hops normalize completion-token keys per source
     layer; cross-dialect hops retain the source dialect's cap. Every actually
-    unbounded hop contributes the configured conservative fallback.
+    unbounded hop contributes the configured conservative fallback. A hop's
+    bound is its cap plus any reasoning its provider generates outside the
+    cap, times its candidate count (``_hop_output_capacity``).
     """
     provider_global_defaults = _output_cap_params(global_defaults)
     provider_kwargs = _output_cap_params(kwargs)
@@ -635,50 +919,78 @@ def _effective_output_bound(
 
         if not is_provider_fallback:
             if runtime.adapter.dialect == ProviderName.OPENAI.value:
-                native = {
-                    **_normalized_openai_output_cap_layer(
+                native = _merge_openai_cap_layers(
+                    _normalized_openai_output_cap_layer(
                         runtime.adapter.name,
                         target_model,
                         provider_global_defaults,
                     ),
-                    **_normalized_openai_output_cap_layer(
+                    _normalized_openai_output_cap_layer(
                         runtime.adapter.name,
                         target_model,
                         provider_entry_defaults,
                     ),
-                    **_normalized_openai_output_cap_layer(
+                    _normalized_openai_output_cap_layer(
                         runtime.adapter.name,
                         target_model,
                         provider_kwargs,
                     ),
-                }
+                )
+            elif runtime.adapter.dialect == ProviderName.GOOGLE.value:
+                native = _google_bound_native(
+                    provider_global_defaults, provider_entry_defaults, provider_kwargs
+                )
             else:
                 native = {
                     **provider_global_defaults,
                     **provider_entry_defaults,
                     **provider_kwargs,
                 }
-            cap = _dialect_output_cap(runtime.adapter.dialect, native)
+            capacity = _hop_output_capacity(
+                runtime.adapter.dialect,
+                runtime.adapter.name,
+                target_model,
+                native,
+                default_bound=default_bound,
+                strict=False,
+            )
         elif primary.adapter.dialect == runtime.adapter.dialect:
             target_name = runtime.adapter.name
-            native = {
-                **_normalized_openai_output_cap_layer(
+            native = _merge_openai_cap_layers(
+                _normalized_openai_output_cap_layer(
                     target_name,
                     runtime.entry.model,
                     provider_global_defaults,
                 ),
-                **_normalized_openai_output_cap_layer(
+                _normalized_openai_output_cap_layer(
                     target_name,
                     runtime.entry.model,
                     provider_entry_defaults,
                 ),
-                **_normalized_openai_output_cap_layer(
+                _normalized_openai_output_cap_layer(
                     target_name,
                     runtime.entry.model,
                     provider_kwargs,
                 ),
-            }
-            cap = _dialect_output_cap(runtime.adapter.dialect, native)
+            )
+            if runtime.adapter.dialect == ProviderName.GOOGLE.value:
+                native = _google_bound_native(
+                    provider_global_defaults, provider_entry_defaults, provider_kwargs
+                )
+            # extra_body is endpoint-scoped: a cross-provider hop drops the
+            # caller's and sends only the target entry's own (see
+            # _build_hop_kwargs).
+            native.pop("extra_body", None)
+            if "extra_body" in provider_entry_defaults:
+                native["extra_body"] = provider_entry_defaults["extra_body"]
+            capacity = _hop_output_capacity(
+                runtime.adapter.dialect,
+                target_name,
+                runtime.entry.model,
+                native,
+                default_bound=default_bound,
+                strict=False,
+            )
         else:
             source_defaults = _source_output_cap_defaults(
                 primary.adapter.dialect,
@@ -686,34 +998,250 @@ def _effective_output_bound(
             )
             if primary.adapter.dialect == ProviderName.OPENAI.value:
                 source_model = cast(str, kwargs["model"])
-                source_native = {
-                    **_normalized_openai_output_cap_layer(
+                source_native = _merge_openai_cap_layers(
+                    _normalized_openai_output_cap_layer(
                         primary.adapter.name,
                         source_model,
                         provider_global_defaults,
                     ),
-                    **_normalized_openai_output_cap_layer(
+                    _normalized_openai_output_cap_layer(
                         primary.adapter.name,
                         source_model,
                         source_defaults,
                     ),
-                    **_normalized_openai_output_cap_layer(
+                    _normalized_openai_output_cap_layer(
                         primary.adapter.name,
                         source_model,
                         provider_kwargs,
                     ),
-                }
+                )
+            elif primary.adapter.dialect == ProviderName.GOOGLE.value:
+                source_native = _google_bound_native(
+                    provider_global_defaults, source_defaults, provider_kwargs
+                )
             else:
                 source_native = {
                     **provider_global_defaults,
                     **source_defaults,
                     **provider_kwargs,
                 }
-            cap = _dialect_output_cap(primary.adapter.dialect, source_native)
+            capacity = _hop_output_capacity(
+                primary.adapter.dialect,
+                primary.adapter.name,
+                cast(str, kwargs["model"]),
+                source_native,
+                default_bound=default_bound,
+                strict=False,
+            )
 
-        bounds.append(cap if cap is not None else default_bound)
+        bounds.append(capacity)
 
     return max(bounds, default=default_bound)
+
+
+def _azure_accepts_max_completion_tokens(client: object) -> bool:
+    """True when an Azure OpenAI client's api-version accepts max_completion_tokens.
+
+    Dated versions from 2024-09-01 on (preview or GA) accept it; so do the v1
+    API's ``v1``/``preview``/``latest`` labels and a client with no api-version
+    at all (a plain OpenAI client on an Azure v1 base URL).
+    """
+    version = getattr(client, "_api_version", None)
+    if version is None:
+        return True
+    if not isinstance(version, str):
+        return False
+    if version in ("v1", "preview", "latest"):
+        return True
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}(-preview)?", version) is None:
+        return False
+    return version[:10] >= _AZURE_MAX_COMPLETION_TOKENS_SINCE
+
+
+def _google_view_strict(kwargs: dict[str, object]) -> dict[str, Any]:
+    """The Google bound view of one final request; a refused shape refuses the call."""
+    try:
+        return google_output_bound_view(kwargs)
+    except UntranslatableRequestError:
+        raise _UnboundableOutput("malformed_cap_container") from None
+
+
+def _google_normalized_strict(kwargs: dict[str, object]) -> dict[str, Any]:
+    """One modern Google request with aliases folded into config, as the adapter sends it."""
+    try:
+        return normalize_google_generate_content_kwargs(kwargs, target_shape="google_genai")
+    except UntranslatableRequestError:
+        raise _UnboundableOutput("malformed_cap_container") from None
+
+
+def _legacy_google_view(runtime: ProviderRuntime, kwargs: dict[str, object]) -> dict[str, Any]:
+    """Project a legacy Google request with its GenerativeModel constructor defaults."""
+    try:
+        return prepare_legacy_google_metering_kwargs(runtime.sdk_client, kwargs)
+    except UntranslatableRequestError:
+        raise _UnboundableOutput("malformed_cap_container") from None
+
+
+def _with_default_output_cap(
+    *,
+    runtime: ProviderRuntime,
+    model: str,
+    kwargs: dict[str, object],
+    surface: str,
+    default_bound: int,
+) -> dict[str, object]:
+    """Give an uncapped hop the output cap its reservation already assumed.
+
+    ``_effective_output_bound`` charges an uncapped hop ``default_bound``
+    output tokens per candidate, on the lease and the per-call check alike.
+    Called only for a call admitted under hard_deny (via
+    ``_hard_deny_hop_request``): a final provider request with no positive cap
+    gets ``default_bound`` in its dialect's native cap field. A positive caller
+    or default cap is never touched; a non-positive or malformed one counts as
+    absent, exactly as the bound resolver reads it. The OpenAI and Anthropic
+    cap is read from the body the SDK sends, with extra_body merged over named
+    arguments. Runs after translation, so a cross-dialect hop that refuses an
+    uncapped source still refuses. Returns ``kwargs`` itself when nothing
+    changes, else a shallow copy. Raises ``_UnboundableOutput`` when the cap
+    cannot be added (an Azure api-version without max_completion_tokens).
+    """
+    dialect = runtime.adapter.dialect
+    if surface == "responses":
+        if _positive_output_cap(kwargs.get("max_output_tokens")) is not None:
+            return kwargs
+        return {**kwargs, "max_output_tokens": default_bound}
+    if dialect == ProviderName.GOOGLE.value:
+        shape = _client_shape(runtime.sdk_client, dialect)
+        effective: dict[str, Any]
+        if shape == "google_generativeai":
+            # The legacy GenerativeModel may carry its own constructor cap.
+            effective = _legacy_google_view(runtime, kwargs)
+        else:
+            # Fold generation_config and other aliases into config first, as
+            # the adapter does before sending, so an aliased explicit cap is
+            # seen and never replaced.
+            kwargs = _google_normalized_strict(kwargs)
+            effective = _google_view_strict(kwargs)
+        if _dialect_output_cap(dialect, effective) is not None:
+            return kwargs
+        return cast(
+            "dict[str, object]",
+            with_google_output_cap(
+                kwargs,
+                default_bound,
+                target_shape=(
+                    "google_generativeai" if shape == "google_generativeai" else "google_genai"
+                ),
+            ),
+        )
+    if dialect in (ProviderName.OPENAI.value, ProviderName.ANTHROPIC.value):
+        if _dialect_output_cap(dialect, _merged_body(kwargs, strict=False)) is not None:
+            return kwargs
+    elif _dialect_output_cap(dialect, kwargs) is not None:
+        return kwargs
+    if dialect == ProviderName.BEDROCK.value:
+        inference = kwargs.get("inferenceConfig")
+        if inference is None:
+            return {**kwargs, "inferenceConfig": {"maxTokens": default_bound}}
+        if not isinstance(inference, dict):
+            # Malformed container: the strict pre-send check refuses it.
+            return kwargs
+        return {**kwargs, "inferenceConfig": {**inference, "maxTokens": default_bound}}
+    if dialect == ProviderName.OPENAI.value:
+        uncapped = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in ("max_tokens", "max_completion_tokens")
+        }
+        if runtime.adapter.name == ProviderName.AZURE_OPENAI.value:
+            # The deployment name says nothing about the model family, so
+            # always use the key every current model accepts.
+            if not _azure_accepts_max_completion_tokens(runtime.sdk_client):
+                raise _UnboundableOutput("azure_api_version")
+            return {**uncapped, "max_completion_tokens": default_bound}
+        return {
+            **uncapped,
+            **_normalized_openai_output_cap_layer(
+                runtime.adapter.name, model, {"max_tokens": default_bound}
+            ),
+        }
+    if dialect == ProviderName.ANTHROPIC.value:
+        return {**kwargs, "max_tokens": default_bound}
+    return kwargs
+
+
+def _final_output_capacity(
+    *,
+    runtime: ProviderRuntime,
+    model: str,
+    kwargs: dict[str, object],
+    surface: str,
+) -> int:
+    """Most output the final hop request can produce, or raise ``_UnboundableOutput``."""
+    if surface == "responses":
+        # Nothing in a Responses body extension is folded into the bound.
+        _merged_body(kwargs, strict=True)
+        cap = _positive_output_cap(kwargs.get("max_output_tokens"))
+        if cap is None:
+            raise _UnboundableOutput("bound_exceeded")
+        return cap
+    dialect = runtime.adapter.dialect
+    view: dict[str, Any] = kwargs
+    if dialect == ProviderName.GOOGLE.value:
+        shape = _client_shape(runtime.sdk_client, dialect)
+        if shape == "google_generativeai":
+            view = _legacy_google_view(runtime, kwargs)
+        else:
+            view = _google_view_strict(kwargs)
+            # Client-level http_options.extra_body is merged into every request
+            # at serialization and would replace the generation config.
+            options = getattr(
+                getattr(runtime.sdk_client, "_api_client", None), "_http_options", None
+            )
+            if _google_body_extension(options):
+                raise _UnboundableOutput("unsupported_override")
+    return _hop_output_capacity(
+        dialect, runtime.adapter.name, model, view, default_bound=0, strict=True
+    )
+
+
+def _hard_deny_hop_request(
+    *,
+    runtime: ProviderRuntime,
+    model: str,
+    kwargs: dict[str, object],
+    surface: str,
+    default_bound: int,
+    reserved_bound: int,
+) -> dict[str, object]:
+    """Hold one hop of a hard_deny call to the output bound its check priced.
+
+    Caps an uncapped request at ``default_bound``, then reads the possible
+    output of the request the provider would actually receive. When that
+    cannot be bounded, or exceeds ``reserved_bound``, the call is refused
+    locally with ``OutputBoundUnenforceableError`` before any provider I/O.
+    """
+    reason: OutputBoundReason
+    try:
+        capped = _with_default_output_cap(
+            runtime=runtime,
+            model=model,
+            kwargs=kwargs,
+            surface=surface,
+            default_bound=default_bound,
+        )
+        capacity = _final_output_capacity(
+            runtime=runtime, model=model, kwargs=capped, surface=surface
+        )
+    except _UnboundableOutput as exc:
+        reason = exc.reason
+    else:
+        if capacity <= reserved_bound:
+            return capped
+        reason = "bound_exceeded"
+    raise OutputBoundUnenforceableError(
+        provider=runtime.adapter.name, reason=reason, hint=_OUTPUT_BOUND_HINTS[reason]
+    )
 
 
 @dataclass(frozen=True)
