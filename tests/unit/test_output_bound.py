@@ -685,3 +685,48 @@ class TestLegacyGoogleInjection:
             "max_output_tokens": DEFAULT_OUTPUT_BOUND,
         }
         assert generation == {"top_p": 0.9}
+
+
+@pytest.mark.unit
+class TestLeasePostureRace:
+    def test_renewal_drop_before_the_result_keeps_the_admission_authority(self) -> None:
+        """A renewal landing between reservation and result cannot erase hard_deny.
+
+        The ledger stamps the posture on the admission in the reservation's own
+        section. An ineligible renewal that drops the lease before the enforcer
+        builds its result must not turn a funded call into an uncapped one.
+        """
+        import time
+
+        import solwyn
+        from solwyn._lease import LeaseDecision
+
+        plane = FakeControlPlane()
+        client = _openai_client()
+        with plane.wrap(client) as wrapped, solwyn.run("race") as run_id:
+            wrapped.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
+            enforcer = wrapped._solwyn_budget
+            ledger = enforcer._lease
+            admission = ledger.admit(
+                run_id=run_id,
+                call_id="race-call",
+                estimated_input_tokens=1,
+                model="gpt-5.5",
+                now=time.monotonic(),
+                breaker_open=False,
+                output_bound=DEFAULT_OUTPUT_BOUND,
+            )
+            assert admission.decision is LeaseDecision.ADMIT_LOCAL
+            state = ledger._states[run_id]
+            assert state.lease_id is not None
+            # The renewal lands: the lease is gone before the result is built.
+            assert ledger.drop_if_current(
+                run_id, lease_id=state.lease_id, generation=state.generation
+            )
+
+            result = enforcer._result_from_admission(run_id, admission)
+            ledger.release("race-call", claim_token=admission.claim_token)
+
+        assert result.allowed is True
+        assert result.lease_id is not None
+        assert result.hard_deny_admitted is True

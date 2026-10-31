@@ -1628,7 +1628,6 @@ class _BudgetEnforcerBase:
         """
         with self._state_lock:
             snapshot = self._lease.snapshot_for(agent_run_id)
-            posture_mode = self._lease.posture_mode_for(agent_run_id)
         return BudgetCheckResult(
             allowed=admission.admitted,
             remaining_budget=snapshot.remaining_budget if snapshot is not None else 0.0,
@@ -1647,11 +1646,12 @@ class _BudgetEnforcerBase:
             denied_by_period=("agent_run" if admission.decision is LeaseDecision.DENY else None),
             deny_source=("lease_exhausted" if admission.decision is LeaseDecision.DENY else None),
             deny_reason=(admission.reason if admission.decision is LeaseDecision.DENY else None),
-            # Lease-funded only: an uncounted admission carries no lease_id.
+            # Lease-funded only (an uncounted admission carries no lease_id),
+            # under the posture captured when the tokens were reserved.
             hard_deny_admitted=(
                 admission.admitted
                 and admission.lease_id is not None
-                and posture_mode is BudgetMode.HARD_DENY
+                and admission.posture_mode is BudgetMode.HARD_DENY
             ),
         )
 

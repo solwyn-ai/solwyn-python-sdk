@@ -734,28 +734,60 @@ client = Solwyn(
 ### Output bound
 
 Every token-billed budget check, per-call or lease, prices the call's output
-before it runs. The bound is the largest explicit output cap across the
-configured provider chain (`max_tokens`, `max_completion_tokens`,
-`max_output_tokens`, Google `config.max_output_tokens`, Bedrock
-`inferenceConfig.maxTokens`), after per-call, provider-default and global
-precedence. A per-call check sends it as `estimated_output_bound`, so the API
-reserves input plus that many output tokens. In `hard_deny`, a call whose bound
-would overrun the remaining budget is refused before the provider is called.
+before it runs. The bound is the most output any configured provider hop can
+produce: its output cap, plus any reasoning the provider generates outside
+that cap, times its candidate count (`n` for OpenAI-style chat,
+`candidate_count` for Google). Caps are read after per-call, provider-default
+and global precedence, exactly as the request is sent: `max_tokens`,
+`max_completion_tokens`, `max_output_tokens`, Google `config` and
+`generation_config` (snake or camel case), Bedrock `inferenceConfig.maxTokens`,
+and OpenAI or Anthropic `extra_body`, which those SDKs apply over named
+arguments. A per-call check sends the bound as `estimated_output_bound`, so the
+API reserves input plus that many output tokens. In `hard_deny`, a call whose
+bound would overrun the remaining budget is refused before the provider is
+called.
 
 A request with no positive cap is priced at `lease_output_bound_default`
-(4096 by default, configurable). On a `hard_deny` project, an uncapped call is
-capped at that value: Solwyn sends it to the provider as the dialect's cap
-field, because an unbounded call cannot honestly be held to a hard cap. Set
-your own cap to choose a different limit. An explicit cap you set is always
-sent as is. The cap is added only when Solwyn itself admitted the call under
-`hard_deny` (a check allow, or a lease whose posture is `hard_deny`). Nothing
-changes on `alert_only` projects, and a call admitted fail-open during an
-outage is sent exactly as you built it. Media calls (images, audio, video,
-embeddings) keep their own estimate and carry no output bound.
+(4096 by default, configurable) per candidate. On a `hard_deny` project, an
+uncapped call is capped at that value: Solwyn sends it to the provider as the
+dialect's cap field (`max_completion_tokens` for every Azure OpenAI
+deployment), because an unbounded call cannot honestly be held to a hard cap.
+Set your own cap to choose a different limit. An explicit cap you set is
+always sent as is.
 
-Known limitation: a scoped `hard_deny` rule (for example a tag or run cap) on
-an `alert_only` project is not visible in the check's mode, so its uncapped
-calls are not capped and can overshoot that rule by one call.
+On a `hard_deny` project Solwyn then checks the request the provider would
+actually receive. If its possible output cannot be bounded, or exceeds what the
+check priced, the call is refused locally with `OutputBoundUnenforceableError`
+before any provider I/O: the reservation is released and the failover chain
+stops. `error.reason` is one of:
+
+| Reason | When |
+|---|---|
+| `malformed_cap_container` | Google `config`, Bedrock `inferenceConfig` or `extra_body` is not an object |
+| `malformed_candidate_count` | `n` or `candidate_count` is set but not a positive integer |
+| `reasoning_without_budget` | Qwen thinking (on by default) without a positive `thinking_budget`, or an xAI reasoning model (its cap excludes reasoning and it has no budget) |
+| `client_body_override` | Google `http_options.extra_body.generationConfig` (per request or on the client), or a cap or count key in Bedrock `additionalModelRequestFields` |
+| `azure_api_version` | An uncapped Azure OpenAI call on an api-version older than 2024-09-01, which has no `max_completion_tokens` |
+| `bound_exceeded` | Any other request whose possible output exceeds the priced bound |
+
+`error.hint` says how to fix the request. All of this applies only when Solwyn
+itself admitted the call under `hard_deny` (a check allow, or a lease whose
+posture is `hard_deny`). Nothing changes on `alert_only` projects, and a call
+admitted fail-open during an outage is sent exactly as you built it. Media
+calls (images, audio, video, embeddings) keep their own estimate and carry no
+output bound.
+
+Known limitations:
+
+- A scoped `hard_deny` rule (for example a tag or run cap) on an `alert_only`
+  project is not visible in the check's mode, so its uncapped calls are not
+  capped and can overshoot that rule by one call.
+- Reasoning is treated as inside the cap for every provider not listed above.
+  That is documented for OpenAI, Azure, Anthropic, Gemini, Together and
+  OpenRouter, and unverified for DeepSeek, Groq, Mistral, Z.ai, Perplexity and
+  Fireworks.
+- A Qwen thinking-only model that ignores `enable_thinking=False` can still
+  reason past the bound.
 
 ### Run-scoped leases
 
