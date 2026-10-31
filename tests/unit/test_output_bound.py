@@ -142,6 +142,30 @@ def _bedrock_client() -> MagicMock:
     return client
 
 
+_DIALECT_CALLS: dict[str, tuple[Any, Any, Any]] = {
+    "anthropic": (
+        _anthropic_client,
+        lambda w: w._solwyn_client.messages.create,
+        lambda w: w.messages.create(model="claude-sonnet-5", messages=MESSAGES),
+    ),
+    "google": (
+        _google_client,
+        lambda w: w._solwyn_client.models.generate_content,
+        lambda w: w.models.generate_content(model="gemini-3-pro", contents="hello"),
+    ),
+    "bedrock": (
+        _bedrock_client,
+        lambda w: w._solwyn_client.converse,
+        lambda w: w.converse(modelId="us.anthropic.claude-sonnet-4-5-v1:0", messages=MESSAGES),
+    ),
+    "responses": (
+        _responses_client,
+        lambda w: w._solwyn_client.responses.create,
+        lambda w: w.responses.create(model="gpt-5.5", input="hello"),
+    ),
+}
+
+
 def _sent_kwargs(method: MagicMock) -> dict[str, Any]:
     method.assert_called_once()
     return dict(method.call_args.kwargs)
@@ -358,19 +382,103 @@ class TestCheckSendsTheBoundPerDialect:
 
 
 @pytest.mark.unit
-class TestLeasePathSharesInjection:
-    def test_run_scoped_lease_call_is_capped_too(self) -> None:
+class TestInjectionOnlyUnderHardDeny:
+    """The cap is injected only for a call Solwyn admitted under hard_deny."""
+
+    def test_alert_only_check_sends_the_request_as_built(self) -> None:
+        plane = FakeControlPlane(mode="alert_only")
+        client = _openai_client()
+        with plane.wrap(client, lease_enabled=False) as solwyn:
+            solwyn.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
+
+        # The bound is still priced; the provider request is untouched.
+        assert _only_check_bound(plane) == DEFAULT_OUTPUT_BOUND
+        assert _sent_kwargs(client.chat.completions.create) == {
+            "model": "gpt-5.5",
+            "messages": MESSAGES,
+        }
+
+    @pytest.mark.parametrize("dialect", ["anthropic", "google", "bedrock", "responses"])
+    def test_alert_only_leaves_every_dialect_uncapped(self, dialect: str) -> None:
+        plane = FakeControlPlane(mode="alert_only")
+        with plane.wrap(_DIALECT_CALLS[dialect][0](), lease_enabled=False) as solwyn:
+            method = _DIALECT_CALLS[dialect][1](solwyn)
+            _DIALECT_CALLS[dialect][2](solwyn)
+        sent = _sent_kwargs(method)
+        assert not {"max_tokens", "max_output_tokens", "inferenceConfig"} & set(sent)
+        assert "max_output_tokens" not in (sent.get("config") or {})
+
+    def test_fail_open_outage_sends_the_request_as_built(self) -> None:
+        plane = FakeControlPlane()
+        client = _openai_client()
+        with (
+            plane.wrap(client, lease_enabled=False, budget_mode="hard_deny") as solwyn,
+            plane.outage(path="/api/v1/budgets/check"),
+        ):
+            solwyn.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
+
+        # Even with a hard_deny constructor mode, an outage admission is not
+        # Solwyn authority, so nothing is injected.
+        assert plane.checks == []
+        assert _sent_kwargs(client.chat.completions.create) == {
+            "model": "gpt-5.5",
+            "messages": MESSAGES,
+        }
+
+    def test_cached_hard_deny_allow_still_injects(self) -> None:
+        plane = FakeControlPlane()
+        client = _openai_client()
+        with plane.wrap(client, lease_enabled=False, budget_check_cache_ttl=60) as solwyn:
+            solwyn.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
+            solwyn.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
+
+        assert len(plane.checks) == 1
+        calls = client.chat.completions.create.call_args_list
+        assert [call.kwargs["max_completion_tokens"] for call in calls] == [
+            DEFAULT_OUTPUT_BOUND,
+            DEFAULT_OUTPUT_BOUND,
+        ]
+
+    def test_lease_hard_deny_posture_injects(self) -> None:
         import solwyn
 
         plane = FakeControlPlane()
         client = _openai_client()
         with plane.wrap(client) as wrapped, solwyn.run("bounded"):
             wrapped.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
+            wrapped.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
 
         assert plane.checks == []
         assert len(plane.lease_grants) == 1
-        sent = _sent_kwargs(client.chat.completions.create)
-        assert sent["max_completion_tokens"] == DEFAULT_OUTPUT_BOUND
+        calls = client.chat.completions.create.call_args_list
+        assert [call.kwargs["max_completion_tokens"] for call in calls] == [
+            DEFAULT_OUTPUT_BOUND,
+            DEFAULT_OUTPUT_BOUND,
+        ]
+
+    def test_lease_alert_only_posture_does_not_inject(self) -> None:
+        import solwyn
+
+        plane = FakeControlPlane(mode="alert_only")
+        client = _openai_client()
+        with plane.wrap(client) as wrapped, solwyn.run("unbounded"):
+            wrapped.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
+
+        assert plane.checks == []
+        assert len(plane.lease_grants) == 1
+        assert "max_completion_tokens" not in _sent_kwargs(client.chat.completions.create)
+
+    def test_enforcer_flags_only_hard_deny_allows(self) -> None:
+        from conftest import ALLOW_BUDGET_RESPONSE
+
+        from solwyn._types import BudgetCheckResponse
+
+        base = _BudgetEnforcerBase(api_url="https://api.test.solwyn.ai", api_key="k" * 8)
+        hard = BudgetCheckResponse(**{**ALLOW_BUDGET_RESPONSE, "mode": "hard_deny"})
+        alert = BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE)
+        assert base._build_result_from_response(hard).hard_deny_admitted is True
+        assert base._build_result_from_response(alert).hard_deny_admitted is False
+        assert base._build_fail_open_result().hard_deny_admitted is False
 
 
 @pytest.mark.unit

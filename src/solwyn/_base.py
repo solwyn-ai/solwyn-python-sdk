@@ -732,9 +732,11 @@ def _with_default_output_cap(
     """Give an uncapped hop the output cap its reservation already assumed.
 
     ``_effective_output_bound`` charges an uncapped hop ``default_bound``
-    output tokens, on the lease and the per-call check alike. This makes that
-    charge true: a final provider request with no positive cap gets
-    ``default_bound`` in its dialect's native cap field. A positive caller or
+    output tokens, on the lease and the per-call check alike. For a call
+    admitted under hard_deny (``BudgetCheckResult.hard_deny_admitted``; the
+    caller gates on it) this makes that charge true: a final provider request
+    with no positive cap gets ``default_bound`` in its dialect's native cap
+    field. Any other admission sends the request as built. A positive caller or
     default cap is never touched; a non-positive or malformed one counts as
     absent, exactly as the bound resolver reads it. A malformed container
     (a non-mapping Google config or Bedrock ``inferenceConfig``) is left for

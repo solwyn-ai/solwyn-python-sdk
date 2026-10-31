@@ -9,7 +9,6 @@ from conftest import WireRecorder
 from fake_provider import RESPONSE_CONTENT, FakeProviderServer
 from pydantic import BaseModel
 
-from solwyn._lease import DEFAULT_OUTPUT_BOUND
 from solwyn._types import CallStatus, ProviderName
 
 INPUT = "Return the deterministic fake response."
@@ -50,7 +49,6 @@ def _assert_request_and_lifecycle(
     assert len(recorder.budget_checks) == 1
     check = recorder.budget_checks[0]
     assert check["provider"] == "openai"
-    assert check["estimated_output_bound"] == DEFAULT_OUTPUT_BOUND
     assert check["fallback_providers"] == []
     assert check["fallback_models"] == []
 
@@ -113,11 +111,7 @@ class TestSyncResponsesPipeline:
         _assert_estimated_request_and_lifecycle(
             recorder,
             fake_provider,
-            expected_body={
-                "model": MODEL,
-                "input": INPUT,
-                "max_output_tokens": DEFAULT_OUTPUT_BOUND,
-            },
+            expected_body={"model": MODEL, "input": INPUT},
         )
 
     def test_parse_without_usage_settles_estimate(
@@ -144,7 +138,6 @@ class TestSyncResponsesPipeline:
             expected_body={
                 "model": MODEL,
                 "input": INPUT,
-                "max_output_tokens": DEFAULT_OUTPUT_BOUND,
                 "text": {"format": STRUCTURED_FORMAT},
             },
         )
@@ -162,11 +155,7 @@ class TestSyncResponsesPipeline:
         _assert_request_and_lifecycle(
             recorder,
             fake_provider,
-            expected_body={
-                "model": MODEL,
-                "input": INPUT,
-                "max_output_tokens": DEFAULT_OUTPUT_BOUND,
-            },
+            expected_body={"model": MODEL, "input": INPUT},
         )
 
     def test_create_stream(
@@ -188,12 +177,7 @@ class TestSyncResponsesPipeline:
         _assert_request_and_lifecycle(
             recorder,
             fake_provider,
-            expected_body={
-                "model": MODEL,
-                "input": INPUT,
-                "max_output_tokens": DEFAULT_OUTPUT_BOUND,
-                "stream": True,
-            },
+            expected_body={"model": MODEL, "input": INPUT, "stream": True},
         )
 
     def test_parse(self, make_wrapped_client: Any, fake_provider: FakeProviderServer) -> None:
@@ -216,7 +200,6 @@ class TestSyncResponsesPipeline:
             expected_body={
                 "model": MODEL,
                 "input": INPUT,
-                "max_output_tokens": DEFAULT_OUTPUT_BOUND,
                 "text": {"format": STRUCTURED_FORMAT},
             },
         )
@@ -234,12 +217,7 @@ class TestSyncResponsesPipeline:
         _assert_request_and_lifecycle(
             recorder,
             fake_provider,
-            expected_body={
-                "model": MODEL,
-                "input": INPUT,
-                "max_output_tokens": DEFAULT_OUTPUT_BOUND,
-                "stream": True,
-            },
+            expected_body={"model": MODEL, "input": INPUT, "stream": True},
         )
 
 
@@ -259,11 +237,7 @@ class TestAsyncResponsesPipeline:
         _assert_estimated_request_and_lifecycle(
             recorder,
             fake_provider,
-            expected_body={
-                "model": MODEL,
-                "input": INPUT,
-                "max_output_tokens": DEFAULT_OUTPUT_BOUND,
-            },
+            expected_body={"model": MODEL, "input": INPUT},
         )
 
     async def test_parse_without_usage_settles_estimate(
@@ -290,7 +264,6 @@ class TestAsyncResponsesPipeline:
             expected_body={
                 "model": MODEL,
                 "input": INPUT,
-                "max_output_tokens": DEFAULT_OUTPUT_BOUND,
                 "text": {"format": STRUCTURED_FORMAT},
             },
         )
@@ -307,11 +280,7 @@ class TestAsyncResponsesPipeline:
         _assert_request_and_lifecycle(
             recorder,
             fake_provider,
-            expected_body={
-                "model": MODEL,
-                "input": INPUT,
-                "max_output_tokens": DEFAULT_OUTPUT_BOUND,
-            },
+            expected_body={"model": MODEL, "input": INPUT},
         )
 
     async def test_create_stream(
@@ -334,12 +303,7 @@ class TestAsyncResponsesPipeline:
         _assert_request_and_lifecycle(
             recorder,
             fake_provider,
-            expected_body={
-                "model": MODEL,
-                "input": INPUT,
-                "max_output_tokens": DEFAULT_OUTPUT_BOUND,
-                "stream": True,
-            },
+            expected_body={"model": MODEL, "input": INPUT, "stream": True},
         )
 
     async def test_parse(
@@ -364,7 +328,6 @@ class TestAsyncResponsesPipeline:
             expected_body={
                 "model": MODEL,
                 "input": INPUT,
-                "max_output_tokens": DEFAULT_OUTPUT_BOUND,
                 "text": {"format": STRUCTURED_FORMAT},
             },
         )
@@ -382,10 +345,5 @@ class TestAsyncResponsesPipeline:
         _assert_request_and_lifecycle(
             recorder,
             fake_provider,
-            expected_body={
-                "model": MODEL,
-                "input": INPUT,
-                "max_output_tokens": DEFAULT_OUTPUT_BOUND,
-                "stream": True,
-            },
+            expected_body={"model": MODEL, "input": INPUT, "stream": True},
         )

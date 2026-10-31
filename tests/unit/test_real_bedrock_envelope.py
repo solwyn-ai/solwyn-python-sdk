@@ -176,19 +176,37 @@ def test_adapter_service_tier_falls_back_to_performance_config() -> None:
 
 
 @pytest.mark.unit
+def test_hard_deny_admission_sends_an_inference_config_botocore_accepts() -> None:
+    # WS-13: a hard_deny admission caps an uncapped converse at the default
+    # output bound. The real stubber validates the injected inferenceConfig
+    # against the botocore service model, not just a mock's kwargs.
+    client = _bedrock_client()
+    stubber = Stubber(client)
+    params = {
+        "modelId": BEDROCK_MODEL,
+        "messages": _messages(),
+        "inferenceConfig": {"maxTokens": DEFAULT_OUTPUT_BOUND},
+    }
+    stubber.add_response("converse", _full_envelope(), params)
+
+    solwyn = Solwyn(client, api_key=VALID_API_KEY)
+    solwyn._solwyn_reporter.report = lambda e: None
+    solwyn._solwyn_reporter.report_settlement = lambda c, e: None
+
+    hard_deny_allow = {**ALLOW_BUDGET_RESPONSE, "mode": "hard_deny"}
+    with _mock_budget(solwyn, hard_deny_allow), stubber:
+        solwyn.converse(modelId=BEDROCK_MODEL, messages=_messages())
+    stubber.assert_no_pending_responses()
+
+
+@pytest.mark.unit
 def test_wrapped_converse_reports_normalized_usage_and_region() -> None:
     # Wrap the REAL stubbed client and drive one converse through the full
     # interception pipeline. The proxy renames modelId->model internally and
     # BACK at dispatch, so the stubber's expected_params see modelId.
     client = _bedrock_client()
     stubber = Stubber(client)
-    # An uncapped converse gets the default output bound (WS-13); the real
-    # botocore stubber validates the injected inferenceConfig against the model.
-    params = {
-        "modelId": BEDROCK_MODEL,
-        "messages": _messages(),
-        "inferenceConfig": {"maxTokens": DEFAULT_OUTPUT_BOUND},
-    }
+    params = {"modelId": BEDROCK_MODEL, "messages": _messages()}
     stubber.add_response("converse", _full_envelope(), params)
 
     solwyn = Solwyn(client, api_key=VALID_API_KEY)

@@ -219,6 +219,13 @@ class BudgetCheckResult(BaseModel):
     # (CostPolicy). The SDK never computes price. None when not provided.
     price_hints: dict[str, float] | None = None
     failover_tuning_allowed: bool | None = None
+    # WS-13: True only for a call admitted under hard_deny by Solwyn's own
+    # authority: a server check allow (live, or replayed from the allow
+    # cache) in hard_deny mode, or a lease-funded admission whose posture is
+    # hard_deny. The client then holds an uncapped request to the output
+    # bound the check priced. Every alert_only, fail-open or outage admission
+    # keeps False and the request is sent exactly as the caller built it.
+    hard_deny_admitted: bool = False
 
 
 @dataclass(slots=True)
@@ -469,8 +476,9 @@ class _BudgetEnforcerBase:
         """The output bound a per-call check sends, resolved like the lease's.
 
         A text call's missing or non-positive bound becomes the configured
-        default, as in ``LeaseLedger._output_bound``; the client sends that
-        same default to the provider for an uncapped hop, so the bound holds.
+        default, as in ``LeaseLedger._output_bound``. Under hard_deny the client
+        sends that same default to the provider for an uncapped hop, so the
+        bound holds.
         Media checks keep their own estimate and send no bound. The wire field
         is capped at ``ORDINARY_TOKEN_COUNT_MAX``.
         """
@@ -1187,6 +1195,7 @@ class _BudgetEnforcerBase:
                 denied_by_period=response.denied_by_period,
                 price_hints=price_hints,
                 failover_tuning_allowed=failover_tuning_allowed,
+                hard_deny_admitted=response.mode == BudgetMode.HARD_DENY,
             )
 
         # Denied by cloud
@@ -1619,6 +1628,7 @@ class _BudgetEnforcerBase:
         """
         with self._state_lock:
             snapshot = self._lease.snapshot_for(agent_run_id)
+            posture_mode = self._lease.posture_mode_for(agent_run_id)
         return BudgetCheckResult(
             allowed=admission.admitted,
             remaining_budget=snapshot.remaining_budget if snapshot is not None else 0.0,
@@ -1637,6 +1647,12 @@ class _BudgetEnforcerBase:
             denied_by_period=("agent_run" if admission.decision is LeaseDecision.DENY else None),
             deny_source=("lease_exhausted" if admission.decision is LeaseDecision.DENY else None),
             deny_reason=(admission.reason if admission.decision is LeaseDecision.DENY else None),
+            # Lease-funded only: an uncounted admission carries no lease_id.
+            hard_deny_admitted=(
+                admission.admitted
+                and admission.lease_id is not None
+                and posture_mode is BudgetMode.HARD_DENY
+            ),
         )
 
     def _lease_result_when_breaker_refuses(
@@ -2635,6 +2651,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                         current_usage=cached.current_usage,
                         denied_by_period=cached.denied_by_period,
                         price_hints=_str_keyed_hints(cached),
+                        hard_deny_admitted=cached.mode == BudgetMode.HARD_DENY,
                     )
 
         breaker = self._control_plane_breaker
@@ -3417,6 +3434,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                         current_usage=cached.current_usage,
                         denied_by_period=cached.denied_by_period,
                         price_hints=_str_keyed_hints(cached),
+                        hard_deny_admitted=cached.mode == BudgetMode.HARD_DENY,
                     )
 
         breaker = self._control_plane_breaker

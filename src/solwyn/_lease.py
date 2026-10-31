@@ -280,6 +280,11 @@ class LeaseLedger:
         state = self._states.get(run_id)
         return state.snapshot if state is not None else None
 
+    def posture_mode_for(self, run_id: str) -> BudgetMode | None:
+        """The customer's mode from the run's last grant posture, if it holds one."""
+        state = self._states.get(run_id)
+        return state.posture_mode if state is not None and state.has_lease else None
+
     def active_run_ids(self) -> list[str]:
         """Runs holding an installed lease (surrender targets)."""
         return [run_id for run_id, state in self._states.items() if state.has_lease]

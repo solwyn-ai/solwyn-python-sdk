@@ -651,7 +651,8 @@ class BudgetCheckRequest(BaseModel):
         description=(
             "Maximum output tokens the pending call can produce: the largest "
             "explicit cap across the configured chain, or the SDK's default bound "
-            "(also sent to the provider) for an uncapped hop. The server prices "
+            "for an uncapped hop (sent to the provider as its cap when the call "
+            "is admitted under hard_deny). The server prices "
             "the reservation as input plus this bound at the output rate. None "
             "for media checks, and omitted from the wire when None."
         ),

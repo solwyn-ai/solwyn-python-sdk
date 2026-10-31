@@ -8,10 +8,11 @@ derived from git tags (hatch-vcs).
 ## [0.10.0] - Unreleased
 
 A `hard_deny` budget now bounds a call's output, not only its input. Every
-per-call budget check sends the call's output bound, and a request with no
-output cap is sent to the provider with one, so a single call can no longer
-spend far past the cap. Before this, one uncapped or large-cap call on an
-expensive reasoning model could pass a $1 cap and spend several dollars.
+per-call budget check sends the call's output bound. On a `hard_deny` project,
+a request with no output cap is sent to the provider with one, so a single
+call can no longer spend far past the cap. Before this, one uncapped or
+large-cap call on an expensive reasoning model could pass a $1 cap and spend
+several dollars. Nothing changes on `alert_only` projects.
 
 Wire-contract change is API-first: Solwyn Cloud must accept
 `estimated_output_bound` on `POST /api/v1/budgets/check` before this SDK
@@ -20,36 +21,47 @@ unreachable control plane.
 
 ### Changed
 
-- **Uncapped calls are now sent with an output cap.** A chat, Messages,
-  Responses, Google or Bedrock request whose final provider request has no
-  positive output cap gets `lease_output_bound_default` (4096 by default) in
-  its dialect's cap field: `max_completion_tokens` or `max_tokens` for
-  OpenAI-dialect providers (by the same model rule as the existing key
-  rewrite), `max_output_tokens` for Responses, `max_tokens` for Anthropic,
-  `config.max_output_tokens` for Google (`generation_config` for the legacy
-  SDK, after its constructor defaults), and `inferenceConfig.maxTokens` for
-  Bedrock. This applies on the lease and per-call paths in every budget mode,
-  and makes the bound both paths already reserved true. An explicit positive
-  cap is always sent as is. A zero, negative or non-integer cap counts as no
-  cap. A request that needs more than 4096 output tokens must set its own cap
-  or raise `lease_output_bound_default`.
+- **On `hard_deny` projects, uncapped calls are capped at
+  `lease_output_bound_default`** (4096 by default, configurable), because an
+  unbounded call cannot honestly be held to a hard cap. Set your own cap to
+  choose a different limit. The cap goes in the dialect's own field:
+  `max_completion_tokens` or `max_tokens` for OpenAI-dialect providers (by the
+  same model rule as the existing key rewrite), `max_output_tokens` for
+  Responses, `max_tokens` for Anthropic, `config.max_output_tokens` for Google
+  (`generation_config` for the legacy SDK, after its constructor defaults),
+  and `inferenceConfig.maxTokens` for Bedrock. It is added only when Solwyn
+  admitted the call under `hard_deny`: a check allow in `hard_deny` mode (live
+  or from the allow cache), or a lease-funded call whose lease posture is
+  `hard_deny`. An `alert_only` admission, a fail-open or outage admission, or
+  an uncounted expired-lease admission sends the request exactly as the caller
+  built it. An explicit positive cap is always sent as is. A zero, negative or
+  non-integer cap counts as no cap.
 
 ### Added
 
 - **`estimated_output_bound` on the per-call budget check.** The check carries
   the same bound the lease path reserves: the largest explicit cap across the
-  configured provider chain, else `lease_output_bound_default`. The API prices
-  the reservation as input plus that many output tokens at the model's output
-  rate, so in `hard_deny` a call whose bound would overrun the remaining budget
-  is refused before the provider is called. Media checks omit the field. A
-  direct `check_budget` caller that passes no bound on a text check sends the
-  default, exactly as the lease ledger reserves it.
+  configured provider chain, else `lease_output_bound_default`. It is sent on
+  every text check, in every mode. The API prices the reservation as input
+  plus that many output tokens at the model's output rate, so in `hard_deny` a
+  call whose bound would overrun the remaining budget is refused before the
+  provider is called. Media checks omit the field. A direct `check_budget`
+  caller that passes no bound on a text check sends the default, exactly as
+  the lease ledger reserves it.
+- **`BudgetCheckResult.hard_deny_admitted`** (default `False`) records whether
+  the call was admitted under `hard_deny` by Solwyn's own authority.
 
 ### Fixed
 
 - **The allow cache no longer admits a larger call on a smaller call's allow.**
   The output bound is now part of the cached cohort, so an allow priced for a
   100-token cap cannot admit a 10,000-token call inside the cache window.
+
+### Known limitations
+
+- A scoped `hard_deny` rule (for example a tag or run cap) on an `alert_only`
+  project is not visible in the check's mode. Its uncapped calls are not
+  capped, so they can still overshoot that rule by one call.
 
 ## [0.9.0] - 2026-10-25
 
