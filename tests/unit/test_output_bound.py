@@ -513,3 +513,67 @@ class TestHardDenyRefusesBeforeTheProvider:
         assert 0 < stub.reservations[0] <= 1.00
         sent = _sent_kwargs(client.chat.completions.create)
         assert sent["max_completion_tokens"] == 1_000
+
+
+class _LegacyRequest:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+
+    @staticmethod
+    def to_dict(request: _LegacyRequest, **_options: object) -> dict[str, Any]:
+        return request.payload
+
+
+class _LegacyGenerativeModel:
+    """Duck-typed ``google.generativeai.GenerativeModel`` with constructor defaults."""
+
+    def __init__(self, generation_config: dict[str, Any]) -> None:
+        self._generation_config = generation_config
+
+    def _prepare_request(self, **kwargs: Any) -> _LegacyRequest:
+        merged = {**self._generation_config, **(kwargs.get("generation_config") or {})}
+        return _LegacyRequest({"contents": kwargs["contents"], "generation_config": merged})
+
+
+_LegacyGenerativeModel.__module__ = "google.generativeai.generative_models"
+_LegacyGenerativeModel.__name__ = "GenerativeModel"
+
+
+def _legacy_runtime(generation_config: dict[str, Any]) -> Any:
+    return SimpleNamespace(
+        adapter=SimpleNamespace(dialect="google", name="google"),
+        sdk_client=_LegacyGenerativeModel(generation_config),
+    )
+
+
+@pytest.mark.unit
+class TestLegacyGoogleInjection:
+    def _cap(self, runtime: Any, kwargs: dict[str, object]) -> dict[str, object]:
+        from solwyn._base import _with_default_output_cap
+
+        return _with_default_output_cap(
+            runtime=runtime,
+            model="gemini-1.5-pro",
+            kwargs=kwargs,
+            surface="chat",
+            default_bound=DEFAULT_OUTPUT_BOUND,
+        )
+
+    def test_constructor_cap_is_respected(self) -> None:
+        kwargs: dict[str, object] = {"contents": "hello"}
+        assert self._cap(_legacy_runtime({"max_output_tokens": 300}), kwargs) is kwargs
+
+    def test_uncapped_model_gets_call_generation_config(self) -> None:
+        capped = self._cap(_legacy_runtime({"temperature": 0.3}), {"contents": "hello"})
+        assert capped["generation_config"] == {"max_output_tokens": DEFAULT_OUTPUT_BOUND}
+
+    def test_call_generation_config_is_copied_not_mutated(self) -> None:
+        generation = {"top_p": 0.9}
+        capped = self._cap(
+            _legacy_runtime({}), {"contents": "hello", "generation_config": generation}
+        )
+        assert capped["generation_config"] == {
+            "top_p": 0.9,
+            "max_output_tokens": DEFAULT_OUTPUT_BOUND,
+        }
+        assert generation == {"top_p": 0.9}
