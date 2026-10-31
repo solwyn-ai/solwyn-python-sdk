@@ -8,6 +8,7 @@ UntranslatableRequestError -- raised when a cross-provider hop cannot translate 
 UntranslatableModelError -- raised when a model id is not configured for a target provider.
 UnsupportedSurfaceError -- raised when an adapter does not serve a requested media surface.
 UntrackedSpendSurfaceError -- raised when strict posture refuses an untracked capability.
+OutputBoundUnenforceableError -- raised when a hard_deny call's output cannot be bounded.
 CoverageMismatchError -- raised when a literal coverage audit pin drifts.
 SolwynTagsClampedWarning -- emitted when merged tags exceed the event cap.
 """
@@ -15,6 +16,7 @@ SolwynTagsClampedWarning -- emitted when merged tags exceed the event cap.
 from __future__ import annotations
 
 from functools import partial
+from typing import Literal
 
 
 class SolwynError(Exception):
@@ -205,6 +207,45 @@ class UntranslatableRequestError(SolwynError):
             f"UntranslatableRequestError("
             f"source={self.source!r}, target={self.target!r}, feature={self.feature!r})"
         )
+
+
+OutputBoundReason = Literal[
+    "malformed_cap_container",
+    "malformed_candidate_count",
+    "reasoning_without_budget",
+    "unsupported_override",
+    "azure_api_version",
+    "multi_generation_loop",
+    "bound_exceeded",
+]
+
+
+class OutputBoundUnenforceableError(SolwynError):
+    """Raised when a call admitted under hard_deny cannot be held to its output bound.
+
+    The budget check priced the call at its output bound. When the request the
+    provider would receive could produce more output than that, the SDK refuses
+    the call locally instead of sending it. Raised after the budget check and
+    before any provider I/O: the reservation is released, the failover chain
+    stops, and no provider health is recorded. Never raised outside hard_deny.
+
+    Attributes:
+        code: Always ``"output_bound_unenforceable"``.
+        provider: Provider the refused hop was bound for.
+        reason: Closed structural slug naming why the bound cannot hold.
+        hint: One sentence telling the caller how to fix the request.
+    """
+
+    code = "output_bound_unenforceable"
+
+    def __init__(self, *, provider: str, reason: OutputBoundReason, hint: str) -> None:
+        super().__init__(f"{hint} ({self.code}: {reason})")
+        self.provider = provider
+        self.reason = reason
+        self.hint = hint
+
+    def __repr__(self) -> str:
+        return f"OutputBoundUnenforceableError(provider={self.provider!r}, reason={self.reason!r})"
 
 
 class UntranslatableModelError(SolwynError):

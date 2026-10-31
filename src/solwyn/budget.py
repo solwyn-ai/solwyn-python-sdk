@@ -28,7 +28,12 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from solwyn import _run_control
-from solwyn._constants import CALL_ID_MAX_LENGTH, CALL_ID_PATTERN, SIGNED_BIGINT_MAX
+from solwyn._constants import (
+    CALL_ID_MAX_LENGTH,
+    CALL_ID_PATTERN,
+    ORDINARY_TOKEN_COUNT_MAX,
+    SIGNED_BIGINT_MAX,
+)
 from solwyn._control_plane_transport import (
     ControlPlaneTransport,
     non_closing_async_transport,
@@ -214,6 +219,13 @@ class BudgetCheckResult(BaseModel):
     # (CostPolicy). The SDK never computes price. None when not provided.
     price_hints: dict[str, float] | None = None
     failover_tuning_allowed: bool | None = None
+    # WS-13: True only for a call admitted under hard_deny by Solwyn's own
+    # authority: a server check allow (live, or replayed from the allow
+    # cache) in hard_deny mode, or a lease-funded admission whose posture is
+    # hard_deny. The client then holds an uncapped request to the output
+    # bound the check priced. Every alert_only, fail-open or outage admission
+    # keeps False and the request is sent exactly as the caller built it.
+    hard_deny_admitted: bool = False
 
 
 @dataclass(slots=True)
@@ -248,6 +260,7 @@ class _AllowCacheKey:
     fallback_providers: tuple[str, ...]
     fallback_models: tuple[str, ...]
     modality: str
+    estimated_output_bound: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,6 +435,7 @@ class _BudgetEnforcerBase:
         estimated_media: MediaUsage | None = None,
         agent_run_id: str | None = None,
         tags: dict[str, str] | None = None,
+        estimated_output_bound: int | None = None,
     ) -> BudgetCheckRequest:
         """Build a BudgetCheckRequest for the cloud API.
 
@@ -433,6 +447,8 @@ class _BudgetEnforcerBase:
         call on the right basis. ``estimated_media`` carries a non-text surface's
         pre-flight non-token quantities (image counts, media seconds, character
         counts) for a precise check-time cost; None for chat/token calls.
+        ``estimated_output_bound`` is the resolved bound from
+        ``_check_output_bound``; None omits it from the wire.
         """
         return BudgetCheckRequest(
             estimated_input_tokens=estimated_input_tokens,
@@ -440,6 +456,7 @@ class _BudgetEnforcerBase:
             provider=ProviderName(provider),
             modality=modality,
             estimated_media=estimated_media,
+            estimated_output_bound=estimated_output_bound,
             fallback_providers=[ProviderName(p) for p in (fallback_providers or [])],
             fallback_models=list(fallback_models or []),
             agent_run_id=agent_run_id,
@@ -449,6 +466,28 @@ class _BudgetEnforcerBase:
             price_hints_version="1",
         )
 
+    def _check_output_bound(
+        self,
+        estimated_output_bound: int | None,
+        *,
+        modality: Modality,
+        estimated_media: MediaUsage | None,
+    ) -> int | None:
+        """The output bound a per-call check sends, resolved like the lease's.
+
+        A text call's missing or non-positive bound becomes the configured
+        default, as in ``LeaseLedger._output_bound``. Under hard_deny the client
+        sends that same default to the provider for an uncapped hop, so the
+        bound holds.
+        Media checks keep their own estimate and send no bound. The wire field
+        is capped at ``ORDINARY_TOKEN_COUNT_MAX``.
+        """
+        if modality != "text" or estimated_media is not None:
+            return None
+        if estimated_output_bound is None or estimated_output_bound <= 0:
+            return self._lease.output_bound_default
+        return min(estimated_output_bound, ORDINARY_TOKEN_COUNT_MAX)
+
     @staticmethod
     def _allow_cache_key(
         *,
@@ -457,14 +496,20 @@ class _BudgetEnforcerBase:
         fallback_providers: Sequence[str],
         fallback_models: Sequence[str],
         modality: str,
+        estimated_output_bound: int | None,
     ) -> _AllowCacheKey:
-        """Build the cache cohort for one priced provider/model chain."""
+        """Build the cache cohort for one priced provider/model chain.
+
+        The output bound is part of the cohort: an allow priced for a small
+        bound must not admit a call that can spend a larger one.
+        """
         return _AllowCacheKey(
             provider=provider,
             model=model,
             fallback_providers=tuple(fallback_providers),
             fallback_models=tuple(fallback_models),
             modality=modality,
+            estimated_output_bound=estimated_output_bound,
         )
 
     def _cached_allow_locked(self, key: _AllowCacheKey) -> BudgetCheckResponse | None:
@@ -1150,6 +1195,7 @@ class _BudgetEnforcerBase:
                 denied_by_period=response.denied_by_period,
                 price_hints=price_hints,
                 failover_tuning_allowed=failover_tuning_allowed,
+                hard_deny_admitted=response.mode == BudgetMode.HARD_DENY,
             )
 
         # Denied by cloud
@@ -1600,6 +1646,13 @@ class _BudgetEnforcerBase:
             denied_by_period=("agent_run" if admission.decision is LeaseDecision.DENY else None),
             deny_source=("lease_exhausted" if admission.decision is LeaseDecision.DENY else None),
             deny_reason=(admission.reason if admission.decision is LeaseDecision.DENY else None),
+            # Lease-funded only (an uncounted admission carries no lease_id),
+            # under the posture captured when the tokens were reserved.
+            hard_deny_admitted=(
+                admission.admitted
+                and admission.lease_id is not None
+                and admission.posture_mode is BudgetMode.HARD_DENY
+            ),
         )
 
     def _lease_result_when_breaker_refuses(
@@ -2571,12 +2624,18 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         # Use cache if valid (only allow decisions are cached).
         # Snapshot under the lock to avoid a TOCTOU race between the validity
         # check and reading the cached fields.
+        check_output_bound = self._check_output_bound(
+            estimated_output_bound,
+            modality=modality,
+            estimated_media=estimated_media,
+        )
         cache_key = self._allow_cache_key(
             provider=provider,
             model=model,
             fallback_providers=fallback_providers,
             fallback_models=fallback_models,
             modality=modality,
+            estimated_output_bound=check_output_bound,
         )
         if agent_run_id is None and tags is None:
             with self._state_lock:
@@ -2592,6 +2651,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                         current_usage=cached.current_usage,
                         denied_by_period=cached.denied_by_period,
                         price_hints=_str_keyed_hints(cached),
+                        hard_deny_admitted=cached.mode == BudgetMode.HARD_DENY,
                     )
 
         breaker = self._control_plane_breaker
@@ -2627,6 +2687,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             estimated_media,
             agent_run_id,
             tags,
+            check_output_bound,
         )
 
         uncounted_report: _UncountedReport | None = None
@@ -3346,12 +3407,18 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             if leased is not None:
                 return leased
 
+        check_output_bound = self._check_output_bound(
+            estimated_output_bound,
+            modality=modality,
+            estimated_media=estimated_media,
+        )
         cache_key = self._allow_cache_key(
             provider=provider,
             model=model,
             fallback_providers=fallback_providers,
             fallback_models=fallback_models,
             modality=modality,
+            estimated_output_bound=check_output_bound,
         )
         if agent_run_id is None and tags is None:
             with self._state_lock:
@@ -3367,6 +3434,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                         current_usage=cached.current_usage,
                         denied_by_period=cached.denied_by_period,
                         price_hints=_str_keyed_hints(cached),
+                        hard_deny_admitted=cached.mode == BudgetMode.HARD_DENY,
                     )
 
         breaker = self._control_plane_breaker
@@ -3402,6 +3470,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             estimated_media,
             agent_run_id,
             tags,
+            check_output_bound,
         )
 
         uncounted_report: _UncountedReport | None = None

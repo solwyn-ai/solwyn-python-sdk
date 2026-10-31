@@ -16,6 +16,7 @@ import inspect
 import json
 import re
 import socket
+import threading
 import warnings
 from collections.abc import AsyncIterator, Callable, Collection, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
@@ -186,12 +187,27 @@ class OfflineViolationError(RuntimeError):
 
 
 class _SocketCounter:
+    """Count and deny socket access made by the capturing thread.
+
+    The socket patch is process-wide, but a background thread left by earlier
+    work in the same process (a reporter flush, a lease renewal) is not the
+    capture's own access. Counting it made the offline guard, and the
+    determinism test that compares two captures, nondeterministic. Other
+    threads keep the original behavior.
+    """
+
     def __init__(self) -> None:
         self.attempts = 0
+        self._owner = threading.get_ident()
 
-    def deny(self, *args: object, **kwargs: object) -> None:
-        self.attempts += 1
-        raise OfflineViolationError("provider inventory attempted socket access")
+    def guard(self, original: Callable[..., Any]) -> Callable[..., Any]:
+        def guarded(*args: object, **kwargs: object) -> Any:
+            if threading.get_ident() != self._owner:
+                return original(*args, **kwargs)
+            self.attempts += 1
+            raise OfflineViolationError("provider inventory attempted socket access")
+
+        return guarded
 
 
 def shape_keys() -> tuple[str, ...]:
@@ -224,9 +240,9 @@ def import_name_for_shape(shape_key: str) -> str:
 def _deny_socket_access() -> Iterator[_SocketCounter]:
     counter = _SocketCounter()
     with (
-        patch.object(socket, "create_connection", side_effect=counter.deny),
-        patch.object(socket.socket, "connect", side_effect=counter.deny),
-        patch.object(socket.socket, "connect_ex", side_effect=counter.deny),
+        patch.object(socket, "create_connection", new=counter.guard(socket.create_connection)),
+        patch.object(socket.socket, "connect", new=counter.guard(socket.socket.connect)),
+        patch.object(socket.socket, "connect_ex", new=counter.guard(socket.socket.connect_ex)),
     ):
         yield counter
 

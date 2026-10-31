@@ -122,6 +122,11 @@ class LeaseAdmission:
     renewal_due: bool = False
     mode: BudgetMode | None = None
     reason: str | None = None
+    # The run's lease posture when a lease-funded admission reserved its
+    # tokens, captured in the same section as the reservation. A renewal that
+    # lands before the enforcer builds its result can drop the lease, but it
+    # cannot change the authority this call was admitted under.
+    posture_mode: BudgetMode | None = None
     # Opaque local capability for this exact call-id claim. It never goes on
     # the wire; callers must present it on re-entry, settlement, or release so
     # an expired owner cannot mutate a later reuse of the same call_id.
@@ -356,7 +361,10 @@ class LeaseLedger:
             admission = self._admit_live(state, call_id, reserve, now, breaker_open)
         else:
             admission = self._admit_expired(state, call_id, reserve, now, breaker_open)
-        return replace(admission, claim_token=owned_claim_token)
+        posture_mode = (
+            state.posture_mode if admission.admitted and admission.lease_id is not None else None
+        )
+        return replace(admission, claim_token=owned_claim_token, posture_mode=posture_mode)
 
     def _admit_live(
         self,

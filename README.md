@@ -731,6 +731,101 @@ client = Solwyn(
 | `alert_only` | Log a warning when budget is exceeded (default) |
 | `hard_deny` | Raise `BudgetExceededError` and block the call |
 
+### Output bound
+
+Every token-billed budget check, per-call or lease, prices the call's output
+before it runs. The bound is the most output any configured provider hop can
+produce: its output cap, plus any reasoning the provider generates outside
+that cap, times its candidate count (`n` for OpenAI-style chat,
+`candidate_count` for Google). Caps are read after per-call, provider-default
+and global precedence, exactly as the request is sent: `max_tokens`,
+`max_completion_tokens`, `max_output_tokens`, Google `config` and
+`generation_config` (snake or camel case), Bedrock `inferenceConfig.maxTokens`,
+and OpenAI or Anthropic `extra_body`, which those SDKs apply over named
+arguments. A per-call check sends the bound as `estimated_output_bound`, so the
+API reserves input plus that many output tokens. In `hard_deny`, a call whose
+bound would overrun the remaining budget is refused before the provider is
+called.
+
+A request with no positive cap is priced at `lease_output_bound_default`
+(4096 by default, configurable) per candidate. On a `hard_deny` project, an
+uncapped call is capped at that value: Solwyn sends it to the provider as the
+dialect's cap field (`max_completion_tokens` for every Azure OpenAI
+deployment), because an unbounded call cannot honestly be held to a hard cap.
+Set your own cap to choose a different limit. An explicit cap you set is
+always sent as is.
+
+On a `hard_deny` project Solwyn then checks the request the provider would
+actually receive. If its possible output cannot be bounded, or exceeds what the
+check priced, the call is refused locally with `OutputBoundUnenforceableError`
+before any provider I/O: the reservation is released and the failover chain
+stops. `error.reason` is one of:
+
+| Reason | When |
+|---|---|
+| `malformed_cap_container` | Google `config`, Bedrock `inferenceConfig` or `extra_body` is not an object |
+| `malformed_candidate_count` | `n` or `candidate_count` is set but not a positive integer |
+| `reasoning_without_budget` | Qwen thinking (on by default) without a positive `thinking_budget`, or an xAI reasoning model (its cap excludes reasoning and it has no budget). On a host Solwyn does not attribute to a provider with its own rule, a Qwen (`qwen*`, `qwq*`) or Grok (`grok*`) model id gets the same rule, after any `vendor/` prefix; set `provider=` explicitly to opt out |
+| `unsupported_override` | A body extension carries a key Solwyn cannot account for (see below) |
+| `multi_generation_loop` | The provider SDK could generate more than once inside the call: Google automatic continuation or automatic function calling turned on explicitly, Anthropic `fallbacks`, or Anthropic middleware that resends after a successful response |
+| `azure_api_version` | An uncapped Azure OpenAI call on an api-version older than 2024-09-01, which has no `max_completion_tokens` |
+| `bound_exceeded` | Any other request whose possible output exceeds the priced bound |
+
+Body extensions are allowlisted. On a `hard_deny` admission a request body
+extension may carry only keys the bound accounts for:
+
+- OpenAI-style `extra_body`: `max_tokens`, `max_completion_tokens` and `n`,
+  plus `enable_thinking` and `thinking_budget` for Qwen.
+- Anthropic `extra_body`: `max_tokens`.
+- Responses `extra_body`, and Google `http_options.extra_body` (per request or
+  on the client): nothing.
+- Bedrock `additionalModelRequestFields`: `thinking` (Anthropic models require
+  its budget to stay below `maxTokens`).
+
+Any other key, including `model`, refuses the call with
+`unsupported_override`.
+
+A `hard_deny` call makes exactly one model generation. Google automatic
+continuation and automatic function calling are turned off when you have not
+set them (both are SDK-side options, so the request body is unchanged), and
+refused when you turned them on. Anthropic `fallbacks`, and clients carrying
+the SDK's `BetaRefusalFallbackMiddleware`, are refused. Anthropic clients also
+get an innermost Solwyn middleware for the call. On every send, the first
+included, it checks the outgoing request (the admitted model, a cap within the
+priced bound, no fallbacks), then claims the call's single generation slot
+before any I/O, so overlapping sends cannot both go out. After one successful
+(2xx) response, any further request is refused before it is sent, and the
+reservation is kept. Retries after a failed attempt still pass.
+
+`error.hint` says how to fix the request. All of this applies only when Solwyn
+itself admitted the call under `hard_deny` (a check allow, or a lease whose
+posture is `hard_deny`). Nothing changes on `alert_only` projects, and a call
+admitted fail-open during an outage is sent exactly as you built it. Media
+calls (images, audio, video, embeddings) keep their own estimate and carry no
+output bound.
+
+Known limitations:
+
+- A scoped `hard_deny` rule (for example a tag or run cap) on an `alert_only`
+  project is not visible in the check's mode, so its uncapped calls are not
+  capped and can overshoot that rule by one call.
+- Reasoning is treated as inside the cap for every provider not listed above.
+  That is documented for OpenAI, Azure, Anthropic, Gemini, Together and
+  OpenRouter, and unverified for DeepSeek, Groq, Mistral, Z.ai, Perplexity and
+  Fireworks.
+- A Qwen thinking-only model that ignores `enable_thinking=False` can still
+  reason past the bound.
+- The one-generation middleware covers Anthropic clients only. google-genai
+  and the OpenAI SDK have no per-call transport hook, so Google relies on the
+  continuation and function-calling rules above, and the OpenAI-style metered
+  paths have no internal generation loop. Bedrock Converse makes one request
+  per call. Code you own that rewrites requests (a custom httpx transport or
+  event hook, a boto3 event handler) is out of scope.
+- Reasoning rules follow the detected provider. Qwen and xAI models served
+  through another gateway follow that gateway's rules.
+- Anthropic `context_management` compaction through the typed beta parameter
+  is not proven to stay within `max_tokens` and is not checked.
+
 ### Run-scoped leases
 
 Token-billed calls inside `solwyn.run(...)` use budget leases by default. The first
@@ -805,7 +900,9 @@ scheduled flush can still overflow.
 Each reservation includes the input estimate plus the largest effective output
 cap across the configured provider chain, including global defaults, provider
 defaults, and Google/Bedrock nested cap fields. When a hop has no explicit cap,
-`lease_output_bound_default` supplies that hop’s conservative output allowance.
+`lease_output_bound_default` supplies that hop’s output allowance. On a
+`hard_deny` posture the hop is sent to the provider with that cap (see
+[Output bound](#output-bound)).
 
 Cancelling an async chat or Responses call, or interrupting a sync one with a
 non-`Exception` `BaseException` (`KeyboardInterrupt`, `SystemExit`), retires its
@@ -1113,7 +1210,7 @@ def test_denial_fixture(solwyn_control_plane, solwyn_test_client):
 | `budget_check_cache_ttl` | `SOLWYN_BUDGET_CHECK_CACHE_TTL` | `5` | Allow-cache lifetime for eligible legacy/non-run checks |
 | `budget_check_timeout` | `SOLWYN_BUDGET_CHECK_TIMEOUT` | `1.0` | Hot-path control-plane check/grant timeout in seconds |
 | `lease_enabled` | `SOLWYN_LEASE_ENABLED` | `True` | Use in-memory token leases for eligible run-scoped calls |
-| `lease_output_bound_default` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token allowance when no configured provider hop has an explicit cap |
+| `lease_output_bound_default` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token bound for a request with no explicit cap: priced by every budget check, and sent to the provider as its cap on `hard_deny` projects |
 | `velocity_mode` | `SOLWYN_VELOCITY_MODE` | `warn` | Content-free run velocity posture: `off`, advisory `warn`, or local `deny` |
 | `velocity_repeat_count` | `SOLWYN_VELOCITY_REPEAT_COUNT` | `5` | Near-identical same-model calls required inside the repeat window |
 | `velocity_repeat_window_s` | `SOLWYN_VELOCITY_REPEAT_WINDOW_S` | `60.0` | Seconds retained for repeat-size matching |

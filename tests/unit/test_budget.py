@@ -186,6 +186,7 @@ class TestBudgetEnforcerBase:
             fallback_providers=[],
             fallback_models=[],
             modality="text",
+            estimated_output_bound=4096,
         )
         base._cache_response(response, cache_key=key)
         with base._state_lock:
@@ -268,6 +269,7 @@ class TestBudgetEnforcerBase:
             fallback_providers=[],
             fallback_models=[],
             modality="text",
+            estimated_output_bound=4096,
         )
         base._cache_response(response, cache_key=key)
         with base._state_lock:
@@ -348,6 +350,7 @@ class TestBudgetEnforcerBase:
             fallback_providers=[],
             fallback_models=[],
             modality="text",
+            estimated_output_bound=4096,
         )
         base._cache_response(BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE), cache_key=cached_key)
         response = BudgetCheckResponse.model_validate(

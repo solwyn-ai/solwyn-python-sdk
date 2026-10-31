@@ -15,7 +15,11 @@ from typing import Any
 import httpx
 import pytest
 
-from solwyn.exceptions import ConfigurationError, UntrackedSpendSurfaceError
+from solwyn.exceptions import (
+    ConfigurationError,
+    OutputBoundUnenforceableError,
+    UntrackedSpendSurfaceError,
+)
 from solwyn.testing import FakeControlPlane
 
 anthropic = pytest.importorskip("anthropic", minversion="1.14.0")
@@ -309,9 +313,11 @@ async def test_beta_messages_without_iterations_settle_like_messages_create(
 def test_non_beta_messages_create_counts_compaction_iterations_from_untyped_extra() -> None:
     # Compaction requested through extra_body on the GA surface: the GA Usage
     # model carries ``iterations`` as an untyped extra list of plain dicts.
+    # alert_only: under hard_deny the extra_body allowlist refuses this key
+    # (see test_hard_deny_refuses_compaction_requested_through_extra_body).
     usage, iterations, expected = _THRESHOLD
     seen: list[Any] = []
-    plane = FakeControlPlane()
+    plane = FakeControlPlane(mode="alert_only")
     wrapper = plane.wrap(_anthropic_client(_handler(seen, usage, iterations)), lease_enabled=False)
     with wrapper:
         response = wrapper.messages.create(
@@ -326,6 +332,24 @@ def test_non_beta_messages_create_counts_compaction_iterations_from_untyped_extr
     settled = _settled(plane)
     for key, value in expected.items():
         assert settled[key] == value, key
+
+
+def test_hard_deny_refuses_compaction_requested_through_extra_body() -> None:
+    # extra_body may carry only keys the output bound accounts for under
+    # hard_deny; context_management is not one, so nothing is sent.
+    usage, iterations, _expected = _THRESHOLD
+    seen: list[Any] = []
+    plane = FakeControlPlane()
+    wrapper = plane.wrap(_anthropic_client(_handler(seen, usage, iterations)), lease_enabled=False)
+    with wrapper, pytest.raises(OutputBoundUnenforceableError) as caught:
+        wrapper.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=64,
+            messages=[{"role": "user", "content": _PROMPT}],
+            extra_body={"context_management": {"edits": [{"type": "compact_20260112"}]}},
+        )
+    assert caught.value.reason == "unsupported_override"
+    assert seen == []
 
 
 @pytest.mark.parametrize(

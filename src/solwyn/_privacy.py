@@ -18,6 +18,7 @@ If you add a new helper here, add a corresponding enforcement test.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, NoReturn
 
 from solwyn._types import MediaUsage
@@ -402,8 +403,9 @@ def prepare_legacy_google_metering_kwargs(
             feature="unsupported_google_estimation_shape",
         )
         config: dict[str, Any] = {}
-        if "max_output_tokens" in generation:
-            config["max_output_tokens"] = generation["max_output_tokens"]
+        for key in ("max_output_tokens", "candidate_count"):
+            if key in generation:
+                config[key] = generation[key]
         if payload.get("system_instruction") is not None:
             config["system_instruction"] = payload["system_instruction"]
         projected: dict[str, Any] = {
@@ -567,6 +569,88 @@ def merge_google_generate_content_kwargs(
     if saw_config:
         merged[config_key] = merged_config
     return merged
+
+
+_OUTGOING_BOUND_KEYS = ("model", "max_tokens", "fallbacks")
+
+
+def outgoing_request_bound_fields(request: object) -> dict[str, Any]:
+    """Read only the model, output cap and fallbacks of an outgoing SDK request.
+
+    For the anthropic middleware view (``APIRequest``): its JSON body merged
+    with ``extra_json`` exactly as the SDK builds the wire body. The body also
+    carries messages, so the read stays in this content-privileged module and
+    returns scalars only.
+    """
+    body = getattr(request, "json", None)
+    extra = getattr(getattr(request, "options", None), "extra_json", None)
+    merged: dict[str, Any] = {}
+    if isinstance(body, Mapping):
+        merged.update(body)
+    if isinstance(extra, Mapping):
+        merged.update(extra)
+    return {key: merged[key] for key in _OUTGOING_BOUND_KEYS if key in merged}
+
+
+_GOOGLE_BOUND_CONFIG_KEYS = (
+    "max_output_tokens",
+    "maxOutputTokens",
+    "candidate_count",
+    "candidateCount",
+    "http_options",
+    "httpOptions",
+)
+
+
+def google_output_bound_view(*layers: dict[str, Any]) -> dict[str, Any]:
+    """Merge Google request layers exactly as dispatch does, keeping only bound fields.
+
+    Uses dispatch's own field-level merge (``merge_google_generate_content_kwargs``),
+    so a per-call ``config`` without a cap keeps a lower layer's cap, and
+    ``generation_config`` / top-level ``max_output_tokens`` aliases fold into
+    ``config``. The result carries only the output cap, candidate count and
+    http_options, never contents or a system instruction. Raises
+    ``UntranslatableRequestError`` for a shape dispatch would also refuse.
+    """
+    merged = merge_google_generate_content_kwargs(*layers, target_shape="google_genai")
+    config = _google_config_mapping(merged.get("config"), feature="unsupported_google_config_shape")
+    return {"config": {key: config[key] for key in _GOOGLE_BOUND_CONFIG_KEYS if key in config}}
+
+
+def with_google_output_cap(
+    kwargs: dict[str, Any],
+    cap: int,
+    *,
+    target_shape: str,
+) -> dict[str, Any]:
+    """Return a hop request whose generation config carries ``max_output_tokens``.
+
+    The config may also hold a system instruction, so the copy stays inside
+    this content-privileged module. The caller's config object is never
+    mutated: dicts are copied, pydantic configs use ``model_copy``, and other
+    config objects become an ephemeral mapping the SDK accepts. A config that
+    is not a mapping or an object with attributes is malformed, so the request
+    is returned unchanged for the provider SDK to reject.
+    """
+    config_key = "generation_config" if target_shape == "google_generativeai" else "config"
+    config = kwargs.get(config_key)
+    capped: object
+    if config is None:
+        capped = {"max_output_tokens": cap}
+    elif isinstance(config, dict):
+        # Replace, never duplicate, the camelCase alias the SDK also accepts.
+        capped = {
+            **{key: value for key, value in config.items() if key != "maxOutputTokens"},
+            "max_output_tokens": cap,
+        }
+    elif callable(getattr(config, "model_copy", None)):
+        capped = config.model_copy(update={"max_output_tokens": cap})
+    elif isinstance(getattr(config, "__dict__", None), dict):
+        mapping = _google_config_mapping(config, feature="unsupported_google_config_shape")
+        capped = {**mapping, "max_output_tokens": cap}
+    else:
+        return kwargs
+    return {**kwargs, config_key: capped}
 
 
 def normalize_google_translation_source_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:

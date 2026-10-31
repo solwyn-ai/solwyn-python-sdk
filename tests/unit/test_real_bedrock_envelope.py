@@ -36,6 +36,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY
 
+from solwyn._lease import DEFAULT_OUTPUT_BOUND
 from solwyn.client import Solwyn
 from solwyn.providers import get_adapter_for_client
 from solwyn.providers.bedrock import BedrockAdapter
@@ -172,6 +173,30 @@ def test_adapter_service_tier_falls_back_to_performance_config() -> None:
 # ---------------------------------------------------------------------------
 # 3. Wrapped end-to-end converse through the real stubbed client
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_hard_deny_admission_sends_an_inference_config_botocore_accepts() -> None:
+    # WS-13: a hard_deny admission caps an uncapped converse at the default
+    # output bound. The real stubber validates the injected inferenceConfig
+    # against the botocore service model, not just a mock's kwargs.
+    client = _bedrock_client()
+    stubber = Stubber(client)
+    params = {
+        "modelId": BEDROCK_MODEL,
+        "messages": _messages(),
+        "inferenceConfig": {"maxTokens": DEFAULT_OUTPUT_BOUND},
+    }
+    stubber.add_response("converse", _full_envelope(), params)
+
+    solwyn = Solwyn(client, api_key=VALID_API_KEY)
+    solwyn._solwyn_reporter.report = lambda e: None
+    solwyn._solwyn_reporter.report_settlement = lambda c, e: None
+
+    hard_deny_allow = {**ALLOW_BUDGET_RESPONSE, "mode": "hard_deny"}
+    with _mock_budget(solwyn, hard_deny_allow), stubber:
+        solwyn.converse(modelId=BEDROCK_MODEL, messages=_messages())
+    stubber.assert_no_pending_responses()
 
 
 @pytest.mark.unit
