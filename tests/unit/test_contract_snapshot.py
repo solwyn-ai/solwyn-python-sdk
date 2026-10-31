@@ -76,6 +76,8 @@ EXPECTED_CHECK_FIELDS = {
     "provider",
     "modality",
     "estimated_media",
+    # WS-13 output bound (API-first; omitted when None, i.e. media checks).
+    "estimated_output_bound",
     "fallback_providers",
     "fallback_models",
     "agent_run_id",
@@ -93,6 +95,7 @@ EXPECTED_CHECK_FIELDS = {
 # otherwise unopted model construction omits it.
 _NONE_SKIPPED_CHECK_FIELDS = {
     "estimated_media",
+    "estimated_output_bound",
     "agent_run_id",
     "tags",
     "failover_directive_version",
@@ -522,6 +525,40 @@ class TestWireModelDumpSnapshots:
             "fallback_models": ["claude-x"],
         }
 
+    def test_budget_check_request_output_bound_serializes_only_when_set(self) -> None:
+        base = BudgetCheckRequest(
+            estimated_input_tokens=10,
+            model="gpt-5.5",
+            provider=ProviderName.OPENAI,
+        )
+        assert "estimated_output_bound" not in base.model_dump(mode="json")
+
+        bounded = BudgetCheckRequest(
+            estimated_input_tokens=10,
+            model="gpt-5.5",
+            provider=ProviderName.OPENAI,
+            estimated_output_bound=10_000,
+        )
+        assert bounded.model_dump(mode="json") == {
+            "estimated_input_tokens": 10,
+            "model": "gpt-5.5",
+            "provider": "openai",
+            "modality": "text",
+            "estimated_output_bound": 10_000,
+            "fallback_providers": [],
+            "fallback_models": [],
+        }
+
+    @pytest.mark.parametrize("bound", [-1, wire_constants.ORDINARY_TOKEN_COUNT_MAX + 1])
+    def test_budget_check_request_output_bound_range_matches_core(self, bound: int) -> None:
+        with pytest.raises(ValidationError):
+            BudgetCheckRequest(
+                estimated_input_tokens=10,
+                model="gpt-5.5",
+                provider=ProviderName.OPENAI,
+                estimated_output_bound=bound,
+            )
+
     def test_budget_check_request_uncounted_tally_serializes_only_when_nonzero(self) -> None:
         base = BudgetCheckRequest(
             estimated_input_tokens=10,
@@ -635,6 +672,7 @@ class TestWireModelDumpSnapshots:
 
         assert set(dumped) == EXPECTED_CHECK_FIELDS - {
             "estimated_media",
+            "estimated_output_bound",
             "tags",
             "failover_directive_version",
             "run_directive_version",
@@ -701,6 +739,7 @@ class TestWireModelDumpSnapshots:
         dumped = req.model_dump(mode="json")
         assert set(dumped) == EXPECTED_CHECK_FIELDS - {
             "agent_run_id",
+            "estimated_output_bound",
             "tags",
             "failover_directive_version",
             "run_directive_version",

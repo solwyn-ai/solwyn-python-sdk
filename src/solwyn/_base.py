@@ -29,7 +29,11 @@ from solwyn import _otel
 from solwyn._constants import FAILOVER_ERROR_CLASS_MAX_LENGTH, ORDINARY_TOKEN_COUNT_MAX
 from solwyn._lifecycle import register_fork_reset
 from solwyn._otel import _TraceSnapshot, _validated_trace
-from solwyn._privacy import estimate_content_length
+from solwyn._privacy import (
+    estimate_content_length,
+    prepare_legacy_google_metering_kwargs,
+    with_google_output_cap,
+)
 from solwyn._routing import (
     CostPolicy,
     HealthBasedPolicy,
@@ -77,6 +81,7 @@ from solwyn.exceptions import (
     ConfigurationError,
     UnsupportedSurfaceError,
     UntrackedSpendSurfaceError,
+    UntranslatableRequestError,
 )
 from solwyn.providers._errors import Disposition, classify_exception
 
@@ -714,6 +719,80 @@ def _effective_output_bound(
         bounds.append(cap if cap is not None else default_bound)
 
     return max(bounds, default=default_bound)
+
+
+def _with_default_output_cap(
+    *,
+    runtime: ProviderRuntime,
+    model: str,
+    kwargs: dict[str, object],
+    surface: str,
+    default_bound: int,
+) -> dict[str, object]:
+    """Give an uncapped hop the output cap its reservation already assumed.
+
+    ``_effective_output_bound`` charges an uncapped hop ``default_bound``
+    output tokens, on the lease and the per-call check alike. This makes that
+    charge true: a final provider request with no positive cap gets
+    ``default_bound`` in its dialect's native cap field. A positive caller or
+    default cap is never touched; a non-positive or malformed one counts as
+    absent, exactly as the bound resolver reads it. A malformed container
+    (a non-mapping Google config or Bedrock ``inferenceConfig``) is left for
+    the provider SDK to reject. Runs after translation,
+    so a cross-dialect hop that refuses an uncapped source still refuses.
+    Returns ``kwargs`` itself when nothing changes, else a shallow copy.
+    """
+    dialect = runtime.adapter.dialect
+    if surface == "responses":
+        if _positive_output_cap(kwargs.get("max_output_tokens")) is not None:
+            return kwargs
+        return {**kwargs, "max_output_tokens": default_bound}
+    if dialect == ProviderName.GOOGLE.value:
+        shape = _client_shape(runtime.sdk_client, dialect)
+        effective: dict[str, Any] = kwargs
+        if shape == "google_generativeai":
+            # The legacy GenerativeModel may carry its own constructor cap.
+            try:
+                effective = prepare_legacy_google_metering_kwargs(runtime.sdk_client, kwargs)
+            except UntranslatableRequestError:
+                return kwargs
+        if _dialect_output_cap(dialect, effective) is not None:
+            return kwargs
+        return cast(
+            "dict[str, object]",
+            with_google_output_cap(
+                kwargs,
+                default_bound,
+                target_shape=(
+                    "google_generativeai" if shape == "google_generativeai" else "google_genai"
+                ),
+            ),
+        )
+    if _dialect_output_cap(dialect, kwargs) is not None:
+        return kwargs
+    if dialect == ProviderName.BEDROCK.value:
+        inference = kwargs.get("inferenceConfig")
+        if inference is None:
+            return {**kwargs, "inferenceConfig": {"maxTokens": default_bound}}
+        if not isinstance(inference, dict):
+            # Malformed container: boto3 rejects it before any spend.
+            return kwargs
+        return {**kwargs, "inferenceConfig": {**inference, "maxTokens": default_bound}}
+    if dialect == ProviderName.OPENAI.value:
+        uncapped = {
+            key: value
+            for key, value in kwargs.items()
+            if key not in ("max_tokens", "max_completion_tokens")
+        }
+        return {
+            **uncapped,
+            **_normalized_openai_output_cap_layer(
+                runtime.adapter.name, model, {"max_tokens": default_bound}
+            ),
+        }
+    if dialect == ProviderName.ANTHROPIC.value:
+        return {**kwargs, "max_tokens": default_bound}
+    return kwargs
 
 
 @dataclass(frozen=True)

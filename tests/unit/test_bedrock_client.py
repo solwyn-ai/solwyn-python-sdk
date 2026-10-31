@@ -23,6 +23,7 @@ import httpx
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, _accepted_response
 
+from solwyn._lease import DEFAULT_OUTPUT_BOUND
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import ConfigurationError, UntrackedSpendSurfaceError
 
@@ -297,8 +298,12 @@ class TestBedrockConverseInterception:
         # Assert: metered surfaces reached only their matching provider methods,
         # and every blocked spend surface refused before provider I/O.
         assert converse_result is client.converse.return_value
-        client.converse.assert_called_once_with(modelId=BEDROCK_MODEL)
-        client.converse_stream.assert_called_once_with(modelId=BEDROCK_MODEL)
+        client.converse.assert_called_once_with(
+            modelId=BEDROCK_MODEL, inferenceConfig={"maxTokens": DEFAULT_OUTPUT_BOUND}
+        )
+        client.converse_stream.assert_called_once_with(
+            modelId=BEDROCK_MODEL, inferenceConfig={"maxTokens": DEFAULT_OUTPUT_BOUND}
+        )
         assert blocked_budget_calls == 0
         assert blocked_reporting_calls == 0
         budget_post.assert_called()
@@ -939,8 +944,12 @@ class TestAsyncBedrockConverse:
         # Assert: resolver-approved calls reached exactly the corresponding
         # provider methods, while blocked spend surfaces performed no I/O.
         assert converse_result is client.converse.return_value
-        client.converse.assert_awaited_once_with(modelId=BEDROCK_MODEL)
-        client.converse_stream.assert_awaited_once_with(modelId=BEDROCK_MODEL)
+        client.converse.assert_awaited_once_with(
+            modelId=BEDROCK_MODEL, inferenceConfig={"maxTokens": DEFAULT_OUTPUT_BOUND}
+        )
+        client.converse_stream.assert_awaited_once_with(
+            modelId=BEDROCK_MODEL, inferenceConfig={"maxTokens": DEFAULT_OUTPUT_BOUND}
+        )
         assert blocked_budget_calls == 0
         assert blocked_budget_awaits == 0
         assert blocked_reporting_calls == 0

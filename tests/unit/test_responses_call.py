@@ -22,6 +22,7 @@ from conftest import VALID_API_KEY, VALID_PROJECT_ID, patch_wrapper_local
 from openai import NOT_GIVEN, omit
 
 from solwyn._base import _reset_unmetered_spend_warnings
+from solwyn._lease import DEFAULT_OUTPUT_BOUND
 from solwyn._proxies import _AsyncResponsesProxy, _SyncResponsesProxy
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import ConfigurationError, ProviderUnavailableError, UnsupportedSurfaceError
@@ -672,7 +673,12 @@ class TestResponsesPublicProxySync:
             assert result is response
             check.assert_called_once()
             assert client._responses.create_calls == [
-                {"model": "gpt-5.5", "input": "hello", "extra_body": extra_body}
+                {
+                    "max_output_tokens": DEFAULT_OUTPUT_BOUND,
+                    "model": "gpt-5.5",
+                    "input": "hello",
+                    "extra_body": extra_body,
+                }
             ]
 
     @pytest.mark.parametrize("leaf", ["create", "parse"])
@@ -809,7 +815,12 @@ class TestResponsesPublicProxySync:
             assert check.call_args.kwargs["provider"] == "azure_openai"
             assert client._responses.create_calls == []
             assert client._responses.parse_calls == [
-                {"model": "deployment", "input": "hello", "text_format": dict}
+                {
+                    "max_output_tokens": DEFAULT_OUTPUT_BOUND,
+                    "model": "deployment",
+                    "input": "hello",
+                    "text_format": dict,
+                }
             ]
             solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
@@ -900,7 +911,12 @@ class TestResponsesPublicProxySync:
 
             check.assert_called_once()
             assert client._responses.create_calls == [
-                {"model": "deployment", "input": "hello", "stream": True}
+                {
+                    "max_output_tokens": DEFAULT_OUTPUT_BOUND,
+                    "model": "deployment",
+                    "input": "hello",
+                    "stream": True,
+                }
             ]
             solwyn._solwyn_reporter.report_settlement.assert_called_once()
             _, event = solwyn._solwyn_reporter.report_settlement.call_args.args
@@ -961,7 +977,9 @@ class TestResponsesPublicProxySync:
                 assert events.get_final_response() is terminal.response
 
             check.assert_called_once()
-            assert client._responses.stream_calls == [{"model": "deployment", "input": "hello"}]
+            assert client._responses.stream_calls == [
+                {"max_output_tokens": DEFAULT_OUTPUT_BOUND, "model": "deployment", "input": "hello"}
+            ]
             solwyn._solwyn_reporter.report_settlement.assert_called_once()
             _, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.provider.value == "azure_openai"
@@ -1046,7 +1064,9 @@ class TestResponsesPublicProxySync:
 
             assert result is response
             check.assert_called_once()
-            assert client._responses.create_calls == [{"model": "gpt-5.5", "input": "hello"}]
+            assert client._responses.create_calls == [
+                {"max_output_tokens": DEFAULT_OUTPUT_BOUND, "model": "gpt-5.5", "input": "hello"}
+            ]
             solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     def test_native_parse_reuses_defaults_budgeting_dispatch_and_flat_settlement(self) -> None:
@@ -1296,6 +1316,7 @@ class TestResponsesPublicProxySync:
             check.assert_called_once()
             assert client._responses.stream_calls == [
                 {
+                    "max_output_tokens": DEFAULT_OUTPUT_BOUND,
                     "model": "gpt-5.5",
                     "input": "1234",
                     sentinel_key: sentinel,
@@ -1616,6 +1637,7 @@ class TestResponsesPublicProxySync:
             check.assert_called_once()
             assert client._responses.create_calls == [
                 {
+                    "max_output_tokens": DEFAULT_OUTPUT_BOUND,
                     "model": "gpt-5.5",
                     "input": "hello",
                     "background": True,
@@ -1969,7 +1991,12 @@ class TestResponsesPublicProxyAsync:
             assert result is response
             check.assert_awaited_once()
             assert client._responses.create_calls == [
-                {"model": "gpt-5.5", "input": "hello", "extra_body": extra_body}
+                {
+                    "max_output_tokens": DEFAULT_OUTPUT_BOUND,
+                    "model": "gpt-5.5",
+                    "input": "hello",
+                    "extra_body": extra_body,
+                }
             ]
 
     @pytest.mark.asyncio
@@ -2105,7 +2132,12 @@ class TestResponsesPublicProxyAsync:
             assert check.call_args.kwargs["provider"] == "azure_openai"
             assert client._responses.create_calls == []
             assert client._responses.parse_calls == [
-                {"model": "deployment", "input": "hello", "text_format": dict}
+                {
+                    "max_output_tokens": DEFAULT_OUTPUT_BOUND,
+                    "model": "deployment",
+                    "input": "hello",
+                    "text_format": dict,
+                }
             ]
             solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
@@ -2197,7 +2229,13 @@ class TestResponsesPublicProxyAsync:
                     assert await anext(events) is delta
 
             check.assert_awaited_once()
-            assert client._responses.stream_calls == [{"model": "deployment", "input": "12345678"}]
+            assert client._responses.stream_calls == [
+                {
+                    "max_output_tokens": DEFAULT_OUTPUT_BOUND,
+                    "model": "deployment",
+                    "input": "12345678",
+                }
+            ]
             solwyn._solwyn_reporter.report_settlement.assert_called_once()
             confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.provider.value == "azure_openai"
@@ -2326,7 +2364,9 @@ class TestResponsesPublicProxyAsync:
 
             assert result is response
             check.assert_awaited_once()
-            assert client._responses.create_calls == [{"model": "gpt-5.5", "input": "hello"}]
+            assert client._responses.create_calls == [
+                {"max_output_tokens": DEFAULT_OUTPUT_BOUND, "model": "gpt-5.5", "input": "hello"}
+            ]
             solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.asyncio
@@ -2587,6 +2627,7 @@ class TestResponsesPublicProxyAsync:
             check.assert_awaited_once()
             assert client._responses.stream_calls == [
                 {
+                    "max_output_tokens": DEFAULT_OUTPUT_BOUND,
                     "model": "gpt-5.5",
                     "input": "1234",
                     sentinel_key: sentinel,
@@ -3151,6 +3192,7 @@ class TestResponsesPublicProxyAsync:
             check.assert_awaited_once()
             assert client._responses.create_calls == [
                 {
+                    "max_output_tokens": DEFAULT_OUTPUT_BOUND,
                     "model": "gpt-5.5",
                     "input": "hello",
                     "background": True,
@@ -3457,7 +3499,7 @@ class TestResponsesInterceptedCallSync:
 
             assert result is response
             client.chat.completions.create.assert_called_once_with(
-                model="gpt-5.5", messages=messages
+                model="gpt-5.5", messages=messages, max_completion_tokens=DEFAULT_OUTPUT_BOUND
             )
             client.responses.create.assert_not_called()
             check.assert_called_once()
@@ -3924,7 +3966,7 @@ class TestResponsesInterceptedCallAsync:
 
             assert result is response
             client.chat.completions.create.assert_awaited_once_with(
-                model="gpt-5.5", messages=messages
+                model="gpt-5.5", messages=messages, max_completion_tokens=DEFAULT_OUTPUT_BOUND
             )
             client.responses.create.assert_not_awaited()
             check.assert_awaited_once()

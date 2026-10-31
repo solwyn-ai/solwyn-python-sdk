@@ -731,6 +731,25 @@ client = Solwyn(
 | `alert_only` | Log a warning when budget is exceeded (default) |
 | `hard_deny` | Raise `BudgetExceededError` and block the call |
 
+### Output bound
+
+Every token-billed budget check, per-call or lease, prices the call's output
+before it runs. The bound is the largest explicit output cap across the
+configured provider chain (`max_tokens`, `max_completion_tokens`,
+`max_output_tokens`, Google `config.max_output_tokens`, Bedrock
+`inferenceConfig.maxTokens`), after per-call, provider-default and global
+precedence. A per-call check sends it as `estimated_output_bound`, so the API
+reserves input plus that many output tokens. In `hard_deny`, a call whose bound
+would overrun the remaining budget is refused before the provider is called.
+
+A request with no positive cap is bounded by `lease_output_bound_default`
+(4096 by default), and Solwyn sends that value to the provider as the
+dialect's cap field. The call therefore cannot produce more output than the
+check priced. An explicit cap you set is always sent as is. Set your own cap,
+or raise `lease_output_bound_default`, if your calls need longer outputs.
+Media calls (images, audio, video, embeddings) keep their own estimate and
+carry no output bound.
+
 ### Run-scoped leases
 
 Token-billed calls inside `solwyn.run(...)` use budget leases by default. The first
@@ -805,7 +824,8 @@ scheduled flush can still overflow.
 Each reservation includes the input estimate plus the largest effective output
 cap across the configured provider chain, including global defaults, provider
 defaults, and Google/Bedrock nested cap fields. When a hop has no explicit cap,
-`lease_output_bound_default` supplies that hop’s conservative output allowance.
+`lease_output_bound_default` supplies that hop’s output allowance, and the hop
+is sent to the provider with that cap (see [Output bound](#output-bound)).
 
 Cancelling an async chat or Responses call, or interrupting a sync one with a
 non-`Exception` `BaseException` (`KeyboardInterrupt`, `SystemExit`), retires its
@@ -1113,7 +1133,7 @@ def test_denial_fixture(solwyn_control_plane, solwyn_test_client):
 | `budget_check_cache_ttl` | `SOLWYN_BUDGET_CHECK_CACHE_TTL` | `5` | Allow-cache lifetime for eligible legacy/non-run checks |
 | `budget_check_timeout` | `SOLWYN_BUDGET_CHECK_TIMEOUT` | `1.0` | Hot-path control-plane check/grant timeout in seconds |
 | `lease_enabled` | `SOLWYN_LEASE_ENABLED` | `True` | Use in-memory token leases for eligible run-scoped calls |
-| `lease_output_bound_default` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token allowance when no configured provider hop has an explicit cap |
+| `lease_output_bound_default` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token bound for a request with no explicit cap: priced by every budget check and sent to the provider as its cap |
 | `velocity_mode` | `SOLWYN_VELOCITY_MODE` | `warn` | Content-free run velocity posture: `off`, advisory `warn`, or local `deny` |
 | `velocity_repeat_count` | `SOLWYN_VELOCITY_REPEAT_COUNT` | `5` | Near-identical same-model calls required inside the repeat window |
 | `velocity_repeat_window_s` | `SOLWYN_VELOCITY_REPEAT_WINDOW_S` | `60.0` | Seconds retained for repeat-size matching |

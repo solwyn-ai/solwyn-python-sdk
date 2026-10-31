@@ -28,6 +28,7 @@ from conftest import (
 
 from solwyn import _base
 from solwyn._base import _reset_unmetered_spend_warnings
+from solwyn._lease import DEFAULT_OUTPUT_BOUND
 from solwyn._types import CallStatus, ProviderName
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.exceptions import UnsupportedSurfaceError
@@ -117,10 +118,18 @@ class _TogetherCompletions:
         model: str,
         messages: list[dict[str, object]],
         stream: bool = False,
+        max_tokens: int | None = None,
     ) -> object:
         if self._order_log is not None:
             self._order_log.append("dispatch")
-        self.calls.append({"model": model, "messages_identity": id(messages), "stream": stream})
+        self.calls.append(
+            {
+                "model": model,
+                "messages_identity": id(messages),
+                "stream": stream,
+                "max_tokens": max_tokens,
+            }
+        )
         return self.response
 
 
@@ -149,10 +158,18 @@ class _AsyncTogetherCompletions:
         model: str,
         messages: list[dict[str, object]],
         stream: bool = False,
+        max_tokens: int | None = None,
     ) -> object:
         if self._order_log is not None:
             self._order_log.append("dispatch")
-        self.calls.append({"model": model, "messages_identity": id(messages), "stream": stream})
+        self.calls.append(
+            {
+                "model": model,
+                "messages_identity": id(messages),
+                "stream": stream,
+                "max_tokens": max_tokens,
+            }
+        )
         return self.response
 
 
@@ -534,7 +551,12 @@ def test_sync_together_runs_budget_dispatch_usage_and_success_pipeline() -> None
     assert check_budget.call_args.kwargs["model"] == MODEL
     assert check_budget.call_args.kwargs["estimated_input_tokens"] > 0
     assert client.completions.calls == [
-        {"model": MODEL, "messages_identity": id(messages), "stream": False}
+        {
+            "model": MODEL,
+            "messages_identity": id(messages),
+            "stream": False,
+            "max_tokens": DEFAULT_OUTPUT_BOUND,
+        }
     ]
     assert len(reported) == 1
     event = reported[0]
@@ -576,7 +598,12 @@ async def test_async_together_runs_budget_dispatch_usage_and_success_pipeline() 
     assert check_budget.call_args.kwargs["model"] == MODEL
     assert check_budget.call_args.kwargs["estimated_input_tokens"] > 0
     assert client.completions.calls == [
-        {"model": MODEL, "messages_identity": id(messages), "stream": False}
+        {
+            "model": MODEL,
+            "messages_identity": id(messages),
+            "stream": False,
+            "max_tokens": DEFAULT_OUTPUT_BOUND,
+        }
     ]
     assert len(reported) == 1
     event = reported[0]
@@ -624,7 +651,12 @@ def test_sync_together_stream_settles_from_terminal_usage() -> None:
     # Assert
     assert chunks[-1] is terminal_usage
     assert client.completions.calls == [
-        {"model": MODEL, "messages_identity": id(messages), "stream": True}
+        {
+            "model": MODEL,
+            "messages_identity": id(messages),
+            "stream": True,
+            "max_tokens": DEFAULT_OUTPUT_BOUND,
+        }
     ]
     assert reported == []
     assert len(settlements) == 1
@@ -719,7 +751,12 @@ async def test_async_together_stream_settles_from_terminal_usage() -> None:
     assert chunks[-1] is terminal_usage
     assert check_budget.call_args.kwargs["provider"] == "together"
     assert client.completions.calls == [
-        {"model": MODEL, "messages_identity": id(messages), "stream": True}
+        {
+            "model": MODEL,
+            "messages_identity": id(messages),
+            "stream": True,
+            "max_tokens": DEFAULT_OUTPUT_BOUND,
+        }
     ]
     assert len(settlements) == 1
     confirm, event = settlements[0]

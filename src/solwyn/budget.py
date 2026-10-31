@@ -28,7 +28,12 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from solwyn import _run_control
-from solwyn._constants import CALL_ID_MAX_LENGTH, CALL_ID_PATTERN, SIGNED_BIGINT_MAX
+from solwyn._constants import (
+    CALL_ID_MAX_LENGTH,
+    CALL_ID_PATTERN,
+    ORDINARY_TOKEN_COUNT_MAX,
+    SIGNED_BIGINT_MAX,
+)
 from solwyn._control_plane_transport import (
     ControlPlaneTransport,
     non_closing_async_transport,
@@ -248,6 +253,7 @@ class _AllowCacheKey:
     fallback_providers: tuple[str, ...]
     fallback_models: tuple[str, ...]
     modality: str
+    estimated_output_bound: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,6 +428,7 @@ class _BudgetEnforcerBase:
         estimated_media: MediaUsage | None = None,
         agent_run_id: str | None = None,
         tags: dict[str, str] | None = None,
+        estimated_output_bound: int | None = None,
     ) -> BudgetCheckRequest:
         """Build a BudgetCheckRequest for the cloud API.
 
@@ -433,6 +440,8 @@ class _BudgetEnforcerBase:
         call on the right basis. ``estimated_media`` carries a non-text surface's
         pre-flight non-token quantities (image counts, media seconds, character
         counts) for a precise check-time cost; None for chat/token calls.
+        ``estimated_output_bound`` is the resolved bound from
+        ``_check_output_bound``; None omits it from the wire.
         """
         return BudgetCheckRequest(
             estimated_input_tokens=estimated_input_tokens,
@@ -440,6 +449,7 @@ class _BudgetEnforcerBase:
             provider=ProviderName(provider),
             modality=modality,
             estimated_media=estimated_media,
+            estimated_output_bound=estimated_output_bound,
             fallback_providers=[ProviderName(p) for p in (fallback_providers or [])],
             fallback_models=list(fallback_models or []),
             agent_run_id=agent_run_id,
@@ -449,6 +459,27 @@ class _BudgetEnforcerBase:
             price_hints_version="1",
         )
 
+    def _check_output_bound(
+        self,
+        estimated_output_bound: int | None,
+        *,
+        modality: Modality,
+        estimated_media: MediaUsage | None,
+    ) -> int | None:
+        """The output bound a per-call check sends, resolved like the lease's.
+
+        A text call's missing or non-positive bound becomes the configured
+        default, as in ``LeaseLedger._output_bound``; the client sends that
+        same default to the provider for an uncapped hop, so the bound holds.
+        Media checks keep their own estimate and send no bound. The wire field
+        is capped at ``ORDINARY_TOKEN_COUNT_MAX``.
+        """
+        if modality != "text" or estimated_media is not None:
+            return None
+        if estimated_output_bound is None or estimated_output_bound <= 0:
+            return self._lease.output_bound_default
+        return min(estimated_output_bound, ORDINARY_TOKEN_COUNT_MAX)
+
     @staticmethod
     def _allow_cache_key(
         *,
@@ -457,14 +488,20 @@ class _BudgetEnforcerBase:
         fallback_providers: Sequence[str],
         fallback_models: Sequence[str],
         modality: str,
+        estimated_output_bound: int | None,
     ) -> _AllowCacheKey:
-        """Build the cache cohort for one priced provider/model chain."""
+        """Build the cache cohort for one priced provider/model chain.
+
+        The output bound is part of the cohort: an allow priced for a small
+        bound must not admit a call that can spend a larger one.
+        """
         return _AllowCacheKey(
             provider=provider,
             model=model,
             fallback_providers=tuple(fallback_providers),
             fallback_models=tuple(fallback_models),
             modality=modality,
+            estimated_output_bound=estimated_output_bound,
         )
 
     def _cached_allow_locked(self, key: _AllowCacheKey) -> BudgetCheckResponse | None:
@@ -2571,12 +2608,18 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         # Use cache if valid (only allow decisions are cached).
         # Snapshot under the lock to avoid a TOCTOU race between the validity
         # check and reading the cached fields.
+        check_output_bound = self._check_output_bound(
+            estimated_output_bound,
+            modality=modality,
+            estimated_media=estimated_media,
+        )
         cache_key = self._allow_cache_key(
             provider=provider,
             model=model,
             fallback_providers=fallback_providers,
             fallback_models=fallback_models,
             modality=modality,
+            estimated_output_bound=check_output_bound,
         )
         if agent_run_id is None and tags is None:
             with self._state_lock:
@@ -2627,6 +2670,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             estimated_media,
             agent_run_id,
             tags,
+            check_output_bound,
         )
 
         uncounted_report: _UncountedReport | None = None
@@ -3346,12 +3390,18 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             if leased is not None:
                 return leased
 
+        check_output_bound = self._check_output_bound(
+            estimated_output_bound,
+            modality=modality,
+            estimated_media=estimated_media,
+        )
         cache_key = self._allow_cache_key(
             provider=provider,
             model=model,
             fallback_providers=fallback_providers,
             fallback_models=fallback_models,
             modality=modality,
+            estimated_output_bound=check_output_bound,
         )
         if agent_run_id is None and tags is None:
             with self._state_lock:
@@ -3402,6 +3452,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             estimated_media,
             agent_run_id,
             tags,
+            check_output_bound,
         )
 
         uncounted_report: _UncountedReport | None = None

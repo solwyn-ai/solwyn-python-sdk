@@ -66,8 +66,11 @@ class _TypedTogetherCompletions:
         model: str,
         messages: list[dict[str, object]],
         stream: bool = False,
+        max_tokens: int | None = None,
     ) -> object:
-        self.calls.append({"model": model, "messages": messages, "stream": stream})
+        self.calls.append(
+            {"model": model, "messages": messages, "stream": stream, "max_tokens": max_tokens}
+        )
         return self.response
 
 
@@ -508,6 +511,7 @@ class TestCompatFailover:
                 "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
                 "messages": _REQUEST["messages"],
                 "stream": False,
+                "max_tokens": 4096,
             }
         ]
         event = _reported_events(solwyn)[0]
@@ -538,6 +542,7 @@ class TestCompatFailover:
                 "model": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
                 "messages": _REQUEST["messages"],
                 "stream": True,
+                "max_tokens": 4096,
             }
         ]
         event = _reported_events(solwyn)[0]

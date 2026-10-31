@@ -5,6 +5,52 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
+## [0.10.0] - Unreleased
+
+A `hard_deny` budget now bounds a call's output, not only its input. Every
+per-call budget check sends the call's output bound, and a request with no
+output cap is sent to the provider with one, so a single call can no longer
+spend far past the cap. Before this, one uncapped or large-cap call on an
+expensive reasoning model could pass a $1 cap and spend several dollars.
+
+Wire-contract change is API-first: Solwyn Cloud must accept
+`estimated_output_bound` on `POST /api/v1/budgets/check` before this SDK
+releases. An older API rejects the field with a 422, which the SDK treats as an
+unreachable control plane.
+
+### Changed
+
+- **Uncapped calls are now sent with an output cap.** A chat, Messages,
+  Responses, Google or Bedrock request whose final provider request has no
+  positive output cap gets `lease_output_bound_default` (4096 by default) in
+  its dialect's cap field: `max_completion_tokens` or `max_tokens` for
+  OpenAI-dialect providers (by the same model rule as the existing key
+  rewrite), `max_output_tokens` for Responses, `max_tokens` for Anthropic,
+  `config.max_output_tokens` for Google (`generation_config` for the legacy
+  SDK, after its constructor defaults), and `inferenceConfig.maxTokens` for
+  Bedrock. This applies on the lease and per-call paths in every budget mode,
+  and makes the bound both paths already reserved true. An explicit positive
+  cap is always sent as is. A zero, negative or non-integer cap counts as no
+  cap. A request that needs more than 4096 output tokens must set its own cap
+  or raise `lease_output_bound_default`.
+
+### Added
+
+- **`estimated_output_bound` on the per-call budget check.** The check carries
+  the same bound the lease path reserves: the largest explicit cap across the
+  configured provider chain, else `lease_output_bound_default`. The API prices
+  the reservation as input plus that many output tokens at the model's output
+  rate, so in `hard_deny` a call whose bound would overrun the remaining budget
+  is refused before the provider is called. Media checks omit the field. A
+  direct `check_budget` caller that passes no bound on a text check sends the
+  default, exactly as the lease ledger reserves it.
+
+### Fixed
+
+- **The allow cache no longer admits a larger call on a smaller call's allow.**
+  The output bound is now part of the cached cohort, so an allow priced for a
+  100-token cap cannot admit a 10,000-token call inside the cache window.
+
 ## [0.9.0] - 2026-10-25
 
 The SDK now meters Anthropic `beta.messages.create` and OpenAI

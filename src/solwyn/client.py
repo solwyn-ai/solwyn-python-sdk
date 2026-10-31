@@ -52,6 +52,7 @@ from solwyn._base import (
     _responses_output_bound,
     _SolwynBase,
     _with_call_span,
+    _with_default_output_cap,
 )
 from solwyn._control_plane_transport import (
     ControlPlaneTransport,
@@ -3071,6 +3072,15 @@ class Solwyn(_SolwynBase):
                             call_kwargs = rt.adapter.prepare_streaming(
                                 call_kwargs, cross_provider=is_provider_fallback
                             )
+                    # The pre-flight charged an uncapped hop the default
+                    # output bound; send that bound so the charge holds.
+                    call_kwargs = _with_default_output_cap(
+                        runtime=rt,
+                        model=served_model,
+                        kwargs=call_kwargs,
+                        surface=_surface,
+                        default_bound=self._solwyn_config.lease_output_bound_default,
+                    )
                 except Exception:
                     cb.release_probe(admission)
                     probe_to_release = None
@@ -4841,6 +4851,15 @@ class AsyncSolwyn(_SolwynBase):
                             call_kwargs = rt.adapter.prepare_streaming(
                                 call_kwargs, cross_provider=is_provider_fallback
                             )
+                    # The pre-flight charged an uncapped hop the default
+                    # output bound; send that bound so the charge holds.
+                    call_kwargs = _with_default_output_cap(
+                        runtime=rt,
+                        model=served_model,
+                        kwargs=call_kwargs,
+                        surface=_surface,
+                        default_bound=self._solwyn_config.lease_output_bound_default,
+                    )
                 except Exception:
                     cb.release_probe(admission)
                     probe_to_release = None

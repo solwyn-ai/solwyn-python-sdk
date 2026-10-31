@@ -36,6 +36,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY
 
+from solwyn._lease import DEFAULT_OUTPUT_BOUND
 from solwyn.client import Solwyn
 from solwyn.providers import get_adapter_for_client
 from solwyn.providers.bedrock import BedrockAdapter
@@ -181,7 +182,13 @@ def test_wrapped_converse_reports_normalized_usage_and_region() -> None:
     # BACK at dispatch, so the stubber's expected_params see modelId.
     client = _bedrock_client()
     stubber = Stubber(client)
-    params = {"modelId": BEDROCK_MODEL, "messages": _messages()}
+    # An uncapped converse gets the default output bound (WS-13); the real
+    # botocore stubber validates the injected inferenceConfig against the model.
+    params = {
+        "modelId": BEDROCK_MODEL,
+        "messages": _messages(),
+        "inferenceConfig": {"maxTokens": DEFAULT_OUTPUT_BOUND},
+    }
     stubber.add_response("converse", _full_envelope(), params)
 
     solwyn = Solwyn(client, api_key=VALID_API_KEY)

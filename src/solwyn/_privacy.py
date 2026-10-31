@@ -569,6 +569,38 @@ def merge_google_generate_content_kwargs(
     return merged
 
 
+def with_google_output_cap(
+    kwargs: dict[str, Any],
+    cap: int,
+    *,
+    target_shape: str,
+) -> dict[str, Any]:
+    """Return a hop request whose generation config carries ``max_output_tokens``.
+
+    The config may also hold a system instruction, so the copy stays inside
+    this content-privileged module. The caller's config object is never
+    mutated: dicts are copied, pydantic configs use ``model_copy``, and other
+    config objects become an ephemeral mapping the SDK accepts. A config that
+    is not a mapping or an object with attributes is malformed, so the request
+    is returned unchanged for the provider SDK to reject.
+    """
+    config_key = "generation_config" if target_shape == "google_generativeai" else "config"
+    config = kwargs.get(config_key)
+    capped: object
+    if config is None:
+        capped = {"max_output_tokens": cap}
+    elif isinstance(config, dict):
+        capped = {**config, "max_output_tokens": cap}
+    elif callable(getattr(config, "model_copy", None)):
+        capped = config.model_copy(update={"max_output_tokens": cap})
+    elif isinstance(getattr(config, "__dict__", None), dict):
+        mapping = _google_config_mapping(config, feature="unsupported_google_config_shape")
+        capped = {**mapping, "max_output_tokens": cap}
+    else:
+        return kwargs
+    return {**kwargs, config_key: capped}
+
+
 def normalize_google_translation_source_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     """Normalize the documented Google source subset for canonical translation.
 
