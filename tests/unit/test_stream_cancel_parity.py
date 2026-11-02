@@ -870,6 +870,61 @@ class TestDroppedStreamSettlesOnce:
         assert calls == [os.getpid()]
         assert len(plane.confirms) == 1
 
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_fork_from_inside_a_close_still_settles_streams_in_the_child(self) -> None:
+        # The process forks from inside a client close's settle pass (as a
+        # multiprocessing start from a warning handler would). The child
+        # never unwinds that pass, yet its own close must settle its streams.
+        from solwyn._token_details import TokenDetails
+        from solwyn.stream import _StreamSettlement
+
+        class _NoUsage:
+            def finalize(self) -> TokenDetails:
+                return TokenDetails()
+
+        plane = FakeControlPlane()
+        wrapped = plane.wrap(_Provider(_OpenStream()).client(is_async=False))
+        forked: list[int] = []
+
+        def fork_here(*_args: Any) -> None:
+            pid = os.fork()
+            if pid != 0:
+                forked.append(pid)
+                return
+            code = 1  # pragma: no cover - runs in the child
+            try:
+                settled: list[TokenDetails] = []
+                fresh = _StreamSettlement(
+                    _NoUsage(),  # type: ignore[arg-type]
+                    lambda usage, _ms: settled.append(usage),
+                )
+                wrapped._track_open_stream(fresh)
+                wrapped._settle_open_streams()
+                code = 0 if len(settled) == 1 else 2
+            finally:
+                os._exit(code)
+
+        forking = _StreamSettlement(_NoUsage(), fork_here)  # type: ignore[arg-type]
+        wrapped._track_open_stream(forking)
+        try:
+            wrapped._settle_open_streams()
+            [pid] = forked
+            deadline = time.monotonic() + 5
+            status = 0
+            while time.monotonic() < deadline:
+                done, status = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    break
+                time.sleep(0.01)
+            else:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                pytest.fail("the child hung")
+            assert os.waitstatus_to_exitcode(status) == 0, "the child's close skipped its stream"
+        finally:
+            wrapped.close()
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("is_async", [False, True])
     @pytest.mark.parametrize("funding", ["per_call", "lease"])

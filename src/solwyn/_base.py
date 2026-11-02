@@ -2425,6 +2425,9 @@ class _SolwynBase:
         self._solwyn_breaker_lock = threading.Lock()
         self._solwyn_guard_lock = threading.Lock()
         self._solwyn_velocity._reset_after_fork_in_child()
+        # A fork from inside a close's settle pass never unwinds it here: give
+        # the child a fresh marker so its own closes settle their streams.
+        _SETTLING_OPEN_STREAMS.clients = set()
         # A stream settlement in flight in the parent can never signal the
         # child's copy: mark it done here (the child does not settle it).
         for settlement in list(getattr(self, "_solwyn_open_streams", None) or ()):
