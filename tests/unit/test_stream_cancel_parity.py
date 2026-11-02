@@ -592,6 +592,34 @@ class TestDroppedStreamSettlesOnce:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("funding", ["per_call", "lease"])
+    async def test_unreadable_usage_still_settles_the_dropped_floor(
+        self, funding: str, is_async: bool
+    ) -> None:
+        plane = FakeControlPlane(granted_tokens=128, final_grant=True)
+        provider = _Provider(_OpenStream())
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+        scope = solwyn.run("unreadable") if funding == "lease" else contextlib.nullcontext()
+        with scope:
+            stream = await _open_stream(wrapped, is_async=is_async)
+            await _read(stream, is_async=is_async, chunks=1)
+            broken = patch.object(
+                stream._settlement._accumulator, "finalize", side_effect=ValueError("usage")
+            )
+            with broken:
+                await _close_client(wrapped, is_async=is_async)
+            assert stream._settlement.settled
+
+        [confirm] = plane.confirms
+        assert confirm.token_details.is_estimated is True
+        assert confirm.token_details.output_tokens == 100
+        assert (confirm.lease_id is not None) is (funding == "lease")
+        if funding == "lease":
+            assert plane.lease_surrenders[-1].spent_tokens >= 100
+        assert len(plane.ingested) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
     async def test_dropped_settlement_never_raises(self, is_async: bool) -> None:
         plane = FakeControlPlane()
         provider = _Provider(_OpenStream())

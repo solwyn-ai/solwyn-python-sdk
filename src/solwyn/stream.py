@@ -105,7 +105,14 @@ class _StreamSettlement:
                 return
             try:
                 elapsed_ms = (time.monotonic() - self._start_time) * 1000
-                on_dropped(self._accumulator.finalize(), elapsed_ms)
+                try:
+                    observed = self._accumulator.finalize()
+                except Exception as exc:
+                    # Unreadable usage is still a dropped stream: settle its
+                    # funding on nothing observed rather than skip it.
+                    logger.warning("stream.dropped_finalize_failed: %s", type(exc).__name__)
+                    observed = TokenDetails()
+                on_dropped(observed, elapsed_ms)
             finally:
                 self._dropped_done.set()
         except BaseException as exc:
