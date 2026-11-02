@@ -986,3 +986,73 @@ class TestCloseOutFlushNudge:
             assert reporter._shutdown_event.wake.is_set()
         finally:
             await reporter.close()
+
+
+class _SequencedProvider(_Provider):
+    """A provider that answers each request with the next status in turn."""
+
+    def __init__(self, statuses: list[int]) -> None:
+        super().__init__()
+        self._statuses = list(statuses)
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.status = self._statuses.pop(0) if self._statuses else 200
+        return super().handler(request)
+
+
+@pytest.mark.unit
+class TestTerminalAmbiguityKeepsTheLeaseClaim:
+    """TS r2 parity: when the LAST hop of a lease-funded call fails post-send
+    ambiguous, terminal cleanup must not hand the claim back. Final 128-token
+    grant; primary 429, last fallback 500 under failover_idempotency="always",
+    then a second call in the same run."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_ambiguous_last_hop_keeps_its_claim_spent(
+        self, is_async: bool, streaming: bool
+    ) -> None:
+        import solwyn
+
+        plane = FakeControlPlane(granted_tokens=128, final_grant=True)
+        primary, fallback = _SequencedProvider([429, 200]), _Provider(500)
+        wrap = plane.wrap_async if is_async else plane.wrap
+        wrapped = wrap(
+            primary.client(is_async=is_async),
+            fallback=[(fallback.client(GROQ_URL, is_async=is_async), PRICEY)],
+            failover_idempotency="always",
+        )
+        request = {"model": CHEAP, "messages": MESSAGES, "max_tokens": 100}
+
+        async def call(**extra: Any) -> Any:
+            result = wrapped.chat.completions.create(**request, **extra)
+            return await result if is_async else result
+
+        try:
+            with solwyn.run("terminal-ambiguity") as run_id:
+                with pytest.raises(openai.InternalServerError):
+                    await call(stream=streaming) if streaming else await call()
+                state = wrapped._solwyn_budget._lease.state_for(run_id)
+                first_spent, first_reserved = state.spent_tokens_since_report, state.reserved_tokens
+                # The second call no longer fits the lease's remainder, so it
+                # must take a per-call check rather than reuse a refunded claim.
+                await call()
+        finally:
+            if is_async:
+                await wrapped.close()
+            else:
+                wrapped.close()
+
+        # Both calls really ran: primary 429, then the ambiguous fallback, then
+        # the second call's primary success.
+        assert len(primary.bodies) == 2
+        assert len(fallback.bodies) == 1
+        assert len(plane.lease_grants) == 1
+        assert first_reserved == 0
+        assert first_spent >= 100
+        assert [(check.provider.value, check.model) for check in plane.checks] == [
+            ("openai", CHEAP)
+        ]
+        assert plane.lease_surrenders
+        assert plane.lease_surrenders[-1].spent_tokens >= 100
