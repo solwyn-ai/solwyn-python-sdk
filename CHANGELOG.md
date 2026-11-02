@@ -28,7 +28,7 @@ may have spent. Keeping that funding is now `hard_deny` only.
 Under `hard_deny`, a call whose usage can't be measured and may have been
 billed is recorded at its reserved amount, marked estimated, so the dashboard
 can show more than the provider billed (for example, a stream stopped early).
-This needs Solwyn API support that is live from <core deploy date>.
+This needs Solwyn API support that is live from 2026-11-02.
 
 ### Fixed
 
@@ -72,11 +72,11 @@ This needs Solwyn API support that is live from <core deploy date>.
   its usual event: early close, garbage collection and client close, a
   mid-stream error, a stream wrap or Responses entry failure, a cancellation
   without proof, an unknown failure after dispatch, a terminal ambiguous
-  failure, and the one-generation guard. The API keeps it as a durable
-  receipt, accepts it up to an hour after the check, and counts the larger of
-  the receipt and the call's events. A possibly billed hop that fails over is
-  recorded under its own call id, so it counts beside the hop that served the
-  call.
+  failure, and a one-generation guard refusal after a send that may have been
+  billed. The API keeps it as a durable receipt, accepts it up to an hour
+  after the check, and counts the larger of the receipt and the call's events.
+  A possibly billed hop that fails over is recorded under its own call id, so
+  it counts beside the hop that served the call.
 - **A response whose body fails to decode no longer fails over.** A 200 whose
   gzip or deflate body could not be decoded reached Solwyn as a connection
   error and was failed over as if nothing had been sent, so the provider could

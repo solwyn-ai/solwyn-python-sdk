@@ -796,7 +796,8 @@ included, it checks the outgoing request (the admitted model, a cap within the
 priced bound, no fallbacks), then claims the call's single generation slot
 before any I/O, so overlapping sends cannot both go out. After one successful
 (2xx) response, any further request is refused before it is sent, and the
-reservation is kept. Retries after a failed attempt still pass.
+reservation is kept. A refusal before anything was sent gives the reservation
+back. Retries after a failed attempt still pass.
 
 `error.hint` says how to fix the request. All of this applies only when Solwyn
 itself admitted the call under `hard_deny` (a check allow, or a lease whose
@@ -936,7 +937,7 @@ The floor survives lease surrender, reservation expiry and reconcile, so the
 cap keeps holding. This means the dashboard can show more than the provider
 billed, for example for a stream stopped early. A possibly billed hop that
 fails over is recorded under its own call id, beside the hop that served the
-call. This needs Solwyn API support that is live from <core deploy date>. On `alert_only` those calls settle
+call. This needs Solwyn API support that is live from 2026-11-02. On `alert_only` those calls settle
 once at their observed usage and give the claim back, as before; failover
 routing and the `possibly_succeeded` receipt flag are the same in every mode.
 The local floor for a completed call whose usage is missing or unreadable
