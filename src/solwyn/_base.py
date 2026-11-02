@@ -96,6 +96,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Per thread, the ids of clients whose close() is settling open streams on it.
+_SETTLING_OPEN_STREAMS = threading.local()
+
 _CallMethod = TypeVar("_CallMethod", bound=Callable[..., Any])
 
 
@@ -2381,19 +2384,34 @@ class _SolwynBase:
         worker, an early close or a stream error already claimed is waited for
         until its settlement is enqueued.
         Never raises.
+
+        A close() re-entered on a thread already in here (a log handler that
+        closes the client on the wait's timeout warning) returns at once: the
+        outer close is already settling these streams, and a nested pass
+        would restart every wait. This runs without awaiting, so the marker
+        never spans an async close's awaits.
         """
         streams = getattr(self, "_solwyn_open_streams", None)
         if not streams:
             return
-        while True:
-            # A collection can retire an entry mid-snapshot; retry until stable.
-            try:
-                open_streams = list(streams)
-                break
-            except RuntimeError:
-                continue
-        for settlement in open_streams:
-            settlement.settle_dropped(wait=True)
+        active: set[int] | None = getattr(_SETTLING_OPEN_STREAMS, "clients", None)
+        if active is None:
+            active = _SETTLING_OPEN_STREAMS.clients = set()
+        if id(self) in active:
+            return
+        active.add(id(self))
+        try:
+            while True:
+                # A collection can retire an entry mid-snapshot; retry until stable.
+                try:
+                    open_streams = list(streams)
+                    break
+                except RuntimeError:
+                    continue
+            for settlement in open_streams:
+                settlement.settle_dropped(wait=True)
+        finally:
+            active.discard(id(self))
 
     def _reset_after_fork_in_child(self) -> None:
         """Replace locks and clear process-local velocity state in a child.

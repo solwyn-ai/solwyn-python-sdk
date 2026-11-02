@@ -754,11 +754,14 @@ class TestDroppedStreamSettlesOnce:
         # The nested settlement enqueues after the reporter sealed: accepted.
         assert outcome["drops"].get("settlement_confirm.closed_enqueue") == 1
 
-    def test_two_reentrant_closes_across_streams_return(self) -> None:
+    @pytest.mark.parametrize("handler_on", ["solwyn.tests.two_reentrant_closes", "solwyn", ""])
+    def test_two_reentrant_closes_across_streams_return(self, handler_on: str) -> None:
         # Two threads each claim a stream, then a warning handler closes the
         # client from inside each settlement. The first holds the handler's
         # lock while its close waits for the second, which waits for that
-        # lock. The bounded wait breaks the cycle.
+        # lock. The bounded wait breaks the cycle. On the solwyn or root
+        # logger the handler also sees the wait's own timeout warning, and
+        # the close it starts there must not wait again.
         plane = FakeControlPlane()
         provider = _Provider(_OpenStream())
 
@@ -790,7 +793,7 @@ class TestDroppedStreamSettlesOnce:
             for stream in streams:
                 next(stream)
             handler = _CloseOnWarning()
-            probe_logger.addHandler(handler)
+            logging.getLogger(handler_on).addHandler(handler)
             try:
                 with (
                     patch.object(reporter, "report_settlement", report),
@@ -802,7 +805,7 @@ class TestDroppedStreamSettlesOnce:
                     for closer in closers:
                         closer.join()
             finally:
-                probe_logger.removeHandler(handler)
+                logging.getLogger(handler_on).removeHandler(handler)
             outcome["drops"] = dict(reporter.dropped_counts)
 
         worker = threading.Thread(target=probe, daemon=True)
