@@ -761,3 +761,53 @@ class TestLocalRefusalLeavesNoHold:
 
         assert len(qwen.bodies) == 1
         assert stub.held == {}
+
+
+@pytest.mark.unit
+class TestAsyncAmbiguousExposure:
+    """Sol r1 B2, async client: the ambiguous attempt's exposure is kept and the
+    next attempt is admitted separately, same identity and lease-funded alike."""
+
+    @pytest.mark.asyncio
+    async def test_async_same_identity_hop_beside_the_hold_is_refused(self) -> None:
+        from solwyn.client import AsyncSolwyn
+
+        stub, primary, again = _PricedPlane(budget_limit=0.003), _Provider(500), _Provider()
+        solwyn = AsyncSolwyn(
+            primary.client(is_async=True),
+            api_key=stub.plane.api_key,
+            api_url=stub.plane.api_url,
+            control_plane_transport=stub,
+            lease_enabled=False,
+            fallback=[(again.client(is_async=True), CHEAP)],
+            failover_idempotency="always",
+        )
+        try:
+            with pytest.raises(BudgetExceededError):
+                await solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+        finally:
+            await solwyn.close()
+
+        assert again.bodies == []
+        assert set(stub.held) == {"res_1"}
+
+    @pytest.mark.asyncio
+    async def test_async_lease_funded_ambiguous_attempt_is_readmitted(self) -> None:
+        import solwyn
+
+        plane = FakeControlPlane()
+        primary, fallback = _Provider(500), _Provider()
+        wrapped = plane.wrap_async(
+            primary.client(is_async=True),
+            fallback=[(fallback.client(GROQ_URL, is_async=True), PRICEY)],
+            failover_idempotency="always",
+        )
+        async with wrapped:
+            with solwyn.run("ambiguous-async") as run_id:
+                await wrapped.chat.completions.create(model=CHEAP, messages=MESSAGES)
+                state = wrapped._solwyn_budget._lease.state_for(run_id)
+                spent = state.spent_tokens_since_report
+
+        assert [(check.provider.value, check.model) for check in plane.checks] == [("groq", PRICEY)]
+        assert plane.confirms[0].lease_id is None
+        assert spent >= DEFAULT_OUTPUT_BOUND
