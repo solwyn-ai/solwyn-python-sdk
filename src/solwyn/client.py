@@ -3191,9 +3191,10 @@ class Solwyn(_SolwynBase):
             # primary was attempted and raised; CIRCUIT_OPEN if it was skipped OPEN).
             primary_errored = False
             primary_reached = False
-            # Under hard_deny a per-call admission prices one (provider, model);
-            # a hop that differs is re-admitted at its own price before it is
-            # sent (_readmit_failover_hop).
+            # Under hard_deny a per-call admission prices one (provider, model)
+            # and funds one generation; a hop that differs, or any hop after a
+            # possibly billed attempt, is re-admitted at its own price before
+            # it is sent (_readmit_failover_hop).
             admitted_identity = (primary.adapter.name, requested_model)
             admitted_spend_unknown = False
             for idx, rt in enumerate(candidates):
@@ -3223,10 +3224,13 @@ class Solwyn(_SolwynBase):
                 # chain depth).
                 chain_index = next(i for i, r in enumerate(self._solwyn_runtimes) if r is rt)
                 hop_model = requested_model if is_primary else rt.entry.model
+                # After a possibly billed attempt the next one is re-admitted
+                # whatever its identity: two possibly billed generations must
+                # never share one reservation.
                 if (
                     getattr(budget, "hard_deny_admitted", False) is True
                     and getattr(budget, "lease_id", None) is None
-                    and (provider, hop_model) != admitted_identity
+                    and ((provider, hop_model) != admitted_identity or admitted_spend_unknown)
                 ):
                     budget, estimated_output_bound = self._readmit_failover_hop(
                         budget=budget,
@@ -5114,9 +5118,10 @@ class AsyncSolwyn(_SolwynBase):
             # primary was attempted and raised; CIRCUIT_OPEN if it was skipped OPEN).
             primary_errored = False
             primary_reached = False
-            # Under hard_deny a per-call admission prices one (provider, model);
-            # a hop that differs is re-admitted at its own price before it is
-            # sent (_readmit_failover_hop).
+            # Under hard_deny a per-call admission prices one (provider, model)
+            # and funds one generation; a hop that differs, or any hop after a
+            # possibly billed attempt, is re-admitted at its own price before
+            # it is sent (_readmit_failover_hop).
             admitted_identity = (primary.adapter.name, requested_model)
             admitted_spend_unknown = False
             for idx, rt in enumerate(candidates):
@@ -5146,10 +5151,13 @@ class AsyncSolwyn(_SolwynBase):
                 # chain depth).
                 chain_index = next(i for i, r in enumerate(self._solwyn_runtimes) if r is rt)
                 hop_model = requested_model if is_primary else rt.entry.model
+                # After a possibly billed attempt the next one is re-admitted
+                # whatever its identity: two possibly billed generations must
+                # never share one reservation.
                 if (
                     getattr(budget, "hard_deny_admitted", False) is True
                     and getattr(budget, "lease_id", None) is None
-                    and (provider, hop_model) != admitted_identity
+                    and ((provider, hop_model) != admitted_identity or admitted_spend_unknown)
                 ):
                     budget, estimated_output_bound = await self._readmit_failover_hop(
                         budget=budget,

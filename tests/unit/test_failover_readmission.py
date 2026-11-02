@@ -413,3 +413,47 @@ class TestReadmissionAfterLeaseRefusal:
         # reservation, so nothing is left reserved after the call.
         assert len(claimed) == 1
         assert reserved == {}
+
+
+@pytest.mark.unit
+class TestReadmissionAfterAnAmbiguousAttempt:
+    """Finding 2: after a possibly billed attempt, the next attempt is
+    re-admitted even when its provider and model match, so two possibly
+    billed generations never share one reservation."""
+
+    def _wrap_same_identity(self, stub: _PricedPlane, primary: Any, again: Any) -> Any:
+        from solwyn.client import Solwyn
+
+        return Solwyn(
+            primary,
+            api_key=stub.plane.api_key,
+            api_url=stub.plane.api_url,
+            control_plane_transport=stub,
+            budget_check_cache_ttl=0,
+            lease_enabled=False,
+            fallback=[(again, CHEAP)],
+            failover_idempotency="always",
+        )
+
+    def test_same_identity_hop_after_an_ambiguous_attempt_is_readmitted(self) -> None:
+        stub, primary, again = _PricedPlane(budget_limit=_ROOMY), _Provider(500), _Provider()
+        with self._wrap_same_identity(stub, primary.client(), again.client()) as solwyn:
+            solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+
+        assert [check["model"] for check in stub.checks] == [CHEAP, CHEAP]
+        assert len(again.bodies) == 1
+        # The possibly billed hold stays; the hop settles its own reservation.
+        assert [confirm["reservation_id"] for confirm in stub.confirms] == ["res_2"]
+        assert set(stub.held) == {"res_1"}
+
+    def test_same_identity_hop_that_does_not_fit_beside_the_hold_is_refused(self) -> None:
+        # One cheap reservation (about $0.0025) fits a $0.004 cap; two do not.
+        stub, primary, again = _PricedPlane(budget_limit=0.004), _Provider(500), _Provider()
+        with (
+            self._wrap_same_identity(stub, primary.client(), again.client()) as solwyn,
+            pytest.raises(BudgetExceededError),
+        ):
+            solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+
+        assert len(primary.bodies) == 1
+        assert again.bodies == []
