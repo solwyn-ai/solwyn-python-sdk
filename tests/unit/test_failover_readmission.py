@@ -1056,3 +1056,47 @@ class TestTerminalAmbiguityKeepsTheLeaseClaim:
         ]
         assert plane.lease_surrenders
         assert plane.lease_surrenders[-1].spent_tokens >= 100
+
+
+@pytest.mark.unit
+class TestTerminalAmbiguityOnAPrimaryOnlyCall:
+    """TS r2 parity, shape (a): the primary alone fails post-send ambiguous
+    (503) and the walk ends on it. Its lease claim stays spent, so the next
+    call in the run needs a per-call check."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_ambiguous_only_hop_keeps_its_claim_spent(
+        self, is_async: bool, streaming: bool
+    ) -> None:
+        import solwyn
+
+        plane = FakeControlPlane(granted_tokens=128, final_grant=True)
+        primary = _SequencedProvider([503, 200])
+        wrap = plane.wrap_async if is_async else plane.wrap
+        wrapped = wrap(primary.client(is_async=is_async), failover_idempotency="always")
+        request = {"model": CHEAP, "messages": MESSAGES, "max_tokens": 100}
+
+        async def call(**extra: Any) -> Any:
+            result = wrapped.chat.completions.create(**request, **extra)
+            return await result if is_async else result
+
+        try:
+            with solwyn.run("terminal-ambiguity-only") as run_id:
+                with pytest.raises(openai.InternalServerError):
+                    await call(stream=streaming) if streaming else await call()
+                state = wrapped._solwyn_budget._lease.state_for(run_id)
+                first_spent, first_reserved = state.spent_tokens_since_report, state.reserved_tokens
+                await call()
+        finally:
+            if is_async:
+                await wrapped.close()
+            else:
+                wrapped.close()
+
+        assert len(primary.bodies) == 2
+        assert first_reserved == 0
+        assert first_spent >= 100
+        assert [check.model for check in plane.checks] == [CHEAP]
+        assert plane.lease_surrenders[-1].spent_tokens >= 100
