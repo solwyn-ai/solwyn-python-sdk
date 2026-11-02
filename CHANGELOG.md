@@ -5,7 +5,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
-## [0.10.1] - Unreleased
+## [0.10.1] - 2026-11-02
 
 Bug fixes: `hard_deny` now also covers failover hops and `decisions.create`.
 In both cases a call could spend past a `hard_deny` budget.
