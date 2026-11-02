@@ -239,10 +239,10 @@ def test_sync_unmetered_surface_warns_and_passes_through(caplog: pytest.LogCaptu
     check_budget.assert_not_called()
     report.assert_not_called()
     report_settlement.assert_not_called()
-    assert len(_base_records(caplog)) == 1
-    warning = _base_records(caplog)[0].getMessage()
-    assert "together" in warning
-    assert "rerank" in warning
+    records = _base_records(caplog)
+    assert len(records) == 1
+    assert records[0].args[:3] == ("together", "native_together", "rerank")
+    warning = records[0].getMessage()
     assert "no budget check" in warning
     assert "no cost event" in warning
     assert "tracking for this surface is coming" in warning.lower()
@@ -327,10 +327,10 @@ async def test_async_unmetered_surface_warns_and_passes_through(
     check_budget.assert_not_awaited()
     report.assert_not_called()
     report_settlement.assert_not_called()
-    assert len(_base_records(caplog)) == 1
-    warning = _base_records(caplog)[0].getMessage()
-    assert "together" in warning
-    assert "rerank" in warning
+    records = _base_records(caplog)
+    assert len(records) == 1
+    assert records[0].args[:3] == ("together", "native_together", "rerank")
+    warning = records[0].getMessage()
     assert "no budget check" in warning
     assert "no cost event" in warning
     assert "tracking for this surface is coming" in warning.lower()
