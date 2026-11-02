@@ -769,6 +769,7 @@ stops. `error.reason` is one of:
 | `unsupported_override` | A body extension carries a key Solwyn cannot account for (see below) |
 | `multi_generation_loop` | The provider SDK could generate more than once inside the call: Google automatic continuation or automatic function calling turned on explicitly, Anthropic `fallbacks`, or Anthropic middleware that resends after a successful response |
 | `azure_api_version` | An uncapped Azure OpenAI call on an api-version older than 2024-09-01, which has no `max_completion_tokens` |
+| `no_output_cap` | The API takes no output-cap parameter, so no bound can be enforced. Today this is OpenAI `decisions.create` |
 | `bound_exceeded` | Any other request whose possible output exceeds the priced bound |
 
 Body extensions are allowlisted. On a `hard_deny` admission a request body
@@ -803,6 +804,22 @@ posture is `hard_deny`). Nothing changes on `alert_only` projects, and a call
 admitted fail-open during an outage is sent exactly as you built it. Media
 calls (images, audio, video, embeddings) keep their own estimate and carry no
 output bound.
+
+Failover hops are priced on their own. The check prices the model you asked
+for, but a call that fails over is billed at the model that served it. On a
+`hard_deny` project, before Solwyn sends a call to a hop whose provider or
+model differs from what was admitted, it frees the earlier reservation (at
+zero tokens when that attempt was not billed) and runs a fresh check for the
+hop, at the hop's own price and output bound. If the hop does not fit the
+remaining budget, the call is refused with `BudgetExceededError` and the hop
+is never called. Any attempt after one that may already have been billed is
+checked again too, even on the same provider and model. A call funded by a
+run's budget lease needs no second check while every (provider, model) it can
+reach is in the lease's declared failover chain, because the lease is valued
+at the most expensive pair in that chain. A declared model name on a provider
+the lease never declared takes a per-call check. One exception: after a lease-funded attempt that may have
+been billed, that attempt's lease tokens stay spent and the next attempt gets
+its own per-call check.
 
 Known limitations:
 
@@ -1207,7 +1224,7 @@ def test_denial_fixture(solwyn_control_plane, solwyn_test_client):
 | `tags` | `SOLWYN_TAGS` | `None` | Default spend tags for intercepted calls; env format is comma-separated `key=value` entries |
 | `fail_open` | `SOLWYN_FAIL_OPEN` | `True` | When Solwyn API is unreachable: `True` allows calls and tallies their tokens for the next successful check; `False` denies calls that no live budget lease covers |
 | `budget_mode` | `SOLWYN_BUDGET_MODE` | `alert_only` | Budget enforcement mode |
-| `budget_check_cache_ttl` | `SOLWYN_BUDGET_CHECK_CACHE_TTL` | `5` | Allow-cache lifetime for eligible legacy/non-run checks |
+| `budget_check_cache_ttl` | `SOLWYN_BUDGET_CHECK_CACHE_TTL` | `5` | Allow-cache lifetime for eligible legacy/non-run checks. `hard_deny` allows are never cached |
 | `budget_check_timeout` | `SOLWYN_BUDGET_CHECK_TIMEOUT` | `1.0` | Hot-path control-plane check/grant timeout in seconds |
 | `lease_enabled` | `SOLWYN_LEASE_ENABLED` | `True` | Use in-memory token leases for eligible run-scoped calls |
 | `lease_output_bound_default` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token bound for a request with no explicit cap: priced by every budget check, and sent to the provider as its cap on `hard_deny` projects |

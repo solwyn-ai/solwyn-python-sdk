@@ -722,7 +722,7 @@ class TestLeaseRenewal:
                                 _grant_payload(lease_id=f"lease-sync-{index}")
                             ),
                             now=time.monotonic(),
-                            declared_models=["gpt-5.5"],
+                            declared_models=[("openai", "gpt-5.5")],
                         )
                     enforcer._start_renewal(
                         run_id,
@@ -767,7 +767,7 @@ class TestLeaseRenewal:
                             _grant_payload(lease_id=f"lease-async-{index}")
                         ),
                         now=time.monotonic(),
-                        declared_models=["gpt-5.5"],
+                        declared_models=[("openai", "gpt-5.5")],
                     )
                 enforcer._start_renewal(
                     run_id,
@@ -923,7 +923,7 @@ class TestLeaseRenewal:
                             )
                         ),
                         now=time.monotonic(),
-                        declared_models=["gpt-5.5"],
+                        declared_models=[("openai", "gpt-5.5")],
                     )
                 release.set()
                 assert _wait_for(lambda: renew.call_count == 1)
@@ -1100,13 +1100,14 @@ class TestLeaseSurrender:
                 RUN,
                 LeaseGrantResponse.model_validate(_grant_payload()),
                 now=time.monotonic(),
-                declared_models=["gpt-5.5"],
+                declared_models=[("openai", "gpt-5.5")],
             )
             before_snapshot = enforcer._lease.admit(
                 run_id=RUN,
                 call_id="before-snapshot",
                 estimated_input_tokens=100,
                 output_bound=500,
+                provider="openai",
                 model="gpt-5.5",
                 now=time.monotonic(),
                 breaker_open=False,
@@ -1134,6 +1135,7 @@ class TestLeaseSurrender:
                 call_id="after-snapshot",
                 estimated_input_tokens=100,
                 output_bound=500,
+                provider="openai",
                 model="gpt-5.5",
                 now=time.monotonic(),
                 breaker_open=False,
@@ -1356,7 +1358,7 @@ class TestLeaseSurrender:
                     RUN,
                     LeaseGrantResponse.model_validate(_grant_payload()),
                     now=time.monotonic(),
-                    declared_models=["gpt-5.5"],
+                    declared_models=[("openai", "gpt-5.5")],
                 )
             enforcer._start_renewal(
                 RUN,
@@ -1409,7 +1411,7 @@ class TestLeaseSurrender:
                     RUN,
                     LeaseGrantResponse.model_validate(_grant_payload()),
                     now=time.monotonic(),
-                    declared_models=["gpt-5.5"],
+                    declared_models=[("openai", "gpt-5.5")],
                 )
             enforcer._start_renewal(
                 RUN,
@@ -1843,7 +1845,7 @@ class TestLeaseSurrender:
                                 _grant_payload(lease_id=f"surrender-lease-{index}")
                             ),
                             now=time.monotonic(),
-                            declared_models=["gpt-5.5"],
+                            declared_models=[("openai", "gpt-5.5")],
                         )
 
                 started = time.monotonic()
@@ -2015,7 +2017,7 @@ class TestLeaseSettlement:
                 RUN,
                 LeaseGrantResponse.model_validate(_grant_payload()),
                 now=time.monotonic(),
-                declared_models=["gpt-5.5"],
+                declared_models=[("openai", "gpt-5.5")],
             )
         state = enforcer._lease.state_for(RUN)
         assert state is not None
@@ -2034,7 +2036,7 @@ class TestLeaseSettlement:
                 RUN,
                 LeaseGrantResponse.model_validate(_grant_payload()),
                 now=time.monotonic(),
-                declared_models=["gpt-5.5"],
+                declared_models=[("openai", "gpt-5.5")],
             )
         state = enforcer._lease.state_for(RUN)
         assert state is not None
@@ -2053,13 +2055,14 @@ class TestLeaseSettlement:
                 RUN,
                 LeaseGrantResponse.model_validate(_grant_payload()),
                 now=time.monotonic(),
-                declared_models=["gpt-5.5"],
+                declared_models=[("openai", "gpt-5.5")],
             )
             enforcer._lease.admit(
                 run_id=RUN,
                 call_id="not-a-canonical-uuid",
                 estimated_input_tokens=100,
                 output_bound=500,
+                provider="openai",
                 model="gpt-5.5",
                 now=time.monotonic(),
                 breaker_open=False,

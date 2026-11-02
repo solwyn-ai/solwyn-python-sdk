@@ -658,6 +658,11 @@ _OUTPUT_BOUND_HINTS: dict[OutputBoundReason, str] = {
         "continuation or automatic function calling). Turn those off for this call, "
         "or run the loop yourself so Solwyn checks each generation."
     ),
+    "no_output_cap": (
+        "This API has no output-cap parameter, so Solwyn cannot hold the call to a "
+        "hard budget. Run it on an alert_only project, or use an API that takes an "
+        "output cap."
+    ),
     "bound_exceeded": (
         "Set the output cap and candidate count on the call itself so the request "
         "fits the output bound Solwyn priced."

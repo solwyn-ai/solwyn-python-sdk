@@ -5,6 +5,63 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
+## [0.10.1] - 2026-11-02
+
+Bug fixes: `hard_deny` now also covers failover hops and `decisions.create`.
+In both cases a call could spend past a `hard_deny` budget.
+
+### Fixed
+
+- **A failover hop is checked at its own price.** The budget check prices the
+  model you asked for, but settlement prices the model that served the call.
+  When the first model failed and the call failed over to a pricier one, the
+  call could settle above its reservation. For example, 4096 output tokens
+  reserve about $0.0025 on gpt-4o-mini but can cost about $0.041 on gpt-4o, so
+  a $0.01 cap could be passed. Now, on a `hard_deny` project, before a call is
+  sent to a hop whose provider or model differs from what was admitted, Solwyn
+  frees the earlier reservation and runs a fresh check for the hop at its own
+  price and output bound. The earlier reservation is settled at zero tokens
+  under a new call id when its attempt was not billed, and kept when it may
+  have been billed. If the hop does not fit, the call is refused with
+  `BudgetExceededError` (the same error and denial reasons as a first-hop
+  denial) and the hop is never called. A hop that fits is reserved and capped
+  at its own price. A hop that CostPolicy routes first is checked the same
+  way. `alert_only`, fail-open and outage behavior is unchanged, and a retry
+  on the same provider and model needs no second check. Calls funded by a
+  run's budget lease need no change: the lease is valued at the most expensive
+  model in its declared failover chain. For the hop check, `check_budget`
+  takes `per_call_only=True`, which skips the lease branch.
+- **Any attempt after a possibly billed one is checked again.** When an
+  attempt failed in a way that may still have been billed and the call failed
+  over, the next attempt is re-admitted even if it uses the same provider and
+  model, so two possibly billed generations never share one reservation.
+- **A lease-funded call no longer stacks generations on one lease claim.**
+  With `failover_idempotency="always"`, a lease-funded attempt that may have
+  been billed was followed by the next attempt on the same claim, so two
+  generations could be counted as one. On `hard_deny`, that claim now stays
+  spent at its full bound and the next attempt gets its own per-call check.
+- **A lease covers (provider, model) pairs, not model names.** A lease was
+  treated as covering any call whose model names it had declared, even on a
+  provider it never declared, which core prices differently. A call is now
+  lease-funded only when every (provider, model) it can reach was declared;
+  otherwise it takes a per-call check.
+- **`hard_deny` allows are no longer cached.** A cached allow carries no
+  reservation, so a repeated call, or a second call failing over to the same
+  hop, could run on an allow that nothing funded. Every `hard_deny` call now
+  gets its own check. `alert_only` allows are still cached.
+- **`decisions.create` is refused on `hard_deny` projects.** The Decisions API
+  has no output-cap parameter, so the output bound its check prices could not
+  be enforced. On a `hard_deny` admission the call is now refused before any
+  provider request with `OutputBoundUnenforceableError` and the new reason
+  `no_output_cap`. It still runs on `alert_only` projects.
+- **A call refused before any provider request no longer holds budget.** A
+  `hard_deny` refusal made locally after the budget check (`decisions.create`,
+  or any `OutputBoundUnenforceableError` raised before sending) left its
+  per-call reservation held on the server until it expired, which could deny
+  the next valid call. The reservation is now settled at zero tokens, and that
+  confirm, like the one that frees a failed-over hop's reservation, is sent
+  within one reporter cycle instead of at the next 5-second flush.
+
 ## [0.10.0] - 2026-10-31
 
 A `hard_deny` budget now bounds a call's output, not only its input. Every

@@ -483,7 +483,8 @@ class TestSyncLeaseId:
         assert confirms[by_tags["b"].call_id].reservation_id is not None
 
     def test_allow_cache_hit_outside_a_run_has_no_lease_and_no_confirm(self) -> None:
-        plane = FakeControlPlane()
+        # alert_only: a hard_deny allow is never cached (it funds no reservation).
+        plane = FakeControlPlane(mode="alert_only")
         wrapped = plane.wrap(_OpenAIStub(), budget_check_cache_ttl=60.0)
         try:
             wrapped.chat.completions.create(model="gpt-5.5", messages=_MESSAGES)

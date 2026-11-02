@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from solwyn import run
-from solwyn._types import CallStatus
+from solwyn._types import BudgetMode, CallStatus
 from solwyn.exceptions import (
     BudgetExceededError,
     ConfigurationError,
@@ -19,6 +19,9 @@ from solwyn.exceptions import (
 from solwyn.providers.openai import OpenAIAdapter
 from solwyn.testing import FakeControlPlane
 
+# These tests cover Decisions metering and settlement, so the planes run
+# alert_only: under hard_deny Decisions is refused before dispatch because it
+# takes no output cap (tests/unit/test_failover_readmission.py).
 openai = pytest.importorskip("openai", minversion="3.26.0")
 decision_types = pytest.importorskip("openai.types.decision")
 pytestmark = pytest.mark.unit
@@ -58,7 +61,7 @@ async def _wrapped(
         payload = response() if callable(response) else response
         return httpx.Response(status, json=_decision() if payload is None else payload)
 
-    plane = plane or FakeControlPlane()
+    plane = plane or FakeControlPlane(mode="alert_only")
     if is_async:
         raw = openai.AsyncOpenAI(
             api_key="offline", http_client=httpx.AsyncClient(transport=httpx.MockTransport(handle))
@@ -170,7 +173,8 @@ async def test_decisions_settles_requested_model_and_preserves_provider_response
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
 async def test_decisions_budget_deny_never_dispatches_or_settles(is_async):
-    async with _wrapped(is_async) as (wrapper, plane, seen):
+    # hard_deny: the denial is decided before the no-output-cap refusal.
+    async with _wrapped(is_async, plane=FakeControlPlane()) as (wrapper, plane, seen):
         plane.deny_next()
         with pytest.raises(BudgetExceededError):
             await _create(wrapper, is_async, **REQUEST)
@@ -212,7 +216,7 @@ async def test_decisions_missing_usage_with_no_readable_text_still_settles(
     questions = [{"type": "predicate", "instructions": ""}]
     if iterator_questions:
         questions = iter(REQUEST["questions"])
-    plane = FakeControlPlane(granted_tokens=60, final_grant=True)
+    plane = FakeControlPlane(mode="alert_only", granted_tokens=60, final_grant=True)
     async with _wrapped(is_async, response=payload, plane=plane, lease_output_bound_default=20) as (
         wrapper,
         _,
@@ -264,7 +268,7 @@ async def test_decisions_lease_keeps_output_bound_when_usage_is_unmeasured(is_as
             "total_tokens": 3,
         }
     )
-    plane = FakeControlPlane(granted_tokens=60, final_grant=True)
+    plane = FakeControlPlane(mode="alert_only", granted_tokens=60, final_grant=True)
     async with _wrapped(is_async, response=payload, plane=plane, lease_output_bound_default=20) as (
         wrapper,
         _,
@@ -393,7 +397,7 @@ async def test_decisions_dispatch_errors_retire_lease_claims_without_refunding_u
         transport_error = interrupt
     expected_error = type(interrupt) if "interrupt" in fault else openai.APITimeoutError
     unknown_spend = fault in {"read", "interrupt"}
-    plane = FakeControlPlane(granted_tokens=35, final_grant=True)
+    plane = FakeControlPlane(mode="alert_only", granted_tokens=35, final_grant=True)
     async with _wrapped(
         is_async, plane=plane, transport_error=transport_error, lease_output_bound_default=20
     ) as (wrapper, _, seen):
@@ -410,6 +414,9 @@ async def test_decisions_dispatch_errors_retire_lease_claims_without_refunding_u
             assert state.reserved_tokens == 0
             assert state.spent_tokens_since_report == (35 if unknown_spend else 0)
             if unknown_spend:
+                # The follow-up denial is what proves the spent tokens stayed
+                # spent; denials raise only in hard_deny.
+                plane.mode = BudgetMode.HARD_DENY
                 plane.deny_next()
                 with pytest.raises(BudgetExceededError):
                     await _create(wrapper, is_async, **REQUEST)
@@ -481,7 +488,7 @@ async def test_decisions_raw_mirrors_and_admin_report_keep_exact_untracked_postu
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
 async def test_decisions_stale_acknowledgment_is_rejected_as_metered(is_async):
     raw = (openai.AsyncOpenAI if is_async else openai.OpenAI)(api_key="offline")
-    plane = FakeControlPlane()
+    plane = FakeControlPlane(mode="alert_only")
     try:
         with pytest.raises(ConfigurationError, match="classified as metered"):
             (plane.wrap_async if is_async else plane.wrap)(

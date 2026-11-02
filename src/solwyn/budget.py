@@ -44,6 +44,7 @@ from solwyn._control_plane_transport import (
 from solwyn._lease import (
     DEFAULT_OUTPUT_BOUND,
     INELIGIBLE_RETRY_AFTER_S,
+    DeclaredModel,
     GrantOutcome,
     LeaseAdmission,
     LeaseDecision,
@@ -522,7 +523,11 @@ class _BudgetEnforcerBase:
         if cached is None:
             return None
         response, expires_at = cached
-        if not response.allowed or time.monotonic() >= expires_at:
+        if (
+            not response.allowed
+            or response.mode == BudgetMode.HARD_DENY
+            or time.monotonic() >= expires_at
+        ):
             self._allow_cache.pop(key, None)
             return None
         self._allow_cache.move_to_end(key)
@@ -720,7 +725,13 @@ class _BudgetEnforcerBase:
                 # create the very registry/sticky split the epoch work closes.
                 self._run_hard_deny_responses.pop(agent_run_id, None)
                 self._run_hard_deny_observed_at.pop(agent_run_id, None)
-            elif cache_allowed_response and cache_key is not None:
+            elif (
+                cache_allowed_response
+                and cache_key is not None
+                # A cached allow funds no reservation. Under hard_deny every
+                # call must be priced and reserved, so its allow is never kept.
+                and response.mode != BudgetMode.HARD_DENY
+            ):
                 self._store_allow_locked(cache_key, response)
             return
 
@@ -1337,10 +1348,12 @@ class _BudgetEnforcerBase:
         agent_run_id: str,
         call_id: str,
         estimated_input_tokens: int,
+        provider: str,
         model: str,
         estimated_output_bound: int | None,
         modality: Modality,
         estimated_media: MediaUsage | None,
+        fallback_providers: Sequence[str],
         fallback_models: Sequence[str],
         breaker_open_override: bool | None = None,
         claim_token: int | None = None,
@@ -1360,12 +1373,14 @@ class _BudgetEnforcerBase:
                 run_id=agent_run_id,
                 call_id=call_id,
                 estimated_input_tokens=estimated_input_tokens,
+                provider=provider,
                 model=model,
                 now=time.monotonic(),
                 breaker_open=breaker_open,
                 output_bound=estimated_output_bound,
                 modality=modality,
                 has_estimated_media=estimated_media is not None,
+                fallback_providers=list(fallback_providers),
                 fallback_models=list(fallback_models),
                 claim_token=claim_token,
             )
@@ -1409,7 +1424,7 @@ class _BudgetEnforcerBase:
         self,
         agent_run_id: str,
         response: LeaseGrantResponse,
-        declared_models: Sequence[str],
+        declared_models: Sequence[DeclaredModel],
         *,
         renewal_request: LeaseRenewRequest | None = None,
         close_epoch: int | None = None,
@@ -1492,7 +1507,7 @@ class _BudgetEnforcerBase:
         self,
         agent_run_id: str,
         response: LeaseGrantResponse,
-        declared_models: Sequence[str],
+        declared_models: Sequence[DeclaredModel],
         *,
         renewal_request: LeaseRenewRequest | None,
     ) -> GrantOutcome:
@@ -1661,10 +1676,12 @@ class _BudgetEnforcerBase:
         agent_run_id: str | None,
         call_id: str | None,
         estimated_input_tokens: int,
+        provider: str,
         model: str,
         estimated_output_bound: int | None,
         modality: Modality,
         estimated_media: MediaUsage | None,
+        fallback_providers: Sequence[str],
         fallback_models: Sequence[str],
         claim_token: int | None,
     ) -> BudgetCheckResult | None:
@@ -1683,7 +1700,9 @@ class _BudgetEnforcerBase:
             agent_run_id=agent_run_id,
             call_id=call_id,
             estimated_input_tokens=estimated_input_tokens,
+            provider=provider,
             model=model,
+            fallback_providers=fallback_providers,
             estimated_output_bound=estimated_output_bound,
             modality=modality,
             estimated_media=estimated_media,
@@ -2101,7 +2120,7 @@ class _BudgetEnforcerBase:
         agent_run_id: str,
         request: LeaseRenewRequest,
         response: LeaseGrantResponse,
-        declared_models: Sequence[str],
+        declared_models: Sequence[DeclaredModel],
         *,
         close_epoch: int | None = None,
     ) -> LeaseSurrenderRequest | None:
@@ -2283,7 +2302,7 @@ class _BudgetEnforcerBase:
         agent_run_id: str,
         resp: httpx.Response,
         *,
-        declared_models: list[str],
+        declared_models: list[DeclaredModel],
         close_epoch: int,
     ) -> tuple[
         _GrantVerdict,
@@ -2559,6 +2578,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         tags: dict[str, str] | None = None,
         call_id: str | None = None,
         estimated_output_bound: int | None = None,
+        per_call_only: bool = False,
     ) -> BudgetCheckResult:
         """Check whether a call is within budget.
 
@@ -2568,6 +2588,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         surface's modality (e.g. ``"embedding"``). ``estimated_media`` carries a
         non-text surface's pre-flight non-token quantities for a precise
         check-time cost; None for chat/token calls.
+
+        ``per_call_only`` skips the lease branch: a failover hop re-admitted
+        under hard_deny replaces a per-call reservation with another one.
 
         Run-scoped, token-billed traffic meets the LEASE path first (PJ-2):
         ``call_id`` keys the reservation the call draws down (so settlement can
@@ -2595,7 +2618,8 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         lease_call_id: str | None = None
         lease_claim_token: int | None = None
         if (
-            modality == "text"
+            not per_call_only
+            and modality == "text"
             and estimated_media is None
             and tags is None
             and self._lease_path_applies(agent_run_id)
@@ -2637,7 +2661,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             modality=modality,
             estimated_output_bound=check_output_bound,
         )
-        if agent_run_id is None and tags is None:
+        # A hop re-check (per_call_only) is always fresh and reservation-backed:
+        # it neither reads nor writes the allow cache.
+        if agent_run_id is None and tags is None and not per_call_only:
             with self._state_lock:
                 cached = self._cached_allow_locked(cache_key)
                 if cached is not None:
@@ -2664,10 +2690,12 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 agent_run_id=agent_run_id,
                 call_id=lease_call_id,
                 estimated_input_tokens=estimated_input_tokens,
+                provider=provider,
                 model=model,
                 estimated_output_bound=estimated_output_bound,
                 modality=modality,
                 estimated_media=estimated_media,
+                fallback_providers=fallback_providers,
                 fallback_models=fallback_models,
                 claim_token=lease_claim_token,
             )
@@ -2779,7 +2807,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 cloud_response = self._cache_response(
                     cloud_response,
                     agent_run_id=agent_run_id,
-                    cache_allowed_response=tags is None,
+                    cache_allowed_response=tags is None and not per_call_only,
                     cache_key=cache_key,
                     request_epoch=request_epoch,
                 )
@@ -2829,7 +2857,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             agent_run_id=agent_run_id,
             call_id=call_id,
             estimated_input_tokens=estimated_input_tokens,
+            provider=provider,
             model=model,
+            fallback_providers=fallback_providers,
             estimated_output_bound=estimated_output_bound,
             modality=modality,
             estimated_media=estimated_media,
@@ -2873,7 +2903,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 agent_run_id=agent_run_id,
                 call_id=call_id,
                 estimated_input_tokens=estimated_input_tokens,
+                provider=provider,
                 model=model,
+                fallback_providers=fallback_providers,
                 estimated_output_bound=estimated_output_bound,
                 modality=modality,
                 estimated_media=estimated_media,
@@ -2957,7 +2989,10 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             verdict, response, late_surrender = self._install_grant(
                 agent_run_id,
                 resp,
-                declared_models=[model, *fallback_models],
+                declared_models=[
+                    (provider, model),
+                    *zip(fallback_providers, fallback_models, strict=True),
+                ],
                 close_epoch=close_epoch,
             )
             if late_surrender is not None:
@@ -2997,7 +3032,12 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         request, close_epoch = work
         thread = threading.Thread(
             target=self._run_renewal_worker,
-            args=(agent_run_id, request, [model, *fallback_models], close_epoch),
+            args=(
+                agent_run_id,
+                request,
+                [(provider, model), *zip(fallback_providers, fallback_models, strict=True)],
+                close_epoch,
+            ),
             name="solwyn-lease-renew",
             daemon=True,
         )
@@ -3028,7 +3068,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         self,
         agent_run_id: str,
         request: LeaseRenewRequest,
-        declared_models: list[str],
+        declared_models: list[DeclaredModel],
         close_epoch: int,
     ) -> None:
         """Run one renewal and always return its bounded worker slot."""
@@ -3046,7 +3086,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         self,
         agent_run_id: str,
         request: LeaseRenewRequest,
-        declared_models: list[str],
+        declared_models: list[DeclaredModel],
         *,
         close_epoch: int | None = None,
     ) -> None:
@@ -3374,6 +3414,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         tags: dict[str, str] | None = None,
         call_id: str | None = None,
         estimated_output_bound: int | None = None,
+        per_call_only: bool = False,
     ) -> BudgetCheckResult:
         """Async version of budget check. See BudgetEnforcer.check_budget."""
         self._run_cleanup_loop = asyncio.get_running_loop()
@@ -3381,7 +3422,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         lease_call_id: str | None = None
         lease_claim_token: int | None = None
         if (
-            modality == "text"
+            not per_call_only
+            and modality == "text"
             and estimated_media is None
             and tags is None
             and self._lease_path_applies(agent_run_id)
@@ -3420,7 +3462,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             modality=modality,
             estimated_output_bound=check_output_bound,
         )
-        if agent_run_id is None and tags is None:
+        # A hop re-check (per_call_only) is always fresh and reservation-backed:
+        # it neither reads nor writes the allow cache.
+        if agent_run_id is None and tags is None and not per_call_only:
             with self._state_lock:
                 cached = self._cached_allow_locked(cache_key)
                 if cached is not None:
@@ -3447,10 +3491,12 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 agent_run_id=agent_run_id,
                 call_id=lease_call_id,
                 estimated_input_tokens=estimated_input_tokens,
+                provider=provider,
                 model=model,
                 estimated_output_bound=estimated_output_bound,
                 modality=modality,
                 estimated_media=estimated_media,
+                fallback_providers=fallback_providers,
                 fallback_models=fallback_models,
                 claim_token=lease_claim_token,
             )
@@ -3562,7 +3608,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 cloud_response = self._cache_response(
                     cloud_response,
                     agent_run_id=agent_run_id,
-                    cache_allowed_response=tags is None,
+                    cache_allowed_response=tags is None and not per_call_only,
                     cache_key=cache_key,
                     request_epoch=request_epoch,
                 )
@@ -3607,7 +3653,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             agent_run_id=agent_run_id,
             call_id=call_id,
             estimated_input_tokens=estimated_input_tokens,
+            provider=provider,
             model=model,
+            fallback_providers=fallback_providers,
             estimated_output_bound=estimated_output_bound,
             modality=modality,
             estimated_media=estimated_media,
@@ -3649,7 +3697,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 agent_run_id=agent_run_id,
                 call_id=call_id,
                 estimated_input_tokens=estimated_input_tokens,
+                provider=provider,
                 model=model,
+                fallback_providers=fallback_providers,
                 estimated_output_bound=estimated_output_bound,
                 modality=modality,
                 estimated_media=estimated_media,
@@ -3732,7 +3782,10 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             verdict, response, late_surrender = self._install_grant(
                 agent_run_id,
                 resp,
-                declared_models=[model, *fallback_models],
+                declared_models=[
+                    (provider, model),
+                    *zip(fallback_providers, fallback_models, strict=True),
+                ],
                 close_epoch=close_epoch,
             )
             if late_surrender is not None:
@@ -3781,7 +3834,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         coroutine = self._renew_lease(
             agent_run_id,
             request,
-            [model, *fallback_models],
+            [(provider, model), *zip(fallback_providers, fallback_models, strict=True)],
             close_epoch=close_epoch,
         )
         try:
@@ -3812,7 +3865,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         self,
         agent_run_id: str,
         request: LeaseRenewRequest,
-        declared_models: list[str],
+        declared_models: list[DeclaredModel],
         *,
         close_epoch: int | None = None,
     ) -> None:
