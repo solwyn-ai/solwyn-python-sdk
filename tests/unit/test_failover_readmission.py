@@ -59,9 +59,20 @@ class _PricedPlane(httpx.BaseTransport, httpx.AsyncBaseTransport):
     (receipts, events) goes to the zero-network double.
     """
 
-    def __init__(self, *, budget_limit: float, mode: str = "hard_deny") -> None:
+    def __init__(
+        self,
+        *,
+        budget_limit: float,
+        mode: str = "hard_deny",
+        price_hints: dict[str, float] | None = None,
+        deny_checks: frozenset[int] = frozenset(),
+    ) -> None:
         self.budget_limit = budget_limit
         self.mode = mode
+        # Relative price hints for CostPolicy, and 1-based check numbers that
+        # are denied whatever the budget says.
+        self.price_hints = price_hints
+        self.deny_checks = deny_checks
         self.checks: list[dict[str, Any]] = []
         self.confirms: list[dict[str, Any]] = []
         self.held: dict[str, float] = {}
@@ -97,6 +108,8 @@ class _PricedPlane(httpx.BaseTransport, httpx.AsyncBaseTransport):
         )
         remaining = self.budget_limit - self.spent - sum(self.held.values())
         allowed = self.mode != "hard_deny" or reservation <= remaining
+        if len(self.checks) in self.deny_checks:
+            allowed = False
         reservation_id = f"res_{len(self.checks)}"
         if allowed:
             self.held[reservation_id] = reservation
@@ -111,6 +124,7 @@ class _PricedPlane(httpx.BaseTransport, httpx.AsyncBaseTransport):
                 "current_usage": self.budget_limit - remaining,
                 "project_id": VALID_PROJECT_ID,
                 **({} if allowed else {"denied_by_period": "monthly"}),
+                **({"price_hints": self.price_hints} if self.price_hints is not None else {}),
             },
         )
 
@@ -811,3 +825,75 @@ class TestAsyncAmbiguousExposure:
         assert [(check.provider.value, check.model) for check in plane.checks] == [("groq", PRICEY)]
         assert plane.confirms[0].lease_id is None
         assert spent >= DEFAULT_OUTPUT_BOUND
+
+
+@pytest.mark.unit
+class TestHopDenialAttribution:
+    """A hop denial receipt is attributed by the hop's relation to the original
+    primary, and keeps the originally requested model."""
+
+    def _denials(self, solwyn: Any, run: Any) -> list[Any]:
+        reported: list[Any] = []
+        original = solwyn._solwyn_reporter.report
+        with patch.object(
+            solwyn._solwyn_reporter,
+            "report",
+            side_effect=lambda event: (reported.append(event), original(event)),
+        ):
+            run()
+        return [event for event in reported if event.status.value == "budget_denied"]
+
+    def test_return_to_the_primary_is_not_labelled_a_fallback(self) -> None:
+        from solwyn._routing import CostPolicy
+        from solwyn.client import Solwyn
+
+        # CostPolicy routes to groq first (check 2); it fails over back to the
+        # primary, whose re-check (check 3) is denied.
+        stub = _PricedPlane(
+            budget_limit=_ROOMY,
+            price_hints={"openai": 3.0, "groq": 1.0},
+            deny_checks=frozenset({3}),
+        )
+        primary, fallback = _Provider(), _Provider(429)
+        solwyn = Solwyn(
+            primary.client(),
+            api_key=stub.plane.api_key,
+            api_url=stub.plane.api_url,
+            control_plane_transport=stub,
+            budget_check_cache_ttl=0,
+            lease_enabled=False,
+            fallback=[(fallback.client(GROQ_URL), PRICEY)],
+            selection_policy=CostPolicy(),
+        )
+
+        def run() -> None:
+            with pytest.raises(BudgetExceededError):
+                solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+
+        with solwyn:
+            denials = self._denials(solwyn, run)
+
+        assert [check["model"] for check in stub.checks] == [CHEAP, PRICEY, CHEAP]
+        assert len(denials) == 1
+        assert denials[0].model == CHEAP
+        assert denials[0].attempt_index == 0
+        assert denials[0].is_model_fallback is False
+        assert denials[0].is_provider_fallback is False
+        assert primary.bodies == []
+
+    def test_cross_provider_denial_keeps_the_requested_model(self) -> None:
+        stub, primary, fallback = _setup(_TIGHT)
+        solwyn = _wrap(stub, primary.client(), fallback.client(GROQ_URL))
+
+        def run() -> None:
+            with pytest.raises(BudgetExceededError):
+                solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+
+        with solwyn:
+            denials = self._denials(solwyn, run)
+
+        assert len(denials) == 1
+        assert denials[0].is_provider_fallback is True
+        assert denials[0].is_model_fallback is False
+        assert denials[0].requested_provider == "openai"
+        assert denials[0].requested_model == CHEAP

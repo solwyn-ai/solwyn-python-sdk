@@ -2390,6 +2390,7 @@ class Solwyn(_SolwynBase):
         primary: ProviderRuntime,
         runtime: ProviderRuntime,
         model: str,
+        requested_model: str,
         chain_index: int,
         kwargs: dict[str, object],
         is_streaming: bool,
@@ -2436,7 +2437,10 @@ class Solwyn(_SolwynBase):
             per_call_only=True,
         )
         if not hop_budget.allowed:
+            # Attribution follows the hop's relation to the original primary,
+            # so a return to the primary after a cost-routed hop is no fallback.
             is_provider_fallback = runtime.entry.provider != primary.entry.provider
+            is_model_fallback = not is_provider_fallback and runtime is not primary
             _report_budget_denial(
                 self,
                 budget=hop_budget,
@@ -2450,9 +2454,10 @@ class Solwyn(_SolwynBase):
                 estimated_output_bound=bound,
                 velocity_flags=velocity_flags,
                 attempt_index=chain_index,
-                is_model_fallback=not is_provider_fallback,
+                is_model_fallback=is_model_fallback,
                 is_provider_fallback=is_provider_fallback,
                 requested_provider=primary.entry.provider if is_provider_fallback else None,
+                requested_model=requested_model if is_provider_fallback else None,
             )
             raise _budget_denial_error(
                 budget=hop_budget,
@@ -3248,6 +3253,7 @@ class Solwyn(_SolwynBase):
                         primary=primary,
                         runtime=rt,
                         model=hop_model,
+                        requested_model=requested_model,
                         chain_index=chain_index,
                         kwargs=kwargs,
                         is_streaming=is_streaming,
@@ -4428,6 +4434,7 @@ class AsyncSolwyn(_SolwynBase):
         primary: ProviderRuntime,
         runtime: ProviderRuntime,
         model: str,
+        requested_model: str,
         chain_index: int,
         kwargs: dict[str, object],
         is_streaming: bool,
@@ -4466,7 +4473,10 @@ class AsyncSolwyn(_SolwynBase):
             per_call_only=True,
         )
         if not hop_budget.allowed:
+            # Attribution follows the hop's relation to the original primary,
+            # so a return to the primary after a cost-routed hop is no fallback.
             is_provider_fallback = runtime.entry.provider != primary.entry.provider
+            is_model_fallback = not is_provider_fallback and runtime is not primary
             _report_budget_denial(
                 self,
                 budget=hop_budget,
@@ -4480,9 +4490,10 @@ class AsyncSolwyn(_SolwynBase):
                 estimated_output_bound=bound,
                 velocity_flags=velocity_flags,
                 attempt_index=chain_index,
-                is_model_fallback=not is_provider_fallback,
+                is_model_fallback=is_model_fallback,
                 is_provider_fallback=is_provider_fallback,
                 requested_provider=primary.entry.provider if is_provider_fallback else None,
+                requested_model=requested_model if is_provider_fallback else None,
             )
             raise _budget_denial_error(
                 budget=hop_budget,
@@ -5207,6 +5218,7 @@ class AsyncSolwyn(_SolwynBase):
                         primary=primary,
                         runtime=rt,
                         model=hop_model,
+                        requested_model=requested_model,
                         chain_index=chain_index,
                         kwargs=kwargs,
                         is_streaming=is_streaming,
