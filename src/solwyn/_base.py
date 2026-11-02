@@ -1352,6 +1352,9 @@ class _OneGenerationGuard:
         self._lock = threading.Lock()
         self._in_flight = False
         self.succeeded = False
+        # Whether a send this guard let through may have been billed, by the
+        # same evidence as a dispatched attempt (attempt_maybe_billed).
+        self._maybe_billed = False
         self._model: str | None = None
         self._bound = 0
 
@@ -1382,10 +1385,21 @@ class _OneGenerationGuard:
                 self._refuse("bound_exceeded")
             self._in_flight = True
 
-    def _settle(self, response: object | None) -> None:
+    @property
+    def may_have_billed(self) -> bool:
+        """Whether a send has gone out that may have been billed (or still may be)."""
+        with self._lock:
+            return self._maybe_billed or self._in_flight
+
+    def _settle(self, response: object | None, exc: BaseException | None = None) -> None:
         status = getattr(response, "status_code", None)
+        if exc is not None:
+            billed = attempt_maybe_billed(exc)
+        else:
+            billed = not (isinstance(status, int) and (400 <= status < 500 or status == 529))
         with self._lock:
             self._in_flight = False
+            self._maybe_billed = self._maybe_billed or billed
             if isinstance(status, int) and 200 <= status < 300:
                 self.succeeded = True
 
@@ -1394,11 +1408,12 @@ class _OneGenerationGuard:
 
         def solwyn_one_generation_guard(request: Any, call_next: Callable[[Any], Any]) -> Any:
             self._claim(request)
-            response = None
             try:
                 response = call_next(request)
-            finally:
-                self._settle(response)
+            except BaseException as exc:
+                self._settle(None, exc)
+                raise
+            self._settle(response)
             return response
 
         return solwyn_one_generation_guard
@@ -1408,11 +1423,12 @@ class _OneGenerationGuard:
 
         async def solwyn_one_generation_guard(request: Any, call_next: Callable[[Any], Any]) -> Any:
             self._claim(request)
-            response = None
             try:
                 response = await call_next(request)
-            finally:
-                self._settle(response)
+            except BaseException as exc:
+                self._settle(None, exc)
+                raise
+            self._settle(response)
             return response
 
         return solwyn_one_generation_guard

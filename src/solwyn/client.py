@@ -3509,6 +3509,14 @@ class Solwyn(_SolwynBase):
                             if loop_refused
                             else classify_exception(exc, dispatched=usage_unknown)
                         )
+                        # A guard refusal is billed only when a send it let
+                        # through may have been (a refusal before any send,
+                        # such as a middleware rewrite, gives the hold back).
+                        loop_billed = (
+                            loop_refused
+                            and generation_guard is not None
+                            and generation_guard.may_have_billed
+                        )
                         # Funding follows billing evidence, not routing: once
                         # dispatched, the attempt is possibly billed unless a 4xx
                         # status or a proven pre-send transport failure says it
@@ -3516,8 +3524,10 @@ class Solwyn(_SolwynBase):
                         # paid). In particular, a rejected 429 followed by
                         # Retry-After sleep holds the probe but has no paid work
                         # to refund.
-                        usage_unknown = loop_refused or (
-                            usage_unknown and attempt_maybe_billed(exc)
+                        usage_unknown = (
+                            loop_billed
+                            if loop_refused
+                            else usage_unknown and attempt_maybe_billed(exc)
                         )
                         # Fix [A]: the PRIMARY was attempted and raised in this walk
                         # -> a later cross-provider success is a REACTIVE failover
@@ -3561,7 +3571,7 @@ class Solwyn(_SolwynBase):
                         # A correctly-not-failed-over post-send-ambiguous abort
                         # emits an ERROR event with possibly_succeeded=True so the Cloud API
                         # can reconcile the (possibly-landed, never-confirmed) reservation.
-                        possibly_succeeded = loop_refused or (
+                        possibly_succeeded = loop_billed or (
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
                         floored = usage_unknown and _hard_deny_funding(budget)
@@ -5563,6 +5573,14 @@ class AsyncSolwyn(_SolwynBase):
                             if loop_refused
                             else classify_exception(exc, dispatched=usage_unknown)
                         )
+                        # A guard refusal is billed only when a send it let
+                        # through may have been (a refusal before any send,
+                        # such as a middleware rewrite, gives the hold back).
+                        loop_billed = (
+                            loop_refused
+                            and generation_guard is not None
+                            and generation_guard.may_have_billed
+                        )
                         # Funding follows billing evidence, not routing: once
                         # dispatched, the attempt is possibly billed unless a 4xx
                         # status or a proven pre-send transport failure says it
@@ -5570,8 +5588,10 @@ class AsyncSolwyn(_SolwynBase):
                         # paid). In particular, a rejected 429 followed by
                         # Retry-After sleep holds the probe but has no paid work
                         # to refund.
-                        usage_unknown = loop_refused or (
-                            usage_unknown and attempt_maybe_billed(exc)
+                        usage_unknown = (
+                            loop_billed
+                            if loop_refused
+                            else usage_unknown and attempt_maybe_billed(exc)
                         )
                         # Fix [A]: the PRIMARY was attempted and raised in this walk
                         # -> a later cross-provider success is a REACTIVE failover
@@ -5613,7 +5633,7 @@ class AsyncSolwyn(_SolwynBase):
                         # A correctly-not-failed-over post-send-ambiguous abort
                         # emits an ERROR event with possibly_succeeded=True so the Cloud API
                         # can reconcile the (possibly-landed, never-confirmed) reservation.
-                        possibly_succeeded = loop_refused or (
+                        possibly_succeeded = loop_billed or (
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
                         floored = usage_unknown and _hard_deny_funding(budget)

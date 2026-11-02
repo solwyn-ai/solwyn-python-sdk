@@ -1211,12 +1211,6 @@ class _FailingFirst:
             )
         if self.case == "unknown_cause":
             raise RuntimeError("transport adapter blew up after sending")
-        if self.case == "loop_guard":
-            # The one-generation guard raises from the provider's transport
-            # when the provider SDK sends a second request for one call.
-            raise solwyn.OutputBoundUnenforceableError(
-                provider="openai", reason="multi_generation_loop", hint="test"
-            )
         if self.case == "responses_entry":
             return httpx.Response(503, json={"error": {"message": "unavailable"}})
         raise asyncio.CancelledError() if self.is_async else KeyboardInterrupt()
@@ -1244,7 +1238,6 @@ _FAILURE_CASES = [
     "read_timeout",
     "truncated_json",
     "unknown_cause",
-    "loop_guard",
     "cancel_in_flight",
     "responses_entry",
 ]
@@ -1443,3 +1436,49 @@ class TestReadmittedHopGetsItsOwnGeneration:
         assert floor.model == _CLAUDE
         assert served.model == _CLAUDE_FALLBACK
         assert floor.call_id != served.call_id
+
+
+@pytest.mark.unit
+class TestGuardRefusalFundingFollowsSendEvidence:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("sent_first", [False, True])
+    async def test_guard_refusal_floors_only_after_a_send(
+        self, sent_first: bool, is_async: bool
+    ) -> None:
+        # A middleware loop sends once, then the guard refuses the second
+        # generation: the first is billed. A middleware rewrite is refused
+        # before any send: nothing is billed and no floor is kept.
+        def rewritten(request: Any) -> Any:
+            return request.copy(body={**request.json, "max_tokens": 9000})
+
+        def sync_middleware(request: Any, call_next: Any) -> Any:
+            if sent_first:
+                call_next(request)
+                return call_next(request)
+            return call_next(rewritten(request))
+
+        async def async_middleware(request: Any, call_next: Any) -> Any:
+            if sent_first:
+                await call_next(request)
+                return await call_next(request)
+            return await call_next(rewritten(request))
+
+        plane, wire = FakeControlPlane(), _AnthropicWire()
+        middleware = [async_middleware if is_async else sync_middleware]
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(
+            wire.client(is_async=is_async, middleware=middleware), lease_enabled=False
+        )
+        try:
+            with pytest.raises(solwyn.OutputBoundUnenforceableError):
+                result = wrapped.messages.create(model=_CLAUDE, messages=MESSAGES, max_tokens=100)
+                if is_async:
+                    await result
+        finally:
+            await _close_client(wrapped, is_async=is_async)
+
+        assert len(wire.models) == (1 if sent_first else 0)
+        floors = [c for c in plane.confirms if c.token_details.is_estimated]
+        assert len(floors) == (1 if sent_first else 0)
+        [event] = plane.ingested
+        assert event.possibly_succeeded is (True if sent_first else None)
