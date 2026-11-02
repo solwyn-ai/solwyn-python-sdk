@@ -749,3 +749,133 @@ class TestUnrecognizedPostDispatchFailureKeepsItsClaim:
         # The released claim funds the next call: no per-call check.
         assert plane.checks == []
         assert plane.ingested[0].possibly_succeeded is None
+
+
+# ── Every funding-keeping rule applies under hard_deny only ──────────────
+
+
+class _ByMode:
+    """First request ends in ``case``; later requests answer normally."""
+
+    def __init__(self, case: str, *, is_async: bool) -> None:
+        self.case = case
+        self.is_async = is_async
+        self.requests = 0
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests += 1
+        if self.requests > 1:
+            return httpx.Response(200, json=_CHAT_BODY)
+        if self.case in ("caller_break", "dropped"):
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=_OpenStream()
+            )
+        if self.case == "mid_stream_error":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=_BrokenStream(httpx.ReadError("connection reset")),
+            )
+        if self.case == "read_timeout":
+            raise httpx.ReadTimeout("no response")
+        if self.case == "truncated_json":
+            return httpx.Response(
+                200, headers={"content-type": "application/json"}, content=b'{"id": "c", "cho'
+            )
+        # cancel_in_flight: the caller gives up while the request is out.
+        raise asyncio.CancelledError() if self.is_async else KeyboardInterrupt()
+
+    async def async_handler(self, request: httpx.Request) -> httpx.Response:
+        return self.handler(request)
+
+    def client(self) -> Any:
+        if self.is_async:
+            return openai.AsyncOpenAI(
+                api_key="sk-test",
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(self.async_handler)),
+                max_retries=0,
+            )
+        return openai.OpenAI(
+            api_key="sk-test",
+            http_client=httpx.Client(transport=httpx.MockTransport(self.handler)),
+            max_retries=0,
+        )
+
+
+_CASES = [
+    "caller_break",
+    "dropped",
+    "mid_stream_error",
+    "read_timeout",
+    "truncated_json",
+    "cancel_in_flight",
+]
+
+
+@pytest.mark.unit
+class TestFundingRulesByMode:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("case", _CASES)
+    @pytest.mark.parametrize("budget_mode", ["hard_deny", "alert_only"])
+    async def test_possibly_billed_funding_is_kept_only_under_hard_deny(
+        self, budget_mode: str, case: str, is_async: bool
+    ) -> None:
+        plane = FakeControlPlane(mode=budget_mode, granted_tokens=128, final_grant=True)
+        provider = _ByMode(case, is_async=is_async)
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client())
+        streaming = case in ("caller_break", "dropped", "mid_stream_error")
+
+        async def create(**extra: Any) -> Any:
+            result = wrapped.chat.completions.create(**_REQUEST, **extra)
+            return await result if is_async else result
+
+        try:
+            with solwyn.run(f"by-mode-{budget_mode}-{case}") as run_id:
+                state = None
+                if streaming:
+                    stream = await create(stream=True)
+                    state = wrapped._solwyn_budget._lease.state_for(run_id)
+                    if case == "caller_break":
+                        await _consume(stream, is_async=is_async, break_after=2)
+                    elif case == "dropped":
+                        await _read(stream, is_async=is_async, chunks=2)
+                        del stream
+                        gc.collect()
+                        assert _wait_until(lambda: state.reserved_tokens == 0)
+                    else:
+                        with pytest.raises(openai.APIError):
+                            await _consume(stream, is_async=is_async, break_after=None)
+                else:
+                    expected: Any = (
+                        (asyncio.CancelledError if is_async else KeyboardInterrupt)
+                        if case == "cancel_in_flight"
+                        else Exception
+                    )
+                    with pytest.raises(expected):
+                        await create()
+                    state = wrapped._solwyn_budget._lease.state_for(run_id)
+                spent, reserved = state.spent_tokens_since_report, state.reserved_tokens
+                await create()
+        finally:
+            await _close_client(wrapped, is_async=is_async)
+
+        assert reserved == 0
+        first = plane.ingested[0]
+        if budget_mode == "hard_deny":
+            # Kept at the bound: the next call no longer fits the lease.
+            assert spent >= 100
+            assert [check.model for check in plane.checks] == [MODEL]
+        else:
+            # Released (or settled at the observed zero): the lease funds it.
+            assert spent == 0
+            assert plane.checks == []
+        if case in ("caller_break", "dropped"):
+            assert first.status.value == "success"
+            # A lease confirm goes out in both modes; hard_deny sends the
+            # estimate (floored locally), alert_only the observed zero usage.
+            assert plane.confirms[0].token_details.is_estimated is (budget_mode == "hard_deny")
+        else:
+            # The receipt flag does not depend on the mode.
+            assert first.status.value == "error"
+            assert first.possibly_succeeded is True

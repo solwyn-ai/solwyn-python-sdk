@@ -965,8 +965,7 @@ class TestMaterializedGoogleStreamForwardsClose:
     def test_abandoning_materialized_google_stream_closes_original_once(self) -> None:
         # End-to-end: a Google-served stream the caller breaks out of and closes
         # must (a) call the ORIGINAL generator's close() exactly once and (b)
-        # settle exactly once (no double settle). Abandoned per-call, it sends
-        # no confirm: one success receipt keeps the hold.
+        # settle on_complete exactly once (no double settle).
         google = _google_client()
         original = _ClosableGoogleStream(
             [_google_text_chunk("a"), _google_text_chunk("b"), _google_text_chunk("c")]
@@ -975,9 +974,7 @@ class TestMaterializedGoogleStreamForwardsClose:
 
         solwyn = _make_solwyn(google, model="gemini-3.5-flash")
         confirms: list[Any] = []
-        events: list[Any] = []
         solwyn._solwyn_reporter.report_settlement = lambda req, event: confirms.append(req)
-        solwyn._solwyn_reporter.report = events.append
 
         request = {
             "model": "gemini-3.5-flash",
@@ -997,10 +994,9 @@ class TestMaterializedGoogleStreamForwardsClose:
                 break  # abandon after the first chunk
 
         # The ORIGINAL provider generator was closed exactly once (connection
-        # released) and settlement fired exactly once (single receipt).
+        # released) and settlement fired exactly once (single confirm).
         assert original.close_calls == 1
-        assert confirms == []
-        assert [event.status.value for event in events] == ["success"]
+        assert len(confirms) == 1
         _close(solwyn)
 
     @pytest.mark.unit
@@ -1014,9 +1010,7 @@ class TestMaterializedGoogleStreamForwardsClose:
 
         solwyn = _make_async_solwyn(google, model="gemini-3.5-flash")
         confirms: list[Any] = []
-        events: list[Any] = []
         solwyn._solwyn_reporter.report_settlement = lambda req, event: confirms.append(req)
-        solwyn._solwyn_reporter.report = events.append
 
         request = {
             "model": "gemini-3.5-flash",
@@ -1035,9 +1029,9 @@ class TestMaterializedGoogleStreamForwardsClose:
                     break  # abandon after the first chunk
 
         assert original.aclose_calls == 1
-        # Settled exactly once: one success receipt, no confirm.
-        assert confirms == []
-        assert [event.status.value for event in events] == ["success"]
+        # Settlement rides report_settlement exactly once (the blocking
+        # confirm_cost path no longer exists).
+        assert len(confirms) == 1
         await _aclose(solwyn)
 
 
@@ -1500,9 +1494,8 @@ class TestStreamingIdempotencyMatrix:
 class TestAbandonedStreamSettlement:
     def test_early_break_then_close_settles_once_via_report_settlement(self) -> None:
         # A caller that breaks early and closes the stream still settles via
-        # close()/__exit__, ONCE. Its usage report never arrived, so the
-        # per-call hold is not confirmed: one success receipt carries the
-        # observed (here estimated) usage.
+        # close()/__exit__: on_complete fires ONCE with whatever usage was
+        # observed, and settlement is fire-and-forget via reporter.report_settlement.
         client = _openai_client()
         # A long stream the caller abandons after the first chunk.
         client.chat.completions.create.return_value = iter(
@@ -1510,10 +1503,9 @@ class TestAbandonedStreamSettlement:
         )
 
         solwyn = _make_solwyn(client, model="gpt-5.5")
+        # A reservation makes on_complete build + fire-and-forget a confirm.
         confirms: list[Any] = []
-        events: list[Any] = []
         solwyn._solwyn_reporter.report_settlement = lambda req, event: confirms.append(req)
-        solwyn._solwyn_reporter.report = events.append
 
         request = {
             "model": "gpt-5.5",
@@ -1532,11 +1524,10 @@ class TestAbandonedStreamSettlement:
             for _chunk in stream:
                 break  # abandon after the first chunk
 
-        # Settled exactly once (no duplicate receipt), and no confirm frees the
-        # hold the provider may have spent.
-        assert confirms == []
-        assert [event.status.value for event in events] == ["success"]
-        assert events[0].token_details.is_estimated is True
+        # Settled exactly once: a single fire-and-forget confirm was enqueued for
+        # the reservation (no duplicate confirm / double-spend).
+        assert len(confirms) == 1
+        assert confirms[0].reservation_id == "resv_1"
         _close(solwyn)
 
     def test_explicit_close_after_break_does_not_double_settle(self) -> None:
@@ -1549,9 +1540,7 @@ class TestAbandonedStreamSettlement:
 
         solwyn = _make_solwyn(client, model="gpt-5.5")
         confirms: list[Any] = []
-        events: list[Any] = []
         solwyn._solwyn_reporter.report_settlement = lambda req, event: confirms.append(req)
-        solwyn._solwyn_reporter.report = events.append
 
         request = {
             "model": "gpt-5.5",
@@ -1570,8 +1559,7 @@ class TestAbandonedStreamSettlement:
             stream.close()
             stream.close()  # extra close() — must NOT settle again
 
-        assert confirms == []
-        assert [event.status.value for event in events] == ["success"]
+        assert len(confirms) == 1
         _close(solwyn)
 
     @pytest.mark.unit
@@ -1587,9 +1575,7 @@ class TestAbandonedStreamSettlement:
 
         solwyn = _make_async_solwyn(client, model="gpt-5.5")
         confirms: list[Any] = []
-        events: list[Any] = []
         solwyn._solwyn_reporter.report_settlement = lambda req, event: confirms.append(req)
-        solwyn._solwyn_reporter.report = events.append
 
         request = {
             "model": "gpt-5.5",
@@ -1607,9 +1593,9 @@ class TestAbandonedStreamSettlement:
                 async for _chunk in stream:
                     break  # abandon after the first chunk
 
-        # Settled exactly once: one success receipt, no confirm.
-        assert confirms == []
-        assert [event.status.value for event in events] == ["success"]
+        # Settled exactly once via report_settlement (the blocking confirm_cost
+        # path no longer exists).
+        assert len(confirms) == 1
         await _aclose(solwyn)
 
 

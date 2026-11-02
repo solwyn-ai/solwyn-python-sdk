@@ -2396,8 +2396,17 @@ def billing_otel(monkeypatch):
         (True, "exit", "success"),
     ],
 )
+@pytest.mark.parametrize("budget_mode", ["hard_deny", "alert_only"])
 async def test_stream_interrupt_billing_matches_main(
-    billing_otel, monkeypatch, async_mode, terminal, status, exception, responses, otel_spans
+    billing_otel,
+    monkeypatch,
+    async_mode,
+    terminal,
+    status,
+    exception,
+    responses,
+    otel_spans,
+    budget_mode,
 ):
     from test_otel_population import _raw_client
 
@@ -2407,7 +2416,7 @@ async def test_stream_interrupt_billing_matches_main(
     source = _BillingStream(terminal, exception, responses)
     raw.chat.completions.create.return_value = source
     raw.responses = SimpleNamespace(stream=MagicMock(spec=[], return_value=source))
-    plane = FakeControlPlane()
+    plane = FakeControlPlane(mode=budget_mode)
     wrapper = (plane.wrap_async if async_mode else plane.wrap)(
         raw, otel_spans=otel_spans, trace_correlation=False, budget_check_cache_ttl=0
     )
@@ -2450,10 +2459,10 @@ async def test_stream_interrupt_billing_matches_main(
             result.close()
         state = wrapper._get_circuit_breaker("openai").get_state()
         assert state.failure_count == 0
-        if status == "success":
+        if status == "success" and budget_mode == "hard_deny":
             # The stream never reached its natural end, so its usage report is
-            # incomplete: the per-call hold is not confirmed (0.10.2). One
-            # success receipt carries the observed usage.
+            # incomplete: under hard_deny the per-call hold is not confirmed
+            # (0.10.2). One success receipt carries the observed usage.
             assert not settlements
             assert len(events) == 1
             event = events[0]
@@ -2464,6 +2473,22 @@ async def test_stream_interrupt_billing_matches_main(
             )
             assert event.possibly_succeeded is None
             assert event.failover_error_class is None
+            assert state.success_count == 0
+        elif status == "success":
+            # alert_only: unchanged, the observed usage is confirmed.
+            assert len(settlements) == 1
+            confirm, event = settlements[0]
+            assert (confirm.token_details.input_tokens, confirm.token_details.output_tokens) == (
+                12,
+                4,
+            )
+            assert (event.input_tokens, event.output_tokens, event.status.value) == (
+                12,
+                4,
+                "success",
+            )
+            assert event.possibly_succeeded is None
+            assert not events
             assert state.success_count == 0
         else:
             assert not settlements
@@ -2498,6 +2523,7 @@ async def test_stream_interrupt_billing_matches_main(
         (asyncio.CancelledError, 0, True),
     ],
 )
+@pytest.mark.parametrize("budget_mode", ["hard_deny", "alert_only"])
 async def test_stream_entry_failure_billing_matches_main(
     billing_otel,
     monkeypatch,
@@ -2507,6 +2533,7 @@ async def test_stream_entry_failure_billing_matches_main(
     possibly_succeeded,
     responses,
     otel_spans,
+    budget_mode,
 ):
     from test_otel_population import _raw_client
 
@@ -2516,7 +2543,7 @@ async def test_stream_entry_failure_billing_matches_main(
     source = _BillingStream("entry", exception, responses)
     raw.chat.completions.create.return_value = source
     raw.responses = SimpleNamespace(stream=MagicMock(spec=[], return_value=source))
-    plane = FakeControlPlane()
+    plane = FakeControlPlane(mode=budget_mode)
     wrapper = (plane.wrap_async if async_mode else plane.wrap)(
         raw, otel_spans=otel_spans, trace_correlation=False, budget_check_cache_ttl=0
     )
@@ -2557,15 +2584,28 @@ async def test_stream_entry_failure_billing_matches_main(
             await result.close()
         else:
             result.close()
-        assert not settlements
-        assert len(events) == 1
-        if not responses:
-            # Closed before its natural end: no confirm frees the per-call
-            # hold (0.10.2); the success receipt's usage is an estimate.
+        if responses:
+            assert not settlements
+            assert len(events) == 1
+        elif budget_mode == "hard_deny":
+            # Closed before its natural end: under hard_deny no confirm frees
+            # the per-call hold (0.10.2); the success receipt is an estimate.
+            assert not settlements
+            assert len(events) == 1
             event = events[0]
             assert event.status.value == "success"
             assert event.token_details is not None
             assert event.token_details.is_estimated is True
+        else:
+            # alert_only: unchanged, the observed (zero) usage is confirmed.
+            assert len(settlements) == 1
+            confirm, event = settlements[0]
+            assert (confirm.token_details.input_tokens, confirm.token_details.output_tokens) == (
+                0,
+                0,
+            )
+            assert event.status.value == "success"
+            assert not events
     finally:
         if async_mode:
             await wrapper.close()

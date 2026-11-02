@@ -2147,7 +2147,6 @@ class TestSyncStreamingInterception:
         budget.reservation_id = "res_stream_abort"
         solwyn._solwyn_budget.check_budget = MagicMock(return_value=budget)
         solwyn._solwyn_reporter.report_settlement = MagicMock()
-        solwyn._solwyn_reporter.report = MagicMock()
 
         with solwyn_pkg.run("sync-cooperative-stop") as run_id:
             stream = solwyn.chat.completions.create(
@@ -2182,13 +2181,11 @@ class TestSyncStreamingInterception:
         assert exc_info.value.source == "server"
         assert inner.pulled == chunks[:3]
         assert inner.close_calls == 1
-        # The stop ended the stream before its natural end: the per-call hold
-        # is not confirmed down to the partial usage; one success receipt
-        # carries what was observed.
-        solwyn._solwyn_reporter.report_settlement.assert_not_called()
-        solwyn._solwyn_reporter.report.assert_called_once()
-        (event,) = solwyn._solwyn_reporter.report.call_args.args
-        assert event.status.value == "success"
+        solwyn._solwyn_reporter.report_settlement.assert_called_once()
+        confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
+        assert confirm.reservation_id == "res_stream_abort"
+        assert confirm.token_details.input_tokens == 10
+        assert confirm.token_details.output_tokens == 2
         assert event.input_tokens == 10
         assert event.output_tokens == 2
         assert event.agent_run_id == run_id
@@ -2209,7 +2206,6 @@ class TestSyncStreamingInterception:
         budget.reservation_id = "res_stream_evicted_stop"
         solwyn._solwyn_budget.check_budget = MagicMock(return_value=budget)
         solwyn._solwyn_reporter.report_settlement = MagicMock()
-        solwyn._solwyn_reporter.report = MagicMock()
 
         with solwyn_pkg.run("sync-evicted-stop") as run_id:
             stream = solwyn.chat.completions.create(
@@ -2235,8 +2231,7 @@ class TestSyncStreamingInterception:
         )
         assert inner.pulled == chunks[:2]
         assert inner.close_calls == 1
-        solwyn._solwyn_reporter.report_settlement.assert_not_called()
-        solwyn._solwyn_reporter.report.assert_called_once()
+        solwyn._solwyn_reporter.report_settlement.assert_called_once()
         assert run_id not in _run_control._STATE.active_handles
 
         solwyn._solwyn_reporter._http.close()
@@ -2269,7 +2264,6 @@ class TestSyncStreamingInterception:
         budget.reservation_id = "res_stream_race"
         solwyn._solwyn_budget.check_budget = MagicMock(return_value=budget)
         solwyn._solwyn_reporter.report_settlement = MagicMock()
-        solwyn._solwyn_reporter.report = MagicMock()
 
         with solwyn_pkg.run("sync-stream-race") as run_id:
             first = solwyn.chat.completions.create(
@@ -2294,8 +2288,7 @@ class TestSyncStreamingInterception:
 
         assert first_inner.pulled == [_openai_usage_chunk(output_tokens=1)]
         assert second_inner.pulled == [_openai_usage_chunk(output_tokens=2)]
-        solwyn._solwyn_reporter.report_settlement.assert_not_called()
-        assert solwyn._solwyn_reporter.report.call_count == 2
+        assert solwyn._solwyn_reporter.report_settlement.call_count == 2
         assert run_id not in _run_control._STATE.active_handles
         solwyn._solwyn_reporter._http.close()
         solwyn._solwyn_budget._http.close()
@@ -2589,7 +2582,6 @@ class TestAsyncStreamingInterception:
         budget.reservation_id = "res_stream_abort"
         solwyn._solwyn_budget.check_budget = AsyncMockFn(return_value=budget)
         solwyn._solwyn_reporter.report_settlement = MagicMock()
-        solwyn._solwyn_reporter.report = MagicMock()
 
         async with solwyn_pkg.run("async-cooperative-stop") as run_id:
             stream = await solwyn.chat.completions.create(
@@ -2624,13 +2616,11 @@ class TestAsyncStreamingInterception:
         assert exc_info.value.source == "server"
         assert inner.pulled == chunks[:3]
         assert inner.aclose_calls == 1
-        # The stop ended the stream before its natural end: the per-call hold
-        # is not confirmed down to the partial usage; one success receipt
-        # carries what was observed.
-        solwyn._solwyn_reporter.report_settlement.assert_not_called()
-        solwyn._solwyn_reporter.report.assert_called_once()
-        (event,) = solwyn._solwyn_reporter.report.call_args.args
-        assert event.status.value == "success"
+        solwyn._solwyn_reporter.report_settlement.assert_called_once()
+        confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
+        assert confirm.reservation_id == "res_stream_abort"
+        assert confirm.token_details.input_tokens == 10
+        assert confirm.token_details.output_tokens == 2
         assert event.input_tokens == 10
         assert event.output_tokens == 2
         assert event.agent_run_id == run_id
@@ -2655,7 +2645,6 @@ class TestAsyncStreamingInterception:
         budget.reservation_id = "res_async_stream_evicted_stop"
         solwyn._solwyn_budget.check_budget = AsyncMockFn(return_value=budget)
         solwyn._solwyn_reporter.report_settlement = MagicMock()
-        solwyn._solwyn_reporter.report = MagicMock()
 
         async with solwyn_pkg.run("async-evicted-stop") as run_id:
             stream = await solwyn.chat.completions.create(
@@ -2681,8 +2670,7 @@ class TestAsyncStreamingInterception:
         )
         assert inner.pulled == chunks[:2]
         assert inner.aclose_calls == 1
-        solwyn._solwyn_reporter.report_settlement.assert_not_called()
-        solwyn._solwyn_reporter.report.assert_called_once()
+        solwyn._solwyn_reporter.report_settlement.assert_called_once()
         assert run_id not in _run_control._STATE.active_handles
 
         await solwyn._solwyn_budget._http.aclose()
@@ -2719,7 +2707,6 @@ class TestAsyncStreamingInterception:
         budget.reservation_id = "res_async_stream_race"
         solwyn._solwyn_budget.check_budget = AsyncMockFn(return_value=budget)
         solwyn._solwyn_reporter.report_settlement = MagicMock()
-        solwyn._solwyn_reporter.report = MagicMock()
 
         async with solwyn_pkg.run("async-stream-race") as run_id:
             first = await solwyn.chat.completions.create(
@@ -2744,8 +2731,7 @@ class TestAsyncStreamingInterception:
 
         assert first_inner.pulled == [first_chunk]
         assert second_inner.pulled == [second_chunk]
-        solwyn._solwyn_reporter.report_settlement.assert_not_called()
-        assert solwyn._solwyn_reporter.report.call_count == 2
+        assert solwyn._solwyn_reporter.report_settlement.call_count == 2
         assert run_id not in _run_control._STATE.active_handles
         await solwyn._solwyn_budget._http.aclose()
         await solwyn._solwyn_reporter._http.aclose()

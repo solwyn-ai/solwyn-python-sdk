@@ -2509,17 +2509,21 @@ class TestClientLeasePlumbing:
         solwyn._solwyn_reporter._http.close()
         solwyn._solwyn_budget._http.close()
 
-    def test_an_unknown_failure_after_dispatch_keeps_the_bound(self) -> None:
+    @pytest.mark.parametrize("hard_deny", [True, False], ids=["hard_deny", "alert_only"])
+    def test_an_unknown_failure_after_dispatch_keeps_the_bound_under_hard_deny(
+        self, hard_deny: bool
+    ) -> None:
         # No positive evidence the request went unbilled (an unparseable 200
-        # looks like this): the claim is retired at its bound, not handed back.
+        # looks like this): under hard_deny the claim is retired at its bound;
+        # elsewhere it is handed back as before.
         client, _ = _openai_client()
         client.chat.completions.create.side_effect = RuntimeError("unknown")
         solwyn = _build_solwyn(client)
+        budget = _lease_result()
+        budget.hard_deny_admitted = hard_deny
 
         with (
-            patch.object(
-                solwyn._solwyn_budget, "check_budget", return_value=_lease_result()
-            ) as check,
+            patch.object(solwyn._solwyn_budget, "check_budget", return_value=budget) as check,
             patch.object(solwyn._solwyn_budget, "release_reservation") as release,
             patch.object(solwyn._solwyn_budget, "abandon_reservation") as abandon,
             patch.object(solwyn._solwyn_reporter, "report"),
@@ -2530,8 +2534,9 @@ class TestClientLeasePlumbing:
                 model="gpt-5.5", messages=[{"role": "user", "content": "Hello"}]
             )
 
-        release.assert_not_called()
-        abandon.assert_called_once_with(
+        expected, other = (abandon, release) if hard_deny else (release, abandon)
+        other.assert_not_called()
+        expected.assert_called_once_with(
             check.call_args.kwargs["call_id"],
             lease_claim_token=123,
         )

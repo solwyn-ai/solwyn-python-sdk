@@ -772,6 +772,18 @@ def _safe_extract_region(runtime: ProviderRuntime) -> str | None:
         return None
 
 
+def _hard_deny_funding(budget: Any) -> bool:
+    """Whether possibly billed funding is kept (consumed at its bound) for ``budget``.
+
+    Keeping funding because usage is unknown or the call may have been billed
+    applies only to a ``hard_deny`` admission. Elsewhere it bounds nothing, and
+    the claim is released as before. Routing and the ``possibly_succeeded``
+    receipt flag do not depend on the mode. (The older local floor for missing
+    or malformed usage on a completed call applies in every mode.)
+    """
+    return getattr(budget, "hard_deny_admitted", False) is True
+
+
 def _settle_stream_failure(
     owner: Any,
     ctx: _AttemptContext,
@@ -796,7 +808,7 @@ def _settle_stream_failure(
         owner._get_circuit_breaker(provider).record_failure()
     elif admission is not None:
         owner._get_circuit_breaker(provider).release_probe(admission)
-    if possibly_succeeded:
+    if possibly_succeeded and _hard_deny_funding(budget):
         owner._solwyn_budget.abandon_reservation(
             call_id, lease_claim_token=_lease_claim_token(budget)
         )
@@ -2794,7 +2806,7 @@ class Solwyn(_SolwynBase):
             if not isinstance(exc, Exception) and spec.modality != "text":
                 raise
             possibly_succeeded = spec.dispatched_spend_unknown(exc, dispatched=dispatched)
-            if possibly_succeeded:
+            if possibly_succeeded and _hard_deny_funding(budget):
                 self._solwyn_budget.abandon_reservation(
                     call_id, lease_claim_token=_lease_claim_token(budget)
                 )
@@ -3521,7 +3533,7 @@ class Solwyn(_SolwynBase):
                             # Stop the chain. A possibly billed attempt (refused
                             # loop, unparseable or unknown failure after dispatch)
                             # keeps its bound; a proven rejection gives it back.
-                            if usage_unknown:
+                            if usage_unknown and _hard_deny_funding(budget):
                                 self._solwyn_budget.abandon_reservation(
                                     call_id,
                                     lease_claim_token=_lease_claim_token(budget),
@@ -3534,13 +3546,19 @@ class Solwyn(_SolwynBase):
                             raise  # do NOT advance the chain
                         if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
                             # The receipt lets the server reconcile unknown usage;
-                            # local lease authority must also keep its spent bound.
-                            self._solwyn_budget.abandon_reservation(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
+                            # under hard_deny the lease also keeps its spent bound.
+                            if _hard_deny_funding(budget):
+                                self._solwyn_budget.abandon_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            else:
+                                self._solwyn_budget.release_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
                             raise  # re-raise ORIGINAL exception (drop-in contract)
-                        if usage_unknown:
+                        if usage_unknown and _hard_deny_funding(budget):
                             # Failing over does not un-send this hop (ambiguous
                             # failover, or a possibly billed FAILOVER such as 529). The call keeps
                             # its reservation, pinned: no later settlement, refusal,
@@ -3915,6 +3933,12 @@ class Solwyn(_SolwynBase):
             abandoned: bool = False,
             record_latency: bool = True,
         ) -> None:
+            if abandoned and not _hard_deny_funding(budget):
+                # The early-close rule applies under hard_deny only (as in the
+                # TS SDK). Elsewhere it bounds nothing, and a per-call hold kept
+                # until its TTL would inflate the counters that budget alerts
+                # read, so an early-closed stream settles on its observed usage.
+                abandoned = False
             usage_unmeasured = False
             if estimate_empty_usage or abandoned:
                 if token_details.input_tokens == 0 and token_details.output_tokens == 0:
@@ -4856,7 +4880,7 @@ class AsyncSolwyn(_SolwynBase):
             if not isinstance(exc, Exception) and spec.modality != "text":
                 raise
             possibly_succeeded = spec.dispatched_spend_unknown(exc, dispatched=dispatched)
-            if possibly_succeeded:
+            if possibly_succeeded and _hard_deny_funding(budget):
                 self._solwyn_budget.abandon_reservation(
                     call_id, lease_claim_token=_lease_claim_token(budget)
                 )
@@ -5533,7 +5557,7 @@ class AsyncSolwyn(_SolwynBase):
                             # Stop the chain. A possibly billed attempt (refused
                             # loop, unparseable or unknown failure after dispatch)
                             # keeps its bound; a proven rejection gives it back.
-                            if usage_unknown:
+                            if usage_unknown and _hard_deny_funding(budget):
                                 self._solwyn_budget.abandon_reservation(
                                     call_id,
                                     lease_claim_token=_lease_claim_token(budget),
@@ -5545,14 +5569,20 @@ class AsyncSolwyn(_SolwynBase):
                                 )
                             raise  # do NOT advance the chain
                         if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
-                            # Mirror sync: retire the claim without refunding
-                            # authority the provider may already have consumed.
-                            self._solwyn_budget.abandon_reservation(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
+                            # Mirror sync: under hard_deny, retire the claim without
+                            # refunding authority the provider may have consumed.
+                            if _hard_deny_funding(budget):
+                                self._solwyn_budget.abandon_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            else:
+                                self._solwyn_budget.release_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
                             raise
-                        if usage_unknown:
+                        if usage_unknown and _hard_deny_funding(budget):
                             # Mirror sync: pin the still-live reservation so no
                             # later exit from this call (cancellation included)
                             # can refund what this hop may have consumed.
@@ -5923,6 +5953,12 @@ class AsyncSolwyn(_SolwynBase):
         ) -> None:
             # Synchronous (no I/O, no awaits) so a dropped stream can settle
             # from the run-cleanup worker or from close(), off the event loop.
+            if abandoned and not _hard_deny_funding(budget):
+                # The early-close rule applies under hard_deny only (as in the
+                # TS SDK). Elsewhere it bounds nothing, and a per-call hold kept
+                # until its TTL would inflate the counters that budget alerts
+                # read, so an early-closed stream settles on its observed usage.
+                abandoned = False
             usage_unmeasured = False
             if estimate_empty_usage or abandoned:
                 if token_details.input_tokens == 0 and token_details.output_tokens == 0:

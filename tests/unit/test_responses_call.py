@@ -1394,19 +1394,24 @@ class TestResponsesPublicProxySync:
             solwyn._solwyn_reporter.report_settlement.assert_not_called()
             solwyn._solwyn_reporter.report.assert_not_called()
 
-    def test_native_stream_helper_enter_failure_releases_reservation(self) -> None:
+    @pytest.mark.parametrize("hard_deny", [True, False], ids=["hard_deny", "alert_only"])
+    def test_native_stream_helper_enter_failure_releases_reservation(self, hard_deny: bool) -> None:
         error = _Status(503, "stream open failed")
         inner = _FakeSyncResponseStream([], object())
         provider_manager = _FakeSyncResponseStreamManager(inner, enter_error=error)
         client = _NativeOpenAIClient(provider_manager)
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            budget = _allow_budget()
+            budget.hard_deny_admitted = hard_deny
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=budget)
             release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
+            handback = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=handback),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -1418,7 +1423,10 @@ class TestResponsesPublicProxySync:
                 pass
 
             assert exc_info.value is error
-            release.assert_called_once()
+            # Under hard_deny the possibly billed claim is kept; elsewhere it is
+            # handed back. The receipt is flagged in every mode.
+            (release if hard_deny else handback).assert_called_once()
+            (handback if hard_deny else release).assert_not_called()
             # 5xx is post-send ambiguous: a health failure whose charge the
             # server must reconcile.
             breaker_failure.assert_called_once_with()
@@ -1481,23 +1489,28 @@ class TestResponsesPublicProxySync:
             ):
                 raise ValueError("application failed")
 
-            # Closed before the stream's end: one success receipt, no confirm.
-            solwyn._solwyn_reporter.report_settlement.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
-    def test_native_stream_helper_wrap_failure_releases_and_closes_once(self) -> None:
+    @pytest.mark.parametrize("hard_deny", [True, False], ids=["hard_deny", "alert_only"])
+    def test_native_stream_helper_wrap_failure_releases_and_closes_once(
+        self, hard_deny: bool
+    ) -> None:
         original = ValueError("wrapping failed")
         inner = _FakeSyncResponseStream([], object())
         provider_manager = _FakeSyncResponseStreamManager(inner)
         client = _NativeOpenAIClient(provider_manager)
 
         with _sync_solwyn(client) as solwyn:
-            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            budget = _allow_budget()
+            budget.hard_deny_admitted = hard_deny
+            check = MagicMock(spec=solwyn._solwyn_budget.check_budget, return_value=budget)
             release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
+            handback = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=handback),
                 patch_wrapper_local(solwyn, "_wrap_stream", MagicMock(side_effect=original)),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
@@ -1516,7 +1529,10 @@ class TestResponsesPublicProxySync:
                 manager.close()
 
             assert exc_info.value is original
-            release.assert_called_once()
+            # Under hard_deny the possibly billed claim is kept; elsewhere it is
+            # handed back. The receipt is flagged in every mode.
+            (release if hard_deny else handback).assert_called_once()
+            (handback if hard_deny else release).assert_not_called()
             # Wrapping is SDK-side bookkeeping, never a provider-health verdict.
             breaker_failure.assert_not_called()
             probe_release.assert_called_once()
@@ -2200,15 +2216,13 @@ class TestResponsesPublicProxyAsync:
 
             check.assert_awaited_once()
             assert client._responses.stream_calls == [{"model": "deployment", "input": "12345678"}]
-            # Abandoned before its end: no confirm frees the hold; one success
-            # receipt carries the length estimate.
-            solwyn._solwyn_reporter.report_settlement.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_called_once()
-            (event,) = solwyn._solwyn_reporter.report.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.provider.value == "azure_openai"
             assert event.input_tokens == 2
             assert event.output_tokens == 0
             assert event.token_details.is_estimated is True
+            assert confirm.token_details == event.token_details
 
     @pytest.mark.asyncio
     async def test_azure_stream_helper_without_usage_holds_lease_floor(self) -> None:
@@ -2706,19 +2720,26 @@ class TestResponsesPublicProxyAsync:
             solwyn._solwyn_reporter.report_settlement.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_native_stream_helper_enter_failure_releases_reservation(self) -> None:
+    @pytest.mark.parametrize("hard_deny", [True, False], ids=["hard_deny", "alert_only"])
+    async def test_native_stream_helper_enter_failure_releases_reservation(
+        self, hard_deny: bool
+    ) -> None:
         error = _Status(503, "stream open failed")
         inner = _FakeAsyncResponseStream([], object())
         provider_manager = _FakeAsyncResponseStreamManager(inner, enter_error=error)
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            budget = _allow_budget()
+            budget.hard_deny_admitted = hard_deny
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=budget)
             release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
+            handback = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=handback),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -2730,7 +2751,10 @@ class TestResponsesPublicProxyAsync:
                     pass
 
             assert exc_info.value is error
-            release.assert_called_once()
+            # Under hard_deny the possibly billed claim is kept; elsewhere it is
+            # handed back. The receipt is flagged in every mode.
+            (release if hard_deny else handback).assert_called_once()
+            (handback if hard_deny else release).assert_not_called()
             # 5xx is post-send ambiguous: a health failure whose charge the
             # server must reconcile.
             breaker_failure.assert_called_once_with()
@@ -2795,15 +2819,15 @@ class TestResponsesPublicProxyAsync:
                 async with solwyn.responses.stream(model="gpt-5.5", input="1234"):
                     raise ValueError("application failed")
 
-            # Closed before the stream's end: one success receipt, no confirm.
-            solwyn._solwyn_reporter.report_settlement.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_called_once()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("opened_before_wait", [False, True])
+    @pytest.mark.parametrize("hard_deny", [True, False], ids=["hard_deny", "alert_only"])
     async def test_native_stream_helper_entry_cancellation_reconciles_and_closes_once(
         self,
         opened_before_wait: bool,
+        hard_deny: bool,
     ) -> None:
         inner = _FakeAsyncResponseStream([], object())
         enter_started = asyncio.Event()
@@ -2832,12 +2856,16 @@ class TestResponsesPublicProxyAsync:
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            budget = _allow_budget()
+            budget.hard_deny_admitted = hard_deny
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=budget)
             release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
+            handback = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=handback),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
                     "record_failure",
@@ -2854,7 +2882,10 @@ class TestResponsesPublicProxyAsync:
                 await manager.close()
 
             check.assert_awaited_once()
-            release.assert_called_once()
+            # Under hard_deny the possibly billed claim is kept; elsewhere it is
+            # handed back. The receipt is flagged in every mode.
+            (release if hard_deny else handback).assert_called_once()
+            (handback if hard_deny else release).assert_not_called()
             breaker_failure.assert_not_called()
             solwyn._solwyn_reporter.report.assert_called_once()
             solwyn._solwyn_reporter.report_settlement.assert_not_called()
@@ -2890,9 +2921,8 @@ class TestResponsesPublicProxyAsync:
             assert len(provider_manager.exit_calls) == 1
             assert inner.aclose_calls == 1
             release.assert_not_called()
-            # Closed before the stream's end: one success receipt, no confirm.
-            solwyn._solwyn_reporter.report_settlement.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_called_once()
+            solwyn._solwyn_reporter.report.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_concurrent_reentry_keeps_first_entry_closable(
@@ -2947,9 +2977,8 @@ class TestResponsesPublicProxyAsync:
             assert len(provider_manager.exit_calls) == 1
             assert inner.aclose_calls == 1
             release.assert_not_called()
-            # Closed before the stream's end: one success receipt, no confirm.
-            solwyn._solwyn_reporter.report_settlement.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_called_once()
+            solwyn._solwyn_reporter.report.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_cancelled_close_is_publicly_retryable(self) -> None:
@@ -3017,24 +3046,30 @@ class TestResponsesPublicProxyAsync:
             assert provider_manager.max_active_exits == 1
             assert inner.aclose_calls == 1
             release.assert_not_called()
-            # Closed before the stream's end: one success receipt, no confirm.
-            solwyn._solwyn_reporter.report_settlement.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_called_once()
+            solwyn._solwyn_reporter.report.assert_not_called()
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_native_stream_helper_wrap_failure_releases_and_closes_once(self) -> None:
+    @pytest.mark.parametrize("hard_deny", [True, False], ids=["hard_deny", "alert_only"])
+    async def test_native_stream_helper_wrap_failure_releases_and_closes_once(
+        self, hard_deny: bool
+    ) -> None:
         original = ValueError("wrapping failed")
         inner = _FakeAsyncResponseStream([], object())
         provider_manager = _FakeAsyncResponseStreamManager(inner)
         client = _AsyncNativeOpenAIClient(provider_manager)
 
         async with _async_solwyn(client) as solwyn:
-            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=_allow_budget())
+            budget = _allow_budget()
+            budget.hard_deny_admitted = hard_deny
+            check = AsyncMock(spec=solwyn._solwyn_budget.check_budget, return_value=budget)
             release = MagicMock(spec=solwyn._solwyn_budget.abandon_reservation)
+            handback = MagicMock(spec=solwyn._solwyn_budget.release_reservation)
             breaker_failure = MagicMock()
             with (
                 patch.object(solwyn._solwyn_budget, "check_budget", new=check),
                 patch.object(solwyn._solwyn_budget, "abandon_reservation", new=release),
+                patch.object(solwyn._solwyn_budget, "release_reservation", new=handback),
                 patch_wrapper_local(solwyn, "_wrap_stream_async", MagicMock(side_effect=original)),
                 patch.object(
                     solwyn._get_circuit_breaker("openai"),
@@ -3053,7 +3088,10 @@ class TestResponsesPublicProxyAsync:
                 await manager.close()
 
             assert exc_info.value is original
-            release.assert_called_once()
+            # Under hard_deny the possibly billed claim is kept; elsewhere it is
+            # handed back. The receipt is flagged in every mode.
+            (release if hard_deny else handback).assert_called_once()
+            (handback if hard_deny else release).assert_not_called()
             # Wrapping is SDK-side bookkeeping, never a provider-health verdict.
             breaker_failure.assert_not_called()
             probe_release.assert_called_once()
@@ -3805,13 +3843,11 @@ class TestResponsesInterceptedCallSync:
             stream.close()
             stream.close()
 
-            # Abandoned per-call: no confirm frees the hold; one success
-            # receipt carries the length estimate.
-            solwyn._solwyn_reporter.report_settlement.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_called_once()
-            (event,) = solwyn._solwyn_reporter.report.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert event.token_details.input_tokens == 2
             assert event.token_details.is_estimated is True
+            assert confirm.token_details == event.token_details
 
     def test_lease_backed_abandoned_stream_holds_reserved_floor(self) -> None:
         client, _ = _mock_openai_client()
@@ -4295,13 +4331,11 @@ class TestResponsesInterceptedCallAsync:
             await stream.close()
             await stream.close()
 
-            # Abandoned per-call: no confirm frees the hold; one success
-            # receipt carries the length estimate.
-            solwyn._solwyn_reporter.report_settlement.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_called_once()
-            (settled_event,) = solwyn._solwyn_reporter.report.call_args.args
+            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            confirm, settled_event = solwyn._solwyn_reporter.report_settlement.call_args.args
             assert settled_event.token_details.input_tokens == 2
             assert settled_event.token_details.is_estimated is True
+            assert confirm.token_details == settled_event.token_details
 
     @pytest.mark.asyncio
     async def test_lease_backed_abandoned_stream_holds_reserved_floor(self) -> None:

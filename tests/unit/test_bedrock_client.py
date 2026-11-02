@@ -446,13 +446,13 @@ class TestBedrockConverseStream:
         # one-level-deep close obligation raw boto3's EventStream imposes.
         # close() must settle EXACTLY once (the _settled guard) and stay
         # idempotent on repeat calls. Abandoned before the terminal metadata
-        # event, no usage was measured: the per-call hold is kept (no confirm)
-        # and one success receipt carries the estimated usage.
+        # event, the settlement carries the zeros the accumulator observed
+        # (the explicit zero-settle warning is pinned in
+        # test_providers/test_bedrock.py).
         client = _mock_bedrock_client()
         solwyn = _make_solwyn(client)
         settlements: list = []
-        receipts: list = []
-        solwyn._solwyn_reporter.report = receipts.append
+        solwyn._solwyn_reporter.report = lambda e: None
         solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
@@ -467,18 +467,19 @@ class TestBedrockConverseStream:
             result["stream"].close()
 
         assert consumed == [{"messageStart": {"role": "assistant"}}]
-        assert settlements == []
-        assert len(receipts) == 1
-        event = receipts[0]
+        assert len(settlements) == 1
+        confirm, event = settlements[0]
+        assert confirm.reservation_id == "res_123"
         assert event.provider == "bedrock"
-        assert event.status.value == "success"
-        # No terminal metadata event was consumed: the usage is an estimate.
-        assert event.token_details.is_estimated is True
+        # No terminal metadata event was consumed — settles at zero usage.
+        assert event.input_tokens == 0
+        assert event.output_tokens == 0
+        assert confirm.token_details.input_tokens == 0
+        assert confirm.token_details.output_tokens == 0
 
         # close() is idempotent: a second call must NOT double-settle.
         result["stream"].close()
-        assert settlements == []
-        assert len(receipts) == 1
+        assert len(settlements) == 1
         solwyn.close()
 
     def test_converse_stream_early_abandon_context_manager_settles_exactly_once(self) -> None:
@@ -487,8 +488,7 @@ class TestBedrockConverseStream:
         client = _mock_bedrock_client()
         solwyn = _make_solwyn(client)
         settlements: list = []
-        receipts: list = []
-        solwyn._solwyn_reporter.report = receipts.append
+        solwyn._solwyn_reporter.report = lambda e: None
         solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
@@ -500,8 +500,11 @@ class TestBedrockConverseStream:
                 for _event in result["stream"]:
                     break  # abandon after the FIRST event
 
-        assert settlements == []
-        assert [event.status.value for event in receipts] == ["success"]
+        assert len(settlements) == 1
+        confirm, event = settlements[0]
+        assert confirm.reservation_id == "res_123"
+        assert event.input_tokens == 0
+        assert event.output_tokens == 0
         solwyn.close()
 
 
@@ -1027,8 +1030,8 @@ class TestAsyncBedrockConverse:
     async def test_async_converse_stream_early_abandon_close_settles_exactly_once(self) -> None:
         # Async mirror of finding #6: abandoning result["stream"] early must
         # settle the reservation via `await result["stream"].close()` — exactly
-        # once (the _settled guard), idempotent on repeat calls. No usage was
-        # measured before the terminal metadata event, so the hold is kept.
+        # once (the _settled guard), idempotent on repeat calls, at the zero
+        # usage observed before the terminal metadata event.
         client = _mock_async_bedrock_client()
         client.converse_stream = AsyncMockFn(
             return_value={
@@ -1038,8 +1041,7 @@ class TestAsyncBedrockConverse:
         )
         solwyn = _make_async_solwyn(client)
         settlements: list = []
-        receipts: list = []
-        solwyn._solwyn_reporter.report = receipts.append
+        solwyn._solwyn_reporter.report = lambda e: None
         solwyn._solwyn_reporter.report_settlement = lambda c, e: settlements.append((c, e))
 
         with _mock_budget(solwyn):
@@ -1054,16 +1056,18 @@ class TestAsyncBedrockConverse:
             await result["stream"].close()
 
         assert consumed == [{"messageStart": {"role": "assistant"}}]
-        assert settlements == []
-        assert len(receipts) == 1
-        assert receipts[0].provider == "bedrock"
-        assert receipts[0].status.value == "success"
-        assert receipts[0].token_details.is_estimated is True
+        assert len(settlements) == 1
+        confirm, event = settlements[0]
+        assert confirm.reservation_id == "res_123"
+        assert event.provider == "bedrock"
+        # No terminal metadata event was consumed — settles at zero usage.
+        assert event.input_tokens == 0
+        assert event.output_tokens == 0
+        assert confirm.token_details.input_tokens == 0
 
         # close() is idempotent: a second call must NOT double-settle.
         await result["stream"].close()
-        assert settlements == []
-        assert len(receipts) == 1
+        assert len(settlements) == 1
 
         await solwyn._solwyn_budget._http.aclose()
         await solwyn._solwyn_reporter._http.aclose()

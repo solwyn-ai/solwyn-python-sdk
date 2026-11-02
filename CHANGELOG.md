@@ -21,14 +21,16 @@ derived from git tags (hatch-vcs).
   classifications are unchanged. Coverage fingerprints are refreshed for this
   admission.
 
-Bug fix: a stream closed early no longer gives back budget it may have spent.
+Bug fixes: under `hard_deny`, a stream closed early or dropped, and a call that
+fails in an unrecognized way after it was sent, no longer give back budget they
+may have spent. Keeping that funding is now `hard_deny` only.
 
 ### Fixed
 
-- **A stream closed before its end keeps its funding.** When you broke out of
-  a stream and closed it (or left its `with` block, or a run stop ended it)
-  before the provider sent its final usage report, Solwyn settled the call
-  with the usage it had seen so far, often zero tokens. The provider may still
+- **A stream closed before its end keeps its funding (`hard_deny`).** When you
+  broke out of a stream and closed it (or left its `with` block, or a run stop
+  ended it) before the provider sent its final usage report, Solwyn settled
+  the call with the usage it had seen so far, often zero tokens. The provider may still
   bill the whole generation. On a run lease, the claim was refunded, so the
   next call in the run could reuse tokens that were already spent. For
   example, on a final 128-token lease, a stream that had reserved 101 tokens
@@ -56,6 +58,20 @@ Bug fix: a stream closed early no longer gives back budget it may have spent.
   included), a 529, or a transport error that proves nothing was sent. This
   also covers a connection error whose cause is not a pre-send failure and a
   Responses `stream()` entry failure. Failover routing is unchanged.
+
+### Changed
+
+- **Keeping possibly billed funding is `hard_deny` only.** The rules above,
+  and the older ones that consume a lease claim after a 5xx, a read timeout, a
+  mid-stream error, a stream wrap or Responses entry failure, or a
+  cancellation after dispatch, now apply only to calls admitted under
+  `hard_deny`. They protect the cap, and `alert_only` has none to protect. A
+  kept per-call hold would also hold the counters that budget alerts read at
+  the full bound until it expires. On `alert_only`, those calls settle once
+  at their observed usage and release the claim, as before 0.10.1. Failover
+  routing and the `possibly_succeeded` receipt flag are the same in every
+  mode, and the local floor for a call whose usage is missing or unreadable
+  still applies in every mode. Matches the TS SDK.
 
 ## [0.10.1] - 2026-11-02
 

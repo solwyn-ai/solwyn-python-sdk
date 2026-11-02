@@ -921,6 +921,14 @@ defaults, and Google/Bedrock nested cap fields. When a hop has no explicit cap,
 `hard_deny` posture the hop is sent to the provider with that cap (see
 [Output bound](#output-bound)).
 
+Every rule below that keeps a possibly billed call's funding (a lease claim
+spent at its reserved bound, or a per-call hold left until its TTL) applies
+only to a call admitted under `hard_deny`. On `alert_only` those calls settle
+once at their observed usage and give the claim back, as before; failover
+routing and the `possibly_succeeded` receipt flag are the same in every mode.
+The local floor for a completed call whose usage is missing or unreadable
+applies in every mode.
+
 Cancelling an async chat or Responses call, or interrupting a sync one with a
 non-`Exception` `BaseException` (`KeyboardInterrupt`, `SystemExit`), retires its
 local reservation immediately and re-raises the original exception.
@@ -958,6 +966,7 @@ the stream. A stream still open when the interpreter exits is not settled. A
 stream that settles after its client's reporter has shut down still holds its
 lease claim locally, but its receipt is refused and counted in the reporter's
 `dropped_counts` (`settlement_confirm.closed_enqueue`, `event.closed_enqueue`).
+
 Once a request is dispatched, Solwyn treats a failure as possibly billed
 unless there is positive evidence it was not: a 4xx status (429 included), a
 529 (overloaded), or a transport failure that proves the request was never sent
