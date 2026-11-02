@@ -522,7 +522,11 @@ class _BudgetEnforcerBase:
         if cached is None:
             return None
         response, expires_at = cached
-        if not response.allowed or time.monotonic() >= expires_at:
+        if (
+            not response.allowed
+            or response.mode == BudgetMode.HARD_DENY
+            or time.monotonic() >= expires_at
+        ):
             self._allow_cache.pop(key, None)
             return None
         self._allow_cache.move_to_end(key)
@@ -720,7 +724,13 @@ class _BudgetEnforcerBase:
                 # create the very registry/sticky split the epoch work closes.
                 self._run_hard_deny_responses.pop(agent_run_id, None)
                 self._run_hard_deny_observed_at.pop(agent_run_id, None)
-            elif cache_allowed_response and cache_key is not None:
+            elif (
+                cache_allowed_response
+                and cache_key is not None
+                # A cached allow funds no reservation. Under hard_deny every
+                # call must be priced and reserved, so its allow is never kept.
+                and response.mode != BudgetMode.HARD_DENY
+            ):
                 self._store_allow_locked(cache_key, response)
             return
 

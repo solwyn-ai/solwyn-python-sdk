@@ -1219,7 +1219,7 @@ def test_denial_fixture(solwyn_control_plane, solwyn_test_client):
 | `tags` | `SOLWYN_TAGS` | `None` | Default spend tags for intercepted calls; env format is comma-separated `key=value` entries |
 | `fail_open` | `SOLWYN_FAIL_OPEN` | `True` | When Solwyn API is unreachable: `True` allows calls and tallies their tokens for the next successful check; `False` denies calls that no live budget lease covers |
 | `budget_mode` | `SOLWYN_BUDGET_MODE` | `alert_only` | Budget enforcement mode |
-| `budget_check_cache_ttl` | `SOLWYN_BUDGET_CHECK_CACHE_TTL` | `5` | Allow-cache lifetime for eligible legacy/non-run checks |
+| `budget_check_cache_ttl` | `SOLWYN_BUDGET_CHECK_CACHE_TTL` | `5` | Allow-cache lifetime for eligible legacy/non-run checks. `hard_deny` allows are never cached |
 | `budget_check_timeout` | `SOLWYN_BUDGET_CHECK_TIMEOUT` | `1.0` | Hot-path control-plane check/grant timeout in seconds |
 | `lease_enabled` | `SOLWYN_LEASE_ENABLED` | `True` | Use in-memory token leases for eligible run-scoped calls |
 | `lease_output_bound_default` | `SOLWYN_LEASE_OUTPUT_BOUND_DEFAULT` | `4096` | Output-token bound for a request with no explicit cap: priced by every budget check, and sent to the provider as its cap on `hard_deny` projects |

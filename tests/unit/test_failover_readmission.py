@@ -31,8 +31,10 @@ GROQ_URL = "https://api.groq.com/openai/v1"
 
 # Synthetic USD-per-token cards (not live rates): the pricey hop's output is
 # about 16x the cheap one's, like gpt-4o against gpt-4o-mini.
+CHEAP_2 = "cheap-model-2"
 _RATES = {
     CHEAP: (0.15 / 1_000_000, 0.6 / 1_000_000),
+    CHEAP_2: (0.15 / 1_000_000, 0.6 / 1_000_000),
     PRICEY: (2.5 / 1_000_000, 10.0 / 1_000_000),
 }
 
@@ -457,3 +459,53 @@ class TestReadmissionAfterAnAmbiguousAttempt:
 
         assert len(primary.bodies) == 1
         assert again.bodies == []
+
+
+@pytest.mark.unit
+class TestHardDenyAllowsAreNeverCached:
+    """Finding 4: a cached allow carries no reservation, so under hard_deny it
+    would admit a second generation that nothing funds."""
+
+    def _wrap_cached(self, stub: _PricedPlane, primary: Any, fallback: Any | None = None) -> Any:
+        from solwyn.client import Solwyn
+
+        options: dict[str, Any] = {}
+        if fallback is not None:
+            options["fallback"] = [(fallback, PRICEY)]
+        return Solwyn(
+            primary,
+            api_key=stub.plane.api_key,
+            api_url=stub.plane.api_url,
+            control_plane_transport=stub,
+            budget_check_cache_ttl=60,
+            lease_enabled=False,
+            **options,
+        )
+
+    def test_shared_fallback_is_checked_for_each_call(self) -> None:
+        stub, primary, fallback = _setup(_ROOMY)
+        with self._wrap_cached(stub, primary.client(), fallback.client(GROQ_URL)) as solwyn:
+            solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+            solwyn.chat.completions.create(model=CHEAP_2, messages=MESSAGES)
+
+        assert [check["model"] for check in stub.checks] == [CHEAP, PRICEY, CHEAP_2, PRICEY]
+        assert len(fallback.bodies) == 2
+        served = [c for c in stub.confirms if c["model"] == PRICEY]
+        assert len({confirm["reservation_id"] for confirm in served}) == 2
+
+    def test_repeated_call_is_checked_each_time(self) -> None:
+        stub, provider = _PricedPlane(budget_limit=_ROOMY), _Provider()
+        with self._wrap_cached(stub, provider.client()) as solwyn:
+            solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+            solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+
+        assert [check["model"] for check in stub.checks] == [CHEAP, CHEAP]
+        assert len({confirm["reservation_id"] for confirm in stub.confirms}) == 2
+
+    def test_alert_only_allows_are_still_cached(self) -> None:
+        stub, provider = _PricedPlane(budget_limit=_ROOMY, mode="alert_only"), _Provider()
+        with self._wrap_cached(stub, provider.client()) as solwyn:
+            solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+            solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+
+        assert [check["model"] for check in stub.checks] == [CHEAP]

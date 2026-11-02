@@ -31,6 +31,14 @@ In both cases a call could spend past a `hard_deny` budget.
   run's budget lease need no change: the lease is valued at the most expensive
   model in its declared failover chain. For the hop check, `check_budget`
   takes `per_call_only=True`, which skips the lease branch.
+- **Any attempt after a possibly billed one is checked again.** When an
+  attempt failed in a way that may still have been billed and the call failed
+  over, the next attempt is re-admitted even if it uses the same provider and
+  model, so two possibly billed generations never share one reservation.
+- **`hard_deny` allows are no longer cached.** A cached allow carries no
+  reservation, so a repeated call, or a second call failing over to the same
+  hop, could run on an allow that nothing funded. Every `hard_deny` call now
+  gets its own check. `alert_only` allows are still cached.
 - **`decisions.create` is refused on `hard_deny` projects.** The Decisions API
   has no output-cap parameter, so the output bound its check prices could not
   be enforced. On a `hard_deny` admission the call is now refused before any

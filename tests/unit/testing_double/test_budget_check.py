@@ -93,7 +93,9 @@ def test_alert_only_denial_allows_with_warning_but_keeps_denial_metadata() -> No
 
 @pytest.mark.unit
 def test_allow_cache_skips_second_network_check_without_reusing_reservation() -> None:
-    plane = FakeControlPlane()
+    # alert_only: a hard_deny allow is never cached (a cached allow funds no
+    # reservation).
+    plane = FakeControlPlane(mode="alert_only")
     with closing(_enforcer(plane, cache_ttl=60)) as enforcer:
         first = _check(enforcer)
         cached = _check(enforcer)

@@ -425,14 +425,16 @@ class TestInjectionOnlyUnderHardDeny:
             "messages": MESSAGES,
         }
 
-    def test_cached_hard_deny_allow_still_injects(self) -> None:
+    def test_hard_deny_allow_is_never_cached_and_each_call_injects(self) -> None:
+        # A cached allow funds no reservation, so hard_deny never caches one:
+        # each call is checked and capped on its own.
         plane = FakeControlPlane()
         client = _openai_client()
         with plane.wrap(client, lease_enabled=False, budget_check_cache_ttl=60) as solwyn:
             solwyn.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
             solwyn.chat.completions.create(model="gpt-5.5", messages=MESSAGES)
 
-        assert len(plane.checks) == 1
+        assert len(plane.checks) == 2
         calls = client.chat.completions.create.call_args_list
         assert [call.kwargs["max_completion_tokens"] for call in calls] == [
             DEFAULT_OUTPUT_BOUND,
@@ -514,7 +516,8 @@ class TestEnforcerResolution:
 @pytest.mark.unit
 class TestAllowCacheCohort:
     def test_allow_for_a_small_bound_does_not_admit_a_larger_one(self) -> None:
-        plane = FakeControlPlane()
+        # alert_only: hard_deny allows are never cached at all.
+        plane = FakeControlPlane(mode="alert_only")
         client = _openai_client()
         with plane.wrap(client, lease_enabled=False, budget_check_cache_ttl=60) as solwyn:
             solwyn.chat.completions.create(model="gpt-5.5", messages=MESSAGES, max_tokens=100)
