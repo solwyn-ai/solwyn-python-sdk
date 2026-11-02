@@ -2415,6 +2415,8 @@ class Solwyn(_SolwynBase):
         )
         if close_out is not None:
             self._solwyn_reporter.report_confirm(close_out)
+            # Free the hold now, not at the next flush interval.
+            self._solwyn_reporter.request_flush()
         bound = _failover_hop_bound(
             primary=primary,
             runtime=runtime,
@@ -2734,6 +2736,8 @@ class Solwyn(_SolwynBase):
             )
             if close_out is not None:
                 self._solwyn_reporter.report_confirm(close_out)
+                # Free the hold now, not at the next flush interval.
+                self._solwyn_reporter.request_flush()
             raise OutputBoundUnenforceableError(
                 provider=provider,
                 reason="no_output_cap",
@@ -3338,6 +3342,8 @@ class Solwyn(_SolwynBase):
                         )
                         if close_out is not None:
                             self._solwyn_reporter.report_confirm(close_out)
+                            # Free the hold now, not at the next flush interval.
+                            self._solwyn_reporter.request_flush()
                     raise
 
                 # Same-provider retry budget for THIS chain entry (config seam,
@@ -4451,6 +4457,8 @@ class AsyncSolwyn(_SolwynBase):
         )
         if close_out is not None:
             self._solwyn_reporter.report_confirm(close_out)
+            # Free the hold now, not at the next flush interval.
+            self._solwyn_reporter.request_flush()
         bound = _failover_hop_bound(
             primary=primary,
             runtime=runtime,
@@ -4745,6 +4753,8 @@ class AsyncSolwyn(_SolwynBase):
             )
             if close_out is not None:
                 self._solwyn_reporter.report_confirm(close_out)
+                # Free the hold now, not at the next flush interval.
+                self._solwyn_reporter.request_flush()
             raise OutputBoundUnenforceableError(
                 provider=provider,
                 reason="no_output_cap",
@@ -5303,6 +5313,8 @@ class AsyncSolwyn(_SolwynBase):
                         )
                         if close_out is not None:
                             self._solwyn_reporter.report_confirm(close_out)
+                            # Free the hold now, not at the next flush interval.
+                            self._solwyn_reporter.request_flush()
                     raise
 
                 # Same-provider retry budget for THIS chain entry (mirrors the sync

@@ -58,7 +58,9 @@ In both cases a call could spend past a `hard_deny` budget.
   `hard_deny` refusal made locally after the budget check (`decisions.create`,
   or any `OutputBoundUnenforceableError` raised before sending) left its
   per-call reservation held on the server until it expired, which could deny
-  the next valid call. The reservation is now settled at zero tokens.
+  the next valid call. The reservation is now settled at zero tokens, and that
+  confirm, like the one that frees a failed-over hop's reservation, is sent
+  within one reporter cycle instead of at the next 5-second flush.
 
 ## [0.10.0] - 2026-10-31
 

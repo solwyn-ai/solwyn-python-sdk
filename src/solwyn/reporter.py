@@ -1671,6 +1671,39 @@ class _ReporterBase:
         return result
 
 
+class _WakingEvent(threading.Event):
+    """The sync reporter's shutdown flag, which also wakes its flush thread.
+
+    ``wake`` lets a caller request an early flush (``request_flush``) without
+    signalling shutdown; ``set()`` fires ``wake`` too, so shutdown still
+    interrupts the sleep at once.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.wake = threading.Event()
+
+    def set(self) -> None:
+        super().set()
+        self.wake.set()
+
+
+class _WakingAsyncEvent(asyncio.Event):
+    """The async reporter's shutdown flag, which also wakes its flush task.
+
+    Like ``_WakingEvent``; both events are only ever set from the loop that
+    runs the flush task.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.wake = asyncio.Event()
+
+    def set(self) -> None:
+        super().set()
+        self.wake.set()
+
+
 class MetadataReporter(_ReporterBase):
     """Synchronous metadata reporter with a background daemon thread.
 
@@ -1748,7 +1781,7 @@ class MetadataReporter(_ReporterBase):
         self._close_lock = threading.RLock()
         self._worker_finalize_deadline: float | None = None
         self._http = self._new_http_client(timeout=10.0)
-        self._shutdown = threading.Event()
+        self._shutdown = _WakingEvent()
         self._in_flight_lock = threading.Lock()
         self._breaker_worker_lock = threading.Lock()
         self._untracked_worker_lock = threading.Lock()
@@ -1879,7 +1912,7 @@ class MetadataReporter(_ReporterBase):
         if not self._shutdown.is_set():
             # Replace the inherited Event and arm the lazy relaunch; a closed
             # reporter keeps its set Event and never relaunches.
-            self._shutdown = threading.Event()
+            self._shutdown = _WakingEvent()
             self._needs_thread_restart = True
 
     def _notify_untracked_observation(self) -> None:
@@ -2275,7 +2308,16 @@ class MetadataReporter(_ReporterBase):
         try:
             more = False
             while not self._shutdown.is_set():
-                if self._shutdown.wait(timeout=0.0 if more else self.flush_interval):
+                signal = self._shutdown
+                timeout = 0.0 if more else self.flush_interval
+                if isinstance(signal, _WakingEvent):
+                    # Sleep until the interval, an early-flush request, or
+                    # shutdown (which also sets wake).
+                    if signal.wake.wait(timeout=timeout):
+                        signal.wake.clear()
+                        if signal.is_set():
+                            break
+                elif signal.wait(timeout=timeout):
                     break
                 more = False
                 try:
@@ -2966,6 +3008,17 @@ class MetadataReporter(_ReporterBase):
         if not enqueued:
             self._count_drop("confirm", "closed_enqueue")
 
+    def request_flush(self) -> None:
+        """Wake the flush thread now rather than at its next interval.
+
+        Never blocks: it only sets an event, so a close-out confirm (which
+        frees a held reservation) goes out within one flush cycle instead of
+        up to ``flush_interval`` later. Delivery stays serial on the thread.
+        """
+        signal = self._shutdown
+        if isinstance(signal, _WakingEvent) and not signal.is_set():
+            signal.wake.set()
+
     def report_settlement(self, request: BudgetConfirmRequest, event: MetadataEvent) -> None:
         """Fire-and-forget a stream settlement as one ordered queue item."""
         if self._shutdown.is_set():
@@ -3117,7 +3170,7 @@ class AsyncMetadataReporter(_ReporterBase):
             raise RuntimeError("cannot start a closed AsyncMetadataReporter")
         if self._flush_task is not None and not self._flush_task.done():
             return
-        self._shutdown_event = asyncio.Event()
+        self._shutdown_event = _WakingAsyncEvent()
         self._flush_task = asyncio.create_task(self._flush_loop(), context=contextvars.Context())
 
     def _notify_untracked_observation(self) -> None:
@@ -3194,6 +3247,24 @@ class AsyncMetadataReporter(_ReporterBase):
         )
         if not enqueued:
             self._count_drop("confirm", "closed_enqueue")
+
+    def request_flush(self) -> None:
+        """Wake the flush task now rather than at its next interval.
+
+        Never blocks and never crosses threads: it sets the wake event only
+        when called on the loop that runs the flush task; anywhere else it is
+        a no-op and the regular interval applies.
+        """
+        signal = self._shutdown_event
+        task = self._flush_task
+        if not isinstance(signal, _WakingAsyncEvent) or task is None or task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if task.get_loop() is loop and not signal.is_set():
+            signal.wake.set()
 
     def report_settlement(self, request: BudgetConfirmRequest, event: MetadataEvent) -> None:
         """Fire-and-forget a stream settlement as one ordered queue item."""
@@ -3359,6 +3430,17 @@ class AsyncMetadataReporter(_ReporterBase):
                 await asyncio.sleep(0)
                 if self._shutdown_event.is_set():
                     break
+            elif isinstance(signal := self._shutdown_event, _WakingAsyncEvent):
+                # Sleep until the interval, an early-flush request, or shutdown
+                # (which also sets wake).
+                try:
+                    await asyncio.wait_for(signal.wake.wait(), timeout=self.flush_interval)
+                except TimeoutError:
+                    pass
+                else:
+                    signal.wake.clear()
+                    if signal.is_set():
+                        break
             else:
                 try:
                     await asyncio.wait_for(

@@ -897,3 +897,92 @@ class TestHopDenialAttribution:
         assert denials[0].is_model_fallback is False
         assert denials[0].requested_provider == "openai"
         assert denials[0].requested_model == CHEAP
+
+
+@pytest.mark.unit
+class TestCloseOutFlushNudge:
+    """A close-out confirm is sent within one flush cycle, not after the
+    reporter's regular interval (5 s by default), so a held reservation is
+    freed before the next call's check. Real reporter, default interval."""
+
+    _QUESTIONS = [{"type": "predicate", "instructions": "Is it a greeting?"}]
+    _WITHIN = 1.0  # seconds; the default flush interval is 5 s
+
+    def _wrap_default(self, stub: _PricedPlane, client: Any, *, is_async: bool = False) -> Any:
+        from solwyn.client import AsyncSolwyn, Solwyn
+
+        wrapper = AsyncSolwyn if is_async else Solwyn
+        return wrapper(
+            client,
+            api_key=stub.plane.api_key,
+            api_url=stub.plane.api_url,
+            control_plane_transport=stub,
+            lease_enabled=False,
+        )
+
+    def test_sync_close_out_is_sent_before_the_next_check(self) -> None:
+        import time
+
+        stub, provider = _PricedPlane(budget_limit=0.003), _Provider()
+        with self._wrap_default(stub, provider.client()) as solwyn:
+            assert solwyn._solwyn_reporter.flush_interval == 5.0
+            with pytest.raises(OutputBoundUnenforceableError):
+                solwyn.decisions.create(model=CHEAP, input="hi", questions=self._QUESTIONS)
+            deadline = time.monotonic() + self._WITHIN
+            while stub.held and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert stub.held == {}
+            checks_before = len(stub.checks)
+            solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+
+        assert len(stub.checks) == checks_before + 1
+        assert len(provider.bodies) == 1
+
+    @pytest.mark.asyncio
+    async def test_async_close_out_is_sent_before_the_next_check(self) -> None:
+        import asyncio
+        import time
+
+        stub, provider = _PricedPlane(budget_limit=0.003), _Provider()
+        solwyn = self._wrap_default(stub, provider.client(is_async=True), is_async=True)
+        try:
+            assert solwyn._solwyn_reporter.flush_interval == 5.0
+            with pytest.raises(OutputBoundUnenforceableError):
+                await solwyn.decisions.create(model=CHEAP, input="hi", questions=self._QUESTIONS)
+            deadline = time.monotonic() + self._WITHIN
+            while stub.held and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert stub.held == {}
+            await solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+        finally:
+            await solwyn.close()
+
+        assert len(provider.bodies) == 1
+
+    def test_sync_failover_close_out_is_sent_promptly(self) -> None:
+        import time
+
+        stub, primary, fallback = _setup(_ROOMY)
+        # _wrap keeps the reporter's default flush interval.
+        with _wrap(stub, primary.client(), fallback.client(GROQ_URL)) as solwyn:
+            solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+            deadline = time.monotonic() + self._WITHIN
+            while "res_1" in stub.held and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert "res_1" not in stub.held
+
+    @pytest.mark.asyncio
+    async def test_async_nudge_off_the_reporter_loop_is_a_no_op(self) -> None:
+        import asyncio
+
+        from solwyn.reporter import AsyncMetadataReporter
+
+        reporter = AsyncMetadataReporter("https://api.test.solwyn.ai", "sk_proj_" + "a" * 64)
+        reporter.start()
+        try:
+            await asyncio.to_thread(reporter.request_flush)
+            assert not reporter._shutdown_event.wake.is_set()
+            reporter.request_flush()
+            assert reporter._shutdown_event.wake.is_set()
+        finally:
+            await reporter.close()
