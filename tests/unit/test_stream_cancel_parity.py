@@ -16,8 +16,10 @@ import contextlib
 import functools
 import gc
 import json
+import logging
 import os
 import signal
+import sys
 import threading
 import time
 import weakref
@@ -674,6 +676,83 @@ class TestDroppedStreamSettlesOnce:
         assert confirm.token_details.is_estimated is True
         assert len(plane.ingested) == 1
         assert reporter.dropped_counts.get("settlement_confirm.closed_enqueue") is None
+
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("ending", ["early_close", "stream_error"])
+    def test_client_close_from_inside_its_own_settlement_returns(
+        self, ending: str, is_async: bool
+    ) -> None:
+        # A warning handler closes the client while this thread is settling a
+        # stream (async: an eagerly started close task runs inline). Close must
+        # not wait for the settlement it is nested in.
+        if is_async and sys.version_info < (3, 12):
+            pytest.skip("asyncio.eager_task_factory needs Python 3.12")
+        plane = FakeControlPlane()
+        first = _OpenStream() if ending == "early_close" else _BrokenStream(httpx.ReadError("x"))
+        provider = _Provider(first)
+        probe_logger = logging.getLogger("solwyn.tests.reentrant_close")
+        outcome: dict[str, Any] = {}
+
+        class _CloseOnWarning(logging.Handler):
+            def __init__(self, close: Any) -> None:
+                super().__init__(logging.WARNING)
+                self.close_client = close
+
+            def emit(self, record: logging.LogRecord) -> None:
+                close, self.close_client = self.close_client, None
+                if close is not None:
+                    outcome["closed"] = close()
+
+        def warn_then(report_settlement: Any) -> Any:
+            def report(*args: Any) -> None:
+                probe_logger.warning("settling")
+                report_settlement(*args)
+
+            return report
+
+        async def end_stream(stream: Any) -> None:
+            if ending == "early_close":
+                await _read(stream, is_async=is_async, chunks=1)
+                await stream.close() if is_async else stream.close()
+                return
+            with contextlib.suppress(Exception):
+                if is_async:
+                    async for _ in stream:
+                        pass
+                else:
+                    for _ in stream:
+                        pass
+
+        async def probe() -> None:
+            wrapped = (plane.wrap_async if is_async else plane.wrap)(
+                provider.client(is_async=is_async)
+            )
+            reporter = wrapped._solwyn_reporter
+            if is_async:
+                loop = asyncio.get_running_loop()
+                loop.set_task_factory(asyncio.eager_task_factory)  # type: ignore[attr-defined]
+                handler = _CloseOnWarning(lambda: loop.create_task(wrapped.close()))
+            else:
+                handler = _CloseOnWarning(wrapped.close)
+            stream = await _open_stream(wrapped, is_async=is_async)
+            probe_logger.addHandler(handler)
+            try:
+                with patch.object(
+                    reporter, "report_settlement", warn_then(reporter.report_settlement)
+                ):
+                    await end_stream(stream)
+                if is_async:
+                    await outcome["closed"]
+            finally:
+                probe_logger.removeHandler(handler)
+            outcome["drops"] = dict(reporter.dropped_counts)
+
+        worker = threading.Thread(target=asyncio.run, args=(probe(),), daemon=True)
+        worker.start()
+        worker.join(5)
+        assert not worker.is_alive(), "client close waited for its own settlement"
+        # The nested settlement enqueues after the reporter sealed: accepted.
+        assert outcome["drops"].get("settlement_confirm.closed_enqueue") == 1
 
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")

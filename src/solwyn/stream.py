@@ -70,6 +70,9 @@ class _StreamSettlement:
         # close can wait for a settlement still enqueueing before it seals.
         self._idle = threading.Event()
         self._idle.set()
+        # The thread that won the claim: a client close it runs reentrantly
+        # (from inside its own settlement) must not wait for itself.
+        self._owner: int | None = None
         self._accumulator = accumulator
         self._on_dropped = on_dropped
         self._start_time = time.monotonic()
@@ -85,6 +88,7 @@ class _StreamSettlement:
             if self._settled:
                 return False
             self._settled = True
+            self._owner = threading.get_ident()
             self._idle.clear()
             return True
 
@@ -110,7 +114,13 @@ class _StreamSettlement:
             return
         try:
             if not self.claim():
-                if wait:
+                # A close reentered from this thread's own settlement (a log
+                # handler, an eagerly started async close) would wait for
+                # itself: skip the wait. The reporter then seals before that
+                # settlement enqueues, so its pair is dropped and counted as
+                # closed_enqueue, which a client closed from inside its own
+                # settlement accepts.
+                if wait and self._owner != threading.get_ident():
                     self._idle.wait()
                 return
             try:
