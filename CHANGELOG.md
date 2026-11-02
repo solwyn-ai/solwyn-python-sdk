@@ -57,7 +57,17 @@ may have spent. Keeping that funding is now `hard_deny` only.
   dispatch, a failure keeps its bound unless it has a 4xx status (429
   included), a 529, or a transport error that proves nothing was sent. This
   also covers a connection error whose cause is not a pre-send failure and a
-  Responses `stream()` entry failure. Failover routing is unchanged.
+  Responses `stream()` entry failure.
+- **A response whose body fails to decode no longer fails over.** A 200 whose
+  gzip or deflate body could not be decoded reached Solwyn as a connection
+  error and was failed over as if nothing had been sent, so the provider could
+  bill twice. A body that arrived but failed to decode (content decoding or
+  JSON parsing, at the top or anywhere in the cause chain) is now post-send
+  ambiguous for routing in every mode, like a read timeout. Under the default
+  `failover_idempotency="safe"` the call raises instead of failing over; under
+  `"always"` it may fail over, and under `hard_deny` the next hop is
+  re-admitted. A numeric status still decides routing first, and a failure
+  raised before the request was sent is unchanged. Same rule as the TS SDK.
 
 ### Changed
 

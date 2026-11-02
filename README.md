@@ -973,7 +973,11 @@ unless there is positive evidence it was not: a 4xx status (429 included), a
 (connect refused, connect or pool timeout). Anything else keeps the bound,
 including an HTTP 200 whose body fails to parse or decode, any other 5xx, a
 connection error without pre-send proof, and an unknown exception. Whether the
-call fails over is decided separately and is unchanged.
+call fails over is decided separately. A response whose body arrived but failed
+to decode (gzip or deflate, or unparseable JSON, including behind a connection
+error) is treated like a read timeout for routing in every mode: under the
+default `failover_idempotency="safe"` it does not fail over, and under
+`"always"` it may, with the next hop re-admitted under `hard_deny`.
 Sync and async dispatch errors with unknown post-send usage (read timeouts,
 5xx responses, or protocol drops) also retain the bound when ambiguous failover
 is disabled. With `failover_idempotency="always"` the call fails over instead,

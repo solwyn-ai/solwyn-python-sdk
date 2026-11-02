@@ -149,6 +149,16 @@ _POST_SEND_BY_NAME = frozenset(
 # Used both directly (via ``_transport_disposition``, step 2) and as the
 # cause-inspection allowlist for the openai/anthropic wrappers (steps 1 and 7).
 _PRE_SEND_HTTPX = (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ConnectError)
+# A response arrived but its body failed to decode (content decoding or JSON
+# parsing), so the provider may have billed it. Shared with the TS SDK's name
+# table: httpx/httpx2 ``DecodingError`` (openai, anthropic, google-genai,
+# together), ``JSONDecodeError``, urllib3's ``DecodeError`` and botocore's
+# ``ResponseParserError`` (Bedrock). Schema validation of a decoded body is not
+# a decode failure.
+_BODY_DECODE_NAMES = frozenset(
+    {"DecodingError", "JSONDecodeError", "DecodeError", "ResponseParserError"}
+)
+_DECODE_CHAIN_LIMIT = 8
 _PRE_SEND_TRANSPORT_NAMES = frozenset({"ConnectTimeout", "PoolTimeout", "ConnectError"})
 
 # Sentinel for static attribute lookups: distinguishes "absent" from a real
@@ -256,11 +266,29 @@ def _numeric_status(exc: BaseException) -> int | None:
     return None
 
 
-def classify_exception(exc: BaseException) -> Disposition:
+def _has_body_decode_failure(exc: BaseException) -> bool:
+    """Whether ``exc`` or a link of its cause chain is a body decode failure.
+
+    Follows ``__cause__``, else ``__context__``, for at most
+    ``_DECODE_CHAIN_LIMIT`` links, and stops on a cycle.
+    """
+    seen: set[int] = set()
+    link: BaseException | None = exc
+    while link is not None and len(seen) < _DECODE_CHAIN_LIMIT and id(link) not in seen:
+        seen.add(id(link))
+        if {_static_class_name(cls) for cls in type(link).__mro__} & _BODY_DECODE_NAMES:
+            return True
+        link = link.__cause__ or link.__context__
+    return False
+
+
+def classify_exception(exc: BaseException, *, dispatched: bool = True) -> Disposition:
     """Classify a transport exception into a failover ``Disposition``.
 
     Duck-typed: never ``isinstance`` on a provider SDK class (they may be absent
-    or differ across versions). Certainty-first: a PROVEN httpx/httpx2 transport
+    or differ across versions). ``dispatched=False`` marks a failure raised
+    before the request was handed to the provider (no response can exist).
+    Certainty-first: a PROVEN httpx/httpx2 transport
     class settles whether the request could have landed before any class name or
     numeric status is consulted; everything unrecognized falls through to the
     status check. See the module docstring for why the branch ordering below is
@@ -327,6 +355,14 @@ def classify_exception(exc: BaseException) -> Disposition:
             return Disposition.FAIL_FAST
         if status >= 500:
             return Disposition.POST_SEND_AMBIGUOUS
+
+    # 6b. A response arrived but its body failed to decode (gzip/deflate or
+    #     JSON), at the top or behind a connection wrapper: post-send, so it
+    #     must never fail over under the safe policy. A numeric status above
+    #     wins (its routing is already known). Before dispatch no response
+    #     exists, so a decode-named local error keeps the default.
+    if dispatched and _has_body_decode_failure(exc):
+        return Disposition.POST_SEND_AMBIGUOUS
 
     # 7. Provider connection-error wrapper (no status, not itself a timeout).
     #    The openai/anthropic APIConnectionError wraps BOTH provably pre-send

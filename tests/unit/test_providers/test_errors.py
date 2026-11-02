@@ -633,5 +633,79 @@ class TestAttemptMaybeBilled:
 
     def test_routing_is_unchanged_for_the_unknown_default(self) -> None:
         # Routing still stops the chain on an unknown failure; only funding moved.
-        assert classify_exception(_json_error()) is Disposition.FAIL_FAST
+        assert classify_exception(RuntimeError("unknown")) is Disposition.FAIL_FAST
         assert classify_exception(_wrapped(APIConnectionError, None)) is Disposition.FAILOVER
+
+
+# ---------------------------------------------------------------------------
+# Body decode failures: a response arrived, so routing is post-send ambiguous
+# ---------------------------------------------------------------------------
+
+
+def _named(name: str, base: type[Exception] = Exception) -> type[Exception]:
+    return type(name, (base,), {})
+
+
+def _decode_failures() -> list[Exception]:
+    import urllib3.exceptions
+
+    failures: list[Exception] = [
+        httpx.DecodingError("bad gzip"),
+        _json_error(),
+        urllib3.exceptions.DecodeError("bad deflate"),
+        _named("ResponseParserError")("botocore could not parse the body"),
+    ]
+    try:
+        import httpx2
+
+        failures.append(httpx2.DecodingError("bad gzip"))
+    except (ImportError, AttributeError):
+        pass
+    return failures
+
+
+@pytest.mark.unit
+class TestBodyDecodeFailureRouting:
+    def test_a_decode_failure_at_the_top_is_ambiguous(self) -> None:
+        for exc in _decode_failures():
+            assert classify_exception(exc) is Disposition.POST_SEND_AMBIGUOUS, exc
+
+    def test_a_decode_failure_in_the_cause_chain_vetoes_failover(self) -> None:
+        for decode in _decode_failures():
+            wrapper = _wrapped(APIConnectionError, decode)
+            assert classify_exception(wrapper) is Disposition.POST_SEND_AMBIGUOUS, decode
+            # Deeper in the chain, through __context__ as well as __cause__.
+            middle = RuntimeError("middle")
+            middle.__context__ = decode
+            assert (
+                classify_exception(_wrapped(APIConnectionError, middle))
+                is Disposition.POST_SEND_AMBIGUOUS
+            )
+
+    def test_before_dispatch_a_decode_named_error_keeps_fail_fast(self) -> None:
+        for exc in _decode_failures():
+            assert classify_exception(exc, dispatched=False) is Disposition.FAIL_FAST, exc
+
+    @pytest.mark.parametrize(
+        ("status", "expected"),
+        [(400, Disposition.FAIL_FAST), (429, Disposition.FAILOVER), (529, Disposition.FAILOVER)],
+    )
+    def test_a_numeric_status_wins_over_a_decode_failure(
+        self, status: int, expected: Disposition
+    ) -> None:
+        exc = _Status(status)
+        exc.__context__ = httpx.DecodingError("error body did not decode")
+        assert classify_exception(exc) is expected
+
+    def test_a_cycle_in_the_chain_terminates(self) -> None:
+        first, second = RuntimeError("a"), RuntimeError("b")
+        first.__cause__, second.__cause__ = second, first
+        assert classify_exception(_wrapped(APIConnectionError, first)) is Disposition.FAILOVER
+
+    def test_schema_validation_is_not_a_decode_failure(self) -> None:
+        # A decoded body that fails the SDK's schema keeps its routing.
+        assert classify_exception(_validation_error()) is Disposition.FAIL_FAST
+        assert (
+            classify_exception(_wrapped(APIConnectionError, RuntimeError("unknown")))
+            is Disposition.FAILOVER
+        )

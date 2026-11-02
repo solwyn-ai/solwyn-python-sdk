@@ -716,13 +716,10 @@ class TestUnrecognizedPostDispatchFailureKeepsItsClaim:
         assert plane.lease_surrenders[-1].spent_tokens >= 100
         failed = plane.ingested[0]
         assert failed.status.value == "error"
-        # A stopped chain flags its receipt; a failover hop (529, a connection
-        # wrapper without pre-send proof) keeps the failover receipt shape and
-        # is pinned instead, like an ambiguous failover hop.
-        # (The openai SDK wraps a body decode error in APIConnectionError,
-        # which routes as failover; a handler's own exception propagates raw.)
-        stops_the_chain = kind in ("truncated_json", "unknown_cause")
-        assert failed.possibly_succeeded is (True if stops_the_chain else None)
+        # A stopped chain flags its receipt. A body that failed to decode is
+        # post-send ambiguous (no failover under "safe"); a handler's own
+        # exception propagates raw and stops the chain as unknown.
+        assert failed.possibly_succeeded is True
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("is_async", [False, True])
@@ -879,3 +876,76 @@ class TestFundingRulesByMode:
             # The receipt flag does not depend on the mode.
             assert first.status.value == "error"
             assert first.possibly_succeeded is True
+
+
+# ── A body that fails to decode is post-send ambiguous for routing ───────
+
+_GROQ_URL = "https://api.groq.com/openai/v1"
+_FALLBACK_MODEL = "llama-3.3-70b-versatile"
+
+
+class _Answering:
+    def __init__(self) -> None:
+        self.requests = 0
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests += 1
+        return httpx.Response(200, json={**_CHAT_BODY, "model": _FALLBACK_MODEL})
+
+    async def async_handler(self, request: httpx.Request) -> httpx.Response:
+        return self.handler(request)
+
+    def client(self, *, is_async: bool) -> Any:
+        if is_async:
+            return openai.AsyncOpenAI(
+                api_key="gsk-test",
+                base_url=_GROQ_URL,
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(self.async_handler)),
+                max_retries=0,
+            )
+        return openai.OpenAI(
+            api_key="gsk-test",
+            base_url=_GROQ_URL,
+            http_client=httpx.Client(transport=httpx.MockTransport(self.handler)),
+            max_retries=0,
+        )
+
+
+@pytest.mark.unit
+class TestUndecodableBodyRouting:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("idempotency", ["safe", "always"])
+    async def test_undecodable_body_fails_over_only_when_always(
+        self, idempotency: str, is_async: bool
+    ) -> None:
+        plane = FakeControlPlane()
+        primary, fallback = _Failing("decode_error"), _Answering()
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(
+            primary.client(is_async=is_async),
+            fallback=[(fallback.client(is_async=is_async), _FALLBACK_MODEL)],
+            failover_idempotency=idempotency,
+        )
+
+        async def create() -> Any:
+            result = wrapped.chat.completions.create(**_REQUEST)
+            return await result if is_async else result
+
+        try:
+            if idempotency == "safe":
+                with pytest.raises(openai.APIConnectionError):
+                    await create()
+            else:
+                await create()
+        finally:
+            await _close_client(wrapped, is_async=is_async)
+
+        assert primary.requests == 1
+        if idempotency == "safe":
+            # The provider answered: failing over could bill a second time.
+            assert fallback.requests == 0
+            assert plane.ingested[0].possibly_succeeded is True
+        else:
+            # "always" may fail over; under hard_deny the next hop is re-admitted.
+            assert fallback.requests == 1
+            assert [check.model for check in plane.checks] == [MODEL, _FALLBACK_MODEL]

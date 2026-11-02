@@ -3439,7 +3439,11 @@ class Solwyn(_SolwynBase):
                         # health verdict), but the first generation's usage is
                         # unknown, so the reservation keeps its bound.
                         loop_refused = isinstance(exc, OutputBoundUnenforceableError)
-                        disp = Disposition.FAIL_FAST if loop_refused else classify_exception(exc)
+                        disp = (
+                            Disposition.FAIL_FAST
+                            if loop_refused
+                            else classify_exception(exc, dispatched=usage_unknown)
+                        )
                         # Funding follows billing evidence, not routing: once
                         # dispatched, the attempt is possibly billed unless a 4xx
                         # status or a proven pre-send transport failure says it
@@ -5465,7 +5469,11 @@ class AsyncSolwyn(_SolwynBase):
                         # health verdict), but the first generation's usage is
                         # unknown, so the reservation keeps its bound.
                         loop_refused = isinstance(exc, OutputBoundUnenforceableError)
-                        disp = Disposition.FAIL_FAST if loop_refused else classify_exception(exc)
+                        disp = (
+                            Disposition.FAIL_FAST
+                            if loop_refused
+                            else classify_exception(exc, dispatched=usage_unknown)
+                        )
                         # Funding follows billing evidence, not routing: once
                         # dispatched, the attempt is possibly billed unless a 4xx
                         # status or a proven pre-send transport failure says it
