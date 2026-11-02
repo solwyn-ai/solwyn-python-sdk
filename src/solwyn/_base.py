@@ -88,7 +88,7 @@ from solwyn.exceptions import (
     UntrackedSpendSurfaceError,
     UntranslatableRequestError,
 )
-from solwyn.providers._errors import Disposition, classify_exception
+from solwyn.providers._errors import attempt_maybe_billed
 
 if TYPE_CHECKING:
     from solwyn._registry import ProviderRuntime
@@ -1569,10 +1569,8 @@ class MediaSurfaceSpec:
         """Text leases retain authority for ambiguous dispatch errors and interrupts."""
         if self.modality != "text" or not dispatched:
             return False
-        return (
-            not isinstance(exc, Exception)
-            or classify_exception(exc) is Disposition.POST_SEND_AMBIGUOUS
-        )
+        # Billing evidence, not routing: see attempt_maybe_billed.
+        return attempt_maybe_billed(exc)
 
 
 def _validate_decisions_kwargs(kwargs: Mapping[str, object]) -> None:

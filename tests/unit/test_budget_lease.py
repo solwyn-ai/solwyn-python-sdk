@@ -2480,9 +2480,13 @@ class TestClientLeasePlumbing:
         solwyn._solwyn_reporter._http.close()
         solwyn._solwyn_budget._http.close()
 
-    def test_a_failed_call_hands_the_reservation_back(self) -> None:
+    def test_a_rejected_call_hands_the_reservation_back(self) -> None:
+        # A 4xx proves the provider refused the request: nothing was billed.
+        class _Rejected(Exception):
+            status_code = 400
+
         client, _ = _openai_client()
-        client.chat.completions.create.side_effect = RuntimeError("fail fast")
+        client.chat.completions.create.side_effect = _Rejected("fail fast")
         solwyn = _build_solwyn(client)
 
         with (
@@ -2492,13 +2496,42 @@ class TestClientLeasePlumbing:
             patch.object(solwyn._solwyn_budget, "release_reservation") as release,
             patch.object(solwyn._solwyn_reporter, "report"),
             solwyn_pkg.run("doomed-job"),
-            pytest.raises(RuntimeError),
+            pytest.raises(_Rejected),
         ):
             solwyn.chat.completions.create(
                 model="gpt-5.5", messages=[{"role": "user", "content": "Hello"}]
             )
 
         release.assert_called_once_with(
+            check.call_args.kwargs["call_id"],
+            lease_claim_token=123,
+        )
+        solwyn._solwyn_reporter._http.close()
+        solwyn._solwyn_budget._http.close()
+
+    def test_an_unknown_failure_after_dispatch_keeps_the_bound(self) -> None:
+        # No positive evidence the request went unbilled (an unparseable 200
+        # looks like this): the claim is retired at its bound, not handed back.
+        client, _ = _openai_client()
+        client.chat.completions.create.side_effect = RuntimeError("unknown")
+        solwyn = _build_solwyn(client)
+
+        with (
+            patch.object(
+                solwyn._solwyn_budget, "check_budget", return_value=_lease_result()
+            ) as check,
+            patch.object(solwyn._solwyn_budget, "release_reservation") as release,
+            patch.object(solwyn._solwyn_budget, "abandon_reservation") as abandon,
+            patch.object(solwyn._solwyn_reporter, "report"),
+            solwyn_pkg.run("doomed-job"),
+            pytest.raises(RuntimeError),
+        ):
+            solwyn.chat.completions.create(
+                model="gpt-5.5", messages=[{"role": "user", "content": "Hello"}]
+            )
+
+        release.assert_not_called()
+        abandon.assert_called_once_with(
             check.call_args.kwargs["call_id"],
             lease_claim_token=123,
         )

@@ -349,6 +349,45 @@ def classify_exception(exc: BaseException) -> Disposition:
     return Disposition.FAIL_FAST
 
 
+def attempt_maybe_billed(exc: BaseException) -> bool:
+    """Whether a DISPATCHED attempt that raised ``exc`` may have been billed.
+
+    Independent of :func:`classify_exception`, which decides ROUTING (fail over,
+    stop, or stop as ambiguous). Routing must not decide funding: an unknown
+    failure stops the chain (FAIL_FAST) yet may come from a paid response, for
+    example an HTTP 200 whose body fails to parse. So after dispatch an attempt
+    counts as possibly billed unless there is positive evidence it was not:
+
+    - a numeric 4xx status (429 included), or 529 (overloaded): the provider
+      refused the request before generation started;
+    - a transport failure that proves the request was never sent (connect
+      refused, connect/pool timeout, botocore's pre-send classes), at the top or
+      as the direct cause of a provider timeout/connection wrapper.
+
+    Everything else counts as billed: every other 5xx, post-send transport errors,
+    timeouts and connection wrappers without pre-send proof (a bare
+    ``APIConnectionError`` with no cause still fails over, but proves nothing
+    about sending), decode/parse/validation errors, unknown exceptions, and any
+    non-``Exception`` (cancellation, interrupt). Bedrock's 408/424 model errors
+    mean the model ran, so their names win over their statuses.
+    """
+    if not isinstance(exc, Exception):
+        return True
+    names = {_static_class_name(cls) for cls in type(exc).__mro__}
+    if "ReadTimeoutError" in names or names & _POST_SEND_BY_NAME:
+        return True
+    if names & _BOTOCORE_PRE_SEND_NAMES:
+        return False
+    transport = _transport_disposition(exc)
+    if transport is not None:
+        return transport is not Disposition.FAILOVER
+    if "APITimeoutError" in names or "APIConnectionError" in names:
+        cause = exc.__cause__ or exc.__context__
+        return cause is None or _transport_disposition(cause) is not Disposition.FAILOVER
+    status = _numeric_status(exc)
+    return status is None or not (400 <= status < 500 or status == 529)
+
+
 def retry_after_seconds(exc: BaseException) -> float | None:
     """Return a non-negative ``Retry-After`` delay (seconds) for an HTTP 429, else None.
 

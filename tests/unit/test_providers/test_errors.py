@@ -505,3 +505,133 @@ class TestTogetherExceptionClassification:
     )
     def test_legacy_v1_unknown_error_family_is_fail_fast(self, error_type: type[Exception]) -> None:
         assert classify_exception(error_type("legacy Together error")) is Disposition.FAIL_FAST
+
+
+# ---------------------------------------------------------------------------
+# attempt_maybe_billed: funding evidence, independent of routing
+# ---------------------------------------------------------------------------
+
+
+class _ModelTimeoutException(_Status):
+    """Bedrock's 408 that means the model ran (name wins over status)."""
+
+
+_ModelTimeoutException.__name__ = "ModelTimeoutException"
+
+
+class _EndpointConnectionError(Exception):
+    pass
+
+
+_EndpointConnectionError.__name__ = "EndpointConnectionError"
+
+
+def _wrapped(wrapper: type[Exception], cause: BaseException | None) -> Exception:
+    exc = wrapper()
+    exc.__cause__ = cause
+    return exc
+
+
+def _validation_error() -> Exception:
+    import pydantic
+
+    class _Shape(pydantic.BaseModel):
+        x: int
+
+    try:
+        _Shape.model_validate({"x": "not an int"})
+    except pydantic.ValidationError as exc:
+        return exc
+    raise AssertionError("expected a ValidationError")
+
+
+def _json_error() -> Exception:
+    import json
+
+    try:
+        json.loads('{"id": "c", "cho')
+    except json.JSONDecodeError as exc:
+        return exc
+    raise AssertionError("expected a JSONDecodeError")
+
+
+@pytest.mark.unit
+class TestAttemptMaybeBilled:
+    @pytest.mark.parametrize("status", [400, 401, 403, 404, 409, 413, 422, 429, 529])
+    def test_a_4xx_or_529_proves_no_charge(self, status: int) -> None:
+        # 529 (overloaded) rejects before generation starts: a known rejection,
+        # the same rule as the TS SDK.
+        from solwyn.providers._errors import attempt_maybe_billed
+
+        assert attempt_maybe_billed(_Status(status)) is False
+        assert attempt_maybe_billed(_GoogleErr(status)) is False
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ConnectError("refused"),
+            httpx.ConnectTimeout("slow connect"),
+            httpx.PoolTimeout("pool"),
+            _EndpointConnectionError(),
+        ],
+        ids=["connect_error", "connect_timeout", "pool_timeout", "botocore_endpoint"],
+    )
+    def test_a_proven_pre_send_failure_proves_no_charge(self, exc: Exception) -> None:
+        from solwyn.providers._errors import attempt_maybe_billed
+
+        assert attempt_maybe_billed(exc) is False
+        if isinstance(exc, httpx.HTTPError):
+            # The openai/anthropic wrappers chain httpx causes, never botocore.
+            assert attempt_maybe_billed(_wrapped(APIConnectionError, exc)) is False
+            assert attempt_maybe_billed(_wrapped(APITimeoutError, exc)) is False
+
+    @pytest.mark.parametrize(
+        "make",
+        [
+            lambda: _Status(500),
+            lambda: _Status(503),
+            lambda: _Status(502),
+            lambda: _GoogleErr(503),
+            lambda: _ModelTimeoutException(408),
+            lambda: httpx.ReadTimeout("read"),
+            lambda: httpx.RemoteProtocolError("dropped"),
+            lambda: httpx.DecodingError("bad gzip"),
+            lambda: _wrapped(APIConnectionError, None),
+            lambda: _wrapped(APITimeoutError, None),
+            lambda: _wrapped(APIConnectionError, httpx.DecodingError("bad gzip")),
+            lambda: _wrapped(APIConnectionError, RuntimeError("unknown")),
+            _json_error,
+            _validation_error,
+            lambda: ValueError("unparseable"),
+            lambda: RuntimeError("unknown"),
+            lambda: KeyboardInterrupt(),
+        ],
+        ids=[
+            "500",
+            "503",
+            "502",
+            "google_503",
+            "bedrock_model_timeout_408",
+            "read_timeout",
+            "remote_protocol",
+            "decoding_error",
+            "bare_connection_wrapper",
+            "bare_timeout_wrapper",
+            "connection_wrapper_decode_cause",
+            "connection_wrapper_unknown_cause",
+            "json_decode",
+            "pydantic_validation",
+            "value_error",
+            "runtime_error",
+            "keyboard_interrupt",
+        ],
+    )
+    def test_anything_else_counts_as_billed(self, make: Any) -> None:
+        from solwyn.providers._errors import attempt_maybe_billed
+
+        assert attempt_maybe_billed(make()) is True
+
+    def test_routing_is_unchanged_for_the_unknown_default(self) -> None:
+        # Routing still stops the chain on an unknown failure; only funding moved.
+        assert classify_exception(_json_error()) is Disposition.FAIL_FAST
+        assert classify_exception(_wrapped(APIConnectionError, None)) is Disposition.FAILOVER

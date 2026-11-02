@@ -141,7 +141,12 @@ from solwyn.exceptions import (
     UntranslatableRequestError,
 )
 from solwyn.providers import _translation
-from solwyn.providers._errors import Disposition, classify_exception, retry_after_seconds
+from solwyn.providers._errors import (
+    Disposition,
+    attempt_maybe_billed,
+    classify_exception,
+    retry_after_seconds,
+)
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 from solwyn.stream import (
     AsyncStreamWrapper,
@@ -950,6 +955,9 @@ def _make_stream_entry_error_handler(
             if isinstance(exc, Exception)
             else Disposition.POST_SEND_AMBIGUOUS
         )
+        # The manager sent its request in __enter__: possibly billed unless the
+        # failure proves otherwise (a 4xx such as a 400/429 is a known rejection).
+        maybe_billed = attempt_maybe_billed(exc)
         _settle_stream_failure(
             owner,
             ctx,
@@ -963,7 +971,7 @@ def _make_stream_entry_error_handler(
             agent_run=agent_run,
             trace=trace,
             record_breaker_failure=isinstance(exc, Exception) and disp is not Disposition.FAIL_FAST,
-            possibly_succeeded=True if disp is Disposition.POST_SEND_AMBIGUOUS else None,
+            possibly_succeeded=True if maybe_billed else None,
             failover_error_class=type(exc).__name__,
             admission=admission,
         )
@@ -3420,9 +3428,16 @@ class Solwyn(_SolwynBase):
                         # unknown, so the reservation keeps its bound.
                         loop_refused = isinstance(exc, OutputBoundUnenforceableError)
                         disp = Disposition.FAIL_FAST if loop_refused else classify_exception(exc)
-                        # In particular, a rejected 429 followed by Retry-After
-                        # sleep holds the probe but has no paid work to refund.
-                        usage_unknown = disp is Disposition.POST_SEND_AMBIGUOUS
+                        # Funding follows billing evidence, not routing: once
+                        # dispatched, the attempt is possibly billed unless a 4xx
+                        # status or a proven pre-send transport failure says it
+                        # was not (an unparseable 200 stops the chain yet may be
+                        # paid). In particular, a rejected 429 followed by
+                        # Retry-After sleep holds the probe but has no paid work
+                        # to refund.
+                        usage_unknown = loop_refused or (
+                            usage_unknown and attempt_maybe_billed(exc)
+                        )
                         # Fix [A]: the PRIMARY was attempted and raised in this walk
                         # -> a later cross-provider success is a REACTIVE failover
                         # (PRIMARY_ERROR), not a proactive breaker-open reroute.
@@ -3465,8 +3480,12 @@ class Solwyn(_SolwynBase):
                         # A correctly-not-failed-over post-send-ambiguous abort
                         # emits an ERROR event with possibly_succeeded=True so the Cloud API
                         # can reconcile the (possibly-landed, never-confirmed) reservation.
-                        possibly_succeeded = loop_refused or (
-                            disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
+                        possibly_succeeded = usage_unknown and (
+                            disp is Disposition.FAIL_FAST
+                            or (
+                                disp is Disposition.POST_SEND_AMBIGUOUS
+                                and not allow_ambiguous_failover
+                            )
                         )
                         try:
                             self._solwyn_reporter.report(
@@ -3498,18 +3517,21 @@ class Solwyn(_SolwynBase):
                             logger.warning(
                                 "call.error_receipt_failed: %s", type(receipt_exc).__name__
                             )
-                        if disp is Disposition.FAIL_FAST and loop_refused:
-                            self._solwyn_budget.abandon_reservation(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
-                            raise
                         if disp is Disposition.FAIL_FAST:
-                            self._solwyn_budget.release_reservation(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
-                            raise  # 4xx/404/refusal — do NOT advance the chain
+                            # Stop the chain. A possibly billed attempt (refused
+                            # loop, unparseable or unknown failure after dispatch)
+                            # keeps its bound; a proven rejection gives it back.
+                            if usage_unknown:
+                                self._solwyn_budget.abandon_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            else:
+                                self._solwyn_budget.release_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            raise  # do NOT advance the chain
                         if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
                             # The receipt lets the server reconcile unknown usage;
                             # local lease authority must also keep its spent bound.
@@ -3518,8 +3540,9 @@ class Solwyn(_SolwynBase):
                                 lease_claim_token=_lease_claim_token(budget),
                             )
                             raise  # re-raise ORIGINAL exception (drop-in contract)
-                        if disp is Disposition.POST_SEND_AMBIGUOUS:
-                            # Failing over does not un-send this hop. The call keeps
+                        if usage_unknown:
+                            # Failing over does not un-send this hop (ambiguous
+                            # failover, or a possibly billed FAILOVER such as 529). The call keeps
                             # its reservation, pinned: no later settlement, refusal,
                             # or chain exhaustion may refund the bound.
                             if (
@@ -5419,9 +5442,16 @@ class AsyncSolwyn(_SolwynBase):
                         # unknown, so the reservation keeps its bound.
                         loop_refused = isinstance(exc, OutputBoundUnenforceableError)
                         disp = Disposition.FAIL_FAST if loop_refused else classify_exception(exc)
-                        # In particular, a rejected 429 followed by Retry-After
-                        # sleep holds the probe but has no paid work to refund.
-                        usage_unknown = disp is Disposition.POST_SEND_AMBIGUOUS
+                        # Funding follows billing evidence, not routing: once
+                        # dispatched, the attempt is possibly billed unless a 4xx
+                        # status or a proven pre-send transport failure says it
+                        # was not (an unparseable 200 stops the chain yet may be
+                        # paid). In particular, a rejected 429 followed by
+                        # Retry-After sleep holds the probe but has no paid work
+                        # to refund.
+                        usage_unknown = loop_refused or (
+                            usage_unknown and attempt_maybe_billed(exc)
+                        )
                         # Fix [A]: the PRIMARY was attempted and raised in this walk
                         # -> a later cross-provider success is a REACTIVE failover
                         # (PRIMARY_ERROR), not a proactive breaker-open reroute.
@@ -5462,8 +5492,12 @@ class AsyncSolwyn(_SolwynBase):
                         # A correctly-not-failed-over post-send-ambiguous abort
                         # emits an ERROR event with possibly_succeeded=True so the Cloud API
                         # can reconcile the (possibly-landed, never-confirmed) reservation.
-                        possibly_succeeded = loop_refused or (
-                            disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
+                        possibly_succeeded = usage_unknown and (
+                            disp is Disposition.FAIL_FAST
+                            or (
+                                disp is Disposition.POST_SEND_AMBIGUOUS
+                                and not allow_ambiguous_failover
+                            )
                         )
                         try:
                             self._solwyn_reporter.report(
@@ -5495,18 +5529,21 @@ class AsyncSolwyn(_SolwynBase):
                             logger.warning(
                                 "call.error_receipt_failed: %s", type(receipt_exc).__name__
                             )
-                        if disp is Disposition.FAIL_FAST and loop_refused:
-                            self._solwyn_budget.abandon_reservation(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
-                            raise
                         if disp is Disposition.FAIL_FAST:
-                            self._solwyn_budget.release_reservation(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
-                            raise
+                            # Stop the chain. A possibly billed attempt (refused
+                            # loop, unparseable or unknown failure after dispatch)
+                            # keeps its bound; a proven rejection gives it back.
+                            if usage_unknown:
+                                self._solwyn_budget.abandon_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            else:
+                                self._solwyn_budget.release_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            raise  # do NOT advance the chain
                         if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
                             # Mirror sync: retire the claim without refunding
                             # authority the provider may already have consumed.
@@ -5515,7 +5552,7 @@ class AsyncSolwyn(_SolwynBase):
                                 lease_claim_token=_lease_claim_token(budget),
                             )
                             raise
-                        if disp is Disposition.POST_SEND_AMBIGUOUS:
+                        if usage_unknown:
                             # Mirror sync: pin the still-live reservation so no
                             # later exit from this call (cancellation included)
                             # can refund what this hop may have consumed.

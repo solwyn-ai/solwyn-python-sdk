@@ -46,6 +46,16 @@ Bug fix: a stream closed early no longer gives back budget it may have spent.
   back the same way. It now settles once as an early close when it is
   collected. Closing the client also settles every stream it returned that is
   still open, before the reporter shuts down.
+- **An unrecognized failure after dispatch keeps its funding.** Whether a
+  failed attempt gave its budget back was decided by its failover routing, so
+  any failure that stops the chain counted as unbilled. An HTTP 200 whose body
+  failed to parse (or any unknown exception) released a lease claim the
+  provider may have spent: on a final 128-token lease, the next call could
+  then run on the same tokens. Funding now follows billing evidence: after
+  dispatch, a failure keeps its bound unless it has a 4xx status (429
+  included), a 529, or a transport error that proves nothing was sent. This
+  also covers a connection error whose cause is not a pre-send failure and a
+  Responses `stream()` entry failure. Failover routing is unchanged.
 
 ## [0.10.1] - 2026-11-02
 

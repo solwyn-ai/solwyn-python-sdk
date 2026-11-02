@@ -2488,7 +2488,9 @@ async def test_stream_interrupt_billing_matches_main(
 @pytest.mark.parametrize(
     "exception,failure_count,possibly_succeeded",
     [
-        (ValueError, 0, None),
+        # The manager sent its request in __enter__: an unknown failure there
+        # is possibly billed; a proven pre-send ConnectError is not.
+        (ValueError, 0, True),
         (httpx.ConnectError, 1, None),
         (KeyboardInterrupt, 0, True),
         (GeneratorExit, 0, True),

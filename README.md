@@ -958,6 +958,13 @@ the stream. A stream still open when the interpreter exits is not settled. A
 stream that settles after its client's reporter has shut down still holds its
 lease claim locally, but its receipt is refused and counted in the reporter's
 `dropped_counts` (`settlement_confirm.closed_enqueue`, `event.closed_enqueue`).
+Once a request is dispatched, Solwyn treats a failure as possibly billed
+unless there is positive evidence it was not: a 4xx status (429 included), a
+529 (overloaded), or a transport failure that proves the request was never sent
+(connect refused, connect or pool timeout). Anything else keeps the bound,
+including an HTTP 200 whose body fails to parse or decode, any other 5xx, a
+connection error without pre-send proof, and an unknown exception. Whether the
+call fails over is decided separately and is unchanged.
 Sync and async dispatch errors with unknown post-send usage (read timeouts,
 5xx responses, or protocol drops) also retain the bound when ambiguous failover
 is disabled. With `failover_idempotency="always"` the call fails over instead,

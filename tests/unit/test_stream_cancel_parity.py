@@ -631,3 +631,121 @@ def test_open_and_dropped_streams_at_interpreter_exit_raise_nothing(tmp_path: An
     assert result.stdout.strip() == "ok"
     assert "Traceback" not in result.stderr
     assert "Exception ignored" not in result.stderr
+
+
+# ── An unrecognized failure after dispatch is possibly billed (TS finding 4) ──
+
+
+class _Failing:
+    """First request fails after dispatch in ``kind``; later requests succeed."""
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+        self.requests = 0
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests += 1
+        if self.requests > 1:
+            return httpx.Response(200, json=_CHAT_BODY)
+        if self.kind == "truncated_json":
+            return httpx.Response(
+                200, headers={"content-type": "application/json"}, content=b'{"id": "c", "cho'
+            )
+        if self.kind == "decode_error":
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json", "content-encoding": "gzip"},
+                content=b"not gzip at all",
+            )
+        if self.kind == "unknown_cause":
+            raise RuntimeError("transport adapter blew up after sending")
+        if self.kind == "overloaded_529":
+            return httpx.Response(529, json={"error": {"message": "overloaded"}})
+        return httpx.Response(500, json={"error": {"message": "server error"}})
+
+    async def async_handler(self, request: httpx.Request) -> httpx.Response:
+        return self.handler(request)
+
+    def client(self, *, is_async: bool) -> Any:
+        if is_async:
+            return openai.AsyncOpenAI(
+                api_key="sk-test",
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(self.async_handler)),
+                max_retries=0,
+            )
+        return openai.OpenAI(
+            api_key="sk-test",
+            http_client=httpx.Client(transport=httpx.MockTransport(self.handler)),
+            max_retries=0,
+        )
+
+
+@pytest.mark.unit
+class TestUnrecognizedPostDispatchFailureKeepsItsClaim:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("kind", ["truncated_json", "decode_error", "unknown_cause"])
+    async def test_claim_stays_spent_and_next_call_is_checked(
+        self, is_async: bool, kind: str
+    ) -> None:
+        plane = FakeControlPlane(granted_tokens=128, final_grant=True)
+        provider = _Failing(kind)
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+
+        async def create() -> Any:
+            result = wrapped.chat.completions.create(**_REQUEST)
+            return await result if is_async else result
+
+        try:
+            with solwyn.run(f"post-dispatch-{kind}") as run_id:
+                with pytest.raises(Exception) as raised:
+                    await create()
+                assert not isinstance(raised.value, solwyn.SolwynError)
+                state = wrapped._solwyn_budget._lease.state_for(run_id)
+                spent, reserved = state.spent_tokens_since_report, state.reserved_tokens
+                await create()
+        finally:
+            await _close_client(wrapped, is_async=is_async)
+
+        assert provider.requests == 2
+        assert reserved == 0
+        # The provider may have billed the whole bound: it stays spent ...
+        assert spent >= 100
+        # ... so the second call no longer fits the 128-token lease.
+        assert [check.model for check in plane.checks] == [MODEL]
+        assert plane.lease_surrenders[-1].spent_tokens >= 100
+        failed = plane.ingested[0]
+        assert failed.status.value == "error"
+        # A stopped chain flags its receipt; a failover hop (529, a connection
+        # wrapper without pre-send proof) keeps the failover receipt shape and
+        # is pinned instead, like an ambiguous failover hop.
+        # (The openai SDK wraps a body decode error in APIConnectionError,
+        # which routes as failover; a handler's own exception propagates raw.)
+        stops_the_chain = kind in ("truncated_json", "unknown_cause")
+        assert failed.possibly_succeeded is (True if stops_the_chain else None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    async def test_a_529_is_a_known_rejection_and_releases(self, is_async: bool) -> None:
+        plane = FakeControlPlane(granted_tokens=128, final_grant=True)
+        provider = _Failing("overloaded_529")
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+
+        async def create() -> Any:
+            result = wrapped.chat.completions.create(**_REQUEST)
+            return await result if is_async else result
+
+        try:
+            with solwyn.run("post-dispatch-529") as run_id:
+                with pytest.raises(openai.APIStatusError):
+                    await create()
+                state = wrapped._solwyn_budget._lease.state_for(run_id)
+                spent, reserved = state.spent_tokens_since_report, state.reserved_tokens
+                await create()
+        finally:
+            await _close_client(wrapped, is_async=is_async)
+
+        assert (spent, reserved) == (0, 0)
+        # The released claim funds the next call: no per-call check.
+        assert plane.checks == []
+        assert plane.ingested[0].possibly_succeeded is None
