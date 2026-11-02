@@ -304,8 +304,13 @@ class TestFailoverReadmission:
             solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
 
         assert [check["model"] for check in stub.checks] == [CHEAP, PRICEY]
-        assert [confirm["reservation_id"] for confirm in stub.confirms] == ["res_2"]
-        assert set(stub.held) == {"res_1"}
+        # The possibly billed primary confirms its floor on its own reservation,
+        # under its own call id, beside the hop's settle (0.10.2): no hold left.
+        assert [confirm["reservation_id"] for confirm in stub.confirms] == ["res_1", "res_2"]
+        floor, served = stub.confirms
+        assert floor["token_details"]["is_estimated"] is True
+        assert floor["call_id"] != served["call_id"]
+        assert stub.held == {}
 
     def test_alert_only_fails_over_without_a_second_check(self) -> None:
         stub, primary, fallback = _setup(_TIGHT, mode="alert_only")
@@ -458,9 +463,11 @@ class TestReadmissionAfterAnAmbiguousAttempt:
 
         assert [check["model"] for check in stub.checks] == [CHEAP, CHEAP]
         assert len(again.bodies) == 1
-        # The possibly billed hold stays; the hop settles its own reservation.
-        assert [confirm["reservation_id"] for confirm in stub.confirms] == ["res_2"]
-        assert set(stub.held) == {"res_1"}
+        # The possibly billed hold is confirmed at its floor under its own call
+        # id; the hop settles its own reservation (0.10.2).
+        assert [confirm["reservation_id"] for confirm in stub.confirms] == ["res_1", "res_2"]
+        assert stub.confirms[0]["token_details"]["is_estimated"] is True
+        assert stub.held == {}
 
     def test_same_identity_hop_that_does_not_fit_beside_the_hold_is_refused(self) -> None:
         # One cheap reservation (about $0.0025) fits a $0.004 cap; two do not.
@@ -551,10 +558,13 @@ class TestLeaseFundedAmbiguousFailover:
         # The fallback paid its own per-call check at its own bound ...
         assert [(check.provider.value, check.model) for check in plane.checks] == [("groq", PRICEY)]
         assert plane.checks[0].estimated_output_bound == DEFAULT_OUTPUT_BOUND
-        # ... and settles that reservation, not the lease.
-        assert len(plane.confirms) == 1
-        assert plane.confirms[0].reservation_id is not None
-        assert plane.confirms[0].lease_id is None
+        # ... and settles that reservation; the primary's lease claim confirms
+        # its floor under its own call id (0.10.2).
+        [floor] = [c for c in plane.confirms if c.token_details.is_estimated]
+        [served] = [c for c in plane.confirms if not c.token_details.is_estimated]
+        assert floor.lease_id is not None and floor.call_id != served.call_id
+        assert served.reservation_id is not None
+        assert served.lease_id is None
         # The possibly billed primary's claim stays spent at its floor.
         assert reserved == 0
         assert spent >= DEFAULT_OUTPUT_BOUND
@@ -803,7 +813,10 @@ class TestAsyncAmbiguousExposure:
             await solwyn.close()
 
         assert again.bodies == []
-        assert set(stub.held) == {"res_1"}
+        # The possibly billed hold was confirmed at its floor (0.10.2) and
+        # still counts, so the hop beside it was refused.
+        assert stub.held == {}
+        assert stub.confirms[0]["token_details"]["is_estimated"] is True
 
     @pytest.mark.asyncio
     async def test_async_lease_funded_ambiguous_attempt_is_readmitted(self) -> None:
@@ -823,7 +836,8 @@ class TestAsyncAmbiguousExposure:
                 spent = state.spent_tokens_since_report
 
         assert [(check.provider.value, check.model) for check in plane.checks] == [("groq", PRICEY)]
-        assert plane.confirms[0].lease_id is None
+        [served] = [c for c in plane.confirms if not c.token_details.is_estimated]
+        assert served.lease_id is None
         assert spent >= DEFAULT_OUTPUT_BOUND
 
 

@@ -368,10 +368,17 @@ async def test_failed_over_ambiguous_hop_pins_the_bound_for_every_later_exit(
     # receipt, and a served hop confirms its MEASURED usage, not the bound.
     errors = [event for event in plane.ingested if event.status == "error"]
     assert errors and all(event.possibly_succeeded is None for event in errors)
+    # Under hard_deny each possibly billed (503) hop also confirms its floor,
+    # under its own error event's call id (0.10.2); a 429 or 400 hop does not.
+    floors = [c for c in plane.confirms if c.token_details.is_estimated]
+    measured = [c for c in plane.confirms if not c.token_details.is_estimated]
+    assert len(floors) == (primary_error is _Status503) + (fallback_error is _Status503)
+    assert {floor.call_id for floor in floors} <= {event.call_id for event in errors}
     if fallback_error is None:
-        assert _only_confirm(plane).token_details.total_tokens == 15
+        [served] = measured
+        assert served.token_details.total_tokens == 15
     else:
-        assert plane.confirms == []
+        assert measured == []
     assert [s.spent_tokens for s in plane.lease_surrenders] == [spent]
 
 

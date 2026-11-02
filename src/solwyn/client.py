@@ -3562,6 +3562,18 @@ class Solwyn(_SolwynBase):
                         possibly_succeeded = loop_refused or (
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
+                        floored = usage_unknown and _hard_deny_funding(budget)
+                        # A possibly billed hop the walk advances past settles
+                        # under its own call id: core nets max(receipt, events)
+                        # per call id, so sharing the served hop's id would
+                        # hide this hop's floor behind that hop's spend.
+                        hop_call_id = (
+                            str(uuid.uuid4())
+                            if floored
+                            and disp is not Disposition.FAIL_FAST
+                            and (disp is Disposition.FAILOVER or allow_ambiguous_failover)
+                            else call_id
+                        )
                         try:
                             hop_region = _safe_extract_region(rt)
                             reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
@@ -3577,28 +3589,18 @@ class Solwyn(_SolwynBase):
                                 requested_model=requested_model if is_provider_fallback else None,
                                 failover_error_class=type(exc).__name__,
                                 attempt_index=chain_index,
-                                call_id=call_id,
+                                call_id=hop_call_id,
                                 possibly_succeeded=True if possibly_succeeded else None,
                                 agent_run=agent_run,
                                 trace=trace,
                                 provider_region=hop_region,
                                 lease_id=lease_id,
                             )
-                            if (
-                                usage_unknown
-                                and _hard_deny_funding(budget)
-                                and (reservation_id or lease_id)
-                                and (
-                                    disp is Disposition.FAIL_FAST
-                                    or (
-                                        disp is Disposition.POST_SEND_AMBIGUOUS
-                                        and not allow_ambiguous_failover
-                                    )
-                                )
-                            ):
-                                # A possibly billed attempt ends the call under
-                                # hard_deny: confirm its floor beside the receipt so
-                                # core keeps it durably (netted per call id).
+                            if floored and (reservation_id or lease_id):
+                                # A possibly billed attempt under hard_deny,
+                                # whether it ends the call or the walk advances:
+                                # confirm its floor beside the receipt so core
+                                # keeps it durably (netted per call id).
                                 floor_confirm = self._solwyn_budget.build_confirm_request(
                                     reservation_id=reservation_id,
                                     lease_id=lease_id,
@@ -3607,7 +3609,7 @@ class Solwyn(_SolwynBase):
                                     token_details=_floor_usage(budget, TokenDetails()),
                                     provider=provider,
                                     is_provider_fallback=is_provider_fallback,
-                                    call_id=call_id,
+                                    call_id=hop_call_id,
                                     provider_region=hop_region,
                                     usage_unmeasured=True,
                                 )
@@ -5610,6 +5612,18 @@ class AsyncSolwyn(_SolwynBase):
                         possibly_succeeded = loop_refused or (
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
+                        floored = usage_unknown and _hard_deny_funding(budget)
+                        # A possibly billed hop the walk advances past settles
+                        # under its own call id: core nets max(receipt, events)
+                        # per call id, so sharing the served hop's id would
+                        # hide this hop's floor behind that hop's spend.
+                        hop_call_id = (
+                            str(uuid.uuid4())
+                            if floored
+                            and disp is not Disposition.FAIL_FAST
+                            and (disp is Disposition.FAILOVER or allow_ambiguous_failover)
+                            else call_id
+                        )
                         try:
                             hop_region = _safe_extract_region(rt)
                             reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
@@ -5625,28 +5639,18 @@ class AsyncSolwyn(_SolwynBase):
                                 requested_model=requested_model if is_provider_fallback else None,
                                 failover_error_class=type(exc).__name__,
                                 attempt_index=chain_index,
-                                call_id=call_id,
+                                call_id=hop_call_id,
                                 possibly_succeeded=True if possibly_succeeded else None,
                                 agent_run=agent_run,
                                 trace=trace,
                                 provider_region=hop_region,
                                 lease_id=lease_id,
                             )
-                            if (
-                                usage_unknown
-                                and _hard_deny_funding(budget)
-                                and (reservation_id or lease_id)
-                                and (
-                                    disp is Disposition.FAIL_FAST
-                                    or (
-                                        disp is Disposition.POST_SEND_AMBIGUOUS
-                                        and not allow_ambiguous_failover
-                                    )
-                                )
-                            ):
-                                # A possibly billed attempt ends the call under
-                                # hard_deny: confirm its floor beside the receipt so
-                                # core keeps it durably (netted per call id).
+                            if floored and (reservation_id or lease_id):
+                                # A possibly billed attempt under hard_deny,
+                                # whether it ends the call or the walk advances:
+                                # confirm its floor beside the receipt so core
+                                # keeps it durably (netted per call id).
                                 floor_confirm = self._solwyn_budget.build_confirm_request(
                                     reservation_id=reservation_id,
                                     lease_id=lease_id,
@@ -5655,7 +5659,7 @@ class AsyncSolwyn(_SolwynBase):
                                     token_details=_floor_usage(budget, TokenDetails()),
                                     provider=provider,
                                     is_provider_fallback=is_provider_fallback,
-                                    call_id=call_id,
+                                    call_id=hop_call_id,
                                     provider_region=hop_region,
                                     usage_unmeasured=True,
                                 )

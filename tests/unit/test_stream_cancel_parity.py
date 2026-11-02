@@ -1233,3 +1233,54 @@ class TestFailureFloorSurvivesExpiryAndSurrender:
             await _next_call_is_denied(plane, wrapped, is_async=is_async)
         finally:
             await _close_client(wrapped, is_async=is_async)
+
+
+@pytest.mark.unit
+class TestFailedOverHopFloorHasItsOwnCallId:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("funding", ["per_call", "lease"])
+    async def test_a_possibly_billed_hop_that_fails_over_counts_beside_the_served_hop(
+        self, funding: str, is_async: bool
+    ) -> None:
+        plane = _CorePlane(granted_tokens=500, final_grant=True)
+        primary, fallback = _FailingFirst("read_timeout", is_async=is_async), _Answering()
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(
+            primary.client(),
+            fallback=[(fallback.client(is_async=is_async), _FALLBACK_MODEL)],
+            failover_idempotency="always",
+        )
+        scope = solwyn.run("floor-failover") if funding == "lease" else contextlib.nullcontext()
+        with scope:
+            result = wrapped.chat.completions.create(**_REQUEST)
+            if is_async:
+                await result
+        await _close_client(wrapped, is_async=is_async)
+
+        assert (primary.requests, fallback.requests) == (1, 1)
+        floor = _floor_confirm(plane)
+        [served] = [c for c in plane.confirms if not c.token_details.is_estimated]
+        # The failed-over hop settles under a fresh call id, with its own error
+        # event; the served hop keeps the call's id.
+        assert floor.call_id != served.call_id
+        assert (floor.model, floor.provider) == (MODEL, "openai")
+        assert (floor.lease_id is not None) is (funding == "lease")
+        [hop_event] = [e for e in plane.ingested if e.call_id == floor.call_id]
+        assert (hop_event.status.value, hop_event.attempt_index) == ("error", 0)
+        [served_event] = [e for e in plane.ingested if e.call_id == served.call_id]
+        assert served_event.status.value == "success"
+
+        # Both hops count: the next call is denied once floor + served is spent.
+        served_tokens = served.token_details.input_tokens + served.token_details.output_tokens
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(primary.client())
+        try:
+            plane.expire_and_reconcile()
+            plane.headroom_tokens = (
+                floor.token_details.input_tokens + floor.token_details.output_tokens + served_tokens
+            )
+            with pytest.raises(solwyn.BudgetExceededError):
+                result = wrapped.chat.completions.create(**_REQUEST)
+                if is_async:
+                    await result
+        finally:
+            await _close_client(wrapped, is_async=is_async)
