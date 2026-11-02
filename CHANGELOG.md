@@ -40,6 +40,11 @@ In both cases a call could spend past a `hard_deny` budget.
   been billed was followed by the next attempt on the same claim, so two
   generations could be counted as one. On `hard_deny`, that claim now stays
   spent at its full bound and the next attempt gets its own per-call check.
+- **A lease covers (provider, model) pairs, not model names.** A lease was
+  treated as covering any call whose model names it had declared, even on a
+  provider it never declared, which core prices differently. A call is now
+  lease-funded only when every (provider, model) it can reach was declared;
+  otherwise it takes a per-call check.
 - **`hard_deny` allows are no longer cached.** A cached allow carries no
   reservation, so a repeated call, or a second call failing over to the same
   hop, could run on an allow that nothing funded. Every `hard_deny` call now

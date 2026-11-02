@@ -36,6 +36,10 @@ from solwyn._types import (
 
 logger = logging.getLogger(__name__)
 
+# One priced lane of a lease: core prices a lease per (provider, model) pair,
+# so coverage is decided on the pair, never the bare model name.
+DeclaredModel = tuple[str, str]
+
 # Reservation bound for a call that carries no max_tokens-family cap.
 DEFAULT_OUTPUT_BOUND = 4096
 
@@ -199,7 +203,7 @@ class LeaseState:
     posture_mode: BudgetMode = BudgetMode.ALERT_ONLY
     on_unreachable: OnUnreachable = "fail_open"
     final_grant: bool = False
-    declared_models: set[str] = field(default_factory=set)
+    declared_models: set[DeclaredModel] = field(default_factory=set)
     reservations: dict[str, _Reservation] = field(default_factory=dict)
     renewal_in_flight: bool = False
     consecutive_failures: int = 0
@@ -230,9 +234,21 @@ class LeaseState:
             if reservation.lease_id == self.lease_id
         )
 
-    def covers(self, model: str, fallback_models: Sequence[str]) -> bool:
-        """True when every model the call may reach is in the declared set."""
-        return {model, *fallback_models} <= self.declared_models
+    def covers(
+        self,
+        provider: str,
+        model: str,
+        fallback_providers: Sequence[str],
+        fallback_models: Sequence[str],
+    ) -> bool:
+        """True when every (provider, model) the call may reach is declared.
+
+        Core values the lease at the worst rate of its declared pairs, so a
+        declared model name on an undeclared provider is not covered.
+        """
+        return {(provider, model), *zip(fallback_providers, fallback_models, strict=True)} <= (
+            self.declared_models
+        )
 
 
 class LeaseLedger:
@@ -297,12 +313,14 @@ class LeaseLedger:
         run_id: str,
         call_id: str,
         estimated_input_tokens: int,
+        provider: str,
         model: str,
         now: float,
         breaker_open: bool,
         output_bound: int | None = None,
         modality: Modality = "text",
         has_estimated_media: bool = False,
+        fallback_providers: Sequence[str] = (),
         fallback_models: Sequence[str] = (),
         claim_token: int | None = None,
     ) -> LeaseAdmission:
@@ -343,7 +361,11 @@ class LeaseLedger:
             state.run_ineligible = False
             state.ineligible_retry_at = 0.0
 
-        if state is not None and state.has_lease and not state.covers(model, fallback_models):
+        if (
+            state is not None
+            and state.has_lease
+            and not state.covers(provider, model, fallback_providers, fallback_models)
+        ):
             return replace(
                 LeaseAdmission(LeaseDecision.LEGACY_CHECK, reason="model_outside_declared_set"),
                 claim_token=owned_claim_token,
@@ -522,7 +544,7 @@ class LeaseLedger:
         response: LeaseGrantResponse,
         *,
         now: float,
-        declared_models: Iterable[str] = (),
+        declared_models: Iterable[DeclaredModel] = (),
         expected_lease_id: str | None = None,
         expected_generation: int | None = None,
     ) -> tuple[GrantOutcome, LeaseSurrenderRequest | None]:

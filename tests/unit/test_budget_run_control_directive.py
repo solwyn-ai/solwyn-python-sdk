@@ -1461,7 +1461,7 @@ class TestLeaseRunControl:
                     RUN_ID,
                     replacement,
                     now=budget_module.time.monotonic(),
-                    declared_models=["gpt-5.5"],
+                    declared_models=[("openai", "gpt-5.5")],
                 )[0]
                 is GrantOutcome.APPLIED
             )
@@ -1528,7 +1528,7 @@ class TestLeaseRunControl:
                         _grant_payload(lease_id="lse_b", generation=1)
                     ),
                     now=budget_module.time.monotonic(),
-                    declared_models=["gpt-5.5"],
+                    declared_models=[("openai", "gpt-5.5")],
                 )[0]
                 is GrantOutcome.APPLIED
             )
@@ -1749,7 +1749,7 @@ class TestLeaseRunControl:
                     RUN_ID,
                     replacement,
                     now=budget_module.time.monotonic(),
-                    declared_models=["gpt-5.5"],
+                    declared_models=[("openai", "gpt-5.5")],
                 )[0]
                 is GrantOutcome.APPLIED
             )

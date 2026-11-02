@@ -44,6 +44,7 @@ from solwyn._control_plane_transport import (
 from solwyn._lease import (
     DEFAULT_OUTPUT_BOUND,
     INELIGIBLE_RETRY_AFTER_S,
+    DeclaredModel,
     GrantOutcome,
     LeaseAdmission,
     LeaseDecision,
@@ -1347,10 +1348,12 @@ class _BudgetEnforcerBase:
         agent_run_id: str,
         call_id: str,
         estimated_input_tokens: int,
+        provider: str,
         model: str,
         estimated_output_bound: int | None,
         modality: Modality,
         estimated_media: MediaUsage | None,
+        fallback_providers: Sequence[str],
         fallback_models: Sequence[str],
         breaker_open_override: bool | None = None,
         claim_token: int | None = None,
@@ -1370,12 +1373,14 @@ class _BudgetEnforcerBase:
                 run_id=agent_run_id,
                 call_id=call_id,
                 estimated_input_tokens=estimated_input_tokens,
+                provider=provider,
                 model=model,
                 now=time.monotonic(),
                 breaker_open=breaker_open,
                 output_bound=estimated_output_bound,
                 modality=modality,
                 has_estimated_media=estimated_media is not None,
+                fallback_providers=list(fallback_providers),
                 fallback_models=list(fallback_models),
                 claim_token=claim_token,
             )
@@ -1419,7 +1424,7 @@ class _BudgetEnforcerBase:
         self,
         agent_run_id: str,
         response: LeaseGrantResponse,
-        declared_models: Sequence[str],
+        declared_models: Sequence[DeclaredModel],
         *,
         renewal_request: LeaseRenewRequest | None = None,
         close_epoch: int | None = None,
@@ -1502,7 +1507,7 @@ class _BudgetEnforcerBase:
         self,
         agent_run_id: str,
         response: LeaseGrantResponse,
-        declared_models: Sequence[str],
+        declared_models: Sequence[DeclaredModel],
         *,
         renewal_request: LeaseRenewRequest | None,
     ) -> GrantOutcome:
@@ -1671,10 +1676,12 @@ class _BudgetEnforcerBase:
         agent_run_id: str | None,
         call_id: str | None,
         estimated_input_tokens: int,
+        provider: str,
         model: str,
         estimated_output_bound: int | None,
         modality: Modality,
         estimated_media: MediaUsage | None,
+        fallback_providers: Sequence[str],
         fallback_models: Sequence[str],
         claim_token: int | None,
     ) -> BudgetCheckResult | None:
@@ -1693,7 +1700,9 @@ class _BudgetEnforcerBase:
             agent_run_id=agent_run_id,
             call_id=call_id,
             estimated_input_tokens=estimated_input_tokens,
+            provider=provider,
             model=model,
+            fallback_providers=fallback_providers,
             estimated_output_bound=estimated_output_bound,
             modality=modality,
             estimated_media=estimated_media,
@@ -2111,7 +2120,7 @@ class _BudgetEnforcerBase:
         agent_run_id: str,
         request: LeaseRenewRequest,
         response: LeaseGrantResponse,
-        declared_models: Sequence[str],
+        declared_models: Sequence[DeclaredModel],
         *,
         close_epoch: int | None = None,
     ) -> LeaseSurrenderRequest | None:
@@ -2293,7 +2302,7 @@ class _BudgetEnforcerBase:
         agent_run_id: str,
         resp: httpx.Response,
         *,
-        declared_models: list[str],
+        declared_models: list[DeclaredModel],
         close_epoch: int,
     ) -> tuple[
         _GrantVerdict,
@@ -2679,10 +2688,12 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 agent_run_id=agent_run_id,
                 call_id=lease_call_id,
                 estimated_input_tokens=estimated_input_tokens,
+                provider=provider,
                 model=model,
                 estimated_output_bound=estimated_output_bound,
                 modality=modality,
                 estimated_media=estimated_media,
+                fallback_providers=fallback_providers,
                 fallback_models=fallback_models,
                 claim_token=lease_claim_token,
             )
@@ -2844,7 +2855,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             agent_run_id=agent_run_id,
             call_id=call_id,
             estimated_input_tokens=estimated_input_tokens,
+            provider=provider,
             model=model,
+            fallback_providers=fallback_providers,
             estimated_output_bound=estimated_output_bound,
             modality=modality,
             estimated_media=estimated_media,
@@ -2888,7 +2901,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 agent_run_id=agent_run_id,
                 call_id=call_id,
                 estimated_input_tokens=estimated_input_tokens,
+                provider=provider,
                 model=model,
+                fallback_providers=fallback_providers,
                 estimated_output_bound=estimated_output_bound,
                 modality=modality,
                 estimated_media=estimated_media,
@@ -2972,7 +2987,10 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             verdict, response, late_surrender = self._install_grant(
                 agent_run_id,
                 resp,
-                declared_models=[model, *fallback_models],
+                declared_models=[
+                    (provider, model),
+                    *zip(fallback_providers, fallback_models, strict=True),
+                ],
                 close_epoch=close_epoch,
             )
             if late_surrender is not None:
@@ -3012,7 +3030,12 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         request, close_epoch = work
         thread = threading.Thread(
             target=self._run_renewal_worker,
-            args=(agent_run_id, request, [model, *fallback_models], close_epoch),
+            args=(
+                agent_run_id,
+                request,
+                [(provider, model), *zip(fallback_providers, fallback_models, strict=True)],
+                close_epoch,
+            ),
             name="solwyn-lease-renew",
             daemon=True,
         )
@@ -3043,7 +3066,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         self,
         agent_run_id: str,
         request: LeaseRenewRequest,
-        declared_models: list[str],
+        declared_models: list[DeclaredModel],
         close_epoch: int,
     ) -> None:
         """Run one renewal and always return its bounded worker slot."""
@@ -3061,7 +3084,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         self,
         agent_run_id: str,
         request: LeaseRenewRequest,
-        declared_models: list[str],
+        declared_models: list[DeclaredModel],
         *,
         close_epoch: int | None = None,
     ) -> None:
@@ -3464,10 +3487,12 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 agent_run_id=agent_run_id,
                 call_id=lease_call_id,
                 estimated_input_tokens=estimated_input_tokens,
+                provider=provider,
                 model=model,
                 estimated_output_bound=estimated_output_bound,
                 modality=modality,
                 estimated_media=estimated_media,
+                fallback_providers=fallback_providers,
                 fallback_models=fallback_models,
                 claim_token=lease_claim_token,
             )
@@ -3624,7 +3649,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             agent_run_id=agent_run_id,
             call_id=call_id,
             estimated_input_tokens=estimated_input_tokens,
+            provider=provider,
             model=model,
+            fallback_providers=fallback_providers,
             estimated_output_bound=estimated_output_bound,
             modality=modality,
             estimated_media=estimated_media,
@@ -3666,7 +3693,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 agent_run_id=agent_run_id,
                 call_id=call_id,
                 estimated_input_tokens=estimated_input_tokens,
+                provider=provider,
                 model=model,
+                fallback_providers=fallback_providers,
                 estimated_output_bound=estimated_output_bound,
                 modality=modality,
                 estimated_media=estimated_media,
@@ -3749,7 +3778,10 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             verdict, response, late_surrender = self._install_grant(
                 agent_run_id,
                 resp,
-                declared_models=[model, *fallback_models],
+                declared_models=[
+                    (provider, model),
+                    *zip(fallback_providers, fallback_models, strict=True),
+                ],
                 close_epoch=close_epoch,
             )
             if late_surrender is not None:
@@ -3798,7 +3830,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         coroutine = self._renew_lease(
             agent_run_id,
             request,
-            [model, *fallback_models],
+            [(provider, model), *zip(fallback_providers, fallback_models, strict=True)],
             close_epoch=close_epoch,
         )
         try:
@@ -3829,7 +3861,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         self,
         agent_run_id: str,
         request: LeaseRenewRequest,
-        declared_models: list[str],
+        declared_models: list[DeclaredModel],
         *,
         close_epoch: int | None = None,
     ) -> None:

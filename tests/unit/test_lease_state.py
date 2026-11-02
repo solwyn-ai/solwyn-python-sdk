@@ -91,7 +91,7 @@ def _granted_ledger(now: float = 1_000.0, **response_overrides: Any) -> LeaseLed
     """A ledger holding a live lease for RUN, installed at ``now``."""
     ledger = _ledger()
     outcome, _release = ledger.apply_grant_response(
-        RUN, _response(**response_overrides), now=now, declared_models=["gpt-5.5"]
+        RUN, _response(**response_overrides), now=now, declared_models=[("openai", "gpt-5.5")]
     )
     if outcome is not GrantOutcome.APPLIED:
         raise AssertionError(f"fixture grant not applied: {outcome}")
@@ -103,6 +103,7 @@ def _admit(ledger: LeaseLedger, **kwargs: Any) -> LeaseAdmission:
         "run_id": RUN,
         "call_id": "call-1",
         "estimated_input_tokens": 1_000,
+        "provider": "openai",
         "model": "gpt-5.5",
         "now": 1_001.0,
         "breaker_open": False,
@@ -169,19 +170,34 @@ class TestAdmissionGates:
     def test_fallback_model_outside_declared_set_takes_the_legacy_path(self) -> None:
         ledger = _granted_ledger()
 
-        admission = _admit(ledger, fallback_models=["claude-4"])
+        admission = _admit(ledger, fallback_providers=["anthropic"], fallback_models=["claude-4"])
 
         assert admission.decision is LeaseDecision.LEGACY_CHECK
 
     def test_declared_chain_is_admitted(self) -> None:
         ledger = _ledger()
         ledger.apply_grant_response(
-            RUN, _response(), now=1_000.0, declared_models=["gpt-5.5", "claude-4"]
+            RUN,
+            _response(),
+            now=1_000.0,
+            declared_models=[("openai", "gpt-5.5"), ("anthropic", "claude-4")],
         )
 
-        admission = _admit(ledger, fallback_models=["claude-4"])
+        admission = _admit(ledger, fallback_providers=["anthropic"], fallback_models=["claude-4"])
 
         assert admission.decision is LeaseDecision.ADMIT_LOCAL
+
+    def test_declared_model_on_an_undeclared_provider_takes_the_legacy_path(self) -> None:
+        # Core prices a lease per (provider, model) pair; a declared model
+        # name on another provider is not covered.
+        ledger = _ledger()
+        ledger.apply_grant_response(
+            RUN, _response(), now=1_000.0, declared_models=[("openai", "gpt-5.5")]
+        )
+
+        admission = _admit(ledger, provider="azure_openai")
+
+        assert admission.decision is LeaseDecision.LEGACY_CHECK
 
     def test_server_ineligible_run_takes_the_legacy_path(self) -> None:
         ledger = _ledger()
@@ -227,7 +243,7 @@ class TestGrantApplication:
         ledger = _ledger()
 
         outcome, _release = ledger.apply_grant_response(
-            RUN, _response(), now=1_000.0, declared_models=["gpt-5.5"]
+            RUN, _response(), now=1_000.0, declared_models=[("openai", "gpt-5.5")]
         )
 
         assert outcome is GrantOutcome.APPLIED
@@ -500,7 +516,9 @@ class TestLiveLeaseAdmission:
 
     def test_absent_output_bound_uses_the_configured_default(self) -> None:
         ledger = _ledger(output_bound_default=2_048)
-        ledger.apply_grant_response(RUN, _response(), now=1_000.0, declared_models=["gpt-5.5"])
+        ledger.apply_grant_response(
+            RUN, _response(), now=1_000.0, declared_models=[("openai", "gpt-5.5")]
+        )
 
         admission = _admit(ledger, estimated_input_tokens=1_000)
 
@@ -513,7 +531,9 @@ class TestLiveLeaseAdmission:
         # the remainder with nothing standing behind it. Deliberate: fall back
         # to the configured bound rather than trust an absurd cap.
         ledger = _ledger(output_bound_default=2_048)
-        ledger.apply_grant_response(RUN, _response(), now=1_000.0, declared_models=["gpt-5.5"])
+        ledger.apply_grant_response(
+            RUN, _response(), now=1_000.0, declared_models=[("openai", "gpt-5.5")]
+        )
 
         admission = _admit(ledger, estimated_input_tokens=1_000, output_bound=bound)
 
@@ -842,7 +862,7 @@ class TestReservationLifecycle:
             RUN,
             _response(lease_id="lse_new", generation=1, granted_tokens=50_000),
             now=1_010.0,
-            declared_models=["gpt-5.5"],
+            declared_models=[("openai", "gpt-5.5")],
         )
 
         # Act
@@ -955,7 +975,7 @@ class TestReservationLifecycle:
             RUN,
             _response(),
             now=1_002.0,
-            declared_models=["gpt-5.5"],
+            declared_models=[("openai", "gpt-5.5")],
         )
         reentry = _admit(
             ledger,
@@ -987,7 +1007,7 @@ class TestReservationLifecycle:
             RUN,
             _response(lease_length_s=10_000.0),
             now=1_900.0,
-            declared_models=["gpt-5.5"],
+            declared_models=[("openai", "gpt-5.5")],
         )
         successor = _admit(ledger, call_id="aba", now=1_901.0)
         assert successor.decision is LeaseDecision.ADMIT_LOCAL
@@ -1078,7 +1098,7 @@ class TestReservationLifecycle:
             other_run,
             _response(lease_id="lse_other"),
             now=1_000.0,
-            declared_models=["gpt-5.5"],
+            declared_models=[("openai", "gpt-5.5")],
         )
         _admit(ledger, call_id="global-dup", estimated_input_tokens=1_000, output_bound=500)
 
@@ -1088,6 +1108,7 @@ class TestReservationLifecycle:
                 call_id="global-dup",
                 estimated_input_tokens=1_000,
                 output_bound=500,
+                provider="openai",
                 model="gpt-5.5",
                 now=1_002.0,
                 breaker_open=False,
@@ -1110,7 +1131,7 @@ class TestReservationLifecycle:
             RUN,
             _response(lease_id="lse_new", generation=1),
             now=1_010.0,
-            declared_models=["gpt-5.5"],
+            declared_models=[("openai", "gpt-5.5")],
         )
         _admit(ledger, call_id="new", estimated_input_tokens=1_000, output_bound=500, now=1_011.0)
 
@@ -1299,7 +1320,7 @@ class TestRenewalBookkeeping:
             RUN,
             _response(lease_id="lse_replacement", generation=1, granted_tokens=77_000),
             now=1_010.0,
-            declared_models=["gpt-5.5"],
+            declared_models=[("openai", "gpt-5.5")],
         )
         replacement_request = ledger.claim_renewal_request(RUN)
         assert replacement_request is not None
@@ -1625,7 +1646,7 @@ class TestRenewalNetting:
             RUN,
             _response(lease_id="lse_new", generation=2, granted_tokens=50_000),
             now=1_020.0,
-            declared_models=["gpt-5.5"],
+            declared_models=[("openai", "gpt-5.5")],
         )
 
         # Assert — NEITHER term crosses a lease boundary. Both are only
@@ -1652,7 +1673,7 @@ class TestRenewalNetting:
             RUN,
             _response(lease_id="lse_regrant", generation=1, granted_tokens=50_000),
             now=1_030.0,
-            declared_models=["gpt-5.5"],
+            declared_models=[("openai", "gpt-5.5")],
         )
 
         # Assert — post-drop spend belongs to no lease; the regrant is whole,
@@ -1751,7 +1772,9 @@ class TestUncountedTally:
         ledger = _ledger()
         ledger.record_uncounted(RUN, 5_096)
         ledger.record_uncounted(RUN, 2_000)
-        ledger.apply_grant_response(RUN, _response(), now=1_000.0, declared_models=["gpt-5.5"])
+        ledger.apply_grant_response(
+            RUN, _response(), now=1_000.0, declared_models=[("openai", "gpt-5.5")]
+        )
 
         # Act
         request = ledger.build_renewal_request(RUN)
@@ -1781,13 +1804,15 @@ class TestDeclaredModelSet:
         # lease L2 is granted declaring only model B. The server folded L2's
         # worst-case rate over {B} alone, so A must not ride L2.
         ledger = _ledger()
-        ledger.apply_grant_response(RUN, _response(), now=1_000.0, declared_models=["model-a"])
+        ledger.apply_grant_response(
+            RUN, _response(), now=1_000.0, declared_models=[("openai", "model-a")]
+        )
         ledger.drop(RUN)
         ledger.apply_grant_response(
             RUN,
             _response(lease_id="lse_2", generation=1),
             now=1_010.0,
-            declared_models=["model-b"],
+            declared_models=[("openai", "model-b")],
         )
 
         # Act
@@ -1803,10 +1828,12 @@ class TestDeclaredModelSet:
         # The server UNIONS a re-declaration into the lease's declared set, so
         # the holder must too — and a renewal that re-declares nothing keeps it.
         ledger = _ledger()
-        ledger.apply_grant_response(RUN, _response(), now=1_000.0, declared_models=["model-a"])
+        ledger.apply_grant_response(
+            RUN, _response(), now=1_000.0, declared_models=[("openai", "model-a")]
+        )
 
         ledger.apply_grant_response(
-            RUN, _response(generation=2), now=1_010.0, declared_models=["model-b"]
+            RUN, _response(generation=2), now=1_010.0, declared_models=[("openai", "model-b")]
         )
         ledger.apply_grant_response(RUN, _response(generation=3), now=1_020.0)
 
@@ -1890,6 +1917,7 @@ class TestConcurrentBurst:
                     run_id=RUN,
                     call_id=f"call-{index}",
                     estimated_input_tokens=1_000,
+                    provider="openai",
                     model="gpt-5.5",
                     output_bound=500,
                     now=1_001.0,

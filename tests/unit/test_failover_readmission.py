@@ -562,3 +562,49 @@ class TestLeaseFundedAmbiguousFailover:
         assert plane.checks == []
         assert len(plane.confirms) == 1
         assert plane.confirms[0].lease_id is not None
+
+
+TOGETHER_URL = "https://api.together.xyz/v1"
+LLAMA = "llama-3.1-8b-instant"
+GPT_OSS = "openai/gpt-oss-20b"
+
+
+@pytest.mark.unit
+class TestLeaseCoversProviderModelPairs:
+    """Finding 6: a lease covers the (provider, model) pairs it declared, as
+    core prices them, not bare model names."""
+
+    def test_declared_model_on_an_undeclared_provider_takes_a_per_call_check(self) -> None:
+        import solwyn
+
+        plane = FakeControlPlane()
+        primary, fallback = _Provider(), _Provider()
+        wrapped = plane.wrap(
+            primary.client(GROQ_URL), fallback=[(fallback.client(TOGETHER_URL), GPT_OSS)]
+        )
+        with wrapped, solwyn.run("pairs"):
+            # Declares (groq, llama) and (together, gpt-oss).
+            wrapped.chat.completions.create(model=LLAMA, messages=MESSAGES)
+            # (groq, gpt-oss) was never declared, though the name gpt-oss was.
+            wrapped.chat.completions.create(model=GPT_OSS, messages=MESSAGES)
+
+        assert len(plane.lease_grants) == 1
+        assert [(check.provider.value, check.model) for check in plane.checks] == [
+            ("groq", GPT_OSS)
+        ]
+        assert len(primary.bodies) == 2
+
+    def test_declared_pair_stays_lease_funded(self) -> None:
+        import solwyn
+
+        plane = FakeControlPlane()
+        primary, fallback = _Provider(), _Provider()
+        wrapped = plane.wrap(
+            primary.client(GROQ_URL), fallback=[(fallback.client(TOGETHER_URL), GPT_OSS)]
+        )
+        with wrapped, solwyn.run("pairs-same"):
+            wrapped.chat.completions.create(model=LLAMA, messages=MESSAGES)
+            wrapped.chat.completions.create(model=LLAMA, messages=MESSAGES)
+
+        assert len(plane.lease_grants) == 1
+        assert plane.checks == []

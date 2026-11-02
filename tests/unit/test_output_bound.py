@@ -714,6 +714,7 @@ class TestLeasePostureRace:
                 run_id=run_id,
                 call_id="race-call",
                 estimated_input_tokens=1,
+                provider="openai",
                 model="gpt-5.5",
                 now=time.monotonic(),
                 breaker_open=False,
