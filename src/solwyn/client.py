@@ -3880,9 +3880,11 @@ class Solwyn(_SolwynBase):
         # providers without regional pricing). Captured once, closed over.
         provider_region = _safe_extract_region(runtime)
 
-        def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
+        def on_complete(
+            token_details: TokenDetails, _elapsed_ms: float, *, abandoned: bool = False
+        ) -> None:
             usage_unmeasured = False
-            if estimate_empty_usage:
+            if estimate_empty_usage or abandoned:
                 if token_details.input_tokens == 0 and token_details.output_tokens == 0:
                     token_details = TokenDetails(
                         input_tokens=estimated_input_tokens,
@@ -3895,6 +3897,12 @@ class Solwyn(_SolwynBase):
                     # response's output: the lease must hold its reserved bound
                     # rather than re-lend spent output allowance.
                     usage_unmeasured = True
+            if abandoned:
+                # Closed before its natural end (caller break or close, run
+                # stop): the provider may have billed the whole generation, but
+                # its usage report never arrived. The observed tokens are only a
+                # floor, so a lease claim holds its reserved bound.
+                usage_unmeasured = True
             self._get_circuit_breaker(provider).record_success()
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
@@ -3904,7 +3912,10 @@ class Solwyn(_SolwynBase):
             service_tier = accumulator.get_service_tier()
             confirm = None
             reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
-            if reservation_id or lease_id:
+            if lease_id or (reservation_id and not abandoned):
+                # An abandoned per-call stream sends no confirm: confirming a
+                # floor would free the rest of a hold the provider may have
+                # spent. The hold stays until the server's reservation TTL.
                 confirm = self._solwyn_budget.build_confirm_request(
                     reservation_id=reservation_id,
                     lease_id=lease_id,
@@ -3918,7 +3929,7 @@ class Solwyn(_SolwynBase):
                     service_tier=service_tier,
                     usage_unmeasured=usage_unmeasured,
                 )
-            else:
+            elif not reservation_id:
                 # A legacy fail-open admission (no key to confirm against): replace its
                 # outage-tally estimate with the provider-reported total.
                 self._solwyn_budget.settle_uncounted(
@@ -3995,6 +4006,7 @@ class Solwyn(_SolwynBase):
                 accumulator,
                 on_complete,
                 on_error,
+                on_abandon=functools.partial(on_complete, abandoned=True),
                 call_span=call_span,
                 chunk_translator=chunk_translator,
                 abort_check=(
@@ -5840,9 +5852,11 @@ class AsyncSolwyn(_SolwynBase):
         # providers without regional pricing). Captured once, closed over.
         provider_region = _safe_extract_region(runtime)
 
-        async def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
+        async def on_complete(
+            token_details: TokenDetails, _elapsed_ms: float, *, abandoned: bool = False
+        ) -> None:
             usage_unmeasured = False
-            if estimate_empty_usage:
+            if estimate_empty_usage or abandoned:
                 if token_details.input_tokens == 0 and token_details.output_tokens == 0:
                     token_details = TokenDetails(
                         input_tokens=estimated_input_tokens,
@@ -5855,6 +5869,12 @@ class AsyncSolwyn(_SolwynBase):
                     # response's output: the lease must hold its reserved bound
                     # rather than re-lend spent output allowance.
                     usage_unmeasured = True
+            if abandoned:
+                # Closed before its natural end (caller break or close, run
+                # stop): the provider may have billed the whole generation, but
+                # its usage report never arrived. The observed tokens are only a
+                # floor, so a lease claim holds its reserved bound.
+                usage_unmeasured = True
             self._get_circuit_breaker(provider).record_success()
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
@@ -5864,7 +5884,10 @@ class AsyncSolwyn(_SolwynBase):
             service_tier = accumulator.get_service_tier()
             confirm = None
             reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
-            if reservation_id or lease_id:
+            if lease_id or (reservation_id and not abandoned):
+                # An abandoned per-call stream sends no confirm: confirming a
+                # floor would free the rest of a hold the provider may have
+                # spent. The hold stays until the server's reservation TTL.
                 confirm = self._solwyn_budget.build_confirm_request(
                     reservation_id=reservation_id,
                     lease_id=lease_id,
@@ -5878,7 +5901,7 @@ class AsyncSolwyn(_SolwynBase):
                     service_tier=service_tier,
                     usage_unmeasured=usage_unmeasured,
                 )
-            else:
+            elif not reservation_id:
                 # A legacy fail-open admission (no key to confirm against): replace its
                 # outage-tally estimate with the provider-reported total.
                 self._solwyn_budget.settle_uncounted(
@@ -5952,6 +5975,7 @@ class AsyncSolwyn(_SolwynBase):
                 accumulator,
                 on_complete,
                 on_error,
+                on_abandon=functools.partial(on_complete, abandoned=True),
                 call_span=call_span,
                 chunk_translator=chunk_translator,
                 abort_check=(

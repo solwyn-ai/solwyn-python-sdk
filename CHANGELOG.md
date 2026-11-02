@@ -5,7 +5,7 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
-## [Unreleased]
+## [0.10.2] - Unreleased
 
 ### Added
 
@@ -20,6 +20,27 @@ derived from git tags (hatch-vcs).
   helpers in their separate acknowledgment scope. The `beta.organization.*`
   classifications are unchanged. Coverage fingerprints are refreshed for this
   admission.
+
+Bug fix: a stream closed early no longer gives back budget it may have spent.
+
+### Fixed
+
+- **A stream closed before its end keeps its funding.** When you broke out of
+  a stream and closed it (or left its `with` block, or a run stop ended it)
+  before the provider sent its final usage report, Solwyn settled the call
+  with the usage it had seen so far, often zero tokens. The provider may still
+  bill the whole generation. On a run lease, the claim was refunded, so the
+  next call in the run could reuse tokens that were already spent. For
+  example, on a final 128-token lease, a stream that had reserved 101 tokens
+  was closed after two chunks, its claim went back to the lease, and the next
+  call ran with no budget check. On a per-call reservation, the confirm freed
+  the hold at the partial (or zero) usage. Now an early-closed stream keeps
+  its lease claim spent at the reserved bound, and a per-call reservation gets
+  no confirm, so its hold stays until the server's reservation TTL. The call
+  still reports one success receipt with the usage it saw (the input estimate,
+  marked estimated, when it saw none). A stream that reaches its end settles
+  exactly as before. Applies to every provider, sync and async, including the
+  Responses `stream()` manager.
 
 ## [0.10.1] - 2026-11-02
 

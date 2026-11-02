@@ -199,7 +199,7 @@ for event in response["stream"]:
     ...
 ```
 
-If you stop consuming the stream early, call `response["stream"].close()` (or wrap iteration in `with response["stream"]:`) to settle the budget reservation — the same close obligation raw boto3's `EventStream` has. `close()` settles exactly once with whatever usage was observed and is safe to call repeatedly.
+If you stop consuming the stream early, call `response["stream"].close()` (or wrap iteration in `with response["stream"]:`) to settle the budget reservation. Raw boto3's `EventStream` has the same close obligation. `close()` settles exactly once and is safe to call repeatedly; a stream closed before its end settles as described in [early stream close](#early-stream-close).
 
 Notes:
 
@@ -937,6 +937,17 @@ recorded, the provider stream is closed best-effort, and the original error is
 re-raised. The Responses `stream()` manager applies the same rule to a wrap
 failure at context entry. Use stream context managers or explicit
 close when abandoning an established stream so its provider connection closes.
+
+<a id="early-stream-close"></a>
+An established stream closed before its natural end (the caller breaks off and
+closes it, leaves its context manager, or a run stop ends it) never delivered
+its final usage report, so the provider may have billed more than Solwyn saw.
+Its funding is not refunded: a lease claim stays spent at its reserved bound,
+and a per-call reservation gets no confirm, so its hold stays until the
+server's reservation TTL. The call still reports one success receipt with the
+usage it observed (the pre-flight input estimate, marked estimated, when it
+observed none), and its breaker records a success. A stream that reaches its
+natural end confirms its measured usage as before.
 Sync and async dispatch errors with unknown post-send usage (read timeouts,
 5xx responses, or protocol drops) also retain the bound when ambiguous failover
 is disabled. With `failover_idempotency="always"` the call fails over instead,
@@ -1334,9 +1345,10 @@ inspect `run_termination(run_id)`, or explicitly clear stored stop state with
 `RunTermination` (`reason`, `source`, and `at_monotonic`) or `None`. A non-streaming
 request already in flight is not preempted. A metered stream already returned is
 stopped cooperatively at its next raw provider-chunk boundary: that chunk is
-pulled and discarded, previously observed usage is settled exactly once as a
-partial success, the provider stream is closed, and the original
-`RunStoppedError` remains terminal for later iterator calls.
+pulled and discarded, previously observed usage is reported exactly once as a
+partial success that keeps its funding (an
+[early stream close](#early-stream-close)), the provider stream is closed, and
+the original `RunStoppedError` remains terminal for later iterator calls.
 
 Provider errors (e.g., `openai.RateLimitError`) pass through unmodified.
 

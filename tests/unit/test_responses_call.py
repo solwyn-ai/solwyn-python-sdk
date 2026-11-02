@@ -1481,7 +1481,9 @@ class TestResponsesPublicProxySync:
             ):
                 raise ValueError("application failed")
 
-            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            # Closed before the stream's end: one success receipt, no confirm.
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
 
     def test_native_stream_helper_wrap_failure_releases_and_closes_once(self) -> None:
         original = ValueError("wrapping failed")
@@ -2198,13 +2200,15 @@ class TestResponsesPublicProxyAsync:
 
             check.assert_awaited_once()
             assert client._responses.stream_calls == [{"model": "deployment", "input": "12345678"}]
-            solwyn._solwyn_reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
+            # Abandoned before its end: no confirm frees the hold; one success
+            # receipt carries the length estimate.
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
+            (event,) = solwyn._solwyn_reporter.report.call_args.args
             assert event.provider.value == "azure_openai"
             assert event.input_tokens == 2
             assert event.output_tokens == 0
             assert event.token_details.is_estimated is True
-            assert confirm.token_details == event.token_details
 
     @pytest.mark.asyncio
     async def test_azure_stream_helper_without_usage_holds_lease_floor(self) -> None:
@@ -2791,7 +2795,9 @@ class TestResponsesPublicProxyAsync:
                 async with solwyn.responses.stream(model="gpt-5.5", input="1234"):
                     raise ValueError("application failed")
 
-            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            # Closed before the stream's end: one success receipt, no confirm.
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("opened_before_wait", [False, True])
@@ -2884,8 +2890,9 @@ class TestResponsesPublicProxyAsync:
             assert len(provider_manager.exit_calls) == 1
             assert inner.aclose_calls == 1
             release.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_not_called()
-            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            # Closed before the stream's end: one success receipt, no confirm.
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_concurrent_reentry_keeps_first_entry_closable(
@@ -2940,8 +2947,9 @@ class TestResponsesPublicProxyAsync:
             assert len(provider_manager.exit_calls) == 1
             assert inner.aclose_calls == 1
             release.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_not_called()
-            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            # Closed before the stream's end: one success receipt, no confirm.
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_cancelled_close_is_publicly_retryable(self) -> None:
@@ -3009,8 +3017,9 @@ class TestResponsesPublicProxyAsync:
             assert provider_manager.max_active_exits == 1
             assert inner.aclose_calls == 1
             release.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_not_called()
-            solwyn._solwyn_reporter.report_settlement.assert_called_once()
+            # Closed before the stream's end: one success receipt, no confirm.
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_wrap_failure_releases_and_closes_once(self) -> None:
@@ -3796,11 +3805,13 @@ class TestResponsesInterceptedCallSync:
             stream.close()
             stream.close()
 
-            solwyn._solwyn_reporter.report_settlement.assert_called_once()
-            confirm, event = solwyn._solwyn_reporter.report_settlement.call_args.args
+            # Abandoned per-call: no confirm frees the hold; one success
+            # receipt carries the length estimate.
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
+            (event,) = solwyn._solwyn_reporter.report.call_args.args
             assert event.token_details.input_tokens == 2
             assert event.token_details.is_estimated is True
-            assert confirm.token_details == event.token_details
 
     def test_lease_backed_abandoned_stream_holds_reserved_floor(self) -> None:
         client, _ = _mock_openai_client()
@@ -4284,11 +4295,13 @@ class TestResponsesInterceptedCallAsync:
             await stream.close()
             await stream.close()
 
-            solwyn._solwyn_reporter.report_settlement.assert_called_once()
-            confirm, settled_event = solwyn._solwyn_reporter.report_settlement.call_args.args
+            # Abandoned per-call: no confirm frees the hold; one success
+            # receipt carries the length estimate.
+            solwyn._solwyn_reporter.report_settlement.assert_not_called()
+            solwyn._solwyn_reporter.report.assert_called_once()
+            (settled_event,) = solwyn._solwyn_reporter.report.call_args.args
             assert settled_event.token_details.input_tokens == 2
             assert settled_event.token_details.is_estimated is True
-            assert confirm.token_details == settled_event.token_details
 
     @pytest.mark.asyncio
     async def test_lease_backed_abandoned_stream_holds_reserved_floor(self) -> None:

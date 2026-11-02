@@ -55,7 +55,9 @@ class SyncStreamWrapper:
 
     If the caller breaks early or abandons the iterator, call close()
     explicitly or use the context manager (``with stream:``) to settle
-    the budget reservation with whatever usage data was observed.
+    the budget reservation. A stream closed before its natural end fires
+    ``on_abandon`` (default: on_complete) with whatever usage was observed,
+    so the client can tell an incomplete report from a finished one.
 
     Thread safety: _settle() and _settle_error() are protected by a
     threading.Lock so that concurrent calls (e.g. close() racing with
@@ -89,6 +91,7 @@ class SyncStreamWrapper:
         abort_release: Callable[[], None] | None = None,
         call_span: _CallSpan = _INACTIVE_CALL_SPAN,
         on_finalize_error: Callable[[BaseException], None] | None = None,
+        on_abandon: Callable[[TokenDetails, float], None] | None = None,
     ) -> None:
         self._call_span = call_span
         self._span_finalizer = call_span.finalize_on_gc(self)
@@ -99,6 +102,8 @@ class SyncStreamWrapper:
         self._on_complete = on_complete
         self._on_error = on_error
         self._on_finalize_error = on_finalize_error or on_error
+        self._on_abandon = on_abandon or on_complete
+        self._finished = False
         self._chunk_translator = chunk_translator
         self._abort_check = abort_check
         self._abort_finalizer = (
@@ -119,8 +124,12 @@ class SyncStreamWrapper:
                 self._abort_exc = exc
             return self._abort_exc
 
-    def _settle(self) -> None:
-        """Fire on_complete exactly once with accumulated data."""
+    def _settle(self, *, abandoned: bool = False) -> None:
+        """Fire on_complete exactly once with accumulated data.
+
+        ``abandoned`` (closed before the stream's natural end) fires on_abandon
+        instead: the usage the provider would have reported never arrived.
+        """
         with self._lock:
             if self._settled:
                 return
@@ -140,7 +149,7 @@ class SyncStreamWrapper:
                     logger.warning("stream.finalize_cleanup_failed: %s", type(cleanup_exc).__name__)
                 raise
             try:
-                self._on_complete(token_details, elapsed_ms)
+                (self._on_abandon if abandoned else self._on_complete)(token_details, elapsed_ms)
                 failed = False
             except Exception as cb_exc:
                 # Log only the CALLBACK failure's class name — never a traceback
@@ -214,6 +223,7 @@ class SyncStreamWrapper:
                     return chunk
                 self._pending_chunks.extend(self._chunk_translator(chunk))
             except StopIteration:
+                self._finished = True
                 self._settle()
                 raise
             except Exception as exc:
@@ -241,7 +251,7 @@ class SyncStreamWrapper:
         Called automatically by __exit__ if the stream wasn't fully consumed.
         """
         with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT:
-            self._settle()
+            self._settle(abandoned=not self._finished)
             if hasattr(self._stream, "close"):
                 self._stream.close()
 
@@ -312,6 +322,7 @@ class AsyncStreamWrapper:
         abort_release: Callable[[], None] | None = None,
         call_span: _CallSpan = _INACTIVE_CALL_SPAN,
         on_finalize_error: Callable[[BaseException], Awaitable[None]] | None = None,
+        on_abandon: Callable[[TokenDetails, float], Awaitable[None]] | None = None,
     ) -> None:
         self._call_span = call_span
         self._span_finalizer = call_span.finalize_on_gc(self)
@@ -322,6 +333,8 @@ class AsyncStreamWrapper:
         self._on_complete = on_complete
         self._on_error = on_error
         self._on_finalize_error = on_finalize_error or on_error
+        self._on_abandon = on_abandon or on_complete
+        self._finished = False
         self._chunk_translator = chunk_translator
         self._abort_check = abort_check
         self._abort_finalizer = (
@@ -333,8 +346,8 @@ class AsyncStreamWrapper:
         self._cleanup_complete = False
         self._close_lock = asyncio.Lock()
 
-    async def _settle(self) -> None:
-        """Fire on_complete exactly once with accumulated data."""
+    async def _settle(self, *, abandoned: bool = False) -> None:
+        """Fire on_complete (on_abandon when ``abandoned``) exactly once."""
         if self._settled:
             return
         self._settled = True
@@ -351,7 +364,8 @@ class AsyncStreamWrapper:
                     logger.warning("stream.finalize_cleanup_failed: %s", type(cleanup_exc).__name__)
                 raise
             try:
-                await self._on_complete(token_details, elapsed_ms)
+                callback = self._on_abandon if abandoned else self._on_complete
+                await callback(token_details, elapsed_ms)
                 failed = False
             except Exception as cb_exc:
                 # Structural-only log of the CALLBACK failure; never a traceback (fix [D]).
@@ -423,6 +437,7 @@ class AsyncStreamWrapper:
                     return chunk
                 self._pending_chunks.extend(self._chunk_translator(chunk))
             except StopAsyncIteration:
+                self._finished = True
                 await self._settle()
                 raise
             except BaseException as exc:
@@ -450,7 +465,7 @@ class AsyncStreamWrapper:
             async with self._close_lock:
                 if self._cleanup_complete:
                     return
-                await self._settle()
+                await self._settle(abandoned=not self._finished)
                 if hasattr(self._stream, "aclose"):
                     await self._stream.aclose()
                 elif hasattr(self._stream, "close"):
@@ -731,7 +746,8 @@ class _SyncResponsesStreamManagerWrapper:
                         and not isinstance(args[1], Exception)
                     ):
                         self._call_span.end(error=True, exception=args[1])
-                    self._wrapped_stream()._settle()
+                    stream = self._wrapped_stream()
+                    stream._settle(abandoned=not stream._finished)
                 else:
                     self._release_before_entry()
             except BaseException as exc:
@@ -927,7 +943,8 @@ class _AsyncResponsesStreamManagerWrapper:
                         ):
                             await self._wrapped_stream()._settle_error(args[1])
                         else:
-                            await self._wrapped_stream()._settle()
+                            stream = self._wrapped_stream()
+                            await stream._settle(abandoned=not stream._finished)
                     else:
                         await self._release_before_entry()
                 except BaseException as exc:

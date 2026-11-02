@@ -2451,12 +2451,12 @@ async def test_stream_interrupt_billing_matches_main(
         state = wrapper._get_circuit_breaker("openai").get_state()
         assert state.failure_count == 0
         if status == "success":
-            assert len(settlements) == 1
-            confirm, event = settlements[0]
-            assert (confirm.token_details.input_tokens, confirm.token_details.output_tokens) == (
-                12,
-                4,
-            )
+            # The stream never reached its natural end, so its usage report is
+            # incomplete: the per-call hold is not confirmed (0.10.2). One
+            # success receipt carries the observed usage.
+            assert not settlements
+            assert len(events) == 1
+            event = events[0]
             assert (event.input_tokens, event.output_tokens, event.status.value) == (
                 12,
                 4,
@@ -2464,7 +2464,6 @@ async def test_stream_interrupt_billing_matches_main(
             )
             assert event.possibly_succeeded is None
             assert event.failover_error_class is None
-            assert not events
             assert state.success_count == 0
         else:
             assert not settlements
@@ -2556,22 +2555,15 @@ async def test_stream_entry_failure_billing_matches_main(
             await result.close()
         else:
             result.close()
-        if responses:
-            assert not settlements
-            assert len(events) == 1
-        else:
-            assert len(settlements) == 1
-            confirm, event = settlements[0]
-            assert (confirm.token_details.input_tokens, confirm.token_details.output_tokens) == (
-                0,
-                0,
-            )
-            assert (event.input_tokens, event.output_tokens, event.status.value) == (
-                0,
-                0,
-                "success",
-            )
-            assert not events
+        assert not settlements
+        assert len(events) == 1
+        if not responses:
+            # Closed before its natural end: no confirm frees the per-call
+            # hold (0.10.2); the success receipt's usage is an estimate.
+            event = events[0]
+            assert event.status.value == "success"
+            assert event.token_details is not None
+            assert event.token_details.is_estimated is True
     finally:
         if async_mode:
             await wrapper.close()
