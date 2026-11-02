@@ -88,7 +88,7 @@ from solwyn.exceptions import (
     UntrackedSpendSurfaceError,
     UntranslatableRequestError,
 )
-from solwyn.providers._errors import attempt_maybe_billed
+from solwyn.providers._errors import Disposition, attempt_maybe_billed, classify_exception
 
 if TYPE_CHECKING:
     from solwyn._registry import ProviderRuntime
@@ -1566,10 +1566,18 @@ class MediaSurfaceSpec:
         return self.modality == "text" and (token_details is None or token_details.is_estimated)
 
     def dispatched_spend_unknown(self, exc: BaseException, *, dispatched: bool) -> bool:
-        """Text leases retain authority for ambiguous dispatch errors and interrupts."""
+        """Receipt flag: an ambiguous dispatch error or interrupt on a text call."""
         if self.modality != "text" or not dispatched:
             return False
-        # Billing evidence, not routing: see attempt_maybe_billed.
+        return (
+            not isinstance(exc, Exception)
+            or classify_exception(exc) is Disposition.POST_SEND_AMBIGUOUS
+        )
+
+    def dispatched_maybe_billed(self, exc: BaseException, *, dispatched: bool) -> bool:
+        """Funding: a dispatched text call may have been billed (attempt_maybe_billed)."""
+        if self.modality != "text" or not dispatched:
+            return False
         return attempt_maybe_billed(exc)
 
 

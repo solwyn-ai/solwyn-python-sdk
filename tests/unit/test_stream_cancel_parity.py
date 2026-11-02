@@ -716,10 +716,11 @@ class TestUnrecognizedPostDispatchFailureKeepsItsClaim:
         assert plane.lease_surrenders[-1].spent_tokens >= 100
         failed = plane.ingested[0]
         assert failed.status.value == "error"
-        # A stopped chain flags its receipt. A body that failed to decode is
-        # post-send ambiguous (no failover under "safe"); a handler's own
-        # exception propagates raw and stops the chain as unknown.
-        assert failed.possibly_succeeded is True
+        # The receipt flag follows routing: a body that failed to decode is
+        # post-send ambiguous and flagged; a handler's own exception
+        # propagates raw and stops the chain as unknown, unflagged. Funding is
+        # kept either way (above).
+        assert failed.possibly_succeeded is (None if kind == "unknown_cause" else True)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("is_async", [False, True])

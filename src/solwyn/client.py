@@ -801,14 +801,21 @@ def _settle_stream_failure(
     possibly_succeeded: bool | None,
     failover_error_class: str | None = None,
     admission: CircuitBreakerAdmission | None = None,
+    maybe_billed: bool | None = None,
 ) -> None:
-    """Reconcile a terminal attempt without usage: health, local debit, receipt."""
+    """Reconcile a terminal attempt without usage: health, local debit, receipt.
+
+    ``possibly_succeeded`` is the receipt flag. ``maybe_billed`` decides the
+    funding (kept under hard_deny) and defaults to the flag.
+    """
     is_provider_fallback = ctx.is_provider_fallback
     if record_breaker_failure:
         owner._get_circuit_breaker(provider).record_failure()
     elif admission is not None:
         owner._get_circuit_breaker(provider).release_probe(admission)
-    if possibly_succeeded and _hard_deny_funding(budget):
+    if maybe_billed is None:
+        maybe_billed = bool(possibly_succeeded)
+    if maybe_billed and _hard_deny_funding(budget):
         owner._solwyn_budget.abandon_reservation(
             call_id, lease_claim_token=_lease_claim_token(budget)
         )
@@ -967,8 +974,9 @@ def _make_stream_entry_error_handler(
             if isinstance(exc, Exception)
             else Disposition.POST_SEND_AMBIGUOUS
         )
-        # The manager sent its request in __enter__: possibly billed unless the
-        # failure proves otherwise (a 4xx such as a 400/429 is a known rejection).
+        # The manager sent its request in __enter__: its funding is possibly
+        # billed unless the failure proves otherwise (a 4xx such as a 400/429
+        # is a known rejection). The receipt flag follows the routing.
         maybe_billed = attempt_maybe_billed(exc)
         _settle_stream_failure(
             owner,
@@ -983,9 +991,10 @@ def _make_stream_entry_error_handler(
             agent_run=agent_run,
             trace=trace,
             record_breaker_failure=isinstance(exc, Exception) and disp is not Disposition.FAIL_FAST,
-            possibly_succeeded=True if maybe_billed else None,
+            possibly_succeeded=True if disp is Disposition.POST_SEND_AMBIGUOUS else None,
             failover_error_class=type(exc).__name__,
             admission=admission,
+            maybe_billed=maybe_billed,
         )
 
     return on_entry_error
@@ -2805,8 +2814,12 @@ class Solwyn(_SolwynBase):
         except BaseException as exc:
             if not isinstance(exc, Exception) and spec.modality != "text":
                 raise
+            # The receipt flag keeps its routing-derived meaning; funding
+            # follows billing evidence (attempt_maybe_billed), under hard_deny.
             possibly_succeeded = spec.dispatched_spend_unknown(exc, dispatched=dispatched)
-            if possibly_succeeded and _hard_deny_funding(budget):
+            if spec.dispatched_maybe_billed(exc, dispatched=dispatched) and _hard_deny_funding(
+                budget
+            ):
                 self._solwyn_budget.abandon_reservation(
                     call_id, lease_claim_token=_lease_claim_token(budget)
                 )
@@ -3496,12 +3509,8 @@ class Solwyn(_SolwynBase):
                         # A correctly-not-failed-over post-send-ambiguous abort
                         # emits an ERROR event with possibly_succeeded=True so the Cloud API
                         # can reconcile the (possibly-landed, never-confirmed) reservation.
-                        possibly_succeeded = usage_unknown and (
-                            disp is Disposition.FAIL_FAST
-                            or (
-                                disp is Disposition.POST_SEND_AMBIGUOUS
-                                and not allow_ambiguous_failover
-                            )
+                        possibly_succeeded = loop_refused or (
+                            disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
                         try:
                             self._solwyn_reporter.report(
@@ -4883,8 +4892,12 @@ class AsyncSolwyn(_SolwynBase):
         except BaseException as exc:
             if not isinstance(exc, Exception) and spec.modality != "text":
                 raise
+            # The receipt flag keeps its routing-derived meaning; funding
+            # follows billing evidence (attempt_maybe_billed), under hard_deny.
             possibly_succeeded = spec.dispatched_spend_unknown(exc, dispatched=dispatched)
-            if possibly_succeeded and _hard_deny_funding(budget):
+            if spec.dispatched_maybe_billed(exc, dispatched=dispatched) and _hard_deny_funding(
+                budget
+            ):
                 self._solwyn_budget.abandon_reservation(
                     call_id, lease_claim_token=_lease_claim_token(budget)
                 )
@@ -5524,12 +5537,8 @@ class AsyncSolwyn(_SolwynBase):
                         # A correctly-not-failed-over post-send-ambiguous abort
                         # emits an ERROR event with possibly_succeeded=True so the Cloud API
                         # can reconcile the (possibly-landed, never-confirmed) reservation.
-                        possibly_succeeded = usage_unknown and (
-                            disp is Disposition.FAIL_FAST
-                            or (
-                                disp is Disposition.POST_SEND_AMBIGUOUS
-                                and not allow_ambiguous_failover
-                            )
+                        possibly_succeeded = loop_refused or (
+                            disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
                         try:
                             self._solwyn_reporter.report(
