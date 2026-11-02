@@ -16,6 +16,8 @@ import contextlib
 import functools
 import gc
 import json
+import os
+import signal
 import threading
 import time
 import weakref
@@ -672,6 +674,61 @@ class TestDroppedStreamSettlesOnce:
         assert confirm.token_details.is_estimated is True
         assert len(plane.ingested) == 1
         assert reporter.dropped_counts.get("settlement_confirm.closed_enqueue") is None
+
+    @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    def test_fork_during_a_settlement_in_flight_never_waits_in_the_child(self) -> None:
+        # The parent's cleanup worker is mid-settlement when the process
+        # forks. The child's copy can never be signalled, so its client close
+        # must not wait for it, and must not settle the parent's stream.
+        plane = FakeControlPlane()
+        wrapped = plane.wrap(_Provider(_OpenStream()).client(is_async=False))
+        stream = wrapped.chat.completions.create(**_REQUEST, stream=True)
+        next(stream)
+        settlement = stream._settlement
+        on_dropped = settlement._on_dropped
+        calls: list[int] = []
+        claimed, release = threading.Event(), threading.Event()
+
+        def slow_on_dropped(*args: Any) -> None:
+            calls.append(os.getpid())
+            claimed.set()
+            release.wait(5)
+            on_dropped(*args)
+
+        settlement._on_dropped = slow_on_dropped
+        worker = threading.Thread(target=settlement.settle_dropped)
+        worker.start()
+        try:
+            assert claimed.wait(5)
+            pid = os.fork()
+            if pid == 0:  # pragma: no cover - runs in the child
+                code = 1
+                try:
+                    wrapped._settle_open_streams()
+                    code = 0 if len(calls) == 1 else 2
+                finally:
+                    os._exit(code)
+            deadline = time.monotonic() + 5
+            status = 0
+            while time.monotonic() < deadline:
+                done, status = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    break
+                time.sleep(0.01)
+            else:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                pytest.fail("the child waited forever on the parent's settlement")
+            assert os.waitstatus_to_exitcode(status) == 0
+        finally:
+            release.set()
+            worker.join(5)
+            wrapped.close()
+
+        # The parent still settles its own stream once.
+        assert calls == [os.getpid()]
+        assert len(plane.confirms) == 1
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("is_async", [False, True])

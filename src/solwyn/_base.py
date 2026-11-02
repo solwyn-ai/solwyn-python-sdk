@@ -2407,6 +2407,10 @@ class _SolwynBase:
         self._solwyn_breaker_lock = threading.Lock()
         self._solwyn_guard_lock = threading.Lock()
         self._solwyn_velocity._reset_after_fork_in_child()
+        # A stream settlement in flight in the parent can never signal the
+        # child's copy: mark it done here (the child does not settle it).
+        for settlement in list(getattr(self, "_solwyn_open_streams", None) or ()):
+            settlement._reset_after_fork_in_child()
 
     def _warn_velocity(self, run_id: str, flags: tuple[str, ...]) -> None:
         """Warn for newly flagged run rules, with monitor-owned rate limiting."""

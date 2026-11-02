@@ -92,6 +92,12 @@ class _StreamSettlement:
         """Mark the won settlement handed to the reporter (or given up)."""
         self._idle.set()
 
+    def _reset_after_fork_in_child(self) -> None:
+        """A settlement in flight at fork is the parent's: never wait for it here."""
+        self._lock = threading.Lock()
+        self._idle = threading.Event()
+        self._idle.set()
+
     def settle_dropped(self, *, wait: bool = False) -> None:
         """Settle a stream that was dropped or outlived its client. Never raises.
 
