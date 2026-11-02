@@ -1359,3 +1359,87 @@ class TestFailedOverHopFloorHasItsOwnCallId:
                     await result
         finally:
             await _close_client(wrapped, is_async=is_async)
+
+
+# ── Anthropic: the one-generation guard follows each admission ────────────
+
+
+class _AnthropicWire:
+    """anthropic 2.x (httpx2) wire double; ``undecodable`` answers a 200 that fails to parse."""
+
+    def __init__(self, *, undecodable: bool = False) -> None:
+        self.undecodable = undecodable
+        self.models: list[str] = []
+
+    def handler(self, request: Any) -> Any:
+        httpx2 = pytest.importorskip("httpx2")
+        body = json.loads(request.content)
+        self.models.append(body["model"])
+        if self.undecodable:
+            return httpx2.Response(
+                200,
+                request=request,
+                headers={"content-type": "application/json"},
+                content=b'{"id": "msg_1", "typ',
+            )
+        message = {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": body["model"],
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 5},
+        }
+        return httpx2.Response(200, request=request, json=message)
+
+    async def async_handler(self, request: Any) -> Any:
+        return self.handler(request)
+
+    def client(self, *, is_async: bool, middleware: Any = None) -> Any:
+        anthropic = pytest.importorskip("anthropic")
+        httpx2 = pytest.importorskip("httpx2")
+        options: dict[str, Any] = {"api_key": "k", "max_retries": 0}
+        if middleware is not None:
+            options["middleware"] = middleware
+        if is_async:
+            return anthropic.AsyncAnthropic(
+                http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(self.async_handler)),
+                **options,
+            )
+        return anthropic.Anthropic(
+            http_client=httpx2.Client(transport=httpx2.MockTransport(self.handler)), **options
+        )
+
+
+_CLAUDE, _CLAUDE_FALLBACK = "claude-fable-5", "claude-opus-4-8"
+
+
+@pytest.mark.unit
+class TestReadmittedHopGetsItsOwnGeneration:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    async def test_undecodable_answer_fails_over_to_a_sent_fallback(self, is_async: bool) -> None:
+        plane = FakeControlPlane()
+        primary, fallback = _AnthropicWire(undecodable=True), _AnthropicWire()
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(
+            primary.client(is_async=is_async),
+            fallback=[(fallback.client(is_async=is_async), _CLAUDE_FALLBACK)],
+            failover_idempotency="always",
+        )
+        try:
+            result = wrapped.messages.create(model=_CLAUDE, messages=MESSAGES, max_tokens=100)
+            if is_async:
+                await result
+        finally:
+            await _close_client(wrapped, is_async=is_async)
+
+        # The re-admitted fallback is sent, not refused as a second generation.
+        assert (primary.models, fallback.models) == ([_CLAUDE], [_CLAUDE_FALLBACK])
+        assert [check.model for check in plane.checks] == [_CLAUDE, _CLAUDE_FALLBACK]
+        # Only the first attempt is possibly billed without usage: one floor.
+        [floor] = [c for c in plane.confirms if c.token_details.is_estimated]
+        [served] = [c for c in plane.confirms if not c.token_details.is_estimated]
+        assert floor.model == _CLAUDE
+        assert served.model == _CLAUDE_FALLBACK
+        assert floor.call_id != served.call_id

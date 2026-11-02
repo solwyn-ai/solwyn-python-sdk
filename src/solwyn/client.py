@@ -3358,6 +3358,8 @@ class Solwyn(_SolwynBase):
                     )
                     admitted_identity = (provider, hop_model)
                     admitted_spend_unknown = False
+                    # The new admission funds its own single generation.
+                    generation_guard = None
 
                 # Build native kwargs for this hop. A cross-provider hop runs the
                 # translation contract and may RAISE an Untranslatable* error here,
@@ -5414,6 +5416,8 @@ class AsyncSolwyn(_SolwynBase):
                     )
                     admitted_identity = (provider, hop_model)
                     admitted_spend_unknown = False
+                    # The new admission funds its own single generation.
+                    generation_guard = None
 
                 # Build native kwargs for this hop. A cross-provider hop runs the
                 # translation contract and may RAISE an Untranslatable* error here,
