@@ -692,3 +692,72 @@ class TestPerCallOnlyChecksBypassTheCache:
             self._check(enforcer)
 
         assert len(plane.checks) == 2
+
+
+QWEN_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+
+
+@pytest.mark.unit
+class TestLocalRefusalLeavesNoHold:
+    """Sol r1 B4: a hard_deny refusal made before any provider request must
+    free the per-call hold its check took, or the next valid call is denied."""
+
+    def _wrap_single(self, stub: _PricedPlane, client: Any, *, is_async: bool = False) -> Any:
+        from solwyn.client import AsyncSolwyn, Solwyn
+
+        wrapper = AsyncSolwyn if is_async else Solwyn
+        return wrapper(
+            client,
+            api_key=stub.plane.api_key,
+            api_url=stub.plane.api_url,
+            control_plane_transport=stub,
+            lease_enabled=False,
+        )
+
+    _QUESTIONS = [{"type": "predicate", "instructions": "Is it a greeting?"}]
+
+    def test_decisions_refusal_frees_its_hold(self) -> None:
+        # One cheap 4096-token reservation is about $0.0025; a $0.003 cap fits
+        # exactly one, so a stranded hold would deny the chat call after it.
+        stub, provider = _PricedPlane(budget_limit=0.003), _Provider()
+        with self._wrap_single(stub, provider.client()) as solwyn:
+            with pytest.raises(OutputBoundUnenforceableError):
+                solwyn.decisions.create(model=CHEAP, input="hi", questions=self._QUESTIONS)
+            # The zero-usage confirm rides the reporter queue; deliver it.
+            solwyn._solwyn_reporter._drain_confirms()
+            solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+
+        assert len(provider.bodies) == 1
+        assert stub.held == {}
+        refused = [c for c in stub.confirms if c["reservation_id"] == "res_1"]
+        assert len(refused) == 1
+        assert refused[0]["token_details"]["output_tokens"] == 0
+
+    @pytest.mark.asyncio
+    async def test_async_decisions_refusal_frees_its_hold(self) -> None:
+        stub, provider = _PricedPlane(budget_limit=0.003), _Provider()
+        solwyn = self._wrap_single(stub, provider.client(is_async=True), is_async=True)
+        try:
+            with pytest.raises(OutputBoundUnenforceableError):
+                await solwyn.decisions.create(model=CHEAP, input="hi", questions=self._QUESTIONS)
+            await solwyn._solwyn_reporter._drain_confirms()
+            await solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+        finally:
+            await solwyn.close()
+
+        assert len(provider.bodies) == 1
+        assert stub.held == {}
+
+    def test_output_bound_refusal_on_chat_frees_its_hold(self) -> None:
+        # Qwen with default thinking and no budget is refused before send.
+        stub, qwen = _PricedPlane(budget_limit=0.003), _Provider()
+        with self._wrap_single(stub, qwen.client(QWEN_URL)) as solwyn:
+            with pytest.raises(OutputBoundUnenforceableError):
+                solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+            solwyn._solwyn_reporter._drain_confirms()
+            solwyn.chat.completions.create(
+                model=CHEAP, messages=MESSAGES, extra_body={"enable_thinking": False}
+            )
+
+        assert len(qwen.bodies) == 1
+        assert stub.held == {}

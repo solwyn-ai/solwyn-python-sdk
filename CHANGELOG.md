@@ -54,6 +54,11 @@ In both cases a call could spend past a `hard_deny` budget.
   be enforced. On a `hard_deny` admission the call is now refused before any
   provider request with `OutputBoundUnenforceableError` and the new reason
   `no_output_cap`. It still runs on `alert_only` projects.
+- **A call refused before any provider request no longer holds budget.** A
+  `hard_deny` refusal made locally after the budget check (`decisions.create`,
+  or any `OutputBoundUnenforceableError` raised before sending) left its
+  per-call reservation held on the server until it expired, which could deny
+  the next valid call. The reservation is now settled at zero tokens.
 
 ## [0.10.0] - 2026-10-31
 

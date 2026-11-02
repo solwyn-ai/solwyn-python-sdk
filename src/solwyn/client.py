@@ -1952,7 +1952,7 @@ def _failover_hop_bound(
     )
 
 
-def _failover_close_out(
+def _zero_usage_close_out(
     client: Solwyn | AsyncSolwyn,
     budget: BudgetCheckResult,
     admitted: tuple[str, str],
@@ -1960,11 +1960,12 @@ def _failover_close_out(
     primary: ProviderRuntime,
     spend_unknown: bool,
 ) -> BudgetConfirmRequest | None:
-    """A zero-usage confirm that frees the admitted per-call reservation.
+    """A zero-usage confirm that frees a per-call reservation nothing billed.
 
-    The server frees a per-call hold only through a confirm. The admitted
-    identity produced no billed output when its attempt failed over (or was
-    never attempted), so the confirm settles it at zero tokens. It carries a
+    The server frees a per-call hold only through a confirm. Used when the
+    admitted identity produced no billed output: its attempt failed over or
+    was never attempted, or the call was refused locally before any provider
+    request. The confirm settles the hold at zero tokens. It carries a
     FRESH call id: the server counts account spend once per call id, and the
     served hop's real confirm must be the one that counts. A post-send
     ambiguous attempt may have been billed, so its hold is kept.
@@ -2408,7 +2409,7 @@ class Solwyn(_SolwynBase):
         refuses the call exactly like a primary denial, before the hop's
         provider is called.
         """
-        close_out = _failover_close_out(
+        close_out = _zero_usage_close_out(
             self, budget, admitted, primary=primary, spend_unknown=spend_unknown
         )
         if close_out is not None:
@@ -2722,6 +2723,12 @@ class Solwyn(_SolwynBase):
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
+            # Nothing was sent, so the per-call hold is settled at zero.
+            close_out = _zero_usage_close_out(
+                self, budget, (provider, requested_model), primary=runtime, spend_unknown=False
+            )
+            if close_out is not None:
+                self._solwyn_reporter.report_confirm(close_out)
             raise OutputBoundUnenforceableError(
                 provider=provider,
                 reason="no_output_cap",
@@ -3306,13 +3313,25 @@ class Solwyn(_SolwynBase):
                         extra_client_options = _guarded_client_options(
                             rt, extra_client_options, generation_guard, is_async=False
                         )
-                except Exception:
+                except Exception as exc:
                     cb.release_probe(admission)
                     probe_to_release = None
                     self._solwyn_budget.release_reservation(
                         call_id,
                         lease_claim_token=_lease_claim_token(budget),
                     )
+                    if isinstance(exc, OutputBoundUnenforceableError):
+                        # Refused before any provider request: settle the
+                        # per-call hold at zero so it never strands budget.
+                        close_out = _zero_usage_close_out(
+                            self,
+                            budget,
+                            admitted_identity,
+                            primary=primary,
+                            spend_unknown=admitted_spend_unknown,
+                        )
+                        if close_out is not None:
+                            self._solwyn_reporter.report_confirm(close_out)
                     raise
 
                 # Same-provider retry budget for THIS chain entry (config seam,
@@ -4420,7 +4439,7 @@ class AsyncSolwyn(_SolwynBase):
         velocity_flags: Collection[str],
     ) -> tuple[BudgetCheckResult, int]:
         """Async twin of ``Solwyn._readmit_failover_hop``."""
-        close_out = _failover_close_out(
+        close_out = _zero_usage_close_out(
             self, budget, admitted, primary=primary, spend_unknown=spend_unknown
         )
         if close_out is not None:
@@ -4709,6 +4728,12 @@ class AsyncSolwyn(_SolwynBase):
                 call_id,
                 lease_claim_token=_lease_claim_token(budget),
             )
+            # Nothing was sent, so the per-call hold is settled at zero.
+            close_out = _zero_usage_close_out(
+                self, budget, (provider, requested_model), primary=runtime, spend_unknown=False
+            )
+            if close_out is not None:
+                self._solwyn_reporter.report_confirm(close_out)
             raise OutputBoundUnenforceableError(
                 provider=provider,
                 reason="no_output_cap",
@@ -5247,13 +5272,25 @@ class AsyncSolwyn(_SolwynBase):
                         extra_client_options = _guarded_client_options(
                             rt, extra_client_options, generation_guard, is_async=True
                         )
-                except Exception:
+                except Exception as exc:
                     cb.release_probe(admission)
                     probe_to_release = None
                     self._solwyn_budget.release_reservation(
                         call_id,
                         lease_claim_token=_lease_claim_token(budget),
                     )
+                    if isinstance(exc, OutputBoundUnenforceableError):
+                        # Refused before any provider request: settle the
+                        # per-call hold at zero so it never strands budget.
+                        close_out = _zero_usage_close_out(
+                            self,
+                            budget,
+                            admitted_identity,
+                            primary=primary,
+                            spend_unknown=admitted_spend_unknown,
+                        )
+                        if close_out is not None:
+                            self._solwyn_reporter.report_confirm(close_out)
                     raise
 
                 # Same-provider retry budget for THIS chain entry (mirrors the sync
