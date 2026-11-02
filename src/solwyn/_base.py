@@ -2378,7 +2378,8 @@ class _SolwynBase:
         Called by close() before the reporter seals, so the receipts ship.
         Settling claims each stream's single settlement, so a later close(),
         natural end, error or GC of that stream does nothing. A stream the GC
-        worker already claimed is waited for until its settlement is enqueued.
+        worker, an early close or a stream error already claimed is waited for
+        until its settlement is enqueued.
         Never raises.
         """
         streams = getattr(self, "_solwyn_open_streams", None)
@@ -2392,7 +2393,7 @@ class _SolwynBase:
             except RuntimeError:
                 continue
         for settlement in open_streams:
-            settlement.settle_dropped()
+            settlement.settle_dropped(wait=True)
 
     def _reset_after_fork_in_child(self) -> None:
         """Replace locks and clear process-local velocity state in a child.

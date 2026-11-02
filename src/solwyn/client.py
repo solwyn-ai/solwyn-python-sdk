@@ -4191,10 +4191,10 @@ class Solwyn(_SolwynBase):
             self._track_open_stream(wrapper._settlement)
             return result
         except BaseException:
-            if wrapper is not None:
-                # The caller never receives this wrapper; the wrap failure is
-                # reconciled by the walk, so its GC finalizer must not settle again.
-                wrapper._claim_settlement()
+            # The caller never receives this wrapper; the wrap failure is
+            # reconciled by the walk, so its GC finalizer must not settle again.
+            if wrapper is not None and wrapper._claim_settlement():
+                wrapper._settlement.finish()
             if termination_handle is not None:
                 termination_handle.release()
             raise
@@ -6251,10 +6251,10 @@ class AsyncSolwyn(_SolwynBase):
             self._track_open_stream(wrapper._settlement)
             return result
         except BaseException:
-            if wrapper is not None:
-                # The caller never receives this wrapper; the wrap failure is
-                # reconciled by the walk, so its GC finalizer must not settle again.
-                wrapper._claim_settlement()
+            # The caller never receives this wrapper; the wrap failure is
+            # reconciled by the walk, so its GC finalizer must not settle again.
+            if wrapper is not None and wrapper._claim_settlement():
+                wrapper._settlement.finish()
             if termination_handle is not None:
                 termination_handle.release()
             raise

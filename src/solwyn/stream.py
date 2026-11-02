@@ -66,10 +66,10 @@ class _StreamSettlement:
     ) -> None:
         self._lock = threading.Lock()
         self._settled = False
-        # Clear only while a dropped settlement that won the claim is still
-        # enqueueing, so client close can wait for it before sealing.
-        self._dropped_done = threading.Event()
-        self._dropped_done.set()
+        # Clear from a won claim until that path calls finish(), so client
+        # close can wait for a settlement still enqueueing before it seals.
+        self._idle = threading.Event()
+        self._idle.set()
         self._accumulator = accumulator
         self._on_dropped = on_dropped
         self._start_time = time.monotonic()
@@ -85,23 +85,27 @@ class _StreamSettlement:
             if self._settled:
                 return False
             self._settled = True
+            self._idle.clear()
             return True
 
-    def settle_dropped(self) -> None:
-        """Settle a stream that was dropped or outlived its client. Never raises."""
+    def finish(self) -> None:
+        """Mark the won settlement handed to the reporter (or given up)."""
+        self._idle.set()
+
+    def settle_dropped(self, *, wait: bool = False) -> None:
+        """Settle a stream that was dropped or outlived its client. Never raises.
+
+        ``wait`` (client close): when another path (early close, stream error,
+        GC) already claimed it, wait until that path has enqueued, so the
+        reporter seals after it. Every such segment is synchronous.
+        """
         on_dropped = self._on_dropped
         if on_dropped is None:
             return
         try:
-            with self._lock:
-                won = not self._settled
-                if won:
-                    self._settled = True
-                    self._dropped_done.clear()
-            if not won:
-                # GC on the cleanup worker may have claimed it and still be
-                # enqueueing: client close waits, so the reporter seals after.
-                self._dropped_done.wait()
+            if not self.claim():
+                if wait:
+                    self._idle.wait()
                 return
             try:
                 elapsed_ms = (time.monotonic() - self._start_time) * 1000
@@ -114,7 +118,7 @@ class _StreamSettlement:
                     observed = TokenDetails()
                 on_dropped(observed, elapsed_ms)
             finally:
-                self._dropped_done.set()
+                self.finish()
         except BaseException as exc:
             # Structural only: the class name, never the exception text.
             with contextlib.suppress(BaseException):
@@ -252,6 +256,7 @@ class SyncStreamWrapper:
                     type(cb_exc).__name__,
                 )
         finally:
+            self._settlement.finish()
             self._call_span.end(
                 error=failed or self._abort_exc is not None, exception=self._abort_exc
             )
@@ -274,6 +279,7 @@ class SyncStreamWrapper:
                     type(cb_exc).__name__,
                 )
         finally:
+            self._settlement.finish()
             self._call_span.end(error=True, exception=exc)
 
     def _claim_settlement(self) -> bool:
@@ -481,6 +487,7 @@ class AsyncStreamWrapper:
                     type(cb_exc).__name__,
                 )
         finally:
+            self._settlement.finish()
             self._call_span.end(
                 error=failed or self._abort_exc is not None, exception=self._abort_exc
             )
@@ -503,6 +510,7 @@ class AsyncStreamWrapper:
                     type(cb_exc).__name__,
                 )
         finally:
+            self._settlement.finish()
             self._call_span.end(error=True, exception=exc)
 
     def _claim_settlement(self) -> bool:

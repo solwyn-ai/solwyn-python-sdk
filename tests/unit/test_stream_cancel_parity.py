@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import gc
 import json
 import threading
@@ -589,6 +590,88 @@ class TestDroppedStreamSettlesOnce:
         assert [event.status.value for event in plane.ingested] == ["success"]
         assert reporter.dropped_counts.get("settlement_confirm.closed_enqueue") is None
         del stream
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("ending", ["early_close", "stream_error"])
+    async def test_client_close_waits_for_a_stream_settlement_in_flight(
+        self, ending: str, is_async: bool
+    ) -> None:
+        # Another thread's early close or mid-stream error has claimed the
+        # stream but not yet enqueued its pair when the client closes.
+        plane = FakeControlPlane()
+        first = _OpenStream() if ending == "early_close" else _BrokenStream(httpx.ReadError("x"))
+        provider = _Provider(first)
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+        reporter = wrapped._solwyn_reporter
+        if is_async:
+            reporter.start()  # the flush loop lives on this loop, not the worker's
+        stream = await _open_stream(wrapped, is_async=is_async)
+        await _read(stream, is_async=is_async, chunks=1)
+        name = "_on_abandon" if ending == "early_close" else "_on_error"
+        callback = getattr(stream, name)
+        claimed, sealed = threading.Event(), threading.Event()
+
+        def hold() -> None:
+            claimed.set()
+            sealed.wait(0.5)  # unblocked early only if the reporter seals first
+
+        if is_async:
+
+            async def slow(*args: Any, **kwargs: Any) -> None:
+                hold()
+                await callback(*args, **kwargs)
+
+            async def end_stream() -> None:
+                if ending == "early_close":
+                    await stream.close()
+                else:
+                    with contextlib.suppress(Exception):
+                        async for _ in stream:
+                            pass
+
+            target = functools.partial(asyncio.run, end_stream())
+        else:
+
+            def slow(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+                hold()
+                callback(*args, **kwargs)
+
+            def end_stream_sync() -> None:
+                if ending == "early_close":
+                    stream.close()
+                else:
+                    with contextlib.suppress(Exception):
+                        for _ in stream:
+                            pass
+
+            target = end_stream_sync
+
+        setattr(stream, name, slow)
+        reporter_close = reporter.close
+
+        if is_async:
+
+            async def close_then_mark(*args: Any, **kwargs: Any) -> None:
+                await reporter_close(*args, **kwargs)
+                sealed.set()
+        else:
+
+            def close_then_mark(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+                reporter_close(*args, **kwargs)
+                sealed.set()
+
+        worker = threading.Thread(target=target)
+        worker.start()
+        assert claimed.wait(5)
+        with patch.object(reporter, "close", close_then_mark):
+            await _close_client(wrapped, is_async=is_async)
+        worker.join(5)
+
+        [confirm] = plane.confirms
+        assert confirm.token_details.is_estimated is True
+        assert len(plane.ingested) == 1
+        assert reporter.dropped_counts.get("settlement_confirm.closed_enqueue") is None
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("is_async", [False, True])
