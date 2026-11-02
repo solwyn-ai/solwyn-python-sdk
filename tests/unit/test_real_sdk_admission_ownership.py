@@ -124,7 +124,10 @@ async def test_dispatch_cancel_retires_claim_without_refunding_paid_authority(ha
         assert errors[0].attempt_index == 0
         assert errors[0].lease_id == reservation.lease_id
         assert errors[0].input_tokens == errors[0].output_tokens == 0
-        assert all(c.call_id != call_id for c in plane.confirms)
+        # Under hard_deny the unknown spend is confirmed at its floor (0.10.2).
+        [floor] = [c for c in plane.confirms if c.call_id == call_id]
+        assert floor.token_details.is_estimated is True
+        assert floor.lease_id == reservation.lease_id
         assert len(plane.lease_surrenders) == 1
     finally:
         finish.set()
@@ -459,7 +462,9 @@ async def test_cancellation_in_context_body_is_neutral_and_keeps_unknown_spend(r
             assert not breaker._half_open_probe_active
             assert body.closes == 1
         await wrapped.close()
-        assert plane.confirms == []
+        # Under hard_deny the unknown spend is confirmed at its floor (0.10.2).
+        [floor] = plane.confirms
+        assert floor.token_details.is_estimated is True
         assert len(plane.ingested) == 1
         assert plane.ingested[0].possibly_succeeded is True
     finally:

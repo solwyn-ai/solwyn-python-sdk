@@ -144,7 +144,9 @@ def _assert_receipt(plane, call_id, lease_id):
     assert errors[0].trace_id == "00000000000000000000000000000abc"
     assert errors[0].span_id == "00000000000000de"
     assert errors[0].trace_sampled is True
-    assert not any(confirm.call_id == call_id for confirm in plane.confirms)
+    # Under hard_deny the unmeasurable spend is confirmed at its floor (0.10.2).
+    [floor] = [confirm for confirm in plane.confirms if confirm.call_id == call_id]
+    assert (floor.lease_id, floor.token_details.is_estimated) == (lease_id, True)
 
 
 def test_sync_real_anthropic_finalization_error_retires_owner_neutrally() -> None:

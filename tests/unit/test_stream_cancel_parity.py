@@ -19,6 +19,7 @@ import threading
 import time
 import weakref
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -973,13 +974,17 @@ class _CorePlane(FakeControlPlane):
     of an issued reservation, or any lease confirm. An ordinary on-time
     per-call confirm moves only the counter, which reconcile lowers back to
     durable spend. An unconfirmed per-call hold expires. Lease float is gone
-    after surrender, so only receipted or ingested spend survives it. A check
-    is denied when spend, live holds and its own reservation pass the cap.
+    after surrender, so only receipted or ingested spend survives it.
+
+    ``headroom_tokens`` stands for "the cap minus one more call's own
+    reservation": a check is denied once spend and live holds reach it. Tests
+    set it to the first attempt's floor, so the next call is denied exactly
+    when that floor still counts in full.
     """
 
-    def __init__(self, *, cap_tokens: int, **kwargs: Any) -> None:
+    def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self.cap_tokens = cap_tokens
+        self.headroom_tokens: int | None = None
         self._holds: dict[str, int] = {}
         self._issued: set[str] = set()
         self._receipts: dict[str, int] = {}
@@ -1004,7 +1009,7 @@ class _CorePlane(FakeControlPlane):
             need = int(body.get("estimated_input_tokens") or 0) + int(
                 body.get("estimated_output_bound") or 0
             )
-            if self.spent_tokens() + need > self.cap_tokens:
+            if self.headroom_tokens is not None and self.spent_tokens() >= self.headroom_tokens:
                 self._pending_denials.append("monthly")
         response = super()._handle_check(body)
         reservation_id = getattr(response.body, "reservation_id", None)
@@ -1045,13 +1050,16 @@ class _CorePlane(FakeControlPlane):
         return response
 
 
-# Each attempt reserves its input estimate plus max_tokens=100. A cap of 150
-# fits one reservation but not two, so after the first attempt's floor is
-# counted the next call is denied, and without it the next call would fit.
-_CAP_TOKENS = 150
+def _floor_confirm(plane: _CorePlane) -> Any:
+    [floor] = [c for c in plane.confirms if c.token_details.is_estimated]
+    return floor
 
 
-async def _next_call_is_denied(wrapped: Any, *, is_async: bool) -> None:
+async def _next_call_is_denied(plane: _CorePlane, wrapped: Any, *, is_async: bool) -> None:
+    """After expiry, reconcile or surrender, the floor alone still fills the cap."""
+    floor = _floor_confirm(plane)
+    plane.expire_and_reconcile()
+    plane.headroom_tokens = floor.token_details.input_tokens + floor.token_details.output_tokens
     with pytest.raises(solwyn.BudgetExceededError):
         result = wrapped.chat.completions.create(**_REQUEST)
         if is_async:
@@ -1067,7 +1075,7 @@ class TestFloorSurvivesExpiryAndSurrender:
     async def test_early_closed_stream_floor_still_denies_the_next_call(
         self, ending: str, funding: str, is_async: bool
     ) -> None:
-        plane = _CorePlane(cap_tokens=_CAP_TOKENS, granted_tokens=128, final_grant=True)
+        plane = _CorePlane(granted_tokens=128, final_grant=True)
         provider = _Provider(_OpenStream())
         wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
         scope = solwyn.run("floor-stream") if funding == "lease" else contextlib.nullcontext()
@@ -1088,12 +1096,140 @@ class TestFloorSurvivesExpiryAndSurrender:
         # stream is still open and close settles it); a lease is surrendered.
         await _close_client(wrapped, is_async=is_async)
         wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
-        plane.expire_and_reconcile()
 
-        [floor] = [c for c in plane.confirms if c.token_details.is_estimated]
+        floor = _floor_confirm(plane)
         assert floor.token_details.output_tokens == 100
         assert (floor.lease_id is not None) is (funding == "lease")
         try:
-            await _next_call_is_denied(wrapped, is_async=is_async)
+            await _next_call_is_denied(plane, wrapped, is_async=is_async)
+        finally:
+            await _close_client(wrapped, is_async=is_async)
+
+
+class _FailingFirst:
+    """The first request ends in ``case`` after dispatch; later ones succeed."""
+
+    def __init__(self, case: str, *, is_async: bool) -> None:
+        self.case = case
+        self.is_async = is_async
+        self.requests = 0
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.requests += 1
+        if self.requests > 1:
+            return httpx.Response(200, json=_CHAT_BODY)
+        if self.case == "mid_stream_error":
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=_BrokenStream(httpx.ReadError("connection reset")),
+            )
+        if self.case == "wrap_failure":
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=_OpenStream()
+            )
+        if self.case == "read_timeout":
+            raise httpx.ReadTimeout("no response")
+        if self.case == "truncated_json":
+            return httpx.Response(
+                200, headers={"content-type": "application/json"}, content=b'{"id": "c", "cho'
+            )
+        if self.case == "unknown_cause":
+            raise RuntimeError("transport adapter blew up after sending")
+        if self.case == "loop_guard":
+            # The one-generation guard raises from the provider's transport
+            # when the provider SDK sends a second request for one call.
+            raise solwyn.OutputBoundUnenforceableError(
+                provider="openai", reason="multi_generation_loop", hint="test"
+            )
+        if self.case == "responses_entry":
+            return httpx.Response(503, json={"error": {"message": "unavailable"}})
+        raise asyncio.CancelledError() if self.is_async else KeyboardInterrupt()
+
+    async def async_handler(self, request: httpx.Request) -> httpx.Response:
+        return self.handler(request)
+
+    def client(self) -> Any:
+        if self.is_async:
+            return openai.AsyncOpenAI(
+                api_key="sk-test",
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(self.async_handler)),
+                max_retries=0,
+            )
+        return openai.OpenAI(
+            api_key="sk-test",
+            http_client=httpx.Client(transport=httpx.MockTransport(self.handler)),
+            max_retries=0,
+        )
+
+
+_FAILURE_CASES = [
+    "mid_stream_error",
+    "wrap_failure",
+    "read_timeout",
+    "truncated_json",
+    "unknown_cause",
+    "loop_guard",
+    "cancel_in_flight",
+    "responses_entry",
+]
+
+
+async def _fail_first_call(wrapped: Any, case: str, *, is_async: bool) -> None:
+    if case == "responses_entry":
+        manager = wrapped.responses.stream(model=MODEL, input="hi", max_output_tokens=100)
+        with pytest.raises(openai.APIStatusError):
+            if is_async:
+                async with manager:
+                    pass
+            else:
+                with manager:
+                    pass
+        return
+    streaming = case in ("mid_stream_error", "wrap_failure")
+    expected: Any = Exception
+    if case == "cancel_in_flight":
+        expected = asyncio.CancelledError if is_async else KeyboardInterrupt
+    with pytest.raises(expected):
+        result = wrapped.chat.completions.create(
+            **_REQUEST, **({"stream": True} if streaming else {})
+        )
+        result = await result if is_async else result
+        if streaming:
+            await _consume(result, is_async=is_async, break_after=None)
+
+
+@pytest.mark.unit
+class TestFailureFloorSurvivesExpiryAndSurrender:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("funding", ["per_call", "lease"])
+    @pytest.mark.parametrize("case", _FAILURE_CASES)
+    async def test_possibly_billed_failure_floor_still_denies_the_next_call(
+        self, case: str, funding: str, is_async: bool
+    ) -> None:
+        plane = _CorePlane(granted_tokens=128, final_grant=True)
+        provider = _FailingFirst(case, is_async=is_async)
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client())
+        adapter = wrapped._solwyn_runtimes[0].adapter
+        wrap_patch = (
+            patch.object(adapter, "wrap_stream_result", side_effect=ValueError("wrap"))
+            if case == "wrap_failure"
+            else contextlib.nullcontext()
+        )
+        scope = solwyn.run(f"floor-{case}") if funding == "lease" else contextlib.nullcontext()
+        with scope, wrap_patch:
+            await _fail_first_call(wrapped, case, is_async=is_async)
+        await _close_client(wrapped, is_async=is_async)
+
+        floor = _floor_confirm(plane)
+        assert floor.token_details.output_tokens == 100
+        assert (floor.lease_id is not None) is (funding == "lease")
+        # The attempt's own event is unchanged: an error receipt, same call id.
+        [event] = [e for e in plane.ingested if e.call_id == floor.call_id]
+        assert event.status.value == "error"
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client())
+        try:
+            await _next_call_is_denied(plane, wrapped, is_async=is_async)
         finally:
             await _close_client(wrapped, is_async=is_async)

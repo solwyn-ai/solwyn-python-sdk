@@ -215,7 +215,10 @@ async def test_google_first_chunk_cancel_closes_source_and_conservatively_retire
         assert errors[0].failover_error_class == "CancelledError"
         assert errors[0].lease_id == reservation.lease_id
         assert errors[0].input_tokens == errors[0].output_tokens == 0
-        assert not any(confirm.call_id == call_id for confirm in plane.confirms)
+        # Under hard_deny the unknown spend is confirmed at its floor (0.10.2).
+        [floor] = [confirm for confirm in plane.confirms if confirm.call_id == call_id]
+        assert floor.token_details.is_estimated is True
+        assert floor.lease_id == reservation.lease_id
         assert source.closes == 1
     finally:
         await wrapped.close()

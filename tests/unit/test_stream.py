@@ -2495,9 +2495,15 @@ async def test_stream_interrupt_billing_matches_main(
             assert not events
             assert state.success_count == 0
         else:
-            assert not settlements
-            assert len(events) == 1
-            event = events[0]
+            if budget_mode == "hard_deny":
+                # The receipt rides with a floor confirm (the reservation,
+                # marked estimated) so core keeps the unknown spend (0.10.2).
+                [(confirm, event)] = settlements
+                assert confirm.token_details.is_estimated is True
+                assert not events
+            else:
+                assert not settlements
+                [event] = events
             assert (event.input_tokens, event.output_tokens, event.status.value) == (0, 0, "error")
             assert event.possibly_succeeded is True
             assert event.failover_error_class == exception.__name__
@@ -2573,12 +2579,21 @@ async def test_stream_entry_failure_billing_matches_main(
                 result.__enter__()
         state = wrapper._get_circuit_breaker("openai").get_state()
         assert (state.failure_count, state.success_count) == (failure_count if responses else 0, 0)
-        assert not settlements
+        # Under hard_deny a possibly billed entry failure (anything but the
+        # proven pre-send ConnectError) also confirms its floor (0.10.2).
+        floored = responses and budget_mode == "hard_deny" and exception is not httpx.ConnectError
+        if floored:
+            [(confirm, entry_event)] = settlements
+            assert confirm.token_details.is_estimated is True
+            assert not events
+        else:
+            assert not settlements
         if responses:
-            assert len(events) == 1
-            assert events[0].status.value == "error"
-            assert events[0].possibly_succeeded is possibly_succeeded
-            assert events[0].failover_error_class == exception.__name__
+            receipts = [entry_event] if floored else events
+            assert len(receipts) == 1
+            assert receipts[0].status.value == "error"
+            assert receipts[0].possibly_succeeded is possibly_succeeded
+            assert receipts[0].failover_error_class == exception.__name__
         else:
             # Direct-stream context entry historically leaves settlement to close.
             assert not events
@@ -2587,8 +2602,8 @@ async def test_stream_entry_failure_billing_matches_main(
         else:
             result.close()
         if responses:
-            assert not settlements
-            assert len(events) == 1
+            assert len(settlements) == (1 if floored else 0)
+            assert len(events) == (0 if floored else 1)
         elif budget_mode == "hard_deny":
             # Closed before its natural end: under hard_deny the reservation is
             # confirmed at its floor (0.10.2); the success event keeps today's

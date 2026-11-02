@@ -817,11 +817,13 @@ def _settle_stream_failure(
     failover_error_class: str | None = None,
     admission: CircuitBreakerAdmission | None = None,
     maybe_billed: bool | None = None,
+    observed: TokenDetails | None = None,
 ) -> None:
     """Reconcile a terminal attempt without usage: health, local debit, receipt.
 
     ``possibly_succeeded`` is the receipt flag. ``maybe_billed`` decides the
-    funding (kept under hard_deny) and defaults to the flag.
+    funding and defaults to the flag. Under hard_deny a possibly billed attempt
+    confirms its floor (at least ``observed``, when given) beside its receipt.
     """
     is_provider_fallback = ctx.is_provider_fallback
     if record_breaker_failure:
@@ -830,33 +832,53 @@ def _settle_stream_failure(
         owner._get_circuit_breaker(provider).release_probe(admission)
     if maybe_billed is None:
         maybe_billed = bool(possibly_succeeded)
-    if maybe_billed and _hard_deny_funding(budget):
-        owner._solwyn_budget.abandon_reservation(
-            call_id, lease_claim_token=_lease_claim_token(budget)
-        )
-    else:
-        owner._solwyn_budget.release_reservation(
-            call_id, lease_claim_token=_lease_claim_token(budget)
-        )
-    owner._solwyn_reporter.report(
-        owner._build_error_event(
-            model=ctx.model,
-            provider=provider,
-            latency_ms=ctx.elapsed_ms(),
-            is_model_fallback=is_model_fallback,
-            is_provider_fallback=is_provider_fallback,
-            requested_provider=primary.entry.provider if is_provider_fallback else None,
-            requested_model=requested_model if is_provider_fallback else None,
-            failover_error_class=failover_error_class,
-            attempt_index=ctx.attempt_index,
-            call_id=call_id,
-            possibly_succeeded=possibly_succeeded,
-            agent_run=agent_run,
-            trace=trace,
-            provider_region=provider_region,
-            lease_id=_settlement_keys(budget)[1],
-        )
+    keep = maybe_billed and _hard_deny_funding(budget)
+    reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
+    event = owner._build_error_event(
+        model=ctx.model,
+        provider=provider,
+        latency_ms=ctx.elapsed_ms(),
+        is_model_fallback=is_model_fallback,
+        is_provider_fallback=is_provider_fallback,
+        requested_provider=primary.entry.provider if is_provider_fallback else None,
+        requested_model=requested_model if is_provider_fallback else None,
+        failover_error_class=failover_error_class,
+        attempt_index=ctx.attempt_index,
+        call_id=call_id,
+        possibly_succeeded=possibly_succeeded,
+        agent_run=agent_run,
+        trace=trace,
+        provider_region=provider_region,
+        lease_id=lease_id,
     )
+    confirm = None
+    if keep and (reservation_id or lease_id):
+        # Durable: core keeps an estimated confirm as a receipt and nets it
+        # against this receipt event per call id. Locally the claim settles
+        # at no less than its bound.
+        try:
+            confirm = owner._solwyn_budget.build_confirm_request(
+                reservation_id=reservation_id,
+                lease_id=lease_id,
+                lease_claim_token=lease_claim_token,
+                model=ctx.model,
+                token_details=_floor_usage(budget, observed or TokenDetails()),
+                provider=provider,
+                is_provider_fallback=is_provider_fallback,
+                call_id=call_id,
+                provider_region=provider_region,
+                usage_unmeasured=True,
+            )
+        except Exception as confirm_exc:
+            logger.warning("settlement.floor_confirm_failed: %s", type(confirm_exc).__name__)
+    if confirm is not None:
+        owner._solwyn_reporter.report_settlement(confirm, event)
+        return
+    if keep:
+        owner._solwyn_budget.abandon_reservation(call_id, lease_claim_token=lease_claim_token)
+    else:
+        owner._solwyn_budget.release_reservation(call_id, lease_claim_token=lease_claim_token)
+    owner._solwyn_reporter.report(event)
 
 
 def _settle_stream_wrap_failure(
@@ -916,6 +938,7 @@ def _make_stream_error_handler(
     trace: _TraceSnapshot | None = None,
     admission: CircuitBreakerAdmission | None = None,
     provider_failure: bool = True,
+    observed_usage: Callable[[], TokenDetails] | None = None,
 ) -> Callable[[BaseException], None]:
     """Build the established stream-error reconciliation callback once.
 
@@ -927,6 +950,12 @@ def _make_stream_error_handler(
     provider_region = _safe_extract_region(runtime)
 
     def on_error(_exc: BaseException) -> None:
+        observed = None
+        if observed_usage is not None:
+            try:
+                observed = observed_usage()
+            except Exception as usage_exc:
+                logger.warning("stream.observed_usage_failed: %s", type(usage_exc).__name__)
         _settle_stream_failure(
             owner,
             ctx,
@@ -949,6 +978,7 @@ def _make_stream_error_handler(
                 else None
             ),
             admission=admission,
+            observed=observed,
         )
 
     return on_error
@@ -1056,6 +1086,7 @@ def _make_async_stream_error_handler(
     trace: _TraceSnapshot | None = None,
     admission: CircuitBreakerAdmission | None = None,
     provider_failure: bool = True,
+    observed_usage: Callable[[], TokenDetails] | None = None,
 ) -> Callable[[BaseException], Awaitable[None]]:
     sync_handler = _make_stream_error_handler(
         owner,
@@ -1070,6 +1101,7 @@ def _make_async_stream_error_handler(
         trace=trace,
         admission=admission,
         provider_failure=provider_failure,
+        observed_usage=observed_usage,
     )
 
     async def on_error(exc: BaseException) -> None:
@@ -3531,29 +3563,57 @@ class Solwyn(_SolwynBase):
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
                         try:
-                            self._solwyn_reporter.report(
-                                self._build_error_event(
-                                    model=served_model,
-                                    provider=provider,
-                                    latency_ms=ctx.elapsed_ms(),
-                                    is_model_fallback=is_model_fallback,
-                                    is_provider_fallback=is_provider_fallback,
-                                    requested_provider=(
-                                        primary.entry.provider if is_provider_fallback else None
-                                    ),
-                                    requested_model=requested_model
-                                    if is_provider_fallback
-                                    else None,
-                                    failover_error_class=type(exc).__name__,
-                                    attempt_index=chain_index,
-                                    call_id=call_id,
-                                    possibly_succeeded=True if possibly_succeeded else None,
-                                    agent_run=agent_run,
-                                    trace=trace,
-                                    provider_region=_safe_extract_region(rt),
-                                    lease_id=_settlement_keys(budget)[1],
-                                )
+                            hop_region = _safe_extract_region(rt)
+                            reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
+                            event = self._build_error_event(
+                                model=served_model,
+                                provider=provider,
+                                latency_ms=ctx.elapsed_ms(),
+                                is_model_fallback=is_model_fallback,
+                                is_provider_fallback=is_provider_fallback,
+                                requested_provider=(
+                                    primary.entry.provider if is_provider_fallback else None
+                                ),
+                                requested_model=requested_model if is_provider_fallback else None,
+                                failover_error_class=type(exc).__name__,
+                                attempt_index=chain_index,
+                                call_id=call_id,
+                                possibly_succeeded=True if possibly_succeeded else None,
+                                agent_run=agent_run,
+                                trace=trace,
+                                provider_region=hop_region,
+                                lease_id=lease_id,
                             )
+                            if (
+                                usage_unknown
+                                and _hard_deny_funding(budget)
+                                and (reservation_id or lease_id)
+                                and (
+                                    disp is Disposition.FAIL_FAST
+                                    or (
+                                        disp is Disposition.POST_SEND_AMBIGUOUS
+                                        and not allow_ambiguous_failover
+                                    )
+                                )
+                            ):
+                                # A possibly billed attempt ends the call under
+                                # hard_deny: confirm its floor beside the receipt so
+                                # core keeps it durably (netted per call id).
+                                floor_confirm = self._solwyn_budget.build_confirm_request(
+                                    reservation_id=reservation_id,
+                                    lease_id=lease_id,
+                                    lease_claim_token=lease_claim_token,
+                                    model=served_model,
+                                    token_details=_floor_usage(budget, TokenDetails()),
+                                    provider=provider,
+                                    is_provider_fallback=is_provider_fallback,
+                                    call_id=call_id,
+                                    provider_region=hop_region,
+                                    usage_unmeasured=True,
+                                )
+                                self._solwyn_reporter.report_settlement(floor_confirm, event)
+                            else:
+                                self._solwyn_reporter.report(event)
                         except Exception as receipt_exc:
                             # The receipt is best-effort: losing it must never mask the
                             # provider's error or skip the reservation's terminal step.
@@ -3634,19 +3694,6 @@ class Solwyn(_SolwynBase):
                 # runs ONLY on the non-streaming path, AFTER the streaming early return.
                 if is_streaming:
                     if _surface == "responses" and _responses_leaf == "stream":
-                        on_error = _make_stream_error_handler(
-                            self,
-                            rt,
-                            ctx,
-                            budget,
-                            primary,
-                            requested_model=requested_model,
-                            is_model_fallback=is_model_fallback,
-                            call_id=call_id,
-                            agent_run=agent_run,
-                            trace=trace,
-                            admission=admission,
-                        )
                         # The manager sends its request in __enter__, AFTER this
                         # candidate walk: its failure needs the walk's classification,
                         # not the established stream's unconditional verdict.
@@ -3682,7 +3729,6 @@ class Solwyn(_SolwynBase):
                                 estimated_input_tokens=est_in,
                                 estimate_empty_usage=True,
                                 velocity_flags=velocity_flags,
-                                on_error=on_error,
                                 admission=admission,
                                 termination_handle=termination_handle,
                             ),
@@ -4074,6 +4120,7 @@ class Solwyn(_SolwynBase):
                 agent_run=agent_run,
                 trace=trace,
                 admission=admission,
+                observed_usage=accumulator.finalize,
             )
 
         # Cross-DIALECT hop: reshape each served chunk back to the caller's
@@ -5564,29 +5611,57 @@ class AsyncSolwyn(_SolwynBase):
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
                         try:
-                            self._solwyn_reporter.report(
-                                self._build_error_event(
-                                    model=served_model,
-                                    provider=provider,
-                                    latency_ms=ctx.elapsed_ms(),
-                                    is_model_fallback=is_model_fallback,
-                                    is_provider_fallback=is_provider_fallback,
-                                    requested_provider=(
-                                        primary.entry.provider if is_provider_fallback else None
-                                    ),
-                                    requested_model=requested_model
-                                    if is_provider_fallback
-                                    else None,
-                                    failover_error_class=type(exc).__name__,
-                                    attempt_index=chain_index,
-                                    call_id=call_id,
-                                    possibly_succeeded=True if possibly_succeeded else None,
-                                    agent_run=agent_run,
-                                    trace=trace,
-                                    provider_region=_safe_extract_region(rt),
-                                    lease_id=_settlement_keys(budget)[1],
-                                )
+                            hop_region = _safe_extract_region(rt)
+                            reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
+                            event = self._build_error_event(
+                                model=served_model,
+                                provider=provider,
+                                latency_ms=ctx.elapsed_ms(),
+                                is_model_fallback=is_model_fallback,
+                                is_provider_fallback=is_provider_fallback,
+                                requested_provider=(
+                                    primary.entry.provider if is_provider_fallback else None
+                                ),
+                                requested_model=requested_model if is_provider_fallback else None,
+                                failover_error_class=type(exc).__name__,
+                                attempt_index=chain_index,
+                                call_id=call_id,
+                                possibly_succeeded=True if possibly_succeeded else None,
+                                agent_run=agent_run,
+                                trace=trace,
+                                provider_region=hop_region,
+                                lease_id=lease_id,
                             )
+                            if (
+                                usage_unknown
+                                and _hard_deny_funding(budget)
+                                and (reservation_id or lease_id)
+                                and (
+                                    disp is Disposition.FAIL_FAST
+                                    or (
+                                        disp is Disposition.POST_SEND_AMBIGUOUS
+                                        and not allow_ambiguous_failover
+                                    )
+                                )
+                            ):
+                                # A possibly billed attempt ends the call under
+                                # hard_deny: confirm its floor beside the receipt so
+                                # core keeps it durably (netted per call id).
+                                floor_confirm = self._solwyn_budget.build_confirm_request(
+                                    reservation_id=reservation_id,
+                                    lease_id=lease_id,
+                                    lease_claim_token=lease_claim_token,
+                                    model=served_model,
+                                    token_details=_floor_usage(budget, TokenDetails()),
+                                    provider=provider,
+                                    is_provider_fallback=is_provider_fallback,
+                                    call_id=call_id,
+                                    provider_region=hop_region,
+                                    usage_unmeasured=True,
+                                )
+                                self._solwyn_reporter.report_settlement(floor_confirm, event)
+                            else:
+                                self._solwyn_reporter.report(event)
                         except Exception as receipt_exc:
                             # The receipt is best-effort: losing it must never mask the
                             # provider's error or skip the reservation's terminal step.
@@ -5665,19 +5740,6 @@ class AsyncSolwyn(_SolwynBase):
                 # runs ONLY on the non-streaming path, AFTER the streaming early return.
                 if is_streaming:
                     if _surface == "responses" and _responses_leaf == "stream":
-                        on_error = _make_async_stream_error_handler(
-                            self,
-                            rt,
-                            ctx,
-                            budget,
-                            primary,
-                            requested_model=requested_model,
-                            is_model_fallback=is_model_fallback,
-                            call_id=call_id,
-                            agent_run=agent_run,
-                            trace=trace,
-                            admission=admission,
-                        )
                         # The manager sends its request in __aenter__, AFTER this
                         # candidate walk: its failure needs the walk's classification,
                         # not the established stream's unconditional verdict.
@@ -5713,7 +5775,6 @@ class AsyncSolwyn(_SolwynBase):
                                 estimated_input_tokens=est_in,
                                 estimate_empty_usage=True,
                                 velocity_flags=velocity_flags,
-                                on_error=on_error,
                                 admission=admission,
                                 termination_handle=termination_handle,
                             ),
@@ -6108,6 +6169,7 @@ class AsyncSolwyn(_SolwynBase):
                 agent_run=agent_run,
                 trace=trace,
                 admission=admission,
+                observed_usage=accumulator.finalize,
             )
 
         # Cross-DIALECT hop: reshape each served chunk back to the caller's

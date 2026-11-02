@@ -181,6 +181,7 @@ def _assert_one_error_receipt(
     *,
     possibly_succeeded: bool | None,
     error_class: str,
+    floored: bool | None = None,
 ) -> None:
     events: list[MetadataEvent] = [e for e in plane.ingested if e.call_id == call_id]
     assert len(events) == 1, events
@@ -191,7 +192,17 @@ def _assert_one_error_receipt(
     assert event.attempt_index == 0
     assert event.lease_id == "lse_fake1"
     assert event.input_tokens == event.output_tokens == 0
-    assert all(confirm.call_id != call_id for confirm in plane.confirms)
+    # Under hard_deny a possibly billed attempt also confirms its floor (the
+    # reservation, marked estimated) so core keeps it durably; the event
+    # keeps its observed zero usage.
+    confirms = [c for c in plane.confirms if c.call_id == call_id]
+    if possibly_succeeded is True if floored is None else floored:
+        [confirm] = confirms
+        assert confirm.lease_id == "lse_fake1"
+        assert confirm.token_details.is_estimated is True
+        assert confirm.token_details.output_tokens > 0
+    else:
+        assert confirms == []
 
 
 _BREAKER_CONFIG: dict[str, Any] = {
@@ -327,6 +338,9 @@ def test_sync_interrupt_cleanup_failure_never_masks_the_interrupt(
             # Act
             with (
                 patch.object(wrapped._solwyn_reporter, "report", side_effect=cleanup_error),
+                patch.object(
+                    wrapped._solwyn_reporter, "report_settlement", side_effect=cleanup_error
+                ),
                 caplog.at_level("WARNING", logger="solwyn.client"),
                 pytest.raises(KeyboardInterrupt) as raised,
             ):

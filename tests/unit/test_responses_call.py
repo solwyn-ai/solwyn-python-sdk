@@ -1425,17 +1425,28 @@ class TestResponsesPublicProxySync:
             assert exc_info.value is error
             # Under hard_deny the possibly billed claim is kept; elsewhere it is
             # handed back. The receipt is flagged in every mode.
-            (release if hard_deny else handback).assert_called_once()
-            (handback if hard_deny else release).assert_not_called()
+            reporter = solwyn._solwyn_reporter
+            if hard_deny:
+                # Under hard_deny the possibly billed claim is confirmed at its
+                # floor (marked estimated) beside its receipt (0.10.2).
+                release.assert_not_called()
+                handback.assert_not_called()
+                reporter.report.assert_not_called()
+                reporter.report_settlement.assert_called_once()
+                floor, receipt = reporter.report_settlement.call_args.args
+                assert floor.token_details.is_estimated is True
+            else:
+                handback.assert_called_once()
+                release.assert_not_called()
+                reporter.report_settlement.assert_not_called()
+                reporter.report.assert_called_once()
+                receipt = reporter.report.call_args.args[0]
             # 5xx is post-send ambiguous: a health failure whose charge the
             # server must reconcile.
             breaker_failure.assert_called_once_with()
-            solwyn._solwyn_reporter.report_settlement.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_called_once()
-            event = solwyn._solwyn_reporter.report.call_args.args[0]
-            assert event.possibly_succeeded is True
+            assert receipt.possibly_succeeded is True
             # `_Status` is reported wire-normalized (leading underscore stripped).
-            assert event.failover_error_class == "Status"
+            assert receipt.failover_error_class == "Status"
 
     def test_native_stream_helper_fail_fast_enter_failure_spares_the_breaker(self) -> None:
         error = _Status(400, "invalid request")
@@ -1531,16 +1542,27 @@ class TestResponsesPublicProxySync:
             assert exc_info.value is original
             # Under hard_deny the possibly billed claim is kept; elsewhere it is
             # handed back. The receipt is flagged in every mode.
-            (release if hard_deny else handback).assert_called_once()
-            (handback if hard_deny else release).assert_not_called()
+            reporter = solwyn._solwyn_reporter
+            if hard_deny:
+                # Under hard_deny the possibly billed claim is confirmed at its
+                # floor (marked estimated) beside its receipt (0.10.2).
+                release.assert_not_called()
+                handback.assert_not_called()
+                reporter.report.assert_not_called()
+                reporter.report_settlement.assert_called_once()
+                floor, receipt = reporter.report_settlement.call_args.args
+                assert floor.token_details.is_estimated is True
+            else:
+                handback.assert_called_once()
+                release.assert_not_called()
+                reporter.report_settlement.assert_not_called()
+                reporter.report.assert_called_once()
+                receipt = reporter.report.call_args.args[0]
             # Wrapping is SDK-side bookkeeping, never a provider-health verdict.
             breaker_failure.assert_not_called()
             probe_release.assert_called_once()
-            solwyn._solwyn_reporter.report.assert_called_once()
-            receipt = solwyn._solwyn_reporter.report.call_args.args[0]
             assert receipt.possibly_succeeded is True
             assert receipt.failover_error_class == "ValueError"
-            solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert len(provider_manager.exit_calls) == 1
             assert inner.close_calls == 1
 
@@ -2753,17 +2775,28 @@ class TestResponsesPublicProxyAsync:
             assert exc_info.value is error
             # Under hard_deny the possibly billed claim is kept; elsewhere it is
             # handed back. The receipt is flagged in every mode.
-            (release if hard_deny else handback).assert_called_once()
-            (handback if hard_deny else release).assert_not_called()
+            reporter = solwyn._solwyn_reporter
+            if hard_deny:
+                # Under hard_deny the possibly billed claim is confirmed at its
+                # floor (marked estimated) beside its receipt (0.10.2).
+                release.assert_not_called()
+                handback.assert_not_called()
+                reporter.report.assert_not_called()
+                reporter.report_settlement.assert_called_once()
+                floor, receipt = reporter.report_settlement.call_args.args
+                assert floor.token_details.is_estimated is True
+            else:
+                handback.assert_called_once()
+                release.assert_not_called()
+                reporter.report_settlement.assert_not_called()
+                reporter.report.assert_called_once()
+                receipt = reporter.report.call_args.args[0]
             # 5xx is post-send ambiguous: a health failure whose charge the
             # server must reconcile.
             breaker_failure.assert_called_once_with()
-            solwyn._solwyn_reporter.report_settlement.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_called_once()
-            event = solwyn._solwyn_reporter.report.call_args.args[0]
-            assert event.possibly_succeeded is True
+            assert receipt.possibly_succeeded is True
             # `_Status` is reported wire-normalized (leading underscore stripped).
-            assert event.failover_error_class == "Status"
+            assert receipt.failover_error_class == "Status"
 
     @pytest.mark.asyncio
     async def test_native_stream_helper_fail_fast_enter_failure_spares_the_breaker(self) -> None:
@@ -2884,11 +2917,24 @@ class TestResponsesPublicProxyAsync:
             check.assert_awaited_once()
             # Under hard_deny the possibly billed claim is kept; elsewhere it is
             # handed back. The receipt is flagged in every mode.
-            (release if hard_deny else handback).assert_called_once()
-            (handback if hard_deny else release).assert_not_called()
+            reporter = solwyn._solwyn_reporter
+            if hard_deny:
+                # Under hard_deny the possibly billed claim is confirmed at its
+                # floor (marked estimated) beside its receipt (0.10.2).
+                release.assert_not_called()
+                handback.assert_not_called()
+                reporter.report.assert_not_called()
+                reporter.report_settlement.assert_called_once()
+                floor, receipt = reporter.report_settlement.call_args.args
+                assert floor.token_details.is_estimated is True
+            else:
+                handback.assert_called_once()
+                release.assert_not_called()
+                reporter.report_settlement.assert_not_called()
+                reporter.report.assert_called_once()
+                receipt = reporter.report.call_args.args[0]
+            assert receipt.possibly_succeeded is True
             breaker_failure.assert_not_called()
-            solwyn._solwyn_reporter.report.assert_called_once()
-            solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert provider_manager.enter_calls == 1
             assert len(provider_manager.exit_calls) == 1
             exit_args = provider_manager.exit_calls[0]
@@ -3090,16 +3136,27 @@ class TestResponsesPublicProxyAsync:
             assert exc_info.value is original
             # Under hard_deny the possibly billed claim is kept; elsewhere it is
             # handed back. The receipt is flagged in every mode.
-            (release if hard_deny else handback).assert_called_once()
-            (handback if hard_deny else release).assert_not_called()
+            reporter = solwyn._solwyn_reporter
+            if hard_deny:
+                # Under hard_deny the possibly billed claim is confirmed at its
+                # floor (marked estimated) beside its receipt (0.10.2).
+                release.assert_not_called()
+                handback.assert_not_called()
+                reporter.report.assert_not_called()
+                reporter.report_settlement.assert_called_once()
+                floor, receipt = reporter.report_settlement.call_args.args
+                assert floor.token_details.is_estimated is True
+            else:
+                handback.assert_called_once()
+                release.assert_not_called()
+                reporter.report_settlement.assert_not_called()
+                reporter.report.assert_called_once()
+                receipt = reporter.report.call_args.args[0]
             # Wrapping is SDK-side bookkeeping, never a provider-health verdict.
             breaker_failure.assert_not_called()
             probe_release.assert_called_once()
-            solwyn._solwyn_reporter.report.assert_called_once()
-            receipt = solwyn._solwyn_reporter.report.call_args.args[0]
             assert receipt.possibly_succeeded is True
             assert receipt.failover_error_class == "ValueError"
-            solwyn._solwyn_reporter.report_settlement.assert_not_called()
             assert len(provider_manager.exit_calls) == 1
             assert inner.aclose_calls == 1
 
