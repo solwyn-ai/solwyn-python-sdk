@@ -41,6 +41,11 @@ Bug fix: a stream closed early no longer gives back budget it may have spent.
   marked estimated, when it saw none). A stream that reaches its end settles
   exactly as before. Applies to every provider, sync and async, including the
   Responses `stream()` manager.
+- **A stream dropped without close() now settles.** A stream that was
+  garbage-collected without being closed never settled, so its funding went
+  back the same way. It now settles once as an early close when it is
+  collected. Closing the client also settles every stream it returned that is
+  still open, before the reporter shuts down.
 
 ## [0.10.1] - 2026-11-02
 

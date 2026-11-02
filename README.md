@@ -948,6 +948,16 @@ server's reservation TTL. The call still reports one success receipt with the
 usage it observed (the pre-flight input estimate, marked estimated, when it
 observed none), and its breaker records a success. A stream that reaches its
 natural end confirms its measured usage as before.
+
+A stream you drop without closing settles the same way, exactly once. When it
+is garbage-collected, a finalizer hands settlement to Solwyn's background
+cleanup thread. Closing the client first settles every stream it returned that
+is still open, so those receipts ship before the reporter shuts down. Neither
+path records the stream's latency, because that time measures how long you held
+the stream. A stream still open when the interpreter exits is not settled. A
+stream that settles after its client's reporter has shut down still holds its
+lease claim locally, but its receipt is refused and counted in the reporter's
+`dropped_counts` (`settlement_confirm.closed_enqueue`, `event.closed_enqueue`).
 Sync and async dispatch errors with unknown post-send usage (read timeouts,
 5xx responses, or protocol drops) also retain the bound when ambiguous failover
 is disabled. With `failover_idempotency="always"` the call fails over instead,

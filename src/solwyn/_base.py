@@ -92,6 +92,7 @@ from solwyn.providers._errors import Disposition, classify_exception
 
 if TYPE_CHECKING:
     from solwyn._registry import ProviderRuntime
+    from solwyn.stream import _StreamSettlement
 
 logger = logging.getLogger(__name__)
 
@@ -2342,6 +2343,32 @@ class _SolwynBase:
                 return self._resolve_unknown_value(returned, path)
             return self._guard_resource(returned, path)
         raise RuntimeError(f"unsupported surface kind in runtime resolver: {rule.kind.value}")
+
+    def _track_open_stream(self, settlement: _StreamSettlement) -> None:
+        """Remember a returned stream so close() can settle it if still open."""
+        streams = getattr(self, "_solwyn_open_streams", None)
+        if streams is not None:
+            streams.add(settlement)
+
+    def _settle_open_streams(self) -> None:
+        """Settle every stream still open, once each, as an early close.
+
+        Called by close() before the reporter seals, so the receipts ship.
+        Settling claims each stream's single settlement, so a later close(),
+        natural end, error or GC of that stream does nothing. Never raises.
+        """
+        streams = getattr(self, "_solwyn_open_streams", None)
+        if not streams:
+            return
+        while True:
+            # A collection can retire an entry mid-snapshot; retry until stable.
+            try:
+                open_streams = list(streams)
+                break
+            except RuntimeError:
+                continue
+        for settlement in open_streams:
+            settlement.settle_dropped()
 
     def _reset_after_fork_in_child(self) -> None:
         """Replace locks and clear process-local velocity state in a child.

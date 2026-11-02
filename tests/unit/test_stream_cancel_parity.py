@@ -12,7 +12,11 @@ attempt as possibly billed.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
+import threading
+import time
+import weakref
 from typing import Any
 
 import httpx
@@ -325,3 +329,305 @@ class TestCancellationRacingAKnownUnbilledRejection:
             monkeypatch.undo()
             wrapped.close()
         _assert_unbilled(plane, spent, reserved)
+
+
+# ── Dropped without close(): GC and client close settle once ─────────────
+
+
+def _wait_until(predicate: Any, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+async def _await_until(predicate: Any, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return predicate()
+
+
+async def _read(stream: Any, *, is_async: bool, chunks: int) -> None:
+    for _ in range(chunks):
+        if is_async:
+            await anext(stream)
+        else:
+            next(stream)
+
+
+async def _close_client(wrapped: Any, *, is_async: bool) -> None:
+    if is_async:
+        await wrapped.close()
+    else:
+        wrapped.close()
+
+
+async def _open_stream(wrapped: Any, *, is_async: bool) -> Any:
+    # No local alias may outlive the caller's reference: GC tests drop it.
+    if is_async:
+        return await wrapped.chat.completions.create(**_REQUEST, stream=True)
+    return wrapped.chat.completions.create(**_REQUEST, stream=True)
+
+
+@pytest.mark.unit
+class TestDroppedStreamSettlesOnce:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    async def test_dropped_lease_stream_keeps_its_claim_spent(self, is_async: bool) -> None:
+        plane = FakeControlPlane(granted_tokens=128, final_grant=True)
+        provider = _Provider(_OpenStream())
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+
+        async def create(**extra: Any) -> Any:
+            result = wrapped.chat.completions.create(**_REQUEST, **extra)
+            return await result if is_async else result
+
+        try:
+            with solwyn.run("dropped-lease") as run_id:
+                stream = await create(stream=True)
+                await _read(stream, is_async=is_async, chunks=2)
+                state = wrapped._solwyn_budget._lease.state_for(run_id)
+                assert state.reserved_tokens > 0
+                ref = weakref.ref(stream)
+                del stream
+                gc.collect()
+                assert ref() is None
+                # GC hands settlement to the run-cleanup worker thread.
+                settled = (
+                    await _await_until(lambda: state.reserved_tokens == 0)
+                    if is_async
+                    else _wait_until(lambda: state.reserved_tokens == 0)
+                )
+                assert settled
+                assert state.spent_tokens_since_report >= 100
+                await create()
+        finally:
+            await _close_client(wrapped, is_async=is_async)
+
+        # The second call no longer fits the lease, so it takes a check.
+        assert [check.model for check in plane.checks] == [MODEL]
+        assert plane.lease_surrenders[-1].spent_tokens >= 100
+        first = plane.ingested[0]
+        assert first.status.value == "success"
+        assert first.token_details.is_estimated is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    async def test_dropped_per_call_stream_keeps_the_hold(self, is_async: bool) -> None:
+        plane = FakeControlPlane()
+        provider = _Provider(_OpenStream())
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+        try:
+            stream = await _open_stream(wrapped, is_async=is_async)
+            await _read(stream, is_async=is_async, chunks=2)
+            del stream
+            gc.collect()
+        finally:
+            # Settled by the GC handoff, or by close() if the worker has not
+            # run yet: exactly one receipt either way.
+            await _close_client(wrapped, is_async=is_async)
+
+        assert plane.confirms == []
+        assert [event.status.value for event in plane.ingested] == ["success"]
+        assert plane.ingested[0].token_details.is_estimated is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    async def test_finalizer_keeps_nothing_alive(self, is_async: bool) -> None:
+        from solwyn import _run_control
+
+        plane = FakeControlPlane(granted_tokens=128, final_grant=True)
+        provider = _Provider(_OpenStream())
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+        client_ref = weakref.ref(wrapped)
+        with solwyn.run("dropped-gc") as run_id:
+            stream = await _open_stream(wrapped, is_async=is_async)
+            await _read(stream, is_async=is_async, chunks=1)
+            stream_ref = weakref.ref(stream)
+            cell_ref = weakref.ref(stream._settlement)
+            assert run_id in _run_control._STATE.active_handles
+            del stream
+            gc.collect()
+            assert stream_ref() is None
+            # Settled on the cleanup worker, which then lets go of the cell.
+            assert _wait_until(lambda: (gc.collect(), cell_ref())[1] is None)
+            # The stream's run-stop handle went with it.
+            assert _wait_until(lambda: run_id not in _run_control._STATE.active_handles)
+        await _close_client(wrapped, is_async=is_async)
+        del wrapped
+        gc.collect()
+        assert _wait_until(lambda: (gc.collect(), client_ref())[1] is None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    async def test_client_close_settles_an_open_stream_once(self, is_async: bool) -> None:
+        plane = FakeControlPlane(granted_tokens=128, final_grant=True)
+        provider = _Provider(_OpenStream())
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+        with solwyn.run("close-while-open") as run_id:
+            stream = await _open_stream(wrapped, is_async=is_async)
+            await _read(stream, is_async=is_async, chunks=2)
+            state = wrapped._solwyn_budget._lease.state_for(run_id)
+            await _close_client(wrapped, is_async=is_async)
+            assert state.reserved_tokens == 0
+            assert state.spent_tokens_since_report >= 100
+            # The caller's own close afterwards settles nothing more.
+            if is_async:
+                await stream.close()
+            else:
+                stream.close()
+            del stream
+            gc.collect()
+
+        assert [event.status.value for event in plane.ingested] == ["success"]
+        # The settlement shipped before the reporter sealed, and the surrender
+        # (sent by close) counted the claim at its bound.
+        assert len(plane.confirms) == 1
+        assert plane.lease_surrenders[-1].spent_tokens >= 100
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("order", ["close_first", "dropped_first", "threads"])
+    async def test_close_and_finalizer_settle_once(self, is_async: bool, order: str) -> None:
+        plane = FakeControlPlane()
+        provider = _Provider(_OpenStream())
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+        try:
+            stream = await _open_stream(wrapped, is_async=is_async)
+            await _read(stream, is_async=is_async, chunks=1)
+            settlement = stream._settlement
+
+            async def close() -> None:
+                if is_async:
+                    await stream.close()
+                else:
+                    stream.close()
+
+            if order == "close_first":
+                await close()
+                settlement.settle_dropped()
+            elif order == "dropped_first":
+                settlement.settle_dropped()
+                await close()
+            else:
+                barrier = threading.Barrier(8)
+
+                def race() -> None:
+                    barrier.wait()
+                    settlement.settle_dropped()
+
+                threads = [threading.Thread(target=race) for _ in range(8)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+                await close()
+        finally:
+            await _close_client(wrapped, is_async=is_async)
+
+        assert len(plane.ingested) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    async def test_dropped_settlement_never_raises(self, is_async: bool) -> None:
+        plane = FakeControlPlane()
+        provider = _Provider(_OpenStream())
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+        try:
+            stream = await _open_stream(wrapped, is_async=is_async)
+            await _read(stream, is_async=is_async, chunks=1)
+            settlement = stream._settlement
+            settlement._accumulator = None  # finalize() now raises AttributeError
+            settlement.settle_dropped()
+            assert settlement.settled
+            settlement.settle_dropped()
+        finally:
+            await _close_client(wrapped, is_async=is_async)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    async def test_dropped_after_reporter_shutdown_floors_and_counts(self, is_async: bool) -> None:
+        plane = FakeControlPlane(granted_tokens=128, final_grant=True)
+        provider = _Provider(_OpenStream())
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+        try:
+            with solwyn.run("reporter-closed") as run_id:
+                stream = await _open_stream(wrapped, is_async=is_async)
+                await _read(stream, is_async=is_async, chunks=1)
+                state = wrapped._solwyn_budget._lease.state_for(run_id)
+                if is_async:
+                    await wrapped._solwyn_reporter.close()
+                else:
+                    wrapped._solwyn_reporter.close()
+                settlement = stream._settlement
+                del stream
+                gc.collect()
+                assert _wait_until(lambda: settlement.settled)
+                # Locally the claim still holds its bound ...
+                assert state.reserved_tokens == 0
+                assert state.spent_tokens_since_report >= 100
+                # ... but the sealed reporter refuses the pair and counts it.
+                drops = wrapped._solwyn_reporter.dropped_counts
+                assert drops.get("settlement_confirm.closed_enqueue") == 1
+                assert drops.get("event.closed_enqueue") == 1
+        finally:
+            await _close_client(wrapped, is_async=is_async)
+        assert plane.confirms == []
+        assert plane.ingested == []
+
+
+_EXIT_SCRIPT = r"""
+import json, httpx, openai, solwyn
+from solwyn.testing import FakeControlPlane
+
+def _chunk(i):
+    body = {"id": "c", "object": "chat.completion.chunk", "created": 0, "model": "gpt-4o",
+            "choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": None}]}
+    return ("data: " + json.dumps(body) + "\n\n").encode()
+
+class Body(httpx.SyncByteStream):
+    def __iter__(self):
+        for i in range(50):
+            yield _chunk(i)
+
+def handler(request):
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=Body())
+
+plane = FakeControlPlane(granted_tokens=128, final_grant=True)
+client = plane.wrap(openai.OpenAI(api_key="sk-test", max_retries=0,
+    http_client=httpx.Client(transport=httpx.MockTransport(handler))))
+run = solwyn.run("exit-open")
+run.__enter__()
+KEPT = client.chat.completions.create(model="gpt-4o", messages=[{"role": "user", "content": "hi"}],
+    max_tokens=100, stream=True)
+next(KEPT)
+DROPPED = client.chat.completions.create(model="gpt-4o",
+    messages=[{"role": "user", "content": "hi"}], max_tokens=100, stream=True)
+next(DROPPED)
+del DROPPED
+print("ok", flush=True)
+"""
+
+
+@pytest.mark.unit
+def test_open_and_dropped_streams_at_interpreter_exit_raise_nothing(tmp_path: Any) -> None:
+    import subprocess
+    import sys
+
+    script = tmp_path / "exit_open_stream.py"
+    script.write_text(_EXIT_SCRIPT)
+    result = subprocess.run(
+        [sys.executable, "-W", "error::RuntimeWarning", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.strip() == "ok"
+    assert "Traceback" not in result.stderr
+    assert "Exception ignored" not in result.stderr

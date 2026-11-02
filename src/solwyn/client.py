@@ -28,6 +28,7 @@ import math
 import sys
 import time
 import uuid
+import weakref
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -146,6 +147,7 @@ from solwyn.stream import (
     AsyncStreamWrapper,
     SyncStreamWrapper,
     _AsyncResponsesStreamManagerWrapper,
+    _StreamSettlement,
     _SyncResponsesStreamManagerWrapper,
 )
 
@@ -2123,6 +2125,9 @@ class Solwyn(_SolwynBase):
             lease_output_bound_default=config.lease_output_bound_default,
         )
 
+        # Streams this client returned that may still be open, held weakly
+        # (each entry is the stream's settlement cell, not the stream).
+        self._solwyn_open_streams: weakref.WeakSet[_StreamSettlement] = weakref.WeakSet()
         # Metadata reporter
         self._solwyn_reporter = MetadataReporter(
             config.api_url,
@@ -3881,7 +3886,11 @@ class Solwyn(_SolwynBase):
         provider_region = _safe_extract_region(runtime)
 
         def on_complete(
-            token_details: TokenDetails, _elapsed_ms: float, *, abandoned: bool = False
+            token_details: TokenDetails,
+            _elapsed_ms: float,
+            *,
+            abandoned: bool = False,
+            record_latency: bool = True,
         ) -> None:
             usage_unmeasured = False
             if estimate_empty_usage or abandoned:
@@ -3906,7 +3915,10 @@ class Solwyn(_SolwynBase):
             self._get_circuit_breaker(provider).record_success()
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
-            self.record_latency(provider, ctx.elapsed_ms())
+            # A dropped stream (GC, client close) skips it: that time measures
+            # how long the caller held the stream, not the provider.
+            if record_latency:
+                self.record_latency(provider, ctx.elapsed_ms())
             # Extracted ONCE — confirm and metadata for one call_id must carry
             # the same tier or the enforcement counter and durable cost diverge.
             service_tier = accumulator.get_service_tier()
@@ -3999,6 +4011,7 @@ class Solwyn(_SolwynBase):
         # The SERVED adapter owns its stream nesting (Bedrock wraps the INNER
         # event stream); the PRIMARY adapter owns the caller-dialect result
         # shape (Bedrock callers get the boto3 contract dict back).
+        wrapper: SyncStreamWrapper | None = None
         try:
             source = runtime.adapter.unwrap_stream_source(response)
             wrapper = SyncStreamWrapper(
@@ -4007,6 +4020,7 @@ class Solwyn(_SolwynBase):
                 on_complete,
                 on_error,
                 on_abandon=functools.partial(on_complete, abandoned=True),
+                on_dropped=functools.partial(on_complete, abandoned=True, record_latency=False),
                 call_span=call_span,
                 chunk_translator=chunk_translator,
                 abort_check=(
@@ -4032,14 +4046,23 @@ class Solwyn(_SolwynBase):
                     provider_failure=False,
                 ),
             )
-            return primary.adapter.wrap_stream_result(wrapper, response)
+            result = primary.adapter.wrap_stream_result(wrapper, response)
+            self._track_open_stream(wrapper._settlement)
+            return result
         except BaseException:
+            if wrapper is not None:
+                # The caller never receives this wrapper; the wrap failure is
+                # reconciled by the walk, so its GC finalizer must not settle again.
+                wrapper._claim_settlement()
             if termination_handle is not None:
                 termination_handle.release()
             raise
 
     def close(self) -> None:
         """Shut down Solwyn state, then close the wrapped provider client."""
+        # Streams still open settle first, as early closes, so their receipts
+        # reach the reporter before it seals.
+        self._settle_open_streams()
         self._solwyn_reporter.close()
         self._solwyn_budget.close()
         provider_close = getattr(self._solwyn_client, "close", None)
@@ -4223,6 +4246,8 @@ class AsyncSolwyn(_SolwynBase):
             lease_output_bound_default=config.lease_output_bound_default,
         )
 
+        # Open streams, held weakly; see the sync constructor.
+        self._solwyn_open_streams: weakref.WeakSet[_StreamSettlement] = weakref.WeakSet()
         self._solwyn_reporter = AsyncMetadataReporter(
             config.api_url,
             config.api_key,
@@ -5852,9 +5877,15 @@ class AsyncSolwyn(_SolwynBase):
         # providers without regional pricing). Captured once, closed over.
         provider_region = _safe_extract_region(runtime)
 
-        async def on_complete(
-            token_details: TokenDetails, _elapsed_ms: float, *, abandoned: bool = False
+        def settle_stream(
+            token_details: TokenDetails,
+            _elapsed_ms: float,
+            *,
+            abandoned: bool = False,
+            record_latency: bool = True,
         ) -> None:
+            # Synchronous (no I/O, no awaits) so a dropped stream can settle
+            # from the run-cleanup worker or from close(), off the event loop.
             usage_unmeasured = False
             if estimate_empty_usage or abandoned:
                 if token_details.input_tokens == 0 and token_details.output_tokens == 0:
@@ -5878,7 +5909,10 @@ class AsyncSolwyn(_SolwynBase):
             self._get_circuit_breaker(provider).record_success()
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
-            self.record_latency(provider, ctx.elapsed_ms())
+            # A dropped stream (GC, client close) skips it: that time measures
+            # how long the caller held the stream, not the provider.
+            if record_latency:
+                self.record_latency(provider, ctx.elapsed_ms())
             # Extracted ONCE — confirm and metadata must carry the same tier
             # (see the sync on_complete).
             service_tier = accumulator.get_service_tier()
@@ -5941,6 +5975,11 @@ class AsyncSolwyn(_SolwynBase):
             else:
                 self._solwyn_reporter.report(event)
 
+        async def on_complete(
+            token_details: TokenDetails, elapsed_ms: float, *, abandoned: bool = False
+        ) -> None:
+            settle_stream(token_details, elapsed_ms, abandoned=abandoned)
+
         if on_error is None:
             on_error = _make_async_stream_error_handler(
                 self,
@@ -5968,6 +6007,7 @@ class AsyncSolwyn(_SolwynBase):
         )
         # Stream nesting and caller-dialect result shape are adapter-owned —
         # see the sync ``_wrap_stream``.
+        wrapper: AsyncStreamWrapper | None = None
         try:
             source = runtime.adapter.unwrap_stream_source(response)
             wrapper = AsyncStreamWrapper(
@@ -5976,6 +6016,7 @@ class AsyncSolwyn(_SolwynBase):
                 on_complete,
                 on_error,
                 on_abandon=functools.partial(on_complete, abandoned=True),
+                on_dropped=functools.partial(settle_stream, abandoned=True, record_latency=False),
                 call_span=call_span,
                 chunk_translator=chunk_translator,
                 abort_check=(
@@ -6001,14 +6042,22 @@ class AsyncSolwyn(_SolwynBase):
                     provider_failure=False,
                 ),
             )
-            return primary.adapter.wrap_stream_result(wrapper, response)
+            result = primary.adapter.wrap_stream_result(wrapper, response)
+            self._track_open_stream(wrapper._settlement)
+            return result
         except BaseException:
+            if wrapper is not None:
+                # The caller never receives this wrapper; the wrap failure is
+                # reconciled by the walk, so its GC finalizer must not settle again.
+                wrapper._claim_settlement()
             if termination_handle is not None:
                 termination_handle.release()
             raise
 
     async def close(self) -> None:
         """Shut down Solwyn state, then close the wrapped provider client."""
+        # See the sync close: open streams settle before the reporter seals.
+        self._settle_open_streams()
         await self._solwyn_reporter.close()
         await self._solwyn_budget.close()
         provider_close = getattr(self._solwyn_client, "aclose", None)

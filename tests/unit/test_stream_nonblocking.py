@@ -54,7 +54,9 @@ def test_async_on_complete_does_not_call_confirm_cost() -> None:
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef) and node.name == "AsyncSolwyn":
             for item in ast.walk(node):
-                if isinstance(item, ast.AsyncFunctionDef) and item.name == "on_complete":
+                # The async client's settle body is the synchronous settle_stream
+                # (shared with the dropped-stream path); on_complete delegates to it.
+                if isinstance(item, ast.FunctionDef) and item.name == "settle_stream":
                     source_lines = client_py.splitlines()
                     fn_lines = source_lines[item.lineno - 1 : item.end_lineno]
                     fn_text = "\n".join(fn_lines)
