@@ -384,3 +384,32 @@ class TestDecisionsUnderHardDeny:
             wrapped.decisions.create(model="gpt-5.5", input="hi", questions=self._QUESTIONS)
 
         assert provider.bodies == []
+
+
+@pytest.mark.unit
+class TestReadmissionAfterLeaseRefusal:
+    """Finding 1: a run-scoped call whose lease grant is refused takes a per-call
+    check, which claims its call id in the lease ledger. The hop's re-check
+    must not trip over that claim, and must leave nothing reserved under it."""
+
+    @pytest.mark.parametrize(
+        ("status", "code"), [(409, "lease_holder_cap_exceeded"), (503, "lease_unavailable")]
+    )
+    def test_failover_after_a_refused_grant_is_readmitted(self, status: int, code: str) -> None:
+        import solwyn
+
+        plane = FakeControlPlane()
+        primary, fallback = _Provider(429), _Provider()
+        wrapped = plane.wrap(primary.client(), fallback=[(fallback.client(GROQ_URL), PRICEY)])
+        with wrapped, plane.refuse_leases(status=status, code=code), solwyn.run("refused"):
+            wrapped.chat.completions.create(model=CHEAP, messages=MESSAGES)
+            ledger = wrapped._solwyn_budget._lease
+            claimed = dict(ledger._call_claims)
+            reserved = dict(ledger._call_index)
+
+        assert [check.model for check in plane.checks] == [CHEAP, PRICEY]
+        assert len(fallback.bodies) == 1
+        # The primary's claim is the ledger's replay tombstone; it owns no
+        # reservation, so nothing is left reserved after the call.
+        assert len(claimed) == 1
+        assert reserved == {}
