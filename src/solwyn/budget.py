@@ -2661,7 +2661,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             modality=modality,
             estimated_output_bound=check_output_bound,
         )
-        if agent_run_id is None and tags is None:
+        # A hop re-check (per_call_only) is always fresh and reservation-backed:
+        # it neither reads nor writes the allow cache.
+        if agent_run_id is None and tags is None and not per_call_only:
             with self._state_lock:
                 cached = self._cached_allow_locked(cache_key)
                 if cached is not None:
@@ -2805,7 +2807,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 cloud_response = self._cache_response(
                     cloud_response,
                     agent_run_id=agent_run_id,
-                    cache_allowed_response=tags is None,
+                    cache_allowed_response=tags is None and not per_call_only,
                     cache_key=cache_key,
                     request_epoch=request_epoch,
                 )
@@ -3460,7 +3462,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             modality=modality,
             estimated_output_bound=check_output_bound,
         )
-        if agent_run_id is None and tags is None:
+        # A hop re-check (per_call_only) is always fresh and reservation-backed:
+        # it neither reads nor writes the allow cache.
+        if agent_run_id is None and tags is None and not per_call_only:
             with self._state_lock:
                 cached = self._cached_allow_locked(cache_key)
                 if cached is not None:
@@ -3604,7 +3608,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 cloud_response = self._cache_response(
                     cloud_response,
                     agent_run_id=agent_run_id,
-                    cache_allowed_response=tags is None,
+                    cache_allowed_response=tags is None and not per_call_only,
                     cache_key=cache_key,
                     request_epoch=request_epoch,
                 )

@@ -608,3 +608,87 @@ class TestLeaseCoversProviderModelPairs:
 
         assert len(plane.lease_grants) == 1
         assert plane.checks == []
+
+
+@pytest.mark.unit
+class TestHopChecksAreFreshWithTheDefaultCache:
+    """Sol r1 B1: with the DEFAULT cache config, every hop re-check is a fresh,
+    reservation-backed check, never an allow served from the cache."""
+
+    def _wrap_default(self, stub: _PricedPlane, primary: Any, fallback: Any, **kw: Any) -> Any:
+        from solwyn.client import AsyncSolwyn, Solwyn
+
+        wrapper = AsyncSolwyn if kw.pop("is_async", False) else Solwyn
+        return wrapper(
+            primary,
+            api_key=stub.plane.api_key,
+            api_url=stub.plane.api_url,
+            control_plane_transport=stub,
+            lease_enabled=False,
+            fallback=[(fallback, PRICEY)],
+        )
+
+    def test_two_calls_sharing_a_fallback_each_reserve_it(self) -> None:
+        # Two $0.041 hops do not fit a $0.05 cap together: the second refuses.
+        stub, primary, fallback = _setup(0.05)
+        with self._wrap_default(stub, primary.client(), fallback.client(GROQ_URL)) as solwyn:
+            solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+            with pytest.raises(BudgetExceededError):
+                solwyn.chat.completions.create(model=CHEAP_2, messages=MESSAGES)
+
+        assert [check["model"] for check in stub.checks] == [CHEAP, PRICEY, CHEAP_2, PRICEY]
+        assert len(fallback.bodies) == 1
+
+    @pytest.mark.asyncio
+    async def test_async_two_calls_sharing_a_fallback_each_reserve_it(self) -> None:
+        stub, primary, fallback = _setup(0.05)
+        solwyn = self._wrap_default(
+            stub,
+            primary.client(is_async=True),
+            fallback.client(GROQ_URL, is_async=True),
+            is_async=True,
+        )
+        try:
+            await solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
+            with pytest.raises(BudgetExceededError):
+                await solwyn.chat.completions.create(model=CHEAP_2, messages=MESSAGES)
+        finally:
+            await solwyn.close()
+
+        assert [check["model"] for check in stub.checks] == [CHEAP, PRICEY, CHEAP_2, PRICEY]
+        assert len(fallback.bodies) == 1
+
+
+@pytest.mark.unit
+class TestPerCallOnlyChecksBypassTheCache:
+    """A hop re-check neither reads nor writes the allow cache, whatever mode a
+    cached entry has (parity with TS #26)."""
+
+    def _enforcer(self, plane: FakeControlPlane) -> Any:
+        from solwyn.budget import BudgetEnforcer
+
+        return BudgetEnforcer(plane.api_url, plane.api_key, transport=plane.transport, cache_ttl=60)
+
+    def _check(self, enforcer: Any, **kw: Any) -> Any:
+        return enforcer.check_budget(estimated_input_tokens=1, model=PRICEY, provider="groq", **kw)
+
+    def test_a_cached_allow_never_answers_a_per_call_only_check(self) -> None:
+        from contextlib import closing
+
+        plane = FakeControlPlane(mode="alert_only")
+        with closing(self._enforcer(plane)) as enforcer:
+            self._check(enforcer)
+            fresh = self._check(enforcer, per_call_only=True)
+
+        assert len(plane.checks) == 2
+        assert fresh.reservation_id is not None
+
+    def test_a_per_call_only_allow_is_never_cached(self) -> None:
+        from contextlib import closing
+
+        plane = FakeControlPlane(mode="alert_only")
+        with closing(self._enforcer(plane)) as enforcer:
+            self._check(enforcer, per_call_only=True)
+            self._check(enforcer)
+
+        assert len(plane.checks) == 2
