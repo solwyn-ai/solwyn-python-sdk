@@ -26,6 +26,10 @@ from solwyn.providers._accumulator import StreamUsageAccumulator
 
 logger = logging.getLogger(__name__)
 
+# How long client close waits for another thread's claimed settlement to
+# enqueue before it seals the reporter anyway (see settle_dropped).
+_CLOSE_WAIT_TIMEOUT_S = 5.0
+
 
 class _AbortHandleFinalizer:
     """Keep explicit releases synchronous and GC releases outside SDK locks."""
@@ -120,8 +124,19 @@ class _StreamSettlement:
                 # settlement enqueues, so its pair is dropped and counted as
                 # closed_enqueue, which a client closed from inside its own
                 # settlement accepts.
-                if wait and self._owner != threading.get_ident():
-                    self._idle.wait()
+                # Another thread's claim is waited for, but only so long: that
+                # thread may itself be blocked on this one (two reentrant
+                # closes, each holding a log handler lock the other needs).
+                # Past the timeout the reporter seals, and a pair that
+                # thread enqueues afterwards is dropped and counted as
+                # closed_enqueue. That is accepted. The warning is logged only
+                # after the wait has ended, so it never blocks the wait.
+                if (
+                    wait
+                    and self._owner != threading.get_ident()
+                    and not self._idle.wait(_CLOSE_WAIT_TIMEOUT_S)
+                ):
+                    logger.warning("stream.close_wait_timed_out")
                 return
             try:
                 elapsed_ms = (time.monotonic() - self._start_time) * 1000

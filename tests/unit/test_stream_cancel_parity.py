@@ -754,6 +754,64 @@ class TestDroppedStreamSettlesOnce:
         # The nested settlement enqueues after the reporter sealed: accepted.
         assert outcome["drops"].get("settlement_confirm.closed_enqueue") == 1
 
+    def test_two_reentrant_closes_across_streams_return(self) -> None:
+        # Two threads each claim a stream, then a warning handler closes the
+        # client from inside each settlement. The first holds the handler's
+        # lock while its close waits for the second, which waits for that
+        # lock. The bounded wait breaks the cycle.
+        plane = FakeControlPlane()
+        provider = _Provider(_OpenStream())
+
+        def stream_response(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, headers={"content-type": "text/event-stream"}, stream=_OpenStream()
+            )
+
+        provider.handler = stream_response  # type: ignore[method-assign]
+        probe_logger = logging.getLogger("solwyn.tests.two_reentrant_closes")
+        both_claimed = threading.Barrier(2)
+        outcome: dict[str, Any] = {}
+
+        def probe() -> None:
+            wrapped = plane.wrap(provider.client(is_async=False))
+            reporter = wrapped._solwyn_reporter
+            report_settlement = reporter.report_settlement
+
+            def report(*args: Any) -> None:
+                both_claimed.wait(5)
+                probe_logger.warning("settling")
+                report_settlement(*args)
+
+            class _CloseOnWarning(logging.Handler):
+                def emit(self, record: logging.LogRecord) -> None:
+                    wrapped.close()
+
+            streams = [wrapped.chat.completions.create(**_REQUEST, stream=True) for _ in range(2)]
+            for stream in streams:
+                next(stream)
+            handler = _CloseOnWarning()
+            probe_logger.addHandler(handler)
+            try:
+                with (
+                    patch.object(reporter, "report_settlement", report),
+                    patch("solwyn.stream._CLOSE_WAIT_TIMEOUT_S", 0.5, create=True),
+                ):
+                    closers = [threading.Thread(target=stream.close) for stream in streams]
+                    for closer in closers:
+                        closer.start()
+                    for closer in closers:
+                        closer.join()
+            finally:
+                probe_logger.removeHandler(handler)
+            outcome["drops"] = dict(reporter.dropped_counts)
+
+        worker = threading.Thread(target=probe, daemon=True)
+        worker.start()
+        worker.join(2.0)
+        assert not worker.is_alive(), "the two reentrant closes deadlocked"
+        # Both settlements enqueued after the reporter sealed: accepted.
+        assert outcome["drops"].get("settlement_confirm.closed_enqueue") == 2
+
     @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
     @pytest.mark.filterwarnings("ignore::DeprecationWarning")
     def test_fork_during_a_settlement_in_flight_never_waits_in_the_child(self) -> None:
