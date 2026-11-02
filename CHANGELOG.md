@@ -25,6 +25,11 @@ Bug fixes: under `hard_deny`, a stream closed early or dropped, and a call that
 fails in an unrecognized way after it was sent, no longer give back budget they
 may have spent. Keeping that funding is now `hard_deny` only.
 
+Under `hard_deny`, a call whose usage can't be measured and may have been
+billed is recorded at its reserved amount, marked estimated, so the dashboard
+can show more than the provider billed (for example, a stream stopped early).
+This needs Solwyn API support that is live from <core deploy date>.
+
 ### Fixed
 
 - **A stream closed before its end keeps its funding (`hard_deny`).** When you
@@ -36,11 +41,11 @@ may have spent. Keeping that funding is now `hard_deny` only.
   example, on a final 128-token lease, a stream that had reserved 101 tokens
   was closed after two chunks, its claim went back to the lease, and the next
   call ran with no budget check. On a per-call reservation, the confirm freed
-  the hold at the partial (or zero) usage. Now an early-closed stream keeps
-  its lease claim spent at the reserved bound, and a per-call reservation gets
-  no confirm, so its hold stays until the server's reservation TTL. The call
-  still reports one success receipt with the usage it saw (the input estimate,
-  marked estimated, when it saw none). A stream that reaches its end settles
+  the hold at the partial (or zero) usage. Now an early-closed stream confirms
+  its floor: the reservation's estimated input tokens and output bound (or the
+  observed usage, where larger), marked estimated, on its lease claim or
+  per-call reservation. The call still reports one success receipt with the
+  usage it saw (the input estimate, marked estimated, when it saw none). A stream that reaches its end settles
   exactly as before. Applies to every provider, sync and async, including the
   Responses `stream()` manager.
 - **A stream dropped without close() now settles.** A stream that was
@@ -58,6 +63,20 @@ may have spent. Keeping that funding is now `hard_deny` only.
   included), a 529, or a transport error that proves nothing was sent. This
   also covers a connection error whose cause is not a pre-send failure and a
   Responses `stream()` entry failure.
+- **Possibly billed spend is recorded durably (`hard_deny`).** Keeping a
+  possibly billed call's funding used to be local: a lease claim stayed spent
+  on the SDK's own ledger, and a per-call hold was left to expire. The Solwyn
+  API gave both back at lease surrender or hold expiry, so the cap could be
+  passed afterwards. Now every such path sends a floor confirm (the
+  reservation, or the observed usage where larger, marked estimated) beside
+  its usual event: early close, garbage collection and client close, a
+  mid-stream error, a stream wrap or Responses entry failure, a cancellation
+  without proof, an unknown failure after dispatch, a terminal ambiguous
+  failure, and the one-generation guard. The API keeps it as a durable
+  receipt, accepts it up to an hour after the check, and counts the larger of
+  the receipt and the call's events. A possibly billed hop that fails over is
+  recorded under its own call id, so it counts beside the hop that served the
+  call.
 - **A response whose body fails to decode no longer fails over.** A 200 whose
   gzip or deflate body could not be decoded reached Solwyn as a connection
   error and was failed over as if nothing had been sent, so the provider could

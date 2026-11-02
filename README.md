@@ -921,9 +921,22 @@ defaults, and Google/Bedrock nested cap fields. When a hop has no explicit cap,
 `hard_deny` posture the hop is sent to the provider with that cap (see
 [Output bound](#output-bound)).
 
-Every rule below that keeps a possibly billed call's funding (a lease claim
-spent at its reserved bound, or a per-call hold left until its TTL) applies
-only to a call admitted under `hard_deny`. On `alert_only` those calls settle
+Every rule below that keeps a possibly billed call's funding applies only to a
+call admitted under `hard_deny`.
+
+<a id="floor-confirm"></a>
+Under `hard_deny`, a call whose usage can't be measured and may have been
+billed is recorded at its reserved amount, marked estimated. Solwyn confirms
+the attempt's floor on its own reservation or lease claim: the reservation's
+estimated input tokens and the attempt's output bound (or the observed usage,
+where that is larger), priced on that attempt's provider and model, with
+`is_estimated: true`. The attempt's own event is sent as usual, and the Solwyn
+API counts the larger of the two for that call, so nothing is counted twice.
+The floor survives lease surrender, reservation expiry and reconcile, so the
+cap keeps holding. This means the dashboard can show more than the provider
+billed, for example for a stream stopped early. A possibly billed hop that
+fails over is recorded under its own call id, beside the hop that served the
+call. This needs Solwyn API support that is live from <core deploy date>. On `alert_only` those calls settle
 once at their observed usage and give the claim back, as before; failover
 routing and the `possibly_succeeded` receipt flag are the same in every mode.
 The local floor for a completed call whose usage is missing or unreadable
@@ -950,10 +963,9 @@ close when abandoning an established stream so its provider connection closes.
 An established stream closed before its natural end (the caller breaks off and
 closes it, leaves its context manager, or a run stop ends it) never delivered
 its final usage report, so the provider may have billed more than Solwyn saw.
-Its funding is not refunded: a lease claim stays spent at its reserved bound,
-and a per-call reservation gets no confirm, so its hold stays until the
-server's reservation TTL. The call still reports one success receipt with the
-usage it observed (the pre-flight input estimate, marked estimated, when it
+Under `hard_deny` it confirms its [floor](#floor-confirm), on a lease claim or
+a per-call reservation alike. The call still reports one success receipt with
+the usage it observed (the pre-flight input estimate, marked estimated, when it
 observed none), and its breaker records a success. A stream that reaches its
 natural end confirms its measured usage as before.
 
@@ -964,8 +976,10 @@ is still open, so those receipts ship before the reporter shuts down. Neither
 path records the stream's latency, because that time measures how long you held
 the stream. A stream still open when the interpreter exits is not settled. A
 stream that settles after its client's reporter has shut down still holds its
-lease claim locally, but its receipt is refused and counted in the reporter's
-`dropped_counts` (`settlement_confirm.closed_enqueue`, `event.closed_enqueue`).
+lease claim locally, but its floor confirm and its event are refused and
+counted in the reporter's `dropped_counts` (`settlement_confirm.closed_enqueue`,
+`event.closed_enqueue`). The Solwyn API then never sees that spend: it stops
+counting when the per-call hold expires or the lease ends.
 
 Once a request is dispatched, Solwyn treats a failure as possibly billed
 unless there is positive evidence it was not: a 4xx status (429 included), a
