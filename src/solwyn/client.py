@@ -3225,12 +3225,14 @@ class Solwyn(_SolwynBase):
                 chain_index = next(i for i, r in enumerate(self._solwyn_runtimes) if r is rt)
                 hop_model = requested_model if is_primary else rt.entry.model
                 # After a possibly billed attempt the next one is re-admitted
-                # whatever its identity: two possibly billed generations must
-                # never share one reservation.
-                if (
-                    getattr(budget, "hard_deny_admitted", False) is True
-                    and getattr(budget, "lease_id", None) is None
-                    and ((provider, hop_model) != admitted_identity or admitted_spend_unknown)
+                # whatever its identity or funding: two possibly billed
+                # generations must never share one reservation or lease claim.
+                if getattr(budget, "hard_deny_admitted", False) is True and (
+                    admitted_spend_unknown
+                    or (
+                        getattr(budget, "lease_id", None) is None
+                        and (provider, hop_model) != admitted_identity
+                    )
                 ):
                     budget, estimated_output_bound = self._readmit_failover_hop(
                         budget=budget,
@@ -3484,10 +3486,22 @@ class Solwyn(_SolwynBase):
                             # Failing over does not un-send this hop. The call keeps
                             # its reservation, pinned: no later settlement, refusal,
                             # or chain exhaustion may refund the bound.
-                            self._solwyn_budget.mark_reservation_spend_unknown(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
+                            if (
+                                getattr(budget, "hard_deny_admitted", False) is True
+                                and getattr(budget, "lease_id", None) is not None
+                            ):
+                                # Under hard_deny a lease claim funds one
+                                # generation: consume it at its floor, and the
+                                # next attempt is re-admitted per call.
+                                self._solwyn_budget.abandon_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            else:
+                                self._solwyn_budget.mark_reservation_spend_unknown(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
                             admitted_spend_unknown = True
                         last_exc = exc
                         advanced = True
@@ -5152,12 +5166,14 @@ class AsyncSolwyn(_SolwynBase):
                 chain_index = next(i for i, r in enumerate(self._solwyn_runtimes) if r is rt)
                 hop_model = requested_model if is_primary else rt.entry.model
                 # After a possibly billed attempt the next one is re-admitted
-                # whatever its identity: two possibly billed generations must
-                # never share one reservation.
-                if (
-                    getattr(budget, "hard_deny_admitted", False) is True
-                    and getattr(budget, "lease_id", None) is None
-                    and ((provider, hop_model) != admitted_identity or admitted_spend_unknown)
+                # whatever its identity or funding: two possibly billed
+                # generations must never share one reservation or lease claim.
+                if getattr(budget, "hard_deny_admitted", False) is True and (
+                    admitted_spend_unknown
+                    or (
+                        getattr(budget, "lease_id", None) is None
+                        and (provider, hop_model) != admitted_identity
+                    )
                 ):
                     budget, estimated_output_bound = await self._readmit_failover_hop(
                         budget=budget,
@@ -5405,10 +5421,22 @@ class AsyncSolwyn(_SolwynBase):
                             # Mirror sync: pin the still-live reservation so no
                             # later exit from this call (cancellation included)
                             # can refund what this hop may have consumed.
-                            self._solwyn_budget.mark_reservation_spend_unknown(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
+                            if (
+                                getattr(budget, "hard_deny_admitted", False) is True
+                                and getattr(budget, "lease_id", None) is not None
+                            ):
+                                # Under hard_deny a lease claim funds one
+                                # generation: consume it at its floor, and the
+                                # next attempt is re-admitted per call.
+                                self._solwyn_budget.abandon_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            else:
+                                self._solwyn_budget.mark_reservation_spend_unknown(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
                             admitted_spend_unknown = True
                         last_exc = exc
                         advanced = True

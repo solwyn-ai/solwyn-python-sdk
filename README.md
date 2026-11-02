@@ -812,9 +812,13 @@ model differs from what was admitted, it frees the earlier reservation (at
 zero tokens when that attempt was not billed) and runs a fresh check for the
 hop, at the hop's own price and output bound. If the hop does not fit the
 remaining budget, the call is refused with `BudgetExceededError` and the hop
-is never called. A call funded by a run's budget lease needs no second check:
-the lease is valued at the most expensive model in its declared failover
-chain.
+is never called. Any attempt after one that may already have been billed is
+checked again too, even on the same provider and model. A call funded by a
+run's budget lease needs no second check while it stays inside the lease's
+declared failover chain, because the lease is valued at the most expensive
+model in that chain. One exception: after a lease-funded attempt that may have
+been billed, that attempt's lease tokens stay spent and the next attempt gets
+its own per-call check.
 
 Known limitations:
 

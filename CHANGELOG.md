@@ -35,6 +35,11 @@ In both cases a call could spend past a `hard_deny` budget.
   attempt failed in a way that may still have been billed and the call failed
   over, the next attempt is re-admitted even if it uses the same provider and
   model, so two possibly billed generations never share one reservation.
+- **A lease-funded call no longer stacks generations on one lease claim.**
+  With `failover_idempotency="always"`, a lease-funded attempt that may have
+  been billed was followed by the next attempt on the same claim, so two
+  generations could be counted as one. On `hard_deny`, that claim now stays
+  spent at its full bound and the next attempt gets its own per-call check.
 - **`hard_deny` allows are no longer cached.** A cached allow carries no
   reservation, so a repeated call, or a second call failing over to the same
   hop, could run on an allow that nothing funded. Every `hard_deny` call now

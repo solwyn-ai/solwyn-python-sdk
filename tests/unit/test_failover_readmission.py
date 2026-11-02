@@ -509,3 +509,56 @@ class TestHardDenyAllowsAreNeverCached:
             solwyn.chat.completions.create(model=CHEAP, messages=MESSAGES)
 
         assert [check["model"] for check in stub.checks] == [CHEAP]
+
+
+@pytest.mark.unit
+class TestLeaseFundedAmbiguousFailover:
+    """Finding 5: two possibly billed generations must not share one lease
+    claim. Under hard_deny the possibly billed claim is consumed at its floor,
+    and the next attempt is re-admitted with its own per-call check."""
+
+    def test_next_attempt_after_a_possibly_billed_lease_claim_is_readmitted(self) -> None:
+        import solwyn
+
+        plane = FakeControlPlane()
+        primary, fallback = _Provider(500), _Provider()
+        wrapped = plane.wrap(
+            primary.client(),
+            fallback=[(fallback.client(GROQ_URL), PRICEY)],
+            failover_idempotency="always",
+        )
+        with wrapped, solwyn.run("ambiguous") as run_id:
+            wrapped.chat.completions.create(model=CHEAP, messages=MESSAGES)
+            state = wrapped._solwyn_budget._lease.state_for(run_id)
+            spent = state.spent_tokens_since_report
+            reserved = state.reserved_tokens
+
+        assert len(plane.lease_grants) == 1
+        # The fallback paid its own per-call check at its own bound ...
+        assert [(check.provider.value, check.model) for check in plane.checks] == [("groq", PRICEY)]
+        assert plane.checks[0].estimated_output_bound == DEFAULT_OUTPUT_BOUND
+        # ... and settles that reservation, not the lease.
+        assert len(plane.confirms) == 1
+        assert plane.confirms[0].reservation_id is not None
+        assert plane.confirms[0].lease_id is None
+        # The possibly billed primary's claim stays spent at its floor.
+        assert reserved == 0
+        assert spent >= DEFAULT_OUTPUT_BOUND
+        assert len(fallback.bodies) == 1
+
+    def test_alert_only_lease_failover_is_unchanged(self) -> None:
+        import solwyn
+
+        plane = FakeControlPlane(mode="alert_only")
+        primary, fallback = _Provider(500), _Provider()
+        wrapped = plane.wrap(
+            primary.client(),
+            fallback=[(fallback.client(GROQ_URL), PRICEY)],
+            failover_idempotency="always",
+        )
+        with wrapped, solwyn.run("ambiguous-alert"):
+            wrapped.chat.completions.create(model=CHEAP, messages=MESSAGES)
+
+        assert plane.checks == []
+        assert len(plane.confirms) == 1
+        assert plane.confirms[0].lease_id is not None
