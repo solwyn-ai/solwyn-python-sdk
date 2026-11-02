@@ -40,6 +40,15 @@ WARNING_SURFACES = frozenset({"completions", "rerank", "code_interpreter", "eval
 SILENT_SURFACES = frozenset({"batches", "fine_tuning"})
 
 
+def _base_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Records from ``solwyn._base`` only.
+
+    A background reporter thread left by an earlier test can log (for example
+    ``breaker_send_failed``) inside a capture window, so count only this logger.
+    """
+    return [record for record in caplog.records if record.name == "solwyn._base"]
+
+
 @pytest.fixture(autouse=True)
 def _reset_spend_surface_latch() -> None:
     """Reset per-process observations so untracked tests stay order-independent."""
@@ -230,10 +239,10 @@ def test_sync_unmetered_surface_warns_and_passes_through(caplog: pytest.LogCaptu
     check_budget.assert_not_called()
     report.assert_not_called()
     report_settlement.assert_not_called()
-    assert len(caplog.records) == 1
-    warning = caplog.records[0].getMessage()
-    assert "together" in warning
-    assert "rerank" in warning
+    records = _base_records(caplog)
+    assert len(records) == 1
+    assert records[0].args[:3] == ("together", "native_together", "rerank")
+    warning = records[0].getMessage()
     assert "no budget check" in warning
     assert "no cost event" in warning
     assert "tracking for this surface is coming" in warning.lower()
@@ -318,10 +327,10 @@ async def test_async_unmetered_surface_warns_and_passes_through(
     check_budget.assert_not_awaited()
     report.assert_not_called()
     report_settlement.assert_not_called()
-    assert len(caplog.records) == 1
-    warning = caplog.records[0].getMessage()
-    assert "together" in warning
-    assert "rerank" in warning
+    records = _base_records(caplog)
+    assert len(records) == 1
+    assert records[0].args[:3] == ("together", "native_together", "rerank")
+    warning = records[0].getMessage()
     assert "no budget check" in warning
     assert "no cost event" in warning
     assert "tracking for this surface is coming" in warning.lower()
@@ -371,8 +380,9 @@ def test_sync_warns_once_for_each_warning_surface(
             assert first.create() == surface
             assert second.create() == surface
 
-    assert len(caplog.records) == len(WARNING_SURFACES)
-    warning_messages = [record.getMessage() for record in caplog.records]
+    records = _base_records(caplog)
+    assert len(records) == len(WARNING_SURFACES)
+    warning_messages = [record.getMessage() for record in records]
     for surface in WARNING_SURFACES:
         assert sum(f"surface '{surface}'" in message for message in warning_messages) == 1
         assert resources[surface].create.call_count == 2
@@ -409,9 +419,7 @@ def test_sync_concurrent_unmetered_surface_access_warns_exactly_once(
         results = list(executor.map(access_surface, range(worker_count)))
 
     assert all(result is resource for result in results)
-    # Only this logger: a background reporter thread left by an earlier test
-    # can log (for example breaker_send_failed) inside the capture window.
-    records = [record for record in caplog.records if record.name == "solwyn._base"]
+    records = _base_records(caplog)
     assert len(records) == 1
     assert records[0].args == (
         "together",
@@ -442,8 +450,8 @@ def test_missing_unmetered_surface_does_not_warn_or_consume_latch(
         client.rerank = resource
         assert solwyn.rerank is resource
 
-    assert len(caplog.records) == 1
-    assert "surface 'rerank'" in caplog.records[0].getMessage()
+    assert len(_base_records(caplog)) == 1
+    assert "surface 'rerank'" in _base_records(caplog)[0].getMessage()
     solwyn.close()
 
 
@@ -464,8 +472,8 @@ def test_unmetered_surface_warning_latch_is_per_process(
         assert first.rerank is resource
         assert second.rerank is resource
 
-    assert len(caplog.records) == 1
-    assert "surface 'rerank'" in caplog.records[0].getMessage()
+    assert len(_base_records(caplog)) == 1
+    assert "surface 'rerank'" in _base_records(caplog)[0].getMessage()
     first.close()
     second.close()
 
