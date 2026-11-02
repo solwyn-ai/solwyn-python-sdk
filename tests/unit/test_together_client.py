@@ -409,8 +409,11 @@ def test_sync_concurrent_unmetered_surface_access_warns_exactly_once(
         results = list(executor.map(access_surface, range(worker_count)))
 
     assert all(result is resource for result in results)
-    assert len(caplog.records) == 1
-    assert caplog.records[0].args == (
+    # Only this logger: a background reporter thread left by an earlier test
+    # can log (for example breaker_send_failed) inside the capture window.
+    records = [record for record in caplog.records if record.name == "solwyn._base"]
+    assert len(records) == 1
+    assert records[0].args == (
         "together",
         "native_together",
         "rerank",
