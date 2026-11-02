@@ -772,6 +772,21 @@ def _safe_extract_region(runtime: ProviderRuntime) -> str | None:
         return None
 
 
+def _floor_usage(budget: Any, observed: TokenDetails) -> TokenDetails:
+    """The usage a hard_deny attempt whose real usage is unknown confirms.
+
+    The attempt's reservation (its estimated input tokens and output bound),
+    or the observed usage where that is larger, marked estimated so core keeps
+    it as a durable receipt and nets it against the attempt's own event.
+    """
+    reserved_input, reserved_output = getattr(budget, "reserved_tokens", None) or (0, 0)
+    return TokenDetails(
+        input_tokens=min(max(reserved_input, observed.input_tokens), ORDINARY_TOKEN_COUNT_MAX),
+        output_tokens=min(max(reserved_output, observed.output_tokens), ORDINARY_TOKEN_COUNT_MAX),
+        is_estimated=True,
+    )
+
+
 def _hard_deny_funding(budget: Any) -> bool:
     """Whether possibly billed funding is kept (consumed at its bound) for ``budget``.
 
@@ -2472,6 +2487,7 @@ class Solwyn(_SolwynBase):
             estimated_output_bound=bound,
             per_call_only=True,
         )
+        hop_budget.reserved_tokens = (hop_input, bound)
         if not hop_budget.allowed:
             # Attribution follows the hop's relation to the original primary,
             # so a return to the primary after a cost-routed hop is no fallback.
@@ -2699,6 +2715,7 @@ class Solwyn(_SolwynBase):
                 call_id=call_id,
                 estimated_output_bound=estimated_output_bound,
             )
+        budget.reserved_tokens = (est_in, estimated_output_bound or 0)
         _call_span.budget(budget)
         _postcheck_run_control(
             self,
@@ -3119,6 +3136,7 @@ class Solwyn(_SolwynBase):
                     call_id=call_id,
                     estimated_output_bound=estimated_output_bound,
                 )
+        budget.reserved_tokens = (est_in, estimated_output_bound or 0)
         _call_span.budget(budget)
         _postcheck_run_control(
             self,
@@ -3984,16 +4002,18 @@ class Solwyn(_SolwynBase):
             service_tier = accumulator.get_service_tier()
             confirm = None
             reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
-            if lease_id or (reservation_id and not abandoned):
-                # An abandoned per-call stream sends no confirm: confirming a
-                # floor would free the rest of a hold the provider may have
-                # spent. The hold stays until the server's reservation TTL.
+            if reservation_id or lease_id:
+                # Abandoned under hard_deny, the confirm carries the floor (the
+                # reservation, or more if more was observed) so core keeps it
+                # durably; the event keeps the observed usage.
                 confirm = self._solwyn_budget.build_confirm_request(
                     reservation_id=reservation_id,
                     lease_id=lease_id,
                     lease_claim_token=lease_claim_token,
                     model=served_model,
-                    token_details=token_details,
+                    token_details=(
+                        _floor_usage(budget, token_details) if abandoned else token_details
+                    ),
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
@@ -4001,7 +4021,7 @@ class Solwyn(_SolwynBase):
                     service_tier=service_tier,
                     usage_unmeasured=usage_unmeasured,
                 )
-            elif not reservation_id:
+            else:
                 # A legacy fail-open admission (no key to confirm against): replace its
                 # outage-tally estimate with the provider-reported total.
                 self._solwyn_budget.settle_uncounted(
@@ -4577,6 +4597,7 @@ class AsyncSolwyn(_SolwynBase):
             estimated_output_bound=bound,
             per_call_only=True,
         )
+        hop_budget.reserved_tokens = (hop_input, bound)
         if not hop_budget.allowed:
             # Attribution follows the hop's relation to the original primary,
             # so a return to the primary after a cost-routed hop is no fallback.
@@ -4783,6 +4804,7 @@ class AsyncSolwyn(_SolwynBase):
                 call_id=call_id,
                 estimated_output_bound=estimated_output_bound,
             )
+        budget.reserved_tokens = (est_in, estimated_output_bound or 0)
         _call_span.budget(budget)
         _postcheck_run_control(
             self,
@@ -5159,6 +5181,7 @@ class AsyncSolwyn(_SolwynBase):
                     call_id=call_id,
                     estimated_output_bound=estimated_output_bound,
                 )
+        budget.reserved_tokens = (est_in, estimated_output_bound or 0)
         _call_span.budget(budget)
         _postcheck_run_control(
             self,
@@ -6008,16 +6031,18 @@ class AsyncSolwyn(_SolwynBase):
             service_tier = accumulator.get_service_tier()
             confirm = None
             reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
-            if lease_id or (reservation_id and not abandoned):
-                # An abandoned per-call stream sends no confirm: confirming a
-                # floor would free the rest of a hold the provider may have
-                # spent. The hold stays until the server's reservation TTL.
+            if reservation_id or lease_id:
+                # Abandoned under hard_deny, the confirm carries the floor (the
+                # reservation, or more if more was observed) so core keeps it
+                # durably; the event keeps the observed usage.
                 confirm = self._solwyn_budget.build_confirm_request(
                     reservation_id=reservation_id,
                     lease_id=lease_id,
                     lease_claim_token=lease_claim_token,
                     model=served_model,
-                    token_details=token_details,
+                    token_details=(
+                        _floor_usage(budget, token_details) if abandoned else token_details
+                    ),
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
@@ -6025,7 +6050,7 @@ class AsyncSolwyn(_SolwynBase):
                     service_tier=service_tier,
                     usage_unmeasured=usage_unmeasured,
                 )
-            elif not reservation_id:
+            else:
                 # A legacy fail-open admission (no key to confirm against): replace its
                 # outage-tally estimate with the provider-reported total.
                 self._solwyn_budget.settle_uncounted(

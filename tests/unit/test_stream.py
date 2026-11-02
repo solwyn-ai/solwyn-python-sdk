@@ -2461,11 +2461,15 @@ async def test_stream_interrupt_billing_matches_main(
         assert state.failure_count == 0
         if status == "success" and budget_mode == "hard_deny":
             # The stream never reached its natural end, so its usage report is
-            # incomplete: under hard_deny the per-call hold is not confirmed
-            # (0.10.2). One success receipt carries the observed usage.
-            assert not settlements
-            assert len(events) == 1
-            event = events[0]
+            # incomplete: under hard_deny the per-call reservation is confirmed
+            # at its floor, marked estimated (0.10.2). The paired success
+            # event keeps the observed usage.
+            assert len(settlements) == 1
+            confirm, event = settlements[0]
+            assert confirm.token_details.is_estimated is True
+            assert confirm.token_details.input_tokens >= 12
+            assert confirm.token_details.output_tokens >= 4
+            assert not events
             assert (event.input_tokens, event.output_tokens, event.status.value) == (
                 12,
                 4,
@@ -2586,11 +2590,13 @@ async def test_stream_entry_failure_billing_matches_main(
             assert not settlements
             assert len(events) == 1
         elif budget_mode == "hard_deny":
-            # Closed before its natural end: under hard_deny no confirm frees
-            # the per-call hold (0.10.2); the success receipt is an estimate.
-            assert not settlements
-            assert len(events) == 1
-            event = events[0]
+            # Closed before its natural end: under hard_deny the reservation is
+            # confirmed at its floor (0.10.2); the success event keeps today's
+            # usage, here the input estimate.
+            assert len(settlements) == 1
+            confirm, event = settlements[0]
+            assert confirm.token_details.is_estimated is True
+            assert not events
             assert event.status.value == "success"
             assert event.token_details is not None
             assert event.token_details.is_estimated is True

@@ -12,6 +12,7 @@ attempt as possibly billed.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gc
 import json
 import threading
@@ -183,7 +184,9 @@ class TestEstablishedStreamKeepsItsLeaseClaim:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("is_async", [False, True])
     @pytest.mark.parametrize("break_after", [0, 2])
-    async def test_per_call_break_keeps_the_hold(self, is_async: bool, break_after: int) -> None:
+    async def test_per_call_break_confirms_the_floor(
+        self, is_async: bool, break_after: int
+    ) -> None:
         plane = FakeControlPlane()
         provider = _Provider(_OpenStream())
         wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
@@ -197,9 +200,14 @@ class TestEstablishedStreamKeepsItsLeaseClaim:
             else:
                 wrapped.close()
 
-        # No confirm frees the server hold. The receipt is the stream's success
-        # with its observed usage; nothing was measured, so it is the estimate.
-        assert plane.confirms == []
+        # The reservation is confirmed at its floor (the input estimate plus
+        # max_tokens), marked estimated, so core keeps it durably. The event is
+        # the stream's success with its observed usage: nothing was measured,
+        # so it is the estimate.
+        [confirm] = plane.confirms
+        assert confirm.reservation_id is not None
+        assert confirm.token_details.is_estimated is True
+        assert confirm.token_details.output_tokens == 100
         assert len(plane.ingested) == 1
         event = plane.ingested[0]
         assert event.status.value == "success"
@@ -418,7 +426,7 @@ class TestDroppedStreamSettlesOnce:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("is_async", [False, True])
-    async def test_dropped_per_call_stream_keeps_the_hold(self, is_async: bool) -> None:
+    async def test_dropped_per_call_stream_confirms_the_floor(self, is_async: bool) -> None:
         plane = FakeControlPlane()
         provider = _Provider(_OpenStream())
         wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
@@ -429,10 +437,12 @@ class TestDroppedStreamSettlesOnce:
             gc.collect()
         finally:
             # Settled by the GC handoff, or by close() if the worker has not
-            # run yet: exactly one receipt either way.
+            # run yet: exactly one settlement either way.
             await _close_client(wrapped, is_async=is_async)
 
-        assert plane.confirms == []
+        [confirm] = plane.confirms
+        assert confirm.token_details.is_estimated is True
+        assert confirm.token_details.output_tokens == 100
         assert [event.status.value for event in plane.ingested] == ["success"]
         assert plane.ingested[0].token_details.is_estimated is True
 
@@ -950,3 +960,140 @@ class TestUndecodableBodyRouting:
             # "always" may fail over; under hard_deny the next hop is re-admitted.
             assert fallback.requests == 1
             assert [check.model for check in plane.checks] == [MODEL, _FALLBACK_MODEL]
+
+
+# ── Option B: under hard_deny an unknown-usage attempt confirms its floor ──
+
+
+class _CorePlane(FakeControlPlane):
+    """FakeControlPlane plus core's accounting rules (core d948823d), in tokens.
+
+    Spend per call id is max(receipt, sum of its events), whatever the events'
+    status. A receipt is durable: an estimated (floor) confirm, a late confirm
+    of an issued reservation, or any lease confirm. An ordinary on-time
+    per-call confirm moves only the counter, which reconcile lowers back to
+    durable spend. An unconfirmed per-call hold expires. Lease float is gone
+    after surrender, so only receipted or ingested spend survives it. A check
+    is denied when spend, live holds and its own reservation pass the cap.
+    """
+
+    def __init__(self, *, cap_tokens: int, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.cap_tokens = cap_tokens
+        self._holds: dict[str, int] = {}
+        self._issued: set[str] = set()
+        self._receipts: dict[str, int] = {}
+        self._event_tokens: dict[str, int] = {}
+        self._counter_only: dict[str, int] = {}
+
+    def spent_tokens(self) -> int:
+        calls = self._receipts.keys() | self._event_tokens.keys()
+        durable = sum(max(self._receipts.get(c, 0), self._event_tokens.get(c, 0)) for c in calls)
+        return durable + sum(self._counter_only.values()) + sum(self._holds.values())
+
+    def expire_and_reconcile(self) -> None:
+        """Every unconfirmed hold expires; reconcile lowers counters to durable spend."""
+        with self._lock:
+            self._active_reservations.clear()
+            self._holds.clear()
+            self._counter_only.clear()
+
+    def _handle_check(self, body: object) -> Any:
+        need = 0
+        if isinstance(body, dict):
+            need = int(body.get("estimated_input_tokens") or 0) + int(
+                body.get("estimated_output_bound") or 0
+            )
+            if self.spent_tokens() + need > self.cap_tokens:
+                self._pending_denials.append("monthly")
+        response = super()._handle_check(body)
+        reservation_id = getattr(response.body, "reservation_id", None)
+        if reservation_id is not None:
+            self._holds[reservation_id] = need
+            self._issued.add(reservation_id)
+        return response
+
+    def _handle_confirm(self, body: object) -> Any:
+        if isinstance(body, dict):
+            details = body.get("token_details") or {}
+            tokens = int(details.get("input_tokens", 0)) + int(details.get("output_tokens", 0))
+            call_id = str(body.get("call_id"))
+            reservation_id = body.get("reservation_id")
+            if body.get("lease_id") is not None:
+                self._receipts[call_id] = max(self._receipts.get(call_id, 0), tokens)
+            elif reservation_id in self._holds:
+                del self._holds[reservation_id]
+                if details.get("is_estimated"):
+                    self._receipts[call_id] = max(self._receipts.get(call_id, 0), tokens)
+                else:
+                    self._counter_only[call_id] = tokens
+            elif (
+                reservation_id in self._issued and reservation_id not in self._settled_reservations
+            ):
+                # A late confirm of an issued reservation is charged durably.
+                self._receipts[call_id] = max(self._receipts.get(call_id, 0), tokens)
+                self._active_reservations.add(reservation_id)
+        return super()._handle_confirm(body)
+
+    def _handle_ingest(self, body: object) -> Any:
+        before = len(self.ingested)
+        response = super()._handle_ingest(body)
+        for event in self.ingested[before:]:
+            self._event_tokens[event.call_id] = (
+                self._event_tokens.get(event.call_id, 0) + event.input_tokens + event.output_tokens
+            )
+        return response
+
+
+# Each attempt reserves its input estimate plus max_tokens=100. A cap of 150
+# fits one reservation but not two, so after the first attempt's floor is
+# counted the next call is denied, and without it the next call would fit.
+_CAP_TOKENS = 150
+
+
+async def _next_call_is_denied(wrapped: Any, *, is_async: bool) -> None:
+    with pytest.raises(solwyn.BudgetExceededError):
+        result = wrapped.chat.completions.create(**_REQUEST)
+        if is_async:
+            await result
+
+
+@pytest.mark.unit
+class TestFloorSurvivesExpiryAndSurrender:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
+    @pytest.mark.parametrize("funding", ["per_call", "lease"])
+    @pytest.mark.parametrize("ending", ["caller_break", "dropped", "client_close"])
+    async def test_early_closed_stream_floor_still_denies_the_next_call(
+        self, ending: str, funding: str, is_async: bool
+    ) -> None:
+        plane = _CorePlane(cap_tokens=_CAP_TOKENS, granted_tokens=128, final_grant=True)
+        provider = _Provider(_OpenStream())
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+        scope = solwyn.run("floor-stream") if funding == "lease" else contextlib.nullcontext()
+        with scope:
+            stream = await _open_stream(wrapped, is_async=is_async)
+            await _read(stream, is_async=is_async, chunks=2)
+            if ending == "caller_break":
+                if is_async:
+                    await stream.close()
+                else:
+                    stream.close()
+            elif ending == "dropped":
+                settlement = stream._settlement
+                del stream
+                gc.collect()
+                assert _wait_until(lambda: settlement.settled)
+        # Closing the client ships what it queued (for "client_close" the
+        # stream is still open and close settles it); a lease is surrendered.
+        await _close_client(wrapped, is_async=is_async)
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+        plane.expire_and_reconcile()
+
+        [floor] = [c for c in plane.confirms if c.token_details.is_estimated]
+        assert floor.token_details.output_tokens == 100
+        assert (floor.lease_id is not None) is (funding == "lease")
+        try:
+            await _next_call_is_denied(wrapped, is_async=is_async)
+        finally:
+            await _close_client(wrapped, is_async=is_async)
