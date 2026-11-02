@@ -5,6 +5,38 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
+## [0.10.1] - Unreleased
+
+Bug fixes: `hard_deny` now also covers failover hops and `decisions.create`.
+In both cases a call could spend past a `hard_deny` budget.
+
+### Fixed
+
+- **A failover hop is checked at its own price.** The budget check prices the
+  model you asked for, but settlement prices the model that served the call.
+  When the first model failed and the call failed over to a pricier one, the
+  call could settle above its reservation. For example, 4096 output tokens
+  reserve about $0.0025 on gpt-4o-mini but can cost about $0.041 on gpt-4o, so
+  a $0.01 cap could be passed. Now, on a `hard_deny` project, before a call is
+  sent to a hop whose provider or model differs from what was admitted, Solwyn
+  frees the earlier reservation and runs a fresh check for the hop at its own
+  price and output bound. The earlier reservation is settled at zero tokens
+  under a new call id when its attempt was not billed, and kept when it may
+  have been billed. If the hop does not fit, the call is refused with
+  `BudgetExceededError` (the same error and denial reasons as a first-hop
+  denial) and the hop is never called. A hop that fits is reserved and capped
+  at its own price. A hop that CostPolicy routes first is checked the same
+  way. `alert_only`, fail-open and outage behavior is unchanged, and a retry
+  on the same provider and model needs no second check. Calls funded by a
+  run's budget lease need no change: the lease is valued at the most expensive
+  model in its declared failover chain. For the hop check, `check_budget`
+  takes `per_call_only=True`, which skips the lease branch.
+- **`decisions.create` is refused on `hard_deny` projects.** The Decisions API
+  has no output-cap parameter, so the output bound its check prices could not
+  be enforced. On a `hard_deny` admission the call is now refused before any
+  provider request with `OutputBoundUnenforceableError` and the new reason
+  `no_output_cap`. It still runs on `alert_only` projects.
+
 ## [0.10.0] - 2026-10-31
 
 A `hard_deny` budget now bounds a call's output, not only its input. Every

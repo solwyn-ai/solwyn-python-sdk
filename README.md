@@ -769,6 +769,7 @@ stops. `error.reason` is one of:
 | `unsupported_override` | A body extension carries a key Solwyn cannot account for (see below) |
 | `multi_generation_loop` | The provider SDK could generate more than once inside the call: Google automatic continuation or automatic function calling turned on explicitly, Anthropic `fallbacks`, or Anthropic middleware that resends after a successful response |
 | `azure_api_version` | An uncapped Azure OpenAI call on an api-version older than 2024-09-01, which has no `max_completion_tokens` |
+| `no_output_cap` | The API takes no output-cap parameter, so no bound can be enforced. Today this is OpenAI `decisions.create` |
 | `bound_exceeded` | Any other request whose possible output exceeds the priced bound |
 
 Body extensions are allowlisted. On a `hard_deny` admission a request body
@@ -803,6 +804,17 @@ posture is `hard_deny`). Nothing changes on `alert_only` projects, and a call
 admitted fail-open during an outage is sent exactly as you built it. Media
 calls (images, audio, video, embeddings) keep their own estimate and carry no
 output bound.
+
+Failover hops are priced on their own. The check prices the model you asked
+for, but a call that fails over is billed at the model that served it. On a
+`hard_deny` project, before Solwyn sends a call to a hop whose provider or
+model differs from what was admitted, it frees the earlier reservation (at
+zero tokens when that attempt was not billed) and runs a fresh check for the
+hop, at the hop's own price and output bound. If the hop does not fit the
+remaining budget, the call is refused with `BudgetExceededError` and the hop
+is never called. A call funded by a run's budget lease needs no second check:
+the lease is valued at the most expensive model in its declared failover
+chain.
 
 Known limitations:
 

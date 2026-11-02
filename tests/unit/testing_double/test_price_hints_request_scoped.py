@@ -89,6 +89,11 @@ def _hinted_providers(hints: dict[str, float]) -> list[str]:
     return [provider for provider, _ in sorted(hints.items(), key=lambda item: item[1])]
 
 
+# The planes run alert_only: these tests pin which checks carry which price
+# hints. Under hard_deny a cost-routed first hop is re-admitted at its own
+# price, adding a check (tests/unit/test_failover_readmission.py).
+
+
 @pytest.fixture
 def reset_cost_policy_warning() -> Iterator[None]:
     """Isolate CostPolicy's process-wide absent-hints warning latch."""
@@ -100,7 +105,7 @@ def reset_cost_policy_warning() -> Iterator[None]:
 @pytest.mark.unit
 def test_second_call_with_different_primary_model_is_never_ordered_by_first_calls_hints() -> None:
     """Catches a cache key that omits the requested primary model and replays stale hints."""
-    plane = FakeControlPlane(price_hints={"openai": 3.0, "anthropic": 1.0})
+    plane = FakeControlPlane(mode="alert_only", price_hints={"openai": 3.0, "anthropic": 1.0})
     openai, anthropic = _openai_client(), _anthropic_client()
     first_hints = dict(plane.price_hints)
     client = plane.wrap(
@@ -132,7 +137,7 @@ def test_second_call_with_different_primary_model_is_never_ordered_by_first_call
 @pytest.mark.unit
 def test_same_chain_within_ttl_hits_cache_and_replays_its_own_hints() -> None:
     """Catches cached checks that drop the original hint map before rerouting."""
-    plane = FakeControlPlane(price_hints={"openai": 3.0, "anthropic": 1.0})
+    plane = FakeControlPlane(mode="alert_only", price_hints={"openai": 3.0, "anthropic": 1.0})
     openai, anthropic = _openai_client(), _anthropic_client()
     served_hints = dict(plane.price_hints)
     client = plane.wrap(
@@ -183,7 +188,7 @@ def test_empty_hints_restore_configured_order_without_warning(
     reset_cost_policy_warning: None, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Catches an explicit server hint clear being treated as stale cost-routing input."""
-    plane = FakeControlPlane(price_hints={})
+    plane = FakeControlPlane(mode="alert_only", price_hints={})
     client = plane.wrap(
         _openai_client(),
         model="gpt-5.4-nano",
@@ -239,7 +244,7 @@ def test_null_hints_restore_configured_order_and_warn_once(
 @pytest.mark.unit
 def test_health_policy_ignores_hints_entirely() -> None:
     """Catches the default health policy accidentally consuming CostPolicy's server signal."""
-    plane = FakeControlPlane(price_hints={"openai": 3.0, "anthropic": 1.0})
+    plane = FakeControlPlane(mode="alert_only", price_hints={"openai": 3.0, "anthropic": 1.0})
     client = plane.wrap(
         _openai_client(),
         model="gpt-5.4-nano",
@@ -265,7 +270,7 @@ async def test_async_second_call_with_different_primary_model_is_never_ordered_b
     None
 ):
     """Catches the async cache key omitting the requested model and replaying stale hints."""
-    plane = FakeControlPlane(price_hints={"openai": 3.0, "anthropic": 1.0})
+    plane = FakeControlPlane(mode="alert_only", price_hints={"openai": 3.0, "anthropic": 1.0})
     first_hints = dict(plane.price_hints)
     async with plane.wrap_async(
         _async_openai_client(),

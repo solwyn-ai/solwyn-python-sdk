@@ -2559,6 +2559,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         tags: dict[str, str] | None = None,
         call_id: str | None = None,
         estimated_output_bound: int | None = None,
+        per_call_only: bool = False,
     ) -> BudgetCheckResult:
         """Check whether a call is within budget.
 
@@ -2568,6 +2569,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         surface's modality (e.g. ``"embedding"``). ``estimated_media`` carries a
         non-text surface's pre-flight non-token quantities for a precise
         check-time cost; None for chat/token calls.
+
+        ``per_call_only`` skips the lease branch: a failover hop re-admitted
+        under hard_deny replaces a per-call reservation with another one.
 
         Run-scoped, token-billed traffic meets the LEASE path first (PJ-2):
         ``call_id`` keys the reservation the call draws down (so settlement can
@@ -2595,7 +2599,8 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         lease_call_id: str | None = None
         lease_claim_token: int | None = None
         if (
-            modality == "text"
+            not per_call_only
+            and modality == "text"
             and estimated_media is None
             and tags is None
             and self._lease_path_applies(agent_run_id)
@@ -3374,6 +3379,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         tags: dict[str, str] | None = None,
         call_id: str | None = None,
         estimated_output_bound: int | None = None,
+        per_call_only: bool = False,
     ) -> BudgetCheckResult:
         """Async version of budget check. See BudgetEnforcer.check_budget."""
         self._run_cleanup_loop = asyncio.get_running_loop()
@@ -3381,7 +3387,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         lease_call_id: str | None = None
         lease_claim_token: int | None = None
         if (
-            modality == "text"
+            not per_call_only
+            and modality == "text"
             and estimated_media is None
             and tags is None
             and self._lease_path_applies(agent_run_id)

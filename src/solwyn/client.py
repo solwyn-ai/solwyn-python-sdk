@@ -44,6 +44,7 @@ from pydantic import ValidationError
 
 from solwyn import _otel
 from solwyn._base import (
+    _OUTPUT_BOUND_HINTS,
     MediaSurfaceSpec,
     _AttemptContext,
     _client_shape,
@@ -112,6 +113,7 @@ from solwyn._run_control import (
 from solwyn._surfaces import SurfaceSource
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
+    BudgetConfirmRequest,
     CallStatus,
     DenySource,
     FailoverReason,
@@ -215,8 +217,17 @@ def _report_budget_denial(
     velocity_flags: Collection[str],
     modality: Modality = "text",
     media_usage: MediaUsage | None = None,
+    attempt_index: int = 0,
+    is_model_fallback: bool = False,
+    is_provider_fallback: bool = False,
+    requested_provider: ProviderName | None = None,
+    requested_model: str | None = None,
 ) -> None:
-    """Report one content-free budget denial with its internal attribution."""
+    """Report one content-free budget denial with its internal attribution.
+
+    A failover hop refused at re-admission carries its chain position and
+    fallback attribution, so its receipt never collides with the primary's.
+    """
     try:
         client._solwyn_reporter.report(
             client._build_metadata_event(
@@ -227,7 +238,11 @@ def _report_budget_denial(
                 token_details=None,
                 latency_ms=0.0,
                 status=CallStatus.BUDGET_DENIED,
-                is_model_fallback=False,
+                is_model_fallback=is_model_fallback,
+                is_provider_fallback=is_provider_fallback,
+                requested_provider=requested_provider,
+                requested_model=requested_model,
+                attempt_index=attempt_index,
                 call_id=call_id,
                 agent_run=agent_run,
                 trace=trace,
@@ -1908,6 +1923,65 @@ def _legacy_google_candidate_output_bound(
     return max(bounds, default=0)
 
 
+def _failover_hop_bound(
+    *,
+    primary: ProviderRuntime,
+    runtime: ProviderRuntime,
+    global_defaults: dict[str, Any],
+    kwargs: dict[str, object],
+    is_streaming: bool,
+    default_bound: int,
+) -> int:
+    """The output bound of one failover hop, resolved like the call's own bound."""
+    return max(
+        _legacy_google_candidate_output_bound(
+            primary=primary,
+            runtimes=[runtime],
+            global_defaults=global_defaults,
+            kwargs=kwargs,
+            is_streaming=is_streaming,
+            default_bound=default_bound,
+        ),
+        _effective_output_bound(
+            primary=primary,
+            runtimes=[runtime],
+            global_defaults=global_defaults,
+            kwargs=kwargs,
+            default_bound=default_bound,
+        ),
+    )
+
+
+def _failover_close_out(
+    client: Solwyn | AsyncSolwyn,
+    budget: BudgetCheckResult,
+    admitted: tuple[str, str],
+    *,
+    primary: ProviderRuntime,
+    spend_unknown: bool,
+) -> BudgetConfirmRequest | None:
+    """A zero-usage confirm that frees the admitted per-call reservation.
+
+    The server frees a per-call hold only through a confirm. The admitted
+    identity produced no billed output when its attempt failed over (or was
+    never attempted), so the confirm settles it at zero tokens. It carries a
+    FRESH call id: the server counts account spend once per call id, and the
+    served hop's real confirm must be the one that counts. A post-send
+    ambiguous attempt may have been billed, so its hold is kept.
+    """
+    if spend_unknown or budget.reservation_id is None:
+        return None
+    provider, model = admitted
+    return client._solwyn_budget.build_confirm_request(
+        model=model,
+        token_details=TokenDetails(),
+        provider=provider,
+        call_id=str(uuid.uuid4()),
+        reservation_id=budget.reservation_id,
+        is_provider_fallback=provider != primary.adapter.name,
+    )
+
+
 def _media_prepare(
     adapter: Any,
     surface: str,
@@ -2306,6 +2380,86 @@ class Solwyn(_SolwynBase):
             raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
         return self._solwyn_client.start_async_invoke(**kwargs)
 
+    def _readmit_failover_hop(
+        self,
+        *,
+        budget: BudgetCheckResult,
+        admitted: tuple[str, str],
+        spend_unknown: bool,
+        primary: ProviderRuntime,
+        runtime: ProviderRuntime,
+        model: str,
+        chain_index: int,
+        kwargs: dict[str, object],
+        is_streaming: bool,
+        char_count: int,
+        call_id: str,
+        agent_run: _RunContextSnapshot,
+        trace: _TraceSnapshot | None,
+        deadline: Deadline,
+        velocity_flags: Collection[str],
+    ) -> tuple[BudgetCheckResult, int]:
+        """Re-admit a hard_deny call for a failover hop at the hop's own price.
+
+        The pre-flight priced the admitted (provider, model), but settlement
+        prices the hop that serves, so a pricier hop could settle past its
+        reservation. The admitted reservation is closed out first, then the
+        hop gets its own per-call check with its own output bound. A denial
+        refuses the call exactly like a primary denial, before the hop's
+        provider is called.
+        """
+        close_out = _failover_close_out(
+            self, budget, admitted, primary=primary, spend_unknown=spend_unknown
+        )
+        if close_out is not None:
+            self._solwyn_reporter.report_confirm(close_out)
+        bound = _failover_hop_bound(
+            primary=primary,
+            runtime=runtime,
+            global_defaults=self._solwyn_config.default_params,
+            kwargs=kwargs,
+            is_streaming=is_streaming,
+            default_bound=self._solwyn_config.lease_output_bound_default,
+        )
+        provider = runtime.adapter.name
+        hop_input = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
+        hop_budget = self._solwyn_budget.check_budget(
+            estimated_input_tokens=hop_input,
+            model=model,
+            provider=provider,
+            timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
+            agent_run_id=agent_run[0],
+            tags=agent_run[2],
+            call_id=call_id,
+            estimated_output_bound=bound,
+            per_call_only=True,
+        )
+        if not hop_budget.allowed:
+            is_provider_fallback = runtime.entry.provider != primary.entry.provider
+            _report_budget_denial(
+                self,
+                budget=hop_budget,
+                agent_run=agent_run,
+                trace=trace,
+                model=model,
+                provider=provider,
+                input_tokens=hop_input,
+                call_id=call_id,
+                provider_region=_safe_extract_region(runtime),
+                estimated_output_bound=bound,
+                velocity_flags=velocity_flags,
+                attempt_index=chain_index,
+                is_model_fallback=not is_provider_fallback,
+                is_provider_fallback=is_provider_fallback,
+                requested_provider=primary.entry.provider if is_provider_fallback else None,
+            )
+            raise _budget_denial_error(
+                budget=hop_budget,
+                agent_run_id=agent_run[0],
+                estimated_input_tokens=hop_input,
+            )
+        return hop_budget, bound
+
     def _sync_dispatch(
         self,
         runtime: ProviderRuntime,
@@ -2560,6 +2714,19 @@ class Solwyn(_SolwynBase):
         #    call escapes would come down to pool state. Gate it explicitly
         #    instead — chat rejects this exact state, and no provider I/O may
         #    start outside the window.
+        # Under hard_deny the check priced this call at its output bound, which
+        # holds only when the request can carry a cap. Decisions takes no
+        # output-cap parameter, so the call is refused before any provider I/O.
+        if spec.surface == "decisions" and getattr(budget, "hard_deny_admitted", False) is True:
+            self._solwyn_budget.release_reservation(
+                call_id,
+                lease_claim_token=_lease_claim_token(budget),
+            )
+            raise OutputBoundUnenforceableError(
+                provider=provider,
+                reason="no_output_cap",
+                hint=_OUTPUT_BOUND_HINTS["no_output_cap"],
+            )
         if deadline.expired():
             self._solwyn_budget.release_reservation(
                 call_id,
@@ -3024,6 +3191,11 @@ class Solwyn(_SolwynBase):
             # primary was attempted and raised; CIRCUIT_OPEN if it was skipped OPEN).
             primary_errored = False
             primary_reached = False
+            # Under hard_deny a per-call admission prices one (provider, model);
+            # a hop that differs is re-admitted at its own price before it is
+            # sent (_readmit_failover_hop).
+            admitted_identity = (primary.adapter.name, requested_model)
+            admitted_spend_unknown = False
             for idx, rt in enumerate(candidates):
                 if deadline.expired():
                     break
@@ -3050,6 +3222,31 @@ class Solwyn(_SolwynBase):
                 # still uses the candidate-walk ``idx`` (remaining candidates, not
                 # chain depth).
                 chain_index = next(i for i, r in enumerate(self._solwyn_runtimes) if r is rt)
+                hop_model = requested_model if is_primary else rt.entry.model
+                if (
+                    getattr(budget, "hard_deny_admitted", False) is True
+                    and getattr(budget, "lease_id", None) is None
+                    and (provider, hop_model) != admitted_identity
+                ):
+                    budget, estimated_output_bound = self._readmit_failover_hop(
+                        budget=budget,
+                        admitted=admitted_identity,
+                        spend_unknown=admitted_spend_unknown,
+                        primary=primary,
+                        runtime=rt,
+                        model=hop_model,
+                        chain_index=chain_index,
+                        kwargs=kwargs,
+                        is_streaming=is_streaming,
+                        char_count=char_count,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                        trace=trace,
+                        deadline=deadline,
+                        velocity_flags=velocity_flags,
+                    )
+                    admitted_identity = (provider, hop_model)
+                    admitted_spend_unknown = False
 
                 # Build native kwargs for this hop. A cross-provider hop runs the
                 # translation contract and may RAISE an Untranslatable* error here,
@@ -3287,6 +3484,7 @@ class Solwyn(_SolwynBase):
                                 call_id,
                                 lease_claim_token=_lease_claim_token(budget),
                             )
+                            admitted_spend_unknown = True
                         last_exc = exc
                         advanced = True
                     # Reached on a successful hop OR on a terminal failure that advances
@@ -4184,6 +4382,78 @@ class AsyncSolwyn(_SolwynBase):
             raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
         return await self._solwyn_client.start_async_invoke(**kwargs)
 
+    async def _readmit_failover_hop(
+        self,
+        *,
+        budget: BudgetCheckResult,
+        admitted: tuple[str, str],
+        spend_unknown: bool,
+        primary: ProviderRuntime,
+        runtime: ProviderRuntime,
+        model: str,
+        chain_index: int,
+        kwargs: dict[str, object],
+        is_streaming: bool,
+        char_count: int,
+        call_id: str,
+        agent_run: _RunContextSnapshot,
+        trace: _TraceSnapshot | None,
+        deadline: Deadline,
+        velocity_flags: Collection[str],
+    ) -> tuple[BudgetCheckResult, int]:
+        """Async twin of ``Solwyn._readmit_failover_hop``."""
+        close_out = _failover_close_out(
+            self, budget, admitted, primary=primary, spend_unknown=spend_unknown
+        )
+        if close_out is not None:
+            self._solwyn_reporter.report_confirm(close_out)
+        bound = _failover_hop_bound(
+            primary=primary,
+            runtime=runtime,
+            global_defaults=self._solwyn_config.default_params,
+            kwargs=kwargs,
+            is_streaming=is_streaming,
+            default_bound=self._solwyn_config.lease_output_bound_default,
+        )
+        provider = runtime.adapter.name
+        hop_input = estimate_tokens_from_length(char_count, provider=provider) if char_count else 0
+        hop_budget = await self._solwyn_budget.check_budget(
+            estimated_input_tokens=hop_input,
+            model=model,
+            provider=provider,
+            timeout=_budget_timeout(deadline, self._solwyn_config.budget_check_timeout),
+            agent_run_id=agent_run[0],
+            tags=agent_run[2],
+            call_id=call_id,
+            estimated_output_bound=bound,
+            per_call_only=True,
+        )
+        if not hop_budget.allowed:
+            is_provider_fallback = runtime.entry.provider != primary.entry.provider
+            _report_budget_denial(
+                self,
+                budget=hop_budget,
+                agent_run=agent_run,
+                trace=trace,
+                model=model,
+                provider=provider,
+                input_tokens=hop_input,
+                call_id=call_id,
+                provider_region=_safe_extract_region(runtime),
+                estimated_output_bound=bound,
+                velocity_flags=velocity_flags,
+                attempt_index=chain_index,
+                is_model_fallback=not is_provider_fallback,
+                is_provider_fallback=is_provider_fallback,
+                requested_provider=primary.entry.provider if is_provider_fallback else None,
+            )
+            raise _budget_denial_error(
+                budget=hop_budget,
+                agent_run_id=agent_run[0],
+                estimated_input_tokens=hop_input,
+            )
+        return hop_budget, bound
+
     async def _async_dispatch(
         self,
         runtime: ProviderRuntime,
@@ -4413,6 +4683,19 @@ class AsyncSolwyn(_SolwynBase):
         # connect and read decoupled (PJ-8/R7), an expired window would
         # otherwise let a warm pooled connection clear the 0.001s connect floor
         # and read for the full hop bound. See the sync mirror.
+        # Under hard_deny the check priced this call at its output bound, which
+        # holds only when the request can carry a cap. Decisions takes no
+        # output-cap parameter, so the call is refused before any provider I/O.
+        if spec.surface == "decisions" and getattr(budget, "hard_deny_admitted", False) is True:
+            self._solwyn_budget.release_reservation(
+                call_id,
+                lease_claim_token=_lease_claim_token(budget),
+            )
+            raise OutputBoundUnenforceableError(
+                provider=provider,
+                reason="no_output_cap",
+                hint=_OUTPUT_BOUND_HINTS["no_output_cap"],
+            )
         if deadline.expired():
             self._solwyn_budget.release_reservation(
                 call_id,
@@ -4831,6 +5114,11 @@ class AsyncSolwyn(_SolwynBase):
             # primary was attempted and raised; CIRCUIT_OPEN if it was skipped OPEN).
             primary_errored = False
             primary_reached = False
+            # Under hard_deny a per-call admission prices one (provider, model);
+            # a hop that differs is re-admitted at its own price before it is
+            # sent (_readmit_failover_hop).
+            admitted_identity = (primary.adapter.name, requested_model)
+            admitted_spend_unknown = False
             for idx, rt in enumerate(candidates):
                 if deadline.expired():
                     break
@@ -4857,6 +5145,31 @@ class AsyncSolwyn(_SolwynBase):
                 # still uses the candidate-walk ``idx`` (remaining candidates, not
                 # chain depth).
                 chain_index = next(i for i, r in enumerate(self._solwyn_runtimes) if r is rt)
+                hop_model = requested_model if is_primary else rt.entry.model
+                if (
+                    getattr(budget, "hard_deny_admitted", False) is True
+                    and getattr(budget, "lease_id", None) is None
+                    and (provider, hop_model) != admitted_identity
+                ):
+                    budget, estimated_output_bound = await self._readmit_failover_hop(
+                        budget=budget,
+                        admitted=admitted_identity,
+                        spend_unknown=admitted_spend_unknown,
+                        primary=primary,
+                        runtime=rt,
+                        model=hop_model,
+                        chain_index=chain_index,
+                        kwargs=kwargs,
+                        is_streaming=is_streaming,
+                        char_count=char_count,
+                        call_id=call_id,
+                        agent_run=agent_run,
+                        trace=trace,
+                        deadline=deadline,
+                        velocity_flags=velocity_flags,
+                    )
+                    admitted_identity = (provider, hop_model)
+                    admitted_spend_unknown = False
 
                 # Build native kwargs for this hop. A cross-provider hop runs the
                 # translation contract and may RAISE an Untranslatable* error here,
@@ -5088,6 +5401,7 @@ class AsyncSolwyn(_SolwynBase):
                                 call_id,
                                 lease_claim_token=_lease_claim_token(budget),
                             )
+                            admitted_spend_unknown = True
                         last_exc = exc
                         advanced = True
                     # Reached on a successful hop OR on a terminal failure that advances
