@@ -545,6 +545,53 @@ class TestDroppedStreamSettlesOnce:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("is_async", [False, True])
+    async def test_client_close_waits_for_a_gc_settlement_in_flight(self, is_async: bool) -> None:
+        # The cleanup worker has claimed the stream but not yet enqueued its
+        # pair when the client closes: close must not seal the reporter first.
+        plane = FakeControlPlane()
+        provider = _Provider(_OpenStream())
+        wrapped = (plane.wrap_async if is_async else plane.wrap)(provider.client(is_async=is_async))
+        stream = await _open_stream(wrapped, is_async=is_async)
+        await _read(stream, is_async=is_async, chunks=1)
+        settlement = stream._settlement
+        on_dropped = settlement._on_dropped
+        claimed, sealed = threading.Event(), threading.Event()
+
+        def slow_on_dropped(*args: Any) -> None:
+            claimed.set()
+            sealed.wait(0.5)  # unblocked early only if the reporter seals first
+            on_dropped(*args)
+
+        settlement._on_dropped = slow_on_dropped
+        reporter = wrapped._solwyn_reporter
+        reporter_close = reporter.close
+
+        if is_async:
+
+            async def close_then_mark(*args: Any, **kwargs: Any) -> None:
+                await reporter_close(*args, **kwargs)
+                sealed.set()
+        else:
+
+            def close_then_mark(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+                reporter_close(*args, **kwargs)
+                sealed.set()
+
+        worker = threading.Thread(target=settlement.settle_dropped)
+        worker.start()
+        assert claimed.wait(5)
+        with patch.object(reporter, "close", close_then_mark):
+            await _close_client(wrapped, is_async=is_async)
+        worker.join(5)
+
+        [confirm] = plane.confirms
+        assert confirm.token_details.is_estimated is True
+        assert [event.status.value for event in plane.ingested] == ["success"]
+        assert reporter.dropped_counts.get("settlement_confirm.closed_enqueue") is None
+        del stream
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("is_async", [False, True])
     async def test_dropped_settlement_never_raises(self, is_async: bool) -> None:
         plane = FakeControlPlane()
         provider = _Provider(_OpenStream())

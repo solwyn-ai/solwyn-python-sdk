@@ -2361,7 +2361,9 @@ class _SolwynBase:
 
         Called by close() before the reporter seals, so the receipts ship.
         Settling claims each stream's single settlement, so a later close(),
-        natural end, error or GC of that stream does nothing. Never raises.
+        natural end, error or GC of that stream does nothing. A stream the GC
+        worker already claimed is waited for until its settlement is enqueued.
+        Never raises.
         """
         streams = getattr(self, "_solwyn_open_streams", None)
         if not streams:

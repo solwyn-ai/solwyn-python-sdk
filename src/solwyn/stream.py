@@ -66,6 +66,10 @@ class _StreamSettlement:
     ) -> None:
         self._lock = threading.Lock()
         self._settled = False
+        # Clear only while a dropped settlement that won the claim is still
+        # enqueueing, so client close can wait for it before sealing.
+        self._dropped_done = threading.Event()
+        self._dropped_done.set()
         self._accumulator = accumulator
         self._on_dropped = on_dropped
         self._start_time = time.monotonic()
@@ -89,10 +93,21 @@ class _StreamSettlement:
         if on_dropped is None:
             return
         try:
-            if not self.claim():
+            with self._lock:
+                won = not self._settled
+                if won:
+                    self._settled = True
+                    self._dropped_done.clear()
+            if not won:
+                # GC on the cleanup worker may have claimed it and still be
+                # enqueueing: client close waits, so the reporter seals after.
+                self._dropped_done.wait()
                 return
-            elapsed_ms = (time.monotonic() - self._start_time) * 1000
-            on_dropped(self._accumulator.finalize(), elapsed_ms)
+            try:
+                elapsed_ms = (time.monotonic() - self._start_time) * 1000
+                on_dropped(self._accumulator.finalize(), elapsed_ms)
+            finally:
+                self._dropped_done.set()
         except BaseException as exc:
             # Structural only: the class name, never the exception text.
             with contextlib.suppress(BaseException):
