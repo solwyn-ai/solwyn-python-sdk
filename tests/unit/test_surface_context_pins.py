@@ -51,11 +51,11 @@ DECLARED_CONTEXT_DIGESTS: dict[tuple[str, str, str, str], str] = {
         "sha256:672f073f4374a1bcb4cfdb259b0a18386f2036cd2cc05672a8673d34951763f7"
     ),  # 2379 rules
     ("anthropic", "anthropic", "anthropic_sdk", "sync"): (
-        "sha256:c67c20461466a9ba36c9acc6658e59cc6d510d2b9b69340715ab14af377c4fa3"
-    ),  # 4045 rules
+        "sha256:3b9953d9e2a596d49e10bd2f4da566640fc68739cd8267da3dc9405cea9f770b"
+    ),  # 4393 rules
     ("anthropic", "anthropic", "anthropic_sdk", "async"): (
-        "sha256:01b43d433c81cfdd689f0ac60de06c53b1e622ebb88072ea4944748afd9adca6"
-    ),  # 4048 rules
+        "sha256:c99309dc8bbcce57c44eeb38e809cb117b9d091177c4c03297207e860889d76c"
+    ),  # 4396 rules
     ("google", "google", "google_genai", "sync"): (
         "sha256:eeae6876aedb388bb673b9b767833115111071709c02f3e477429726f51f2492"
     ),  # 452 rules

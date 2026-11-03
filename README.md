@@ -28,7 +28,7 @@ Other OpenAI-compatible endpoints (Groq, OpenRouter, vLLM, …) ride the `openai
 | Provider SDK | Declared floor | Tested breakpoints (including floor) | Latest tested |
 |---|---|---|---|
 | `openai` | `openai>=2.0` | `openai==2.0.0`, `openai==2.2.0`, `openai==2.21.0`, `openai==2.34.0`, `openai==2.52.0` | `openai==3.42.0` |
-| `anthropic` | `anthropic>=0.50` | `anthropic==0.50.0`, `anthropic==0.80.0`, `anthropic==1.0.0`, `anthropic==1.14.0` | `anthropic==2.3.0` |
+| `anthropic` | `anthropic>=0.50` | `anthropic==0.50.0`, `anthropic==0.80.0`, `anthropic==1.0.0`, `anthropic==1.14.0` | `anthropic==2.4.0` |
 | `together` | `together>=2.0` | `together==2.0.0`, `together==2.41.0` | `together==3.0.0` |
 | `google-genai` | `google-genai>=1.0` | `google-genai==1.0.0`, `google-genai==1.60.0`, `google-genai==2.0.0` | `google-genai==2.33.0` |
 | `google-generativeai` | `google-generativeai>=0.8.5` | `google-generativeai==0.8.5` | `google-generativeai==0.8.6` |

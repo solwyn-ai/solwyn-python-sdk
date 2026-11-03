@@ -5,6 +5,22 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
+## [Unreleased]
+
+### Added
+
+- **Anthropic SDK 2.4 support.** Anthropic 2.4 promotes four administration
+  APIs from `beta.organization` to the top-level `organization` resource:
+  `analytics` (apps, artifacts, connectors, plugins, skills, summaries, and
+  users reports), `rbac_groups` (with `members`), `rbac_roles` (with
+  `permissions`), and `spend_limits` (`effective` and `increase_requests`).
+  Each promoted path is classified exactly like its `beta.organization.*`
+  predecessor: unmetered, following `on_unmetered`, and requiring exact
+  acknowledgment tokens in strict mode, with raw and streaming response
+  helpers in their separate acknowledgment scope. The `beta.organization.*`
+  classifications are unchanged. Coverage fingerprints are refreshed for this
+  admission.
+
 ## [0.10.1] - 2026-11-02
 
 Bug fixes: `hard_deny` now also covers failover hops and `decisions.create`.
