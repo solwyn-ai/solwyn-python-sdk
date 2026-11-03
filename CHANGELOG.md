@@ -7,6 +7,15 @@ derived from git tags (hatch-vcs).
 
 ## [0.10.2] - 2026-11-03
 
+Bug fixes: under `hard_deny`, a stream closed early or dropped, and a call that
+fails in an unrecognized way after it was sent, no longer give back budget they
+may have spent. Keeping that funding is now `hard_deny` only.
+
+Under `hard_deny`, a call whose usage can't be measured and may have been
+billed is recorded at its reserved amount, marked estimated, so the dashboard
+can show more than the provider billed (for example, a stream stopped early).
+This needs Solwyn API support that is live from 2026-11-02.
+
 ### Added
 
 - **Anthropic SDK 2.4 support.** Anthropic 2.4 promotes four administration
@@ -20,15 +29,6 @@ derived from git tags (hatch-vcs).
   helpers in their separate acknowledgment scope. The `beta.organization.*`
   classifications are unchanged. Coverage fingerprints are refreshed for this
   admission.
-
-Bug fixes: under `hard_deny`, a stream closed early or dropped, and a call that
-fails in an unrecognized way after it was sent, no longer give back budget they
-may have spent. Keeping that funding is now `hard_deny` only.
-
-Under `hard_deny`, a call whose usage can't be measured and may have been
-billed is recorded at its reserved amount, marked estimated, so the dashboard
-can show more than the provider billed (for example, a stream stopped early).
-This needs Solwyn API support that is live from 2026-11-02.
 
 ### Fixed
 
