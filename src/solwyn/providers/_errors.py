@@ -149,6 +149,16 @@ _POST_SEND_BY_NAME = frozenset(
 # Used both directly (via ``_transport_disposition``, step 2) and as the
 # cause-inspection allowlist for the openai/anthropic wrappers (steps 1 and 7).
 _PRE_SEND_HTTPX = (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ConnectError)
+# A response arrived but its body failed to decode (content decoding or JSON
+# parsing), so the provider may have billed it. Shared with the TS SDK's name
+# table: httpx/httpx2 ``DecodingError`` (openai, anthropic, google-genai,
+# together), ``JSONDecodeError``, urllib3's ``DecodeError`` and botocore's
+# ``ResponseParserError`` (Bedrock). Schema validation of a decoded body is not
+# a decode failure.
+_BODY_DECODE_NAMES = frozenset(
+    {"DecodingError", "JSONDecodeError", "DecodeError", "ResponseParserError"}
+)
+_DECODE_CHAIN_LIMIT = 8
 _PRE_SEND_TRANSPORT_NAMES = frozenset({"ConnectTimeout", "PoolTimeout", "ConnectError"})
 
 # Sentinel for static attribute lookups: distinguishes "absent" from a real
@@ -256,11 +266,29 @@ def _numeric_status(exc: BaseException) -> int | None:
     return None
 
 
-def classify_exception(exc: BaseException) -> Disposition:
+def _has_body_decode_failure(exc: BaseException) -> bool:
+    """Whether ``exc`` or a link of its cause chain is a body decode failure.
+
+    Follows ``__cause__``, else ``__context__``, for at most
+    ``_DECODE_CHAIN_LIMIT`` links, and stops on a cycle.
+    """
+    seen: set[int] = set()
+    link: BaseException | None = exc
+    while link is not None and len(seen) < _DECODE_CHAIN_LIMIT and id(link) not in seen:
+        seen.add(id(link))
+        if {_static_class_name(cls) for cls in type(link).__mro__} & _BODY_DECODE_NAMES:
+            return True
+        link = link.__cause__ or link.__context__
+    return False
+
+
+def classify_exception(exc: BaseException, *, dispatched: bool = True) -> Disposition:
     """Classify a transport exception into a failover ``Disposition``.
 
     Duck-typed: never ``isinstance`` on a provider SDK class (they may be absent
-    or differ across versions). Certainty-first: a PROVEN httpx/httpx2 transport
+    or differ across versions). ``dispatched=False`` marks a failure raised
+    before the request was handed to the provider (no response can exist).
+    Certainty-first: a PROVEN httpx/httpx2 transport
     class settles whether the request could have landed before any class name or
     numeric status is consulted; everything unrecognized falls through to the
     status check. See the module docstring for why the branch ordering below is
@@ -328,6 +356,14 @@ def classify_exception(exc: BaseException) -> Disposition:
         if status >= 500:
             return Disposition.POST_SEND_AMBIGUOUS
 
+    # 6b. A response arrived but its body failed to decode (gzip/deflate or
+    #     JSON), at the top or behind a connection wrapper: post-send, so it
+    #     must never fail over under the safe policy. A numeric status above
+    #     wins (its routing is already known). Before dispatch no response
+    #     exists, so a decode-named local error keeps the default.
+    if dispatched and _has_body_decode_failure(exc):
+        return Disposition.POST_SEND_AMBIGUOUS
+
     # 7. Provider connection-error wrapper (no status, not itself a timeout).
     #    The openai/anthropic APIConnectionError wraps BOTH provably pre-send
     #    failures (connect refused / DNS / TLS) AND post-send transport drops
@@ -347,6 +383,45 @@ def classify_exception(exc: BaseException) -> Disposition:
 
     # 8. Default: never failover into the unknown.
     return Disposition.FAIL_FAST
+
+
+def attempt_maybe_billed(exc: BaseException) -> bool:
+    """Whether a DISPATCHED attempt that raised ``exc`` may have been billed.
+
+    Independent of :func:`classify_exception`, which decides ROUTING (fail over,
+    stop, or stop as ambiguous). Routing must not decide funding: an unknown
+    failure stops the chain (FAIL_FAST) yet may come from a paid response, for
+    example an HTTP 200 whose body fails to parse. So after dispatch an attempt
+    counts as possibly billed unless there is positive evidence it was not:
+
+    - a numeric 4xx status (429 included), or 529 (overloaded): the provider
+      refused the request before generation started;
+    - a transport failure that proves the request was never sent (connect
+      refused, connect/pool timeout, botocore's pre-send classes), at the top or
+      as the direct cause of a provider timeout/connection wrapper.
+
+    Everything else counts as billed: every other 5xx, post-send transport errors,
+    timeouts and connection wrappers without pre-send proof (a bare
+    ``APIConnectionError`` with no cause still fails over, but proves nothing
+    about sending), decode/parse/validation errors, unknown exceptions, and any
+    non-``Exception`` (cancellation, interrupt). Bedrock's 408/424 model errors
+    mean the model ran, so their names win over their statuses.
+    """
+    if not isinstance(exc, Exception):
+        return True
+    names = {_static_class_name(cls) for cls in type(exc).__mro__}
+    if "ReadTimeoutError" in names or names & _POST_SEND_BY_NAME:
+        return True
+    if names & _BOTOCORE_PRE_SEND_NAMES:
+        return False
+    transport = _transport_disposition(exc)
+    if transport is not None:
+        return transport is not Disposition.FAILOVER
+    if "APITimeoutError" in names or "APIConnectionError" in names:
+        cause = exc.__cause__ or exc.__context__
+        return cause is None or _transport_disposition(cause) is not Disposition.FAILOVER
+    status = _numeric_status(exc)
+    return status is None or not (400 <= status < 500 or status == 529)
 
 
 def retry_after_seconds(exc: BaseException) -> float | None:

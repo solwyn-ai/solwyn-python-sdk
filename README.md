@@ -199,7 +199,7 @@ for event in response["stream"]:
     ...
 ```
 
-If you stop consuming the stream early, call `response["stream"].close()` (or wrap iteration in `with response["stream"]:`) to settle the budget reservation — the same close obligation raw boto3's `EventStream` has. `close()` settles exactly once with whatever usage was observed and is safe to call repeatedly.
+If you stop consuming the stream early, call `response["stream"].close()` (or wrap iteration in `with response["stream"]:`) to settle the budget reservation. Raw boto3's `EventStream` has the same close obligation. `close()` settles exactly once and is safe to call repeatedly; a stream closed before its end settles as described in [early stream close](#early-stream-close).
 
 Notes:
 
@@ -796,7 +796,8 @@ included, it checks the outgoing request (the admitted model, a cap within the
 priced bound, no fallbacks), then claims the call's single generation slot
 before any I/O, so overlapping sends cannot both go out. After one successful
 (2xx) response, any further request is refused before it is sent, and the
-reservation is kept. Retries after a failed attempt still pass.
+reservation is kept. A refusal before anything was sent gives the reservation
+back. Retries after a failed attempt still pass.
 
 `error.hint` says how to fix the request. All of this applies only when Solwyn
 itself admitted the call under `hard_deny` (a check allow, or a lease whose
@@ -921,6 +922,27 @@ defaults, and Google/Bedrock nested cap fields. When a hop has no explicit cap,
 `hard_deny` posture the hop is sent to the provider with that cap (see
 [Output bound](#output-bound)).
 
+Every rule below that keeps a possibly billed call's funding applies only to a
+call admitted under `hard_deny`.
+
+<a id="floor-confirm"></a>
+Under `hard_deny`, a call whose usage can't be measured and may have been
+billed is recorded at its reserved amount, marked estimated. Solwyn confirms
+the attempt's floor on its own reservation or lease claim: the reservation's
+estimated input tokens and the attempt's output bound (or the observed usage,
+where that is larger), priced on that attempt's provider and model, with
+`is_estimated: true`. The attempt's own event is sent as usual, and the Solwyn
+API counts the larger of the two for that call, so nothing is counted twice.
+The floor survives lease surrender, reservation expiry and reconcile, so the
+cap keeps holding. This means the dashboard can show more than the provider
+billed, for example for a stream stopped early. A possibly billed hop that
+fails over is recorded under its own call id, beside the hop that served the
+call. This needs Solwyn API support that is live from 2026-11-02. On `alert_only` those calls settle
+once at their observed usage and give the claim back, as before; failover
+routing and the `possibly_succeeded` receipt flag are the same in every mode.
+The local floor for a completed call whose usage is missing or unreadable
+applies in every mode.
+
 Cancelling an async chat or Responses call, or interrupting a sync one with a
 non-`Exception` `BaseException` (`KeyboardInterrupt`, `SystemExit`), retires its
 local reservation immediately and re-raises the original exception.
@@ -937,6 +959,40 @@ recorded, the provider stream is closed best-effort, and the original error is
 re-raised. The Responses `stream()` manager applies the same rule to a wrap
 failure at context entry. Use stream context managers or explicit
 close when abandoning an established stream so its provider connection closes.
+
+<a id="early-stream-close"></a>
+An established stream closed before its natural end (the caller breaks off and
+closes it, leaves its context manager, or a run stop ends it) never delivered
+its final usage report, so the provider may have billed more than Solwyn saw.
+Under `hard_deny` it confirms its [floor](#floor-confirm), on a lease claim or
+a per-call reservation alike. The call still reports one success receipt with
+the usage it observed (the pre-flight input estimate, marked estimated, when it
+observed none), and its breaker records a success. A stream that reaches its
+natural end confirms its measured usage as before.
+
+A stream you drop without closing settles the same way, exactly once. When it
+is garbage-collected, a finalizer hands settlement to Solwyn's background
+cleanup thread. Closing the client first settles every stream it returned that
+is still open, so those receipts ship before the reporter shuts down. Neither
+path records the stream's latency, because that time measures how long you held
+the stream. A stream still open when the interpreter exits is not settled. A
+stream that settles after its client's reporter has shut down still holds its
+lease claim locally, but its floor confirm and its event are refused and
+counted in the reporter's `dropped_counts` (`settlement_confirm.closed_enqueue`,
+`event.closed_enqueue`). The Solwyn API then never sees that spend: it stops
+counting when the per-call hold expires or the lease ends.
+
+Once a request is dispatched, Solwyn treats a failure as possibly billed
+unless there is positive evidence it was not: a 4xx status (429 included), a
+529 (overloaded), or a transport failure that proves the request was never sent
+(connect refused, connect or pool timeout). Anything else keeps the bound,
+including an HTTP 200 whose body fails to parse or decode, any other 5xx, a
+connection error without pre-send proof, and an unknown exception. Whether the
+call fails over is decided separately. A response whose body arrived but failed
+to decode (gzip or deflate, or unparseable JSON, including behind a connection
+error) is treated like a read timeout for routing in every mode: under the
+default `failover_idempotency="safe"` it does not fail over, and under
+`"always"` it may, with the next hop re-admitted under `hard_deny`.
 Sync and async dispatch errors with unknown post-send usage (read timeouts,
 5xx responses, or protocol drops) also retain the bound when ambiguous failover
 is disabled. With `failover_idempotency="always"` the call fails over instead,
@@ -1334,9 +1390,10 @@ inspect `run_termination(run_id)`, or explicitly clear stored stop state with
 `RunTermination` (`reason`, `source`, and `at_monotonic`) or `None`. A non-streaming
 request already in flight is not preempted. A metered stream already returned is
 stopped cooperatively at its next raw provider-chunk boundary: that chunk is
-pulled and discarded, previously observed usage is settled exactly once as a
-partial success, the provider stream is closed, and the original
-`RunStoppedError` remains terminal for later iterator calls.
+pulled and discarded, previously observed usage is reported exactly once as a
+partial success that keeps its funding (an
+[early stream close](#early-stream-close)), the provider stream is closed, and
+the original `RunStoppedError` remains terminal for later iterator calls.
 
 Provider errors (e.g., `openai.RateLimitError`) pass through unmodified.
 

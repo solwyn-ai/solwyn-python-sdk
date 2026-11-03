@@ -88,12 +88,16 @@ from solwyn.exceptions import (
     UntrackedSpendSurfaceError,
     UntranslatableRequestError,
 )
-from solwyn.providers._errors import Disposition, classify_exception
+from solwyn.providers._errors import Disposition, attempt_maybe_billed, classify_exception
 
 if TYPE_CHECKING:
     from solwyn._registry import ProviderRuntime
+    from solwyn.stream import _StreamSettlement
 
 logger = logging.getLogger(__name__)
+
+# Per thread, the ids of clients whose close() is settling open streams on it.
+_SETTLING_OPEN_STREAMS = threading.local()
 
 _CallMethod = TypeVar("_CallMethod", bound=Callable[..., Any])
 
@@ -1351,6 +1355,9 @@ class _OneGenerationGuard:
         self._lock = threading.Lock()
         self._in_flight = False
         self.succeeded = False
+        # Whether a send this guard let through may have been billed, by the
+        # same evidence as a dispatched attempt (attempt_maybe_billed).
+        self._maybe_billed = False
         self._model: str | None = None
         self._bound = 0
 
@@ -1381,10 +1388,21 @@ class _OneGenerationGuard:
                 self._refuse("bound_exceeded")
             self._in_flight = True
 
-    def _settle(self, response: object | None) -> None:
+    @property
+    def may_have_billed(self) -> bool:
+        """Whether a send has gone out that may have been billed (or still may be)."""
+        with self._lock:
+            return self._maybe_billed or self._in_flight
+
+    def _settle(self, response: object | None, exc: BaseException | None = None) -> None:
         status = getattr(response, "status_code", None)
+        if exc is not None:
+            billed = attempt_maybe_billed(exc)
+        else:
+            billed = not (isinstance(status, int) and (400 <= status < 500 or status == 529))
         with self._lock:
             self._in_flight = False
+            self._maybe_billed = self._maybe_billed or billed
             if isinstance(status, int) and 200 <= status < 300:
                 self.succeeded = True
 
@@ -1393,11 +1411,12 @@ class _OneGenerationGuard:
 
         def solwyn_one_generation_guard(request: Any, call_next: Callable[[Any], Any]) -> Any:
             self._claim(request)
-            response = None
             try:
                 response = call_next(request)
-            finally:
-                self._settle(response)
+            except BaseException as exc:
+                self._settle(None, exc)
+                raise
+            self._settle(response)
             return response
 
         return solwyn_one_generation_guard
@@ -1407,11 +1426,12 @@ class _OneGenerationGuard:
 
         async def solwyn_one_generation_guard(request: Any, call_next: Callable[[Any], Any]) -> Any:
             self._claim(request)
-            response = None
             try:
                 response = await call_next(request)
-            finally:
-                self._settle(response)
+            except BaseException as exc:
+                self._settle(None, exc)
+                raise
+            self._settle(response)
             return response
 
         return solwyn_one_generation_guard
@@ -1565,13 +1585,19 @@ class MediaSurfaceSpec:
         return self.modality == "text" and (token_details is None or token_details.is_estimated)
 
     def dispatched_spend_unknown(self, exc: BaseException, *, dispatched: bool) -> bool:
-        """Text leases retain authority for ambiguous dispatch errors and interrupts."""
+        """Receipt flag: an ambiguous dispatch error or interrupt on a text call."""
         if self.modality != "text" or not dispatched:
             return False
         return (
             not isinstance(exc, Exception)
             or classify_exception(exc) is Disposition.POST_SEND_AMBIGUOUS
         )
+
+    def dispatched_maybe_billed(self, exc: BaseException, *, dispatched: bool) -> bool:
+        """Funding: a dispatched text call may have been billed (attempt_maybe_billed)."""
+        if self.modality != "text" or not dispatched:
+            return False
+        return attempt_maybe_billed(exc)
 
 
 def _validate_decisions_kwargs(kwargs: Mapping[str, object]) -> None:
@@ -2343,6 +2369,50 @@ class _SolwynBase:
             return self._guard_resource(returned, path)
         raise RuntimeError(f"unsupported surface kind in runtime resolver: {rule.kind.value}")
 
+    def _track_open_stream(self, settlement: _StreamSettlement) -> None:
+        """Remember a returned stream so close() can settle it if still open."""
+        streams = getattr(self, "_solwyn_open_streams", None)
+        if streams is not None:
+            streams.add(settlement)
+
+    def _settle_open_streams(self) -> None:
+        """Settle every stream still open, once each, as an early close.
+
+        Called by close() before the reporter seals, so the receipts ship.
+        Settling claims each stream's single settlement, so a later close(),
+        natural end, error or GC of that stream does nothing. A stream the GC
+        worker, an early close or a stream error already claimed is waited for
+        until its settlement is enqueued.
+        Never raises.
+
+        A close() re-entered on a thread already in here (a log handler that
+        closes the client on the wait's timeout warning) returns at once: the
+        outer close is already settling these streams, and a nested pass
+        would restart every wait. This runs without awaiting, so the marker
+        never spans an async close's awaits.
+        """
+        streams = getattr(self, "_solwyn_open_streams", None)
+        if not streams:
+            return
+        active: set[int] | None = getattr(_SETTLING_OPEN_STREAMS, "clients", None)
+        if active is None:
+            active = _SETTLING_OPEN_STREAMS.clients = set()
+        if id(self) in active:
+            return
+        active.add(id(self))
+        try:
+            while True:
+                # A collection can retire an entry mid-snapshot; retry until stable.
+                try:
+                    open_streams = list(streams)
+                    break
+                except RuntimeError:
+                    continue
+            for settlement in open_streams:
+                settlement.settle_dropped(wait=True)
+        finally:
+            active.discard(id(self))
+
     def _reset_after_fork_in_child(self) -> None:
         """Replace locks and clear process-local velocity state in a child.
 
@@ -2355,6 +2425,13 @@ class _SolwynBase:
         self._solwyn_breaker_lock = threading.Lock()
         self._solwyn_guard_lock = threading.Lock()
         self._solwyn_velocity._reset_after_fork_in_child()
+        # A fork from inside a close's settle pass never unwinds it here: give
+        # the child a fresh marker so its own closes settle their streams.
+        _SETTLING_OPEN_STREAMS.clients = set()
+        # A stream settlement in flight in the parent can never signal the
+        # child's copy: mark it done here (the child does not settle it).
+        for settlement in list(getattr(self, "_solwyn_open_streams", None) or ()):
+            settlement._reset_after_fork_in_child()
 
     def _warn_velocity(self, run_id: str, flags: tuple[str, ...]) -> None:
         """Warn for newly flagged run rules, with monitor-owned rate limiting."""

@@ -5,7 +5,16 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
-## [Unreleased]
+## [0.10.2] - 2026-11-03
+
+Bug fixes: under `hard_deny`, a stream closed early or dropped, and a call that
+fails in an unrecognized way after it was sent, no longer give back budget they
+may have spent. Keeping that funding is now `hard_deny` only.
+
+Under `hard_deny`, a call whose usage can't be measured and may have been
+billed is recorded at its reserved amount, marked estimated, so the dashboard
+can show more than the provider billed (for example, a stream stopped early).
+This needs Solwyn API support that is live from 2026-11-02.
 
 ### Added
 
@@ -20,6 +29,78 @@ derived from git tags (hatch-vcs).
   helpers in their separate acknowledgment scope. The `beta.organization.*`
   classifications are unchanged. Coverage fingerprints are refreshed for this
   admission.
+
+### Fixed
+
+- **A stream closed before its end keeps its funding (`hard_deny`).** When you
+  broke out of a stream and closed it (or left its `with` block, or a run stop
+  ended it) before the provider sent its final usage report, Solwyn settled
+  the call with the usage it had seen so far, often zero tokens. The provider may still
+  bill the whole generation. On a run lease, the claim was refunded, so the
+  next call in the run could reuse tokens that were already spent. For
+  example, on a final 128-token lease, a stream that had reserved 101 tokens
+  was closed after two chunks, its claim went back to the lease, and the next
+  call ran with no budget check. On a per-call reservation, the confirm freed
+  the hold at the partial (or zero) usage. Now an early-closed stream confirms
+  its floor: the reservation's estimated input tokens and output bound (or the
+  observed usage, where larger), marked estimated, on its lease claim or
+  per-call reservation. The call still reports one success receipt with the
+  usage it saw (the input estimate, marked estimated, when it saw none). A stream that reaches its end settles
+  exactly as before. Applies to every provider, sync and async, including the
+  Responses `stream()` manager.
+- **A stream dropped without close() now settles.** A stream that was
+  garbage-collected without being closed never settled, so its funding went
+  back the same way. It now settles once as an early close when it is
+  collected. Closing the client also settles every stream it returned that is
+  still open, before the reporter shuts down.
+- **An unrecognized failure after dispatch keeps its funding.** Whether a
+  failed attempt gave its budget back was decided by its failover routing, so
+  any failure that stops the chain counted as unbilled. An HTTP 200 whose body
+  failed to parse (or any unknown exception) released a lease claim the
+  provider may have spent: on a final 128-token lease, the next call could
+  then run on the same tokens. Funding now follows billing evidence: after
+  dispatch, a failure keeps its bound unless it has a 4xx status (429
+  included), a 529, or a transport error that proves nothing was sent. This
+  also covers a connection error whose cause is not a pre-send failure and a
+  Responses `stream()` entry failure.
+- **Possibly billed spend is recorded durably (`hard_deny`).** Keeping a
+  possibly billed call's funding used to be local: a lease claim stayed spent
+  on the SDK's own ledger, and a per-call hold was left to expire. The Solwyn
+  API gave both back at lease surrender or hold expiry, so the cap could be
+  passed afterwards. Now every such path sends a floor confirm (the
+  reservation, or the observed usage where larger, marked estimated) beside
+  its usual event: early close, garbage collection and client close, a
+  mid-stream error, a stream wrap or Responses entry failure, a cancellation
+  without proof, an unknown failure after dispatch, a terminal ambiguous
+  failure, and a one-generation guard refusal after a send that may have been
+  billed. The API keeps it as a durable receipt, accepts it up to an hour
+  after the check, and counts the larger of the receipt and the call's events.
+  A possibly billed hop that fails over is recorded under its own call id, so
+  it counts beside the hop that served the call.
+- **A response whose body fails to decode no longer fails over.** A 200 whose
+  gzip or deflate body could not be decoded reached Solwyn as a connection
+  error and was failed over as if nothing had been sent, so the provider could
+  bill twice. A body that arrived but failed to decode (content decoding or
+  JSON parsing, at the top or anywhere in the cause chain) is now post-send
+  ambiguous for routing in every mode, like a read timeout. Under the default
+  `failover_idempotency="safe"` the call raises instead of failing over; under
+  `"always"` it may fail over, and under `hard_deny` the next hop is
+  re-admitted. A numeric status still decides routing first, and a failure
+  raised before the request was sent is unchanged. Same rule as the TS SDK.
+
+### Changed
+
+- **Keeping possibly billed funding is `hard_deny` only.** The rules above,
+  and the older ones that consume a lease claim after a 5xx, a read timeout, a
+  mid-stream error, a stream wrap or Responses entry failure, or a
+  cancellation after dispatch, now apply only to calls admitted under
+  `hard_deny`. They protect the cap, and `alert_only` has none to protect. A
+  kept per-call hold would also hold the counters that budget alerts read at
+  the full bound until it expires. On `alert_only`, those calls settle once
+  at their observed usage and release the claim, as before 0.10.1. Failover
+  routing and the `possibly_succeeded` receipt flag are the same in every
+  mode, and the local floor for a call whose usage is missing or unreadable
+  still applies in every mode. Matches the TS SDK.
 
 ## [0.10.1] - 2026-11-02
 

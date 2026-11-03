@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from solwyn import run
-from solwyn._types import BudgetMode, CallStatus
+from solwyn._types import CallStatus
 from solwyn.exceptions import (
     BudgetExceededError,
     ConfigurationError,
@@ -381,7 +381,7 @@ async def test_decisions_provider_error_does_not_dispatch_a_fallback(is_async):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize("fault", ["connect", "read", "interrupt", "preparation-interrupt"])
-async def test_decisions_dispatch_errors_retire_lease_claims_without_refunding_unknown_spend(
+async def test_decisions_dispatch_errors_release_lease_claims_on_alert_only(
     is_async, fault, monkeypatch
 ):
     interrupt = (
@@ -397,6 +397,9 @@ async def test_decisions_dispatch_errors_retire_lease_claims_without_refunding_u
         transport_error = interrupt
     expected_error = type(interrupt) if "interrupt" in fault else openai.APITimeoutError
     unknown_spend = fault in {"read", "interrupt"}
+    # decisions.create runs only on alert_only (hard_deny refuses it for lack of
+    # an output cap), where possibly billed funding is released like any other
+    # failed attempt (0.10.2). The receipt still flags the unknown spend.
     plane = FakeControlPlane(mode="alert_only", granted_tokens=35, final_grant=True)
     async with _wrapped(
         is_async, plane=plane, transport_error=transport_error, lease_output_bound_default=20
@@ -412,14 +415,7 @@ async def test_decisions_dispatch_errors_retire_lease_claims_without_refunding_u
                 await _create(wrapper, is_async, **REQUEST)
             state = wrapper._solwyn_budget._lease.state_for(run_id)
             assert state.reserved_tokens == 0
-            assert state.spent_tokens_since_report == (35 if unknown_spend else 0)
-            if unknown_spend:
-                # The follow-up denial is what proves the spent tokens stayed
-                # spent; denials raise only in hard_deny.
-                plane.mode = BudgetMode.HARD_DENY
-                plane.deny_next()
-                with pytest.raises(BudgetExceededError):
-                    await _create(wrapper, is_async, **REQUEST)
+            assert state.spent_tokens_since_report == 0
 
     assert len(seen) == (0 if fault == "preparation-interrupt" else 1)
     assert plane.confirms == []

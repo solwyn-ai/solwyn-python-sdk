@@ -227,6 +227,10 @@ class BudgetCheckResult(BaseModel):
     # bound the check priced. Every alert_only, fail-open or outage admission
     # keeps False and the request is sent exactly as the caller built it.
     hard_deny_admitted: bool = False
+    # The (estimated input tokens, output bound) this admission reserved, set
+    # by the client after the check. A hard_deny call whose usage is unknown
+    # confirms at least this much. Process-local, like lease_claim_token.
+    reserved_tokens: tuple[int, int] | None = Field(default=None, exclude=True, repr=False)
 
 
 @dataclass(slots=True)

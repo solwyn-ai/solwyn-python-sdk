@@ -9,6 +9,7 @@ and report metadata.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import threading
@@ -24,6 +25,10 @@ from solwyn._token_details import TokenDetails
 from solwyn.providers._accumulator import StreamUsageAccumulator
 
 logger = logging.getLogger(__name__)
+
+# How long client close waits for another thread's claimed settlement to
+# enqueue before it seals the reporter anyway (see settle_dropped).
+_CLOSE_WAIT_TIMEOUT_S = 5.0
 
 
 class _AbortHandleFinalizer:
@@ -46,6 +51,123 @@ class _AbortHandleFinalizer:
         self._finalizer.detach()
 
 
+class _StreamSettlement:
+    """Exactly-once settlement state a stream wrapper shares with its finalizer.
+
+    It never references the wrapper, so the GC finalizer that holds it cannot
+    keep the stream alive. ``claim`` is the single gate every settlement path
+    (natural end, close, error, GC, client close) passes through, so a race
+    between them settles once. ``settle_dropped`` settles a stream nobody
+    closed: it runs on the run-cleanup worker (GC) or on the closing thread
+    (client close), never raises, and fires ``on_dropped`` with whatever usage
+    was observed, as an early close.
+    """
+
+    def __init__(
+        self,
+        accumulator: StreamUsageAccumulator,
+        on_dropped: Callable[[TokenDetails, float], None] | None,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._settled = False
+        # Clear from a won claim until that path calls finish(), so client
+        # close can wait for a settlement still enqueueing before it seals.
+        self._idle = threading.Event()
+        self._idle.set()
+        # The thread that won the claim: a client close it runs reentrantly
+        # (from inside its own settlement) must not wait for itself.
+        self._owner: int | None = None
+        self._accumulator = accumulator
+        self._on_dropped = on_dropped
+        self._start_time = time.monotonic()
+
+    @property
+    def settled(self) -> bool:
+        with self._lock:
+            return self._settled
+
+    def claim(self) -> bool:
+        """Win settlement (True) or learn that another path already did."""
+        with self._lock:
+            if self._settled:
+                return False
+            self._settled = True
+            self._owner = threading.get_ident()
+            self._idle.clear()
+            return True
+
+    def finish(self) -> None:
+        """Mark the won settlement handed to the reporter (or given up)."""
+        self._idle.set()
+
+    def _reset_after_fork_in_child(self) -> None:
+        """A settlement in flight at fork is the parent's: never wait for it here."""
+        self._lock = threading.Lock()
+        self._idle = threading.Event()
+        self._idle.set()
+
+    def settle_dropped(self, *, wait: bool = False) -> None:
+        """Settle a stream that was dropped or outlived its client. Never raises.
+
+        ``wait`` (client close): when another path (early close, stream error,
+        GC) already claimed it, wait until that path has enqueued, so the
+        reporter seals after it. Every such segment is synchronous.
+        """
+        on_dropped = self._on_dropped
+        if on_dropped is None:
+            return
+        try:
+            if not self.claim():
+                # A close reentered from this thread's own settlement (a log
+                # handler, an eagerly started async close) would wait for
+                # itself: skip the wait. The reporter then seals before that
+                # settlement enqueues, so its pair is dropped and counted as
+                # closed_enqueue, which a client closed from inside its own
+                # settlement accepts.
+                # Another thread's claim is waited for, but only so long: that
+                # thread may itself be blocked on this one (two reentrant
+                # closes, each holding a log handler lock the other needs).
+                # Past the timeout the reporter seals, and a pair that
+                # thread enqueues afterwards is dropped and counted as
+                # closed_enqueue. That is accepted. The warning is logged only
+                # after the wait has ended, so it never blocks the wait.
+                if (
+                    wait
+                    and self._owner != threading.get_ident()
+                    and not self._idle.wait(_CLOSE_WAIT_TIMEOUT_S)
+                ):
+                    logger.warning("stream.close_wait_timed_out")
+                return
+            try:
+                elapsed_ms = (time.monotonic() - self._start_time) * 1000
+                try:
+                    observed = self._accumulator.finalize()
+                except Exception as exc:
+                    # Unreadable usage is still a dropped stream: settle its
+                    # funding on nothing observed rather than skip it.
+                    logger.warning("stream.dropped_finalize_failed: %s", type(exc).__name__)
+                    observed = TokenDetails()
+                on_dropped(observed, elapsed_ms)
+            finally:
+                self.finish()
+        except BaseException as exc:
+            # Structural only: the class name, never the exception text.
+            with contextlib.suppress(BaseException):
+                logger.warning("stream.dropped_settlement_failed: %s", type(exc).__name__)
+
+    def arm_gc(self, owner: object) -> weakref.finalize[..., object] | None:
+        """Settle once if ``owner`` is collected unsettled; None without a callback."""
+        if self._on_dropped is None:
+            return None
+        _prepare_run_cleanup()
+        # The finalizer only hands off: the collecting thread may hold SDK
+        # locks, so settlement runs later on the run-cleanup worker. Disabled at
+        # interpreter exit; the exit hook drains anything already handed off.
+        finalizer = weakref.finalize(owner, _defer_run_cleanup, self.settle_dropped)
+        finalizer.atexit = False
+        return finalizer
+
+
 class SyncStreamWrapper:
     """Wraps a synchronous streaming response for token accumulation.
 
@@ -55,7 +177,9 @@ class SyncStreamWrapper:
 
     If the caller breaks early or abandons the iterator, call close()
     explicitly or use the context manager (``with stream:``) to settle
-    the budget reservation with whatever usage data was observed.
+    the budget reservation. A stream closed before its natural end fires
+    ``on_abandon`` (default: on_complete) with whatever usage was observed,
+    so the client can tell an incomplete report from a finished one.
 
     Thread safety: _settle() and _settle_error() are protected by a
     threading.Lock so that concurrent calls (e.g. close() racing with
@@ -89,6 +213,8 @@ class SyncStreamWrapper:
         abort_release: Callable[[], None] | None = None,
         call_span: _CallSpan = _INACTIVE_CALL_SPAN,
         on_finalize_error: Callable[[BaseException], None] | None = None,
+        on_abandon: Callable[[TokenDetails, float], None] | None = None,
+        on_dropped: Callable[[TokenDetails, float], None] | None = None,
     ) -> None:
         self._call_span = call_span
         self._span_finalizer = call_span.finalize_on_gc(self)
@@ -99,6 +225,8 @@ class SyncStreamWrapper:
         self._on_complete = on_complete
         self._on_error = on_error
         self._on_finalize_error = on_finalize_error or on_error
+        self._on_abandon = on_abandon or on_complete
+        self._finished = False
         self._chunk_translator = chunk_translator
         self._abort_check = abort_check
         self._abort_finalizer = (
@@ -106,7 +234,8 @@ class SyncStreamWrapper:
         )
         self._abort_exc: Exception | None = None
         self._start_time = time.monotonic()
-        self._settled = False
+        self._settlement = _StreamSettlement(accumulator, on_dropped)
+        self._gc_finalizer = self._settlement.arm_gc(self)
         self._lock = threading.Lock()
 
     def _latched_abort(self) -> Exception | None:
@@ -119,12 +248,19 @@ class SyncStreamWrapper:
                 self._abort_exc = exc
             return self._abort_exc
 
-    def _settle(self) -> None:
-        """Fire on_complete exactly once with accumulated data."""
-        with self._lock:
-            if self._settled:
-                return
-            self._settled = True
+    def _settle(self, *, abandoned: bool = False) -> None:
+        """Fire on_complete exactly once with accumulated data.
+
+        ``abandoned`` (closed before the stream's natural end) fires on_abandon
+        instead: the usage the provider would have reported never arrived.
+        """
+        if not self._claim_settlement():
+            # Already settled, possibly by client close while this stream was
+            # still open: the stream's own end still retires its run-stop
+            # handle and span (both idempotent).
+            self._release_abort_handle()
+            self._call_span.end(error=self._abort_exc is not None, exception=self._abort_exc)
+            return
         failed = True
         try:
             self._release_abort_handle()
@@ -140,7 +276,7 @@ class SyncStreamWrapper:
                     logger.warning("stream.finalize_cleanup_failed: %s", type(cleanup_exc).__name__)
                 raise
             try:
-                self._on_complete(token_details, elapsed_ms)
+                (self._on_abandon if abandoned else self._on_complete)(token_details, elapsed_ms)
                 failed = False
             except Exception as cb_exc:
                 # Log only the CALLBACK failure's class name — never a traceback
@@ -151,16 +287,17 @@ class SyncStreamWrapper:
                     type(cb_exc).__name__,
                 )
         finally:
+            self._settlement.finish()
             self._call_span.end(
                 error=failed or self._abort_exc is not None, exception=self._abort_exc
             )
 
     def _settle_error(self, exc: BaseException) -> None:
         """Fire on_error exactly once. Mirrors _settle() for the error path."""
-        with self._lock:
-            if self._settled:
-                return
-            self._settled = True
+        if not self._claim_settlement():
+            self._release_abort_handle()
+            self._call_span.end(error=True, exception=exc)
+            return
         try:
             self._release_abort_handle()
             try:
@@ -173,7 +310,17 @@ class SyncStreamWrapper:
                     type(cb_exc).__name__,
                 )
         finally:
+            self._settlement.finish()
             self._call_span.end(error=True, exception=exc)
+
+    def _claim_settlement(self) -> bool:
+        """Win this stream's single settlement; disarm the GC finalizer."""
+        if not self._settlement.claim():
+            return False
+        finalizer = self._gc_finalizer
+        if finalizer is not None:
+            finalizer.detach()
+        return True
 
     def _release_abort_handle(self) -> None:
         finalizer = self._abort_finalizer
@@ -214,6 +361,7 @@ class SyncStreamWrapper:
                     return chunk
                 self._pending_chunks.extend(self._chunk_translator(chunk))
             except StopIteration:
+                self._finished = True
                 self._settle()
                 raise
             except Exception as exc:
@@ -241,7 +389,7 @@ class SyncStreamWrapper:
         Called automatically by __exit__ if the stream wasn't fully consumed.
         """
         with self._call_span.finishing() if self._call_span.active else _NOOP_CONTEXT:
-            self._settle()
+            self._settle(abandoned=not self._finished)
             if hasattr(self._stream, "close"):
                 self._stream.close()
 
@@ -312,6 +460,8 @@ class AsyncStreamWrapper:
         abort_release: Callable[[], None] | None = None,
         call_span: _CallSpan = _INACTIVE_CALL_SPAN,
         on_finalize_error: Callable[[BaseException], Awaitable[None]] | None = None,
+        on_abandon: Callable[[TokenDetails, float], Awaitable[None]] | None = None,
+        on_dropped: Callable[[TokenDetails, float], None] | None = None,
     ) -> None:
         self._call_span = call_span
         self._span_finalizer = call_span.finalize_on_gc(self)
@@ -322,6 +472,8 @@ class AsyncStreamWrapper:
         self._on_complete = on_complete
         self._on_error = on_error
         self._on_finalize_error = on_finalize_error or on_error
+        self._on_abandon = on_abandon or on_complete
+        self._finished = False
         self._chunk_translator = chunk_translator
         self._abort_check = abort_check
         self._abort_finalizer = (
@@ -329,15 +481,20 @@ class AsyncStreamWrapper:
         )
         self._abort_exc: Exception | None = None
         self._start_time = time.monotonic()
-        self._settled = False
+        self._settlement = _StreamSettlement(accumulator, on_dropped)
+        self._gc_finalizer = self._settlement.arm_gc(self)
         self._cleanup_complete = False
         self._close_lock = asyncio.Lock()
 
-    async def _settle(self) -> None:
-        """Fire on_complete exactly once with accumulated data."""
-        if self._settled:
+    async def _settle(self, *, abandoned: bool = False) -> None:
+        """Fire on_complete (on_abandon when ``abandoned``) exactly once."""
+        if not self._claim_settlement():
+            # Already settled, possibly by client close while this stream was
+            # still open: the stream's own end still retires its run-stop
+            # handle and span (both idempotent).
+            self._release_abort_handle()
+            self._call_span.end(error=self._abort_exc is not None, exception=self._abort_exc)
             return
-        self._settled = True
         failed = True
         try:
             self._release_abort_handle()
@@ -351,7 +508,8 @@ class AsyncStreamWrapper:
                     logger.warning("stream.finalize_cleanup_failed: %s", type(cleanup_exc).__name__)
                 raise
             try:
-                await self._on_complete(token_details, elapsed_ms)
+                callback = self._on_abandon if abandoned else self._on_complete
+                await callback(token_details, elapsed_ms)
                 failed = False
             except Exception as cb_exc:
                 # Structural-only log of the CALLBACK failure; never a traceback (fix [D]).
@@ -360,15 +518,17 @@ class AsyncStreamWrapper:
                     type(cb_exc).__name__,
                 )
         finally:
+            self._settlement.finish()
             self._call_span.end(
                 error=failed or self._abort_exc is not None, exception=self._abort_exc
             )
 
     async def _settle_error(self, exc: BaseException) -> None:
         """Fire on_error exactly once. Mirrors _settle() for the error path."""
-        if self._settled:
+        if not self._claim_settlement():
+            self._release_abort_handle()
+            self._call_span.end(error=True, exception=exc)
             return
-        self._settled = True
         try:
             self._release_abort_handle()
             try:
@@ -381,7 +541,17 @@ class AsyncStreamWrapper:
                     type(cb_exc).__name__,
                 )
         finally:
+            self._settlement.finish()
             self._call_span.end(error=True, exception=exc)
+
+    def _claim_settlement(self) -> bool:
+        """Win this stream's single settlement; disarm the GC finalizer."""
+        if not self._settlement.claim():
+            return False
+        finalizer = self._gc_finalizer
+        if finalizer is not None:
+            finalizer.detach()
+        return True
 
     def _release_abort_handle(self) -> None:
         finalizer = self._abort_finalizer
@@ -423,6 +593,7 @@ class AsyncStreamWrapper:
                     return chunk
                 self._pending_chunks.extend(self._chunk_translator(chunk))
             except StopAsyncIteration:
+                self._finished = True
                 await self._settle()
                 raise
             except BaseException as exc:
@@ -450,7 +621,7 @@ class AsyncStreamWrapper:
             async with self._close_lock:
                 if self._cleanup_complete:
                     return
-                await self._settle()
+                await self._settle(abandoned=not self._finished)
                 if hasattr(self._stream, "aclose"):
                     await self._stream.aclose()
                 elif hasattr(self._stream, "close"):
@@ -731,7 +902,8 @@ class _SyncResponsesStreamManagerWrapper:
                         and not isinstance(args[1], Exception)
                     ):
                         self._call_span.end(error=True, exception=args[1])
-                    self._wrapped_stream()._settle()
+                    stream = self._wrapped_stream()
+                    stream._settle(abandoned=not stream._finished)
                 else:
                     self._release_before_entry()
             except BaseException as exc:
@@ -927,7 +1099,8 @@ class _AsyncResponsesStreamManagerWrapper:
                         ):
                             await self._wrapped_stream()._settle_error(args[1])
                         else:
-                            await self._wrapped_stream()._settle()
+                            stream = self._wrapped_stream()
+                            await stream._settle(abandoned=not stream._finished)
                     else:
                         await self._release_before_entry()
                 except BaseException as exc:

@@ -858,12 +858,13 @@ async def test_stream_bookkeeping_failure_ends_span(spans, async_mode, failure):
                 result = await result
         if failure != "wrap":
             if failure == "callback":
-                result._on_complete = (
+                # close() before the stream's end settles through on_abandon.
+                result._on_abandon = (
                     AsyncMock(side_effect=GeneratorExit)
                     if async_mode
                     else MagicMock(spec=[], side_effect=GeneratorExit)
                 )
-                target, name, exception = result, "_on_complete", GeneratorExit
+                target, name, exception = result, "_on_abandon", GeneratorExit
             else:
                 target, name, exception = result._accumulator, "finalize", ValueError
             with patch.object(target, name, side_effect=exception), pytest.raises(exception):

@@ -291,7 +291,11 @@ async def test_dispatch_abort_retires_draw_without_refunding_unknown_spend(
     assert not event.is_provider_fallback
     assert event.lease_id == _granted_lease_id(plane)
     assert event.input_tokens == event.output_tokens == 0
-    assert all(confirm.call_id != call_id for confirm in plane.confirms)
+    # Under hard_deny the unknown (ambiguous) spend is confirmed at its floor,
+    # marked estimated, under the attempt's own call id and lease (0.10.2).
+    floors = [confirm for confirm in plane.confirms if confirm.call_id == call_id]
+    assert len(floors) == int(ambiguous)
+    assert all(f.token_details.is_estimated and f.lease_id == event.lease_id for f in floors)
     assert len(plane.ingested) == 2
     assert len(plane.lease_surrenders) == 1
     assert plane.lease_surrenders[0].spent_tokens == (20 if ambiguous else 15)
@@ -364,10 +368,17 @@ async def test_failed_over_ambiguous_hop_pins_the_bound_for_every_later_exit(
     # receipt, and a served hop confirms its MEASURED usage, not the bound.
     errors = [event for event in plane.ingested if event.status == "error"]
     assert errors and all(event.possibly_succeeded is None for event in errors)
+    # Under hard_deny each possibly billed (503) hop also confirms its floor,
+    # under its own error event's call id (0.10.2); a 429 or 400 hop does not.
+    floors = [c for c in plane.confirms if c.token_details.is_estimated]
+    measured = [c for c in plane.confirms if not c.token_details.is_estimated]
+    assert len(floors) == (primary_error is _Status503) + (fallback_error is _Status503)
+    assert {floor.call_id for floor in floors} <= {event.call_id for event in errors}
     if fallback_error is None:
-        assert _only_confirm(plane).token_details.total_tokens == 15
+        [served] = measured
+        assert served.token_details.total_tokens == 15
     else:
-        assert plane.confirms == []
+        assert measured == []
     assert [s.spent_tokens for s in plane.lease_surrenders] == [spent]
 
 
@@ -540,7 +551,9 @@ class TestSyncLeaseId:
             wrapped.close()
 
         lease_id = _granted_lease_id(plane)
-        assert plane.confirms == []
+        # The possibly billed abort confirms its floor on its lease (0.10.2).
+        [floor] = plane.confirms
+        assert (floor.lease_id, floor.token_details.is_estimated) == (lease_id, True)
         assert len(plane.ingested) == 1
         event = plane.ingested[0]
         assert event.status == "error"
@@ -746,7 +759,10 @@ class TestAsyncLeaseId:
         finally:
             await wrapped.close()
 
-        assert plane.confirms == []
+        # The possibly billed abort confirms its floor on its lease (0.10.2).
+        [floor] = plane.confirms
+        assert floor.token_details.is_estimated is True
+        assert floor.lease_id == _granted_lease_id(plane)
         assert len(plane.ingested) == 1
         event = plane.ingested[0]
         assert event.possibly_succeeded is True

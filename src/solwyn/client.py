@@ -28,6 +28,7 @@ import math
 import sys
 import time
 import uuid
+import weakref
 from collections.abc import (
     AsyncIterator,
     Awaitable,
@@ -140,12 +141,18 @@ from solwyn.exceptions import (
     UntranslatableRequestError,
 )
 from solwyn.providers import _translation
-from solwyn.providers._errors import Disposition, classify_exception, retry_after_seconds
+from solwyn.providers._errors import (
+    Disposition,
+    attempt_maybe_billed,
+    classify_exception,
+    retry_after_seconds,
+)
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 from solwyn.stream import (
     AsyncStreamWrapper,
     SyncStreamWrapper,
     _AsyncResponsesStreamManagerWrapper,
+    _StreamSettlement,
     _SyncResponsesStreamManagerWrapper,
 )
 
@@ -765,6 +772,33 @@ def _safe_extract_region(runtime: ProviderRuntime) -> str | None:
         return None
 
 
+def _floor_usage(budget: Any, observed: TokenDetails) -> TokenDetails:
+    """The usage a hard_deny attempt whose real usage is unknown confirms.
+
+    The attempt's reservation (its estimated input tokens and output bound),
+    or the observed usage where that is larger, marked estimated so core keeps
+    it as a durable receipt and nets it against the attempt's own event.
+    """
+    reserved_input, reserved_output = getattr(budget, "reserved_tokens", None) or (0, 0)
+    return TokenDetails(
+        input_tokens=min(max(reserved_input, observed.input_tokens), ORDINARY_TOKEN_COUNT_MAX),
+        output_tokens=min(max(reserved_output, observed.output_tokens), ORDINARY_TOKEN_COUNT_MAX),
+        is_estimated=True,
+    )
+
+
+def _hard_deny_funding(budget: Any) -> bool:
+    """Whether possibly billed funding is kept (consumed at its bound) for ``budget``.
+
+    Keeping funding because usage is unknown or the call may have been billed
+    applies only to a ``hard_deny`` admission. Elsewhere it bounds nothing, and
+    the claim is released as before. Routing and the ``possibly_succeeded``
+    receipt flag do not depend on the mode. (The older local floor for missing
+    or malformed usage on a completed call applies in every mode.)
+    """
+    return getattr(budget, "hard_deny_admitted", False) is True
+
+
 def _settle_stream_failure(
     owner: Any,
     ctx: _AttemptContext,
@@ -782,40 +816,69 @@ def _settle_stream_failure(
     possibly_succeeded: bool | None,
     failover_error_class: str | None = None,
     admission: CircuitBreakerAdmission | None = None,
+    maybe_billed: bool | None = None,
+    observed: TokenDetails | None = None,
 ) -> None:
-    """Reconcile a terminal attempt without usage: health, local debit, receipt."""
+    """Reconcile a terminal attempt without usage: health, local debit, receipt.
+
+    ``possibly_succeeded`` is the receipt flag. ``maybe_billed`` decides the
+    funding and defaults to the flag. Under hard_deny a possibly billed attempt
+    confirms its floor (at least ``observed``, when given) beside its receipt.
+    """
     is_provider_fallback = ctx.is_provider_fallback
     if record_breaker_failure:
         owner._get_circuit_breaker(provider).record_failure()
     elif admission is not None:
         owner._get_circuit_breaker(provider).release_probe(admission)
-    if possibly_succeeded:
-        owner._solwyn_budget.abandon_reservation(
-            call_id, lease_claim_token=_lease_claim_token(budget)
-        )
-    else:
-        owner._solwyn_budget.release_reservation(
-            call_id, lease_claim_token=_lease_claim_token(budget)
-        )
-    owner._solwyn_reporter.report(
-        owner._build_error_event(
-            model=ctx.model,
-            provider=provider,
-            latency_ms=ctx.elapsed_ms(),
-            is_model_fallback=is_model_fallback,
-            is_provider_fallback=is_provider_fallback,
-            requested_provider=primary.entry.provider if is_provider_fallback else None,
-            requested_model=requested_model if is_provider_fallback else None,
-            failover_error_class=failover_error_class,
-            attempt_index=ctx.attempt_index,
-            call_id=call_id,
-            possibly_succeeded=possibly_succeeded,
-            agent_run=agent_run,
-            trace=trace,
-            provider_region=provider_region,
-            lease_id=_settlement_keys(budget)[1],
-        )
+    if maybe_billed is None:
+        maybe_billed = bool(possibly_succeeded)
+    keep = maybe_billed and _hard_deny_funding(budget)
+    reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
+    event = owner._build_error_event(
+        model=ctx.model,
+        provider=provider,
+        latency_ms=ctx.elapsed_ms(),
+        is_model_fallback=is_model_fallback,
+        is_provider_fallback=is_provider_fallback,
+        requested_provider=primary.entry.provider if is_provider_fallback else None,
+        requested_model=requested_model if is_provider_fallback else None,
+        failover_error_class=failover_error_class,
+        attempt_index=ctx.attempt_index,
+        call_id=call_id,
+        possibly_succeeded=possibly_succeeded,
+        agent_run=agent_run,
+        trace=trace,
+        provider_region=provider_region,
+        lease_id=lease_id,
     )
+    confirm = None
+    if keep and (reservation_id or lease_id):
+        # Durable: core keeps an estimated confirm as a receipt and nets it
+        # against this receipt event per call id. Locally the claim settles
+        # at no less than its bound.
+        try:
+            confirm = owner._solwyn_budget.build_confirm_request(
+                reservation_id=reservation_id,
+                lease_id=lease_id,
+                lease_claim_token=lease_claim_token,
+                model=ctx.model,
+                token_details=_floor_usage(budget, observed or TokenDetails()),
+                provider=provider,
+                is_provider_fallback=is_provider_fallback,
+                call_id=call_id,
+                provider_region=provider_region,
+                usage_unmeasured=True,
+            )
+        except Exception as confirm_exc:
+            logger.warning("settlement.floor_confirm_failed: %s", type(confirm_exc).__name__)
+    if confirm is not None:
+        owner._solwyn_reporter.report_settlement(confirm, event)
+        return
+    if keep:
+        owner._solwyn_budget.abandon_reservation(call_id, lease_claim_token=lease_claim_token)
+    else:
+        owner._solwyn_budget.release_reservation(call_id, lease_claim_token=lease_claim_token)
+    owner._solwyn_reporter.report(event)
 
 
 def _settle_stream_wrap_failure(
@@ -875,6 +938,7 @@ def _make_stream_error_handler(
     trace: _TraceSnapshot | None = None,
     admission: CircuitBreakerAdmission | None = None,
     provider_failure: bool = True,
+    observed_usage: Callable[[], TokenDetails] | None = None,
 ) -> Callable[[BaseException], None]:
     """Build the established stream-error reconciliation callback once.
 
@@ -886,6 +950,12 @@ def _make_stream_error_handler(
     provider_region = _safe_extract_region(runtime)
 
     def on_error(_exc: BaseException) -> None:
+        observed = None
+        if observed_usage is not None:
+            try:
+                observed = observed_usage()
+            except Exception as usage_exc:
+                logger.warning("stream.observed_usage_failed: %s", type(usage_exc).__name__)
         _settle_stream_failure(
             owner,
             ctx,
@@ -908,6 +978,7 @@ def _make_stream_error_handler(
                 else None
             ),
             admission=admission,
+            observed=observed,
         )
 
     return on_error
@@ -948,6 +1019,10 @@ def _make_stream_entry_error_handler(
             if isinstance(exc, Exception)
             else Disposition.POST_SEND_AMBIGUOUS
         )
+        # The manager sent its request in __enter__: its funding is possibly
+        # billed unless the failure proves otherwise (a 4xx such as a 400/429
+        # is a known rejection). The receipt flag follows the routing.
+        maybe_billed = attempt_maybe_billed(exc)
         _settle_stream_failure(
             owner,
             ctx,
@@ -964,6 +1039,7 @@ def _make_stream_entry_error_handler(
             possibly_succeeded=True if disp is Disposition.POST_SEND_AMBIGUOUS else None,
             failover_error_class=type(exc).__name__,
             admission=admission,
+            maybe_billed=maybe_billed,
         )
 
     return on_entry_error
@@ -1010,6 +1086,7 @@ def _make_async_stream_error_handler(
     trace: _TraceSnapshot | None = None,
     admission: CircuitBreakerAdmission | None = None,
     provider_failure: bool = True,
+    observed_usage: Callable[[], TokenDetails] | None = None,
 ) -> Callable[[BaseException], Awaitable[None]]:
     sync_handler = _make_stream_error_handler(
         owner,
@@ -1024,6 +1101,7 @@ def _make_async_stream_error_handler(
         trace=trace,
         admission=admission,
         provider_failure=provider_failure,
+        observed_usage=observed_usage,
     )
 
     async def on_error(exc: BaseException) -> None:
@@ -2123,6 +2201,9 @@ class Solwyn(_SolwynBase):
             lease_output_bound_default=config.lease_output_bound_default,
         )
 
+        # Streams this client returned that may still be open, held weakly
+        # (each entry is the stream's settlement cell, not the stream).
+        self._solwyn_open_streams: weakref.WeakSet[_StreamSettlement] = weakref.WeakSet()
         # Metadata reporter
         self._solwyn_reporter = MetadataReporter(
             config.api_url,
@@ -2438,6 +2519,7 @@ class Solwyn(_SolwynBase):
             estimated_output_bound=bound,
             per_call_only=True,
         )
+        hop_budget.reserved_tokens = (hop_input, bound)
         if not hop_budget.allowed:
             # Attribution follows the hop's relation to the original primary,
             # so a return to the primary after a cost-routed hop is no fallback.
@@ -2665,6 +2747,7 @@ class Solwyn(_SolwynBase):
                 call_id=call_id,
                 estimated_output_bound=estimated_output_bound,
             )
+        budget.reserved_tokens = (est_in, estimated_output_bound or 0)
         _call_span.budget(budget)
         _postcheck_run_control(
             self,
@@ -2780,8 +2863,12 @@ class Solwyn(_SolwynBase):
         except BaseException as exc:
             if not isinstance(exc, Exception) and spec.modality != "text":
                 raise
+            # The receipt flag keeps its routing-derived meaning; funding
+            # follows billing evidence (attempt_maybe_billed), under hard_deny.
             possibly_succeeded = spec.dispatched_spend_unknown(exc, dispatched=dispatched)
-            if possibly_succeeded:
+            if spec.dispatched_maybe_billed(exc, dispatched=dispatched) and _hard_deny_funding(
+                budget
+            ):
                 self._solwyn_budget.abandon_reservation(
                     call_id, lease_claim_token=_lease_claim_token(budget)
                 )
@@ -3081,6 +3168,7 @@ class Solwyn(_SolwynBase):
                     call_id=call_id,
                     estimated_output_bound=estimated_output_bound,
                 )
+        budget.reserved_tokens = (est_in, estimated_output_bound or 0)
         _call_span.budget(budget)
         _postcheck_run_control(
             self,
@@ -3270,6 +3358,8 @@ class Solwyn(_SolwynBase):
                     )
                     admitted_identity = (provider, hop_model)
                     admitted_spend_unknown = False
+                    # The new admission funds its own single generation.
+                    generation_guard = None
 
                 # Build native kwargs for this hop. A cross-provider hop runs the
                 # translation contract and may RAISE an Untranslatable* error here,
@@ -3414,10 +3504,31 @@ class Solwyn(_SolwynBase):
                         # health verdict), but the first generation's usage is
                         # unknown, so the reservation keeps its bound.
                         loop_refused = isinstance(exc, OutputBoundUnenforceableError)
-                        disp = Disposition.FAIL_FAST if loop_refused else classify_exception(exc)
-                        # In particular, a rejected 429 followed by Retry-After
-                        # sleep holds the probe but has no paid work to refund.
-                        usage_unknown = disp is Disposition.POST_SEND_AMBIGUOUS
+                        disp = (
+                            Disposition.FAIL_FAST
+                            if loop_refused
+                            else classify_exception(exc, dispatched=usage_unknown)
+                        )
+                        # A guard refusal is billed only when a send it let
+                        # through may have been (a refusal before any send,
+                        # such as a middleware rewrite, gives the hold back).
+                        loop_billed = (
+                            loop_refused
+                            and generation_guard is not None
+                            and generation_guard.may_have_billed
+                        )
+                        # Funding follows billing evidence, not routing: once
+                        # dispatched, the attempt is possibly billed unless a 4xx
+                        # status or a proven pre-send transport failure says it
+                        # was not (an unparseable 200 stops the chain yet may be
+                        # paid). In particular, a rejected 429 followed by
+                        # Retry-After sleep holds the probe but has no paid work
+                        # to refund.
+                        usage_unknown = (
+                            loop_billed
+                            if loop_refused
+                            else usage_unknown and attempt_maybe_billed(exc)
+                        )
                         # Fix [A]: the PRIMARY was attempted and raised in this walk
                         # -> a later cross-provider success is a REACTIVE failover
                         # (PRIMARY_ERROR), not a proactive breaker-open reroute.
@@ -3460,61 +3571,101 @@ class Solwyn(_SolwynBase):
                         # A correctly-not-failed-over post-send-ambiguous abort
                         # emits an ERROR event with possibly_succeeded=True so the Cloud API
                         # can reconcile the (possibly-landed, never-confirmed) reservation.
-                        possibly_succeeded = loop_refused or (
+                        possibly_succeeded = loop_billed or (
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
+                        floored = usage_unknown and _hard_deny_funding(budget)
+                        # A possibly billed hop the walk advances past settles
+                        # under its own call id: core nets max(receipt, events)
+                        # per call id, so sharing the served hop's id would
+                        # hide this hop's floor behind that hop's spend.
+                        hop_call_id = (
+                            str(uuid.uuid4())
+                            if floored
+                            and disp is not Disposition.FAIL_FAST
+                            and (disp is Disposition.FAILOVER or allow_ambiguous_failover)
+                            else call_id
+                        )
                         try:
-                            self._solwyn_reporter.report(
-                                self._build_error_event(
-                                    model=served_model,
-                                    provider=provider,
-                                    latency_ms=ctx.elapsed_ms(),
-                                    is_model_fallback=is_model_fallback,
-                                    is_provider_fallback=is_provider_fallback,
-                                    requested_provider=(
-                                        primary.entry.provider if is_provider_fallback else None
-                                    ),
-                                    requested_model=requested_model
-                                    if is_provider_fallback
-                                    else None,
-                                    failover_error_class=type(exc).__name__,
-                                    attempt_index=chain_index,
-                                    call_id=call_id,
-                                    possibly_succeeded=True if possibly_succeeded else None,
-                                    agent_run=agent_run,
-                                    trace=trace,
-                                    provider_region=_safe_extract_region(rt),
-                                    lease_id=_settlement_keys(budget)[1],
-                                )
+                            hop_region = _safe_extract_region(rt)
+                            reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
+                            event = self._build_error_event(
+                                model=served_model,
+                                provider=provider,
+                                latency_ms=ctx.elapsed_ms(),
+                                is_model_fallback=is_model_fallback,
+                                is_provider_fallback=is_provider_fallback,
+                                requested_provider=(
+                                    primary.entry.provider if is_provider_fallback else None
+                                ),
+                                requested_model=requested_model if is_provider_fallback else None,
+                                failover_error_class=type(exc).__name__,
+                                attempt_index=chain_index,
+                                call_id=hop_call_id,
+                                possibly_succeeded=True if possibly_succeeded else None,
+                                agent_run=agent_run,
+                                trace=trace,
+                                provider_region=hop_region,
+                                lease_id=lease_id,
                             )
+                            if floored and (reservation_id or lease_id):
+                                # A possibly billed attempt under hard_deny,
+                                # whether it ends the call or the walk advances:
+                                # confirm its floor beside the receipt so core
+                                # keeps it durably (netted per call id).
+                                floor_confirm = self._solwyn_budget.build_confirm_request(
+                                    reservation_id=reservation_id,
+                                    lease_id=lease_id,
+                                    lease_claim_token=lease_claim_token,
+                                    model=served_model,
+                                    token_details=_floor_usage(budget, TokenDetails()),
+                                    provider=provider,
+                                    is_provider_fallback=is_provider_fallback,
+                                    call_id=hop_call_id,
+                                    provider_region=hop_region,
+                                    usage_unmeasured=True,
+                                )
+                                self._solwyn_reporter.report_settlement(floor_confirm, event)
+                            else:
+                                self._solwyn_reporter.report(event)
                         except Exception as receipt_exc:
                             # The receipt is best-effort: losing it must never mask the
                             # provider's error or skip the reservation's terminal step.
                             logger.warning(
                                 "call.error_receipt_failed: %s", type(receipt_exc).__name__
                             )
-                        if disp is Disposition.FAIL_FAST and loop_refused:
-                            self._solwyn_budget.abandon_reservation(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
-                            raise
                         if disp is Disposition.FAIL_FAST:
-                            self._solwyn_budget.release_reservation(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
-                            raise  # 4xx/404/refusal — do NOT advance the chain
+                            # Stop the chain. A possibly billed attempt (refused
+                            # loop, unparseable or unknown failure after dispatch)
+                            # keeps its bound; a proven rejection gives it back.
+                            if usage_unknown and _hard_deny_funding(budget):
+                                self._solwyn_budget.abandon_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            else:
+                                self._solwyn_budget.release_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            raise  # do NOT advance the chain
                         if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
                             # The receipt lets the server reconcile unknown usage;
-                            # local lease authority must also keep its spent bound.
-                            self._solwyn_budget.abandon_reservation(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
+                            # under hard_deny the lease also keeps its spent bound.
+                            if _hard_deny_funding(budget):
+                                self._solwyn_budget.abandon_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            else:
+                                self._solwyn_budget.release_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
                             raise  # re-raise ORIGINAL exception (drop-in contract)
-                        if disp is Disposition.POST_SEND_AMBIGUOUS:
-                            # Failing over does not un-send this hop. The call keeps
+                        if usage_unknown and _hard_deny_funding(budget):
+                            # Failing over does not un-send this hop (ambiguous
+                            # failover, or a possibly billed FAILOVER such as 529). The call keeps
                             # its reservation, pinned: no later settlement, refusal,
                             # or chain exhaustion may refund the bound.
                             if (
@@ -3557,19 +3708,6 @@ class Solwyn(_SolwynBase):
                 # runs ONLY on the non-streaming path, AFTER the streaming early return.
                 if is_streaming:
                     if _surface == "responses" and _responses_leaf == "stream":
-                        on_error = _make_stream_error_handler(
-                            self,
-                            rt,
-                            ctx,
-                            budget,
-                            primary,
-                            requested_model=requested_model,
-                            is_model_fallback=is_model_fallback,
-                            call_id=call_id,
-                            agent_run=agent_run,
-                            trace=trace,
-                            admission=admission,
-                        )
                         # The manager sends its request in __enter__, AFTER this
                         # candidate walk: its failure needs the walk's classification,
                         # not the established stream's unconditional verdict.
@@ -3605,7 +3743,6 @@ class Solwyn(_SolwynBase):
                                 estimated_input_tokens=est_in,
                                 estimate_empty_usage=True,
                                 velocity_flags=velocity_flags,
-                                on_error=on_error,
                                 admission=admission,
                                 termination_handle=termination_handle,
                             ),
@@ -3880,9 +4017,21 @@ class Solwyn(_SolwynBase):
         # providers without regional pricing). Captured once, closed over.
         provider_region = _safe_extract_region(runtime)
 
-        def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
+        def on_complete(
+            token_details: TokenDetails,
+            _elapsed_ms: float,
+            *,
+            abandoned: bool = False,
+            record_latency: bool = True,
+        ) -> None:
+            if abandoned and not _hard_deny_funding(budget):
+                # The early-close rule applies under hard_deny only (as in the
+                # TS SDK). Elsewhere it bounds nothing, and a per-call hold kept
+                # until its TTL would inflate the counters that budget alerts
+                # read, so an early-closed stream settles on its observed usage.
+                abandoned = False
             usage_unmeasured = False
-            if estimate_empty_usage:
+            if estimate_empty_usage or abandoned:
                 if token_details.input_tokens == 0 and token_details.output_tokens == 0:
                     token_details = TokenDetails(
                         input_tokens=estimated_input_tokens,
@@ -3895,22 +4044,36 @@ class Solwyn(_SolwynBase):
                     # response's output: the lease must hold its reserved bound
                     # rather than re-lend spent output allowance.
                     usage_unmeasured = True
+            if abandoned:
+                # Closed before its natural end (caller break or close, run
+                # stop): the provider may have billed the whole generation, but
+                # its usage report never arrived. The observed tokens are only a
+                # floor, so a lease claim holds its reserved bound.
+                usage_unmeasured = True
             self._get_circuit_breaker(provider).record_success()
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
-            self.record_latency(provider, ctx.elapsed_ms())
+            # A dropped stream (GC, client close) skips it: that time measures
+            # how long the caller held the stream, not the provider.
+            if record_latency:
+                self.record_latency(provider, ctx.elapsed_ms())
             # Extracted ONCE — confirm and metadata for one call_id must carry
             # the same tier or the enforcement counter and durable cost diverge.
             service_tier = accumulator.get_service_tier()
             confirm = None
             reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
             if reservation_id or lease_id:
+                # Abandoned under hard_deny, the confirm carries the floor (the
+                # reservation, or more if more was observed) so core keeps it
+                # durably; the event keeps the observed usage.
                 confirm = self._solwyn_budget.build_confirm_request(
                     reservation_id=reservation_id,
                     lease_id=lease_id,
                     lease_claim_token=lease_claim_token,
                     model=served_model,
-                    token_details=token_details,
+                    token_details=(
+                        _floor_usage(budget, token_details) if abandoned else token_details
+                    ),
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
@@ -3971,6 +4134,7 @@ class Solwyn(_SolwynBase):
                 agent_run=agent_run,
                 trace=trace,
                 admission=admission,
+                observed_usage=accumulator.finalize,
             )
 
         # Cross-DIALECT hop: reshape each served chunk back to the caller's
@@ -3988,6 +4152,7 @@ class Solwyn(_SolwynBase):
         # The SERVED adapter owns its stream nesting (Bedrock wraps the INNER
         # event stream); the PRIMARY adapter owns the caller-dialect result
         # shape (Bedrock callers get the boto3 contract dict back).
+        wrapper: SyncStreamWrapper | None = None
         try:
             source = runtime.adapter.unwrap_stream_source(response)
             wrapper = SyncStreamWrapper(
@@ -3995,6 +4160,8 @@ class Solwyn(_SolwynBase):
                 accumulator,
                 on_complete,
                 on_error,
+                on_abandon=functools.partial(on_complete, abandoned=True),
+                on_dropped=functools.partial(on_complete, abandoned=True, record_latency=False),
                 call_span=call_span,
                 chunk_translator=chunk_translator,
                 abort_check=(
@@ -4020,14 +4187,23 @@ class Solwyn(_SolwynBase):
                     provider_failure=False,
                 ),
             )
-            return primary.adapter.wrap_stream_result(wrapper, response)
+            result = primary.adapter.wrap_stream_result(wrapper, response)
+            self._track_open_stream(wrapper._settlement)
+            return result
         except BaseException:
+            # The caller never receives this wrapper; the wrap failure is
+            # reconciled by the walk, so its GC finalizer must not settle again.
+            if wrapper is not None and wrapper._claim_settlement():
+                wrapper._settlement.finish()
             if termination_handle is not None:
                 termination_handle.release()
             raise
 
     def close(self) -> None:
         """Shut down Solwyn state, then close the wrapped provider client."""
+        # Streams still open settle first, as early closes, so their receipts
+        # reach the reporter before it seals.
+        self._settle_open_streams()
         self._solwyn_reporter.close()
         self._solwyn_budget.close()
         provider_close = getattr(self._solwyn_client, "close", None)
@@ -4211,6 +4387,8 @@ class AsyncSolwyn(_SolwynBase):
             lease_output_bound_default=config.lease_output_bound_default,
         )
 
+        # Open streams, held weakly; see the sync constructor.
+        self._solwyn_open_streams: weakref.WeakSet[_StreamSettlement] = weakref.WeakSet()
         self._solwyn_reporter = AsyncMetadataReporter(
             config.api_url,
             config.api_key,
@@ -4480,6 +4658,7 @@ class AsyncSolwyn(_SolwynBase):
             estimated_output_bound=bound,
             per_call_only=True,
         )
+        hop_budget.reserved_tokens = (hop_input, bound)
         if not hop_budget.allowed:
             # Attribution follows the hop's relation to the original primary,
             # so a return to the primary after a cost-routed hop is no fallback.
@@ -4686,6 +4865,7 @@ class AsyncSolwyn(_SolwynBase):
                 call_id=call_id,
                 estimated_output_bound=estimated_output_bound,
             )
+        budget.reserved_tokens = (est_in, estimated_output_bound or 0)
         _call_span.budget(budget)
         _postcheck_run_control(
             self,
@@ -4795,8 +4975,12 @@ class AsyncSolwyn(_SolwynBase):
         except BaseException as exc:
             if not isinstance(exc, Exception) and spec.modality != "text":
                 raise
+            # The receipt flag keeps its routing-derived meaning; funding
+            # follows billing evidence (attempt_maybe_billed), under hard_deny.
             possibly_succeeded = spec.dispatched_spend_unknown(exc, dispatched=dispatched)
-            if possibly_succeeded:
+            if spec.dispatched_maybe_billed(exc, dispatched=dispatched) and _hard_deny_funding(
+                budget
+            ):
                 self._solwyn_budget.abandon_reservation(
                     call_id, lease_claim_token=_lease_claim_token(budget)
                 )
@@ -5058,6 +5242,7 @@ class AsyncSolwyn(_SolwynBase):
                     call_id=call_id,
                     estimated_output_bound=estimated_output_bound,
                 )
+        budget.reserved_tokens = (est_in, estimated_output_bound or 0)
         _call_span.budget(budget)
         _postcheck_run_control(
             self,
@@ -5241,6 +5426,8 @@ class AsyncSolwyn(_SolwynBase):
                     )
                     admitted_identity = (provider, hop_model)
                     admitted_spend_unknown = False
+                    # The new admission funds its own single generation.
+                    generation_guard = None
 
                 # Build native kwargs for this hop. A cross-provider hop runs the
                 # translation contract and may RAISE an Untranslatable* error here,
@@ -5381,10 +5568,31 @@ class AsyncSolwyn(_SolwynBase):
                         # health verdict), but the first generation's usage is
                         # unknown, so the reservation keeps its bound.
                         loop_refused = isinstance(exc, OutputBoundUnenforceableError)
-                        disp = Disposition.FAIL_FAST if loop_refused else classify_exception(exc)
-                        # In particular, a rejected 429 followed by Retry-After
-                        # sleep holds the probe but has no paid work to refund.
-                        usage_unknown = disp is Disposition.POST_SEND_AMBIGUOUS
+                        disp = (
+                            Disposition.FAIL_FAST
+                            if loop_refused
+                            else classify_exception(exc, dispatched=usage_unknown)
+                        )
+                        # A guard refusal is billed only when a send it let
+                        # through may have been (a refusal before any send,
+                        # such as a middleware rewrite, gives the hold back).
+                        loop_billed = (
+                            loop_refused
+                            and generation_guard is not None
+                            and generation_guard.may_have_billed
+                        )
+                        # Funding follows billing evidence, not routing: once
+                        # dispatched, the attempt is possibly billed unless a 4xx
+                        # status or a proven pre-send transport failure says it
+                        # was not (an unparseable 200 stops the chain yet may be
+                        # paid). In particular, a rejected 429 followed by
+                        # Retry-After sleep holds the probe but has no paid work
+                        # to refund.
+                        usage_unknown = (
+                            loop_billed
+                            if loop_refused
+                            else usage_unknown and attempt_maybe_billed(exc)
+                        )
                         # Fix [A]: the PRIMARY was attempted and raised in this walk
                         # -> a later cross-provider success is a REACTIVE failover
                         # (PRIMARY_ERROR), not a proactive breaker-open reroute.
@@ -5425,60 +5633,99 @@ class AsyncSolwyn(_SolwynBase):
                         # A correctly-not-failed-over post-send-ambiguous abort
                         # emits an ERROR event with possibly_succeeded=True so the Cloud API
                         # can reconcile the (possibly-landed, never-confirmed) reservation.
-                        possibly_succeeded = loop_refused or (
+                        possibly_succeeded = loop_billed or (
                             disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover
                         )
+                        floored = usage_unknown and _hard_deny_funding(budget)
+                        # A possibly billed hop the walk advances past settles
+                        # under its own call id: core nets max(receipt, events)
+                        # per call id, so sharing the served hop's id would
+                        # hide this hop's floor behind that hop's spend.
+                        hop_call_id = (
+                            str(uuid.uuid4())
+                            if floored
+                            and disp is not Disposition.FAIL_FAST
+                            and (disp is Disposition.FAILOVER or allow_ambiguous_failover)
+                            else call_id
+                        )
                         try:
-                            self._solwyn_reporter.report(
-                                self._build_error_event(
-                                    model=served_model,
-                                    provider=provider,
-                                    latency_ms=ctx.elapsed_ms(),
-                                    is_model_fallback=is_model_fallback,
-                                    is_provider_fallback=is_provider_fallback,
-                                    requested_provider=(
-                                        primary.entry.provider if is_provider_fallback else None
-                                    ),
-                                    requested_model=requested_model
-                                    if is_provider_fallback
-                                    else None,
-                                    failover_error_class=type(exc).__name__,
-                                    attempt_index=chain_index,
-                                    call_id=call_id,
-                                    possibly_succeeded=True if possibly_succeeded else None,
-                                    agent_run=agent_run,
-                                    trace=trace,
-                                    provider_region=_safe_extract_region(rt),
-                                    lease_id=_settlement_keys(budget)[1],
-                                )
+                            hop_region = _safe_extract_region(rt)
+                            reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
+                            event = self._build_error_event(
+                                model=served_model,
+                                provider=provider,
+                                latency_ms=ctx.elapsed_ms(),
+                                is_model_fallback=is_model_fallback,
+                                is_provider_fallback=is_provider_fallback,
+                                requested_provider=(
+                                    primary.entry.provider if is_provider_fallback else None
+                                ),
+                                requested_model=requested_model if is_provider_fallback else None,
+                                failover_error_class=type(exc).__name__,
+                                attempt_index=chain_index,
+                                call_id=hop_call_id,
+                                possibly_succeeded=True if possibly_succeeded else None,
+                                agent_run=agent_run,
+                                trace=trace,
+                                provider_region=hop_region,
+                                lease_id=lease_id,
                             )
+                            if floored and (reservation_id or lease_id):
+                                # A possibly billed attempt under hard_deny,
+                                # whether it ends the call or the walk advances:
+                                # confirm its floor beside the receipt so core
+                                # keeps it durably (netted per call id).
+                                floor_confirm = self._solwyn_budget.build_confirm_request(
+                                    reservation_id=reservation_id,
+                                    lease_id=lease_id,
+                                    lease_claim_token=lease_claim_token,
+                                    model=served_model,
+                                    token_details=_floor_usage(budget, TokenDetails()),
+                                    provider=provider,
+                                    is_provider_fallback=is_provider_fallback,
+                                    call_id=hop_call_id,
+                                    provider_region=hop_region,
+                                    usage_unmeasured=True,
+                                )
+                                self._solwyn_reporter.report_settlement(floor_confirm, event)
+                            else:
+                                self._solwyn_reporter.report(event)
                         except Exception as receipt_exc:
                             # The receipt is best-effort: losing it must never mask the
                             # provider's error or skip the reservation's terminal step.
                             logger.warning(
                                 "call.error_receipt_failed: %s", type(receipt_exc).__name__
                             )
-                        if disp is Disposition.FAIL_FAST and loop_refused:
-                            self._solwyn_budget.abandon_reservation(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
-                            raise
                         if disp is Disposition.FAIL_FAST:
-                            self._solwyn_budget.release_reservation(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
-                            raise
+                            # Stop the chain. A possibly billed attempt (refused
+                            # loop, unparseable or unknown failure after dispatch)
+                            # keeps its bound; a proven rejection gives it back.
+                            if usage_unknown and _hard_deny_funding(budget):
+                                self._solwyn_budget.abandon_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            else:
+                                self._solwyn_budget.release_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            raise  # do NOT advance the chain
                         if disp is Disposition.POST_SEND_AMBIGUOUS and not allow_ambiguous_failover:
-                            # Mirror sync: retire the claim without refunding
-                            # authority the provider may already have consumed.
-                            self._solwyn_budget.abandon_reservation(
-                                call_id,
-                                lease_claim_token=_lease_claim_token(budget),
-                            )
+                            # Mirror sync: under hard_deny, retire the claim without
+                            # refunding authority the provider may have consumed.
+                            if _hard_deny_funding(budget):
+                                self._solwyn_budget.abandon_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
+                            else:
+                                self._solwyn_budget.release_reservation(
+                                    call_id,
+                                    lease_claim_token=_lease_claim_token(budget),
+                                )
                             raise
-                        if disp is Disposition.POST_SEND_AMBIGUOUS:
+                        if usage_unknown and _hard_deny_funding(budget):
                             # Mirror sync: pin the still-live reservation so no
                             # later exit from this call (cancellation included)
                             # can refund what this hop may have consumed.
@@ -5521,19 +5768,6 @@ class AsyncSolwyn(_SolwynBase):
                 # runs ONLY on the non-streaming path, AFTER the streaming early return.
                 if is_streaming:
                     if _surface == "responses" and _responses_leaf == "stream":
-                        on_error = _make_async_stream_error_handler(
-                            self,
-                            rt,
-                            ctx,
-                            budget,
-                            primary,
-                            requested_model=requested_model,
-                            is_model_fallback=is_model_fallback,
-                            call_id=call_id,
-                            agent_run=agent_run,
-                            trace=trace,
-                            admission=admission,
-                        )
                         # The manager sends its request in __aenter__, AFTER this
                         # candidate walk: its failure needs the walk's classification,
                         # not the established stream's unconditional verdict.
@@ -5569,7 +5803,6 @@ class AsyncSolwyn(_SolwynBase):
                                 estimated_input_tokens=est_in,
                                 estimate_empty_usage=True,
                                 velocity_flags=velocity_flags,
-                                on_error=on_error,
                                 admission=admission,
                                 termination_handle=termination_handle,
                             ),
@@ -5840,9 +6073,23 @@ class AsyncSolwyn(_SolwynBase):
         # providers without regional pricing). Captured once, closed over.
         provider_region = _safe_extract_region(runtime)
 
-        async def on_complete(token_details: TokenDetails, _elapsed_ms: float) -> None:
+        def settle_stream(
+            token_details: TokenDetails,
+            _elapsed_ms: float,
+            *,
+            abandoned: bool = False,
+            record_latency: bool = True,
+        ) -> None:
+            # Synchronous (no I/O, no awaits) so a dropped stream can settle
+            # from the run-cleanup worker or from close(), off the event loop.
+            if abandoned and not _hard_deny_funding(budget):
+                # The early-close rule applies under hard_deny only (as in the
+                # TS SDK). Elsewhere it bounds nothing, and a per-call hold kept
+                # until its TTL would inflate the counters that budget alerts
+                # read, so an early-closed stream settles on its observed usage.
+                abandoned = False
             usage_unmeasured = False
-            if estimate_empty_usage:
+            if estimate_empty_usage or abandoned:
                 if token_details.input_tokens == 0 and token_details.output_tokens == 0:
                     token_details = TokenDetails(
                         input_tokens=estimated_input_tokens,
@@ -5855,22 +6102,36 @@ class AsyncSolwyn(_SolwynBase):
                     # response's output: the lease must hold its reserved bound
                     # rather than re-lend spent output allowance.
                     usage_unmeasured = True
+            if abandoned:
+                # Closed before its natural end (caller break or close, run
+                # stop): the provider may have billed the whole generation, but
+                # its usage report never arrived. The observed tokens are only a
+                # floor, so a lease claim holds its reserved bound.
+                usage_unmeasured = True
             self._get_circuit_breaker(provider).record_success()
             # LatencyPolicy signal: record the SERVED provider's latency as the
             # stream settles (mirrors the non-streaming path). Pure signal store.
-            self.record_latency(provider, ctx.elapsed_ms())
+            # A dropped stream (GC, client close) skips it: that time measures
+            # how long the caller held the stream, not the provider.
+            if record_latency:
+                self.record_latency(provider, ctx.elapsed_ms())
             # Extracted ONCE — confirm and metadata must carry the same tier
             # (see the sync on_complete).
             service_tier = accumulator.get_service_tier()
             confirm = None
             reservation_id, lease_id, lease_claim_token = _settlement_keys(budget)
             if reservation_id or lease_id:
+                # Abandoned under hard_deny, the confirm carries the floor (the
+                # reservation, or more if more was observed) so core keeps it
+                # durably; the event keeps the observed usage.
                 confirm = self._solwyn_budget.build_confirm_request(
                     reservation_id=reservation_id,
                     lease_id=lease_id,
                     lease_claim_token=lease_claim_token,
                     model=served_model,
-                    token_details=token_details,
+                    token_details=(
+                        _floor_usage(budget, token_details) if abandoned else token_details
+                    ),
                     provider=provider,
                     is_provider_fallback=is_provider_fallback,
                     call_id=call_id,
@@ -5918,6 +6179,11 @@ class AsyncSolwyn(_SolwynBase):
             else:
                 self._solwyn_reporter.report(event)
 
+        async def on_complete(
+            token_details: TokenDetails, elapsed_ms: float, *, abandoned: bool = False
+        ) -> None:
+            settle_stream(token_details, elapsed_ms, abandoned=abandoned)
+
         if on_error is None:
             on_error = _make_async_stream_error_handler(
                 self,
@@ -5931,6 +6197,7 @@ class AsyncSolwyn(_SolwynBase):
                 agent_run=agent_run,
                 trace=trace,
                 admission=admission,
+                observed_usage=accumulator.finalize,
             )
 
         # Cross-DIALECT hop: reshape each served chunk back to the caller's
@@ -5945,6 +6212,7 @@ class AsyncSolwyn(_SolwynBase):
         )
         # Stream nesting and caller-dialect result shape are adapter-owned —
         # see the sync ``_wrap_stream``.
+        wrapper: AsyncStreamWrapper | None = None
         try:
             source = runtime.adapter.unwrap_stream_source(response)
             wrapper = AsyncStreamWrapper(
@@ -5952,6 +6220,8 @@ class AsyncSolwyn(_SolwynBase):
                 accumulator,
                 on_complete,
                 on_error,
+                on_abandon=functools.partial(on_complete, abandoned=True),
+                on_dropped=functools.partial(settle_stream, abandoned=True, record_latency=False),
                 call_span=call_span,
                 chunk_translator=chunk_translator,
                 abort_check=(
@@ -5977,14 +6247,22 @@ class AsyncSolwyn(_SolwynBase):
                     provider_failure=False,
                 ),
             )
-            return primary.adapter.wrap_stream_result(wrapper, response)
+            result = primary.adapter.wrap_stream_result(wrapper, response)
+            self._track_open_stream(wrapper._settlement)
+            return result
         except BaseException:
+            # The caller never receives this wrapper; the wrap failure is
+            # reconciled by the walk, so its GC finalizer must not settle again.
+            if wrapper is not None and wrapper._claim_settlement():
+                wrapper._settlement.finish()
             if termination_handle is not None:
                 termination_handle.release()
             raise
 
     async def close(self) -> None:
         """Shut down Solwyn state, then close the wrapped provider client."""
+        # See the sync close: open streams settle before the reporter seals.
+        self._settle_open_streams()
         await self._solwyn_reporter.close()
         await self._solwyn_budget.close()
         provider_close = getattr(self._solwyn_client, "aclose", None)
