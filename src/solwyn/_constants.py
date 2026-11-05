@@ -48,3 +48,25 @@ TAG_VALUE_MAX_LENGTH = 256
 # splitting them into multiple wire events at ORDINARY_TOKEN_COUNT_MAX.
 SIGNED_BIGINT_MAX = (1 << 63) - 1
 ORDINARY_TOKEN_COUNT_MAX = 100_000_000
+# WS-14 API key scoping. Vendored lock-step with core's
+# ``solwyn_shared.constants`` (core's contract parity test compares them).
+# Every request made with an API key names its project in this header: a
+# project name or a ``proj_`` id.
+PROJECT_HEADER = "Solwyn-Project"
+# Diagnostic echo of the resolved project id on every key-authenticated
+# response. The SDK never pins from it; pinning comes only from /auth/key.
+PROJECT_ECHO_HEADER = "Solwyn-Project-Id"
+AUTH_KEY_PATH = "/api/v1/auth/key"
+# The key-path refusal codes core emits (spec section 2.4). ``read_only_key``
+# predates key scoping and is classified alongside them.
+API_KEY_ERROR_CODES = frozenset(
+    {
+        "api_key_invalid",
+        "api_key_expired",
+        "api_key_not_allowed",
+        "project_selector_required",
+        "project_not_found",
+        "project_selector_conflict",
+        "key_not_dedicated",
+    }
+)

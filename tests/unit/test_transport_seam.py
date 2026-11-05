@@ -14,7 +14,13 @@ from typing import Protocol, get_args, get_type_hints
 
 import httpx
 import pytest
-from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID, call_uuid
+from conftest import (
+    ALLOW_BUDGET_RESPONSE,
+    VALID_API_KEY,
+    VALID_PROJECT_ID,
+    call_uuid,
+    validated_binding,
+)
 
 from solwyn import run
 from solwyn._token_details import TokenDetails
@@ -239,11 +245,11 @@ class _SyncClosableComponent(Protocol):
 
 
 def _new_async_enforcer_with_transport(transport: object) -> AsyncBudgetEnforcer:
-    return AsyncBudgetEnforcer(_API_URL, VALID_API_KEY, transport=transport)  # type: ignore[arg-type]
+    return AsyncBudgetEnforcer(_API_URL, validated_binding(VALID_API_KEY), transport=transport)  # type: ignore[arg-type]
 
 
 def _new_async_reporter_with_transport(transport: object) -> AsyncMetadataReporter:
-    return AsyncMetadataReporter(_API_URL, VALID_API_KEY, transport=transport)  # type: ignore[arg-type]
+    return AsyncMetadataReporter(_API_URL, validated_binding(VALID_API_KEY), transport=transport)  # type: ignore[arg-type]
 
 
 def _new_async_solwyn_with_transport(transport: object) -> AsyncSolwyn:
@@ -256,11 +262,11 @@ def _new_async_solwyn_with_transport(transport: object) -> AsyncSolwyn:
 
 
 def _new_sync_enforcer_with_transport(transport: object) -> BudgetEnforcer:
-    return BudgetEnforcer(_API_URL, VALID_API_KEY, transport=transport)  # type: ignore[arg-type]
+    return BudgetEnforcer(_API_URL, validated_binding(VALID_API_KEY), transport=transport)  # type: ignore[arg-type]
 
 
 def _new_sync_reporter_with_transport(transport: object) -> MetadataReporter:
-    return MetadataReporter(_API_URL, VALID_API_KEY, transport=transport)  # type: ignore[arg-type]
+    return MetadataReporter(_API_URL, validated_binding(VALID_API_KEY), transport=transport)  # type: ignore[arg-type]
 
 
 def _new_sync_solwyn_with_transport(transport: object) -> Solwyn:
@@ -505,7 +511,7 @@ async def test_async_enforcer_accepts_a_structural_dual_transport() -> None:
     recorder = _Recorder()
     enforcer = AsyncBudgetEnforcer(
         _API_URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         transport=_StructuralDualTransport(recorder),
     )
 
@@ -522,7 +528,7 @@ def test_sync_enforcer_constructor_uses_injected_transport() -> None:
     recorder = _Recorder()
     enforcer = BudgetEnforcer(
         _API_URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         transport=httpx.MockTransport(recorder.handler),
     )
 
@@ -539,7 +545,7 @@ def test_sync_enforcer_fork_reset_reuses_injected_transport() -> None:
     recorder = _Recorder()
     enforcer = BudgetEnforcer(
         _API_URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         transport=httpx.MockTransport(recorder.handler),
     )
 
@@ -559,7 +565,7 @@ def test_sync_reporter_exit_client_uses_injected_transport() -> None:
     recorder = _Recorder()
     reporter = MetadataReporter(
         _API_URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         transport=httpx.MockTransport(recorder.handler),
     )
 
@@ -580,7 +586,7 @@ async def test_async_enforcer_constructor_uses_injected_transport() -> None:
     recorder = _Recorder()
     enforcer = AsyncBudgetEnforcer(
         _API_URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         transport=httpx.MockTransport(recorder.handler),
     )
 
@@ -598,7 +604,7 @@ async def test_async_enforcer_fork_reset_reuses_injected_transport() -> None:
     recorder = _Recorder()
     enforcer = AsyncBudgetEnforcer(
         _API_URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         transport=httpx.MockTransport(recorder.handler),
     )
 
@@ -619,7 +625,7 @@ async def test_async_reporter_exit_client_uses_injected_transport() -> None:
     recorder = _Recorder()
     reporter = AsyncMetadataReporter(
         _API_URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         transport=httpx.MockTransport(recorder.handler),
     )
 
@@ -640,7 +646,7 @@ def test_async_reporter_gc_exit_flush_retains_transport_without_retaining_report
     transport = _CloseSensitiveDualTransport(recorder)
     reporter = AsyncMetadataReporter(
         _API_URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         transport=transport,
     )
     reporter.report_confirm(
@@ -674,7 +680,7 @@ def test_sync_enforcer_surrender_drain_uses_injected_transport() -> None:
     recorder = _Recorder()
     enforcer = BudgetEnforcer(
         _API_URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         holder_id="holder_transport_seam",
         transport=httpx.MockTransport(recorder.handler),
     )
@@ -700,7 +706,7 @@ async def test_async_enforcer_surrender_drain_uses_injected_transport() -> None:
     recorder = _Recorder()
     enforcer = AsyncBudgetEnforcer(
         _API_URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         holder_id="holder_transport_seam",
         transport=httpx.MockTransport(recorder.handler),
     )

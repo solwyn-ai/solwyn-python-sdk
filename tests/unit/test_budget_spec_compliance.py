@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, VALID_PROJECT_ID
+from conftest import VALID_API_KEY, VALID_PROJECT_ID, validated_binding
 
 from solwyn._types import BudgetMode
 from solwyn.budget import BudgetEnforcer
@@ -25,7 +25,7 @@ def _make_enforcer(**overrides):
     """Create a BudgetEnforcer with sensible test defaults."""
     defaults = {
         "api_url": "https://api.test.solwyn.ai",
-        "api_key": VALID_API_KEY,
+        "binding": validated_binding(VALID_API_KEY),
         "budget_mode": BudgetMode.ALERT_ONLY,
         "fail_open": True,
         "cache_ttl": 5,

@@ -8,7 +8,7 @@ import threading
 from contextvars import copy_context
 
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, validated_binding
 
 import solwyn
 from solwyn import _lifecycle
@@ -143,7 +143,9 @@ provider.shutdown()
 
 def test_pending_surrender_finishes_before_a_later_grant_for_the_same_run():
     plane = FakeControlPlane()
-    enforcer = BudgetEnforcer(plane.api_url, VALID_API_KEY, transport=plane.transport)
+    enforcer = BudgetEnforcer(
+        plane.api_url, validated_binding(VALID_API_KEY), transport=plane.transport
+    )
 
     def chunks():
         with solwyn.run("stream") as rid:
@@ -180,7 +182,9 @@ def test_idle_stream_is_surrendered_without_another_sdk_entry():
             surrendered.set()
         return response
 
-    enforcer = BudgetEnforcer(plane.api_url, VALID_API_KEY, transport=httpx.MockTransport(dispatch))
+    enforcer = BudgetEnforcer(
+        plane.api_url, validated_binding(VALID_API_KEY), transport=httpx.MockTransport(dispatch)
+    )
 
     def chunks():
         with solwyn.run("stream") as rid:
@@ -201,7 +205,9 @@ def test_idle_stream_is_surrendered_without_another_sdk_entry():
 
 def test_stale_context_cleanup_cannot_surrender_a_successor_lease():
     plane = FakeControlPlane()
-    enforcer = BudgetEnforcer(plane.api_url, VALID_API_KEY, transport=plane.transport)
+    enforcer = BudgetEnforcer(
+        plane.api_url, validated_binding(VALID_API_KEY), transport=plane.transport
+    )
     scope = solwyn.run("stream")
 
     def chunks():

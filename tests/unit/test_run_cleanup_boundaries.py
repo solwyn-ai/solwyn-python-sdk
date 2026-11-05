@@ -9,7 +9,7 @@ import sys
 from contextvars import copy_context
 
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, validated_binding
 
 import solwyn
 from solwyn._lifecycle import _drain_run_cleanups
@@ -73,7 +73,9 @@ assert solwyn.current_run()[0] is None
 @pytest.mark.asyncio
 async def test_async_holder_surrenders_an_idle_stream_from_the_cleanup_worker():
     plane = FakeControlPlane()
-    enforcer = AsyncBudgetEnforcer(plane.api_url, VALID_API_KEY, transport=plane.transport)
+    enforcer = AsyncBudgetEnforcer(
+        plane.api_url, validated_binding(VALID_API_KEY), transport=plane.transport
+    )
 
     def chunks():
         with solwyn.run("stream") as rid:

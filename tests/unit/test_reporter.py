@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, _accepted_response, call_uuid
+from conftest import VALID_API_KEY, _accepted_response, call_uuid, validated_binding
 from pydantic import ValidationError
 
 from solwyn._token_details import TokenDetails
@@ -86,7 +86,7 @@ def _quiet_sync_reporter(**kwargs) -> MetadataReporter:
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         reporter = MetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             **kwargs,
         )
     # The patched _flush_loop returns immediately, so the thread is already
@@ -114,7 +114,7 @@ def _unstarted_sync_reporter(**kwargs) -> MetadataReporter:
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         reporter = MetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             **kwargs,
         )
     reporter._thread.join(timeout=2.0)
@@ -173,7 +173,7 @@ class TestMetadataReporter:
         with patch("solwyn.reporter.MetadataReporter._flush_loop"):
             reporter = MetadataReporter(
                 "https://api.test.solwyn.ai",
-                VALID_API_KEY,
+                validated_binding(VALID_API_KEY),
             )
             # Stop the background thread to avoid timing issues
             _stop_flush_thread(reporter)
@@ -187,7 +187,7 @@ class TestMetadataReporter:
         with patch("solwyn.reporter.MetadataReporter._flush_loop"):
             reporter = MetadataReporter(
                 "https://api.test.solwyn.ai",
-                VALID_API_KEY,
+                validated_binding(VALID_API_KEY),
                 batch_size=3,
             )
             _stop_flush_thread(reporter)
@@ -209,7 +209,7 @@ class TestMetadataReporter:
         with patch("solwyn.reporter.MetadataReporter._flush_loop"):
             reporter = MetadataReporter(
                 "https://api.test.solwyn.ai",
-                VALID_API_KEY,
+                validated_binding(VALID_API_KEY),
                 batch_size=10,
             )
             _stop_flush_thread(reporter)
@@ -232,7 +232,7 @@ class TestMetadataReporter:
             patch("solwyn.reporter.MetadataReporter._flush_loop"),
             MetadataReporter(
                 "https://api.test.solwyn.ai",
-                VALID_API_KEY,
+                validated_binding(VALID_API_KEY),
             ) as reporter,
         ):
             _stop_flush_thread(reporter)
@@ -243,7 +243,7 @@ class TestMetadataReporter:
         with patch("solwyn.reporter.MetadataReporter._flush_loop"):
             reporter = MetadataReporter(
                 "https://api.test.solwyn.ai",
-                VALID_API_KEY,
+                validated_binding(VALID_API_KEY),
             )
             _stop_flush_thread(reporter)
 
@@ -260,7 +260,7 @@ class TestMetadataReporter:
         with patch("solwyn.reporter.MetadataReporter._flush_loop"):
             reporter = MetadataReporter(
                 "https://api.test.solwyn.ai",
-                VALID_API_KEY,
+                validated_binding(VALID_API_KEY),
             )
             _stop_flush_thread(reporter)
 
@@ -275,7 +275,7 @@ class TestMetadataReporter:
         with patch("solwyn.reporter.MetadataReporter._flush_loop"):
             reporter = MetadataReporter(
                 "https://api.test.solwyn.ai",
-                VALID_API_KEY,
+                validated_binding(VALID_API_KEY),
             )
             _stop_flush_thread(reporter)
 
@@ -292,7 +292,7 @@ class TestMetadataReporter:
         with patch("solwyn.reporter.MetadataReporter._flush_loop"):
             reporter = MetadataReporter(
                 "https://api.test.solwyn.ai",
-                VALID_API_KEY,
+                validated_binding(VALID_API_KEY),
             )
             _stop_flush_thread(reporter)
 
@@ -316,7 +316,7 @@ class TestMetadataReporter:
         with patch("solwyn.reporter.MetadataReporter._flush_loop"):
             reporter = MetadataReporter(
                 "https://api.test.solwyn.ai",
-                VALID_API_KEY,
+                validated_binding(VALID_API_KEY),
             )
             _stop_flush_thread(reporter)
 
@@ -853,7 +853,7 @@ class TestAsyncMetadataReporter:
     def test_report_enqueues_event(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
         event = _make_event()
         reporter.report(event)
@@ -862,7 +862,7 @@ class TestAsyncMetadataReporter:
     def test_queue_overflow(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             max_queue_size=2,
         )
         reporter.report(_make_event(input_tokens=1))

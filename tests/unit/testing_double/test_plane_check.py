@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import httpx
 import pytest
+from conftest import plane_binding
 
 from solwyn._types import BudgetMode
 from solwyn.budget import BudgetEnforcer
@@ -27,7 +28,7 @@ def test_default_budget_enforcer_check_allows_and_records_directive_opt_in() -> 
     plane = FakeControlPlane()
     enforcer = BudgetEnforcer(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         cache_ttl=0,
         lease_enabled=False,
         transport=plane.transport,

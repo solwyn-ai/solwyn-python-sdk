@@ -21,7 +21,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 import respx
-from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID, call_uuid
+from conftest import (
+    ALLOW_BUDGET_RESPONSE,
+    VALID_API_KEY,
+    VALID_PROJECT_ID,
+    call_uuid,
+    validated_binding,
+)
 from httpx import Response
 from pydantic import ValidationError
 
@@ -100,7 +106,7 @@ def _deny_payload(**overrides: object) -> dict[str, object]:
 def _make_enforcer(**overrides: object) -> BudgetEnforcer:
     defaults: dict[str, object] = {
         "api_url": API_URL,
-        "api_key": VALID_API_KEY,
+        "binding": validated_binding(VALID_API_KEY),
         "budget_mode": BudgetMode.ALERT_ONLY,
         "fail_open": True,
         "cache_ttl": 5,
@@ -113,7 +119,7 @@ def _make_enforcer(**overrides: object) -> BudgetEnforcer:
 def _make_async_enforcer(**overrides: object) -> AsyncBudgetEnforcer:
     defaults: dict[str, object] = {
         "api_url": API_URL,
-        "api_key": VALID_API_KEY,
+        "binding": validated_binding(VALID_API_KEY),
         "budget_mode": BudgetMode.ALERT_ONLY,
         "fail_open": True,
         "cache_ttl": 5,

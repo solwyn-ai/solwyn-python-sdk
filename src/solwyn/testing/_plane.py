@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
+import re
 from collections import deque
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Lock
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
+import httpx
 from pydantic_core import PydanticUndefined
 
+from solwyn._constants import AUTH_KEY_PATH, PROJECT_ECHO_HEADER, PROJECT_HEADER
 from solwyn._otel import _INACTIVE_CALL_SPAN, _CallSpan
 from solwyn._run import current_run
 from solwyn._types import (
+    AuthKeyResponse,
     BreakerStateReport,
     BudgetCheckRequest,
     BudgetCheckResponse,
@@ -79,11 +84,64 @@ _LEASE_PATHS = frozenset(
         "/api/v1/budgets/lease/surrender",
     }
 )
-_RESERVED_WRAP_KWARGS = ("api_key", "api_url", "control_plane_transport")
+_RESERVED_WRAP_KWARGS = ("api_key", "api_url", "project", "control_plane_transport")
 _ENV_PREFIX = "SOLWYN_"
-# api_key/api_url are pinned by the wrapper itself; providers/default_params are
-# derived by the client constructor from its own arguments.
-_WRAPPER_OWNED_CONFIG_FIELDS = frozenset({"api_key", "api_url", "providers", "default_params"})
+# api_key/api_url/project are pinned by the wrapper itself; providers and
+# default_params are derived by the client constructor from its own arguments.
+_WRAPPER_OWNED_CONFIG_FIELDS = frozenset(
+    {"api_key", "api_url", "project", "providers", "default_params"}
+)
+
+# ── API key scoping (core spec sections 2.2 to 2.6) ──────────────────────
+_PROJECT_ID_RE = re.compile(r"^proj_[a-f0-9]{24}$")
+_DEFAULT_PROJECT_ID = "proj_" + "f" * 24
+_DEFAULT_PROJECT_NAME = "fake-project"
+_FAKE_ACCOUNT_ID = "00000000-0000-4000-8000-0000000000ac"
+_FAKE_KEY_ID = "00000000-0000-4000-8000-00000000000e"
+_PROJECT_NAME_MAX_LENGTH = 100
+_WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+_BREAKER_REPORT_PATH_RE = re.compile(r"^/api/v1/projects/([^/]+)/providers/breaker-reports$")
+_WWW_AUTHENTICATE = {"WWW-Authenticate": 'Bearer error="invalid_token"'}
+_INVALID_KEY_MESSAGE = "Invalid or revoked API key."
+_SELECTOR_REQUIRED_MESSAGE = (
+    "This API key needs a project. Set SOLWYN_PROJECT, or send the Solwyn-Project "
+    "header, to a project name or proj_ id."
+)
+_PROJECT_NOT_FOUND_MESSAGE = (
+    "No project on this API key matches Solwyn-Project. Check the name or proj_ id. "
+    "A renamed project's old name stops working; its proj_ id always works."
+)
+_URL_MISMATCH_MESSAGE = "Solwyn-Project names a different project than the URL."
+_MULTIPLE_HEADERS_MESSAGE = "Send one Solwyn-Project header."
+_READ_ONLY_KEY_MESSAGE = "read-only project key cannot write"
+KeyState = Literal["active", "expired", "revoked"]
+KeyScope = Literal["full", "read_only"]
+
+
+@dataclass(slots=True)
+class FakeBudgetRule:
+    """One budget rule on the fake project, for the posture refusals report.
+
+    Mirrors core's ``refusal_posture`` (spec section 1.8): a ``scoped`` rule or
+    a ``runaway_run`` cap makes an alert-only project report ``hard_deny`` when
+    its mode is ``hard_deny`` and it is not paused. Snoozing does not matter
+    (it silences alerts, not enforcement). A ``threshold`` (percent alert)
+    rule never does.
+    """
+
+    kind: Literal["scoped", "runaway_run", "threshold"]
+    mode: BudgetMode | str = BudgetMode.HARD_DENY
+    paused: bool = False
+    snoozed: bool = False
+
+    def enforces_hard(self) -> bool:
+        return (
+            self.kind in ("scoped", "runaway_run")
+            and BudgetMode(self.mode) is BudgetMode.HARD_DENY
+            and not self.paused
+        )
+
+
 _GRANT_ONLY_LEASE_PATH = "/api/v1/budgets/lease"
 _LEASE_RENEW_PATH = "/api/v1/budgets/lease/renew"
 _INGEST_PATH = "/api/v1/metadata/ingest"
@@ -265,6 +323,7 @@ class _ScenarioWindow:
     indices: tuple[int, ...] | None = None
     count: int | None = None
     malformed: bool = False
+    content: bytes | None = None
 
     def consume_if_matching(self, path: str) -> bool:
         if self.path is not None and self.path != path:
@@ -322,7 +381,8 @@ class FakeControlPlane:
         budget_limit: float = 100.0,
         current_usage: float = 0.0,
         remaining_budget: float | None = None,
-        project_id: str = "proj_fake",
+        project_id: str = _DEFAULT_PROJECT_ID,
+        project_name: str = _DEFAULT_PROJECT_NAME,
         failover_tuning_allowed: bool = True,
         price_hints: dict[str, float] | None = None,
         lease_eligible: bool = True,
@@ -342,6 +402,8 @@ class FakeControlPlane:
             raise ValueError("refresh_interval_s must be greater than zero")
         if not refresh_interval_s < lease_length_s:
             raise ValueError("refresh_interval_s must be less than lease_length_s")
+        if not _PROJECT_ID_RE.fullmatch(project_id):
+            raise ValueError("project_id must be a proj_ id (proj_ followed by 24 hex chars)")
 
         self.mode = BudgetMode(mode)
         self.budget_limit = budget_limit
@@ -350,6 +412,7 @@ class FakeControlPlane:
             budget_limit - current_usage if remaining_budget is None else remaining_budget
         )
         self.project_id = project_id
+        self.project_name = project_name
         self.failover_tuning_allowed = failover_tuning_allowed
         self.price_hints = price_hints
         self.lease_eligible = lease_eligible
@@ -359,8 +422,18 @@ class FakeControlPlane:
         self.refresh_interval_s = refresh_interval_s
         self.lease_length_s = lease_length_s
 
-        self.api_key = "sk_proj_" + "0" * 64
+        self.api_key = "solwyn_sk_" + "0" * 64
         self.api_url = "http://control-plane.invalid"
+        # The key and its project. Scripted with expire_key(), revoke_key(),
+        # set_key_scope(), rename_project(), archive_project() and
+        # require_dedicated_keys(); budget_rules feeds the refusal posture.
+        self.key_state: KeyState = "active"
+        self.key_scope: KeyScope = "full"
+        self.key_expires_at = datetime(2099, 1, 1, tzinfo=UTC)
+        self.project_archived = False
+        self.dedicated_keys_only = False
+        self.key_reaches_other_projects = False
+        self.budget_rules: list[FakeBudgetRule] = []
         self.transport = FakeControlPlaneTransport(self)
 
         self.checks: list[BudgetCheckRequest] = []
@@ -372,6 +445,12 @@ class FakeControlPlane:
         self.untracked_reports: list[UntrackedSurfaceReport] = []
         self.breaker_reports: list[dict[str, Any]] = []
         self.unmatched_requests: list[tuple[str, str]] = []
+        # (path, trimmed Solwyn-Project value or None) for every request that
+        # reached authentication, in arrival order.
+        self.project_headers: list[tuple[str, str | None]] = []
+        # Solwyn-Project values of every GET /api/v1/auth/key that reached
+        # authentication.
+        self.auth_key_requests: list[str | None] = []
         self._pending_denials: deque[str] = deque()
         self._pending_lease_denials: deque[str] = deque()
         self._denied_runs: set[str] = set()
@@ -679,6 +758,101 @@ class FakeControlPlane:
                 if record.lease_id not in self._released_leases
             )
 
+    # ── API key and project scripting ──────────────────────────────────
+
+    def auth_headers(self) -> dict[str, str]:
+        """Headers a raw ``httpx`` client needs: this plane's key and project name.
+
+        Every key request names its project (``Solwyn-Project``); without
+        these the plane answers like core does, with a 401 or a 400.
+        """
+        with self._lock:
+            return {
+                "Authorization": f"Bearer {self.api_key}",
+                PROJECT_HEADER: self.project_name,
+            }
+
+    def expire_key(self) -> None:
+        """Make the key expired: every request answers 401 ``api_key_expired``.
+
+        The body carries ``project_budget_mode`` from :meth:`refusal_posture`
+        when the request names the project, exactly as core reports it.
+        """
+        with self._lock:
+            self.key_state = "expired"
+            self.key_expires_at = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=1)
+
+    def revoke_key(self) -> None:
+        """Revoke the key: every request answers 401 ``api_key_invalid`` with the posture."""
+        with self._lock:
+            self.key_state = "revoked"
+
+    def restore_key(self) -> None:
+        """Make the key active again (a rotation the SDK is not told about)."""
+        with self._lock:
+            self.key_state = "active"
+            self.key_expires_at = datetime(2099, 1, 1, tzinfo=UTC)
+
+    def set_key_scope(self, scope: KeyScope) -> None:
+        """``read_only`` keys validate with that scope and get 403 ``read_only_key`` on writes."""
+        if scope not in ("full", "read_only"):
+            raise ValueError("scope must be full or read_only")
+        with self._lock:
+            self.key_scope = scope
+
+    def rename_project(self, name: str) -> None:
+        """Rename the project: its old name stops matching, its ``proj_`` id keeps working."""
+        with self._lock:
+            self.project_name = name
+
+    def archive_project(self) -> None:
+        """Archive the project: no selector matches it any more (404 ``project_not_found``)."""
+        with self._lock:
+            self.project_archived = True
+
+    def require_dedicated_keys(self, enabled: bool = True) -> None:
+        """Make the project accept only dedicated keys while this key reaches others too.
+
+        Every request then answers 403 ``key_not_dedicated``.
+        """
+        with self._lock:
+            self.dedicated_keys_only = enabled
+            self.key_reaches_other_projects = enabled
+
+    def refusal_posture(self) -> Literal["hard_deny", "alert_only"]:
+        """``project_budget_mode`` a refused key reports for this project (core spec 1.8)."""
+        if self.mode is BudgetMode.HARD_DENY:
+            return "hard_deny"
+        if any(rule.enforces_hard() for rule in self.budget_rules):
+            return "hard_deny"
+        return "alert_only"
+
+    @contextmanager
+    def raw_response(
+        self,
+        status: int,
+        content: bytes,
+        *,
+        path: str | None = None,
+        requests: int | None = None,
+    ) -> Iterator[None]:
+        """Answer matching requests with ``status`` and these exact body bytes.
+
+        Use it for answers the real API should never send but a proxy or a
+        broken deployment might: invalid JSON, an empty body, or an unknown
+        error shape. It applies before authentication. ``path`` scopes it to
+        one endpoint.
+        """
+        window = _ScenarioWindow(
+            "raw_response",
+            self._request_count(requests),
+            path=path,
+            status=status,
+            content=content,
+        )
+        with self._scenario(window):
+            yield
+
     def reset_recording(self) -> None:
         """Clear every public request recording while preserving scenario state.
 
@@ -695,6 +869,8 @@ class FakeControlPlane:
             self.untracked_reports.clear()
             self.breaker_reports.clear()
             self.unmatched_requests.clear()
+            self.project_headers.clear()
+            self.auth_key_requests.clear()
 
     def _wrap_options(self, solwyn_kwargs: dict[str, Any]) -> dict[str, Any]:
         """Build the wrapper options: hermetic defaults, wiring, caller kwargs."""
@@ -704,6 +880,7 @@ class FakeControlPlane:
             {
                 "api_key": self.api_key,
                 "api_url": self.api_url,
+                "project": self.project_name,
                 "control_plane_transport": self.transport,
                 "budget_check_cache_ttl": 0,
             }
@@ -715,8 +892,10 @@ class FakeControlPlane:
         """Return a synchronous ``Solwyn`` using this plane's zero-network transport.
 
         Ordinary ``Solwyn`` configuration keyword arguments override testing
-        defaults. ``api_key``, ``api_url``, and ``control_plane_transport`` are
-        reserved so the returned client cannot bypass this plane.
+        defaults. ``api_key``, ``api_url``, ``project`` and
+        ``control_plane_transport`` are reserved so the returned client cannot
+        bypass this plane. The client names the project by its current
+        :attr:`project_name`; once it validates it pins :attr:`project_id`.
 
         Ambient ``SOLWYN_*`` configuration is neutralized: every environment-
         mapped setting with a declared default falls back to that default
@@ -730,7 +909,7 @@ class FakeControlPlane:
         """Return an ``AsyncSolwyn`` using this plane's zero-network transport.
 
         Ordinary ``AsyncSolwyn`` configuration keyword arguments override
-        testing defaults. ``api_key``, ``api_url``, and
+        testing defaults. ``api_key``, ``api_url``, ``project`` and
         ``control_plane_transport`` are reserved so the returned client cannot
         bypass this plane.
 
@@ -883,6 +1062,7 @@ class FakeControlPlane:
         path: str,
         body: object,
         parse_error: PlaneResponse | None,
+        headers: httpx.Headers,
     ) -> PreparedPlaneRequest:
         """Freeze all request effects before the transport performs I/O."""
         with self._lock:
@@ -892,7 +1072,7 @@ class FakeControlPlane:
             elif parse_error is not None:
                 response = parse_error
             else:
-                response = self._handle_locked(method, path, body)
+                response = self._handle_locked(method, path, body, headers)
         return PreparedPlaneRequest(delay, outage, response)
 
     def _consume_transport_effects(self, path: str) -> tuple[float, bool]:
@@ -911,25 +1091,175 @@ class FakeControlPlane:
                 delay += window.seconds
         return delay, False
 
-    def handle(self, method: str, path: str, body: object) -> PlaneResponse:
+    def handle(
+        self,
+        method: str,
+        path: str,
+        body: object,
+        headers: Mapping[str, str] | None = None,
+    ) -> PlaneResponse:
         """Evaluate one real control-plane wire request without network I/O.
 
         Most callers should use :meth:`wrap`; this lower-level seam supports
         contract tests that need the raw status, headers, and response model.
+        ``headers`` default to this plane's key and project name (what a
+        wrapped client sends before it validates); pass them to exercise
+        authentication and the ``Solwyn-Project`` rules.
         """
+        request_headers = httpx.Headers(
+            headers
+            if headers is not None
+            else {
+                "Authorization": f"Bearer {self.api_key}",
+                PROJECT_HEADER: self.project_name,
+            }
+        )
         with self._lock:
-            return self._handle_locked(method, path, body)
+            return self._handle_locked(method, path, body, request_headers)
 
-    def _handle_locked(self, method: str, path: str, body: object) -> PlaneResponse:
+    def _handle_locked(
+        self, method: str, path: str, body: object, headers: httpx.Headers
+    ) -> PlaneResponse:
         """Resolve the route first so a refusal window never hides a 404."""
         handler = self._resolve_handler(method, path)
         if handler is None:
             self.unmatched_requests.append((method, path))
             return PlaneResponse(404, {"detail": "not found"})
+        for window in self._scenario_windows:
+            if window.kind == "raw_response" and window.consume_if_matching(path):
+                return PlaneResponse(window.status, content=window.content or b"")
+        if method == "GET" and path == "/health":
+            return handler(body)
+        auth_refusal = self._authenticate_locked(method, path, headers)
+        if auth_refusal is not None:
+            return auth_refusal
         refusal = self._endpoint_refusal_locked(method, path, body)
-        if refusal is not None:
-            return refusal
-        return handler(body)
+        return self._with_project_echo(refusal if refusal is not None else handler(body))
+
+    def _with_project_echo(self, response: PlaneResponse) -> PlaneResponse:
+        """Every key-authenticated answer carries ``Solwyn-Project-Id`` (core 2.6)."""
+        merged = dict(response.headers or {})
+        merged[PROJECT_ECHO_HEADER] = self.project_id
+        return dataclasses.replace(response, headers=merged)
+
+    def _selector_matches_locked(self, selector: str) -> bool:
+        if self.project_archived or len(selector) > _PROJECT_NAME_MAX_LENGTH:
+            return False
+        lowered = selector.lower()
+        if _PROJECT_ID_RE.fullmatch(lowered):
+            return lowered == self.project_id
+        return lowered == self.project_name.lower()
+
+    @staticmethod
+    def _key_error(
+        status: int,
+        code: str,
+        message: str,
+        *,
+        extra: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> PlaneResponse:
+        detail: dict[str, Any] = {"code": code, "message": message, **(extra or {})}
+        return PlaneResponse(status, {"detail": detail}, headers=headers, exclude_none=False)
+
+    def _authenticate_locked(
+        self, method: str, path: str, headers: httpx.Headers
+    ) -> PlaneResponse | None:
+        """Core's key path, in its precedence order (spec section 2.4)."""
+        trimmed = [value.strip(" \t") for value in headers.get_list(PROJECT_HEADER)]
+        selectors = [value for value in trimmed if value]
+        distinct = set(selectors)
+        selector = selectors[0] if selectors else None
+        self.project_headers.append((path, selector))
+        if path == AUTH_KEY_PATH:
+            self.auth_key_requests.append(selector)
+
+        if headers.get("authorization") != f"Bearer {self.api_key}":
+            return self._key_error(
+                401,
+                "api_key_invalid",
+                _INVALID_KEY_MESSAGE,
+                extra={"project_budget_mode": None},
+                headers=_WWW_AUTHENTICATE,
+            )
+        matched = (
+            len(distinct) == 1 and selector is not None and self._selector_matches_locked(selector)
+        )
+        posture = self.refusal_posture() if matched else None
+        if self.key_state == "revoked":
+            return self._key_error(
+                401,
+                "api_key_invalid",
+                _INVALID_KEY_MESSAGE,
+                extra={"project_budget_mode": posture},
+                headers=_WWW_AUTHENTICATE,
+            )
+        if self.key_state == "expired":
+            expired_on = self.key_expires_at.date().isoformat()
+            return self._key_error(
+                401,
+                "api_key_expired",
+                f"This API key expired on {expired_on}. Rotate it in the dashboard or "
+                "with solwyn keys rotate.",
+                extra={
+                    "expired_at": self.key_expires_at.isoformat().replace("+00:00", "Z"),
+                    "api_key_id": _FAKE_KEY_ID,
+                    "project_budget_mode": posture,
+                },
+                headers=_WWW_AUTHENTICATE,
+            )
+        if len(distinct) > 1:
+            return self._key_error(
+                400,
+                "project_selector_conflict",
+                _MULTIPLE_HEADERS_MESSAGE,
+                extra={"reason": "multiple_headers"},
+            )
+        if selector is None:
+            return self._key_error(400, "project_selector_required", _SELECTOR_REQUIRED_MESSAGE)
+        if not matched:
+            return self._key_error(404, "project_not_found", _PROJECT_NOT_FOUND_MESSAGE)
+        if self.dedicated_keys_only and self.key_reaches_other_projects:
+            return self._key_error(
+                403,
+                "key_not_dedicated",
+                f"Project {self.project_name} only accepts API keys dedicated to it, and "
+                "this key also reaches other projects. Use a key that holds only this project.",
+                extra={"project_id": self.project_id},
+            )
+        url_project = _BREAKER_REPORT_PATH_RE.match(path)
+        if url_project is not None and url_project.group(1) != self.project_id:
+            return self._key_error(
+                400,
+                "project_selector_conflict",
+                _URL_MISMATCH_MESSAGE,
+                extra={"reason": "url_mismatch"},
+            )
+        if self.key_scope == "read_only" and method in _WRITE_METHODS:
+            return self._key_error(403, "read_only_key", _READ_ONLY_KEY_MESSAGE)
+        return None
+
+    def _handle_auth_key(self, _body: object) -> PlaneResponse:
+        response = AuthKeyResponse(
+            account_id=_FAKE_ACCOUNT_ID,
+            key_id=_FAKE_KEY_ID,
+            key_prefix=self.api_key[:26],
+            key_name=self.project_name,
+            scope=self.key_scope,
+            created_via="dashboard",
+            expires_at=self.key_expires_at,
+            rotation_grace_until=None,
+            project_id=self.project_id,
+            project_name=self.project_name,
+            budget_mode=self.mode.value,
+        )
+        return PlaneResponse(
+            200,
+            response,
+            headers={"Cache-Control": "no-store"},
+            exclude_none=False,
+            model_only=True,
+        )
 
     def _resolve_handler(
         self,
@@ -938,6 +1268,8 @@ class FakeControlPlane:
     ) -> Callable[[object], PlaneResponse] | None:
         if method == "GET" and path == "/health":
             return self._handle_health
+        if method == "GET" and path == AUTH_KEY_PATH:
+            return self._handle_auth_key
         if method != "POST":
             return None
         if path == "/api/v1/budgets/check":

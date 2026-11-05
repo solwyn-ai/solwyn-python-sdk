@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 import pytest
-from conftest import VALID_API_KEY, make_mock_client
+from conftest import VALID_API_KEY, make_mock_client, validated_binding
 
 from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer
 from solwyn.circuit_breaker import CircuitBreaker
@@ -31,7 +31,7 @@ _URL = "https://api.test.solwyn.ai"
 def _quiet(**kwargs) -> MetadataReporter:
     """A sync reporter with its background flush thread stopped (_shutdown SET)."""
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
-        reporter = MetadataReporter(_URL, VALID_API_KEY, **kwargs)
+        reporter = MetadataReporter(_URL, validated_binding(VALID_API_KEY), **kwargs)
     reporter._shutdown.set()
     reporter._thread.join(timeout=2.0)
     return reporter
@@ -40,7 +40,7 @@ def _quiet(**kwargs) -> MetadataReporter:
 def _unstarted(**kwargs) -> MetadataReporter:
     """A sync reporter whose thread exited but whose _shutdown stays UNSET."""
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
-        reporter = MetadataReporter(_URL, VALID_API_KEY, **kwargs)
+        reporter = MetadataReporter(_URL, validated_binding(VALID_API_KEY), **kwargs)
     reporter._thread.join(timeout=2.0)
     return reporter
 
@@ -282,7 +282,7 @@ def test_sync_reporter_reset_completed_delivery_stays_terminal() -> None:
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_async_reporter_reset_clears_loop_state_and_swaps_client() -> None:
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     old_http = reporter._http
     old_lock = reporter._breaker_project_lock
     reporter._in_flight = 3
@@ -330,7 +330,7 @@ def test_solwyn_base_reset_replaces_client_locks() -> None:
 
 @pytest.mark.unit
 def test_sync_budget_enforcer_reset_swaps_lock_and_client() -> None:
-    enforcer = BudgetEnforcer(_URL, VALID_API_KEY)
+    enforcer = BudgetEnforcer(_URL, validated_binding(VALID_API_KEY))
     old_lock = enforcer._state_lock
     old_http = enforcer._http
 
@@ -345,7 +345,7 @@ def test_sync_budget_enforcer_reset_swaps_lock_and_client() -> None:
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_async_budget_enforcer_reset_swaps_lock_and_client() -> None:
-    enforcer = AsyncBudgetEnforcer(_URL, VALID_API_KEY)
+    enforcer = AsyncBudgetEnforcer(_URL, validated_binding(VALID_API_KEY))
     old_lock = enforcer._state_lock
     old_http = enforcer._http
 

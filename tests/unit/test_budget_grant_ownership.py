@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from conftest import call_uuid
+from conftest import call_uuid, plane_binding
 
 from solwyn.budget import AsyncBudgetEnforcer, BudgetCheckResult
 from solwyn.circuit_breaker import CircuitBreaker
@@ -70,7 +70,7 @@ def _enforcer(
 ) -> AsyncBudgetEnforcer:
     return AsyncBudgetEnforcer(
         api_url=plane.api_url,
-        api_key=plane.api_key,
+        binding=plane_binding(plane),
         holder_id="grant-ownership-test",
         transport=transport,
         control_plane_breaker=breaker,

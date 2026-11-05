@@ -7,7 +7,7 @@ import json
 
 import httpx
 import pytest
-from conftest import call_uuid
+from conftest import call_uuid, plane_binding
 
 from solwyn import run
 from solwyn._token_details import TokenDetails
@@ -84,7 +84,7 @@ async def test_cancelled_draw_survives_renewal_snapshot_and_terminal_cleanup(
     transport = _HeldRenewalTransport(plane)
     enforcer = AsyncBudgetEnforcer(
         api_url=plane.api_url,
-        api_key=plane.api_key,
+        binding=plane_binding(plane),
         holder_id="cancelled-renewal-holder",
         transport=transport,
     )
@@ -197,7 +197,7 @@ async def test_cancelled_final_grant_stays_spent_without_leaking_an_active_claim
     breaker = CircuitBreaker(name="control-plane", recovery_timeout=3600)
     enforcer = AsyncBudgetEnforcer(
         api_url=plane.api_url,
-        api_key=plane.api_key,
+        binding=plane_binding(plane),
         holder_id="cancelled-final-holder",
         transport=plane.transport,
         control_plane_breaker=breaker,

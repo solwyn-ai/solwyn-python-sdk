@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, call_uuid
+from conftest import VALID_API_KEY, call_uuid, validated_binding
 
 from solwyn._lifecycle import blocking_exit_flush
 from solwyn._token_details import TokenDetails
@@ -83,7 +83,7 @@ def _ok_response() -> MagicMock:
 
 def _quiet_sync(**kwargs: object) -> MetadataReporter:
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
-        reporter = MetadataReporter(_URL, VALID_API_KEY, **kwargs)
+        reporter = MetadataReporter(_URL, validated_binding(VALID_API_KEY), **kwargs)
     reporter._thread.join(timeout=2.0)
     return reporter
 
@@ -97,7 +97,11 @@ def _only_fold(reporter: MetadataReporter | AsyncMetadataReporter):
 @pytest.mark.unit
 @pytest.mark.parametrize("async_mode", [False, True])
 def test_different_traces_share_one_fold_and_replays_have_no_trace(async_mode: bool) -> None:
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY) if async_mode else _quiet_sync()
+    reporter = (
+        AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
+        if async_mode
+        else _quiet_sync()
+    )
     try:
         for trace_id, span_id, sampled in [("1" * 32, "2" * 16, True), ("3" * 32, "4" * 16, False)]:
             reporter._fold_or_count_event_drop(
@@ -2218,7 +2222,9 @@ class TestSyncReceiptFolding:
 class TestAsyncReceiptFolding:
     @pytest.mark.asyncio
     async def test_retry_exhaustion_and_recovery_mirror_sync(self) -> None:
-        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, batch_size=100, max_send_attempts=1)
+        reporter = AsyncMetadataReporter(
+            _URL, validated_binding(VALID_API_KEY), batch_size=100, max_send_attempts=1
+        )
         for i in range(100):
             reporter._queue.append(
                 _PendingEvent(
@@ -2276,7 +2282,7 @@ class TestAsyncReceiptFolding:
 
     @pytest.mark.asyncio
     async def test_rejected_aggregate_requires_later_clean_cycle_before_async_replay(self) -> None:
-        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+        reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
         reporter._fold_or_count_event_drop(
             _event(receipt_aggregate_count=100, input_tokens=500, estimated_output_bound=700),
             "retry_exhausted",
@@ -2362,7 +2368,7 @@ class TestAsyncReceiptFolding:
 
     @pytest.mark.asyncio
     async def test_overflow_sealed_and_settlement_refusals_mirror_sync(self) -> None:
-        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, max_queue_size=1)
+        reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY), max_queue_size=1)
         reporter.report(_event(call_id=call_uuid("async-denied")))
         reporter.report(
             _event(
@@ -2396,7 +2402,9 @@ class TestAsyncReceiptFolding:
 
     @pytest.mark.asyncio
     async def test_settlement_handoff_overflow_and_aggregate_refold_mirror_sync(self) -> None:
-        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, max_queue_size=1, max_send_attempts=1)
+        reporter = AsyncMetadataReporter(
+            _URL, validated_binding(VALID_API_KEY), max_queue_size=1, max_send_attempts=1
+        )
         reporter._move_event_to_queue(_event(call_id=call_uuid("async-settlement-denied")))
         reporter._move_event_to_queue(
             _event(
@@ -2446,7 +2454,7 @@ class TestAsyncReceiptFolding:
     @pytest.mark.asyncio
     async def test_close_replays_fold_once_and_failed_close_counts_terminal_loss(self) -> None:
         recovered = AsyncMetadataReporter(
-            _URL, VALID_API_KEY, shutdown_deadline=0.2, max_send_attempts=1
+            _URL, validated_binding(VALID_API_KEY), shutdown_deadline=0.2, max_send_attempts=1
         )
         recovered._fold_or_count_event_drop(_event(input_tokens=17), "retry_exhausted")
         sent: list[list[dict[str, object]]] = []
@@ -2462,7 +2470,7 @@ class TestAsyncReceiptFolding:
         assert recovered._receipt_fold_snapshot() == {}
 
         failed = AsyncMetadataReporter(
-            _URL, VALID_API_KEY, shutdown_deadline=0.05, max_send_attempts=1
+            _URL, validated_binding(VALID_API_KEY), shutdown_deadline=0.05, max_send_attempts=1
         )
         failed._fold_or_count_event_drop(_event(input_tokens=19), "retry_exhausted")
 
@@ -2482,7 +2490,11 @@ class TestAsyncReceiptFolding:
     @pytest.mark.asyncio
     async def test_final_close_bypasses_capacity_and_terminally_counts_failure(self) -> None:
         healthy = AsyncMetadataReporter(
-            _URL, VALID_API_KEY, max_queue_size=1, batch_size=50, max_send_attempts=1
+            _URL,
+            validated_binding(VALID_API_KEY),
+            max_queue_size=1,
+            batch_size=50,
+            max_send_attempts=1,
         )
         for index in range(3):
             healthy._fold_or_count_event_drop(
@@ -2504,7 +2516,11 @@ class TestAsyncReceiptFolding:
         assert healthy.dropped_counts == {}
 
         failed = AsyncMetadataReporter(
-            _URL, VALID_API_KEY, max_queue_size=1, batch_size=50, max_send_attempts=1
+            _URL,
+            validated_binding(VALID_API_KEY),
+            max_queue_size=1,
+            batch_size=50,
+            max_send_attempts=1,
         )
         for index, count in enumerate((2, 3, 5)):
             failed._fold_or_count_event_drop(
@@ -2522,7 +2538,7 @@ class TestAsyncReceiptFolding:
 
     @pytest.mark.asyncio
     async def test_deadline_sweep_and_blocking_exit_fold_denials(self) -> None:
-        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+        reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
         reporter._queue.extend(
             (
                 _PendingEvent(_event(call_id=call_uuid("async-deadline-denied"))),

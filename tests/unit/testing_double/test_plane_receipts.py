@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 import pytest
+from conftest import plane_binding
 
 from solwyn._types import MetadataEvent
 from solwyn.reporter import MetadataReporter
@@ -317,7 +318,7 @@ def test_rejected_receipt_folds_and_replays_after_a_clean_cycle() -> None:
     plane = FakeControlPlane()
     reporter = MetadataReporter(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         flush_interval=0.01,
         transport=plane.transport,
         breaker_reporting_enabled=False,

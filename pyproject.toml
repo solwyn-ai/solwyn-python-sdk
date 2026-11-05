@@ -97,6 +97,7 @@ markers = [
     "performance: marks tests as performance tests",
     "stress: marks tests as long-running stress tests",
     "chaos: marks tests as chaos tests that intentionally cause failures",
+    "project_validation: unit test that runs the gate's automatic GET /api/v1/auth/key (off by default in unit tests)",
 ]
 
 [tool.ruff]

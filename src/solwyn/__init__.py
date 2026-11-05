@@ -56,6 +56,7 @@ from solwyn.circuit_breaker import CircuitBreakerState
 from solwyn.client import AsyncSolwyn, Solwyn
 from solwyn.config import SolwynConfig
 from solwyn.exceptions import (
+    ApiKeyRefusedError,
     BudgetExceededError,
     ConfigurationError,
     CoverageMismatchError,
@@ -91,6 +92,7 @@ __all__ = [
     "RunTermination",
     "ProviderUnavailableError",
     "ConfigurationError",
+    "ApiKeyRefusedError",
     "CoverageMismatchError",
     "OutputBoundUnenforceableError",
     "UntranslatableRequestError",

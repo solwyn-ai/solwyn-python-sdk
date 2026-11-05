@@ -16,12 +16,26 @@ from solwyn._env import _parse_bool
 from solwyn._lease import DEFAULT_OUTPUT_BOUND
 from solwyn._run import _copy_tags
 from solwyn._types import BudgetMode, ProviderEntry
-from solwyn._validation import validate_project_key_format
+from solwyn._validation import (
+    INVALID_PROJECT_MESSAGE,
+    validate_api_key_format,
+    validate_project_selector,
+)
 from solwyn._velocity import VELOCITY_HISTORY_LIMIT
 from solwyn.exceptions import ConfigurationError
 
 # Environment variable prefix for automatic loading.
 _ENV_PREFIX = "SOLWYN_"
+
+_NO_PROJECT_MESSAGE = (
+    "No Solwyn project configured. Set SOLWYN_PROJECT or pass project= with a "
+    "project name or proj_ id."
+)
+_RETIRED_PROJECT_ID_ENV = "SOLWYN_PROJECT_ID"
+_RETIRED_PROJECT_ID_HINT = " SOLWYN_PROJECT_ID is no longer read; rename it to SOLWYN_PROJECT."
+PROJECT_ID_OPTION_MESSAGE = (
+    "project_id is not an option. Use project= with a project name or proj_ id."
+)
 
 
 class _EnvTags(str):
@@ -41,6 +55,10 @@ class SolwynConfig(BaseModel):
 
     # Required fields
     api_key: str
+    # The project every request names in the Solwyn-Project header: a project
+    # name or a proj_ id. Required; empty means "not configured" so the error
+    # can say how to set it.
+    project: str = ""
 
     # Optional fields with defaults
     api_url: str = "https://api.solwyn.ai"
@@ -173,8 +191,11 @@ class SolwynConfig(BaseModel):
     @classmethod
     def _load_from_env(cls, values: dict[str, Any]) -> dict[str, Any]:
         """Populate missing fields from ``SOLWYN_*`` environment variables."""
+        if "project_id" in values:
+            raise ConfigurationError(PROJECT_ID_OPTION_MESSAGE, field="project_id")
         field_env_map = {
             "api_key": "API_KEY",
+            "project": "PROJECT",
             "api_url": "API_URL",
             "tags": "TAGS",
             "on_unmetered": "ON_UNMETERED",
@@ -280,11 +301,21 @@ class SolwynConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_credentials(self) -> SolwynConfig:
-        """Validate api_key format after construction."""
+        """Validate the api_key format and the project selector after construction."""
         try:
-            validate_project_key_format(self.api_key)
+            self.api_key = validate_api_key_format(self.api_key)
         except ValueError as exc:
             raise ConfigurationError(str(exc), field="api_key") from exc
+
+        if not self.project.strip(" \t"):
+            message = _NO_PROJECT_MESSAGE
+            if os.environ.get(_RETIRED_PROJECT_ID_ENV) is not None:
+                message += _RETIRED_PROJECT_ID_HINT
+            raise ConfigurationError(message, field="project")
+        try:
+            self.project = validate_project_selector(self.project)
+        except ValueError as exc:
+            raise ConfigurationError(INVALID_PROJECT_MESSAGE, field="project") from exc
 
         return self
 

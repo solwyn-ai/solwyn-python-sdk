@@ -10,7 +10,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID, call_uuid
+from conftest import (
+    ALLOW_BUDGET_RESPONSE,
+    VALID_API_KEY,
+    VALID_PROJECT_ID,
+    call_uuid,
+    validated_binding,
+)
 
 import solwyn.budget as budget_module
 from solwyn import _run_control
@@ -99,7 +105,7 @@ def _response(payload: dict[str, object]) -> MagicMock:
 def _enforcer() -> BudgetEnforcer:
     return BudgetEnforcer(
         api_url="https://api.test.solwyn.ai",
-        api_key=VALID_API_KEY,
+        binding=validated_binding(VALID_API_KEY),
         lease_enabled=False,
     )
 
@@ -107,7 +113,7 @@ def _enforcer() -> BudgetEnforcer:
 def _async_enforcer() -> AsyncBudgetEnforcer:
     return AsyncBudgetEnforcer(
         api_url="https://api.test.solwyn.ai",
-        api_key=VALID_API_KEY,
+        binding=validated_binding(VALID_API_KEY),
         lease_enabled=False,
     )
 
@@ -1038,7 +1044,7 @@ class TestLeaseRunControl:
     def test_sync_grant_directive_denies_through_full_admission_path(self) -> None:
         enforcer = BudgetEnforcer(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
 
         with patch.object(
@@ -1074,7 +1080,7 @@ class TestLeaseRunControl:
     async def test_async_grant_directive_denies_through_full_admission_path(self) -> None:
         enforcer = AsyncBudgetEnforcer(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         enforcer._http.post = AsyncMock(
             return_value=_response(_grant_payload(directive_run_id=RUN_ID))
@@ -1109,7 +1115,7 @@ class TestLeaseRunControl:
     async def test_async_wrong_run_control_denied_grant_uses_outage_posture(self) -> None:
         enforcer = AsyncBudgetEnforcer(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         payload = _grant_payload(directive_run_id=OTHER_RUN_ID)
         payload.update(
@@ -1290,7 +1296,7 @@ class TestLeaseRunControl:
     ) -> None:
         enforcer = BudgetEnforcer(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         payload = _grant_payload(directive_run_id=OTHER_RUN_ID)
         payload.update(
@@ -1334,7 +1340,7 @@ class TestLeaseRunControl:
     def test_wrong_run_control_denied_grant_uses_outage_posture_without_state(self) -> None:
         enforcer = BudgetEnforcer(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         payload = _grant_payload(directive_run_id=OTHER_RUN_ID)
         payload.update(
@@ -1842,7 +1848,7 @@ class TestDirectiveEpochCoherence:
     def test_full_grant_denial_keeps_one_stamp_and_reports_the_server_source(self) -> None:
         enforcer = BudgetEnforcer(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         clock = _StepClock(step=0.25)
 
@@ -1959,7 +1965,7 @@ class TestMisroutedDirectiveIsDriftNotOutage:
         breaker = self._breaker()
         enforcer = BudgetEnforcer(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
             lease_enabled=False,
             control_plane_breaker=breaker,
         )
@@ -1996,7 +2002,7 @@ class TestMisroutedDirectiveIsDriftNotOutage:
         breaker = self._breaker()
         enforcer = BudgetEnforcer(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
             control_plane_breaker=breaker,
         )
 
@@ -2032,7 +2038,7 @@ class TestMisroutedDirectiveIsDriftNotOutage:
         breaker = self._breaker()
         enforcer = BudgetEnforcer(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
             control_plane_breaker=breaker,
         )
         first = LeaseGrantResponse.model_validate(_grant_payload())

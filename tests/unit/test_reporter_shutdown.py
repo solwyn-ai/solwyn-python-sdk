@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, call_uuid
+from conftest import VALID_API_KEY, call_uuid, validated_binding
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
@@ -69,7 +69,7 @@ def _make_confirm_request(**overrides) -> BudgetConfirmRequest:
 def _unstarted(**kwargs) -> MetadataReporter:
     """A sync reporter whose thread exited but whose _shutdown stays UNSET."""
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
-        reporter = MetadataReporter(_URL, VALID_API_KEY, **kwargs)
+        reporter = MetadataReporter(_URL, validated_binding(VALID_API_KEY), **kwargs)
     reporter._thread.join(timeout=2.0)
     return reporter
 
@@ -200,7 +200,7 @@ class TestSyncShutdownDeadline:
         monkeypatch.setattr("solwyn.reporter._monotonic", lambda: clock["now"])
         reporter = MetadataReporter(
             _URL,
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             batch_size=1,
             flush_interval=0.01,
             breaker_reporting_enabled=False,
@@ -440,7 +440,9 @@ class TestSyncShutdownDeadline:
 class TestAsyncShutdownDeadline:
     @pytest.mark.asyncio
     async def test_async_close_bounded_by_single_deadline(self) -> None:
-        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
+        reporter = AsyncMetadataReporter(
+            _URL, validated_binding(VALID_API_KEY), flush_interval=3600.0
+        )
         _load_work(reporter)
 
         async def slow_post(url: str, **_kw: object) -> httpx.Response:
@@ -486,7 +488,7 @@ def test_close_deadline_bounds_metadata_batch_send() -> None:
 @pytest.mark.unit
 async def test_async_close_deadline_bounds_metadata_batch_send() -> None:
     """Async twin of the P0 ingest-deadline pin (timeout-honoring mock)."""
-    reporter = AsyncMetadataReporter("https://api.test.solwyn.ai", VALID_API_KEY)
+    reporter = AsyncMetadataReporter("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
     reporter.start()
     reporter.report(_make_event())
 
@@ -565,7 +567,7 @@ def test_timed_out_close_counts_in_hand_confirm_and_blocks_requeue() -> None:
     thread holds a popped confirm mid-POST, close must count that in-hand item
     before returning, and the worker's later transient outcome must neither
     requeue it into the dead queue nor double count it."""
-    reporter = MetadataReporter(_URL, VALID_API_KEY, flush_interval=0.05)
+    reporter = MetadataReporter(_URL, validated_binding(VALID_API_KEY), flush_interval=0.05)
     entered = threading.Event()
     release = threading.Event()
 
@@ -791,7 +793,7 @@ def test_close_bounded_despite_slow_drip_send() -> None:
 async def test_async_close_bounded_despite_slow_drip_send() -> None:
     """Async twin of the slow-drip pin: the final flush rides its own task so
     the deadline can cancel a send whose per-operation timeouts never fire."""
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY), flush_interval=3600.0)
     reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
 
     async def dripping_post(url: str, **_kw: object) -> httpx.Response:
@@ -814,7 +816,7 @@ async def test_async_zero_deadline_close_counts_in_hand_before_returning() -> No
     """#7 review pin: a zero-deadline close cancels the flush task — but must
     still AWAIT its cleanup so the in-hand item is counted (and the exit rescue
     is detached only after every disposition is assigned)."""
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=0.05)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY), flush_interval=0.05)
     entered = asyncio.Event()
     blocker = asyncio.Event()
 
@@ -840,7 +842,7 @@ def test_async_seal_counts_straggler_and_refuses_enqueue() -> None:
     """#10 review pin: the async reporter shares the ownership gate — a
     straggler appended after the final drain is claimed by the seal, and a
     producer that lost the race with close() is refused-and-counted."""
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter._queue.append(_PendingEvent(_make_event()))
 
     reporter._seal_delivery()
@@ -868,7 +870,7 @@ async def test_cancelled_drain_after_seal_counts_in_hand() -> None:
     """Re-review #4 pin, seal branch: a cancelled drain requeues its in-hand
     item for the lifecycle rescue — but never into a SEALED queue (nothing will
     ever drain it again). A seal-refused requeue is counted instead."""
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY), flush_interval=3600.0)
     reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
     entered = asyncio.Event()
 

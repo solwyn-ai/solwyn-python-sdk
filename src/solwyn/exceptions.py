@@ -367,3 +367,23 @@ class ConfigurationError(SolwynError):
         super().__init__(message)
         self.field = field
         self.message = message
+
+
+class ApiKeyRefusedError(ConfigurationError):
+    """Raised when Solwyn refused the API key or its project.
+
+    The SDK raises it when ``validate()`` or a wrapped call meets a refusal it
+    must not run past: an expired, revoked, unrecognised or read-only key, or a
+    project the key does not reach. A subclass of :class:`ConfigurationError`,
+    so one ``except ConfigurationError`` covers construction, ``validate()``
+    and calls.
+
+    Attributes:
+        code: The refusal code (for example ``"api_key_expired"``).
+        field: ``"api_key"`` or ``"project"``, naming what to fix.
+        message: Human-readable description of the problem.
+    """
+
+    def __init__(self, message: str, *, code: str, field: str) -> None:
+        super().__init__(message, field=field)
+        self.code = code

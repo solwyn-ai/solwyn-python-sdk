@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, call_uuid, foreground_records
+from conftest import VALID_API_KEY, call_uuid, foreground_records, validated_binding
 from pydantic import ValidationError
 
 from solwyn import _base, _types
@@ -103,13 +103,17 @@ def _error_response(status_code: int) -> MagicMock:
 
 def _quiet_sync_reporter() -> MetadataReporter:
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
-        reporter = MetadataReporter(API_URL, API_KEY, sdk_instance_id=SDK_INSTANCE_ID)
+        reporter = MetadataReporter(
+            API_URL, validated_binding(API_KEY), sdk_instance_id=SDK_INSTANCE_ID
+        )
     reporter._thread.join(timeout=2.0)
     return reporter
 
 
 def _async_reporter() -> AsyncMetadataReporter:
-    return AsyncMetadataReporter(API_URL, API_KEY, sdk_instance_id=SDK_INSTANCE_ID)
+    return AsyncMetadataReporter(
+        API_URL, validated_binding(API_KEY), sdk_instance_id=SDK_INSTANCE_ID
+    )
 
 
 def _observe(

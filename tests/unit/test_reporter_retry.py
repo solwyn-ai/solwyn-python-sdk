@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, call_uuid
+from conftest import VALID_API_KEY, call_uuid, validated_binding
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
@@ -108,7 +108,7 @@ def _cp_breaker() -> CircuitBreaker:
 def _quiet(**kwargs) -> MetadataReporter:
     """A sync reporter with its background flush thread stopped."""
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
-        reporter = MetadataReporter(_URL, VALID_API_KEY, **kwargs)
+        reporter = MetadataReporter(_URL, validated_binding(VALID_API_KEY), **kwargs)
     # Patched _flush_loop -> thread already dead; leaving _shutdown UNSET keeps
     # report()/report_confirm/report_settlement enqueuing testable (they now
     # refuse and count post-shutdown enqueues).
@@ -122,7 +122,7 @@ def _unstarted(**kwargs) -> MetadataReporter:
     Lets report_confirm / report_settlement enqueue (they gate on _shutdown).
     """
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
-        reporter = MetadataReporter(_URL, VALID_API_KEY, **kwargs)
+        reporter = MetadataReporter(_URL, validated_binding(VALID_API_KEY), **kwargs)
     reporter._thread.join(timeout=2.0)
     return reporter
 
@@ -528,7 +528,7 @@ class TestAsyncReporterRetry:
         clock = _FakeClock()
         monkeypatch.setattr("solwyn.reporter._monotonic", clock)
         reporter = AsyncMetadataReporter(
-            _URL, VALID_API_KEY, max_send_attempts=5, retry_backoff_base=1.0
+            _URL, validated_binding(VALID_API_KEY), max_send_attempts=5, retry_backoff_base=1.0
         )
         reporter._settlement_queue.append(
             _PendingSettlement(_PendingConfirm(_make_confirm_request()), _make_event())
@@ -562,7 +562,7 @@ class TestAsyncReporterRetry:
         clock = _FakeClock()
         monkeypatch.setattr("solwyn.reporter._monotonic", clock)
         reporter = AsyncMetadataReporter(
-            _URL, VALID_API_KEY, max_send_attempts=3, retry_backoff_base=1.0
+            _URL, validated_binding(VALID_API_KEY), max_send_attempts=3, retry_backoff_base=1.0
         )
         reporter._confirm_queue.append(_PendingConfirm(_make_confirm_request()))
 
@@ -583,7 +583,7 @@ class TestAsyncReporterRetry:
 
     @pytest.mark.asyncio
     async def test_settlement_event_survives_confirm_drop(self) -> None:
-        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+        reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
         reporter._settlement_queue.append(
             _PendingSettlement(
                 _PendingConfirm(_make_confirm_request(call_id=call_uuid("c1"))),
@@ -611,7 +611,9 @@ class TestAsyncReporterRetry:
     async def test_breaker_open_holds_settlement_until_recovery(self) -> None:
         breaker = _cp_breaker()
         breaker.record_failure()
-        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, control_plane_breaker=breaker)
+        reporter = AsyncMetadataReporter(
+            _URL, validated_binding(VALID_API_KEY), control_plane_breaker=breaker
+        )
         reporter._settlement_queue.append(
             _PendingSettlement(_PendingConfirm(_make_confirm_request()), _make_event())
         )
@@ -643,7 +645,7 @@ class TestAsyncReporterRetry:
         clock = _FakeClock()
         monkeypatch.setattr("solwyn.reporter._monotonic", clock)
         reporter = AsyncMetadataReporter(
-            _URL, VALID_API_KEY, max_send_attempts=5, retry_backoff_base=1.0
+            _URL, validated_binding(VALID_API_KEY), max_send_attempts=5, retry_backoff_base=1.0
         )
         reporter._confirm_queue.append(
             _PendingConfirm(_make_confirm_request(call_id=call_uuid("a")))
@@ -681,7 +683,7 @@ class TestAsyncReporterRetry:
         clock = _FakeClock()
         monkeypatch.setattr("solwyn.reporter._monotonic", clock)
         reporter = AsyncMetadataReporter(
-            _URL, VALID_API_KEY, max_send_attempts=5, retry_backoff_base=1.0
+            _URL, validated_binding(VALID_API_KEY), max_send_attempts=5, retry_backoff_base=1.0
         )
         reporter._settlement_queue.append(
             _PendingSettlement(
@@ -724,7 +726,9 @@ class TestAsyncReporterRetry:
     ) -> None:
         # Async mirror of the settlement-overflow pin.
         monkeypatch.setattr("solwyn.reporter._MAX_PENDING_CONTROL", 1)
-        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
+        reporter = AsyncMetadataReporter(
+            _URL, validated_binding(VALID_API_KEY), flush_interval=3600.0
+        )
         reporter.report_settlement(
             _make_confirm_request(call_id=call_uuid("old")), _make_event(call_id=call_uuid("old"))
         )
@@ -753,7 +757,7 @@ class TestAsyncReporterRetry:
     @pytest.mark.asyncio
     async def test_settlement_closed_enqueue_counts_both_halves(self) -> None:
         # Async mirror of the closed-enqueue pair-accounting pin.
-        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+        reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
         reporter._closed = True
         reporter.report_settlement(_make_confirm_request(), _make_event())
         assert reporter.dropped_counts["settlement_confirm.closed_enqueue"] == 1
@@ -786,9 +790,9 @@ class TestAccountingAndBounds:
         """#13 review pin: capacity 0 has no defined drop-oldest semantics
         (sync would evict every append, async retained one item) — reject it."""
         with pytest.raises(ValueError, match="max_queue_size"):
-            MetadataReporter(_URL, VALID_API_KEY, max_queue_size=0)
+            MetadataReporter(_URL, validated_binding(VALID_API_KEY), max_queue_size=0)
         with pytest.raises(ValueError, match="max_queue_size"):
-            AsyncMetadataReporter(_URL, VALID_API_KEY, max_queue_size=0)
+            AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY), max_queue_size=0)
 
     def test_ingest_202_rejections_counted_as_drops(self, caplog: pytest.LogCaptureFixture) -> None:
         """#9 review pin: a 202 that rejects individual events is terminal spend
@@ -813,7 +817,9 @@ class TestAccountingAndBounds:
     @pytest.mark.asyncio
     async def test_async_ingest_202_rejections_counted_as_drops(self) -> None:
         """Async mirror of the 202 partial-rejection accounting pin."""
-        reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
+        reporter = AsyncMetadataReporter(
+            _URL, validated_binding(VALID_API_KEY), flush_interval=3600.0
+        )
         rejected = [
             {"code": "unpriced_model", "model": "mystery-9b", "message": "no pricing entry"},
         ]

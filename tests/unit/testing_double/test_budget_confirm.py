@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 import pytest
+from conftest import plane_binding
 
 from solwyn._token_details import TokenDetails
 from solwyn.budget import BudgetEnforcer
@@ -20,14 +21,14 @@ _SAMPLE_TOKEN_DETAILS = TokenDetails(input_tokens=100, output_tokens=50)
 def _components(plane: FakeControlPlane) -> Iterator[tuple[BudgetEnforcer, MetadataReporter]]:
     enforcer = BudgetEnforcer(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         cache_ttl=0,
         lease_enabled=False,
         transport=plane.transport,
     )
     reporter = MetadataReporter(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         flush_interval=60,
         max_send_attempts=1,
         transport=plane.transport,

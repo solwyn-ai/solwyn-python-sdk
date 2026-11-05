@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, _accepted_response, call_uuid
+from conftest import VALID_API_KEY, _accepted_response, call_uuid, validated_binding
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
@@ -86,7 +86,7 @@ class TestAsyncReporterLifecycle:
     async def test_start_creates_flush_task(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             flush_interval=60.0,
         )
         reporter.start()
@@ -105,7 +105,7 @@ class TestAsyncReporterLifecycle:
     async def test_close_flushes_remaining_events(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             batch_size=10,
             flush_interval=60.0,
         )
@@ -129,7 +129,7 @@ class TestAsyncReporterLifecycle:
     async def test_close_sets_shutdown_event(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             flush_interval=60.0,
         )
         reporter.start()
@@ -144,7 +144,7 @@ class TestAsyncReporterLifecycle:
     async def test_close_flushes_remaining_confirms(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             flush_interval=60.0,
         )
         reporter.start()
@@ -174,7 +174,7 @@ class TestAsyncReporterSendBatch:
     async def test_send_batch_posts_to_ingest(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
 
         batch = [_make_event() for _ in range(3)]
@@ -194,7 +194,7 @@ class TestAsyncReporterSendBatch:
     async def test_send_batch_omits_none_fields_from_payload(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
 
         with patch.object(
@@ -212,7 +212,7 @@ class TestAsyncReporterSendBatch:
     async def test_send_batch_includes_service_tier_when_present(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
 
         with patch.object(
@@ -230,7 +230,7 @@ class TestAsyncReporterSendBatch:
         # Async reporter must also propagate agent_run_* into the wire payload.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
 
         event = _make_event(
@@ -256,7 +256,7 @@ class TestAsyncReporterSendBatch:
         # per-day fallback id engages.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
 
         with patch.object(
@@ -275,7 +275,7 @@ class TestAsyncReporterSendBatch:
     async def test_send_batch_swallows_errors(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
 
         batch = [_make_event()]
@@ -295,7 +295,7 @@ class TestAsyncReporterSendBatch:
         # logged by class name only (no body), and not propagate.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
 
         with (
@@ -321,7 +321,7 @@ class TestAsyncReporterSendBatch:
         # WARNING per distinct (code, model), rejected events stay dropped.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
         body = {
             "ingested": 1,
@@ -365,7 +365,7 @@ class TestAsyncReporterSendBatch:
         # and a second flush has nothing to send.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
         reporter.report(_make_event())
         reporter.report(_make_event())
@@ -400,7 +400,7 @@ class TestAsyncReporterSendBatch:
         # path must stay silent, exactly like pre-v0.1.7.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
 
         with (
@@ -426,7 +426,7 @@ class TestAsyncReporterSendBatch:
         # fail-open path.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
         resp = MagicMock(spec=httpx.Response)
         resp.status_code = 202
@@ -452,7 +452,7 @@ class TestAsyncReporterSendBatch:
         # to count-only acknowledgment, never raise into the caller's loop.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
 
         with (
@@ -479,7 +479,7 @@ class TestAsyncReporterSendBatch:
         # caller's event loop — fall back to count-only acknowledgment.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
 
         with (
@@ -513,7 +513,7 @@ class TestAsyncReporterContextManager:
         with patch.object(AsyncMetadataReporter, "_send_batch", new_callable=AsyncMock):
             async with AsyncMetadataReporter(
                 "https://api.test.solwyn.ai",
-                VALID_API_KEY,
+                validated_binding(VALID_API_KEY),
                 flush_interval=60.0,
             ) as reporter:
                 reporter.report(_make_event())
@@ -537,7 +537,7 @@ class TestAsyncReporterBatchFlush:
     async def test_flush_remaining_batches_correctly(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             batch_size=3,
         )
 
@@ -558,7 +558,7 @@ class TestAsyncReporterBatchFlush:
     async def test_flush_remaining_sends_queued_confirms_before_success_events(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
         call_id = call_uuid("call_async_stream_settlement")
         reporter.report(_make_event(call_id=call_id))
@@ -586,7 +586,7 @@ class TestAsyncReporterBatchFlush:
     ) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             batch_size=1,
         )
         older_call_id = call_uuid("call_async_older_metadata")
@@ -633,7 +633,7 @@ class TestAsyncReporterBatchFlush:
         # logged by class name only, drain from the queue, and not propagate.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
         reporter.report_confirm(_make_confirm_request())
 
@@ -663,7 +663,7 @@ class TestAsyncReporterBatchFlush:
         monkeypatch.setattr("solwyn.reporter._monotonic", lambda: clock["t"])
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             max_send_attempts=11,
         )
         reporter.report_confirm(_make_confirm_request())
@@ -702,7 +702,7 @@ class TestAsyncReporterAutoStart:
         # loop so the batch actually gets delivered.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             flush_interval=60.0,
         )
         assert reporter._flush_task is None
@@ -726,7 +726,7 @@ class TestAsyncReporterAutoStart:
         # either, so report_confirm() auto-starts the flush loop as well.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             flush_interval=60.0,
         )
         assert reporter._flush_task is None
@@ -747,7 +747,7 @@ class TestAsyncReporterAutoStart:
     async def test_report_settlement_auto_starts_flush_task(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             flush_interval=60.0,
         )
         assert reporter._flush_task is None
@@ -770,7 +770,7 @@ class TestAsyncReporterAutoStart:
         # shutdown event.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             flush_interval=60.0,
         )
         reporter.start()
@@ -796,7 +796,7 @@ class TestAsyncReporterAutoStart:
         # (project rule: RuntimeError, never assert).
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             flush_interval=60.0,
         )
         reporter.start()
@@ -813,7 +813,7 @@ class TestAsyncReporterAutoStart:
         # reporter): nothing queues, no new flush task, no exception.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             flush_interval=60.0,
         )
         reporter.start()
@@ -840,7 +840,7 @@ class TestAsyncReporterAutoStart:
         # warning fires exactly once per instance across repeated calls.
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             flush_interval=60.0,
         )
 
@@ -864,7 +864,7 @@ class TestAsyncReporterAutoStart:
         # delivered on close().
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             batch_size=10,
             flush_interval=60.0,
         )
@@ -887,7 +887,7 @@ class TestAsyncReporterAutoStart:
         with patch.object(AsyncMetadataReporter, "_send_batch", new_callable=AsyncMock):
             async with AsyncMetadataReporter(
                 "https://api.test.solwyn.ai",
-                VALID_API_KEY,
+                validated_binding(VALID_API_KEY),
                 flush_interval=60.0,
             ) as reporter:
                 task_after_enter = reporter._flush_task

@@ -19,6 +19,9 @@ class PlaneResponse:
     headers: dict[str, str] | None = None
     exclude_none: bool = True
     model_only: bool = False
+    # Raw response bytes, sent verbatim instead of ``body`` (scripted
+    # malformed or empty answers).
+    content: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)

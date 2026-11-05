@@ -28,7 +28,9 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from solwyn import _run_control
+from solwyn._api_key_errors import classify_exception
 from solwyn._constants import (
+    AUTH_KEY_PATH,
     CALL_ID_MAX_LENGTH,
     CALL_ID_PATTERN,
     ORDINARY_TOKEN_COUNT_MAX,
@@ -56,10 +58,11 @@ from solwyn._lifecycle import (
     register_fork_reset,
     register_lease_holder,
 )
-from solwyn._read_only_key import handle_read_only_key_error
+from solwyn._project import ProjectBinding, StoredRefusal
 from solwyn._run_control import clear_termination_if
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
+    AuthKeyResponse,
     BudgetCheckRequest,
     BudgetCheckResponse,
     BudgetConfirmRequest,
@@ -126,7 +129,9 @@ _ALLOW_CACHE_MAX_ENTRIES = 16
 # channel can split the breaker verdict from the call posture — the plane
 # answered (credit it) but this call still degrades down the unreachable
 # ladder. `_grant_lease` converts it before returning, so no caller sees it.
-_GrantVerdict = Literal["applied", "legacy", "denied", "unreachable", "misrouted"]
+# "refused" means Solwyn refused the key or its project: the binding holds the
+# refusal and the caller's exit check applies it.
+_GrantVerdict = Literal["applied", "legacy", "denied", "unreachable", "misrouted", "refused"]
 
 # Sticky run denials protect brief Cloud outages but must not retain an
 # unbounded stream of run UUIDs in a long-lived SDK process.
@@ -180,7 +185,23 @@ _CallId = Annotated[
 ]
 _CALL_ID_ADAPTER = TypeAdapter(_CallId)
 
+# deny_reason on the placeholder a refused request returns. The exit check
+# always discards it (the binding is refused by then), so no caller sees it.
+_API_KEY_REFUSED = "api_key_refused"
+
+# How many times one check_budget may start over after its exit check discarded
+# a result. One re-run after a successful revalidation (spec section 6.5) plus
+# a bound on refusal/recovery churn from other threads.
+_MAX_CHECK_ATTEMPTS = 3
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class _CheckScratch:
+    """What one check attempt claimed locally, so a discarded result can give it back."""
+
+    lease_call_id: str | None = None
 
 
 class _MisroutedControlDenial(Exception):
@@ -298,7 +319,7 @@ class _BudgetEnforcerBase:
     def __init__(
         self,
         api_url: str,
-        api_key: str,
+        binding: ProjectBinding,
         budget_mode: BudgetMode = BudgetMode.ALERT_ONLY,
         fail_open: bool = True,
         cache_ttl: int = 5,
@@ -306,9 +327,20 @@ class _BudgetEnforcerBase:
         holder_id: str | None = None,
         lease_enabled: bool = True,
         lease_output_bound_default: int = DEFAULT_OUTPUT_BOUND,
+        validation_timeout: float = 1.0,
     ) -> None:
         self.api_url = api_url.rstrip("/")
-        self.api_key = api_key
+        # The client's project binding: the API key, the Solwyn-Project header,
+        # the validation state and the refusal fence (spec section 6.2). Shared
+        # with the reporter and the exit drain.
+        self._binding = binding
+        # Per-request timeout of GET /api/v1/auth/key (the budget-check timeout).
+        self._validation_timeout = validation_timeout
+        # Set (from any thread) when the binding recorded a refusal or recovered
+        # from one; the next gate drops every held lease on the caller's thread
+        # before anything could draw on it.
+        self._binding_changed = False
+        binding.add_listener(self._note_binding_change)
         self.budget_mode = budget_mode
         self.fail_open = fail_open
         self.cache_ttl = cache_ttl
@@ -397,6 +429,7 @@ class _BudgetEnforcerBase:
         """Replace the state lock in a forked child (concrete classes also swap
         the inherited HTTP client — a shared socket across processes corrupts)."""
         self._state_lock = threading.Lock()
+        self._binding._reset_after_fork_in_child()
         # A child inherits no lease authority: the parent's leases live in the
         # parent's process, and its in-flight renewal flags are lies here. The
         # child must also become a DIFFERENT holder — the client's
@@ -428,6 +461,135 @@ class _BudgetEnforcerBase:
         self._release_jobs = {}
         self._run_releases = {}
         self._release_counts = {}
+
+    @property
+    def api_key(self) -> str:
+        """The configured API key (owned by the project binding)."""
+        return self._binding.api_key
+
+    # ── project binding: entry gate, exit check, refusals (spec 6.4/6.5) ──
+
+    def _note_binding_change(self) -> None:
+        """Binding listener: may run on any thread, so it only raises a flag."""
+        self._binding_changed = True
+
+    def _drop_leases_after_binding_change(self) -> None:
+        """Surrender every held lease locally after a refusal or a recovery.
+
+        A lease granted before the binding changed must never fund a call
+        after it: on a refusal the gate blocks anyway, and after a recovery the
+        run re-grants under the fresh validation. The surrender requests are
+        best effort (a refused key's surrender is refused too). Cached allows
+        go with them.
+        """
+        if not self._binding_changed:
+            return
+        self._binding_changed = False
+        with self._state_lock:
+            if self._closed:
+                return
+            for run_id in self._lease.active_run_ids():
+                self._owe_release_locked(run_id, self._lease.build_surrender_request(run_id))
+                self._lease.discard(run_id)
+            self._clear_allow_cache_locked()
+        self._dispatch_owed_releases()
+
+    def _note_refusal(self, exc: BaseException, dispatched_at: int) -> bool:
+        """Record a key or project refusal carried by ``exc``; True when it was one."""
+        refusal = classify_exception(exc)
+        if refusal is None:
+            return False
+        self._binding.refuse(refusal, dispatched_at)
+        return True
+
+    def _refused_placeholder(self, claim_token: int | None = None) -> BudgetCheckResult:
+        """What a refused request returns. The exit check always discards it."""
+        return BudgetCheckResult(
+            allowed=False,
+            remaining_budget=0.0,
+            mode=self.budget_mode,
+            deny_source="local_enforcement",
+            deny_reason=_API_KEY_REFUSED,
+            lease_claim_token=claim_token,
+        )
+
+    def _apply_refusal(self, refusal: StoredRefusal) -> BudgetCheckResult:
+        """Apply a stored refusal's effect; ignores ``fail_open`` and every cache.
+
+        ``block`` raises ``ApiKeyRefusedError``. ``allow_unmetered`` (an expired
+        or revoked key on a project that promises to block nothing, after the
+        client validated once) lets the call run with no check and no
+        reservation, logging at error on every call.
+        """
+        if refusal.effect == "block":
+            raise refusal.error()
+        self._binding.note_unmetered_call(refusal)
+        return BudgetCheckResult(
+            allowed=True,
+            remaining_budget=0.0,
+            mode=self.budget_mode,
+            warning=f"Solwyn refused the API key ({refusal.code}); this call is not metered",
+        )
+
+    def _discard_check_result(
+        self,
+        result: BudgetCheckResult,
+        scratch: _CheckScratch,
+        call_id: str | None,
+    ) -> None:
+        """Give back what a result the exit check discarded claimed locally.
+
+        A lease draw is released. A per-call server reservation cannot be
+        handed back from here (only a confirm settles it); the server expires it.
+        """
+        local_call_id = scratch.lease_call_id if scratch.lease_call_id is not None else call_id
+        if local_call_id is not None:
+            self.release_reservation(local_call_id, lease_claim_token=result.lease_claim_token)
+
+    def _exit_check(
+        self,
+        gate_generation: int,
+        result: BudgetCheckResult,
+        scratch: _CheckScratch,
+        call_id: str | None,
+        attempt: int,
+    ) -> BudgetCheckResult | None:
+        """``binding.finish(g0, result)``: the result, or None to start over.
+
+        Every return of a check (a live or cached allow, a lease-funded allow,
+        every outage/error builder) passes here. A refusal recorded since the
+        gate, or any generation change, discards the result; the caller then
+        re-enters the gate, which applies the refusal or, after a successful
+        revalidation, runs the check once more.
+        """
+        verdict = self._binding.exit_verdict(gate_generation)
+        if verdict == "keep":
+            return result
+        if verdict == "rerun" and attempt >= 1:
+            return result
+        self._discard_check_result(result, scratch, call_id)
+        if attempt + 1 >= _MAX_CHECK_ATTEMPTS:
+            refusal = self._binding.refusal
+            if refusal is not None:
+                return self._apply_refusal(refusal)
+            return result
+        return None
+
+    def _auth_key_url(self) -> str:
+        return f"{self.api_url}{AUTH_KEY_PATH}"
+
+    def _validation_result(
+        self,
+        outcome: str,
+        auth: AuthKeyResponse | None,
+    ) -> AuthKeyResponse | None:
+        """Map one public validation onto ``validate()``'s return or raise."""
+        refusal = self._binding.refusal
+        if self._binding.state == "refused" and refusal is not None:
+            raise refusal.error()
+        if self._binding.state == "valid":
+            return auth if outcome == "valid" else self._binding.last_auth
+        return None
 
     def _build_check_request(
         self,
@@ -1541,6 +1703,7 @@ class _BudgetEnforcerBase:
         agent_run_id: str,
         *,
         renewal_request: LeaseRenewRequest | None = None,
+        dispatched_at: int,
     ) -> _GrantVerdict:
         """Map a failed lease round-trip onto a verdict, feeding the breaker.
 
@@ -1548,11 +1711,26 @@ class _BudgetEnforcerBase:
         are deliberate answers, so the plane is credited and the run simply
         drops to the per-call path. Only a transport failure or a non-503 5xx
         counts as unreachable — the posture ladder then owns the call.
+
+        A key or project refusal is recorded on the binding (``"refused"``):
+        the plane is credited, a renewing lease is dropped, and the caller's
+        exit check applies the refusal.
         """
         renewal = renewal_request is not None
         breaker = self._control_plane_breaker
+        if self._note_refusal(exc, dispatched_at):
+            if breaker is not None:
+                breaker.record_success()
+            if renewal_request is not None:
+                with self._state_lock:
+                    self._lease.drop_if_current(
+                        agent_run_id,
+                        lease_id=renewal_request.lease_id,
+                        generation=renewal_request.generation,
+                    )
+            return "refused"
         status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
-        responded = handle_read_only_key_error(exc) or (status is not None and 400 <= status < 500)
+        responded = status is not None and 400 <= status < 500
         if status == 503:
             responded = True
         if responded:
@@ -1866,12 +2044,20 @@ class _BudgetEnforcerBase:
             SIGNED_BIGINT_MAX, self._release_counts.get(reason, 0) + 1
         )
 
-    def _release_failed(self, exc: Exception, *, request_started: bool) -> bool:
+    def _release_failed(
+        self,
+        exc: Exception,
+        *,
+        request_started: bool,
+        dispatched_at: int | None = None,
+    ) -> bool:
         """Classify a release error; only actual request timeouts may retry.
 
         TLS/client construction and loop-affinity failures say nothing about
         API health. Retain breaker admission before setup (an OPEN breaker
         must avoid it), but release that probe neutrally for local failures.
+        A key or project refusal is recorded on the binding and is terminal:
+        no retry, and it never counts against the breaker.
         """
         logger.debug("lease.surrender_failed: %s", type(exc).__name__)
         if not request_started or not isinstance(
@@ -1880,8 +2066,12 @@ class _BudgetEnforcerBase:
             with self._state_lock:
                 self._count_release_locked("local_error" if request_started else "setup_failed")
             return False
+        if dispatched_at is not None and self._note_refusal(exc, dispatched_at):
+            with self._state_lock:
+                self._count_release_locked("refused")
+            return False
         breaker = self._control_plane_breaker
-        if breaker is not None and not handle_read_only_key_error(exc):
+        if breaker is not None:
             breaker.record_failure()
         return isinstance(exc, httpx.TimeoutException)
 
@@ -2383,13 +2573,6 @@ class _BudgetEnforcerBase:
                 breaker.record_success()
         return verdict, response
 
-    def _auth_headers(self) -> dict[str, str]:
-        """Return authorization headers for cloud API requests."""
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
     def _new_exit_http_client(self) -> httpx.Client:
         """Build the sync client used by the interpreter-exit lease drain.
 
@@ -2501,7 +2684,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
     def __init__(
         self,
         api_url: str,
-        api_key: str,
+        binding: ProjectBinding,
         budget_mode: BudgetMode = BudgetMode.ALERT_ONLY,
         fail_open: bool = True,
         cache_ttl: int = 5,
@@ -2511,11 +2694,13 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         holder_id: str | None = None,
         lease_enabled: bool = True,
         lease_output_bound_default: int = DEFAULT_OUTPUT_BOUND,
+        validation_timeout: float = 1.0,
     ) -> None:
         require_sync_transport(transport)
         super().__init__(
             api_url=api_url,
-            api_key=api_key,
+            binding=binding,
+            validation_timeout=validation_timeout,
             budget_mode=budget_mode,
             fail_open=fail_open,
             cache_ttl=cache_ttl,
@@ -2584,6 +2769,113 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         estimated_output_bound: int | None = None,
         per_call_only: bool = False,
     ) -> BudgetCheckResult:
+        """Check whether a call is within budget, behind the project gate.
+
+        The entry gate runs first, before the allow cache, the lease path and
+        the breaker-open branch: a refused binding applies its effect here and
+        nothing else is consulted. Every result then passes the exit check, so
+        a refusal recorded by another call while this one was in flight
+        overrides even an outage result (spec section 6.5). The check itself is
+        ``_check_budget_once``.
+        """
+        attempt = 0
+        while True:
+            verdict = self._gate()
+            if isinstance(verdict, StoredRefusal):
+                return self._apply_refusal(verdict)
+            scratch = _CheckScratch()
+            result = self._check_budget_once(
+                estimated_input_tokens=estimated_input_tokens,
+                model=model,
+                provider=provider,
+                fallback_providers=fallback_providers,
+                fallback_models=fallback_models,
+                timeout=timeout,
+                modality=modality,
+                estimated_media=estimated_media,
+                agent_run_id=agent_run_id,
+                tags=tags,
+                call_id=call_id,
+                estimated_output_bound=estimated_output_bound,
+                per_call_only=per_call_only,
+                scratch=scratch,
+            )
+            kept = self._exit_check(verdict, result, scratch, call_id, attempt)
+            if kept is not None:
+                return kept
+            attempt += 1
+
+    def _gate(self) -> StoredRefusal | int:
+        """Entry gate: revalidate when due (never raises), then admit or refuse."""
+        self._drop_leases_after_binding_change()
+        if self._binding.revalidation_due():
+            self._revalidate()
+            self._drop_leases_after_binding_change()
+        return self._binding.admit()
+
+    def _revalidate(self) -> None:
+        """The gate's automatic validation: single-flight, records, never raises."""
+        flight, leader = self._binding.begin_flight()
+        if not leader:
+            flight.done.wait(self._validation_timeout)
+            return
+        try:
+            self._request_auth_key()
+        except Exception as exc:  # the gate must never raise from validation
+            logger.debug("project.validation_failed: %s", type(exc).__name__)
+            self._binding.validation_unavailable()
+        finally:
+            self._binding.end_flight(flight)
+
+    def _request_auth_key(self) -> tuple[str, AuthKeyResponse | None]:
+        """One ``GET /api/v1/auth/key`` folded into the binding."""
+        headers, dispatched_at = self._binding.request_headers(content_type=False)
+        try:
+            resp = self._http.get(
+                self._auth_key_url(), headers=headers, timeout=self._validation_timeout
+            )
+        except Exception as exc:
+            logger.debug("project.validation_unavailable: %s", type(exc).__name__)
+            self._binding.validation_unavailable()
+            return "unavailable", None
+        return self._binding.apply_auth_key(resp.status_code, resp.content, dispatched_at)
+
+    def validate(self) -> AuthKeyResponse | None:
+        """Validate the key and project now (``GET /api/v1/auth/key``).
+
+        Returns the key's details on success and pins the project id. Raises
+        ``ApiKeyRefusedError`` on every refusal, whatever the project's
+        posture. Returns None when Solwyn could not be reached: nothing
+        changes, and calls keep following ``fail_open``.
+        """
+        flight, leader = self._binding.begin_flight()
+        if not leader:
+            flight.done.wait(self._validation_timeout)
+            return self._validation_result("joined", None)
+        try:
+            outcome, auth = self._request_auth_key()
+        finally:
+            self._binding.end_flight(flight)
+        return self._validation_result(outcome, auth)
+
+    def _check_budget_once(
+        self,
+        *,
+        estimated_input_tokens: int,
+        model: str,
+        provider: str,
+        fallback_providers: list[str] = [],  # noqa: B006 — read-only; never mutated
+        fallback_models: list[str] = [],  # noqa: B006 — read-only; never mutated
+        timeout: float | None = None,
+        modality: Modality = "text",
+        estimated_media: MediaUsage | None = None,
+        agent_run_id: str | None = None,
+        tags: dict[str, str] | None = None,
+        call_id: str | None = None,
+        estimated_output_bound: int | None = None,
+        per_call_only: bool = False,
+        scratch: _CheckScratch,
+    ) -> BudgetCheckResult:
         """Check whether a call is within budget.
 
         ``fallback_providers``/``fallback_models`` describe the configured
@@ -2633,6 +2925,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             lease_call_id = (
                 _validated_call_id(call_id) if call_id is not None else _validated_call_id(None)
             )
+            scratch.lease_call_id = lease_call_id
             leased, lease_claim_token = self._check_lease(
                 agent_run_id=agent_run_id,
                 call_id=lease_call_id,
@@ -2731,20 +3024,21 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             request, uncounted_report = self._with_uncounted_report(request)
             # ── Phase 1: transport + HTTP status. Failures here are OUTAGE
             # semantics — unchanged from before the split.
+            headers, dispatched_at = self._binding.request_headers()
             try:
                 request_epoch = time.monotonic()
                 if timeout is not None:
                     resp = self._http.post(
                         f"{self.api_url}/api/v1/budgets/check",
                         json=request.model_dump(mode="json"),
-                        headers=self._auth_headers(),
+                        headers=headers,
                         timeout=timeout,
                     )
                 else:
                     resp = self._http.post(
                         f"{self.api_url}/api/v1/budgets/check",
                         json=request.model_dump(mode="json"),
-                        headers=self._auth_headers(),
+                        headers=headers,
                     )
                 resp.raise_for_status()
                 # The plane answered 2xx: it has folded this request's tally,
@@ -2754,16 +3048,18 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 uncounted_acknowledged, uncounted_drop_status = (
                     self._uncounted_verdict_for_check_error(exc)
                 )
-                # A read-only-key error means the control plane RESPONDED —
-                # record success. Anything else is an outage: record failure.
-                # Log the exception TYPE only (never a body).
-                if handle_read_only_key_error(exc):
+                # A key or project refusal means the control plane RESPONDED:
+                # record it on the binding, credit the breaker (refusals never
+                # open it) and leave through the exit check, which applies it.
+                # It is never the outage ladder. Anything else is an outage:
+                # record failure. Log the exception TYPE only (never a body).
+                if self._note_refusal(exc, dispatched_at):
                     if breaker is not None:
                         breaker.record_success()
-                else:
-                    if breaker is not None:
-                        breaker.record_failure()
-                    logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
+                    return self._refused_placeholder()
+                if breaker is not None:
+                    breaker.record_failure()
+                logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
                 return self._build_unreachable_result(
                     estimated_input_tokens, agent_run_id, call_id=call_id
                 )
@@ -2882,6 +3178,9 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             )
             if verdict == "denied" and response is not None:
                 return self._lease_deny_result(agent_run_id, response), admission.claim_token
+            if verdict == "refused":
+                # The exit check discards this and applies the refusal.
+                return self._refused_placeholder(admission.claim_token), admission.claim_token
             if verdict == "unreachable":
                 if self.fail_open:
                     # Nothing counts this call anywhere: no lease exists yet, so
@@ -2972,23 +3271,27 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 fallback_models=fallback_models,
             )
             payload = request.model_dump(mode="json")
+            headers, dispatched_at = self._binding.request_headers()
             try:
                 if timeout is not None:
                     resp = self._http.post(
                         f"{self.api_url}{_LEASE_PATH}",
                         json=payload,
-                        headers=self._auth_headers(),
+                        headers=headers,
                         timeout=timeout,
                     )
                 else:
                     resp = self._http.post(
                         f"{self.api_url}{_LEASE_PATH}",
                         json=payload,
-                        headers=self._auth_headers(),
+                        headers=headers,
                     )
                 resp.raise_for_status()
             except Exception as exc:
-                return self._classify_lease_failure(exc, agent_run_id), None
+                return (
+                    self._classify_lease_failure(exc, agent_run_id, dispatched_at=dispatched_at),
+                    None,
+                )
 
             verdict, response, late_surrender = self._install_grant(
                 agent_run_id,
@@ -3108,16 +3411,19 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                         expected_generation=request.generation,
                     )
                 return
+            headers, dispatched_at = self._binding.request_headers()
             try:
                 resp = self._http.post(
                     f"{self.api_url}{_LEASE_RENEW_PATH}",
                     json=request.model_dump(mode="json"),
-                    headers=self._auth_headers(),
+                    headers=headers,
                     timeout=_RENEWAL_TIMEOUT_S,
                 )
                 resp.raise_for_status()
             except Exception as exc:
-                self._classify_lease_failure(exc, agent_run_id, renewal_request=request)
+                self._classify_lease_failure(
+                    exc, agent_run_id, renewal_request=request, dispatched_at=dispatched_at
+                )
                 return
             if breaker is not None:
                 breaker.record_success()
@@ -3165,6 +3471,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 breaker = self._control_plane_breaker
                 admission = breaker.admit() if breaker is not None else None
                 request_started = False
+                dispatched_at: int | None = None
                 try:
                     if admission is not None and not admission.allowed:
                         logger.debug("lease.surrender_skipped_breaker_open")
@@ -3179,16 +3486,19 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     if remaining <= 0:
                         return
                     request_started = True
+                    headers, dispatched_at = self._binding.request_headers()
                     client.post(
                         f"{self.api_url}{_LEASE_SURRENDER_PATH}",
                         json=request.model_dump(mode="json"),
-                        headers=self._auth_headers(),
+                        headers=headers,
                         timeout=max(0.001, min(_SURRENDER_TIMEOUT_S, remaining)),
                     ).raise_for_status()
                     if breaker is not None:
                         breaker.record_success()
                 except Exception as exc:
-                    if self._release_failed(exc, request_started=request_started):
+                    if self._release_failed(
+                        exc, request_started=request_started, dispatched_at=dispatched_at
+                    ):
                         continue
                 finally:
                     if breaker is not None:
@@ -3324,7 +3634,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
     def __init__(
         self,
         api_url: str,
-        api_key: str,
+        binding: ProjectBinding,
         budget_mode: BudgetMode = BudgetMode.ALERT_ONLY,
         fail_open: bool = True,
         cache_ttl: int = 5,
@@ -3334,11 +3644,13 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         holder_id: str | None = None,
         lease_enabled: bool = True,
         lease_output_bound_default: int = DEFAULT_OUTPUT_BOUND,
+        validation_timeout: float = 1.0,
     ) -> None:
         validated_transport = require_dual_transport(transport)
         super().__init__(
             api_url=api_url,
-            api_key=api_key,
+            binding=binding,
+            validation_timeout=validation_timeout,
             budget_mode=budget_mode,
             fail_open=fail_open,
             cache_ttl=cache_ttl,
@@ -3420,6 +3732,107 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         estimated_output_bound: int | None = None,
         per_call_only: bool = False,
     ) -> BudgetCheckResult:
+        """Async twin of ``BudgetEnforcer.check_budget`` (same gate and exit check)."""
+        attempt = 0
+        while True:
+            verdict = await self._gate()
+            if isinstance(verdict, StoredRefusal):
+                return self._apply_refusal(verdict)
+            scratch = _CheckScratch()
+            result = await self._check_budget_once(
+                estimated_input_tokens=estimated_input_tokens,
+                model=model,
+                provider=provider,
+                fallback_providers=fallback_providers,
+                fallback_models=fallback_models,
+                timeout=timeout,
+                modality=modality,
+                estimated_media=estimated_media,
+                agent_run_id=agent_run_id,
+                tags=tags,
+                call_id=call_id,
+                estimated_output_bound=estimated_output_bound,
+                per_call_only=per_call_only,
+                scratch=scratch,
+            )
+            kept = self._exit_check(verdict, result, scratch, call_id, attempt)
+            if kept is not None:
+                return kept
+            attempt += 1
+
+    async def _gate(self) -> StoredRefusal | int:
+        """Entry gate: revalidate when due (never raises), then admit or refuse."""
+        self._drop_leases_after_binding_change()
+        if self._binding.revalidation_due():
+            await self._revalidate()
+            self._drop_leases_after_binding_change()
+        return self._binding.admit()
+
+    async def _join_flight(self, flight: object) -> None:
+        """Wait for another task's validation on this loop; never block the loop."""
+        future = getattr(flight, "future", None)
+        if future is None or getattr(flight, "loop", None) is not asyncio.get_running_loop():
+            return
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(future), self._validation_timeout)
+
+    async def _revalidate(self) -> None:
+        """The gate's automatic validation: single-flight, records, never raises."""
+        flight, leader = self._binding.begin_flight(asyncio.get_running_loop())
+        if not leader:
+            await self._join_flight(flight)
+            return
+        try:
+            await self._request_auth_key()
+        except Exception as exc:  # the gate must never raise from validation
+            logger.debug("project.validation_failed: %s", type(exc).__name__)
+            self._binding.validation_unavailable()
+        finally:
+            self._binding.end_flight(flight)
+
+    async def _request_auth_key(self) -> tuple[str, AuthKeyResponse | None]:
+        """One ``GET /api/v1/auth/key`` folded into the binding."""
+        headers, dispatched_at = self._binding.request_headers(content_type=False)
+        try:
+            resp = await self._http.get(
+                self._auth_key_url(), headers=headers, timeout=self._validation_timeout
+            )
+        except Exception as exc:
+            logger.debug("project.validation_unavailable: %s", type(exc).__name__)
+            self._binding.validation_unavailable()
+            return "unavailable", None
+        return self._binding.apply_auth_key(resp.status_code, resp.content, dispatched_at)
+
+    async def validate(self) -> AuthKeyResponse | None:
+        """Async twin of ``BudgetEnforcer.validate``."""
+        flight, leader = self._binding.begin_flight(asyncio.get_running_loop())
+        if not leader:
+            await self._join_flight(flight)
+            return self._validation_result("joined", None)
+        try:
+            outcome, auth = await self._request_auth_key()
+        finally:
+            self._binding.end_flight(flight)
+        return self._validation_result(outcome, auth)
+
+    async def _check_budget_once(
+        self,
+        *,
+        estimated_input_tokens: int,
+        model: str,
+        provider: str,
+        fallback_providers: list[str] = [],  # noqa: B006 — read-only; never mutated
+        fallback_models: list[str] = [],  # noqa: B006 — read-only; never mutated
+        timeout: float | None = None,
+        modality: Modality = "text",
+        estimated_media: MediaUsage | None = None,
+        agent_run_id: str | None = None,
+        tags: dict[str, str] | None = None,
+        call_id: str | None = None,
+        estimated_output_bound: int | None = None,
+        per_call_only: bool = False,
+        scratch: _CheckScratch,
+    ) -> BudgetCheckResult:
         """Async version of budget check. See BudgetEnforcer.check_budget."""
         self._run_cleanup_loop = asyncio.get_running_loop()
         self._drain_pending_run_surrenders()
@@ -3437,6 +3850,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             lease_call_id = (
                 _validated_call_id(call_id) if call_id is not None else _validated_call_id(None)
             )
+            scratch.lease_call_id = lease_call_id
             leased, lease_claim_token = await self._check_lease(
                 agent_run_id=agent_run_id,
                 call_id=lease_call_id,
@@ -3532,20 +3946,21 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             request, uncounted_report = self._with_uncounted_report(request)
             # ── Phase 1: transport + HTTP status. Failures here are OUTAGE
             # semantics — unchanged from before the split.
+            headers, dispatched_at = self._binding.request_headers()
             try:
                 request_epoch = time.monotonic()
                 if timeout is not None:
                     resp = await self._http.post(
                         f"{self.api_url}/api/v1/budgets/check",
                         json=request.model_dump(mode="json"),
-                        headers=self._auth_headers(),
+                        headers=headers,
                         timeout=timeout,
                     )
                 else:
                     resp = await self._http.post(
                         f"{self.api_url}/api/v1/budgets/check",
                         json=request.model_dump(mode="json"),
-                        headers=self._auth_headers(),
+                        headers=headers,
                     )
                 resp.raise_for_status()
                 # The plane answered 2xx: it has folded this request's tally,
@@ -3555,16 +3970,18 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 uncounted_acknowledged, uncounted_drop_status = (
                     self._uncounted_verdict_for_check_error(exc)
                 )
-                # A read-only-key error means the control plane RESPONDED —
-                # record success. Anything else is an outage: record failure.
-                # Log the exception TYPE only (never a body).
-                if handle_read_only_key_error(exc):
+                # A key or project refusal means the control plane RESPONDED:
+                # record it on the binding, credit the breaker (refusals never
+                # open it) and leave through the exit check, which applies it.
+                # It is never the outage ladder. Anything else is an outage:
+                # record failure. Log the exception TYPE only (never a body).
+                if self._note_refusal(exc, dispatched_at):
                     if breaker is not None:
                         breaker.record_success()
-                else:
-                    if breaker is not None:
-                        breaker.record_failure()
-                    logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
+                    return self._refused_placeholder()
+                if breaker is not None:
+                    breaker.record_failure()
+                logger.warning("Cloud API budget check failed: %s", type(exc).__name__)
                 return self._build_unreachable_result(
                     estimated_input_tokens, agent_run_id, call_id=call_id
                 )
@@ -3678,6 +4095,9 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             )
             if verdict == "denied" and response is not None:
                 return self._lease_deny_result(agent_run_id, response), admission.claim_token
+            if verdict == "refused":
+                # The exit check discards this and applies the refusal.
+                return self._refused_placeholder(admission.claim_token), admission.claim_token
             if verdict == "unreachable":
                 if self.fail_open:
                     self._record_uncounted_cold_start(
@@ -3765,23 +4185,27 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 fallback_models=fallback_models,
             )
             payload = request.model_dump(mode="json")
+            headers, dispatched_at = self._binding.request_headers()
             try:
                 if timeout is not None:
                     resp = await self._http.post(
                         f"{self.api_url}{_LEASE_PATH}",
                         json=payload,
-                        headers=self._auth_headers(),
+                        headers=headers,
                         timeout=timeout,
                     )
                 else:
                     resp = await self._http.post(
                         f"{self.api_url}{_LEASE_PATH}",
                         json=payload,
-                        headers=self._auth_headers(),
+                        headers=headers,
                     )
                 resp.raise_for_status()
             except Exception as exc:
-                return self._classify_lease_failure(exc, agent_run_id), None
+                return (
+                    self._classify_lease_failure(exc, agent_run_id, dispatched_at=dispatched_at),
+                    None,
+                )
 
             verdict, response, late_surrender = self._install_grant(
                 agent_run_id,
@@ -3887,16 +4311,19 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                         expected_generation=request.generation,
                     )
                 return
+            headers, dispatched_at = self._binding.request_headers()
             try:
                 resp = await self._http.post(
                     f"{self.api_url}{_LEASE_RENEW_PATH}",
                     json=request.model_dump(mode="json"),
-                    headers=self._auth_headers(),
+                    headers=headers,
                     timeout=_RENEWAL_TIMEOUT_S,
                 )
                 resp.raise_for_status()
             except Exception as exc:
-                self._classify_lease_failure(exc, agent_run_id, renewal_request=request)
+                self._classify_lease_failure(
+                    exc, agent_run_id, renewal_request=request, dispatched_at=dispatched_at
+                )
                 return
             if breaker is not None:
                 breaker.record_success()
@@ -4098,6 +4525,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 breaker = self._control_plane_breaker
                 admission = breaker.admit() if breaker is not None else None
                 request_started = False
+                dispatched_at: int | None = None
                 try:
                     if admission is not None and not admission.allowed:
                         logger.debug("lease.surrender_skipped_breaker_open")
@@ -4107,17 +4535,20 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                     if remaining <= 0:
                         return
                     request_started = True
+                    headers, dispatched_at = self._binding.request_headers()
                     resp = await client.post(
                         f"{self.api_url}{_LEASE_SURRENDER_PATH}",
                         json=request.model_dump(mode="json"),
-                        headers=self._auth_headers(),
+                        headers=headers,
                         timeout=max(0.001, min(_SURRENDER_TIMEOUT_S, remaining)),
                     )
                     resp.raise_for_status()
                     if breaker is not None:
                         breaker.record_success()
                 except Exception as exc:
-                    if self._release_failed(exc, request_started=request_started):
+                    if self._release_failed(
+                        exc, request_started=request_started, dispatched_at=dispatched_at
+                    ):
                         continue
                 finally:
                     if breaker is not None:

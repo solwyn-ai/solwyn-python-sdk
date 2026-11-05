@@ -33,9 +33,10 @@ from typing import TYPE_CHECKING, Protocol, TypeVar
 
 import httpx
 
-from solwyn._read_only_key import handle_read_only_key_error
+from solwyn._api_key_errors import classify_exception
 
 if TYPE_CHECKING:
+    from solwyn._project import ProjectBinding
     from solwyn.budget import _BudgetEnforcerBase
     from solwyn.circuit_breaker import CircuitBreaker
     from solwyn.reporter import (
@@ -311,6 +312,9 @@ def _start_run_worker(*, spans: bool) -> None:
 
 
 _EXIT_BATCH_SIZE = 50
+# Exit outcome (and drop reason) for an item Solwyn refused because of the key
+# or its project: terminal, never retried, never counted against the breaker.
+_API_KEY_REFUSED = "api_key_refused"
 
 # Whole-process budget for handing leases back at exit. A surrender is a
 # courtesy — the server reclaims the float at the lease deadline anyway — so it
@@ -416,7 +420,7 @@ def register_async_reporter(reporter: AsyncMetadataReporter) -> None:
         reporter._settlement_queue,
         reporter._queue,
         reporter.api_url,
-        reporter.api_key,
+        reporter._binding,
         reporter._control_plane_breaker,
         reporter.shutdown_deadline,
         _gc_drop_counter,
@@ -503,13 +507,16 @@ def _exit_surrender_all() -> None:
                             return
                         if client is None:
                             raise RuntimeError("exit surrender client is required")
+                        headers, dispatched_at = holder._binding.request_headers()
                         _post_confirm_blocking(
                             client,
                             f"{holder.api_url}/api/v1/budgets/lease/surrender",
                             request.model_dump(mode="json"),
-                            holder._auth_headers(),
+                            headers,
                             holder._control_plane_breaker,
                             deadline,
+                            binding=holder._binding,
+                            dispatched_at=dispatched_at,
                         )
                 except Exception as exc:
                     _log_warning("lifecycle.exit_surrender_failed: exc_type=%s", type(exc).__name__)
@@ -628,7 +635,7 @@ def blocking_exit_flush(base: AsyncMetadataReporter) -> None:
         base._settlement_queue,
         base._queue,
         base.api_url,
-        base.api_key,
+        base._binding,
         base._control_plane_breaker,
         base.shutdown_deadline,
         base._record_drop,
@@ -805,7 +812,7 @@ def _drain_queues_blocking(
     settlement_q: collections.deque[_PendingSettlement],
     event_q: collections.deque[_PendingEvent],
     api_url: str,
-    api_key: str,
+    binding: ProjectBinding,
     breaker: CircuitBreaker | None,
     budget: float,
     drop_counter: Callable[[str, str, int], None],
@@ -862,10 +869,8 @@ def _drain_queues_blocking(
         return
 
     deadline = _monotonic() + budget
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    # One shot at exit: every request carries the same dispatch generation.
+    headers, dispatched_at = binding.request_headers()
     base_url = api_url.rstrip("/")
     confirm_url = f"{base_url}/api/v1/budgets/confirm"
     ingest_url = f"{base_url}/api/v1/metadata/ingest"
@@ -901,6 +906,8 @@ def _drain_queues_blocking(
                     headers,
                     breaker,
                     deadline,
+                    binding=binding,
+                    dispatched_at=dispatched_at,
                 )
                 if outcome == "expired":
                     # Keep the in-hand item accountable: requeued for the
@@ -931,6 +938,8 @@ def _drain_queues_blocking(
                     headers,
                     breaker,
                     deadline,
+                    binding=binding,
+                    dispatched_at=dispatched_at,
                 )
                 if outcome == "expired":
                     own.requeue(
@@ -960,6 +969,8 @@ def _drain_queues_blocking(
                     [settlement.event.model_dump(mode="json")],
                     headers,
                     deadline,
+                    binding=binding,
+                    dispatched_at=dispatched_at,
                 )
                 if ev_outcome == "expired":
                     own.resolve_disposed(
@@ -1010,6 +1021,8 @@ def _drain_queues_blocking(
                     [p.event.model_dump(mode="json") for p in batch],
                     headers,
                     deadline,
+                    binding=binding,
+                    dispatched_at=dispatched_at,
                 )
                 if outcome == "expired":
                     own.requeue(event_q, batch, {"event": len(batch)})
@@ -1130,6 +1143,9 @@ def _post_confirm_blocking(
     headers: dict[str, str],
     breaker: CircuitBreaker | None,
     deadline: float,
+    *,
+    binding: ProjectBinding | None = None,
+    dispatched_at: int = 0,
 ) -> str:
     """POST one confirm through the breaker's admission state machine.
 
@@ -1145,9 +1161,12 @@ def _post_confirm_blocking(
     if admission is not None and not admission.allowed:
         return "held"
     try:
-        outcome = _post_json(client, url, payload, headers, deadline)
+        outcome = _post_json(
+            client, url, payload, headers, deadline, binding=binding, dispatched_at=dispatched_at
+        )
         if breaker is not None:
-            if outcome == "sent":
+            if outcome in ("sent", _API_KEY_REFUSED):
+                # A key or project refusal is an answer: never an outage.
                 breaker.record_success()
             elif outcome != "expired":
                 breaker.record_failure()
@@ -1165,16 +1184,22 @@ def _post_json(
     payload: object,
     headers: dict[str, str],
     deadline: float,
+    *,
+    binding: ProjectBinding | None = None,
+    dispatched_at: int = 0,
 ) -> str:
     """POST one payload best-effort and classify the outcome (exit is one shot).
 
     Returns ``"sent"``, ``"expired"`` (deadline reached before an attempt), or
     the drop reason for a failed attempt: ``"retry_exhausted"`` for a transient
     failure (the exit budget IS the whole retry budget) or
-    ``"terminal_status"``. A read-only-key rejection is a policy skip, not a
-    loss. Never raises out of the exit hook.
+    ``"terminal_status"``, or ``"api_key_refused"`` when Solwyn refused the
+    key or its project (recorded on ``binding``; terminal, never retried).
+    Never raises out of the exit hook.
     """
-    outcome, _ = _post_json_response(client, url, payload, headers, deadline)
+    outcome, _ = _post_json_response(
+        client, url, payload, headers, deadline, binding=binding, dispatched_at=dispatched_at
+    )
     return outcome
 
 
@@ -1184,6 +1209,9 @@ def _post_json_response(
     payload: object,
     headers: dict[str, str],
     deadline: float,
+    *,
+    binding: ProjectBinding | None = None,
+    dispatched_at: int = 0,
 ) -> tuple[str, httpx.Response | None]:
     """``_post_json`` plus the 2xx response, for callers that parse the body."""
     remaining = deadline - _monotonic()
@@ -1193,8 +1221,11 @@ def _post_json_response(
         response = client.post(url, json=payload, headers=headers, timeout=min(5.0, remaining))
         response.raise_for_status()
     except Exception as exc:
-        if handle_read_only_key_error(exc):
-            return "sent", None
+        refusal = classify_exception(exc)
+        if refusal is not None:
+            if binding is not None:
+                binding.refuse(refusal, dispatched_at)
+            return _API_KEY_REFUSED, None
         if _monotonic() >= deadline:
             # Deadline passed mid-request (e.g. the joiner's best-effort
             # client teardown surfaced here). The loss reason is the deadline,

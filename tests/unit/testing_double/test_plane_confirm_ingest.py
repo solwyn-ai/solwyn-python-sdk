@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 import httpx
 import pytest
+from conftest import plane_binding
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
@@ -154,7 +155,7 @@ def test_expired_reservation_returns_terminal_404_to_real_reporter() -> None:
     plane.expire_reservations()
     reporter = MetadataReporter(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         flush_interval=60,
         max_send_attempts=1,
         transport=plane.transport,
@@ -456,7 +457,7 @@ def test_slow_confirm_does_not_make_reporter_close_overrun_deadline() -> None:
         reservation_id = _reservation(client, plane)
     reporter = MetadataReporter(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         flush_interval=60,
         transport=plane.transport,
     )

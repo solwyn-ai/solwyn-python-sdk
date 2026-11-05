@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 import httpx
 import pytest
-from conftest import call_uuid
+from conftest import call_uuid, plane_binding
 
 from solwyn._otel import capture_trace
 from solwyn._surfaces import SurfaceContext
@@ -37,11 +37,11 @@ async def test_background_http_has_empty_context_while_preflight_keeps_caller_co
             return await plane.transport.handle_async_request(request)
 
     transport = RecordingTransport()
-    enforcer = AsyncBudgetEnforcer(plane.api_url, plane.api_key, transport=transport)
+    enforcer = AsyncBudgetEnforcer(plane.api_url, plane_binding(plane), transport=transport)
     breaker = CircuitBreaker(name="openai")
     reporter = AsyncMetadataReporter(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         transport=transport,
         flush_interval=0.01,
         sdk_instance_id="context-isolation",

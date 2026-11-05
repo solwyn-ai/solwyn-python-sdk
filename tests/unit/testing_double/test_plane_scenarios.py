@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from conftest import plane_binding
 
 from solwyn._types import MetadataEvent
 from solwyn.circuit_breaker import CircuitBreaker
@@ -447,7 +448,7 @@ def test_refuse_checks_429_drives_real_enforcer_to_outage_posture() -> None:
     plane = FakeControlPlane()
     enforcer = BudgetEnforcer(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         cache_ttl=0,
         lease_enabled=False,
         transport=plane.transport,
@@ -479,7 +480,7 @@ def test_three_scripted_outages_open_real_breaker_then_recover() -> None:
     )
     enforcer = BudgetEnforcer(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         cache_ttl=0,
         control_plane_breaker=breaker,
         lease_enabled=False,

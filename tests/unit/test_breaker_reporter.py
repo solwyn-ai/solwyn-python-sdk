@@ -11,7 +11,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, VALID_PROJECT_ID, _accepted_response, call_uuid
+from conftest import (
+    VALID_API_KEY,
+    VALID_PROJECT_ID,
+    _accepted_response,
+    call_uuid,
+    validated_binding,
+)
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, CallStatus, MetadataEvent, ProviderName
@@ -79,7 +85,7 @@ def _quiet_sync_reporter(**kwargs: object) -> MetadataReporter:
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         reporter = MetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             **kwargs,
         )
     reporter._thread.join(timeout=2.0)
@@ -115,7 +121,7 @@ def _async_reporter_with_two_providers() -> tuple[
     }
     reporter = AsyncMetadataReporter(
         "https://api.test.solwyn.ai",
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         breaker_snapshots=lambda: [
             (provider, breaker.get_state()) for provider, breaker in breakers.items()
         ],
@@ -225,7 +231,7 @@ class TestSyncBreakerReporter:
         metadata_calls = 0
         reporter = MetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             flush_interval=0.01,
             breaker_snapshots=lambda: [(ProviderName.OPENAI, CircuitBreaker().get_state())],
             sdk_instance_id=SDK_INSTANCE_ID,
@@ -765,7 +771,7 @@ class TestAsyncBreakerReporter:
         metadata_calls = 0
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             flush_interval=0.01,
             breaker_snapshots=lambda: [(ProviderName.OPENAI, CircuitBreaker().get_state())],
             sdk_instance_id=SDK_INSTANCE_ID,
@@ -818,7 +824,7 @@ class TestAsyncBreakerReporter:
         anthropic = CircuitBreaker(failure_threshold=1)
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             breaker_snapshots=lambda: [
                 (ProviderName.OPENAI, openai.get_state()),
                 (ProviderName.ANTHROPIC, anthropic.get_state()),
@@ -876,7 +882,7 @@ class TestAsyncBreakerReporter:
         release_breaker = asyncio.Event()
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             breaker_snapshots=lambda: [(ProviderName.OPENAI, CircuitBreaker().get_state())],
             sdk_instance_id=SDK_INSTANCE_ID,
         )
@@ -917,7 +923,7 @@ class TestAsyncBreakerReporter:
         breaker = CircuitBreaker(failure_threshold=1)
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             breaker_snapshots=lambda: [(ProviderName.OPENAI, breaker.get_state())],
             sdk_instance_id=SDK_INSTANCE_ID,
         )
@@ -951,7 +957,7 @@ class TestAsyncBreakerReporter:
         anthropic = CircuitBreaker()
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             breaker_snapshots=lambda: [
                 (ProviderName.OPENAI, openai.get_state()),
                 (ProviderName.ANTHROPIC, anthropic.get_state()),
@@ -991,7 +997,7 @@ class TestAsyncBreakerReporter:
     async def test_shutdown_signal_leaves_the_single_final_flush_to_close(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
         shutdown = MagicMock()
         shutdown.is_set.side_effect = [False, True]
@@ -1008,7 +1014,7 @@ class TestAsyncBreakerReporter:
     async def test_idle_flush_tick_does_not_start_breaker_task(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
         shutdown = MagicMock()
         shutdown.is_set.side_effect = [False, True]
@@ -1030,7 +1036,7 @@ class TestAsyncBreakerReporter:
     async def test_close_forces_final_breaker_cycle(self) -> None:
         reporter = AsyncMetadataReporter(
             "https://api.test.solwyn.ai",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
         )
 
         with patch.object(reporter, "_start_breaker_cycle", return_value=None) as start_cycle:

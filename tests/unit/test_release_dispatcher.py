@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
+from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID, validated_binding
 
 from solwyn._types import LeaseSurrenderRequest
 from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer
@@ -83,7 +83,9 @@ def test_sync_burst_has_fixed_workers_and_bounded_pending() -> None:
         return httpx.Response(200, json={})
 
     enforcer = BudgetEnforcer(
-        "https://offline.invalid", VALID_API_KEY, transport=httpx.MockTransport(handle)
+        "https://offline.invalid",
+        validated_binding(VALID_API_KEY),
+        transport=httpx.MockTransport(handle),
     )
     try:
         for i in range(128):
@@ -124,7 +126,9 @@ async def test_async_burst_has_fixed_workers_and_bounded_pending() -> None:
         return httpx.Response(200, json={})
 
     enforcer = AsyncBudgetEnforcer(
-        "https://offline.invalid", VALID_API_KEY, transport=httpx.MockTransport(handle)
+        "https://offline.invalid",
+        validated_binding(VALID_API_KEY),
+        transport=httpx.MockTransport(handle),
     )
     try:
         for i in range(128):
@@ -146,7 +150,7 @@ async def test_async_burst_has_fixed_workers_and_bounded_pending() -> None:
 
 
 async def test_expired_native_releases_construct_no_clients_or_ssl_contexts() -> None:
-    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", validated_binding(VALID_API_KEY))
     request = LeaseSurrenderRequest(
         lease_id="expired", holder_id="test", generation=1, spent_tokens=0
     )
@@ -197,7 +201,7 @@ async def test_native_tls_initialization_is_single_off_loop_owner_and_pool_reuse
     sent = 0
     original_tls = ssl.create_default_context
     original_client = httpx.AsyncClient.__init__
-    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", validated_binding(VALID_API_KEY))
 
     def tls(*args: object, **kwargs: object) -> ssl.SSLContext:
         tls_threads.append(threading.get_ident())
@@ -263,7 +267,9 @@ def test_sync_close_does_not_wait_for_held_constructor(monkeypatch: pytest.Monke
     monkeypatch.setattr(budget, "_SURRENDER_TIMEOUT_S", 0.01)
     entered, gate, closed = threading.Event(), threading.Event(), threading.Event()
     enforcer = BudgetEnforcer(
-        "https://offline.invalid", VALID_API_KEY, transport=httpx.MockTransport(response)
+        "https://offline.invalid",
+        validated_binding(VALID_API_KEY),
+        transport=httpx.MockTransport(response),
     )
     original = httpx.Client.__init__
 
@@ -379,7 +385,9 @@ async def test_failed_initializer_can_recover_without_losing_later_releases() ->
         return response(request)
 
     enforcer = AsyncBudgetEnforcer(
-        "https://offline.invalid", VALID_API_KEY, transport=httpx.MockTransport(handle)
+        "https://offline.invalid",
+        validated_binding(VALID_API_KEY),
+        transport=httpx.MockTransport(handle),
     )
 
     def construct(self: httpx.AsyncClient, *args: object, **kwargs: object) -> None:
@@ -417,7 +425,9 @@ def test_loop_shutdown_does_not_resurrect_release_tasks_or_lose_queued_work() ->
             return response(request)
 
     transport = HeldTransport()
-    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY, transport=transport)
+    enforcer = AsyncBudgetEnforcer(
+        "https://offline.invalid", validated_binding(VALID_API_KEY), transport=transport
+    )
 
     async def produce() -> None:
         for i in range(8):
@@ -439,7 +449,7 @@ async def test_cancelled_constructor_awaiter_does_not_duplicate_native_setup() -
     entered, gate = threading.Event(), threading.Event()
     calls = 0
     original = ssl.create_default_context
-    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", validated_binding(VALID_API_KEY))
 
     def tls(*args: object, **kwargs: object) -> ssl.SSLContext:
         nonlocal calls
@@ -511,7 +521,9 @@ async def test_cancellation_resistant_request_keeps_its_capacity_until_actual_co
         return httpx.Response(200, json={})
 
     enforcer = AsyncBudgetEnforcer(
-        "https://offline.invalid", VALID_API_KEY, transport=httpx.MockTransport(handle)
+        "https://offline.invalid",
+        validated_binding(VALID_API_KEY),
+        transport=httpx.MockTransport(handle),
     )
     try:
         for i in range(8):
@@ -543,7 +555,9 @@ def test_off_loop_queue_saturation_is_bounded_and_expired_work_cannot_release_su
     import solwyn.budget as budget
 
     enforcer = AsyncBudgetEnforcer(
-        "https://offline.invalid", VALID_API_KEY, transport=httpx.MockTransport(response)
+        "https://offline.invalid",
+        validated_binding(VALID_API_KEY),
+        transport=httpx.MockTransport(response),
     )
     with enforcer._state_lock:
         for i in range(128):
@@ -617,7 +631,9 @@ def test_shutdown_cancellation_never_claims_next_queued_request(swallow_cancel: 
                 return httpx.Response(200, json={})
             return response(request)
 
-    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY, transport=Transport())
+    enforcer = AsyncBudgetEnforcer(
+        "https://offline.invalid", validated_binding(VALID_API_KEY), transport=Transport()
+    )
 
     async def produce() -> None:
         for i in range(8):
@@ -696,7 +712,9 @@ async def test_late_grant_during_pool_teardown_transfers_cleanup_to_new_pool() -
         return response(request)
 
     enforcer = AsyncBudgetEnforcer(
-        "https://offline.invalid", VALID_API_KEY, transport=httpx.MockTransport(handle)
+        "https://offline.invalid",
+        validated_binding(VALID_API_KEY),
+        transport=httpx.MockTransport(handle),
     )
 
     def construct(self: httpx.AsyncClient, *args: object, **kwargs: object) -> None:
@@ -875,7 +893,7 @@ def test_sync_pool_teardown_retains_worker_slot_until_late_grants_can_progress(
         patch.object(httpx.HTTPTransport, "handle_request", handle),
         patch.object(httpx.Client, "close", close),
     ):
-        enforcer = BudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+        enforcer = BudgetEnforcer("https://offline.invalid", validated_binding(VALID_API_KEY))
         enforcer.check_budget(**arguments("initial"))
         enforcer.surrender_run("initial")
         assert release_entered.wait(2)
@@ -936,7 +954,7 @@ def test_native_cancelled_initializer_recovers_on_next_loop_without_duplicate_tl
     calls = 0
     sent: list[str] = []
     original = ssl.create_default_context
-    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", validated_binding(VALID_API_KEY))
 
     def tls(*args: object, **kwargs: object) -> ssl.SSLContext:
         nonlocal calls
@@ -988,7 +1006,7 @@ def test_restarting_loops_during_native_tls_does_not_retain_abandoned_loops() ->
     calls = 0
     loops: list[weakref.ReferenceType[asyncio.AbstractEventLoop]] = []
     original = ssl.create_default_context
-    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", validated_binding(VALID_API_KEY))
 
     def tls(*args: object, **kwargs: object) -> ssl.SSLContext:
         nonlocal calls
@@ -1150,7 +1168,9 @@ def test_established_native_release_pool_stays_on_owning_loop_while_alive(
     worker.start()
     breaker = CircuitBreaker(name="control-plane", failure_threshold=1)
     enforcer = AsyncBudgetEnforcer(
-        f"http://127.0.0.1:{server.server_port}", VALID_API_KEY, control_plane_breaker=breaker
+        f"http://127.0.0.1:{server.server_port}",
+        validated_binding(VALID_API_KEY),
+        control_plane_breaker=breaker,
     )
     original = httpx.AsyncHTTPTransport.handle_async_request
     owner = asyncio.new_event_loop()
@@ -1214,7 +1234,7 @@ def test_established_native_release_pool_stays_on_owning_loop_while_alive(
 def test_pending_native_initializer_cannot_be_taken_from_its_live_loop() -> None:
     entered, finish = threading.Event(), threading.Event()
     original = ssl.create_default_context
-    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", validated_binding(VALID_API_KEY))
     owner = asyncio.new_event_loop()
     sent: list[str] = []
 
@@ -1256,7 +1276,7 @@ def test_pending_native_initializer_cannot_be_taken_from_its_live_loop() -> None
 
 
 def test_native_pool_teardown_keeps_loop_ownership_after_httpx_marks_closed() -> None:
-    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", validated_binding(VALID_API_KEY))
     owner = asyncio.new_event_loop()
     entered, finish = asyncio.Event(), asyncio.Event()
     original = httpx.AsyncHTTPTransport.aclose
@@ -1302,7 +1322,7 @@ def test_native_pool_teardown_keeps_loop_ownership_after_httpx_marks_closed() ->
 def test_native_release_pool_recovers_after_asyncio_run_closes_owner(
     release_before_close: bool,
 ) -> None:
-    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", validated_binding(VALID_API_KEY))
     sent: list[str] = []
     pools: list[weakref.ReferenceType[httpx.AsyncClient]] = []
 
@@ -1350,7 +1370,7 @@ def test_native_release_pool_recovers_after_asyncio_run_closes_owner(
 
 
 def test_queued_release_fence_gets_a_waiter_on_the_new_loop() -> None:
-    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", validated_binding(VALID_API_KEY))
     held = 0
     second_loop = False
     order: list[str] = []
@@ -1403,7 +1423,7 @@ def test_queued_release_fence_gets_a_waiter_on_the_new_loop() -> None:
 def test_closed_loop_pending_native_initializer_retires_only_its_owned_release() -> None:
     entered, finish = threading.Event(), threading.Event()
     original = ssl.create_default_context
-    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", validated_binding(VALID_API_KEY))
     owner = asyncio.new_event_loop()
     owner.set_exception_handler(lambda _loop, _context: None)  # Deliberately abandoned tasks.
     sent: list[str] = []
@@ -1448,7 +1468,7 @@ def test_closed_loop_pending_native_initializer_retires_only_its_owned_release()
 
 
 def test_abandoned_pool_closer_cannot_clear_replacement_pool_or_closer() -> None:
-    enforcer = AsyncBudgetEnforcer("https://offline.invalid", VALID_API_KEY)
+    enforcer = AsyncBudgetEnforcer("https://offline.invalid", validated_binding(VALID_API_KEY))
     owner = asyncio.new_event_loop()
     owner.set_exception_handler(lambda _loop, _context: None)  # Deliberately abandoned tasks.
     entered = asyncio.Event()

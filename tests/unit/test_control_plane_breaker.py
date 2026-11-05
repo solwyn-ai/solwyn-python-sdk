@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, call_uuid
+from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, call_uuid, validated_binding
 
 import solwyn.circuit_breaker as circuit_breaker_mod
 from solwyn._token_details import TokenDetails
@@ -79,7 +79,7 @@ def _make_enforcer(
 ) -> BudgetEnforcer:
     enforcer = BudgetEnforcer(
         "http://control-plane.test",
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         fail_open=fail_open,
         control_plane_breaker=breaker,
         transport=httpx.MockTransport(transport.handler),
@@ -201,7 +201,7 @@ def _make_reporter(
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         reporter = MetadataReporter(
             "http://control-plane.test",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             control_plane_breaker=breaker,
         )
     reporter._shutdown.set()
@@ -331,7 +331,7 @@ class TestProbeCancellationRecovery:
         transport = _ParkingAsyncTransport()
         enforcer = AsyncBudgetEnforcer(
             "http://control-plane.test",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             fail_open=True,
             control_plane_breaker=breaker,
         )
@@ -367,7 +367,7 @@ class TestProbeCancellationRecovery:
         transport = _ParkingAsyncTransport()
         reporter = AsyncMetadataReporter(
             "http://control-plane.test",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             control_plane_breaker=breaker,
         )
         await reporter._http.aclose()
@@ -455,7 +455,7 @@ class TestAdmissionOverload:
         transport = _OverloadTransport()
         enforcer = BudgetEnforcer(
             "http://control-plane.test",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             budget_mode=BudgetMode.HARD_DENY,
             control_plane_breaker=breaker,
             lease_enabled=False,
@@ -486,7 +486,7 @@ class TestAdmissionOverload:
         transport = _OverloadTransport()
         enforcer = BudgetEnforcer(
             "http://control-plane.test",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             control_plane_breaker=breaker,
             transport=httpx.MockTransport(transport.handler),
         )

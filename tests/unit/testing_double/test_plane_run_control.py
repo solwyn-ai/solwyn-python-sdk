@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from conftest import plane_binding
 
 import solwyn as solwyn_pkg
 from solwyn._types import LeaseRenewRequest, ProviderName
@@ -77,7 +78,7 @@ def _grant_payload(
 def _make_enforcer(plane: FakeControlPlane, **overrides: object) -> BudgetEnforcer:
     options: dict[str, object] = {
         "api_url": plane.api_url,
-        "api_key": plane.api_key,
+        "binding": plane_binding(plane),
         "cache_ttl": 0,
         "transport": plane.transport,
         "holder_id": "holder-1",
