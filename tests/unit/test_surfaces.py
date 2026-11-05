@@ -1155,7 +1155,14 @@ def test_together_241_operations_and_mirrors_remain_exact_untracked_surfaces(mod
             "estimate_cost",
             "list_events",
         },
-        "post_training.model_resources": {"create", "retrieve", "list", "estimate_cost", "stop"},
+        "post_training.model_resources": {
+            "create",
+            "retrieve",
+            "list",
+            "estimate_cost",
+            "stop",
+            "extend_expiry",
+        },
         "post_training.supported_models": {"get"},
         "projects": {"list"},
     }
@@ -1368,6 +1375,28 @@ def test_openai_webhook_management_and_mirrors_remain_exact_untracked_surfaces(
         "with_streaming_response.webhooks.event_types.future_operation",
     ):
         assert resolve_surface_rule(context=context, path=path, source=SurfaceSource.RAW) is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("provider", ["openai", "azure_openai", "openai_compatible", "together"])
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_openai_346_admin_resources_remain_exact_untracked_surfaces(
+    provider: str, mode: str
+) -> None:
+    # openai 3.46 adds project service-tier settings and organization workload
+    # identity providers (with their federation rules): account administration,
+    # classified like `projects.data_retention`, `certificates` and
+    # `groups.roles`. Guarded namespaces with exact unmetered operations and
+    # raw/streaming mirrors, never metered.
+    context = SurfaceContext(provider, "openai", "openai_sdk", mode)
+    crud = {"create", "delete", "list", "retrieve", "update"}
+    families = {
+        "admin.organization.projects.service_tier_settings": {"retrieve", "update"},
+        "admin.organization.workload_identity_providers": crud,
+        "admin.organization.workload_identity_providers.federation_rules": crud,
+    }
+    for base, operations in families.items():
+        _assert_exact_guarded_family(context, base, operations)
 
 
 @pytest.mark.unit
