@@ -57,7 +57,13 @@ from solwyn._lifecycle import (
     register_fork_reset,
     register_lease_holder,
 )
-from solwyn._project import ProjectBinding, StoredRefusal, async_status_hook, sync_status_hook
+from solwyn._project import (
+    ProjectBinding,
+    StoredRefusal,
+    async_status_hook,
+    saw_401,
+    sync_status_hook,
+)
 from solwyn._run_control import clear_termination_if
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
@@ -593,6 +599,10 @@ class _BudgetEnforcerBase:
         refusal = self._binding.refusal
         if self._binding.state == "refused" and refusal is not None:
             raise refusal.error()
+        if outcome == "unavailable":
+            # Solwyn could not be reached this time: say so (None), whatever an
+            # earlier validation returned. The binding keeps its state.
+            return None
         if self._binding.state == "valid":
             return auth if outcome == "valid" else self._binding.last_auth
         return None
@@ -2885,7 +2895,7 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             )
         except Exception as exc:
             # A 401 whose body never arrived is still a refusal, never an outage.
-            if self._binding.refuse_unread_401(exc, dispatched_at):
+            if saw_401(exc):  # recorded by the body guard; never an outage
                 return "refused", None
             logger.debug("project.validation_unavailable: %s", type(exc).__name__)
             self._binding.validation_unavailable()
@@ -2894,7 +2904,6 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             resp.status_code,
             resp.content,
             dispatched_at,
-            refines=self._binding.provisional_for(resp.request),
         )
 
     def validate(self) -> AuthKeyResponse | None:
@@ -3892,7 +3901,7 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             )
         except Exception as exc:
             # A 401 whose body never arrived is still a refusal, never an outage.
-            if self._binding.refuse_unread_401(exc, dispatched_at):
+            if saw_401(exc):  # recorded by the body guard; never an outage
                 return "refused", None
             logger.debug("project.validation_unavailable: %s", type(exc).__name__)
             self._binding.validation_unavailable()
@@ -3901,7 +3910,6 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             resp.status_code,
             resp.content,
             dispatched_at,
-            refines=self._binding.provisional_for(resp.request),
         )
 
     async def validate(self) -> AuthKeyResponse | None:

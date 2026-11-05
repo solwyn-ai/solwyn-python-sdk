@@ -104,7 +104,9 @@ expired or revoked. One exception keeps alert-only apps running: after the
 client has validated once, an expired or revoked key on a project that
 promises to block nothing (alert-only, with no unpaused hard budget rule or
 run cap) lets calls run unmetered, logging `solwyn.api_key_refused` at error
-on every call. At startup every refusal blocks.
+on every call. A 401 always blocks first; the SDK then re-checks the key at
+once, and only that fresh answer can let calls run unmetered, so the call that
+met the 401 pays one extra round trip. At startup every refusal blocks.
 
 Old project keys (`sk_proj_...`) no longer work; the SDK rejects them when
 the client is constructed. Create a key in the dashboard or with

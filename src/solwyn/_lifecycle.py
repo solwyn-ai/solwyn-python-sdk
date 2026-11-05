@@ -1081,7 +1081,14 @@ def _drain_queues_blocking(
                             timeout=max(0.001, deadline - _monotonic()),
                         )
                         response.raise_for_status()
-                    except Exception:
+                    except Exception as exc:
+                        # Advisory, but still an answer about the key: a refusal
+                        # is recorded on the shared binding (so a live enforcer
+                        # sharing it stops admitting) and the batch is dropped
+                        # terminally; anything else stays best effort.
+                        if binding.note_refusal(exc, dispatched_at):
+                            untracked_state.mark_sent(advisory_batch)
+                            break
                         continue
                     untracked_state.mark_sent(advisory_batch)
         except Exception as exc:

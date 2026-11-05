@@ -124,7 +124,9 @@ def test_1_stalled_401_body_on_a_check_blocks_instead_of_failing_open() -> None:
         "unknown",
         "block",
     )
-    assert seen == [_CHECK_PATH]  # the second call never left the gate
+    # The check, then the immediate revalidation its 401 scheduled (also a
+    # stalled 401, so still blocked); the second call never left the gate.
+    assert seen == [_CHECK_PATH, AUTH_KEY_PATH]
 
 
 @pytest.mark.unit
@@ -197,33 +199,29 @@ def test_1_stalled_401_body_tightens_an_allow_unmetered_refusal() -> None:
 
 
 @pytest.mark.unit
-def test_1_readable_401_never_flips_an_allow_unmetered_client_to_block() -> None:
+def test_1_alert_only_client_blocks_on_a_401_status_then_relaxes_promptly() -> None:
     plane = FakeControlPlane(mode="alert_only")
-    client = plane.wrap(_StubOpenAI(), lease_enabled=False)
-    clock = [10_000.0]
-    client._solwyn_binding._clock = lambda: clock[0]
+    stub = _StubOpenAI()
+    client = plane.wrap(stub, lease_enabled=False)
     effects: list[str] = []
-    client._solwyn_binding.add_listener(
-        lambda: effects.append(
-            client._solwyn_binding.refusal.effect if client._solwyn_binding.refusal else "none"
-        )
-    )
     try:
         client.validate()
+        client._solwyn_binding.add_listener(
+            lambda: effects.append(
+                client._solwyn_binding.refusal.effect if client._solwyn_binding.refusal else "none"
+            )
+        )
         plane.expire_key()
-        client.chat.completions.create(model="gpt-5.5", messages=_MESSAGES)
-        clock[0] += 61
+        auth_before = len(plane.auth_key_requests)
         client.chat.completions.create(model="gpt-5.5", messages=_MESSAGES)
     finally:
         client.close()
 
-    # The first 401 is held as a provisional block until its body is read,
-    # then refined. Once the client runs unmetered, the revalidation's 401 is
-    # only marked: it never passes through a blocking state.
-    first_unmetered = effects.index("allow_unmetered")
-    assert "block" not in effects[first_unmetered:]
-    assert client._solwyn_binding.refusal is not None
-    assert client._solwyn_binding.refusal.effect == "allow_unmetered"
+    # The 401 status blocked at once (the brief window); the immediate
+    # revalidation, sent by the same call, relaxed it and the call ran.
+    assert effects[:2] == ["block", "allow_unmetered"]
+    assert len(plane.auth_key_requests) == auth_before + 1
+    assert stub.chat.completions.calls == 1
 
 
 # ── 2. every physical dispatch checks the binding ─────────────────────────
@@ -620,7 +618,7 @@ def test_7_a_delayed_refinement_never_weakens_a_refusal_finalized_meanwhile(
 
 
 @pytest.mark.unit
-def test_7_control_an_unchallenged_provisional_refusal_is_refined_by_its_own_body() -> None:
+def test_7_a_401_body_never_relaxes_its_own_status_block() -> None:
     binding = validated_binding()
     request = httpx.Request("POST", f"{_URL}{_CHECK_PATH}")
     _headers, dispatched_at = binding.request_headers()
@@ -630,7 +628,7 @@ def test_7_control_an_unchallenged_provisional_refusal_is_refined_by_its_own_bod
     assert binding.note_refusal(_status_error(response), dispatched_at)
 
     assert binding.refusal is not None
-    assert (binding.refusal.code, binding.refusal.effect) == ("api_key_expired", "allow_unmetered")
+    assert binding.refusal.effect == "block"
 
 
 # ── 8. special native paths re-check the stored refusal ───────────────────

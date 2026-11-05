@@ -2033,6 +2033,13 @@ def _failover_hop_bound(
     )
 
 
+def _raise_if_dispatch_refused(client: Solwyn | AsyncSolwyn) -> None:
+    """Raise the stored blocking refusal, if any (deferred-dispatch entry guard)."""
+    refusal = client._solwyn_budget.dispatch_refusal()
+    if refusal is not None:
+        raise refusal.error()
+
+
 def _refuse_dispatch_if_key_refused(
     client: Solwyn | AsyncSolwyn,
     *,
@@ -3826,6 +3833,7 @@ class Solwyn(_SolwynBase):
                                 provider_failure=False,
                             ),
                             on_entry_error=on_entry_error,
+                            entry_guard=functools.partial(_raise_if_dispatch_refused, self),
                             on_abandoned_before_entry=_make_reservation_release_handler(
                                 self, budget, call_id=call_id, breaker=cb, admission=admission
                             ),
@@ -5929,6 +5937,7 @@ class AsyncSolwyn(_SolwynBase):
                                 provider_failure=False,
                             ),
                             on_entry_error=on_entry_error,
+                            entry_guard=functools.partial(_raise_if_dispatch_refused, self),
                             on_abandoned_before_entry=_make_async_reservation_release_handler(
                                 self, budget, call_id=call_id, breaker=cb, admission=admission
                             ),

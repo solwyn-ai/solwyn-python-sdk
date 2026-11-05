@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 
+import httpx
 import pytest
 from conftest import VALID_API_KEY, VALID_PROJECT, VALID_PROJECT_ID, auth_key_body
 
@@ -120,7 +121,7 @@ def test_unavailable_answers_keep_state_and_schedule_a_retry(status: int, conten
 @pytest.mark.unit
 def test_refused_state_retries_every_sixty_seconds() -> None:
     binding, clock = _binding()
-    binding.refuse(Refusal(code="api_key_invalid"), binding.generation)
+    binding.refuse(Refusal(code="project_not_found"), binding.generation)
 
     assert binding.revalidation_due() is False
     clock.now += REFUSED_RETRY_S - 1
@@ -129,6 +130,75 @@ def test_refused_state_retries_every_sixty_seconds() -> None:
     assert binding.revalidation_due() is True
     binding.validation_unavailable()
     assert binding.revalidation_due() is False
+
+
+@pytest.mark.unit
+def test_a_data_plane_401_schedules_an_immediate_revalidation() -> None:
+    binding, clock = _binding()
+    _validate(binding)
+
+    binding.refuse(Refusal(code="api_key_expired", posture="alert_only"), binding.generation)
+
+    assert binding.revalidation_due() is True
+
+
+@pytest.mark.unit
+def test_a_validation_answer_keeps_the_sixty_second_cadence() -> None:
+    binding, clock = _binding()
+    _headers, dispatched_at = binding.request_headers()
+
+    binding.apply_auth_key(401, b'{"detail":{"code":"api_key_invalid"}}', dispatched_at)
+
+    assert binding.revalidation_due() is False
+    clock.now += REFUSED_RETRY_S
+    assert binding.revalidation_due() is True
+
+
+@pytest.mark.unit
+def test_a_401_status_blocks_and_its_own_body_never_relaxes_it() -> None:
+    binding, _clock = _binding()
+    _validate(binding)
+    request = httpx.Request("POST", "https://api.test.solwyn.ai/api/v1/budgets/check")
+    _headers, dispatched_at = binding.request_headers()
+
+    binding.observe_status(httpx.Response(401, request=request))
+    assert binding.refusal is not None and binding.refusal.effect == "block"
+    body = httpx.Response(
+        401,
+        request=request,
+        content=b'{"detail":{"code":"api_key_expired","project_budget_mode":"alert_only"}}',
+    )
+    error = httpx.HTTPStatusError("refused", request=request, response=body)
+
+    assert binding.note_refusal(error, dispatched_at)
+    assert binding.refusal.effect == "block"
+
+
+@pytest.mark.unit
+def test_only_a_revalidation_dispatched_after_the_refusal_relaxes_it() -> None:
+    binding, _clock = _binding()
+    _validate(binding)
+    request = httpx.Request("POST", "https://api.test.solwyn.ai/api/v1/budgets/check")
+    binding.observe_status(httpx.Response(401, request=request))
+    _headers, revalidation_dispatch = binding.request_headers()
+    body = b'{"detail":{"code":"api_key_expired","project_budget_mode":"alert_only"}}'
+
+    outcome, _ = binding.apply_auth_key(401, body, revalidation_dispatch)
+
+    assert outcome == "refused"
+    assert binding.refusal is not None and binding.refusal.effect == "allow_unmetered"
+
+
+@pytest.mark.unit
+def test_a_401_to_auth_key_does_not_block_at_its_status() -> None:
+    binding, _clock = _binding()
+    _validate(binding)
+    binding.refuse(Refusal(code="api_key_expired", posture="alert_only"), binding.generation)
+    request = httpx.Request("GET", "https://api.test.solwyn.ai/api/v1/auth/key")
+
+    binding.observe_status(httpx.Response(401, request=request))
+
+    assert binding.refusal is not None and binding.refusal.effect == "allow_unmetered"
 
 
 @pytest.mark.unit

@@ -7,11 +7,15 @@ and the exit drain of one client. It owns:
   once ``GET /api/v1/auth/key`` answered 200, the configured selector before);
 - the validation state (``unvalidated``, ``valid``, ``refused``) and the stored
   refusal with its effect (``block`` or ``allow_unmetered``);
-- the generation fence: every request captures ``d = generation`` when it
-  builds its headers, and every mutation takes ``d``. A validation success
-  applies only when nothing changed since its dispatch; a refusal may always
-  tighten, but may relax only when it was dispatched after the stored refusal
-  was recorded. So a delayed response never weakens or clears a newer refusal.
+- one rule for every change: a refusal only ever TIGHTENS the stored state.
+  It is relaxed (``block`` to ``allow_unmetered``, or cleared) only by the
+  classified answer of a request dispatched after the stored refusal was
+  recorded, in practice the single-flight ``/auth/key`` revalidation. Every
+  request captures ``d = generation`` when it builds its headers, and every
+  mutation takes ``d``. A data-plane 401 status records a block before its
+  body is read (a body that stalls or is cancelled cannot fail open) and
+  schedules an immediate revalidation, whose answer may relax it; that 401's
+  own body never does.
 
 The binding is sans-I/O and thread-safe. The enforcers perform the
 ``/auth/key`` request and call back into it.
@@ -23,9 +27,9 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 from pydantic import ValidationError
@@ -37,7 +41,7 @@ from solwyn._api_key_errors import (
     classify_exception,
     refusal_message,
 )
-from solwyn._constants import PROJECT_HEADER
+from solwyn._constants import AUTH_KEY_PATH, PROJECT_HEADER
 from solwyn._types import AuthKeyResponse
 from solwyn._validation import validate_project_selector
 from solwyn.exceptions import ApiKeyRefusedError, ConfigurationError
@@ -53,8 +57,8 @@ ExitVerdict = Literal["keep", "refused", "rerun"]
 UNVALIDATED_RETRY_S = 30.0
 REFUSED_RETRY_S = 60.0
 
-# Request extension key the 401 status hook writes: the provisional-refusal
-# token (or ``True`` when it only marked the request). See ``observe_status``.
+# Request extension the 401 status hook sets, so the caller can tell an unread
+# 401 (a refusal already recorded) from an outage.
 _STATUS_401_EXTENSION = "solwyn.status_401"
 
 # Codes whose refusal may run calls unmetered once the client has validated:
@@ -104,6 +108,60 @@ def _request_of(exc: BaseException) -> httpx.Request | None:
         return None
 
 
+class _ValidationBodyGuard(httpx.SyncByteStream, httpx.AsyncByteStream):
+    """The body of a 401 answer to ``/auth/key``: refuse if it cannot be read.
+
+    A validation 401 does not block at its status (its classified body is the
+    one answer that may relax a stored refusal), so a body that times out, is
+    cancelled or fails in any other way records the blocking refusal here.
+    """
+
+    def __init__(self, inner: Any, binding: ProjectBinding) -> None:
+        self._inner = inner
+        self._binding = binding
+
+    def _refuse_unread(self) -> None:
+        self._binding.refuse(
+            Refusal(code="api_key_invalid"), self._binding.generation, from_validation=True
+        )
+
+    def __iter__(self) -> Iterator[bytes]:
+        try:
+            yield from self._inner
+        except BaseException:
+            self._refuse_unread()
+            raise
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        try:
+            async for chunk in self._inner:
+                yield chunk
+        except BaseException:
+            self._refuse_unread()
+            raise
+
+    def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        if close is not None:
+            close()
+
+    async def aclose(self) -> None:
+        aclose = getattr(self._inner, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+def saw_401(exc: BaseException) -> bool:
+    """Whether ``exc`` ended a request whose 401 status the hook already saw."""
+    request = _request_of(exc)
+    if request is None:
+        return False
+    try:
+        return request.extensions.get(_STATUS_401_EXTENSION) is True
+    except Exception:
+        return False
+
+
 def sync_status_hook(binding: ProjectBinding) -> Callable[[httpx.Response], None]:
     """``event_hooks["response"]`` entry for a sync control-plane client."""
 
@@ -142,9 +200,6 @@ class ProjectBinding:
         self._refusal_gen = 0
         self._next_validate_at = 0.0
         self._flight: _Flight | None = None
-        # Identity of the provisional refusal a 401 status recorded before its
-        # body was read; only the same request's body may then replace it.
-        self._provisional: object | None = None
         self._last_auth: AuthKeyResponse | None = None
         self._listeners: list[Callable[[], None]] = []
         self._logged_codes: set[str] = set()
@@ -222,145 +277,118 @@ class ProjectBinding:
         return "block"
 
     def refuse(
-        self, refusal: Refusal, dispatched_at: int, *, refines: object | None = None
+        self, refusal: Refusal, dispatched_at: int, *, from_validation: bool = False
     ) -> bool:
-        """Record a refusal under the fence; True when the stored refusal changed.
+        """Record a refusal; True when the stored refusal changed.
 
-        ``refines`` is the provisional token the same request's 401 status
-        recorded (``observe_status``); while that provisional refusal is still
-        the stored one, this request's classified body replaces it whatever
-        its strength.
+        Tightening (or an equally strong refusal with new details) always
+        applies. Relaxing ``block`` to ``allow_unmetered`` applies only when
+        the answer was dispatched after the stored refusal was recorded
+        (``dispatched_at >= refusal_gen``). ``from_validation`` marks an
+        ``/auth/key`` answer: it keeps the regular retry cadence, while a new
+        401-class refusal from any other request schedules an immediate
+        revalidation, so an alert-only project relaxes promptly.
         """
-        return self._refuse(refusal, dispatched_at, refines=refines, provisional=False)
-
-    def _refuse(
-        self,
-        refusal: Refusal,
-        dispatched_at: int,
-        *,
-        refines: object | None,
-        provisional: bool,
-    ) -> bool:
         message, field = refusal_message(refusal, self.selector)
-        token: object | None = None
         with self._lock:
-            effect = self._effect_locked(refusal)
-            stored = self._refusal
-            refining = refines is not None and refines is self._provisional
-            if stored is not None and not refining:
-                weaker = stored.effect == "block" and effect == "allow_unmetered"
-                if weaker and dispatched_at < self._refusal_gen:
-                    # An answer older than the stored refusal carries staler
-                    # server state: it may never loosen it.
-                    return False
-                if (stored.code, stored.message, stored.effect, stored.posture) == (
-                    refusal.code,
-                    message,
-                    effect,
-                    refusal.posture,
-                ):
-                    # Another response confirmed the stored refusal: it is
-                    # final now, and a provisional request's delayed body may
-                    # no longer replace it (it falls under the fence instead).
-                    if not provisional:
-                        self._provisional = None
-                    return False
-            self._refusal = StoredRefusal(
-                code=refusal.code,
-                message=message,
-                field=field,
-                effect=effect,
-                posture=refusal.posture,
+            changed, log_first, listeners = self._record_locked(
+                refusal, message, field, dispatched_at, from_validation=from_validation
             )
-            self._state = "refused"
-            self._generation += 1
-            self._refusal_gen = self._generation
-            self._next_validate_at = self._clock() + REFUSED_RETRY_S
-            if provisional:
-                token = object()
-            self._provisional = token
-            first_for_code = not provisional and refusal.code not in self._logged_codes
-            if first_for_code:
-                self._logged_codes.add(refusal.code)
-            listeners = list(self._listeners)
-        if first_for_code:
+        if log_first:
             logger.error("solwyn.configuration_error.%s: %s", refusal.code, message)
         for listener in listeners:
             listener()
-        return True
+        return changed
+
+    def _record_locked(
+        self,
+        refusal: Refusal,
+        message: str,
+        field: str,
+        dispatched_at: int,
+        *,
+        from_validation: bool,
+    ) -> tuple[bool, bool, list[Callable[[], None]]]:
+        """Apply one refusal under the lock: (changed, log it, listeners)."""
+        now = self._clock()
+        if from_validation:
+            self._next_validate_at = now + REFUSED_RETRY_S
+        effect = self._effect_locked(refusal)
+        stored = self._refusal
+        if stored is not None:
+            relaxes = stored.effect == "block" and effect == "allow_unmetered"
+            if relaxes and dispatched_at < self._refusal_gen:
+                return False, False, []
+            if (stored.code, stored.message, stored.effect, stored.posture) == (
+                refusal.code,
+                message,
+                effect,
+                refusal.posture,
+            ):
+                return False, False, []
+        self._refusal = StoredRefusal(
+            code=refusal.code,
+            message=message,
+            field=field,
+            effect=effect,
+            posture=refusal.posture,
+        )
+        self._state = "refused"
+        self._generation += 1
+        self._refusal_gen = self._generation
+        if not from_validation:
+            immediate = refusal.code in _RELAXABLE_CODES
+            self._next_validate_at = now if immediate else now + REFUSED_RETRY_S
+        log_first = refusal.code not in self._logged_codes
+        if log_first:
+            self._logged_codes.add(refusal.code)
+        return True, log_first, list(self._listeners)
 
     def observe_status(self, response: httpx.Response) -> None:
         """Response hook: act on a 401 status before its body is read.
 
-        A 401 body that stalls would otherwise surface as a read timeout, which
-        every caller treats as an outage, and the call would fail open. So the
-        status alone is enough to refuse: with no stored refusal, a blocking
-        ``api_key_invalid`` (posture ``unknown``) is recorded at once, and the
-        body, once read, refines it. With a refusal already stored the request
-        is only marked: an alert-only client is never flipped to blocking by
-        its own revalidation, and a body that never arrives still records the
-        blocking refusal through ``refuse_unread_401``.
+        Any data-plane 401 records a blocking ``api_key_invalid`` (posture
+        ``unknown``) at once, unless a block is already stored: a body that
+        stalls, times out or is cancelled can then never fail open, and that
+        body, however late, never relaxes it. A 401 answer to ``/auth/key`` is
+        the revalidation whose classified body may relax a stored refusal, so
+        it does not block at its status; its body is guarded instead.
         """
         if response.status_code != 401:
             return
+        request = response.request
+        request.extensions[_STATUS_401_EXTENSION] = True
+        if request.url.path.endswith(AUTH_KEY_PATH):
+            response.stream = _ValidationBodyGuard(response.stream, self)
+            return
+        refusal = Refusal(code="api_key_invalid")
+        message, field = refusal_message(refusal, self.selector)
         with self._lock:
-            already_refused = self._refusal is not None
-        marker: object = True
-        if not already_refused:
-            self._refuse(
-                Refusal(code="api_key_invalid"), self.generation, refines=None, provisional=True
+            stored = self._refusal
+            if stored is not None and stored.effect == "block":
+                return  # already blocking, with possibly more precise details
+            _changed, log_first, listeners = self._record_locked(
+                refusal, message, field, self._generation, from_validation=False
             )
-            with self._lock:
-                marker = self._provisional if self._provisional is not None else True
-        response.request.extensions[_STATUS_401_EXTENSION] = marker
-
-    def provisional_for(self, request: httpx.Request | None) -> object | None:
-        """The provisional token ``observe_status`` left on ``request``, if any."""
-        if request is None:
-            return None
-        try:
-            marker = request.extensions.get(_STATUS_401_EXTENSION)
-        except Exception:
-            return None
-        return None if marker is None or marker is True else marker
+        if log_first:
+            logger.error("solwyn.configuration_error.%s: %s", refusal.code, message)
+        for listener in listeners:
+            listener()
 
     def note_refusal(self, exc: BaseException, dispatched_at: int) -> bool:
         """Record the key or project refusal ``exc`` carries; True when it was one.
 
-        Covers a classified refusal answer (refining this request's provisional
-        refusal when there is one) and a 401 whose body never arrived.
+        A 401 whose body never arrived was already recorded at its status, so
+        it counts as a refusal (never an outage) here too.
         """
         refusal = classify_exception(exc)
-        if refusal is None:
-            return self.refuse_unread_401(exc, dispatched_at)
-        self.refuse(refusal, dispatched_at, refines=self.provisional_for(_request_of(exc)))
-        return True
-
-    def refuse_unread_401(self, exc: BaseException, dispatched_at: int) -> bool:
-        """A request whose 401 status arrived but whose body did not: refuse it.
-
-        Every 401 is a refusal; one with no readable body is ``api_key_invalid``
-        with posture ``unknown``, which blocks.
-        """
-        request = _request_of(exc)
-        if request is None:
-            return False
-        try:
-            marker = request.extensions.get(_STATUS_401_EXTENSION)
-        except Exception:
-            return False
-        if marker is None:
-            return False
-        self.refuse(Refusal(code="api_key_invalid"), dispatched_at)
-        return True
+        if refusal is not None:
+            self.refuse(refusal, dispatched_at)
+            return True
+        return saw_401(exc)
 
     def apply_auth_key(
-        self,
-        status: int,
-        content: bytes,
-        dispatched_at: int,
-        *,
-        refines: object | None = None,
+        self, status: int, content: bytes, dispatched_at: int
     ) -> tuple[ValidationOutcome, AuthKeyResponse | None]:
         """Fold one ``/auth/key`` answer into the binding."""
         if status == 200:
@@ -370,14 +398,14 @@ class ProjectBinding:
                 self.validation_unavailable()
                 return "unavailable", None
             if auth.scope != "full":
-                self.refuse(Refusal(code="read_only_key"), dispatched_at)
+                self.refuse(Refusal(code="read_only_key"), dispatched_at, from_validation=True)
                 return "refused", auth
             return self._validation_succeeded(auth, dispatched_at), auth
         refusal = classify(status, content)
         if refusal is None:
             self.validation_unavailable()
             return "unavailable", None
-        self.refuse(refusal, dispatched_at, refines=refines)
+        self.refuse(refusal, dispatched_at, from_validation=True)
         return "refused", None
 
     def _validation_succeeded(self, auth: AuthKeyResponse, dispatched_at: int) -> ValidationOutcome:
@@ -390,7 +418,6 @@ class ProjectBinding:
             # project it was granted for: a recovery or a different pinned id
             # (for example after an outage and a rename) invalidates it.
             recovered = self._state == "refused" or self._pinned_id != auth.project_id
-            self._provisional = None
             self._pinned_id = auth.project_id
             self._last_auth = auth
             self._state = "valid"

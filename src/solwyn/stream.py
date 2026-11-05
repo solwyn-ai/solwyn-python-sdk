@@ -765,10 +765,16 @@ class _SyncResponsesStreamManagerWrapper:
         on_abandoned_before_entry: Callable[[], None],
         abort_release: Callable[[], None] | None = None,
         call_span: _CallSpan = _INACTIVE_CALL_SPAN,
+        entry_guard: Callable[[], None] | None = None,
     ) -> None:
         self._call_span = call_span
         self._span_finalizer = call_span.finalize_on_gc(self)
         self._manager = manager
+        # Runs at entry, before the provider request: the request this
+        # manager sends is a NEW response, so a key refusal recorded since the
+        # budget check must stop it (the never-dispatched cleanup gives the
+        # funding back).
+        self._entry_guard = entry_guard
         self._wrap_stream = wrap_stream
         self._on_error = on_error
         self._on_entry_error = on_entry_error
@@ -864,6 +870,13 @@ class _SyncResponsesStreamManagerWrapper:
             if self._state != "new":
                 raise RuntimeError("Responses stream manager is already entered")
             self._state = "entering"
+            if self._entry_guard is not None:
+                try:
+                    self._entry_guard()
+                except BaseException:
+                    self._state = "closed"
+                    self._release_before_entry()
+                    raise
             try:
                 with self._call_span.current() if self._call_span.active else _NOOP_CONTEXT:
                     source = self._manager.__enter__()
@@ -956,10 +969,16 @@ class _AsyncResponsesStreamManagerWrapper:
         on_abandoned_before_entry: Callable[[], Awaitable[None]],
         abort_release: Callable[[], None] | None = None,
         call_span: _CallSpan = _INACTIVE_CALL_SPAN,
+        entry_guard: Callable[[], None] | None = None,
     ) -> None:
         self._call_span = call_span
         self._span_finalizer = call_span.finalize_on_gc(self)
         self._manager = manager
+        # Runs at entry, before the provider request: the request this
+        # manager sends is a NEW response, so a key refusal recorded since the
+        # budget check must stop it (the never-dispatched cleanup gives the
+        # funding back).
+        self._entry_guard = entry_guard
         self._wrap_stream = wrap_stream
         self._on_error = on_error
         self._on_entry_error = on_entry_error
@@ -1057,6 +1076,13 @@ class _AsyncResponsesStreamManagerWrapper:
             if self._state != "new":
                 raise RuntimeError("Responses stream manager is already entered")
             self._state = "entering"
+            if self._entry_guard is not None:
+                try:
+                    self._entry_guard()
+                except BaseException:
+                    self._state = "closed"
+                    await self._release_before_entry()
+                    raise
             try:
                 with self._call_span.current() if self._call_span.active else _NOOP_CONTEXT:
                     source = await self._manager.__aenter__()

@@ -1774,7 +1774,9 @@ class TestResponsesPublicProxySync:
                     input="hello",
                 )
 
-            assert result is provider_manager
+            # The raw manager is returned wrapped only so a key refusal recorded
+            # before entry still stops its request (WS-14).
+            assert result.__wrapped__ is provider_manager
             assert client._responses.stream_calls == [
                 {"model": "llama-3.3-70b-versatile", "input": "hello"}
             ]
@@ -3379,7 +3381,9 @@ class TestResponsesPublicProxyAsync:
                     input="hello",
                 )
 
-            assert result is provider_manager
+            # The raw manager is returned wrapped only so a key refusal recorded
+            # before entry still stops its request (WS-14).
+            assert result.__wrapped__ is provider_manager
             assert client._responses.stream_calls == [
                 {"model": "llama-3.3-70b-versatile", "input": "hello"}
             ]

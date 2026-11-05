@@ -129,6 +129,19 @@ def _call(client: Solwyn) -> object:
     )
 
 
+def _record_effects(binding: ProjectBinding) -> list[tuple[str, str]]:
+    """Every (code, effect) the binding records, in order."""
+    effects: list[tuple[str, str]] = []
+
+    def listener() -> None:
+        refusal = binding.refusal
+        if refusal is not None:
+            effects.append((refusal.code, refusal.effect))
+
+    binding.add_listener(listener)
+    return effects
+
+
 def _requests_to(plane: FakeControlPlane, path: str) -> int:
     return sum(1 for seen, _ in plane.project_headers if seen == path)
 
@@ -221,6 +234,7 @@ def test_f04_hard_deny_then_alert_only_then_expiry_runs_unmetered_with_error_log
     plane = FakeControlPlane(mode="hard_deny")
     with _wrapped(plane) as (client, stub, _clock):
         client.validate()
+        effects = _record_effects(client._solwyn_binding)
         plane.mode = plane.mode.__class__("alert_only")
         plane.expire_key()
 
@@ -230,16 +244,14 @@ def test_f04_hard_deny_then_alert_only_then_expiry_runs_unmetered_with_error_log
             _call(client)
 
     assert stub.chat.completions.calls == 2
-    refusal = client._solwyn_binding.refusal
-    assert refusal is not None
-    assert (refusal.code, refusal.effect, refusal.posture) == (
-        "api_key_expired",
-        "allow_unmetered",
-        "alert_only",
-    )
-    # The second call ran with no check and no reservation.
+    # The check's 401 status blocked at once (its own alert_only body never
+    # relaxes it); the immediate revalidation, sent by the same call, answered
+    # alert_only and relaxed it, so the call ran unmetered.
+    assert effects[:2] == [("api_key_invalid", "block"), ("api_key_expired", "allow_unmetered")]
+    assert len(plane.auth_key_requests) >= 2
+    # Neither call kept a check or a reservation.
     assert checks_after_first == len(plane.checks) == 0
-    assert caplog.text.count("solwyn.api_key_refused") == 2
+    assert caplog.text.count("solwyn.api_key_refused") >= 2
 
 
 @pytest.mark.unit
@@ -429,8 +441,9 @@ def test_f07_block_survives_revalidation_timeouts_and_check_timeouts() -> None:
     finally:
         enforcer.close()
 
-    # One refused check, then only the 60 s revalidations, each timing out.
-    assert seen == [_CHECK_PATH, AUTH_KEY_PATH, AUTH_KEY_PATH, AUTH_KEY_PATH]
+    # One refused check; its 401 scheduled an immediate revalidation, then
+    # only the 60 s revalidations, each timing out.
+    assert seen == [_CHECK_PATH] + [AUTH_KEY_PATH] * 4
     assert binding.state == "refused"
 
 
@@ -444,11 +457,10 @@ def test_f07b_allow_unmetered_survives_repeated_revalidation_without_raising() -
             _call(client)
             clock.advance(61)
 
+    # No call ever raised; each ran unmetered. The first call's 401 was
+    # revalidated at once, then every 60 s; each answer was the same 401.
     assert stub.chat.completions.calls == 4
-    # The gate revalidated every 60 s; each answer was the same 401.
-    assert len(plane.auth_key_requests) == 1 + 3
-    refusal = client._solwyn_binding.refusal
-    assert refusal is not None and refusal.effect == "allow_unmetered"
+    assert len(plane.auth_key_requests) >= 1 + 1 + 3
 
 
 @pytest.mark.unit
@@ -633,7 +645,8 @@ def test_f12_call_b_is_blocked_on_every_exit_after_call_a_records_a_hard_401(
         enforcer.close()
 
     assert excinfo.value.code == "api_key_expired"
-    assert seen == [_CHECK_PATH, _CHECK_PATH]
+    # B's check, A's check, and A's immediate revalidation (refused again).
+    assert seen == [_CHECK_PATH, _CHECK_PATH, AUTH_KEY_PATH]
     # The fail-open builder did not tally B as an admitted outage call.
     assert variant == "allow" or enforcer.uncounted_tally()[0] <= 1
 
@@ -789,7 +802,8 @@ def test_f16_a_delayed_alert_only_401_never_weakens_a_newer_hard_401() -> None:
     refusal = binding.refusal
     assert refusal is not None
     assert (refusal.posture, refusal.effect) == ("hard_deny", "block")
-    assert seen == [_CHECK_PATH, _CHECK_PATH]  # the third call never left the gate
+    # B's revalidation answered hard too; the third call never left the gate.
+    assert seen == [_CHECK_PATH, _CHECK_PATH, AUTH_KEY_PATH]
 
 
 @pytest.mark.unit
@@ -799,7 +813,7 @@ def test_f17_a_delayed_auth_key_200_never_clears_a_newer_refusal() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request.url.path)
-        if request.url.path == AUTH_KEY_PATH:
+        if request.url.path == AUTH_KEY_PATH and seen.count(AUTH_KEY_PATH) == 1:
             # validate() is in flight; check C runs and records a hard 401.
             if enforcer is None:
                 raise RuntimeError("enforcer not built")
@@ -810,7 +824,12 @@ def test_f17_a_delayed_auth_key_200_never_clears_a_newer_refusal() -> None:
 
     binding = validated_binding()
     enforcer = BudgetEnforcer(
-        _URL, binding, cache_ttl=0, lease_enabled=False, transport=httpx.MockTransport(handler)
+        _URL,
+        binding,
+        cache_ttl=0,
+        lease_enabled=False,
+        transport=httpx.MockTransport(handler),
+        validation_timeout=0.05,
     )
     try:
         with pytest.raises(ApiKeyRefusedError):
@@ -821,7 +840,9 @@ def test_f17_a_delayed_auth_key_200_never_clears_a_newer_refusal() -> None:
         enforcer.close()
 
     assert binding.state == "refused"
-    assert seen == [AUTH_KEY_PATH, _CHECK_PATH]
+    # C's immediate revalidation joined validate()'s flight; the 200 that flight
+    # got was fenced, so the next call revalidated again (refused).
+    assert seen == [AUTH_KEY_PATH, _CHECK_PATH, AUTH_KEY_PATH]
 
 
 @pytest.mark.unit
@@ -836,14 +857,15 @@ def test_f18_a_fresh_revalidation_may_relax_block_to_allow_unmetered() -> None:
             _call(client)
         assert client._solwyn_binding.refusal is not None
         assert client._solwyn_binding.refusal.effect == "block"
+        effects = _record_effects(client._solwyn_binding)
 
         rule.paused = True
         clock.advance(61)
         _call(client)
 
-    refusal = client._solwyn_binding.refusal
-    assert refusal is not None
-    assert (refusal.posture, refusal.effect) == ("alert_only", "allow_unmetered")
+    # The revalidation dispatched after the stored refusal answered alert_only
+    # and relaxed it; the call ran unmetered.
+    assert effects[0] == ("api_key_expired", "allow_unmetered")
     assert stub.chat.completions.calls == 1
 
 

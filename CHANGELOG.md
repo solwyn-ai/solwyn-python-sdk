@@ -83,6 +83,9 @@ working at the same time.
   block nothing (alert-only, with no unpaused hard budget rule or run cap)
   lets calls run unmetered, logging `solwyn.api_key_refused` at error on
   every call. Every other refusal blocks, and at startup every refusal blocks.
+  A 401 always blocks first; the SDK re-checks the key at once, and only that
+  fresh answer can relax the block (the call that met the 401 pays one extra
+  round trip).
 - **A refusal also stops a call already past its budget check.** Every
   provider request the SDK sends (the first attempt, each failover hop, each
   same-provider retry, streaming or not, and media calls) checks for a
@@ -97,7 +100,17 @@ working at the same time.
   to the provider: `audio.speech.create` with an untracked TTS model, and
   `converse`, `converse_stream`, `invoke_model`,
   `invoke_model_with_response_stream` and `start_async_invoke` on clients that
-  are not Bedrock.
+  are not Bedrock. A call that sends its request later (an async method's
+  coroutine, an async page iterator, a `with_streaming_response` manager, or
+  a new `responses.stream(...)` manager) checks again when it is awaited or
+  entered, and so does a handle that sends later: a Google chat session's
+  `send_message` and `send_message_stream`, and OpenAI and Anthropic stream
+  helpers.
+- **A 401 is never forgotten.** The SDK records the refusal as soon as the
+  401 status arrives; if its body then times out, is cancelled or is
+  interrupted, the call is still blocked.
+- `validate()` returns `None` whenever Solwyn could not be reached, even if an
+  earlier validation succeeded.
 - **Budget authority follows the project.** If validation pins a different
   project than the one earlier calls reached (for example after an outage and
   a rename), held leases and cached allows from before are dropped, and a
