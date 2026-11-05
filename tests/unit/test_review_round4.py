@@ -146,7 +146,9 @@ def _wrapped(provider: _Provider) -> Any:
 
 def _refuse(wrapped: Any) -> None:
     binding = wrapped._solwyn_binding
-    binding.refuse(Refusal("api_key_invalid", "hard_deny"), binding.generation, from_validation=True)
+    binding.refuse(
+        Refusal("api_key_invalid", "hard_deny"), binding.generation, from_validation=True
+    )
 
 
 _BATCH = {"input_file_id": "f", "endpoint": "/v1/chat/completions", "completion_window": "24h"}
