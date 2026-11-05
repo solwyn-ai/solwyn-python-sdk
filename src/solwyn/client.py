@@ -2033,6 +2033,38 @@ def _failover_hop_bound(
     )
 
 
+def _refuse_dispatch_if_key_refused(
+    client: Solwyn | AsyncSolwyn,
+    *,
+    budget: BudgetCheckResult,
+    admitted: tuple[str, str],
+    primary: ProviderRuntime,
+    spend_unknown: bool,
+    call_id: str,
+) -> None:
+    """Binding guard before every physical provider dispatch.
+
+    The project gate runs once per admission, but a refusal can be recorded
+    while a call is already past it (by another call, a background send, or
+    this call's own failover re-check). Every attempt (the first hop, each
+    failover hop, each same-provider retry, buffered or streaming, chat,
+    Responses or media) checks the binding first, whatever funds it. A
+    blocking refusal gives the funding back (local lease claim released, a
+    per-call hold settled at zero) and raises before any provider I/O.
+    """
+    refusal = client._solwyn_budget.dispatch_refusal()
+    if refusal is None:
+        return
+    client._solwyn_budget.release_reservation(call_id, lease_claim_token=_lease_claim_token(budget))
+    close_out = _zero_usage_close_out(
+        client, budget, admitted, primary=primary, spend_unknown=spend_unknown
+    )
+    if close_out is not None:
+        client._solwyn_reporter.report_confirm(close_out)
+        client._solwyn_reporter.request_flush()
+    raise refusal.error()
+
+
 def _zero_usage_close_out(
     client: Solwyn | AsyncSolwyn,
     budget: BudgetCheckResult,
@@ -2853,6 +2885,15 @@ class Solwyn(_SolwynBase):
             nonlocal dispatched
             dispatched = True
 
+        _refuse_dispatch_if_key_refused(
+            self,
+            budget=budget,
+            admitted=(provider, requested_model),
+            primary=runtime,
+            spend_unknown=False,
+            call_id=call_id,
+        )
+
         try:
             extra_client_options = self._extra_client_options(runtime, run_id=agent_run[0])
             if _call_span.active:
@@ -3448,6 +3489,14 @@ class Solwyn(_SolwynBase):
                 same_retries_left = tuning.same_provider_retries
                 advanced = False
                 while True:
+                    _refuse_dispatch_if_key_refused(
+                        self,
+                        budget=budget,
+                        admitted=admitted_identity,
+                        primary=primary,
+                        spend_unknown=admitted_spend_unknown,
+                        call_id=call_id,
+                    )
                     ctx = _AttemptContext(
                         model=served_model,
                         start_time=time.monotonic(),
@@ -4986,6 +5035,15 @@ class AsyncSolwyn(_SolwynBase):
             nonlocal dispatched
             dispatched = True
 
+        _refuse_dispatch_if_key_refused(
+            self,
+            budget=budget,
+            admitted=(provider, requested_model),
+            primary=runtime,
+            spend_unknown=False,
+            call_id=call_id,
+        )
+
         try:
             extra_client_options = self._extra_client_options(runtime, run_id=agent_run[0])
             if _call_span.active:
@@ -5537,6 +5595,14 @@ class AsyncSolwyn(_SolwynBase):
                 same_retries_left = tuning.same_provider_retries
                 advanced = False
                 while True:
+                    _refuse_dispatch_if_key_refused(
+                        self,
+                        budget=budget,
+                        admitted=admitted_identity,
+                        primary=primary,
+                        spend_unknown=admitted_spend_unknown,
+                        call_id=call_id,
+                    )
                     ctx = _AttemptContext(
                         model=served_model,
                         start_time=time.monotonic(),

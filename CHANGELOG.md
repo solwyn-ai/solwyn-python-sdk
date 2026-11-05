@@ -83,6 +83,21 @@ working at the same time.
   block nothing (alert-only, with no unpaused hard budget rule or run cap)
   lets calls run unmetered, logging `solwyn.api_key_refused` at error on
   every call. Every other refusal blocks, and at startup every refusal blocks.
+- **A refusal also stops a call already past its budget check.** Every
+  provider request the SDK sends (the first attempt, each failover hop, each
+  same-provider retry, streaming or not, and media calls) checks for a
+  refusal first, gives back the call's funding and raises
+  `ApiKeyRefusedError`. A 401 whose body never arrives still counts as a
+  refusal, never as an outage.
+- **Unmetered provider methods honour refusals.** Methods Solwyn does not
+  meter (for example OpenAI `batches.create`), whether allowed by
+  `on_unmetered` or acknowledged with `acknowledge_untracked`, raise
+  `ApiKeyRefusedError` while the key is refused, including through a
+  reference taken before the refusal.
+- **Budget authority follows the project.** If validation pins a different
+  project than the one earlier calls reached (for example after an outage and
+  a rename), held leases and cached allows from before are dropped, and a
+  lease or allow answered after such a change is never kept.
 - Background items (confirms, metadata, advisory reports, lease releases)
   that meet a refusal are dropped without retry, and the configuration error
   is logged once per code.

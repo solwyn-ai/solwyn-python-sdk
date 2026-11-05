@@ -28,7 +28,6 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from solwyn import _run_control
-from solwyn._api_key_errors import classify_exception
 from solwyn._constants import (
     AUTH_KEY_PATH,
     CALL_ID_MAX_LENGTH,
@@ -58,7 +57,7 @@ from solwyn._lifecycle import (
     register_fork_reset,
     register_lease_holder,
 )
-from solwyn._project import ProjectBinding, StoredRefusal
+from solwyn._project import ProjectBinding, StoredRefusal, async_status_hook, sync_status_hook
 from solwyn._run_control import clear_termination_if
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
@@ -496,11 +495,18 @@ class _BudgetEnforcerBase:
 
     def _note_refusal(self, exc: BaseException, dispatched_at: int) -> bool:
         """Record a key or project refusal carried by ``exc``; True when it was one."""
-        refusal = classify_exception(exc)
-        if refusal is None:
-            return False
-        self._binding.refuse(refusal, dispatched_at)
-        return True
+        return self._binding.note_refusal(exc, dispatched_at)
+
+    def dispatch_refusal(self) -> StoredRefusal | None:
+        """The stored refusal a provider dispatch must not run past, if any.
+
+        Only a blocking refusal stops a dispatch; ``allow_unmetered`` lets an
+        admitted call proceed.
+        """
+        verdict = self._binding.admit()
+        if isinstance(verdict, StoredRefusal) and verdict.effect == "block":
+            return verdict
+        return None
 
     def _refused_placeholder(self, claim_token: int | None = None) -> BudgetCheckResult:
         """What a refused request returns. The exit check always discards it."""
@@ -2245,6 +2251,39 @@ class _BudgetEnforcerBase:
             # still owed: close is its last chance to reach the server.
             return self._lease.drain_surrender_requests()
 
+    def _grant_fenced_by_binding(
+        self, resp: httpx.Response, dispatched_at: int
+    ) -> tuple[bool, LeaseSurrenderRequest | None]:
+        """A grant answered after the binding changed must not install.
+
+        Lease authority belongs to the binding state (and pinned project) it
+        was requested under. Returns whether the grant is fenced, and the
+        surrender that releases it when it carried a lease.
+        """
+        if self._binding.generation == dispatched_at:
+            return False, None
+        try:
+            response = LeaseGrantResponse.model_validate(resp.json())
+        except Exception:
+            return True, None
+        return True, self._late_lease_surrender_request(response)
+
+    def _renewal_fenced_by_binding(
+        self,
+        agent_run_id: str,
+        request: LeaseRenewRequest,
+        response: LeaseGrantResponse,
+        dispatched_at: int,
+    ) -> tuple[bool, LeaseSurrenderRequest | None]:
+        """A renewal answered after the binding changed drops the lease instead."""
+        if self._binding.generation == dispatched_at:
+            return False, None
+        with self._state_lock:
+            self._lease.drop_if_current(
+                agent_run_id, lease_id=request.lease_id, generation=request.generation
+            )
+        return True, self._late_lease_surrender_request(response)
+
     def _late_lease_surrender_request(
         self,
         response: LeaseGrantResponse,
@@ -2728,7 +2767,11 @@ class BudgetEnforcer(_BudgetEnforcerBase):
     def _new_http_client(self, timeout: float = 5.0) -> httpx.Client:
         """Build a sync control-plane client on the configured transport."""
         transport = non_closing_sync_transport(self._transport)
-        return httpx.Client(timeout=timeout, transport=transport)
+        return httpx.Client(
+            timeout=timeout,
+            transport=transport,
+            event_hooks={"response": [sync_status_hook(self._binding)]},
+        )
 
     def _new_exit_http_client(self) -> httpx.Client:
         """Build the sync client used by the interpreter-exit lease drain."""
@@ -2779,6 +2822,11 @@ class BudgetEnforcer(_BudgetEnforcerBase):
         ``_check_budget_once``.
         """
         attempt = 0
+        # A re-run after a discarded attempt that entered the lease path takes
+        # per-call admission: the lease ledger keeps the first attempt's call
+        # id claimed, so the same id can never be admitted on lease authority
+        # twice (the failover hop re-check follows the same rule).
+        rerun_per_call = False
         while True:
             verdict = self._gate()
             if isinstance(verdict, StoredRefusal):
@@ -2797,12 +2845,13 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 tags=tags,
                 call_id=call_id,
                 estimated_output_bound=estimated_output_bound,
-                per_call_only=per_call_only,
+                per_call_only=per_call_only or rerun_per_call,
                 scratch=scratch,
             )
             kept = self._exit_check(verdict, result, scratch, call_id, attempt)
             if kept is not None:
                 return kept
+            rerun_per_call = rerun_per_call or scratch.lease_call_id is not None
             attempt += 1
 
     def _gate(self) -> StoredRefusal | int:
@@ -2835,10 +2884,18 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 self._auth_key_url(), headers=headers, timeout=self._validation_timeout
             )
         except Exception as exc:
+            # A 401 whose body never arrived is still a refusal, never an outage.
+            if self._binding.refuse_unread_401(exc, dispatched_at):
+                return "refused", None
             logger.debug("project.validation_unavailable: %s", type(exc).__name__)
             self._binding.validation_unavailable()
             return "unavailable", None
-        return self._binding.apply_auth_key(resp.status_code, resp.content, dispatched_at)
+        return self._binding.apply_auth_key(
+            resp.status_code,
+            resp.content,
+            dispatched_at,
+            refines=self._binding.provisional_for(resp.request),
+        )
 
     def validate(self) -> AuthKeyResponse | None:
         """Validate the key and project now (``GET /api/v1/auth/key``).
@@ -3107,7 +3164,14 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 cloud_response = self._cache_response(
                     cloud_response,
                     agent_run_id=agent_run_id,
-                    cache_allowed_response=tags is None and not per_call_only,
+                    # An allow decided under an older binding generation (a
+                    # refusal, a recovery or a re-pin since dispatch) is never
+                    # retained.
+                    cache_allowed_response=(
+                        tags is None
+                        and not per_call_only
+                        and self._binding.generation == dispatched_at
+                    ),
                     cache_key=cache_key,
                     request_epoch=request_epoch,
                 )
@@ -3293,6 +3357,13 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     None,
                 )
 
+            fenced, fenced_surrender = self._grant_fenced_by_binding(resp, dispatched_at)
+            if fenced:
+                if fenced_surrender is not None:
+                    self._surrender_late_renewal(fenced_surrender, agent_run_id)
+                if breaker is not None:
+                    breaker.record_success()
+                return "legacy", None
             verdict, response, late_surrender = self._install_grant(
                 agent_run_id,
                 resp,
@@ -3438,6 +3509,13 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                         expected_lease_id=request.lease_id,
                         expected_generation=request.generation,
                     )
+                return
+            renewal_fenced, fenced_surrender = self._renewal_fenced_by_binding(
+                agent_run_id, request, response, dispatched_at
+            )
+            if renewal_fenced:
+                if fenced_surrender is not None:
+                    self._surrender_late_renewal(fenced_surrender, agent_run_id)
                 return
             late_surrender = self._finish_renewal(
                 agent_run_id,
@@ -3685,12 +3763,21 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
     ) -> httpx.AsyncClient:
         """Build an async control-plane client on the configured transport."""
         transport = non_closing_async_transport(self._transport)
-        return httpx.AsyncClient(timeout=timeout, transport=transport, verify=verify)
+        return httpx.AsyncClient(
+            timeout=timeout,
+            transport=transport,
+            verify=verify,
+            event_hooks={"response": [async_status_hook(self._binding)]},
+        )
 
     def _new_exit_http_client(self) -> httpx.Client:
         """Build the sync client used by the interpreter-exit lease drain."""
         transport = non_closing_sync_transport(self._transport)
-        return httpx.Client(timeout=5.0, transport=transport)
+        return httpx.Client(
+            timeout=5.0,
+            transport=transport,
+            event_hooks={"response": [sync_status_hook(self._binding)]},
+        )
 
     def _reset_after_fork_in_child(self) -> None:
         """Fresh state lock AND a fresh async client for the forked child.
@@ -3734,6 +3821,11 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
     ) -> BudgetCheckResult:
         """Async twin of ``BudgetEnforcer.check_budget`` (same gate and exit check)."""
         attempt = 0
+        # A re-run after a discarded attempt that entered the lease path takes
+        # per-call admission: the lease ledger keeps the first attempt's call
+        # id claimed, so the same id can never be admitted on lease authority
+        # twice (the failover hop re-check follows the same rule).
+        rerun_per_call = False
         while True:
             verdict = await self._gate()
             if isinstance(verdict, StoredRefusal):
@@ -3752,12 +3844,13 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 tags=tags,
                 call_id=call_id,
                 estimated_output_bound=estimated_output_bound,
-                per_call_only=per_call_only,
+                per_call_only=per_call_only or rerun_per_call,
                 scratch=scratch,
             )
             kept = self._exit_check(verdict, result, scratch, call_id, attempt)
             if kept is not None:
                 return kept
+            rerun_per_call = rerun_per_call or scratch.lease_call_id is not None
             attempt += 1
 
     async def _gate(self) -> StoredRefusal | int:
@@ -3798,10 +3891,18 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 self._auth_key_url(), headers=headers, timeout=self._validation_timeout
             )
         except Exception as exc:
+            # A 401 whose body never arrived is still a refusal, never an outage.
+            if self._binding.refuse_unread_401(exc, dispatched_at):
+                return "refused", None
             logger.debug("project.validation_unavailable: %s", type(exc).__name__)
             self._binding.validation_unavailable()
             return "unavailable", None
-        return self._binding.apply_auth_key(resp.status_code, resp.content, dispatched_at)
+        return self._binding.apply_auth_key(
+            resp.status_code,
+            resp.content,
+            dispatched_at,
+            refines=self._binding.provisional_for(resp.request),
+        )
 
     async def validate(self) -> AuthKeyResponse | None:
         """Async twin of ``BudgetEnforcer.validate``."""
@@ -4029,7 +4130,14 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 cloud_response = self._cache_response(
                     cloud_response,
                     agent_run_id=agent_run_id,
-                    cache_allowed_response=tags is None and not per_call_only,
+                    # An allow decided under an older binding generation (a
+                    # refusal, a recovery or a re-pin since dispatch) is never
+                    # retained.
+                    cache_allowed_response=(
+                        tags is None
+                        and not per_call_only
+                        and self._binding.generation == dispatched_at
+                    ),
                     cache_key=cache_key,
                     request_epoch=request_epoch,
                 )
@@ -4207,6 +4315,13 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                     None,
                 )
 
+            fenced, fenced_surrender = self._grant_fenced_by_binding(resp, dispatched_at)
+            if fenced:
+                if fenced_surrender is not None:
+                    await self._surrender_late_renewal(fenced_surrender, agent_run_id)
+                if breaker is not None:
+                    breaker.record_success()
+                return "legacy", None
             verdict, response, late_surrender = self._install_grant(
                 agent_run_id,
                 resp,
@@ -4338,6 +4453,13 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                         expected_lease_id=request.lease_id,
                         expected_generation=request.generation,
                     )
+                return
+            renewal_fenced, fenced_surrender = self._renewal_fenced_by_binding(
+                agent_run_id, request, response, dispatched_at
+            )
+            if renewal_fenced:
+                if fenced_surrender is not None:
+                    await self._surrender_late_renewal(fenced_surrender, agent_run_id)
                 return
             late_surrender = self._finish_renewal(
                 agent_run_id,

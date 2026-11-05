@@ -1813,6 +1813,42 @@ class _GuardedResource:
         return f"<guarded provider resource {self._solwyn_path!r}>"
 
 
+class _KeyRefusalGuardedCallable:
+    """An unmetered provider callable that honours the client's key refusals.
+
+    Unmetered spend surfaces never pass the budget gate, so the stored refusal
+    is checked at call time instead: a reference taken before the refusal is
+    stopped too, and an ``acknowledge_untracked`` token never overrides it.
+    Everything else (attributes, ``repr``, ``with_raw_response`` access)
+    passes through to the provider callable.
+    """
+
+    __slots__ = ("__wrapped__", "_solwyn_owner", "_solwyn_path")
+
+    def __init__(self, owner: _SolwynBase, raw: Callable[..., Any], path: str) -> None:
+        self.__wrapped__ = raw
+        self._solwyn_owner = owner
+        self._solwyn_path = path
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        self._solwyn_owner._enforce_key_refusal(self._solwyn_path)
+        return self.__wrapped__(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.__wrapped__, name)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _KeyRefusalGuardedCallable):
+            other = other.__wrapped__
+        return bool(self.__wrapped__ == other)
+
+    def __hash__(self) -> int:
+        return hash(self.__wrapped__)
+
+    def __repr__(self) -> str:
+        return repr(self.__wrapped__)
+
+
 class _SolwynBase:
     """Shared sans-I/O base class for Solwyn sync and async clients.
 
@@ -2193,12 +2229,34 @@ class _SolwynBase:
             drifted_from_rule_id=(drifted_from.rule_id if drifted_from is not None else None),
         )
 
+    def _enforce_key_refusal(self, path: str) -> None:
+        """Stop an unmetered provider call while Solwyn refuses the key or project.
+
+        A blocking refusal raises ``ApiKeyRefusedError``; ``allow_unmetered``
+        lets the call run and logs, like a metered call would.
+        """
+        binding = getattr(self, "_solwyn_binding", None)
+        if binding is None:
+            return
+        verdict = binding.admit()
+        if isinstance(verdict, int):
+            return
+        if verdict.effect == "block":
+            raise verdict.error()
+        binding.note_unmetered_call(verdict)
+
+    def _guard_unmetered_callable(self, value: object, path: str) -> Any:
+        """Wrap a plain unmetered callable so key refusals apply when it is called."""
+        if inspect.ismethod(value) or inspect.isfunction(value) or inspect.isbuiltin(value):
+            return _KeyRefusalGuardedCallable(self, value, path)
+        return value
+
     def _resolve_unknown_value(self, value: object, path: str) -> Any:
         if self._is_guardable_provider_resource(value):
             return self._guard_resource(value, path)
         if self._has_acknowledged_descendant(path):
             raise RuntimeError(f"acknowledged descendant has unguardable prefix: {path}")
-        return value
+        return self._guard_unmetered_callable(value, path)
 
     def _enforce_explicit_surface(
         self,
@@ -2319,7 +2377,7 @@ class _SolwynBase:
                 )
                 return self._resolve_unknown_value(returned, path)
             if self._is_exact_raw_response_escape(path, rule):
-                return returned
+                return self._guard_unmetered_callable(returned, path)
             return self._resolve_unknown_value(returned, path)
         if rule.kind in {SurfaceKind.METADATA, SurfaceKind.INFRASTRUCTURE}:
             if not self._shape_matches_before_evaluation(

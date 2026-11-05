@@ -1221,10 +1221,12 @@ def _post_json_response(
         response = client.post(url, json=payload, headers=headers, timeout=min(5.0, remaining))
         response.raise_for_status()
     except Exception as exc:
-        refusal = classify_exception(exc)
-        if refusal is not None:
-            if binding is not None:
-                binding.refuse(refusal, dispatched_at)
+        refused = (
+            binding.note_refusal(exc, dispatched_at)
+            if binding is not None
+            else classify_exception(exc) is not None
+        )
+        if refused:
             return _API_KEY_REFUSED, None
         if _monotonic() >= deadline:
             # Deadline passed mid-request (e.g. the joiner's best-effort

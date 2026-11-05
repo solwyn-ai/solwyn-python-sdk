@@ -36,7 +36,6 @@ from typing import Literal, NamedTuple, TypeVar
 import httpx
 
 from solwyn import _base
-from solwyn._api_key_errors import classify_exception
 from solwyn._constants import ORDINARY_TOKEN_COUNT_MAX
 from solwyn._control_plane_transport import (
     ControlPlaneTransport,
@@ -52,7 +51,7 @@ from solwyn._lifecycle import (
     register_fork_reset,
     register_sync_reporter,
 )
-from solwyn._project import ProjectBinding
+from solwyn._project import ProjectBinding, async_status_hook, sync_status_hook
 from solwyn._surfaces import SurfaceContext
 from solwyn._types import (
     BreakerStateReport,
@@ -136,12 +135,18 @@ class _DetachedExitClientFactory:
     def __init__(
         self,
         transport: ControlPlaneTransport | None,
+        binding: ProjectBinding,
     ) -> None:
         self._transport = transport
+        self._binding = binding
 
     def _new_exit_http_client(self) -> httpx.Client:
         transport = non_closing_sync_transport(self._transport)
-        return httpx.Client(timeout=5.0, transport=transport)
+        return httpx.Client(
+            timeout=5.0,
+            transport=transport,
+            event_hooks={"response": [sync_status_hook(self._binding)]},
+        )
 
 
 # Raw C0/DEL/C1 control bytes. A compliant server repr-escapes these before
@@ -1498,11 +1503,7 @@ class _ReporterBase:
         logs ``solwyn.configuration_error.<code>`` once per code, and the next
         wrapped call meets the refusal at its gate.
         """
-        refusal = classify_exception(exc)
-        if refusal is None:
-            return False
-        self._binding.refuse(refusal, dispatched_at)
-        return True
+        return self._binding.note_refusal(exc, dispatched_at)
 
     def _confirm_failure_outcome(self, exc: Exception) -> _SendOutcome:
         """Map a confirm send failure to RETRY (transient) or DROPPED (terminal)."""
@@ -1815,7 +1816,11 @@ class MetadataReporter(_ReporterBase):
     def _new_http_client(self, timeout: float = 5.0) -> httpx.Client:
         """Build a sync control-plane client on the configured transport."""
         transport = non_closing_sync_transport(self._transport)
-        return httpx.Client(timeout=timeout, transport=transport)
+        return httpx.Client(
+            timeout=timeout,
+            transport=transport,
+            event_hooks={"response": [sync_status_hook(self._binding)]},
+        )
 
     def _new_exit_http_client(self) -> httpx.Client:
         """Build the sync client used by interpreter-exit delivery."""
@@ -3105,7 +3110,7 @@ class AsyncMetadataReporter(_ReporterBase):
         # async, while GC/interpreter-exit delivery uses a sync client. The
         # caller retains ownership of an injected transport.
         self._transport: ControlPlaneTransport | None = validated_transport
-        self._exit_http_client_factory = _DetachedExitClientFactory(self._transport)
+        self._exit_http_client_factory = _DetachedExitClientFactory(self._transport, self._binding)
         self._http = self._new_async_http_client(timeout=10.0)
         self._shutdown_event: asyncio.Event | None = None
         self._flush_task: asyncio.Task[None] | None = None
@@ -3134,7 +3139,11 @@ class AsyncMetadataReporter(_ReporterBase):
     def _new_async_http_client(self, timeout: float = 5.0) -> httpx.AsyncClient:
         """Build an async control-plane client on the configured transport."""
         transport = non_closing_async_transport(self._transport)
-        return httpx.AsyncClient(timeout=timeout, transport=transport)
+        return httpx.AsyncClient(
+            timeout=timeout,
+            transport=transport,
+            event_hooks={"response": [async_status_hook(self._binding)]},
+        )
 
     def _new_exit_http_client(self) -> httpx.Client:
         """Build the sync client used by GC/interpreter-exit delivery."""
