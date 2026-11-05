@@ -98,7 +98,7 @@ def _untracked(*, index: int = 0) -> UntrackedSurfaceReport:
 def test_confirm_is_204_and_deduplicates_call_and_reservation_replays() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         reservation_id = _reservation(client, plane)
         payload = _confirm(reservation_id).model_dump(mode="json")
         first = client.post(
@@ -137,7 +137,7 @@ def test_confirm_requires_exactly_one_settlement_key(
     payload.pop("reservation_id")
     payload.update(settlement_keys)
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = client.post(
             f"{plane.api_url}/api/v1/budgets/confirm",
             json=payload,
@@ -150,7 +150,7 @@ def test_confirm_requires_exactly_one_settlement_key(
 @pytest.mark.unit
 def test_expired_reservation_returns_terminal_404_to_real_reporter() -> None:
     plane = FakeControlPlane()
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         reservation_id = _reservation(client, plane)
     plane.expire_reservations()
     reporter = MetadataReporter(
@@ -161,7 +161,7 @@ def test_expired_reservation_returns_terminal_404_to_real_reporter() -> None:
         transport=plane.transport,
     )
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         expired = client.post(
             f"{plane.api_url}/api/v1/budgets/confirm",
             json=_confirm(reservation_id, label="expired-raw").model_dump(mode="json"),
@@ -180,7 +180,7 @@ def test_ingest_flattens_validated_events_and_returns_accurate_count() -> None:
     plane = FakeControlPlane()
     events = [_event(label="event-a"), _event(label="event-b")]
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = client.post(
             f"{plane.api_url}/api/v1/metadata/ingest",
             json=[event.model_dump(mode="json") for event in events],
@@ -197,7 +197,7 @@ def test_ingest_replays_and_partial_overlap_skip_existing_call_attempt_identitie
     first_batch = [_event(label="dedup-a"), _event(label="dedup-b")]
     overlapping_batch = [_event(label="dedup-b"), _event(label="dedup-c")]
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         first = client.post(
             f"{plane.api_url}/api/v1/metadata/ingest",
             json=[event.model_dump(mode="json") for event in first_batch],
@@ -291,7 +291,7 @@ def test_invalid_ingest_event_returns_422_without_partial_recording() -> None:
     invalid = _event().model_dump(mode="json")
     invalid["prompt"] = "forbidden contract drift"
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = client.post(
             f"{plane.api_url}/api/v1/metadata/ingest",
             json=[_event(label="valid").model_dump(mode="json"), invalid],
@@ -321,7 +321,7 @@ def test_untracked_accepts_up_to_100_and_rejects_larger_batches() -> None:
     at_cap = [_untracked(index=index + 200) for index in range(100)]
     too_many = [_untracked(index=index + 400) for index in range(101)]
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = client.post(
             f"{plane.api_url}/api/v1/untracked-surfaces",
             json=[report.model_dump(mode="json") for report in accepted],
@@ -354,7 +354,7 @@ def test_untracked_immediate_report_id_replay_is_not_recorded_twice() -> None:
     first = _untracked(index=1)
     newer = _untracked(index=2)
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         accepted = client.post(
             f"{plane.api_url}/api/v1/untracked-surfaces",
             json=[first.model_dump(mode="json")],
@@ -435,7 +435,7 @@ def test_breaker_report_is_a_recording_sink_and_health_is_available() -> None:
     )
     payload = report.model_dump(mode="json")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = client.post(
             f"{plane.api_url}/api/v1/projects/{plane.project_id}/providers/breaker-reports",
             json=payload,
@@ -453,7 +453,7 @@ def test_breaker_report_is_a_recording_sink_and_health_is_available() -> None:
 @pytest.mark.unit
 def test_slow_confirm_does_not_make_reporter_close_overrun_deadline() -> None:
     plane = FakeControlPlane()
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         reservation_id = _reservation(client, plane)
     reporter = MetadataReporter(
         plane.api_url,
@@ -476,7 +476,7 @@ def test_slow_confirm_does_not_make_reporter_close_overrun_deadline() -> None:
 async def test_async_confirm_and_ingest_use_the_same_recording_state() -> None:
     plane = FakeControlPlane()
 
-    async with httpx.AsyncClient(transport=plane.transport) as client:
+    async with httpx.AsyncClient(transport=plane.transport, headers=plane.auth_headers()) as client:
         check = await client.post(
             f"{plane.api_url}/api/v1/budgets/check",
             json=_check_payload(),
@@ -503,7 +503,7 @@ async def test_async_ingest_retry_returns_zero_without_duplicate_recording() -> 
     event = _event(label="async-retry")
     payload = [event.model_dump(mode="json")]
 
-    async with httpx.AsyncClient(transport=plane.transport) as client:
+    async with httpx.AsyncClient(transport=plane.transport, headers=plane.auth_headers()) as client:
         first = await client.post(f"{plane.api_url}/api/v1/metadata/ingest", json=payload)
         replay = await client.post(f"{plane.api_url}/api/v1/metadata/ingest", json=payload)
 
@@ -521,7 +521,7 @@ def test_recording_is_safe_under_concurrent_check_requests() -> None:
     plane = FakeControlPlane()
 
     def send(index: int) -> int:
-        with httpx.Client(transport=plane.transport) as client:
+        with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
             return client.post(
                 f"{plane.api_url}/api/v1/budgets/check",
                 json=_check_payload(model=f"model-{index}"),
@@ -542,7 +542,7 @@ def test_concurrent_duplicate_ingest_batches_are_claimed_atomically() -> None:
     payload = [event.model_dump(mode="json") for event in events]
 
     def send(_index: int) -> int:
-        with httpx.Client(transport=plane.transport) as client:
+        with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
             response = client.post(
                 f"{plane.api_url}/api/v1/metadata/ingest",
                 json=payload,

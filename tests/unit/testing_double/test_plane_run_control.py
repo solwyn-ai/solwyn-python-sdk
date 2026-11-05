@@ -121,7 +121,7 @@ def test_stop_run_attaches_v1_directive_to_opted_in_check() -> None:
     plane = FakeControlPlane()
     plane.stop_run("run-7")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         body = _post_check(client, plane, agent_run_id="run-7")
 
     assert body["allowed"] is False
@@ -141,7 +141,7 @@ def test_stop_run_without_opt_in_denies_but_omits_directive() -> None:
     plane = FakeControlPlane()
     plane.stop_run("run-7")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         body = _post_check(client, plane, agent_run_id="run-7", run_directive_version=None)
 
     assert body["allowed"] is False
@@ -155,7 +155,7 @@ def test_stop_beats_deny_next_and_other_runs_stay_allowed() -> None:
     plane.deny_next(5, period="monthly")
     plane.stop_run("run-7")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         stopped = _post_check(client, plane, agent_run_id="run-7")
         other = _post_check(client, plane, agent_run_id="run-8")
 
@@ -169,7 +169,7 @@ def test_a_check_without_a_run_never_receives_a_directive() -> None:
     plane = FakeControlPlane()
     plane.stop_run("run-7")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         body = _post_check(client, plane)
 
     assert body["allowed"] is True
@@ -181,7 +181,7 @@ def test_scripted_run_stopped_period_stays_directive_free() -> None:
     plane = FakeControlPlane()
     plane.deny_next(period="run_stopped")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         body = _post_check(client, plane, agent_run_id="run-7")
 
     assert body["denied_by_period"] == "run_stopped"
@@ -215,7 +215,7 @@ def test_clear_stop_restores_ordinary_allows() -> None:
     plane.stop_run("run-7")
     plane.clear_stop("run-7")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         body = _post_check(client, plane, agent_run_id="run-7")
 
     assert body["allowed"] is True
@@ -228,7 +228,7 @@ def test_reset_recording_preserves_scenario_stops() -> None:
     plane = FakeControlPlane()
     plane.stop_run("run-7", reason="operator_stop")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         _post_check(client, plane, agent_run_id="run-7")
         plane.reset_recording()
         body = _post_check(client, plane, agent_run_id="run-7")
@@ -248,7 +248,7 @@ def test_stopped_lease_grant_omits_the_lease_block_and_carries_the_directive() -
     plane = FakeControlPlane()
     plane.stop_run("run-lease", reason="operator_stop")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         body = client.post(
             f"{plane.api_url}/api/v1/budgets/lease",
             json=_grant_payload(),
@@ -275,7 +275,7 @@ def test_stopped_lease_grant_without_opt_in_omits_the_directive() -> None:
     payload = _grant_payload()
     del payload["run_directive_version"]
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         body = client.post(f"{plane.api_url}/api/v1/budgets/lease", json=payload).json()
 
     assert body["allowed"] is False
@@ -448,7 +448,7 @@ def test_kill_magic_model_requires_an_open_run_before_dispatch() -> None:
 def test_kill_stop_spreads_to_every_channel_for_that_run() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         allowed = _post_check(client, plane, agent_run_id="run-k", model="solwyn-test/kill")
         stopped = _post_check(client, plane, agent_run_id="run-k", model="solwyn-test/kill")
         other_model = _post_check(client, plane, agent_run_id="run-k")
@@ -475,7 +475,7 @@ def test_misroute_window_rewrites_only_while_active_and_within_its_budget() -> N
     plane = FakeControlPlane()
     plane.stop_run("run-7")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         with plane.misroute_stops(requests=1):
             misrouted = _post_check(client, plane, agent_run_id="run-7")
             exhausted = _post_check(client, plane, agent_run_id="run-7")
@@ -490,7 +490,7 @@ def test_misroute_window_rewrites_only_while_active_and_within_its_budget() -> N
 def test_renewal_of_a_stopped_run_returns_the_stopped_lease_shape() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = client.post(
             f"{plane.api_url}/api/v1/budgets/lease",
             json=_grant_payload(),

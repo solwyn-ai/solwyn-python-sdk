@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, call_uuid, foreground_records, validated_binding
+from conftest import VALID_API_KEY, VALID_PROJECT, call_uuid, foreground_records, validated_binding
 from pydantic import ValidationError
 
 from solwyn import _base, _types
@@ -280,7 +280,7 @@ def test_sync_first_observation_is_due_immediately_then_waits_fifteen_minutes() 
     _observe(reporter)
 
     try:
-        assert reporter._breaker_project_id is None
+        assert reporter._breaker_reporting_project_id() is None
         with (
             patch("solwyn.reporter._monotonic", return_value=now),
             patch.object(reporter._http, "post", return_value=_ok_response()) as post,
@@ -580,7 +580,7 @@ def test_sync_mixed_batch_outcome_advances_only_successful_batch() -> None:
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "second_api_key",
-    [VALID_API_KEY, "sk_proj_" + "b" * 64],
+    [VALID_API_KEY, "solwyn_sk_" + "b" * 64],
     ids=["same-project-key", "different-project-key"],
 )
 def test_sync_reporters_only_drain_their_originating_observations(second_api_key: str) -> None:
@@ -882,6 +882,7 @@ def test_sync_shipping_defaults_post_exact_advisory_wire_without_budget_bootstra
         assert worker_thread is not caller_thread
         assert kwargs["headers"] == {
             "Authorization": f"Bearer {VALID_API_KEY}",
+            "Solwyn-Project": VALID_PROJECT,
             "Content-Type": "application/json",
         }
         body = kwargs["json"]
@@ -990,7 +991,7 @@ async def test_async_first_observation_and_failed_delta_match_sync() -> None:
     reporter = _async_reporter()
     _observe(reporter, mode="async", n=2)
 
-    assert reporter._breaker_project_id is None
+    assert reporter._breaker_reporting_project_id() is None
     with (
         patch("solwyn.reporter._monotonic", return_value=500.0),
         patch.object(

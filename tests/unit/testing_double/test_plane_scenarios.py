@@ -65,12 +65,12 @@ def test_run_denial_and_clear_denials_are_instance_scoped() -> None:
     other = FakeControlPlane()
     plane.deny_run("run-a")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         denied = _post_check(client, plane, agent_run_id="run-a")
         allowed_other_run = _post_check(client, plane, agent_run_id="run-b")
         plane.clear_denials()
         allowed_after_clear = _post_check(client, plane, agent_run_id="run-a")
-    with httpx.Client(transport=other.transport) as client:
+    with httpx.Client(transport=other.transport, headers=other.auth_headers()) as client:
         allowed_other_plane = _post_check(client, other, agent_run_id="run-a")
 
     assert denied.json()["denied_by_period"] == "agent_run"
@@ -98,7 +98,7 @@ def test_magic_models_have_deterministic_check_verdicts(
 ) -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = _post_check(client, plane, model=model, agent_run_id="run-magic-verdict")
 
     assert response.json()["allowed"] is allowed
@@ -110,7 +110,7 @@ def test_magic_models_have_deterministic_check_verdicts(
 def test_runaway_allows_first_check_per_run_then_denies_later_checks() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         first_a = _post_check(
             client,
             plane,
@@ -140,7 +140,7 @@ def test_outage_can_be_scoped_to_one_endpoint_so_ingest_keeps_its_budget() -> No
     plane = FakeControlPlane()
 
     with (
-        httpx.Client(transport=plane.transport) as client,
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
         plane.outage(requests=1, path="/api/v1/budgets/check"),
     ):
         ingested = client.post(
@@ -160,7 +160,7 @@ def test_read_only_can_be_scoped_to_one_endpoint_so_ingest_keeps_its_budget() ->
     plane = FakeControlPlane()
 
     with (
-        httpx.Client(transport=plane.transport) as client,
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
         plane.read_only(requests=1, path="/api/v1/budgets/check"),
     ):
         ingested = client.post(
@@ -179,7 +179,10 @@ def test_read_only_can_be_scoped_to_one_endpoint_so_ingest_keeps_its_budget() ->
 def test_refusal_windows_never_swallow_an_unknown_path() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client, plane.read_only():
+    with (
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
+        plane.read_only(),
+    ):
         unknown = client.post(f"{plane.api_url}/api/v1/nonexistent", json={})
         known = client.post(
             f"{plane.api_url}/api/v1/metadata/ingest",
@@ -197,7 +200,10 @@ def test_refusal_windows_never_swallow_an_unknown_path() -> None:
 def test_outage_is_request_counted_and_recovers_within_context() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client, plane.outage(requests=1):
+    with (
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
+        plane.outage(requests=1),
+    ):
         with pytest.raises(httpx.ConnectError, match="scripted outage"):
             _post_check(client, plane)
         recovered = _post_check(client, plane)
@@ -210,7 +216,7 @@ def test_outage_is_request_counted_and_recovers_within_context() -> None:
 async def test_outage_has_an_async_transport_counterpart() -> None:
     plane = FakeControlPlane()
 
-    async with httpx.AsyncClient(transport=plane.transport) as client:
+    async with httpx.AsyncClient(transport=plane.transport, headers=plane.auth_headers()) as client:
         with plane.outage(requests=1):
             with pytest.raises(httpx.ConnectError, match="scripted outage"):
                 await client.post(
@@ -229,7 +235,7 @@ async def test_outage_has_an_async_transport_counterpart() -> None:
 def test_slow_uses_sync_sleep_only_for_the_matching_path() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         started = time.monotonic()
         with plane.slow(0.03, path="/api/v1/budgets/check", requests=1):
             _post_check(client, plane)
@@ -246,7 +252,7 @@ def test_slow_uses_sync_sleep_only_for_the_matching_path() -> None:
 async def test_slow_uses_async_sleep_for_async_requests() -> None:
     plane = FakeControlPlane()
 
-    async with httpx.AsyncClient(transport=plane.transport) as client:
+    async with httpx.AsyncClient(transport=plane.transport, headers=plane.auth_headers()) as client:
         started = time.monotonic()
         with plane.slow(0.03, path="/api/v1/budgets/check", requests=1):
             await client.post(
@@ -269,7 +275,7 @@ def test_slow_request_keeps_refusal_after_contexts_exit_during_sleep() -> None:
             raise RuntimeError("test did not release scripted sleep")
 
     with (
-        httpx.Client(transport=plane.transport) as client,
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
         ThreadPoolExecutor(max_workers=1) as pool,
         patch("solwyn.testing._transport.time.sleep", side_effect=blocked_sleep),
     ):
@@ -303,7 +309,7 @@ async def test_slow_request_keeps_read_only_after_contexts_exit_during_sleep() -
         sleep_entered.set()
         await release_sleep.wait()
 
-    async with httpx.AsyncClient(transport=plane.transport) as client:
+    async with httpx.AsyncClient(transport=plane.transport, headers=plane.auth_headers()) as client:
         with patch("solwyn.testing._transport.asyncio.sleep", new=blocked_sleep):
             try:
                 with (
@@ -339,7 +345,7 @@ def test_outage_short_circuits_a_slow_window_without_spending_its_budget() -> No
     slept: list[float] = []
 
     with (
-        httpx.Client(transport=plane.transport) as client,
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
         patch("solwyn.testing._transport.time.sleep", side_effect=slept.append),
         plane.slow(0.5, path="/api/v1/budgets/check", requests=1),
     ):
@@ -376,7 +382,10 @@ def test_nested_identical_scenarios_remove_their_own_window_on_exit() -> None:
 def test_read_only_returns_the_sdk_recognized_403_shape() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client, plane.read_only(requests=1):
+    with (
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
+        plane.read_only(requests=1),
+    ):
         response = _post_check(client, plane)
         recovered = _post_check(client, plane)
 
@@ -390,7 +399,7 @@ def test_refuse_checks_429_sets_retry_after_and_is_counted() -> None:
     plane = FakeControlPlane()
 
     with (
-        httpx.Client(transport=plane.transport) as client,
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
         plane.refuse_checks(status=429, requests=1, retry_after=1),
     ):
         refused = _post_check(client, plane)
@@ -432,7 +441,7 @@ def test_refuse_checks_uses_real_core_error_shapes(
     plane = FakeControlPlane()
 
     with (
-        httpx.Client(transport=plane.transport) as client,
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
         plane.refuse_checks(status=status, requests=1),
     ):
         response = _post_check(client, plane)
@@ -517,7 +526,7 @@ def test_three_scripted_outages_open_real_breaker_then_recover() -> None:
 def test_validation_failures_return_422_on_checks_and_lease_paths() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         invalid = _post_check(client, plane, unexpected="drift")
         lease = client.post(
             f"{plane.api_url}/api/v1/budgets/lease",

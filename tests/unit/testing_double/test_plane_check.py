@@ -53,7 +53,7 @@ def test_deny_next_is_consumed_once_and_v1_allow_omits_denied_period() -> None:
     plane = FakeControlPlane()
     plane.deny_next(period="monthly")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         first = client.post(
             f"{plane.api_url}/api/v1/budgets/check",
             json=_check_payload(failover_directive_version="1"),
@@ -81,7 +81,7 @@ def test_stopped_run_check_denial_is_hard_deny_with_no_remaining_budget() -> Non
     )
     plane.deny_next(period="run_stopped")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = client.post(
             f"{plane.api_url}/api/v1/budgets/check",
             json=_check_payload(agent_run_id="run-stopped", failover_directive_version="1"),
@@ -99,7 +99,7 @@ def test_denied_check_floors_remaining_budget_while_allows_keep_the_script() -> 
     plane = FakeControlPlane(budget_limit=5.0, current_usage=6.0, remaining_budget=-1.0)
     plane.deny_next(period="monthly")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         denied = client.post(
             f"{plane.api_url}/api/v1/budgets/check",
             json=_check_payload(failover_directive_version="1"),
@@ -130,7 +130,7 @@ def test_run_scoped_verdicts_fail_loud_without_an_agent_run_id(
     plane = FakeControlPlane()
 
     with (
-        httpx.Client(transport=plane.transport) as client,
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
         pytest.raises(RuntimeError, match=f"run-scoped denial '{period}'"),
     ):
         client.post(
@@ -147,7 +147,7 @@ def test_scripted_run_scoped_denial_fails_loud_without_an_agent_run_id() -> None
     plane.deny_next(period="agent_run")
 
     with (
-        httpx.Client(transport=plane.transport) as client,
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
         pytest.raises(RuntimeError, match="run-scoped denial 'agent_run'"),
     ):
         client.post(
@@ -160,7 +160,7 @@ def test_scripted_run_scoped_denial_fails_loud_without_an_agent_run_id() -> None
 def test_check_serialization_is_legacy_nullable_until_directive_v1_opt_in() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         legacy = client.post(
             f"{plane.api_url}/api/v1/budgets/check",
             json=_check_payload(),
@@ -192,7 +192,7 @@ def test_unknown_magic_model_fails_loud() -> None:
     plane = FakeControlPlane()
 
     with (
-        httpx.Client(transport=plane.transport) as client,
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
         pytest.raises(RuntimeError, match="unknown solwyn testing magic model"),
     ):
         client.post(
@@ -206,7 +206,7 @@ def test_unknown_magic_fallback_model_fails_loud_on_the_raw_transport() -> None:
     plane = FakeControlPlane()
 
     with (
-        httpx.Client(transport=plane.transport) as client,
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
         pytest.raises(RuntimeError, match="unknown solwyn testing magic model"),
     ):
         client.post(
@@ -297,7 +297,7 @@ def test_fallback_runaway_memory_is_ordered_and_deterministic() -> None:
 def test_unknown_path_is_recorded_and_returns_404() -> None:
     plane = FakeControlPlane(mode=BudgetMode.ALERT_ONLY)
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = client.get(f"{plane.api_url}/api/v1/not-real")
 
     assert response.status_code == 404

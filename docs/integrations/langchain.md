@@ -79,10 +79,12 @@ handler = SolwynRunScopeHandler(tags={"framework": "langchain"})
 sync_solwyn = Solwyn(
     OpenAI(api_key=os.environ["OPENAI_API_KEY"]),
     api_key=os.environ["SOLWYN_API_KEY"],
+    project=os.environ["SOLWYN_PROJECT"],
 )
 async_solwyn = AsyncSolwyn(
     AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"]),
     api_key=os.environ["SOLWYN_API_KEY"],
+    project=os.environ["SOLWYN_PROJECT"],
 )
 
 model = ChatOpenAI(

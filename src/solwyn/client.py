@@ -10,7 +10,8 @@ Usage::
 
     client = Solwyn(
         OpenAI(),
-        api_key="sk_proj_...",
+        api_key="solwyn_sk_...",
+        project="checkout-bot",
     )
     response = client.chat.completions.create(
         model="gpt-5.5",
@@ -2104,7 +2105,8 @@ class Solwyn(_SolwynBase):
 
         client = Solwyn(
             OpenAI(),
-            api_key="sk_proj_...",
+            api_key="solwyn_sk_...",
+            project="checkout-bot",
         )
         response = client.chat.completions.create(
             model="gpt-5.5",
@@ -4315,7 +4317,8 @@ class AsyncSolwyn(_SolwynBase):
 
         async with AsyncSolwyn(
             AsyncOpenAI(),
-            api_key="sk_proj_...",
+            api_key="solwyn_sk_...",
+            project="checkout-bot",
         ) as client:
             response = await client.chat.completions.create(
                 model="gpt-5.5",

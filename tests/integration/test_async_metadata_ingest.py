@@ -37,7 +37,7 @@ class TestAsyncMetadataReporterDelivery:
         """Events queued before close() are flushed without error."""
         reporter = AsyncMetadataReporter(
             api_url=test_credentials.api_url,
-            api_key=test_credentials.api_key,
+            binding=test_credentials.binding(),
             flush_interval=60.0,  # long interval — force flush via close()
         )
         reporter.start()
@@ -67,7 +67,7 @@ class TestAsyncMetadataReporterDelivery:
         """report() auto-starts the flush loop with no start() or close() call."""
         reporter = AsyncMetadataReporter(
             api_url=test_credentials.api_url,
-            api_key=test_credentials.api_key,
+            binding=test_credentials.binding(),
             flush_interval=1.0,
         )
         for i in range(5):
@@ -89,7 +89,7 @@ class TestAsyncMetadataReporterDelivery:
         """close() on a never-started, empty reporter does not raise."""
         reporter = AsyncMetadataReporter(
             api_url=test_credentials.api_url,
-            api_key=test_credentials.api_key,
+            binding=test_credentials.binding(),
         )
 
         # Never enqueued, never started -- close() must still shut down cleanly.

@@ -13,12 +13,12 @@ import httpx
 import pytest
 from conftest import (
     VALID_API_KEY,
-    VALID_PROJECT_ID,
     _accepted_response,
     call_uuid,
     validated_binding,
 )
 
+from solwyn._project import ProjectBinding
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, CallStatus, MetadataEvent, ProviderName
 from solwyn.circuit_breaker import CircuitBreaker
@@ -81,11 +81,13 @@ def _confirm() -> BudgetConfirmRequest:
     )
 
 
-def _quiet_sync_reporter(**kwargs: object) -> MetadataReporter:
+def _quiet_sync_reporter(
+    *, binding: ProjectBinding | None = None, **kwargs: object
+) -> MetadataReporter:
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         reporter = MetadataReporter(
             "https://api.test.solwyn.ai",
-            validated_binding(VALID_API_KEY),
+            binding if binding is not None else validated_binding(VALID_API_KEY),
             **kwargs,
         )
     reporter._thread.join(timeout=2.0)
@@ -106,7 +108,6 @@ def reporter_with_two_providers() -> Iterator[
         ],
         sdk_instance_id=SDK_INSTANCE_ID,
     )
-    reporter.observe_project_id(VALID_PROJECT_ID)
     with patch.object(reporter._http, "post", return_value=_ok_response()) as post:
         yield reporter, breakers, post
     reporter._http.close()
@@ -127,7 +128,6 @@ def _async_reporter_with_two_providers() -> tuple[
         ],
         sdk_instance_id=SDK_INSTANCE_ID,
     )
-    reporter.observe_project_id(VALID_PROJECT_ID)
     return reporter, breakers
 
 
@@ -255,7 +255,6 @@ class TestSyncBreakerReporter:
 
         with patch.object(reporter._http, "post", side_effect=send):
             try:
-                reporter.observe_project_id(VALID_PROJECT_ID)
                 assert breaker_started.wait(timeout=1.0)
                 reporter.report(_event())
 
@@ -308,7 +307,6 @@ class TestSyncBreakerReporter:
                 patch.object(reporter._http, "post", return_value=_ok_response()) as post,
                 patch.object(reporter._http, "close") as http_close,
             ):
-                reporter.observe_project_id(VALID_PROJECT_ID)
                 reporter._flush_breaker_reports()
                 post.reset_mock()
                 openai.record_failure()
@@ -348,7 +346,6 @@ class TestSyncBreakerReporter:
             breaker_snapshots=lambda: [(ProviderName.OPENAI, CircuitBreaker().get_state())],
             sdk_instance_id=SDK_INSTANCE_ID,
         )
-        reporter.observe_project_id(VALID_PROJECT_ID)
         real_close = reporter._http.close
 
         def send(url: str, **_kwargs: object) -> MagicMock:
@@ -386,7 +383,6 @@ class TestSyncBreakerReporter:
             sdk_instance_id=SDK_INSTANCE_ID,
             report_untracked_surfaces=False,
         )
-        reporter.observe_project_id(VALID_PROJECT_ID)
         queued = _event()
         reporter.report(queued)
         close_finished = threading.Event()
@@ -478,7 +474,6 @@ class TestSyncBreakerReporter:
             breaker_snapshots=lambda: [(ProviderName.OPENAI, breaker.get_state())],
             sdk_instance_id=SDK_INSTANCE_ID,
         )
-        reporter.observe_project_id(VALID_PROJECT_ID)
         before = datetime.now(UTC)
 
         with patch.object(reporter._http, "post", return_value=_ok_response()) as post:
@@ -512,7 +507,6 @@ class TestSyncBreakerReporter:
             ],
             sdk_instance_id=SDK_INSTANCE_ID,
         )
-        reporter.observe_project_id(VALID_PROJECT_ID)
 
         def send(_url: str, **kwargs: object) -> MagicMock:
             payload = kwargs["json"]
@@ -557,7 +551,6 @@ class TestSyncBreakerReporter:
             ],
             sdk_instance_id=SDK_INSTANCE_ID,
         )
-        reporter.observe_project_id(VALID_PROJECT_ID)
         reporter.report_confirm(_confirm())
         reporter.report(_event())
 
@@ -590,8 +583,10 @@ class TestSyncBreakerReporter:
         reporter._http.close()
 
     def test_unknown_project_does_not_collect_or_post(self) -> None:
+        # Until /auth/key pins the project id there is no URL to report to.
         snapshots = MagicMock(side_effect=AssertionError("snapshot collection must be skipped"))
         reporter = _quiet_sync_reporter(
+            binding=ProjectBinding(VALID_API_KEY, "fake-project"),
             breaker_snapshots=snapshots,
             sdk_instance_id=SDK_INSTANCE_ID,
         )
@@ -610,7 +605,6 @@ class TestSyncBreakerReporter:
             sdk_instance_id=SDK_INSTANCE_ID,
             breaker_reporting_enabled=False,
         )
-        reporter.observe_project_id(VALID_PROJECT_ID)
 
         with patch.object(reporter._http, "post") as post:
             reporter._flush_breaker_reports()
@@ -795,7 +789,6 @@ class TestAsyncBreakerReporter:
 
         with patch.object(reporter._http, "post", new=AsyncMock(side_effect=send)):
             try:
-                reporter.observe_project_id(VALID_PROJECT_ID)
                 reporter.start()
                 await asyncio.wait_for(breaker_started.wait(), timeout=1.0)
                 reporter.report(_event())
@@ -852,7 +845,6 @@ class TestAsyncBreakerReporter:
                 ) as post,
                 patch.object(reporter._http, "aclose", new=AsyncMock()) as http_close,
             ):
-                reporter.observe_project_id(VALID_PROJECT_ID)
                 await reporter._flush_breaker_reports()
                 post.reset_mock()
                 openai.record_failure()
@@ -886,7 +878,6 @@ class TestAsyncBreakerReporter:
             breaker_snapshots=lambda: [(ProviderName.OPENAI, CircuitBreaker().get_state())],
             sdk_instance_id=SDK_INSTANCE_ID,
         )
-        reporter.observe_project_id(VALID_PROJECT_ID)
         real_aclose = reporter._http.aclose
 
         async def send(url: str, **_kwargs: object) -> MagicMock:
@@ -927,7 +918,6 @@ class TestAsyncBreakerReporter:
             breaker_snapshots=lambda: [(ProviderName.OPENAI, breaker.get_state())],
             sdk_instance_id=SDK_INSTANCE_ID,
         )
-        reporter.observe_project_id(VALID_PROJECT_ID)
         before = datetime.now(UTC)
 
         with patch.object(
@@ -964,7 +954,6 @@ class TestAsyncBreakerReporter:
             ],
             sdk_instance_id=SDK_INSTANCE_ID,
         )
-        reporter.observe_project_id(VALID_PROJECT_ID)
         reporter.report_confirm(_confirm())
         reporter.report(_event())
 

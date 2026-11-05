@@ -99,6 +99,7 @@ import os, sys, time
 from datetime import UTC, datetime
 
 import solwyn.reporter as r
+from solwyn._project import ProjectBinding
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
 
@@ -118,7 +119,8 @@ def event(cid):
     )
 
 
-rep = r.MetadataReporter("http://127.0.0.1:{port}", "sk_test_key", flush_interval=0.2)
+binding = ProjectBinding("sk_test_key", "p")
+rep = r.MetadataReporter("http://127.0.0.1:{port}", binding, flush_interval=0.2)
 pid = os.fork()
 if pid == 0:
     # Forked child: only a RELAUNCHED flush thread can deliver this — os._exit
@@ -284,7 +286,7 @@ def test_sync_reporter_reset_completed_delivery_stays_terminal() -> None:
 async def test_async_reporter_reset_clears_loop_state_and_swaps_client() -> None:
     reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     old_http = reporter._http
-    old_lock = reporter._breaker_project_lock
+    old_lock = reporter._breaker_report_lock
     reporter._in_flight = 3
     # Simulate a started reporter (real tasks/events belong to the parent loop).
     reporter._flush_task = object()  # type: ignore[assignment]
@@ -294,7 +296,7 @@ async def test_async_reporter_reset_clears_loop_state_and_swaps_client() -> None
     reporter._reset_after_fork_in_child()
 
     assert reporter._http is not old_http
-    assert reporter._breaker_project_lock is not old_lock
+    assert reporter._breaker_report_lock is not old_lock
     assert reporter._in_flight == 0
     assert reporter._flush_task is None
     assert reporter._breaker_task is None

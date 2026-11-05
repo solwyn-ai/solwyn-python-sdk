@@ -133,7 +133,7 @@ class TestReporterBase:
     def test_enqueue_adds_event(self) -> None:
         base = _ReporterBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         event = _make_event()
         base._enqueue(event)
@@ -142,7 +142,7 @@ class TestReporterBase:
     def test_queue_overflow_drops_oldest(self) -> None:
         base = _ReporterBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
             max_queue_size=3,
         )
 

@@ -14,6 +14,7 @@ from solwyn._types import MetadataEvent, ProviderName
 from solwyn.reporter import MetadataReporter
 
 _TAGS_API_KEY_ENV = "SOLWYN_TEST_TAGS_API_KEY"
+_TAGS_PROJECT_ENV = "SOLWYN_TEST_TAGS_PROJECT"
 _ROUND_TRIP_TAG_KEY = "sdk_t20_live_roundtrip"
 _ROUND_TRIP_TAG_VALUE = "tagged"
 
@@ -24,10 +25,19 @@ def paid_tags_api_key() -> str:
     api_key = os.environ.get(_TAGS_API_KEY_ENV)
     if not api_key:
         pytest.skip(
-            f"live tag round-trip requires a dedicated Team/Scale project key in "
-            f"{_TAGS_API_KEY_ENV}"
+            f"live tag round-trip requires a dedicated Team/Scale API key in "
+            f"{_TAGS_API_KEY_ENV} and its project in {_TAGS_PROJECT_ENV}"
         )
     return api_key
+
+
+@pytest.fixture(scope="session")
+def paid_tags_project() -> str:
+    """The project (name or proj_ id) the paid tags key names."""
+    project = os.environ.get(_TAGS_PROJECT_ENV)
+    if not project:
+        pytest.skip(f"live tag round-trip requires {_TAGS_PROJECT_ENV}")
+    return project
 
 
 def _make_event(
@@ -62,7 +72,7 @@ class TestMetadataReporterDelivery:
         """Events queued before close() are flushed without error."""
         reporter = MetadataReporter(
             api_url=test_credentials.api_url,
-            api_key=test_credentials.api_key,
+            binding=test_credentials.binding(),
             flush_interval=60.0,  # long interval — force flush via close()
         )
         for i in range(5):
@@ -88,13 +98,17 @@ class TestMetadataReporterDelivery:
         self,
         api_url: str,
         paid_tags_api_key: str,
+        paid_tags_project: str,
     ) -> None:
         agent_run_id = f"sdk-t20-{uuid.uuid4().hex}"
         event = _make_event(
             tags={_ROUND_TRIP_TAG_KEY: _ROUND_TRIP_TAG_VALUE},
             agent_run_id=agent_run_id,
         )
-        headers = {"Authorization": f"Bearer {paid_tags_api_key}"}
+        headers = {
+            "Authorization": f"Bearer {paid_tags_api_key}",
+            "Solwyn-Project": paid_tags_project,
+        }
 
         with httpx.Client(base_url=api_url, timeout=15) as http:
             project_response = http.post(

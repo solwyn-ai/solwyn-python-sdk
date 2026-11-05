@@ -132,6 +132,7 @@ listener = SolwynEventListener(tags={"framework": "crewai"})
 client = Solwyn(
     OpenAI(api_key=os.environ["OPENAI_API_KEY"]),
     api_key=os.environ["SOLWYN_API_KEY"],
+    project=os.environ["SOLWYN_PROJECT"],
     provider="openai",
     budget_mode="hard_deny",
 )

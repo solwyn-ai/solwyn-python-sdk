@@ -175,7 +175,9 @@ async def test_open_breaker_avoids_native_release_setup(async_mode: bool) -> Non
 
     breaker = CircuitBreaker(name="control-plane", failure_threshold=1)
     cls = AsyncBudgetEnforcer if async_mode else BudgetEnforcer
-    enforcer = cls("https://offline.invalid", VALID_API_KEY, control_plane_breaker=breaker)
+    enforcer = cls(
+        "https://offline.invalid", validated_binding(VALID_API_KEY), control_plane_breaker=breaker
+    )
     breaker.record_failure()
     request = LeaseSurrenderRequest(lease_id="held", holder_id="test", generation=1, spent_tokens=0)
     try:
@@ -331,7 +333,7 @@ async def test_active_release_remains_fenced_after_wait_timeout(async_mode: bool
     cls = AsyncBudgetEnforcer if async_mode else BudgetEnforcer
     enforcer = cls(
         "https://offline.invalid",
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         transport=httpx.MockTransport(handle_async if async_mode else handle_sync),
     )
     try:
@@ -426,7 +428,9 @@ def test_loop_shutdown_does_not_resurrect_release_tasks_or_lose_queued_work() ->
 
     transport = HeldTransport()
     enforcer = AsyncBudgetEnforcer(
-        "https://offline.invalid", validated_binding(VALID_API_KEY), transport=transport
+        "https://offline.invalid",
+        validated_binding(VALID_API_KEY),
+        transport=transport,
     )
 
     async def produce() -> None:
@@ -585,7 +589,9 @@ def test_off_loop_queue_saturation_is_bounded_and_expired_work_cannot_release_su
 async def test_exact_duplicates_coalesce_without_losing_successor_fences(async_mode: bool) -> None:
     cls = AsyncBudgetEnforcer if async_mode else BudgetEnforcer
     enforcer = cls(
-        "https://offline.invalid", VALID_API_KEY, transport=httpx.MockTransport(response)
+        "https://offline.invalid",
+        validated_binding(VALID_API_KEY),
+        transport=httpx.MockTransport(response),
     )
     first = LeaseSurrenderRequest(
         lease_id="same-row", holder_id="test", generation=1, spent_tokens=2
@@ -632,7 +638,9 @@ def test_shutdown_cancellation_never_claims_next_queued_request(swallow_cancel: 
             return response(request)
 
     enforcer = AsyncBudgetEnforcer(
-        "https://offline.invalid", validated_binding(VALID_API_KEY), transport=Transport()
+        "https://offline.invalid",
+        validated_binding(VALID_API_KEY),
+        transport=Transport(),
     )
 
     async def produce() -> None:
@@ -661,7 +669,11 @@ async def test_worker_start_failure_parks_bounded_fenced_work_for_retry(async_mo
         return response(request)
 
     cls = AsyncBudgetEnforcer if async_mode else BudgetEnforcer
-    enforcer = cls("https://offline.invalid", VALID_API_KEY, transport=httpx.MockTransport(handle))
+    enforcer = cls(
+        "https://offline.invalid",
+        validated_binding(VALID_API_KEY),
+        transport=httpx.MockTransport(handle),
+    )
     try:
         if async_mode:
             await enforcer.check_budget(**arguments("start-failure"))
@@ -813,7 +825,7 @@ async def test_real_slow_response_body_cannot_extend_close_or_free_live_sync_slo
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     cls = AsyncBudgetEnforcer if async_mode else BudgetEnforcer
-    enforcer = cls(f"http://127.0.0.1:{server.server_port}", VALID_API_KEY)
+    enforcer = cls(f"http://127.0.0.1:{server.server_port}", validated_binding(VALID_API_KEY))
     try:
         for i in range(4):
             if async_mode:
@@ -1052,7 +1064,7 @@ async def test_local_release_setup_failure_does_not_trip_admission_breaker(
     cls = AsyncBudgetEnforcer if async_mode else BudgetEnforcer
     enforcer = cls(
         "https://offline.invalid",
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         transport=httpx.MockTransport(response),
         control_plane_breaker=breaker,
     )
@@ -1113,7 +1125,7 @@ async def test_release_request_failure_classification_retains_network_health_and
     cls = AsyncBudgetEnforcer if async_mode else BudgetEnforcer
     enforcer = cls(
         "https://offline.invalid",
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         transport=httpx.MockTransport(handle),
         control_plane_breaker=breaker,
     )

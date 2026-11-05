@@ -881,5 +881,40 @@ def test_header_name_is_the_core_constant() -> None:
     assert PROJECT_HEADER == "Solwyn-Project"
 
 
-def _unused(_: Callable[..., object]) -> None:  # pragma: no cover - keeps imports honest
-    return None
+@pytest.mark.unit
+def test_failover_hop_recheck_refusal_raises_and_never_dispatches_the_fallback() -> None:
+    """A hard_deny failover hop re-admits through check_budget, so it meets the gate too."""
+    openai = pytest.importorskip("openai")
+    plane = FakeControlPlane(mode="hard_deny")
+    fallback_bodies: list[bytes] = []
+
+    def primary(request: httpx.Request) -> httpx.Response:
+        # The key is revoked while the primary attempt is in flight.
+        plane.revoke_key()
+        return httpx.Response(429, json={"error": {"message": "x", "type": "x", "code": None}})
+
+    def fallback(request: httpx.Request) -> httpx.Response:
+        fallback_bodies.append(request.content)
+        raise AssertionError("the fallback must not be dispatched after a refusal")
+
+    def client(handler: Callable[[httpx.Request], httpx.Response], base_url: str | None) -> Any:
+        return openai.OpenAI(
+            api_key="sk-test",
+            base_url=base_url,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+            max_retries=0,
+        )
+
+    wrapped = plane.wrap(
+        client(primary, None),
+        fallback=[(client(fallback, "https://api.groq.com/openai/v1"), "llama-3.3-70b-versatile")],
+        lease_enabled=False,
+    )
+    with wrapped, pytest.raises(ApiKeyRefusedError) as excinfo:
+        wrapped.chat.completions.create(
+            model="gpt-5.5", messages=[{"role": "user", "content": "hi"}]
+        )
+
+    assert excinfo.value.code == "api_key_invalid"
+    assert fallback_bodies == []
+    assert [check.model for check in plane.checks] == ["gpt-5.5"]

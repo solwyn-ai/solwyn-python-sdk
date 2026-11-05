@@ -143,6 +143,7 @@ _CHILD = """
 from datetime import UTC, datetime
 
 import solwyn.reporter as r
+from solwyn._project import ProjectBinding
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
 
@@ -165,7 +166,8 @@ event = MetadataEvent(
     timestamp=datetime.now(UTC),
     call_id="{call_id}",
 )
-rep = r.MetadataReporter("http://127.0.0.1:{port}", "sk_test_key", flush_interval=60.0)
+binding = ProjectBinding("sk_test_key", "p")
+rep = r.MetadataReporter("http://127.0.0.1:{port}", binding, flush_interval=60.0)
 rep.report_settlement(confirm, event)
 # NO close(): a normal interpreter exit must flush via the atexit hook.
 """
@@ -675,7 +677,7 @@ def test_gc_drop_logging_exceptions_do_not_abort_remaining_exit_dispositions() -
             reporter._settlement_queue,
             reporter._queue,
             reporter.api_url,
-            reporter.api_key,
+            reporter._binding,
             reporter._control_plane_breaker,
             0.0,
             _gc_drop_counter,
@@ -1507,7 +1509,7 @@ def test_exit_drain_publishes_disposition_before_returning(
             reporter._settlement_queue,
             reporter._queue,
             reporter.api_url,
-            reporter.api_key,
+            reporter._binding,
             reporter._control_plane_breaker,
             0.15,  # join deadline expires while the publication is gated
             gated_counter,

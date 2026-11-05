@@ -5,7 +5,34 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
-## [Unreleased]
+## [0.11.0] - 2026-11-05
+
+API key scoping. Keys belong to your account and can reach one or more
+projects, so every client now names the project it spends against. This
+release needs a Solwyn API that supports scoped keys; old project keys stop
+working at the same time.
+
+### Breaking
+
+- **New key format and a required project.** Keys are now
+  `solwyn_sk_` followed by 64 lowercase hex characters. Pass the project with
+  `project=` (or set `SOLWYN_PROJECT`): a project name or a `proj_` id.
+  Constructing a client without one raises `ConfigurationError`. Old
+  `sk_proj_` keys are rejected when the client is constructed, with a message
+  that says to create a new key in the dashboard or with `solwyn keys create`.
+- **`project_id=` and `SOLWYN_PROJECT_ID` are gone.** `project_id=` raises
+  `ConfigurationError` (it used to raise `TypeError`), and `SOLWYN_PROJECT_ID`
+  is not read; if it is set and no project is configured, the error says to
+  rename it to `SOLWYN_PROJECT`.
+- **A read-only key is refused, not tolerated.** It used to log one error and
+  let calls continue unmetered. It now fails `validate()` and blocks every
+  call, whatever `fail_open` says.
+- **`solwyn.testing`:** `FakeControlPlane.wrap()` reserves `project`, the
+  plane's key is a `solwyn_sk_` key, its default `project_id` is a real
+  `proj_` id, and every request to it must name the project
+  (`plane.auth_headers()` gives a raw `httpx` client the headers). The
+  `solwyn.testing.contract` functions take the project as a new third
+  argument.
 
 ### Added
 
@@ -21,6 +48,46 @@ derived from git tags (hatch-vcs).
   `post_training.model_resources.extend_expiry`, classified like the other
   model-resource operations. Anthropic 2.5 and google-genai 2.34 add no new
   surfaces. Coverage fingerprints are refreshed for this admission.
+- **`Solwyn-Project` on every request.** The SDK sends the configured project
+  until it has validated, then the project's `proj_` id, so renaming the
+  project in the dashboard does not break a running client.
+- **Lazy validation and `validate()`.** Constructing a client makes no network
+  call. Before the first call that needs Solwyn, the SDK checks the key once
+  with `GET /api/v1/auth/key`. `client.validate()` (`await client.validate()`
+  on `AsyncSolwyn`) runs the same check on demand, returns the key's details,
+  raises on any refusal, and returns `None` when Solwyn cannot be reached.
+- **`ApiKeyRefusedError`**, a `ConfigurationError` with `code` and `field`,
+  raised when Solwyn refuses the key or the project: expired, revoked,
+  unrecognised or read-only keys, a project the key does not reach, or a
+  project that accepts only dedicated keys.
+- **`solwyn.testing`:** the fake control plane implements the scoped-key
+  contract: `GET /api/v1/auth/key`, the `Solwyn-Project` rules and refusal
+  codes, the `Solwyn-Project-Id` echo, and knobs to script them
+  (`expire_key()`, `revoke_key()`, `restore_key()`, `set_key_scope()`,
+  `rename_project()`, `archive_project()`, `require_dedicated_keys()`,
+  `budget_rules` with `FakeBudgetRule`, and `raw_response()`).
+  `solwyn.testing.contract.assert_auth_key_contract` checks the same contract
+  against a live API.
+
+### Changed
+
+- **A refusal is never an outage.** Every 401 from Solwyn, whatever its body,
+  is a key refusal. A refusal is recorded once and checked before anything
+  else on every call: no cached allow, held lease, open control-plane breaker
+  or `fail_open` setting can let a call past it, and a call already in flight
+  when another call met the refusal is blocked too, even if its own check
+  timed out. The SDK revalidates every 60 seconds and recovers on the first
+  success; a late answer can never clear or weaken a newer refusal.
+- **Alert-only projects keep running when a key expires.** After the client
+  has validated once, an expired or revoked key on a project that promises to
+  block nothing (alert-only, with no unpaused hard budget rule or run cap)
+  lets calls run unmetered, logging `solwyn.api_key_refused` at error on
+  every call. Every other refusal blocks, and at startup every refusal blocks.
+- Background items (confirms, metadata, advisory reports, lease releases)
+  that meet a refusal are dropped without retry, and the configuration error
+  is logged once per code.
+- Breaker reports start once the project id is pinned by validation; a budget
+  check response no longer sets it.
 
 ## [0.10.2] - 2026-11-03
 

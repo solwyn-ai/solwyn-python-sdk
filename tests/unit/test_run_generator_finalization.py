@@ -58,6 +58,7 @@ import solwyn
 from solwyn import _lifecycle, _run
 from solwyn._lifecycle import _drain_run_cleanups, _drain_run_span_cleanups
 from solwyn.budget import BudgetEnforcer
+from solwyn._project import ProjectBinding
 from solwyn.testing import FakeControlPlane
 
 gc.disable()
@@ -67,7 +68,8 @@ exporter = InMemorySpanExporter()
 provider.add_span_processor(SimpleSpanProcessor(exporter))
 trace.set_tracer_provider(provider)
 plane = FakeControlPlane()
-enforcer = BudgetEnforcer(plane.api_url, plane.api_key, transport=plane.transport)
+binding = ProjectBinding(plane.api_key, plane.project_name)
+enforcer = BudgetEnforcer(plane.api_url, binding, transport=plane.transport)
 kind, lock_kind = sys.argv[1:3]
 scope = solwyn.run('stream')
 handles = []
@@ -245,10 +247,12 @@ import gc
 from contextvars import copy_context
 import solwyn
 from solwyn.budget import BudgetEnforcer
+from solwyn._project import ProjectBinding
 from solwyn.testing import FakeControlPlane
 
 plane = FakeControlPlane()
-enforcer = BudgetEnforcer(plane.api_url, plane.api_key, transport=plane.transport)
+binding = ProjectBinding(plane.api_key, plane.project_name)
+enforcer = BudgetEnforcer(plane.api_url, binding, transport=plane.transport)
 class ChatStream:
     def __init__(self):
         self.chunks = self.generate()

@@ -23,6 +23,8 @@ from fake_provider import (
     start_on_conventional_port,
 )
 
+from solwyn._constants import PROJECT_HEADER
+from solwyn._project import ProjectBinding
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetMode, MetadataEvent
 from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer
@@ -32,10 +34,23 @@ from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 
 @dataclass(frozen=True)
 class Credentials:
-    """Credentials bootstrapped for an integration test session."""
+    """Credentials bootstrapped for an integration test session.
+
+    ``project`` is the project every key request names in ``Solwyn-Project``
+    (a ``proj_`` id or a project name).
+    """
 
     api_url: str
     api_key: str
+    project: str
+
+    def key_headers(self) -> dict[str, str]:
+        """Headers for a raw key request: the key and the project it names."""
+        return {"Authorization": f"Bearer {self.api_key}", PROJECT_HEADER: self.project}
+
+    def binding(self) -> ProjectBinding:
+        """A fresh, unvalidated binding: the first gate validates against the live API."""
+        return ProjectBinding(self.api_key, self.project)
 
 
 @dataclass(frozen=True)
@@ -160,7 +175,9 @@ def provision_project(
             budget_limit=budget_limit,
             budget_mode=budget_mode,
         )
-    return ProjectCredentials(api_url=api_url, api_key=project["key"], project_id=project["id"])
+    return ProjectCredentials(
+        api_url=api_url, api_key=project["key"], project=project["id"], project_id=project["id"]
+    )
 
 
 def burn_budget(
@@ -177,7 +194,7 @@ def burn_budget(
     hands back no reservation, so there would be nothing to confirm.
     """
     with httpx.Client(base_url=credentials.api_url, timeout=15) as http:
-        headers = {"Authorization": f"Bearer {credentials.api_key}"}
+        headers = credentials.key_headers()
         r = http.post(
             "/api/v1/budgets/check",
             json={"estimated_input_tokens": 100, "model": model, "provider": "openai"},
@@ -209,7 +226,7 @@ def budget_status(credentials: ProjectCredentials) -> dict[str, Any]:
     with httpx.Client(base_url=credentials.api_url, timeout=10) as http:
         r = http.get(
             f"/api/v1/projects/{credentials.project_id}/budget",
-            headers={"Authorization": f"Bearer {credentials.api_key}"},
+            headers=credentials.key_headers(),
         )
         r.raise_for_status()
         body = r.json()
@@ -230,22 +247,25 @@ def _bootstrap_credentials(api_url: str) -> Credentials:
             budget_limit=100.0,
             budget_mode="alert_only",
         )
-    return Credentials(api_url=api_url, api_key=project["key"])
+    return Credentials(api_url=api_url, api_key=project["key"], project=project["id"])
 
 
 @pytest.fixture(scope="session")
 def test_credentials(api_url: str) -> Credentials:
     """Session-scoped test credentials.
 
-    Uses SOLWYN_TEST_API_KEY if set, otherwise bootstraps via the API.
+    Uses SOLWYN_TEST_API_KEY and SOLWYN_TEST_PROJECT if set, otherwise
+    bootstraps via the API.
     """
     env_key = os.environ.get("SOLWYN_TEST_API_KEY")
 
     if env_key:
-        return Credentials(
-            api_url=api_url,
-            api_key=env_key,
-        )
+        env_project = os.environ.get("SOLWYN_TEST_PROJECT")
+        if not env_project:
+            pytest.fail(
+                "SOLWYN_TEST_API_KEY needs SOLWYN_TEST_PROJECT (a project name or proj_ id)"
+            )
+        return Credentials(api_url=api_url, api_key=env_key, project=env_project)
 
     return _bootstrap_credentials(api_url)
 
@@ -260,7 +280,7 @@ def budget_enforcer(test_credentials: Credentials) -> BudgetEnforcer:
     """Sync BudgetEnforcer pointed at the live API."""
     enforcer = BudgetEnforcer(
         api_url=test_credentials.api_url,
-        api_key=test_credentials.api_key,
+        binding=test_credentials.binding(),
         budget_mode=BudgetMode.ALERT_ONLY,
         fail_open=True,
     )
@@ -273,7 +293,7 @@ async def async_budget_enforcer(test_credentials: Credentials) -> AsyncBudgetEnf
     """Async BudgetEnforcer pointed at the live API."""
     enforcer = AsyncBudgetEnforcer(
         api_url=test_credentials.api_url,
-        api_key=test_credentials.api_key,
+        binding=test_credentials.binding(),
         budget_mode=BudgetMode.ALERT_ONLY,
         fail_open=True,
     )
@@ -286,7 +306,7 @@ def metadata_reporter(test_credentials: Credentials) -> MetadataReporter:
     """Sync MetadataReporter pointed at the live API."""
     reporter = MetadataReporter(
         api_url=test_credentials.api_url,
-        api_key=test_credentials.api_key,
+        binding=test_credentials.binding(),
         flush_interval=1.0,
     )
     yield reporter
@@ -298,7 +318,7 @@ async def async_metadata_reporter(test_credentials: Credentials) -> AsyncMetadat
     """Async MetadataReporter pointed at the live API."""
     reporter = AsyncMetadataReporter(
         api_url=test_credentials.api_url,
-        api_key=test_credentials.api_key,
+        binding=test_credentials.binding(),
         flush_interval=1.0,
     )
     reporter.start()
@@ -322,16 +342,20 @@ def hard_denied_credentials(api_url: str) -> Credentials:
     session_id = uuid.uuid4().hex[:12]
     with httpx.Client(base_url=api_url, timeout=10) as http:
         token = _signup_token(http, session_id)
-        key = _create_project(
+        created = _create_project(
             http,
             token,
             name=f"sdk-deny-{session_id}",
             budget_limit=0.05,
             budget_mode="hard_deny",
-        )["key"]
+        )
+    denied_credentials = Credentials(api_url=api_url, api_key=created["key"], project=created["id"])
 
     burner = BudgetEnforcer(
-        api_url=api_url, api_key=key, budget_mode=BudgetMode.HARD_DENY, fail_open=False
+        api_url=api_url,
+        binding=denied_credentials.binding(),
+        budget_mode=BudgetMode.HARD_DENY,
+        fail_open=False,
     )
     try:
         check = burner.check_budget(estimated_input_tokens=100, model="gpt-5.5", provider="openai")
@@ -349,7 +373,7 @@ def hard_denied_credentials(api_url: str) -> Credentials:
             # (shared CALL_ID_PATTERN); a descriptive label is a 422.
             call_id=str(uuid.uuid4()),
         )
-        burn_reporter = MetadataReporter(api_url=api_url, api_key=key)
+        burn_reporter = MetadataReporter(api_url=api_url, binding=denied_credentials.binding())
         try:
             burn_reporter._send_confirm(confirm)
         finally:
@@ -359,7 +383,10 @@ def hard_denied_credentials(api_url: str) -> Credentials:
 
     # Fresh enforcer: its allow-cache is empty, so this check hits the API.
     verifier = BudgetEnforcer(
-        api_url=api_url, api_key=key, budget_mode=BudgetMode.HARD_DENY, fail_open=False
+        api_url=api_url,
+        binding=denied_credentials.binding(),
+        budget_mode=BudgetMode.HARD_DENY,
+        fail_open=False,
     )
     try:
         denied = verifier.check_budget(
@@ -372,7 +399,7 @@ def hard_denied_credentials(api_url: str) -> Credentials:
             "hard-deny bootstrap: burn did not trip the budget "
             f"(usage=${denied.current_usage:.2f}, limit=${denied.budget_limit:.2f})"
         )
-    return Credentials(api_url=api_url, api_key=key)
+    return denied_credentials
 
 
 # Reusable token details for confirm calls
@@ -531,6 +558,7 @@ def make_wrapped_client(
         client = Solwyn(
             inner,
             api_key=creds.api_key,
+            project=creds.project,
             api_url=creds.api_url,
             budget_check_cache_ttl=0,
             **config,
@@ -565,6 +593,7 @@ async def make_async_wrapped_client(
         client = AsyncSolwyn(
             inner,
             api_key=creds.api_key,
+            project=creds.project,
             api_url=creds.api_url,
             budget_check_cache_ttl=0,
             **config,

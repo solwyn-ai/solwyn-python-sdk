@@ -1151,7 +1151,7 @@ class TestLeaseRunControl:
         await enforcer._http.aclose()
 
     def test_grant_directive_marks_and_refuses_before_install(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         other = LeaseGrantResponse.model_validate(_grant_payload(lease_id="lse_other"))
         assert (
             base._apply_lease_response(OTHER_RUN_ID, other, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
@@ -1171,7 +1171,7 @@ class TestLeaseRunControl:
         assert base._lease_path_applies(RUN_ID) is False
 
     def test_real_stopped_deny_shape_keeps_directive_reason_and_run_scope(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         payload = _grant_payload(directive_run_id=RUN_ID)
         payload.update(
             {
@@ -1201,7 +1201,7 @@ class TestLeaseRunControl:
         assert base._build_prior_hard_deny_unavailable_result(OTHER_RUN_ID) is None
 
     def test_repeated_grant_directive_keeps_first_server_reason_everywhere(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         first = LeaseGrantResponse.model_validate(
             _grant_payload(
                 directive_run_id=RUN_ID,
@@ -1247,7 +1247,7 @@ class TestLeaseRunControl:
         )
 
     def test_local_first_writer_is_not_relabelled_by_grant_directive(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         mark_terminated(
             RUN_ID,
             reason="velocity:repeat_size",
@@ -1278,7 +1278,7 @@ class TestLeaseRunControl:
     def test_wrong_run_grant_directive_warns_but_installs_ordinary_grant(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         response = LeaseGrantResponse.model_validate(_grant_payload(directive_run_id=OTHER_RUN_ID))
 
         with caplog.at_level(logging.WARNING, logger="solwyn.budget"):
@@ -1378,7 +1378,7 @@ class TestLeaseRunControl:
     def test_fenced_wrong_run_grant_has_no_warning_or_state_effect(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         response = LeaseGrantResponse.model_validate(_grant_payload(directive_run_id=OTHER_RUN_ID))
         base._closed = True
         base._close_epoch = 1
@@ -1398,7 +1398,7 @@ class TestLeaseRunControl:
         assert not any("run_control.directive_run_mismatch" in r.message for r in caplog.records)
 
     def test_current_renewal_directive_marks_and_drops_but_fenced_one_is_discarded(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         first = LeaseGrantResponse.model_validate(_grant_payload())
         assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
         request = base._build_renewal(
@@ -1433,7 +1433,7 @@ class TestLeaseRunControl:
         assert run_termination(RUN_ID) is None
 
     def test_repeated_renewal_directive_keeps_first_server_reason_everywhere(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         initial = LeaseGrantResponse.model_validate(_grant_payload())
         assert base._apply_lease_response(RUN_ID, initial, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
         first_request = base._build_renewal(
@@ -1513,7 +1513,7 @@ class TestLeaseRunControl:
         self,
     ) -> None:
         """A late reply for lease A must not stop a run now running under B."""
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         first = LeaseGrantResponse.model_validate(_grant_payload())
         assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
         request = base._build_renewal(
@@ -1556,7 +1556,7 @@ class TestLeaseRunControl:
         self,
     ) -> None:
         """A grant landing on a stopped run installs nothing and hands the float back."""
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         first = LeaseGrantResponse.model_validate(_grant_payload())
         assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
         request = base._build_renewal(
@@ -1624,7 +1624,7 @@ class TestLeaseRunControl:
     def test_current_wrong_run_renewal_warns_but_installs_normally(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         first = LeaseGrantResponse.model_validate(_grant_payload())
         assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
         request = base._build_renewal(
@@ -1651,7 +1651,7 @@ class TestLeaseRunControl:
         assert sum("run_control.directive_run_mismatch" in r.message for r in caplog.records) == 1
 
     def test_current_wrong_run_denied_renewal_applies_ordinary_denial(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         first = LeaseGrantResponse.model_validate(_grant_payload())
         assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
         request = base._build_renewal(
@@ -1689,7 +1689,7 @@ class TestLeaseRunControl:
         assert (replay.denied_by_period, replay.deny_reason) == ("agent_run", "agent_run")
 
     def test_current_wrong_run_control_denied_renewal_retains_authority(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         first = LeaseGrantResponse.model_validate(_grant_payload())
         assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
         request = base._build_renewal(
@@ -1734,7 +1734,7 @@ class TestLeaseRunControl:
     def test_fenced_wrong_run_renewal_has_no_warning_or_state_effect(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         first = LeaseGrantResponse.model_validate(_grant_payload())
         assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
         request = base._build_renewal(
@@ -1781,7 +1781,7 @@ class TestDirectiveEpochCoherence:
     def test_no_request_epoch_can_split_a_run_stop_from_its_sticky_denial(
         self, epoch_offset: float
     ) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         directive = BudgetCheckResponse.model_validate(_check_payload(allowed=False))
         clock = _StepClock()
 
@@ -1813,7 +1813,7 @@ class TestDirectiveEpochCoherence:
             assert RUN_ID in base._run_hard_deny_responses
 
     def test_grant_directive_stamps_registry_and_sticky_from_one_observation(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         directed = LeaseGrantResponse.model_validate(_grant_payload(directive_run_id=RUN_ID))
         clock = _StepClock()
 
@@ -1824,7 +1824,7 @@ class TestDirectiveEpochCoherence:
         assert base._run_hard_deny_observed_at[RUN_ID] == _run_control._STATE.observed_at[RUN_ID]
 
     def test_renewal_directive_stamps_registry_and_sticky_from_one_observation(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         first = LeaseGrantResponse.model_validate(_grant_payload())
         assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
         request = base._build_renewal(
@@ -1880,7 +1880,7 @@ class TestDirectiveEpochCoherence:
         assert enforcer._run_hard_deny_observed_at[RUN_ID] == registry_stamp
 
     def test_delayed_alert_only_denial_cannot_erase_a_newer_run_stop(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         directive = BudgetCheckResponse.model_validate(_check_payload(allowed=False))
         base._apply_check_run_control(directive, RUN_ID)
         marked_at = _run_control._STATE.observed_at[RUN_ID]
@@ -1909,7 +1909,7 @@ class TestDirectiveEpochCoherence:
         assert RUN_ID not in base._run_hard_deny_observed_at
 
     def test_suppressed_allow_still_refreshes_the_local_budget_snapshot(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         base._apply_check_run_control(
             BudgetCheckResponse.model_validate(_check_payload(allowed=False)),
             RUN_ID,
@@ -2074,7 +2074,7 @@ class TestMisroutedDirectiveIsDriftNotOutage:
 @pytest.mark.unit
 class TestStoppedRunRefusesLateAuthority:
     def test_renewal_landing_on_a_stopped_run_surrenders_instead_of_installing(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         first = LeaseGrantResponse.model_validate(_grant_payload())
         assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
         request = base._build_renewal(
@@ -2095,7 +2095,7 @@ class TestStoppedRunRefusesLateAuthority:
         assert base._lease.lease_id_for(RUN_ID) is None
 
     def test_close_fenced_directive_renewal_surrenders_without_marking(self) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         first = LeaseGrantResponse.model_validate(_grant_payload())
         assert base._apply_lease_response(RUN_ID, first, ["gpt-5.5"])[0] is GrantOutcome.APPLIED
         request = base._build_renewal(
@@ -2130,7 +2130,7 @@ class TestStoppedRunRefusesLateAuthority:
     def test_outage_replays_a_retained_stop_that_has_no_sticky_response(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", VALID_API_KEY)
+        base = _BudgetEnforcerBase("https://api.test.solwyn.ai", validated_binding(VALID_API_KEY))
         # Registry-only: a local velocity stop files no sticky denial.
         mark_terminated(RUN_ID, reason="velocity:repeat_size", source="local_velocity")
 

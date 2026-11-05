@@ -994,7 +994,7 @@ class TestCloseOutFlushNudge:
         from solwyn.reporter import AsyncMetadataReporter
 
         reporter = AsyncMetadataReporter(
-            "https://api.test.solwyn.ai", validated_binding("sk_proj_" + "a" * 64)
+            "https://api.test.solwyn.ai", validated_binding("solwyn_sk_" + "a" * 64)
         )
         reporter.start()
         try:

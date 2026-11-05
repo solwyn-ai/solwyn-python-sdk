@@ -167,7 +167,7 @@ class _SendOutcome(enum.Enum):
     SENT = "sent"  # delivered
     HELD = "held"  # control-plane breaker refused admission — not an attempt
     RETRY = "retry"  # transient failure — retry after backoff
-    DROPPED = "dropped"  # terminal status / poison item / key refusal — never retry
+    DROPPED = "dropped"  # terminal status / poison item / key refusal: never retry
 
 
 class _IngestRejectionKind(enum.Enum):
@@ -1717,14 +1717,14 @@ class MetadataReporter(_ReporterBase):
 
     Usage::
 
-        reporter = MetadataReporter(api_url, api_key)
+        reporter = MetadataReporter(api_url, binding)
         reporter.report(event)  # non-blocking
         # ...
         reporter.close()  # flush remaining events
 
     Or as a context manager::
 
-        with MetadataReporter(api_url, api_key) as reporter:
+        with MetadataReporter(api_url, binding) as reporter:
             reporter.report(event)
     """
 
@@ -1875,7 +1875,6 @@ class MetadataReporter(_ReporterBase):
         # The mismatched pair therefore means no surviving owner can finish the
         # inherited transition unless the child reopens the internal gate.
         interrupted_seal = self._delivery_closed and not self._delivery_completed
-        self._breaker_project_lock = threading.Lock()
         self._breaker_report_lock = threading.Lock()
         if self._untracked_state is not None:
             self._untracked_state.reset_after_fork_in_child()
@@ -3057,7 +3056,7 @@ class AsyncMetadataReporter(_ReporterBase):
 
     Usage::
 
-        async with AsyncMetadataReporter(api_url, api_key) as reporter:
+        async with AsyncMetadataReporter(api_url, binding) as reporter:
             reporter.report(event)
     """
 
@@ -3155,7 +3154,6 @@ class AsyncMetadataReporter(_ReporterBase):
         Inherited advisory observations are discarded because parent and
         child mint different report IDs.
         """
-        self._breaker_project_lock = threading.Lock()
         self._breaker_report_lock = threading.Lock()
         if self._untracked_state is not None:
             self._untracked_state.reset_after_fork_in_child()

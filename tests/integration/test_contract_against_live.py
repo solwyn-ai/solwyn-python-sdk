@@ -28,6 +28,7 @@ from solwyn._types import (
     ProviderName,
 )
 from solwyn.testing.contract import (
+    assert_auth_key_contract,
     assert_check_contract,
     assert_confirm_contract,
     assert_lease_contract,
@@ -81,7 +82,7 @@ def _create_scoped_project(
             headers=headers,
         )
         updated.raise_for_status()
-    return Credentials(api_url=api_url, api_key=project["key"])
+    return Credentials(api_url=api_url, api_key=project["key"], project=project["id"])
 
 
 def _burn_scoped_budget(
@@ -98,7 +99,7 @@ def _burn_scoped_budget(
         tags=tags,
         failover_directive_version="1",
     )
-    headers = {"Authorization": f"Bearer {credentials.api_key}"}
+    headers = credentials.key_headers()
     with httpx.Client(base_url=credentials.api_url, timeout=15) as http:
         checked = http.post(
             "/api/v1/budgets/check",
@@ -141,7 +142,7 @@ def _create_stopped_project(api_url: str, *, run_id: str = "contract-stopped-run
         )
         created.raise_for_status()
         project = created.json()
-        credentials = Credentials(api_url=api_url, api_key=project["key"])
+        credentials = Credentials(api_url=api_url, api_key=project["key"], project=project["id"])
         ingested = http.post(
             "/api/v1/metadata/ingest",
             json=[
@@ -160,7 +161,7 @@ def _create_stopped_project(api_url: str, *, run_id: str = "contract-stopped-run
                     call_id=str(uuid.uuid4()),
                 ).model_dump(mode="json")
             ],
-            headers={"Authorization": f"Bearer {credentials.api_key}"},
+            headers=credentials.key_headers(),
         )
         ingested.raise_for_status()
         listed = http.get(
@@ -252,6 +253,7 @@ def _route_check_contract(
         elif run_id == "contract-agent-run":
             selected = credentials.agent_run
         request.headers["Authorization"] = f"Bearer {selected.api_key}"
+        request.headers["Solwyn-Project"] = selected.project
 
     return route
 
@@ -266,7 +268,7 @@ def test_shared_check_contract_against_live(
         timeout=15,
         event_hooks={"request": [_route_check_contract(credentials)]},
     ) as http:
-        assert_check_contract(http, credentials.allow.api_key)
+        assert_check_contract(http, credentials.allow.api_key, credentials.allow.project)
 
 
 @pytest.mark.integration
@@ -278,13 +280,15 @@ def test_shared_run_control_contract_against_live(api_url: str) -> None:
     credentials = _create_stopped_project(api_url, run_id=run_id)
 
     with httpx.Client(base_url=credentials.api_url, timeout=15) as http:
-        assert_run_control_contract(http, credentials.api_key, stopped_run_id=run_id)
+        assert_run_control_contract(
+            http, credentials.api_key, credentials.project, stopped_run_id=run_id
+        )
 
 
 @pytest.mark.integration
 def test_shared_trace_ingest_contract_against_live(test_credentials: Credentials) -> None:
     with httpx.Client(base_url=test_credentials.api_url, timeout=15) as http:
-        assert_trace_ingest_contract(http, test_credentials.api_key)
+        assert_trace_ingest_contract(http, test_credentials.api_key, test_credentials.project)
 
 
 @pytest.mark.integration
@@ -300,17 +304,24 @@ def test_shared_receipt_ingest_contract_against_live(api_url: str) -> None:
     )
 
     with httpx.Client(base_url=credentials.api_url, timeout=15) as http:
-        assert_receipt_ingest_contract(http, credentials.api_key)
+        assert_receipt_ingest_contract(http, credentials.api_key, credentials.project)
+
+
+@pytest.mark.integration
+def test_shared_auth_key_contract_against_live(test_credentials: Credentials) -> None:
+    # Needs core 14b-1 (API key scoping) deployed at SOLWYN_TEST_API_URL.
+    with httpx.Client(base_url=test_credentials.api_url, timeout=15) as http:
+        assert_auth_key_contract(http, test_credentials.api_key, test_credentials.project)
 
 
 @pytest.mark.integration
 def test_shared_confirm_contract_against_live(test_credentials: Credentials) -> None:
     with httpx.Client(base_url=test_credentials.api_url, timeout=15) as http:
-        assert_confirm_contract(http, test_credentials.api_key)
+        assert_confirm_contract(http, test_credentials.api_key, test_credentials.project)
 
 
 def _fill_holder_cap(credentials: ProjectCredentials) -> None:
-    headers = {"Authorization": f"Bearer {credentials.api_key}"}
+    headers = credentials.key_headers()
     with httpx.Client(base_url=credentials.api_url, timeout=15) as http:
         refusal: httpx.Response | None = None
         for index in range(40):
@@ -365,10 +376,11 @@ def test_shared_lease_contract_against_live(
         else:
             selected = eligible
         request.headers["Authorization"] = f"Bearer {selected.api_key}"
+        request.headers["Solwyn-Project"] = selected.project
 
     with httpx.Client(
         base_url=api_url,
         timeout=15,
         event_hooks={"request": [route]},
     ) as http:
-        assert_lease_contract(http, eligible.api_key)
+        assert_lease_contract(http, eligible.api_key, eligible.project)

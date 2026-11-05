@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from conftest import VALID_PROJECT_ID, make_mock_client
+from conftest import VALID_PROJECT_ID, make_mock_client, validated_binding
 
 from solwyn._base import _reset_unmetered_spend_warnings
 from solwyn._constants import ORDINARY_TOKEN_COUNT_MAX
@@ -475,7 +475,9 @@ class TestInjectionOnlyUnderHardDeny:
 
         from solwyn._types import BudgetCheckResponse
 
-        base = _BudgetEnforcerBase(api_url="https://api.test.solwyn.ai", api_key="k" * 8)
+        base = _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai", binding=validated_binding("k" * 8)
+        )
         hard = BudgetCheckResponse(**{**ALLOW_BUDGET_RESPONSE, "mode": "hard_deny"})
         alert = BudgetCheckResponse(**ALLOW_BUDGET_RESPONSE)
         assert base._build_result_from_response(hard).hard_deny_admitted is True
@@ -486,7 +488,9 @@ class TestInjectionOnlyUnderHardDeny:
 @pytest.mark.unit
 class TestEnforcerResolution:
     def _base(self) -> _BudgetEnforcerBase:
-        return _BudgetEnforcerBase(api_url="https://api.test.solwyn.ai", api_key="k" * 8)
+        return _BudgetEnforcerBase(
+            api_url="https://api.test.solwyn.ai", binding=validated_binding("k" * 8)
+        )
 
     @pytest.mark.parametrize(
         ("given", "expected"),

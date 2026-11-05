@@ -113,7 +113,7 @@ _PROJECT_NOT_FOUND_MESSAGE = (
 )
 _URL_MISMATCH_MESSAGE = "Solwyn-Project names a different project than the URL."
 _MULTIPLE_HEADERS_MESSAGE = "Send one Solwyn-Project header."
-_READ_ONLY_KEY_MESSAGE = "read-only project key cannot write"
+_READ_ONLY_KEY_MESSAGE = "read-only API key cannot write"
 KeyState = Literal["active", "expired", "revoked"]
 KeyScope = Literal["full", "read_only"]
 
@@ -1717,7 +1717,7 @@ class FakeControlPlane:
                     {
                         "detail": {
                             "code": "read_only_key",
-                            "message": "read-only project key cannot write",
+                            "message": "read-only API key cannot write",
                         }
                     },
                 )

@@ -52,7 +52,8 @@ from solwyn import Solwyn
 
 client = Solwyn(
     OpenAI(),
-    api_key="sk_proj_...",
+    api_key="solwyn_sk_...",
+    project="checkout-bot",
 )
 
 response = client.chat.completions.create(
@@ -66,12 +67,48 @@ client.close()
 Or use as a context manager:
 
 ```python
-with Solwyn(OpenAI(), api_key="sk_proj_...") as client:
+with Solwyn(OpenAI(), api_key="solwyn_sk_...", project="checkout-bot") as client:
     response = client.chat.completions.create(
         model="gpt-5.5",
         messages=[{"role": "user", "content": "Hello!"}],
     )
 ```
+
+### API keys and projects
+
+A Solwyn API key (`solwyn_sk_` followed by 64 lowercase hex characters)
+belongs to your account and can reach one or more projects. Every client names
+the project it spends against with `project=` or `SOLWYN_PROJECT`: a project
+name or a `proj_` id. The SDK sends it as the `Solwyn-Project` header on every
+request.
+
+```python
+client = Solwyn(OpenAI(), api_key="solwyn_sk_...", project="checkout-bot")
+client.validate()  # optional: fail fast at startup
+```
+
+Validation is lazy: constructing a client makes no network call. Before the
+first call that needs Solwyn, the SDK calls `GET /api/v1/auth/key` once, and
+from then on names the project by its `proj_` id, so renaming the project in
+the dashboard does not break a running client. `client.validate()` (`await
+client.validate()` on `AsyncSolwyn`) does the same check on demand and raises
+on any refusal; it returns `None` when Solwyn cannot be reached.
+
+When Solwyn refuses the key or the project, the SDK raises
+`ApiKeyRefusedError`, a `ConfigurationError`, and keeps refusing every later
+call without network until a fresh validation succeeds (it retries every 60
+seconds). A refusal is never treated as an outage: `fail_open`, cached allows,
+held leases and the control-plane breaker cannot let a call past it. Refusals
+include a read-only key, a project the key does not reach, and a key that is
+expired or revoked. One exception keeps alert-only apps running: after the
+client has validated once, an expired or revoked key on a project that
+promises to block nothing (alert-only, with no unpaused hard budget rule or
+run cap) lets calls run unmetered, logging `solwyn.api_key_refused` at error
+on every call. At startup every refusal blocks.
+
+Old project keys (`sk_proj_...`) no longer work; the SDK rejects them when
+the client is constructed. Create a key in the dashboard or with
+`solwyn keys create`. `SOLWYN_PROJECT_ID` is not read; use `SOLWYN_PROJECT`.
 
 ### Drop-in type compatibility
 
@@ -80,7 +117,7 @@ provider SDK type:
 
 ```python
 raw = OpenAI()
-client = Solwyn(raw, api_key="sk_proj_...")
+client = Solwyn(raw, api_key="solwyn_sk_...", project="checkout-bot")
 
 assert isinstance(client, OpenAI)
 assert isinstance(client, type(raw))
@@ -127,7 +164,7 @@ infer budget enforcement for other framework call surfaces.
 from openai import OpenAI
 from solwyn import Solwyn
 
-client = Solwyn(OpenAI(), api_key="sk_proj_...")
+client = Solwyn(OpenAI(), api_key="solwyn_sk_...", project="checkout-bot")
 response = client.chat.completions.create(model="gpt-5.5", messages=[...])
 ```
 
@@ -137,7 +174,7 @@ response = client.chat.completions.create(model="gpt-5.5", messages=[...])
 from anthropic import Anthropic
 from solwyn import Solwyn
 
-client = Solwyn(Anthropic(), api_key="sk_proj_...")
+client = Solwyn(Anthropic(), api_key="solwyn_sk_...", project="checkout-bot")
 response = client.messages.create(model="claude-sonnet-4-20250514", max_tokens=1024, messages=[...])
 ```
 
@@ -159,7 +196,7 @@ remain unmetered and follow `on_unmetered`, like their non-beta counterparts.
 from google import genai
 from solwyn import Solwyn
 
-client = Solwyn(genai.Client(api_key="..."), api_key="sk_proj_...")
+client = Solwyn(genai.Client(api_key="..."), api_key="solwyn_sk_...", project="checkout-bot")
 response = client.models.generate_content(model="gemini-3.5-flash", contents="Hello!")
 ```
 
@@ -180,7 +217,7 @@ bedrock = boto3.client(
     config=Config(retries={"total_max_attempts": 1}, read_timeout=60),
 )
 
-client = Solwyn(bedrock, api_key="sk_proj_...")
+client = Solwyn(bedrock, api_key="solwyn_sk_...", project="checkout-bot")
 response = client.converse(
     modelId="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
     messages=[{"role": "user", "content": [{"text": "Hello!"}]}],
@@ -221,7 +258,7 @@ pip install "solwyn[together]"
 from solwyn import Solwyn
 from together import Together
 
-client = Solwyn(Together(api_key="..."), api_key="sk_proj_...")
+client = Solwyn(Together(api_key="..."), api_key="solwyn_sk_...", project="checkout-bot")
 response = client.chat.completions.create(
     model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
     messages=[{"role": "user", "content": "Hello!"}],
@@ -234,7 +271,7 @@ Pair sync and async client types: use `Solwyn` with `Together`, and `AsyncSolwyn
 from solwyn import AsyncSolwyn
 from together import AsyncTogether
 
-async with AsyncSolwyn(AsyncTogether(api_key="..."), api_key="sk_proj_...") as client:
+async with AsyncSolwyn(AsyncTogether(api_key="..."), api_key="solwyn_sk_...", project="checkout-bot") as client:
     response = await client.chat.completions.create(
         model="meta-llama/Llama-3.3-70B-Instruct-Turbo",
         messages=[{"role": "user", "content": "Hello!"}],
@@ -253,7 +290,8 @@ from solwyn import Solwyn
 
 client = Solwyn(
     OpenAI(base_url="https://api.groq.com/openai/v1", api_key="gsk_..."),
-    api_key="sk_proj_...",
+    api_key="solwyn_sk_...",
+    project="checkout-bot",
 )
 response = client.chat.completions.create(
     model="llama-3.3-70b-versatile",
@@ -286,7 +324,8 @@ For endpoints auto-detection can't name, pin the provider explicitly — on the 
 ```python
 client = Solwyn(
     OpenAI(base_url="http://gpu-box:8080/v1", api_key="-"),
-    api_key="sk_proj_...",
+    api_key="solwyn_sk_...",
+    project="checkout-bot",
     provider="vllm",
     fallback=[(OpenAI(base_url="https://openrouter.ai/api/v1", api_key="sk-or-..."), "openrouter/auto"),
               (other_client, "my-model", {}, "ollama")],
@@ -308,7 +347,7 @@ budget attribution:
 
 ```python
 gateway = OpenAI(base_url="http://localhost:9999/v1", api_key="...")
-client = Solwyn(gateway, api_key="sk_proj_...", provider="openai")
+client = Solwyn(gateway, api_key="solwyn_sk_...", project="checkout-bot", provider="openai")
 
 response = client.responses.create(
     model="gpt-5.5",
@@ -445,7 +484,8 @@ from solwyn import Solwyn
 
 client = Solwyn(
     OpenAI(),
-    api_key="sk_proj_...",
+    api_key="solwyn_sk_...",
+    project="checkout-bot",
     on_unmetered="raise",
     acknowledge_untracked={"responses.retrieve"},
 )
@@ -493,7 +533,8 @@ from solwyn import CoverageFingerprint, Solwyn, coverage
 
 audit_client = Solwyn(
     OpenAI(),
-    api_key="sk_proj_...",
+    api_key="solwyn_sk_...",
+    project="checkout-bot",
     on_unmetered="raise",
 )
 
@@ -537,7 +578,8 @@ from solwyn import AsyncSolwyn
 
 async with AsyncSolwyn(
     AsyncOpenAI(),
-    api_key="sk_proj_...",
+    api_key="solwyn_sk_...",
+    project="checkout-bot",
 ) as client:
     response = await client.chat.completions.create(
         model="gpt-5.5",
@@ -570,7 +612,8 @@ from openai import OpenAI
 
 client = solwyn.Solwyn(
     OpenAI(),
-    api_key="sk_proj_...",
+    api_key="solwyn_sk_...",
+    project="checkout-bot",
     tags={"environment": "prod", "service": "research"},
 )
 
@@ -664,7 +707,8 @@ from solwyn import Solwyn, run
 
 client = Solwyn(
     Anthropic(open_telemetry={"tracer_provider": tracer_provider}),
-    api_key="sk_proj_...",
+    api_key="solwyn_sk_...",
+    project="checkout-bot",
     anthropic_conversation_id=True,
 )
 
@@ -721,7 +765,8 @@ Set `budget_mode` to control spending:
 ```python
 client = Solwyn(
     OpenAI(),
-    api_key="sk_proj_...",
+    api_key="solwyn_sk_...",
+    project="checkout-bot",
     budget_mode="hard_deny",
 )
 ```
@@ -1249,6 +1294,18 @@ every call it refused — who denied it (`deny_source`), why (`deny_reason`), an
 under which period — with `plane.aggregate_replays` holding the folded
 aggregates the SDK replays after an ingest rejection.
 
+### 5. Simulating a refused or expired key
+
+`FakeControlPlane` implements the scoped-key contract: it serves
+`GET /api/v1/auth/key`, requires the `Solwyn-Project` header, and answers with
+the same refusal codes and bodies as Solwyn. Script the key and project with
+`plane.expire_key()`, `plane.revoke_key()`, `plane.restore_key()`,
+`plane.set_key_scope("read_only")`, `plane.rename_project(...)`,
+`plane.archive_project()` and `plane.require_dedicated_keys()`. The posture an
+expired or revoked key reports follows `plane.mode` and `plane.budget_rules`
+(append `FakeBudgetRule("scoped", "hard_deny")` or a `"runaway_run"` cap). A
+raw `httpx` client needs `headers=plane.auth_headers()`.
+
 ### Opt-in pytest fixtures
 
 Fixtures never auto-register. Enable them in the test module (or your own
@@ -1275,7 +1332,8 @@ def test_denial_fixture(solwyn_control_plane, solwyn_test_client):
 
 | Parameter | Env Var | Default | Description |
 |-----------|---------|---------|-------------|
-| `api_key` | `SOLWYN_API_KEY` | *required* | Solwyn project API key |
+| `api_key` | `SOLWYN_API_KEY` | *required* | Solwyn API key (`solwyn_sk_` followed by 64 lowercase hex characters) |
+| `project` | `SOLWYN_PROJECT` | *required* | The project this client spends against: a project name or a `proj_` id. Sent as the `Solwyn-Project` header on every request |
 | `api_url` | `SOLWYN_API_URL` | `https://api.solwyn.ai` | Solwyn API endpoint |
 | `tags` | `SOLWYN_TAGS` | `None` | Default spend tags for intercepted calls; env format is comma-separated `key=value` entries |
 | `fail_open` | `SOLWYN_FAIL_OPEN` | `True` | When Solwyn API is unreachable: `True` allows calls and tallies their tokens for the next successful check; `False` denies calls that no live budget lease covers |
@@ -1325,7 +1383,8 @@ configured order there until lease grants carry hints.
 Use env vars to avoid passing credentials in code:
 
 ```sh
-export SOLWYN_API_KEY="sk_proj_..."
+export SOLWYN_API_KEY="solwyn_sk_..."
+export SOLWYN_PROJECT="checkout-bot"
 ```
 
 ```python
@@ -1348,7 +1407,7 @@ The failover window deliberately does *not* cap a dispatched hop's read. A pre-s
 Lower `failover_hop_read_timeout` if you would rather fail fast than wait out a slow generation (reasoning models, large `max_tokens`) — remembering that the fast failure is an ambiguous re-raise, not a failover:
 
 ```python
-client = Solwyn(OpenAI(), api_key="sk_proj_...", failover_hop_read_timeout=120.0)
+client = Solwyn(OpenAI(), api_key="solwyn_sk_...", project="checkout-bot", failover_hop_read_timeout=120.0)
 ```
 
 **google-genai limitation.** google-genai supports only a single whole-request timeout — it cannot split connect from read (a client-level `httpx.Timeout` via `client_args` is overridden per-request by the SDK itself). Solwyn therefore gives a google hop the read bound (`failover_hop_read_timeout`, default 600s) as its whole-request timeout. Consequence: a google **pre-send hang** (TCP/TLS connect, pool wait) is *not* bounded by `failover_total_timeout` — a single hung google hop can block up to the read bound and exhaust the failover window without ever failing over. (OS TCP timeouts typically cap a dead-host connect at ~1–2 minutes.) If you run google as primary with fallbacks and want a tighter failover guarantee, lower `failover_hop_read_timeout` — for google it bounds the entire request.

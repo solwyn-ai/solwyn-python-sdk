@@ -106,7 +106,7 @@ def make_lease_enforcer() -> Iterator[EnforcerFactory]:
     ) -> tuple[BudgetEnforcer, _WireCounter]:
         enforcer = BudgetEnforcer(
             api_url=credentials.api_url,
-            api_key=credentials.api_key,
+            binding=credentials.binding(),
             budget_mode=budget_mode,
             fail_open=fail_open,
             holder_id=holder_id,
@@ -178,7 +178,7 @@ def _grant_raw(
         r = http.post(
             _LEASE_PATH,
             json=request.model_dump(mode="json"),
-            headers={"Authorization": f"Bearer {credentials.api_key}"},
+            headers=credentials.key_headers(),
         )
         r.raise_for_status()
         body = r.json()
@@ -204,7 +204,7 @@ def _renew_raw(
                 "generation": generation,
                 "spent_tokens": spent_tokens,
             },
-            headers={"Authorization": f"Bearer {credentials.api_key}"},
+            headers=credentials.key_headers(),
         )
 
 
@@ -219,7 +219,7 @@ def _surrender_raw(
                 "holder_id": holder_id,
                 "generation": generation,
             },
-            headers={"Authorization": f"Bearer {credentials.api_key}"},
+            headers=credentials.key_headers(),
         )
         r.raise_for_status()
         return dict(r.json())
@@ -231,7 +231,7 @@ def _send_confirm(credentials: Credentials, confirm_request: Any) -> None:
         r = http.post(
             "/api/v1/budgets/confirm",
             json=confirm_request.model_dump(mode="json"),
-            headers={"Authorization": f"Bearer {credentials.api_key}"},
+            headers=credentials.key_headers(),
         )
         r.raise_for_status()
 

@@ -47,7 +47,6 @@ async def test_background_http_has_empty_context_while_preflight_keeps_caller_co
         sdk_instance_id="context-isolation",
         breaker_snapshots=lambda: [(ProviderName.OPENAI, breaker.get_state())],
     )
-    reporter.observe_project_id(plane.project_id)
     caller = trace.SpanContext(trace_id=0xABC, span_id=0xDE, is_remote=False)
     token = sentinel.set("caller")
     try:

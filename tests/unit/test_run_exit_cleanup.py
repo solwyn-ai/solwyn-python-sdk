@@ -162,6 +162,7 @@ _SHUTDOWN = (
     _TRACING
     + """
 from unittest.mock import MagicMock
+from solwyn._project import ProjectBinding
 from solwyn.testing import FakeControlPlane
 plane = FakeControlPlane()
 raw = MagicMock(spec=['close'])
@@ -284,10 +285,12 @@ def test_gc_of_a_coroutine_with_a_contextmanager_run_never_enters_enforcer():
 import contextlib, gc, types
 import solwyn
 from solwyn.budget import BudgetEnforcer
+from solwyn._project import ProjectBinding
 from solwyn.testing import FakeControlPlane
 gc.disable()
 plane = FakeControlPlane()
-enforcer = BudgetEnforcer(plane.api_url, plane.api_key, transport=plane.transport)
+binding = ProjectBinding(plane.api_key, plane.project_name)
+enforcer = BudgetEnforcer(plane.api_url, binding, transport=plane.transport)
 @contextlib.contextmanager
 def traced():
     with solwyn.run('coroutine') as rid:
@@ -460,6 +463,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
 import solwyn
 from solwyn import _lifecycle
+from solwyn._project import ProjectBinding
 from solwyn.testing import FakeControlPlane
 gc.disable()
 os.environ['SOLWYN_OTEL_SPANS'] = 'true'

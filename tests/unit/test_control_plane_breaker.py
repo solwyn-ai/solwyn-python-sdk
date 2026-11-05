@@ -22,6 +22,7 @@ from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, CircuitState, ProviderName
 from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer, BudgetMode
 from solwyn.circuit_breaker import CircuitBreaker
+from solwyn.exceptions import ApiKeyRefusedError
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 
 
@@ -174,11 +175,14 @@ class TestCheckBreaker:
         transport = _CountingTransport("read_only")
         enforcer = _make_enforcer(breaker, transport, fail_open=True)
 
-        # A read-only-key 403 means the control plane RESPONDED: it fails open
-        # but never counts as an outage, so the breaker stays closed.
+        # A read-only-key 403 means the control plane RESPONDED: it never
+        # counts as an outage, so the breaker stays closed. It is a persistent
+        # refusal, never fail-open: every call is blocked, and only the first
+        # one reached the network.
         for _ in range(3):
-            assert _check(enforcer).allowed is True
-        assert transport.count == 3
+            with pytest.raises(ApiKeyRefusedError):
+                _check(enforcer)
+        assert transport.count == 1
         state = breaker.get_state()
         assert state.state is CircuitState.CLOSED
         assert state.failure_count == 0

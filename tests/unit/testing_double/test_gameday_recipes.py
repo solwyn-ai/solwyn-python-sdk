@@ -71,7 +71,9 @@ def _lease_check(enforcer: BudgetEnforcer, run_id: str) -> BudgetCheckResult:
 
 
 def _reservation(plane: FakeControlPlane) -> str:
-    with httpx.Client(transport=plane.transport, base_url=plane.api_url) as http:
+    with httpx.Client(
+        transport=plane.transport, base_url=plane.api_url, headers=plane.auth_headers()
+    ) as http:
         response = http.post(
             "/api/v1/budgets/check",
             json={
@@ -499,7 +501,7 @@ def test_a_local_velocity_stop_is_never_lifted_by_a_permissive_plane() -> None:
             checks_at_stop = len(plane.checks)
 
             # The plane itself is entirely permissive for this run...
-            with httpx.Client(transport=plane.transport) as http:
+            with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as http:
                 allowed = http.post(
                     f"{plane.api_url}/api/v1/budgets/check",
                     json={

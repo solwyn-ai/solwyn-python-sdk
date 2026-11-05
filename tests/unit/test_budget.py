@@ -107,7 +107,7 @@ class TestBudgetEnforcerBase:
     def test_build_check_request(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         req = base._build_check_request(500, "gpt-5.5", "openai")
         assert not hasattr(req, "project_id")
@@ -124,7 +124,7 @@ class TestBudgetEnforcerBase:
     def test_build_check_request_carries_agent_run_id(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
 
         req = base._build_check_request(
@@ -139,7 +139,7 @@ class TestBudgetEnforcerBase:
     def test_build_check_request_carries_copied_tags(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         tags = {"team": "research"}
 
@@ -159,7 +159,7 @@ class TestBudgetEnforcerBase:
 
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         assert not hasattr(budget_module, "DEFAULT_COST_PER_TOKEN")
         for name in (
@@ -175,7 +175,7 @@ class TestBudgetEnforcerBase:
     def test_cache_allow_decisions(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
             cache_ttl=5,
         )
 
@@ -195,7 +195,7 @@ class TestBudgetEnforcerBase:
     def test_live_allow_clears_matching_server_termination(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         mark_terminated("run_server", reason="run_stopped", source="server")
 
@@ -209,7 +209,7 @@ class TestBudgetEnforcerBase:
     def test_live_allow_does_not_clear_local_velocity_termination(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         mark_terminated(
             "run_local",
@@ -230,7 +230,7 @@ class TestBudgetEnforcerBase:
     def test_live_allow_does_not_clear_different_server_run(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         mark_terminated("run_other", reason="run_stopped", source="server")
 
@@ -247,7 +247,7 @@ class TestBudgetEnforcerBase:
     def test_never_cache_deny_decisions(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
             cache_ttl=5,
         )
 
@@ -258,7 +258,7 @@ class TestBudgetEnforcerBase:
     def test_cache_expires(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
             cache_ttl=0,  # Expire immediately
         )
 
@@ -290,7 +290,7 @@ class TestBudgetEnforcerBase:
     ) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         response = BudgetCheckResponse.model_validate(
             {
@@ -311,7 +311,7 @@ class TestBudgetEnforcerBase:
     def test_lease_run_stopped_denial_is_filed_under_only_its_run(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         response = LeaseGrantResponse.model_validate(
             {
@@ -342,7 +342,7 @@ class TestBudgetEnforcerBase:
     ) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         cached_key = base._allow_cache_key(
             provider="openai",
@@ -368,7 +368,7 @@ class TestBudgetEnforcerBase:
     def test_run_stopped_denial_preserves_prior_project_period_sticky_deny(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         project_denial = BudgetCheckResponse(**_DENY_RESPONSE)
         stopped_denial = BudgetCheckResponse(**_STOPPED_RUN_DENY_RESPONSE)
@@ -1119,8 +1119,9 @@ class TestLegacyUncountedTally:
 
     @pytest.mark.parametrize(
         "status",
-        [422, 404, 401],
-        ids=["422-unknown-model", "404", "401"],
+        # A 401 is never here: every 401 is a key refusal (test_api_key_errors).
+        [422, 404],
+        ids=["422-unknown-model", "404"],
     )
     def test_folding_4xx_clears_the_report_and_warns_once(
         self, status: int, caplog: pytest.LogCaptureFixture
@@ -2072,7 +2073,7 @@ class TestDenialReceiptAttribution:
     def test_live_hard_deny_is_server_attributed_with_exact_period(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
 
         result = base._build_result_from_response(
@@ -2089,7 +2090,7 @@ class TestDenialReceiptAttribution:
     def test_allowed_result_has_no_denial_attribution(self, payload: dict[str, object]) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
 
         result = base._build_result_from_response(BudgetCheckResponse.model_validate(payload))
@@ -2101,7 +2102,7 @@ class TestDenialReceiptAttribution:
     def test_sticky_replay_preserves_exact_period_and_reason(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
         response = BudgetCheckResponse.model_validate(_STOPPED_RUN_DENY_RESPONSE)
         base._cache_response(response, agent_run_id="run_a")
@@ -2118,7 +2119,7 @@ class TestDenialReceiptAttribution:
     def test_fail_closed_builder_uses_structural_reason(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
             fail_open=False,
         )
 
@@ -2138,7 +2139,7 @@ class TestDenialReceiptAttribution:
     def test_lease_ladder_terminal_deny_preserves_reason_and_period(self) -> None:
         base = _BudgetEnforcerBase(
             api_url="https://api.test.solwyn.ai",
-            api_key=VALID_API_KEY,
+            binding=validated_binding(VALID_API_KEY),
         )
 
         result = base._result_from_admission(
