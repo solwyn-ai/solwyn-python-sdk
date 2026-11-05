@@ -8,7 +8,7 @@ import threading
 from contextvars import copy_context
 
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, validated_binding
 
 import solwyn
 from solwyn import _lifecycle
@@ -58,6 +58,7 @@ import solwyn
 from solwyn import _lifecycle, _run
 from solwyn._lifecycle import _drain_run_cleanups, _drain_run_span_cleanups
 from solwyn.budget import BudgetEnforcer
+from solwyn._project import ProjectBinding
 from solwyn.testing import FakeControlPlane
 
 gc.disable()
@@ -67,7 +68,8 @@ exporter = InMemorySpanExporter()
 provider.add_span_processor(SimpleSpanProcessor(exporter))
 trace.set_tracer_provider(provider)
 plane = FakeControlPlane()
-enforcer = BudgetEnforcer(plane.api_url, plane.api_key, transport=plane.transport)
+binding = ProjectBinding(plane.api_key, plane.project_name)
+enforcer = BudgetEnforcer(plane.api_url, binding, transport=plane.transport)
 kind, lock_kind = sys.argv[1:3]
 scope = solwyn.run('stream')
 handles = []
@@ -143,7 +145,9 @@ provider.shutdown()
 
 def test_pending_surrender_finishes_before_a_later_grant_for_the_same_run():
     plane = FakeControlPlane()
-    enforcer = BudgetEnforcer(plane.api_url, VALID_API_KEY, transport=plane.transport)
+    enforcer = BudgetEnforcer(
+        plane.api_url, validated_binding(VALID_API_KEY), transport=plane.transport
+    )
 
     def chunks():
         with solwyn.run("stream") as rid:
@@ -180,7 +184,9 @@ def test_idle_stream_is_surrendered_without_another_sdk_entry():
             surrendered.set()
         return response
 
-    enforcer = BudgetEnforcer(plane.api_url, VALID_API_KEY, transport=httpx.MockTransport(dispatch))
+    enforcer = BudgetEnforcer(
+        plane.api_url, validated_binding(VALID_API_KEY), transport=httpx.MockTransport(dispatch)
+    )
 
     def chunks():
         with solwyn.run("stream") as rid:
@@ -201,7 +207,9 @@ def test_idle_stream_is_surrendered_without_another_sdk_entry():
 
 def test_stale_context_cleanup_cannot_surrender_a_successor_lease():
     plane = FakeControlPlane()
-    enforcer = BudgetEnforcer(plane.api_url, VALID_API_KEY, transport=plane.transport)
+    enforcer = BudgetEnforcer(
+        plane.api_url, validated_binding(VALID_API_KEY), transport=plane.transport
+    )
     scope = solwyn.run("stream")
 
     def chunks():
@@ -239,10 +247,12 @@ import gc
 from contextvars import copy_context
 import solwyn
 from solwyn.budget import BudgetEnforcer
+from solwyn._project import ProjectBinding
 from solwyn.testing import FakeControlPlane
 
 plane = FakeControlPlane()
-enforcer = BudgetEnforcer(plane.api_url, plane.api_key, transport=plane.transport)
+binding = ProjectBinding(plane.api_key, plane.project_name)
+enforcer = BudgetEnforcer(plane.api_url, binding, transport=plane.transport)
 class ChatStream:
     def __init__(self):
         self.chunks = self.generate()

@@ -1,4 +1,4 @@
-"""Single-credential constructor tests for the tier-zero project key API."""
+"""Constructor credential tests: one account API key plus the project it names."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ import pytest
 from solwyn import Solwyn
 from solwyn.exceptions import ConfigurationError
 
-VALID_PROJECT_KEY = "sk_proj_" + "a" * 64
+VALID_KEY = "solwyn_sk_" + "a" * 64
+PROJECT = "checkout-bot"
 
 
 @pytest.fixture(autouse=True)
@@ -40,46 +41,53 @@ def _make_solwyn(client: object, **config_kwargs: object) -> Solwyn:
 
 
 @pytest.mark.unit
-def test_solwyn_constructor_accepts_only_api_key(openai_client: MagicMock) -> None:
-    """Tier-zero: project_id is no longer a constructor parameter."""
-    client = _make_solwyn(openai_client, api_key=VALID_PROJECT_KEY)
+def test_solwyn_constructor_takes_api_key_and_project(openai_client: MagicMock) -> None:
+    client = _make_solwyn(openai_client, api_key=VALID_KEY, project=PROJECT)
 
-    assert client._solwyn_config.api_key == VALID_PROJECT_KEY
+    assert client._solwyn_config.api_key == VALID_KEY
+    assert client._solwyn_config.project == PROJECT
+    assert client._solwyn_binding.selector == PROJECT
+    assert client._solwyn_binding.state == "unvalidated"
     assert not hasattr(client._solwyn_config, "project_id")
 
     client.close()
 
 
 @pytest.mark.unit
-def test_solwyn_rejects_legacy_project_id_kwarg(openai_client: MagicMock) -> None:
-    """Passing project_id should fail clearly."""
-    with pytest.raises(TypeError, match="unexpected keyword argument 'project_id'"):
+def test_solwyn_rejects_project_id_kwarg(openai_client: MagicMock) -> None:
+    with pytest.raises(ConfigurationError) as excinfo:
         _make_solwyn(
             openai_client,
-            api_key=VALID_PROJECT_KEY,
+            api_key=VALID_KEY,
             project_id="proj_" + "0" * 24,
         )
 
+    assert excinfo.value.field == "project_id"
+
 
 @pytest.mark.unit
-def test_solwyn_loads_only_solwyn_api_key_from_env(
+def test_solwyn_loads_api_key_and_project_from_env(
     openai_client: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SOLWYN_PROJECT_ID is no longer recognized."""
-    monkeypatch.setenv("SOLWYN_API_KEY", VALID_PROJECT_KEY)
-    monkeypatch.setenv("SOLWYN_PROJECT_ID", "proj_" + "0" * 24)
+    monkeypatch.setenv("SOLWYN_API_KEY", VALID_KEY)
+    monkeypatch.setenv("SOLWYN_PROJECT", PROJECT)
 
     client = _make_solwyn(openai_client)
 
-    assert client._solwyn_config.api_key == VALID_PROJECT_KEY
-    assert not hasattr(client._solwyn_config, "project_id")
-
+    assert client._solwyn_config.api_key == VALID_KEY
+    assert client._solwyn_config.project == PROJECT
     client.close()
 
 
 @pytest.mark.unit
-def test_solwyn_rejects_legacy_sk_solwyn_prefix(openai_client: MagicMock) -> None:
-    """Legacy sk_solwyn_* keys are rejected after the project-key rename."""
-    with pytest.raises(ConfigurationError, match="must start with 'sk_proj_'"):
-        _make_solwyn(openai_client, api_key="sk_solwyn_" + "a" * 64)
+@pytest.mark.parametrize(
+    "key",
+    ["sk_proj_" + "a" * 64, "sk_solwyn_" + "a" * 64],
+    ids=["old-project-key", "tier-zero-key"],
+)
+def test_solwyn_rejects_retired_key_shapes(openai_client: MagicMock, key: str) -> None:
+    with pytest.raises(ConfigurationError) as excinfo:
+        _make_solwyn(openai_client, api_key=key, project=PROJECT)
+
+    assert excinfo.value.field == "api_key"

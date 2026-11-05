@@ -416,7 +416,8 @@ class TestBasicWrapping:
         solwyn = _make_solwyn(client)
 
         def create_after_project_learned(**_kwargs):
-            assert solwyn._solwyn_reporter._breaker_project_id == VALID_PROJECT_ID
+            # A check response never pins the project; only /auth/key does.
+            assert solwyn._solwyn_binding.pinned_id is None
             return mock_response
 
         client.chat.completions.create.side_effect = create_after_project_learned
@@ -3056,7 +3057,8 @@ class TestAsyncNonStreamingInterception:
         solwyn = _make_async_solwyn(client)
 
         async def create_after_project_learned(**_kwargs):
-            assert solwyn._solwyn_reporter._breaker_project_id == VALID_PROJECT_ID
+            # A check response never pins the project; only /auth/key does.
+            assert solwyn._solwyn_binding.pinned_id is None
             return mock_response
 
         client.chat.completions.create = AsyncMockFn(side_effect=create_after_project_learned)

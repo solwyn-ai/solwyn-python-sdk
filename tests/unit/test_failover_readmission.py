@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from conftest import VALID_PROJECT_ID
+from conftest import VALID_PROJECT_ID, plane_binding, validated_binding
 
 from solwyn._lease import DEFAULT_OUTPUT_BOUND
 from solwyn.exceptions import BudgetExceededError, OutputBoundUnenforceableError
@@ -691,7 +691,9 @@ class TestPerCallOnlyChecksBypassTheCache:
     def _enforcer(self, plane: FakeControlPlane) -> Any:
         from solwyn.budget import BudgetEnforcer
 
-        return BudgetEnforcer(plane.api_url, plane.api_key, transport=plane.transport, cache_ttl=60)
+        return BudgetEnforcer(
+            plane.api_url, plane_binding(plane), transport=plane.transport, cache_ttl=60
+        )
 
     def _check(self, enforcer: Any, **kw: Any) -> Any:
         return enforcer.check_budget(estimated_input_tokens=1, model=PRICEY, provider="groq", **kw)
@@ -991,7 +993,9 @@ class TestCloseOutFlushNudge:
 
         from solwyn.reporter import AsyncMetadataReporter
 
-        reporter = AsyncMetadataReporter("https://api.test.solwyn.ai", "sk_proj_" + "a" * 64)
+        reporter = AsyncMetadataReporter(
+            "https://api.test.solwyn.ai", validated_binding("solwyn_sk_" + "a" * 64)
+        )
         reporter.start()
         try:
             await asyncio.to_thread(reporter.request_flush)

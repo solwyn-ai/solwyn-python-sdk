@@ -120,4 +120,4 @@ jobs:
         env:
           SOLWYN_TEST_API_URL: ${{ secrets.SOLWYN_TEST_API_URL }}
           SOLWYN_TEST_API_KEY: ${{ secrets.SOLWYN_TEST_API_KEY }}
-          SOLWYN_TEST_PROJECT_ID: ${{ secrets.SOLWYN_TEST_PROJECT_ID }}
+          SOLWYN_TEST_PROJECT: ${{ secrets.SOLWYN_TEST_PROJECT }}

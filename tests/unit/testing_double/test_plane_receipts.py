@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 import pytest
+from conftest import plane_binding
 
 from solwyn._types import MetadataEvent
 from solwyn.reporter import MetadataReporter
@@ -62,7 +63,7 @@ def _ordinary_event() -> MetadataEvent:
 
 
 def _ingest(plane: FakeControlPlane, events: list[MetadataEvent]) -> httpx.Response:
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         return client.post(
             f"{plane.api_url}{_INGEST_PATH}",
             json=[event.model_dump(mode="json") for event in events],
@@ -133,7 +134,7 @@ def test_pricing_basis_without_aggregate_count_is_rejected() -> None:
     plane = FakeControlPlane()
     payload = _receipt_payload(receipt_pricing_input_tokens=500)
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = client.post(f"{plane.api_url}{_INGEST_PATH}", json=[payload])
 
     # The vendored model's own validator, mirrored server-side: the whole
@@ -148,7 +149,7 @@ def test_velocity_flags_beyond_the_wire_bound_are_rejected() -> None:
     plane = FakeControlPlane()
     payload = _receipt_payload(velocity_flags=["repeat_size"] * 9)
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = client.post(f"{plane.api_url}{_INGEST_PATH}", json=[payload])
 
     assert response.status_code == 422
@@ -241,7 +242,7 @@ def test_reject_ingest_window_is_request_bounded_and_scoped_to_ingest() -> None:
     plane = FakeControlPlane()
 
     with plane.reject_ingest(count=1, requests=1):
-        with httpx.Client(transport=plane.transport) as client:
+        with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
             # Background control-plane traffic must not spend the script.
             client.post(
                 f"{plane.api_url}/api/v1/budgets/check",
@@ -317,7 +318,7 @@ def test_rejected_receipt_folds_and_replays_after_a_clean_cycle() -> None:
     plane = FakeControlPlane()
     reporter = MetadataReporter(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         flush_interval=0.01,
         transport=plane.transport,
         breaker_reporting_enabled=False,

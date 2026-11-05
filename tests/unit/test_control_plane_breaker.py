@@ -15,13 +15,14 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, call_uuid
+from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, call_uuid, validated_binding
 
 import solwyn.circuit_breaker as circuit_breaker_mod
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, CircuitState, ProviderName
 from solwyn.budget import AsyncBudgetEnforcer, BudgetEnforcer, BudgetMode
 from solwyn.circuit_breaker import CircuitBreaker
+from solwyn.exceptions import ApiKeyRefusedError
 from solwyn.reporter import AsyncMetadataReporter, MetadataReporter
 
 
@@ -79,7 +80,7 @@ def _make_enforcer(
 ) -> BudgetEnforcer:
     enforcer = BudgetEnforcer(
         "http://control-plane.test",
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         fail_open=fail_open,
         control_plane_breaker=breaker,
         transport=httpx.MockTransport(transport.handler),
@@ -174,11 +175,14 @@ class TestCheckBreaker:
         transport = _CountingTransport("read_only")
         enforcer = _make_enforcer(breaker, transport, fail_open=True)
 
-        # A read-only-key 403 means the control plane RESPONDED: it fails open
-        # but never counts as an outage, so the breaker stays closed.
+        # A read-only-key 403 means the control plane RESPONDED: it never
+        # counts as an outage, so the breaker stays closed. It is a persistent
+        # refusal, never fail-open: every call is blocked, and only the first
+        # one reached the network.
         for _ in range(3):
-            assert _check(enforcer).allowed is True
-        assert transport.count == 3
+            with pytest.raises(ApiKeyRefusedError):
+                _check(enforcer)
+        assert transport.count == 1
         state = breaker.get_state()
         assert state.state is CircuitState.CLOSED
         assert state.failure_count == 0
@@ -201,7 +205,7 @@ def _make_reporter(
     with patch("solwyn.reporter.MetadataReporter._flush_loop"):
         reporter = MetadataReporter(
             "http://control-plane.test",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             control_plane_breaker=breaker,
         )
     reporter._shutdown.set()
@@ -259,9 +263,11 @@ class TestConfirmBreaker:
         transport = _CountingTransport("read_only")
         reporter = _make_reporter(breaker, transport)
 
-        for _ in range(3):
-            reporter._send_confirm(_confirm())
-        assert transport.count == 3
+        outcomes = [reporter._send_confirm(_confirm()) for _ in range(3)]
+        # The first 403 is an answer (breaker credited) and refuses the key;
+        # while refused nothing more is sent, so the next two drop locally.
+        assert transport.count == 1
+        assert {outcome.value for outcome in outcomes} == {"refused"}
         assert breaker.get_state().state is CircuitState.CLOSED
         assert reporter._consecutive_confirm_failures == 0
         reporter._http.close()
@@ -331,7 +337,7 @@ class TestProbeCancellationRecovery:
         transport = _ParkingAsyncTransport()
         enforcer = AsyncBudgetEnforcer(
             "http://control-plane.test",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             fail_open=True,
             control_plane_breaker=breaker,
         )
@@ -367,7 +373,7 @@ class TestProbeCancellationRecovery:
         transport = _ParkingAsyncTransport()
         reporter = AsyncMetadataReporter(
             "http://control-plane.test",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             control_plane_breaker=breaker,
         )
         await reporter._http.aclose()
@@ -455,7 +461,7 @@ class TestAdmissionOverload:
         transport = _OverloadTransport()
         enforcer = BudgetEnforcer(
             "http://control-plane.test",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             budget_mode=BudgetMode.HARD_DENY,
             control_plane_breaker=breaker,
             lease_enabled=False,
@@ -486,7 +492,7 @@ class TestAdmissionOverload:
         transport = _OverloadTransport()
         enforcer = BudgetEnforcer(
             "http://control-plane.test",
-            VALID_API_KEY,
+            validated_binding(VALID_API_KEY),
             control_plane_breaker=breaker,
             transport=httpx.MockTransport(transport.handler),
         )

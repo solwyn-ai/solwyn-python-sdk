@@ -10,7 +10,7 @@ from uuid import UUID
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, VALID_PROJECT_ID
+from conftest import VALID_API_KEY, VALID_PROJECT_ID, validated_binding
 
 from solwyn import run
 from solwyn._token_details import TokenDetails
@@ -165,11 +165,14 @@ def test_sync_run_exit_saturation_keeps_reporter_ingesting() -> None:
     plane = _HeldReleasePlane()
     breaker = CircuitBreaker(name="control-plane")
     enforcer = BudgetEnforcer(
-        "https://offline.invalid", VALID_API_KEY, transport=plane, control_plane_breaker=breaker
+        "https://offline.invalid",
+        validated_binding(VALID_API_KEY),
+        transport=plane,
+        control_plane_breaker=breaker,
     )
     reporter = MetadataReporter(
         "https://offline.invalid",
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         transport=plane,
         control_plane_breaker=breaker,
         batch_size=4,
@@ -202,11 +205,14 @@ async def test_async_run_exit_saturation_keeps_reporter_and_ready_loop_progressi
     plane = _HeldReleasePlane()
     breaker = CircuitBreaker(name="control-plane")
     enforcer = AsyncBudgetEnforcer(
-        "https://offline.invalid", VALID_API_KEY, transport=plane, control_plane_breaker=breaker
+        "https://offline.invalid",
+        validated_binding(VALID_API_KEY),
+        transport=plane,
+        control_plane_breaker=breaker,
     )
     reporter = AsyncMetadataReporter(
         "https://offline.invalid",
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         transport=plane,
         control_plane_breaker=breaker,
         batch_size=4,

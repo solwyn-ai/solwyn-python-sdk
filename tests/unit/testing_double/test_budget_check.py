@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import closing
 
 import pytest
+from conftest import plane_binding
 
 from solwyn._types import BudgetMode, CircuitState
 from solwyn.budget import BudgetCheckResult, BudgetEnforcer
@@ -20,7 +21,7 @@ def _enforcer(
 ) -> BudgetEnforcer:
     return BudgetEnforcer(
         api_url=plane.api_url,
-        api_key=plane.api_key,
+        binding=plane_binding(plane),
         budget_mode=BudgetMode.ALERT_ONLY,
         fail_open=True,
         cache_ttl=cache_ttl,

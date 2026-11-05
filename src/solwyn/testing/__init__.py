@@ -4,6 +4,6 @@ It preserves real wire shapes and Pydantic models but does not mock provider tra
 It performs no pricing; the API owns pricing.
 """
 
-from solwyn.testing._plane import MAGIC_MODELS, FakeControlPlane
+from solwyn.testing._plane import MAGIC_MODELS, FakeBudgetRule, FakeControlPlane
 
-__all__ = ["FakeControlPlane", "MAGIC_MODELS"]
+__all__ = ["FakeBudgetRule", "FakeControlPlane", "MAGIC_MODELS"]

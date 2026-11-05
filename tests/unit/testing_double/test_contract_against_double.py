@@ -12,6 +12,7 @@ import pytest
 from solwyn._types import LeaseGrantRequest, ProviderName
 from solwyn.testing import FakeControlPlane
 from solwyn.testing.contract import (
+    assert_auth_key_contract,
     assert_check_contract,
     assert_confirm_contract,
     assert_lease_contract,
@@ -114,7 +115,7 @@ def _run_lease_contract(
             base_url=plane.api_url,
         ) as http,
     ):
-        assert_lease_contract(http, plane.api_key)
+        assert_lease_contract(http, plane.api_key, plane.project_name)
 
 
 @pytest.mark.unit
@@ -125,8 +126,10 @@ def test_shared_check_contract_against_double() -> None:
     plane.deny_next(period="tag")
     plane.deny_run("contract-agent-run")
 
-    with httpx.Client(transport=plane.transport, base_url=plane.api_url) as http:
-        assert_check_contract(http, plane.api_key)
+    with httpx.Client(
+        transport=plane.transport, base_url=plane.api_url, headers=plane.auth_headers()
+    ) as http:
+        assert_check_contract(http, plane.api_key, plane.project_name)
 
     # Prove the pack sent the REQUEST payloads it claims to, not just that the
     # double's scripted-verdict queue happened to return the right shape —
@@ -148,7 +151,7 @@ def test_shared_check_contract_opts_into_and_validates_price_hints() -> None:
 
     # Act
     with httpx.Client(transport=transport, base_url=plane.api_url) as http:
-        assert_check_contract(http, plane.api_key)
+        assert_check_contract(http, plane.api_key, plane.project_name)
 
     # Assert: the probe sends the SDK's exact wire bytes, so the served hint
     # map is observable — without the opt-in the shape check is unreachable.
@@ -183,7 +186,7 @@ def test_shared_check_contract_rejects_unknown_price_hint_provider() -> None:
             match=r"price hint provider 'brandnew' is not a known ProviderName",
         ),
     ):
-        assert_check_contract(http, plane.api_key)
+        assert_check_contract(http, plane.api_key, plane.project_name)
 
 
 @pytest.mark.unit
@@ -218,7 +221,7 @@ def test_shared_check_contract_rejects_unusable_price_hint_values(
         httpx.Client(transport=transport, base_url=plane.api_url) as http,
         pytest.raises(AssertionError, match=message),
     ):
-        assert_check_contract(http, plane.api_key)
+        assert_check_contract(http, plane.api_key, plane.project_name)
 
 
 @pytest.mark.unit
@@ -231,7 +234,7 @@ def test_shared_check_contract_accepts_a_null_price_hint_statement() -> None:
 
     # Act
     with httpx.Client(transport=transport, base_url=plane.api_url) as http:
-        assert_check_contract(http, plane.api_key)
+        assert_check_contract(http, plane.api_key, plane.project_name)
 
     # Assert
     assert served
@@ -242,8 +245,10 @@ def test_shared_check_contract_accepts_a_null_price_hint_statement() -> None:
 def test_shared_confirm_contract_against_double() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport, base_url=plane.api_url) as http:
-        assert_confirm_contract(http, plane.api_key)
+    with httpx.Client(
+        transport=plane.transport, base_url=plane.api_url, headers=plane.auth_headers()
+    ) as http:
+        assert_confirm_contract(http, plane.api_key, plane.project_name)
 
 
 @pytest.mark.unit
@@ -252,8 +257,10 @@ def test_shared_run_control_contract_against_double() -> None:
     run_id = "contract-stopped-run"
     plane.stop_run(run_id)
 
-    with httpx.Client(transport=plane.transport, base_url=plane.api_url) as http:
-        assert_run_control_contract(http, plane.api_key, stopped_run_id=run_id)
+    with httpx.Client(
+        transport=plane.transport, base_url=plane.api_url, headers=plane.auth_headers()
+    ) as http:
+        assert_run_control_contract(http, plane.api_key, plane.project_name, stopped_run_id=run_id)
 
     assert plane.stopped_runs == {run_id: "manual_kill"}
 
@@ -261,8 +268,10 @@ def test_shared_run_control_contract_against_double() -> None:
 @pytest.mark.unit
 def test_shared_trace_ingest_contract_against_double() -> None:
     plane = FakeControlPlane()
-    with httpx.Client(transport=plane.transport, base_url=plane.api_url) as http:
-        assert_trace_ingest_contract(http, plane.api_key)
+    with httpx.Client(
+        transport=plane.transport, base_url=plane.api_url, headers=plane.auth_headers()
+    ) as http:
+        assert_trace_ingest_contract(http, plane.api_key, plane.project_name)
     assert len(plane.ingested) == 2
     assert [event.trace_sampled for event in plane.ingested] == [True, False]
     for event in plane.ingested:
@@ -274,8 +283,10 @@ def test_shared_trace_ingest_contract_against_double() -> None:
 def test_shared_receipt_ingest_contract_against_double() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport, base_url=plane.api_url) as http:
-        assert_receipt_ingest_contract(http, plane.api_key)
+    with httpx.Client(
+        transport=plane.transport, base_url=plane.api_url, headers=plane.auth_headers()
+    ) as http:
+        assert_receipt_ingest_contract(http, plane.api_key, plane.project_name)
 
     assert [event.deny_source for event in plane.denial_receipts] == [
         "server",
@@ -309,7 +320,9 @@ def test_scripted_lease_unavailable_has_exact_double_contract() -> None:
 
     with (
         plane.refuse_leases(status=503, code="lease_unavailable", requests=1),
-        httpx.Client(transport=plane.transport, base_url=plane.api_url) as http,
+        httpx.Client(
+            transport=plane.transport, base_url=plane.api_url, headers=plane.auth_headers()
+        ) as http,
     ):
         response = http.post(
             "/api/v1/budgets/lease",
@@ -411,7 +424,7 @@ def test_shared_contract_wraps_malformed_json_with_phase_context() -> None:
         httpx.Client(transport=transport, base_url=plane.api_url) as http,
         pytest.raises(AssertionError, match="monthly denial.*malformed JSON"),
     ):
-        assert_check_contract(http, plane.api_key)
+        assert_check_contract(http, plane.api_key, plane.project_name)
 
 
 @pytest.mark.unit
@@ -437,7 +450,7 @@ def test_shared_contract_wraps_schema_drift_with_phase_context() -> None:
         httpx.Client(transport=transport, base_url=plane.api_url) as http,
         pytest.raises(AssertionError, match="monthly denial.*schema validation failed"),
     ):
-        assert_check_contract(http, plane.api_key)
+        assert_check_contract(http, plane.api_key, plane.project_name)
 
 
 @pytest.mark.unit
@@ -465,7 +478,7 @@ def test_shared_contract_reports_unexpected_status_with_safe_bounded_preview() -
         httpx.Client(transport=transport, base_url=plane.api_url) as http,
         pytest.raises(AssertionError) as captured,
     ):
-        assert_check_contract(http, plane.api_key)
+        assert_check_contract(http, plane.api_key, plane.project_name)
 
     message = str(captured.value)
     assert "monthly denial" in message
@@ -473,3 +486,52 @@ def test_shared_contract_reports_unexpected_status_with_safe_bounded_preview() -
     assert "contract-status-preview" in message
     assert len(message) < 400
     assert plane.api_key not in message
+
+
+@pytest.mark.unit
+def test_auth_key_contract_against_double() -> None:
+    plane = FakeControlPlane()
+    with httpx.Client(transport=plane.transport, base_url=plane.api_url) as http:
+        assert_auth_key_contract(http, plane.api_key, plane.project_name)
+
+
+class _WireHeaderCheck(httpx.BaseTransport):
+    """Validates every request's headers with h11, as a real HTTP/1.1 send would."""
+
+    def __init__(self, inner: httpx.BaseTransport) -> None:
+        self._inner = inner
+        self.project_values: list[bytes] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        import h11
+
+        connection = h11.Connection(h11.CLIENT)
+        connection.send(  # raises h11.LocalProtocolError on an illegal value
+            h11.Request(method=request.method, target="/", headers=list(request.headers.raw))
+        )
+        self.project_values.extend(
+            value for name, value in request.headers.raw if name.lower() == b"solwyn-project"
+        )
+        return self._inner.handle_request(request)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("by", ["name", "id"])
+def test_auth_key_contract_sends_only_header_values_a_real_client_can_send(by: str) -> None:
+    # Staging found the probe's padded selector (" NAME\t") refused by httpx
+    # (h11 LocalProtocolError) before it reached the server.
+    plane = FakeControlPlane()
+    wire = _WireHeaderCheck(plane.transport)
+    project = plane.project_name if by == "name" else plane.project_id
+    with httpx.Client(transport=wire, base_url=plane.api_url) as http:
+        assert_auth_key_contract(http, plane.api_key, project)
+
+    assert wire.project_values
+    assert all(value == value.strip(b" \t") for value in wire.project_values)
+
+
+@pytest.mark.unit
+def test_auth_key_contract_by_id_against_double() -> None:
+    plane = FakeControlPlane()
+    with httpx.Client(transport=plane.transport, base_url=plane.api_url) as http:
+        assert_auth_key_contract(http, plane.api_key, plane.project_id)

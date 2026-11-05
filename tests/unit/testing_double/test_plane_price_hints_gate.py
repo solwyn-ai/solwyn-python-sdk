@@ -21,7 +21,7 @@ def test_price_hints_require_the_explicit_v1_opt_in() -> None:
     }
     headers = {"Authorization": f"Bearer {plane.api_key}"}
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         legacy = client.post(
             f"{plane.api_url}/api/v1/budgets/check",
             json=payload,

@@ -6,7 +6,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from conftest import call_uuid
+from conftest import call_uuid, plane_binding
 
 import solwyn
 from solwyn import _run_control as control
@@ -142,7 +142,7 @@ def test_healthy_acquire_admission_postcheck_and_release_keep_scalar_accounting(
     size: int, independent: bool
 ) -> None:
     plane = FakeControlPlane()
-    enforcer = BudgetEnforcer(plane.api_url, plane.api_key, transport=plane.transport)
+    enforcer = BudgetEnforcer(plane.api_url, plane_binding(plane), transport=plane.transport)
     handles = []
     try:
         for index in range(size):

@@ -6,7 +6,7 @@ import os
 from unittest.mock import MagicMock, patch
 
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, VALID_PROJECT
 from pydantic import ValidationError
 
 from solwyn._lease import DEFAULT_OUTPUT_BOUND
@@ -18,10 +18,15 @@ from solwyn.exceptions import ConfigurationError, SolwynError
 
 @pytest.fixture(autouse=True)
 def _clean_solwyn_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Remove all SOLWYN_* env vars to prevent test pollution from host environment."""
+    """Remove all SOLWYN_* env vars to prevent test pollution from host environment.
+
+    ``SOLWYN_PROJECT`` is then set to the test project, so tests not about the
+    project still construct; the project tests below delete or override it.
+    """
     for key in list(os.environ):
         if key.startswith("SOLWYN_"):
             monkeypatch.delenv(key)
+    monkeypatch.setenv("SOLWYN_PROJECT", VALID_PROJECT)
 
 
 def _mock_openai_client() -> MagicMock:
@@ -59,7 +64,7 @@ class TestEnvVarConstruction:
 
     def test_kwargs_override_env_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Constructor kwargs take precedence over env vars."""
-        env_key = "sk_proj_" + "b" * 64
+        env_key = "solwyn_sk_" + "b" * 64
         monkeypatch.setenv("SOLWYN_API_KEY", env_key)
 
         client = _mock_openai_client()
@@ -79,17 +84,108 @@ class TestEnvVarConstruction:
 
         assert exc_info.value.field == "api_key"
 
-    def test_solwyn_project_id_env_var_is_ignored(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """SOLWYN_PROJECT_ID is not part of SDK configuration anymore."""
+    def test_solwyn_project_id_env_var_is_not_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SOLWYN_PROJECT_ID is never read; the missing-project error says to rename it."""
         monkeypatch.setenv("SOLWYN_API_KEY", VALID_API_KEY)
+        monkeypatch.delenv("SOLWYN_PROJECT")
         monkeypatch.setenv("SOLWYN_PROJECT_ID", "proj_" + "0" * 24)
 
-        client = _mock_openai_client()
-        solwyn = _make_solwyn(client)
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_solwyn(_mock_openai_client())
 
-        assert not hasattr(solwyn._solwyn_config, "project_id")
+        assert exc_info.value.field == "project"
+        assert exc_info.value.message == (
+            "No Solwyn project configured. Set SOLWYN_PROJECT or pass project= with a "
+            "project name or proj_ id. SOLWYN_PROJECT_ID is no longer read; rename it to "
+            "SOLWYN_PROJECT."
+        )
 
-        solwyn.close()
+    def test_missing_project_raises_configuration_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("SOLWYN_PROJECT")
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_solwyn(_mock_openai_client(), api_key=VALID_API_KEY)
+
+        assert exc_info.value.field == "project"
+        assert exc_info.value.message == (
+            "No Solwyn project configured. Set SOLWYN_PROJECT or pass project= with a "
+            "project name or proj_ id."
+        )
+
+    @pytest.mark.parametrize("source", ["kwarg", "env"])
+    def test_a_padded_project_is_trimmed_before_it_reaches_the_wire(
+        self, monkeypatch: pytest.MonkeyPatch, source: str
+    ) -> None:
+        import h11
+
+        padded = " My Project\t"
+        if source == "env":
+            monkeypatch.setenv("SOLWYN_PROJECT", padded)
+            client = _make_solwyn(_mock_openai_client(), api_key=VALID_API_KEY)
+        else:
+            client = _make_solwyn(_mock_openai_client(), api_key=VALID_API_KEY, project=padded)
+        try:
+            headers, _generation = client._solwyn_binding.request_headers()
+        finally:
+            client.close()
+
+        assert headers["Solwyn-Project"] == "My Project"
+        # A real HTTP/1.1 send accepts it (h11 refuses padded header values).
+        h11.Connection(h11.CLIENT).send(
+            h11.Request(method="GET", target="/", headers=[("Host", "x"), *headers.items()])
+        )
+
+    def test_project_loads_from_env_and_kwarg_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("SOLWYN_PROJECT", "  from-env\t")
+
+        from_env = _make_solwyn(_mock_openai_client(), api_key=VALID_API_KEY)
+        from_kwarg = _make_solwyn(
+            _mock_openai_client(), api_key=VALID_API_KEY, project="proj_" + "1" * 24
+        )
+
+        assert from_env._solwyn_config.project == "from-env"
+        assert from_env._solwyn_binding.selector == "from-env"
+        assert from_kwarg._solwyn_config.project == "proj_" + "1" * 24
+        from_env.close()
+        from_kwarg.close()
+
+    @pytest.mark.parametrize("selector", ["", "bad/name", "x" * 101, "  "])
+    def test_bad_project_raises_configuration_error(
+        self, monkeypatch: pytest.MonkeyPatch, selector: str
+    ) -> None:
+        monkeypatch.delenv("SOLWYN_PROJECT")
+
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_solwyn(_mock_openai_client(), api_key=VALID_API_KEY, project=selector)
+
+        assert exc_info.value.field == "project"
+        if selector.strip():
+            assert exc_info.value.message == (
+                "Invalid project: use a project name (letters, digits, spaces, '.', '_' "
+                "or '-', up to 100 characters) or a proj_ id."
+            )
+
+    @pytest.mark.parametrize("cls", [Solwyn, AsyncSolwyn])
+    def test_project_id_kwarg_is_a_configuration_error(self, cls: type) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            cls(_mock_openai_client(), api_key=VALID_API_KEY, project_id="proj_" + "0" * 24)
+
+        assert exc_info.value.field == "project_id"
+        assert exc_info.value.message == (
+            "project_id is not an option. Use project= with a project name or proj_ id."
+        )
+
+    def test_old_project_key_is_refused_with_its_own_message(self) -> None:
+        with pytest.raises(ConfigurationError) as exc_info:
+            _make_solwyn(_mock_openai_client(), api_key="sk_proj_" + "a" * 64)
+
+        assert exc_info.value.field == "api_key"
+        assert exc_info.value.message == (
+            "This is an old Solwyn project key (sk_proj_). Create a new key in the "
+            "dashboard or with solwyn keys create."
+        )
 
     def test_api_url_loads_from_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """SOLWYN_API_URL env var overrides the default api_url."""
@@ -651,7 +747,7 @@ class TestConfigurationErrorFromBadCredentials:
     """Malformed api_key raises ConfigurationError with correct attributes."""
 
     def test_bad_api_key_prefix_raises_configuration_error(self) -> None:
-        """api_key without sk_proj_ prefix -> ConfigurationError(field='api_key')."""
+        """api_key without the solwyn_sk_ prefix -> ConfigurationError(field='api_key')."""
         client = _mock_openai_client()
 
         with pytest.raises(ConfigurationError) as exc_info:
@@ -666,7 +762,7 @@ class TestConfigurationErrorFromBadCredentials:
         client = _mock_openai_client()
 
         with pytest.raises(ConfigurationError) as exc_info:
-            Solwyn(client, api_key="sk_proj_short")
+            Solwyn(client, api_key="solwyn_sk_short")
 
         assert exc_info.value.field == "api_key"
         assert isinstance(exc_info.value.message, str)
@@ -677,7 +773,7 @@ class TestConfigurationErrorFromBadCredentials:
         client = _mock_openai_client()
 
         with pytest.raises(ConfigurationError) as exc_info:
-            Solwyn(client, api_key="sk_proj_" + "a" * 65)
+            Solwyn(client, api_key="solwyn_sk_" + "a" * 65)
 
         assert exc_info.value.field == "api_key"
         assert isinstance(exc_info.value.message, str)
@@ -697,7 +793,7 @@ class TestConfigurationErrorFromBadCredentials:
     def test_unicode_homograph_api_key_raises_configuration_error(self) -> None:
         """Unicode homograph in api_key (Cyrillic a) -> ConfigurationError."""
         client = _mock_openai_client()
-        bad_key = "sk_proj_" + "\u0430" * 64  # Cyrillic 'а' (U+0430)
+        bad_key = "solwyn_sk_" + "\u0430" * 64  # Cyrillic 'а' (U+0430)
 
         with pytest.raises(ConfigurationError) as exc_info:
             Solwyn(client, api_key=bad_key)
@@ -711,7 +807,7 @@ class TestConfigurationErrorFromBadCredentials:
         client = _mock_openai_client()
 
         with pytest.raises(ConfigurationError) as exc_info:
-            Solwyn(client, api_key="sk_proj_../etc")
+            Solwyn(client, api_key="solwyn_sk_../etc")
 
         assert exc_info.value.field == "api_key"
         assert isinstance(exc_info.value.message, str)
@@ -798,12 +894,14 @@ class TestAsyncSolwynConstructors:
         assert isinstance(exc_info.value.message, str)
         assert len(exc_info.value.message) > 0
 
-    def test_async_project_id_kwarg_is_rejected(self) -> None:
-        """AsyncSolwyn no longer accepts project_id."""
-        client = _mock_openai_client()
+    def test_async_project_kwarg_is_validated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AsyncSolwyn takes project= exactly like Solwyn."""
+        monkeypatch.delenv("SOLWYN_PROJECT")
 
-        with pytest.raises(TypeError, match="unexpected keyword argument 'project_id'"):
-            AsyncSolwyn(client, api_key=VALID_API_KEY, project_id="proj_" + "0" * 24)
+        with pytest.raises(ConfigurationError) as exc_info:
+            AsyncSolwyn(_mock_openai_client(), api_key=VALID_API_KEY, project="bad/name")
+
+        assert exc_info.value.field == "project"
 
 
 @pytest.mark.unit

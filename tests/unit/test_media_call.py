@@ -193,7 +193,8 @@ class TestMediaCallSync:
         solwyn = _build_sync(client)
 
         def create_after_project_learned(**_kwargs):
-            assert solwyn._solwyn_reporter._breaker_project_id == VALID_PROJECT_ID
+            # A check response never pins the project; only /auth/key does.
+            assert solwyn._solwyn_binding.pinned_id is None
             return resp
 
         client.embeddings.create.side_effect = create_after_project_learned
@@ -784,7 +785,8 @@ class TestMediaCallAsync:
         solwyn = AsyncSolwyn(client, api_key=VALID_API_KEY)
 
         async def create_after_project_learned(**_kwargs):
-            assert solwyn._solwyn_reporter._breaker_project_id == VALID_PROJECT_ID
+            # A check response never pins the project; only /auth/key does.
+            assert solwyn._solwyn_binding.pinned_id is None
             return resp
 
         client.embeddings.create.side_effect = create_after_project_learned

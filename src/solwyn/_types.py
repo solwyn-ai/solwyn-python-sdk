@@ -1136,3 +1136,32 @@ class BudgetConfirmRequest(BaseModel):
         if (self.reservation_id is None) == (self.lease_id is None):
             raise ValueError("exactly one of reservation_id / lease_id must be set")
         return self
+
+
+class AuthKeyResponse(BaseModel):
+    """``GET /api/v1/auth/key``: the key and the project its header resolved to.
+
+    Vendored lock-step with core's ``solwyn_shared.models.AuthKeyResponse``
+    (strict, ``extra="forbid"``); core's contract parity test compares the
+    fields. The SDK pins ``project_id`` from this response and nothing else.
+    Parse it with ``model_validate_json`` (strict JSON mode reads the ISO 8601
+    timestamps).
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    account_id: str = Field(..., description="Account that owns the key")
+    key_id: str = Field(..., description="API key id")
+    key_prefix: str = Field(..., description="First 26 characters of the key")
+    key_name: str = Field(..., description="Display name of the key")
+    scope: Literal["full", "read_only"] = Field(..., description="Key scope")
+    created_via: Literal["dashboard", "cli"] = Field(..., description="Where the key was made")
+    expires_at: datetime = Field(..., description="Expiry, ISO 8601 UTC")
+    rotation_grace_until: datetime | None = Field(
+        ..., description="End of the rotation grace window, ISO 8601 UTC, or null"
+    )
+    project_id: str = Field(..., pattern=r"^proj_[a-f0-9]{24}$", description="Resolved project")
+    project_name: str = Field(..., description="Resolved project's current name")
+    budget_mode: Literal["alert_only", "hard_deny"] = Field(
+        ..., description="Resolved project's budget mode"
+    )

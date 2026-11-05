@@ -51,7 +51,7 @@ from solwyn._lifecycle import (
     register_fork_reset,
     register_sync_reporter,
 )
-from solwyn._read_only_key import handle_read_only_key_error
+from solwyn._project import ProjectBinding, async_status_hook, sync_status_hook
 from solwyn._surfaces import SurfaceContext
 from solwyn._types import (
     BreakerStateReport,
@@ -135,12 +135,18 @@ class _DetachedExitClientFactory:
     def __init__(
         self,
         transport: ControlPlaneTransport | None,
+        binding: ProjectBinding,
     ) -> None:
         self._transport = transport
+        self._binding = binding
 
     def _new_exit_http_client(self) -> httpx.Client:
         transport = non_closing_sync_transport(self._transport)
-        return httpx.Client(timeout=5.0, transport=transport)
+        return httpx.Client(
+            timeout=5.0,
+            transport=transport,
+            event_hooks={"response": [sync_status_hook(self._binding)]},
+        )
 
 
 # Raw C0/DEL/C1 control bytes. A compliant server repr-escapes these before
@@ -163,10 +169,18 @@ def _escape_control(value: str) -> str:
 class _SendOutcome(enum.Enum):
     """The disposition of one send attempt."""
 
-    SENT = "sent"  # delivered, or a read-only-key policy skip (terminal, not a loss)
+    SENT = "sent"  # delivered
     HELD = "held"  # control-plane breaker refused admission — not an attempt
     RETRY = "retry"  # transient failure — retry after backoff
-    DROPPED = "dropped"  # terminal status / poison item — never retry
+    DROPPED = "dropped"  # terminal status / poison item: never retry
+    # The key or project is refused: not sent (or refused by Solwyn), dropped
+    # locally and counted under ``api_key_refused``. Never retried.
+    REFUSED = "refused"
+
+
+def _terminal_reason(outcome: _SendOutcome) -> str:
+    """Drop reason of a terminal (non-retried) send outcome."""
+    return "api_key_refused" if outcome is _SendOutcome.REFUSED else "terminal_status"
 
 
 class _IngestRejectionKind(enum.Enum):
@@ -831,7 +845,7 @@ class _ReporterBase:
     def __init__(
         self,
         api_url: str,
-        api_key: str,
+        binding: ProjectBinding,
         *,
         batch_size: int = 50,
         flush_interval: float = 5.0,
@@ -859,7 +873,9 @@ class _ReporterBase:
             # while the async bound retained one item — reject it up front.
             raise ValueError(f"max_queue_size must be >= 1, got {max_queue_size}")
         self.api_url = api_url.rstrip("/")
-        self.api_key = api_key
+        # The client's project binding: key, Solwyn-Project header, pinned
+        # project id (breaker reports) and the refusal fence.
+        self._binding = binding
         self.batch_size = batch_size
         self.flush_interval = flush_interval
         self.max_queue_size = max_queue_size
@@ -883,8 +899,6 @@ class _ReporterBase:
         # dropped) without paying the timeout. Never a provider — excluded from
         # _build_breaker_reports (that is provider health only).
         self._control_plane_breaker = control_plane_breaker
-        self._breaker_project_id: str | None = None
-        self._breaker_project_lock = threading.Lock()
         self._breaker_report_lock = threading.Lock()
         # provider -> (state, failure_count, success_count) of the last report
         # that got a 2xx. Written on successful POST only, so a failed send
@@ -946,23 +960,24 @@ class _ReporterBase:
         # event path bypasses its normal producer bound until seal.
         self._final_delivery_started = False
 
-    def observe_project_id(self, project_id: str | None) -> None:
-        """Remember the non-empty project resolved by a real/cached budget check."""
-        if not project_id:
-            return
-        with self._breaker_project_lock:
-            self._breaker_project_id = project_id
+    @property
+    def api_key(self) -> str:
+        """The configured API key (owned by the project binding)."""
+        return self._binding.api_key
 
     def _breaker_reporting_project_id(self) -> str | None:
-        """Return the learned project only when breaker reporting can run."""
+        """The project pinned by ``/auth/key``, only when breaker reporting can run.
+
+        Pinning comes only from a successful validation; until then breaker
+        reports are skipped.
+        """
         if (
             not self._breaker_reporting_enabled
             or self._breaker_snapshots is None
             or self._sdk_instance_id is None
         ):
             return None
-        with self._breaker_project_lock:
-            return self._breaker_project_id
+        return self._binding.pinned_id
 
     def _build_breaker_reports(
         self, *, force: bool = False
@@ -1489,12 +1504,14 @@ class _ReporterBase:
     # Auth + failure accounting
     # ------------------------------------------------------------------
 
-    def _auth_headers(self) -> dict[str, str]:
-        """Return authorization headers for cloud API requests."""
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+    def _note_refusal(self, exc: BaseException, dispatched_at: int) -> bool:
+        """Record a key or project refusal carried by ``exc``; True when it was one.
+
+        The item that met it is dropped terminally (no retry); the binding
+        logs ``solwyn.configuration_error.<code>`` once per code, and the next
+        wrapped call meets the refusal at its gate.
+        """
+        return self._binding.note_refusal(exc, dispatched_at)
 
     def _confirm_failure_outcome(self, exc: Exception) -> _SendOutcome:
         """Map a confirm send failure to RETRY (transient) or DROPPED (terminal)."""
@@ -1709,21 +1726,21 @@ class MetadataReporter(_ReporterBase):
 
     Usage::
 
-        reporter = MetadataReporter(api_url, api_key)
+        reporter = MetadataReporter(api_url, binding)
         reporter.report(event)  # non-blocking
         # ...
         reporter.close()  # flush remaining events
 
     Or as a context manager::
 
-        with MetadataReporter(api_url, api_key) as reporter:
+        with MetadataReporter(api_url, binding) as reporter:
             reporter.report(event)
     """
 
     def __init__(
         self,
         api_url: str,
-        api_key: str,
+        binding: ProjectBinding,
         *,
         batch_size: int = 50,
         flush_interval: float = 5.0,
@@ -1745,7 +1762,7 @@ class MetadataReporter(_ReporterBase):
         require_sync_transport(transport)
         super().__init__(
             api_url,
-            api_key,
+            binding,
             batch_size=batch_size,
             flush_interval=flush_interval,
             max_queue_size=max_queue_size,
@@ -1807,7 +1824,11 @@ class MetadataReporter(_ReporterBase):
     def _new_http_client(self, timeout: float = 5.0) -> httpx.Client:
         """Build a sync control-plane client on the configured transport."""
         transport = non_closing_sync_transport(self._transport)
-        return httpx.Client(timeout=timeout, transport=transport)
+        return httpx.Client(
+            timeout=timeout,
+            transport=transport,
+            event_hooks={"response": [sync_status_hook(self._binding)]},
+        )
 
     def _new_exit_http_client(self) -> httpx.Client:
         """Build the sync client used by interpreter-exit delivery."""
@@ -1867,7 +1888,6 @@ class MetadataReporter(_ReporterBase):
         # The mismatched pair therefore means no surviving owner can finish the
         # inherited transition unless the child reopens the internal gate.
         interrupted_seal = self._delivery_closed and not self._delivery_completed
-        self._breaker_project_lock = threading.Lock()
         self._breaker_report_lock = threading.Lock()
         if self._untracked_state is not None:
             self._untracked_state.reset_after_fork_in_child()
@@ -2651,7 +2671,7 @@ class MetadataReporter(_ReporterBase):
                 pending.next_attempt_at = next_at
                 self._park_confirm(pending)
                 break  # FIFO: nothing behind a backing-off head may jump it
-            self._resolve_confirm(drop_reason="terminal_status")
+            self._resolve_confirm(drop_reason=_terminal_reason(outcome))
         else:
             return bool(self._confirm_queue)
         return False
@@ -2706,7 +2726,9 @@ class MetadataReporter(_ReporterBase):
                 self._park_settlement(claim)
                 break
             # Terminal confirm: the event is still the durable spend truth.
-            self._resolve_settlement_to_event_queue(claim, confirm_drop_reason="terminal_status")
+            self._resolve_settlement_to_event_queue(
+                claim, confirm_drop_reason=_terminal_reason(outcome)
+            )
         else:
             return bool(self._settlement_queue)
         return False
@@ -2751,7 +2773,7 @@ class MetadataReporter(_ReporterBase):
                 self._resolve_retry_event_batch(claim, keep=keep)
                 break
             cycle_clean = False
-            self._resolve_dropped_event_batch(claim, "terminal_status")
+            self._resolve_dropped_event_batch(claim, _terminal_reason(result.outcome))
         else:
             more = bool(self._queue) and self.batch_size > 0
         if sent_clean_batch and cycle_clean:
@@ -2799,13 +2821,14 @@ class MetadataReporter(_ReporterBase):
         them is fine and is NOT counted as a spend drop.
         """
         for project_id, report in self._build_breaker_reports(force=force):
-            if self._deadline_expired(deadline):
+            if self._deadline_expired(deadline) or self._binding.refused:
                 return
+            headers, dispatched_at = self._binding.request_headers()
             try:
                 response = self._http.post(
                     f"{self.api_url}/api/v1/projects/{project_id}/providers/breaker-reports",
                     json=report.model_dump(mode="json"),
-                    headers=self._auth_headers(),
+                    headers=headers,
                     timeout=self._send_timeout(deadline),
                 )
                 response.raise_for_status()
@@ -2816,9 +2839,9 @@ class MetadataReporter(_ReporterBase):
                         report.success_count,
                     )
             except Exception as exc:
-                if handle_read_only_key_error(exc):
-                    # A read-only key denies every write: end the cycle instead
-                    # of posting the remaining doomed snapshots.
+                if self._note_refusal(exc, dispatched_at):
+                    # A refused key or project refuses every report: end the
+                    # cycle instead of posting the remaining doomed snapshots.
                     return
                 _log_warning(
                     "reporter.breaker_send_failed: provider=%s exc_type=%s",
@@ -2876,13 +2899,18 @@ class MetadataReporter(_ReporterBase):
             batch = built_reports[offset : offset + _UNTRACKED_REPORT_BATCH_SIZE]
             if not batch:
                 continue
+            if self._binding.refused:
+                # Advisory deltas are dropped (not counted as spend), not sent.
+                self._mark_untracked_reports_sent(batch)
+                continue
             self._mark_untracked_reports_attempted(batch)
+            headers, dispatched_at = self._binding.request_headers()
             try:
                 effective_deadline = self._effective_close_deadline(deadline)
                 response = self._http.post(
                     f"{self.api_url}/api/v1/untracked-surfaces",
                     json=[built.report.model_dump(mode="json") for built in batch],
-                    headers=self._auth_headers(),
+                    headers=headers,
                     timeout=(
                         10.0
                         if effective_deadline is None
@@ -2890,7 +2918,11 @@ class MetadataReporter(_ReporterBase):
                     ),
                 )
                 response.raise_for_status()
-            except Exception:
+            except Exception as exc:
+                if self._note_refusal(exc, dispatched_at):
+                    # Terminal: these deltas are dropped, not retried.
+                    self._mark_untracked_reports_sent(batch)
+                    return
                 continue
             self._mark_untracked_reports_sent(batch)
 
@@ -2904,6 +2936,9 @@ class MetadataReporter(_ReporterBase):
         poison item returns DROPPED. Read-only-key is a policy skip, not a loss,
         so it returns SENT.
         """
+        if self._binding.refused:
+            # Refused key or project: nothing goes to Solwyn but /auth/key.
+            return _SendOutcome.REFUSED
         breaker = self._control_plane_breaker
         admission = breaker.admit() if breaker is not None else None
         if admission is not None and not admission.allowed:
@@ -2912,11 +2947,12 @@ class MetadataReporter(_ReporterBase):
             # counter or the breaker.
             _log_debug("reporter.confirm_held_breaker_open")
             return _SendOutcome.HELD
+        headers, dispatched_at = self._binding.request_headers()
         try:
             resp = self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",
                 json=confirm_request.model_dump(mode="json"),
-                headers=self._auth_headers(),
+                headers=headers,
                 timeout=timeout,
             )
             resp.raise_for_status()
@@ -2925,10 +2961,11 @@ class MetadataReporter(_ReporterBase):
             self._record_confirm_success()
             return _SendOutcome.SENT
         except Exception as exc:
-            if handle_read_only_key_error(exc):
+            if self._note_refusal(exc, dispatched_at):
+                # An answer, not an outage: credit the breaker; terminal drop.
                 if breaker is not None:
                     breaker.record_success()
-                return _SendOutcome.SENT
+                return _SendOutcome.REFUSED
             if breaker is not None:
                 breaker.record_failure()
             self._record_confirm_failure(exc)
@@ -2959,21 +2996,27 @@ class MetadataReporter(_ReporterBase):
         timeout = 10.0 if effective_deadline is None else super()._send_timeout(effective_deadline)
         with self._in_flight_lock:
             self._in_flight += 1
+        dispatched_at: int | None = None
         try:
+            if self._binding.refused:
+                return _BatchSendResult(
+                    _SendOutcome.REFUSED, _IngestRejections(_IngestRejectionKind.MALFORMED)
+                )
             payload = [e.model_dump(mode="json") for e in batch]
+            headers, dispatched_at = self._binding.request_headers()
             resp = self._http.post(
                 f"{self.api_url}/api/v1/metadata/ingest",
                 json=payload,
-                headers=self._auth_headers(),
+                headers=headers,
                 timeout=timeout,
             )
             resp.raise_for_status()
             rejections = self._parse_ingest_rejections(resp, len(batch))
             return _BatchSendResult(_SendOutcome.SENT, rejections)
         except Exception as exc:
-            if handle_read_only_key_error(exc):
+            if dispatched_at is not None and self._note_refusal(exc, dispatched_at):
                 return _BatchSendResult(
-                    _SendOutcome.SENT, _IngestRejections(_IngestRejectionKind.MALFORMED)
+                    _SendOutcome.REFUSED, _IngestRejections(_IngestRejectionKind.MALFORMED)
                 )
             # Log only the exception's class name — the type-name-only
             # convention every other except-block follows. Safe here even though
@@ -3039,14 +3082,14 @@ class AsyncMetadataReporter(_ReporterBase):
 
     Usage::
 
-        async with AsyncMetadataReporter(api_url, api_key) as reporter:
+        async with AsyncMetadataReporter(api_url, binding) as reporter:
             reporter.report(event)
     """
 
     def __init__(
         self,
         api_url: str,
-        api_key: str,
+        binding: ProjectBinding,
         *,
         batch_size: int = 50,
         flush_interval: float = 5.0,
@@ -3068,7 +3111,7 @@ class AsyncMetadataReporter(_ReporterBase):
         validated_transport = require_dual_transport(transport)
         super().__init__(
             api_url,
-            api_key,
+            binding,
             batch_size=batch_size,
             flush_interval=flush_interval,
             max_queue_size=max_queue_size,
@@ -3088,7 +3131,7 @@ class AsyncMetadataReporter(_ReporterBase):
         # async, while GC/interpreter-exit delivery uses a sync client. The
         # caller retains ownership of an injected transport.
         self._transport: ControlPlaneTransport | None = validated_transport
-        self._exit_http_client_factory = _DetachedExitClientFactory(self._transport)
+        self._exit_http_client_factory = _DetachedExitClientFactory(self._transport, self._binding)
         self._http = self._new_async_http_client(timeout=10.0)
         self._shutdown_event: asyncio.Event | None = None
         self._flush_task: asyncio.Task[None] | None = None
@@ -3117,7 +3160,11 @@ class AsyncMetadataReporter(_ReporterBase):
     def _new_async_http_client(self, timeout: float = 5.0) -> httpx.AsyncClient:
         """Build an async control-plane client on the configured transport."""
         transport = non_closing_async_transport(self._transport)
-        return httpx.AsyncClient(timeout=timeout, transport=transport)
+        return httpx.AsyncClient(
+            timeout=timeout,
+            transport=transport,
+            event_hooks={"response": [async_status_hook(self._binding)]},
+        )
 
     def _new_exit_http_client(self) -> httpx.Client:
         """Build the sync client used by GC/interpreter-exit delivery."""
@@ -3137,7 +3184,6 @@ class AsyncMetadataReporter(_ReporterBase):
         Inherited advisory observations are discarded because parent and
         child mint different report IDs.
         """
-        self._breaker_project_lock = threading.Lock()
         self._breaker_report_lock = threading.Lock()
         if self._untracked_state is not None:
             self._untracked_state.reset_after_fork_in_child()
@@ -3529,7 +3575,7 @@ class AsyncMetadataReporter(_ReporterBase):
                 pending.next_attempt_at = next_at
                 self._confirm_queue.appendleft(pending)
                 break  # FIFO: nothing behind a backing-off head may jump it
-            self._count_drop("confirm", "terminal_status")
+            self._count_drop("confirm", _terminal_reason(outcome))
         else:
             return bool(self._confirm_queue)
         return False
@@ -3596,7 +3642,7 @@ class AsyncMetadataReporter(_ReporterBase):
                 pending.confirm.next_attempt_at = next_at
                 self._settlement_queue.appendleft(pending)
                 break
-            self._count_drop("settlement_confirm", "terminal_status")
+            self._count_drop("settlement_confirm", _terminal_reason(outcome))
             self._move_event_to_queue(pending.event)
         else:
             return bool(self._settlement_queue)
@@ -3663,7 +3709,7 @@ class AsyncMetadataReporter(_ReporterBase):
                     self._queue.extendleft(reversed(keep))
                 break
             cycle_clean = False
-            self._dispose_pending_events(prefix, "terminal_status")
+            self._dispose_pending_events(prefix, _terminal_reason(result.outcome))
         else:
             more = bool(self._queue) and self.batch_size > 0
         if sent_clean_batch and cycle_clean:
@@ -3704,13 +3750,14 @@ class AsyncMetadataReporter(_ReporterBase):
         are dropped, not counted as spend).
         """
         for project_id, report in self._build_breaker_reports(force=force):
-            if self._deadline_expired(deadline):
+            if self._deadline_expired(deadline) or self._binding.refused:
                 return
+            headers, dispatched_at = self._binding.request_headers()
             try:
                 response = await self._http.post(
                     f"{self.api_url}/api/v1/projects/{project_id}/providers/breaker-reports",
                     json=report.model_dump(mode="json"),
-                    headers=self._auth_headers(),
+                    headers=headers,
                     timeout=self._send_timeout(deadline),
                 )
                 response.raise_for_status()
@@ -3721,9 +3768,9 @@ class AsyncMetadataReporter(_ReporterBase):
                         report.success_count,
                     )
             except Exception as exc:
-                if handle_read_only_key_error(exc):
-                    # A read-only key denies every write: end the cycle instead
-                    # of posting the remaining doomed snapshots.
+                if self._note_refusal(exc, dispatched_at):
+                    # A refused key or project refuses every report: end the
+                    # cycle instead of posting the remaining doomed snapshots.
                     return
                 _log_warning(
                     "reporter.breaker_send_failed: provider=%s exc_type=%s",
@@ -3777,16 +3824,25 @@ class AsyncMetadataReporter(_ReporterBase):
             batch = built_reports[offset : offset + _UNTRACKED_REPORT_BATCH_SIZE]
             if not batch:
                 continue
+            if self._binding.refused:
+                # Advisory deltas are dropped (not counted as spend), not sent.
+                self._mark_untracked_reports_sent(batch)
+                continue
             self._mark_untracked_reports_attempted(batch)
+            headers, dispatched_at = self._binding.request_headers()
             try:
                 response = await self._http.post(
                     f"{self.api_url}/api/v1/untracked-surfaces",
                     json=[built.report.model_dump(mode="json") for built in batch],
-                    headers=self._auth_headers(),
+                    headers=headers,
                     timeout=10.0 if deadline is None else self._send_timeout(deadline),
                 )
                 response.raise_for_status()
-            except Exception:
+            except Exception as exc:
+                if self._note_refusal(exc, dispatched_at):
+                    # Terminal: these deltas are dropped, not retried.
+                    self._mark_untracked_reports_sent(batch)
+                    return
                 continue
             self._mark_untracked_reports_sent(batch)
 
@@ -3797,16 +3853,19 @@ class AsyncMetadataReporter(_ReporterBase):
 
         See ``MetadataReporter._send_confirm``.
         """
+        if self._binding.refused:
+            return _SendOutcome.REFUSED
         breaker = self._control_plane_breaker
         admission = breaker.admit() if breaker is not None else None
         if admission is not None and not admission.allowed:
             _log_debug("reporter.confirm_held_breaker_open")
             return _SendOutcome.HELD
+        headers, dispatched_at = self._binding.request_headers()
         try:
             resp = await self._http.post(
                 f"{self.api_url}/api/v1/budgets/confirm",
                 json=confirm_request.model_dump(mode="json"),
-                headers=self._auth_headers(),
+                headers=headers,
                 timeout=timeout,
             )
             resp.raise_for_status()
@@ -3815,10 +3874,11 @@ class AsyncMetadataReporter(_ReporterBase):
             self._record_confirm_success()
             return _SendOutcome.SENT
         except Exception as exc:
-            if handle_read_only_key_error(exc):
+            if self._note_refusal(exc, dispatched_at):
+                # An answer, not an outage: credit the breaker; terminal drop.
                 if breaker is not None:
                     breaker.record_success()
-                return _SendOutcome.SENT
+                return _SendOutcome.REFUSED
             if breaker is not None:
                 breaker.record_failure()
             self._record_confirm_failure(exc)
@@ -3847,12 +3907,18 @@ class AsyncMetadataReporter(_ReporterBase):
         """
         timeout = 10.0 if deadline is None else self._send_timeout(deadline)
         self._in_flight += 1
+        dispatched_at: int | None = None
         try:
+            if self._binding.refused:
+                return _BatchSendResult(
+                    _SendOutcome.REFUSED, _IngestRejections(_IngestRejectionKind.MALFORMED)
+                )
             payload = [e.model_dump(mode="json") for e in batch]
+            headers, dispatched_at = self._binding.request_headers()
             resp = await self._http.post(
                 f"{self.api_url}/api/v1/metadata/ingest",
                 json=payload,
-                headers=self._auth_headers(),
+                headers=headers,
                 timeout=timeout,
             )
             resp.raise_for_status()
@@ -3860,9 +3926,9 @@ class AsyncMetadataReporter(_ReporterBase):
             rejections = self._parse_ingest_rejections(resp, len(batch))
             return _BatchSendResult(_SendOutcome.SENT, rejections)
         except Exception as exc:
-            if handle_read_only_key_error(exc):
+            if dispatched_at is not None and self._note_refusal(exc, dispatched_at):
                 return _BatchSendResult(
-                    _SendOutcome.SENT, _IngestRejections(_IngestRejectionKind.MALFORMED)
+                    _SendOutcome.REFUSED, _IngestRejections(_IngestRejectionKind.MALFORMED)
                 )
             # Log only the exception's class name — the type-name-only
             # convention every other except-block follows. Safe here even though

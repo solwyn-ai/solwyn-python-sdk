@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
@@ -14,13 +15,71 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
+from solwyn._project import ProjectBinding
 from solwyn._types import ProviderEntry, ProviderName
 from solwyn.circuit_breaker import CircuitBreaker
 from solwyn.config import SolwynConfig
 
-# Valid credentials that pass format validation
-VALID_API_KEY = "sk_proj_" + "a" * 64
-VALID_PROJECT_ID = "proj_" + "a" * 24
+# Valid credentials that pass format validation. They equal FakeControlPlane's
+# defaults, so a pre-validated binding also works against a default plane.
+VALID_API_KEY = "solwyn_sk_" + "0" * 64
+VALID_PROJECT_ID = "proj_" + "f" * 24
+VALID_PROJECT = "fake-project"
+
+
+def auth_key_body(
+    *,
+    api_key: str = VALID_API_KEY,
+    project: str = VALID_PROJECT,
+    project_id: str = VALID_PROJECT_ID,
+    scope: str = "full",
+    budget_mode: str = "hard_deny",
+) -> bytes:
+    """A ``GET /api/v1/auth/key`` 200 body, exactly as core serializes it."""
+    return json.dumps(
+        {
+            "account_id": "00000000-0000-4000-8000-0000000000ac",
+            "key_id": "00000000-0000-4000-8000-00000000000e",
+            "key_prefix": api_key[:26],
+            "key_name": project,
+            "scope": scope,
+            "created_via": "dashboard",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "rotation_grace_until": None,
+            "project_id": project_id,
+            "project_name": project,
+            "budget_mode": budget_mode,
+        }
+    ).encode()
+
+
+def validated_binding(
+    api_key: str = VALID_API_KEY,
+    *,
+    project: str = VALID_PROJECT,
+    project_id: str = VALID_PROJECT_ID,
+) -> ProjectBinding:
+    """A ProjectBinding that already validated: state valid, project id pinned.
+
+    For tests of a component that is not the project gate: the enforcer and
+    reporter then send ``Solwyn-Project: <project_id>`` and never call
+    ``/auth/key``. The gate itself is tested with fresh bindings.
+    """
+    binding = ProjectBinding(api_key, project)
+    outcome, _ = binding.apply_auth_key(
+        200,
+        auth_key_body(api_key=api_key, project=project, project_id=project_id),
+        binding.generation,
+    )
+    if outcome != "valid":
+        raise RuntimeError(f"validated_binding could not validate: {outcome}")
+    return binding
+
+
+def plane_binding(plane: Any) -> ProjectBinding:
+    """A pre-validated binding for a FakeControlPlane's key and project."""
+    return validated_binding(plane.api_key, project=plane.project_name, project_id=plane.project_id)
+
 
 # A minimal one-link provider chain, enough to satisfy SolwynConfig's
 # required ``providers`` invariant in tests that don't care about routing.
@@ -44,6 +103,35 @@ def patch_wrapper_local(wrapper: object, name: str, replacement: Any) -> Iterato
             vars(wrapper).pop(name, None)
         else:
             object.__setattr__(wrapper, name, previous)
+
+
+@pytest.fixture(autouse=True)
+def _no_automatic_project_validation(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unit tests never send the gate's automatic ``GET /api/v1/auth/key``.
+
+    Most unit tests stub one endpoint of a client that has no control-plane
+    transport, so an automatic validation would leave the process for the
+    real default API URL. Off by default, a binding stays ``unvalidated`` and
+    every request names the configured selector, exactly as before key
+    scoping; refusals carried by data-plane answers still apply. Tests of the
+    project gate opt back in with ``@pytest.mark.project_validation``.
+    """
+    if request.node.get_closest_marker("project_validation") is not None:
+        return
+    monkeypatch.setattr(ProjectBinding, "revalidation_due", lambda _self: False)
+
+
+@pytest.fixture(autouse=True)
+def _default_solwyn_project(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every client a unit test builds names a project unless the test says otherwise.
+
+    ``SOLWYN_PROJECT`` is the documented way to configure it; tests of the
+    missing-project error delete it.
+    """
+    monkeypatch.setenv("SOLWYN_PROJECT", VALID_PROJECT)
+    monkeypatch.delenv("SOLWYN_PROJECT_ID", raising=False)
 
 
 @pytest.fixture(autouse=True)

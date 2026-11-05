@@ -24,7 +24,7 @@ from collections.abc import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
-from conftest import VALID_API_KEY, patch_wrapper_local
+from conftest import VALID_API_KEY, patch_wrapper_local, validated_binding
 
 from solwyn import _base
 from solwyn._base import _LATENCY_WINDOW
@@ -290,7 +290,7 @@ def test_price_hints_flow_from_response_to_result() -> None:
         project_id="proj_x",
         price_hints={ProviderName.OPENAI: 10.0, ProviderName.ANTHROPIC: 2.0},
     )
-    enforcer = _BudgetEnforcerBase(api_url="http://x", api_key="k")
+    enforcer = _BudgetEnforcerBase(api_url="http://x", binding=validated_binding("k"))
 
     # Act — the sans-I/O result builder forwards the server signal verbatim,
     # re-keyed by provider VALUE for the routing layer.

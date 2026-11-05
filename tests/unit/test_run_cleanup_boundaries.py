@@ -9,7 +9,7 @@ import sys
 from contextvars import copy_context
 
 import pytest
-from conftest import VALID_API_KEY
+from conftest import VALID_API_KEY, validated_binding
 
 import solwyn
 from solwyn._lifecycle import _drain_run_cleanups
@@ -29,10 +29,12 @@ def test_same_context_gc_after_handled_generator_exit_never_enters_enforcer(star
 import gc, sys
 import solwyn
 from solwyn.budget import BudgetEnforcer
+from solwyn._project import ProjectBinding
 from solwyn.testing import FakeControlPlane
 gc.disable()
 plane = FakeControlPlane()
-enforcer = BudgetEnforcer(plane.api_url, plane.api_key, transport=plane.transport)
+binding = ProjectBinding(plane.api_key, plane.project_name)
+enforcer = BudgetEnforcer(plane.api_url, binding, transport=plane.transport)
 class Stream:
     def __init__(self):
         self.chunks = self.generate()
@@ -73,7 +75,11 @@ assert solwyn.current_run()[0] is None
 @pytest.mark.asyncio
 async def test_async_holder_surrenders_an_idle_stream_from_the_cleanup_worker():
     plane = FakeControlPlane()
-    enforcer = AsyncBudgetEnforcer(plane.api_url, VALID_API_KEY, transport=plane.transport)
+    enforcer = AsyncBudgetEnforcer(
+        plane.api_url,
+        validated_binding(VALID_API_KEY),
+        transport=plane.transport,
+    )
 
     def chunks():
         with solwyn.run("stream") as rid:
@@ -134,6 +140,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
 import solwyn
 from solwyn.reporter import MetadataReporter
+from solwyn._project import ProjectBinding
 from solwyn.testing import FakeControlPlane
 entered, release = threading.Event(), threading.Event()
 class Exporter(SpanExporter):
@@ -146,7 +153,8 @@ provider.add_span_processor(SimpleSpanProcessor(Exporter()))
 trace.set_tracer_provider(provider)
 os.environ['SOLWYN_OTEL_SPANS'] = 'true'
 plane = FakeControlPlane()
-reporter = MetadataReporter(plane.api_url, plane.api_key, transport=plane.transport)
+binding = ProjectBinding(plane.api_key, plane.project_name)
+reporter = MetadataReporter(plane.api_url, binding, transport=plane.transport)
 handle = solwyn.create_run('abandoned')
 del handle
 gc.collect()
@@ -222,16 +230,19 @@ import sys, threading
 from contextvars import copy_context
 import solwyn
 from solwyn.budget import BudgetEnforcer
+from solwyn._project import ProjectBinding
 from solwyn.testing import FakeControlPlane
 plane = FakeControlPlane()
-holders = [BudgetEnforcer(plane.api_url, plane.api_key, transport=plane.transport)
+binding = ProjectBinding(plane.api_key, plane.project_name)
+holders = [BudgetEnforcer(plane.api_url, binding, transport=plane.transport)
            for _ in range(100)]
 stopped = threading.Event()
 thread_errors = []
 threading.excepthook = lambda args: thread_errors.append(args.exc_value)
 def construct():
     while not stopped.is_set() and len(holders) < 1000:
-        holders.append(BudgetEnforcer(plane.api_url, plane.api_key, transport=plane.transport))
+        binding = ProjectBinding(plane.api_key, plane.project_name)
+        holders.append(BudgetEnforcer(plane.api_url, binding, transport=plane.transport))
 def chunks():
     with solwyn.run('stream'):
         yield

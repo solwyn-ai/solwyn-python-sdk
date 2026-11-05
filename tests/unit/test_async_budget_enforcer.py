@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID
+from conftest import ALLOW_BUDGET_RESPONSE, VALID_API_KEY, VALID_PROJECT_ID, validated_binding
 
 from solwyn._types import BudgetCheckResponse, BudgetMode
 from solwyn.budget import AsyncBudgetEnforcer
@@ -53,7 +53,7 @@ def _make_async_enforcer(**overrides) -> AsyncBudgetEnforcer:
     """Create an AsyncBudgetEnforcer with sensible test defaults."""
     defaults = {
         "api_url": "https://api.test.solwyn.ai",
-        "api_key": VALID_API_KEY,
+        "binding": validated_binding(VALID_API_KEY),
         "budget_mode": BudgetMode.ALERT_ONLY,
         "fail_open": True,
         "cache_ttl": 5,

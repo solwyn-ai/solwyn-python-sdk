@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from conftest import plane_binding
 
 import solwyn as solwyn_pkg
 from solwyn._token_details import TokenDetails
@@ -77,7 +78,7 @@ def _post_grant(
 def _make_enforcer(plane: FakeControlPlane, **overrides: object) -> BudgetEnforcer:
     options: dict[str, object] = {
         "api_url": plane.api_url,
-        "api_key": plane.api_key,
+        "binding": plane_binding(plane),
         "cache_ttl": 0,
         "transport": plane.transport,
         "holder_id": "holder-1",
@@ -89,7 +90,7 @@ def _make_enforcer(plane: FakeControlPlane, **overrides: object) -> BudgetEnforc
 def _make_async_enforcer(plane: FakeControlPlane, **overrides: object) -> AsyncBudgetEnforcer:
     options: dict[str, object] = {
         "api_url": plane.api_url,
-        "api_key": plane.api_key,
+        "binding": plane_binding(plane),
         "cache_ttl": 0,
         "transport": plane.transport,
         "holder_id": "holder-1",
@@ -238,7 +239,7 @@ def test_plane_accepts_positive_lease_configuration_boundaries() -> None:
         lease_length_s=1.0,
     )
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = _post_grant(client, plane)
 
     assert response.json()["granted_tokens"] == 1
@@ -250,7 +251,7 @@ def test_plane_accepts_positive_lease_configuration_boundaries() -> None:
 def test_zero_token_grant_keeps_the_full_wire_shape_for_an_alert_only_cap() -> None:
     plane = FakeControlPlane(granted_tokens=0)
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = _post_grant(client, plane)
 
     payload = response.json()
@@ -281,7 +282,7 @@ def test_zero_token_grant_routes_the_real_enforcer_to_the_per_call_check() -> No
 def test_headroom_share_tokens_is_sized_independently_of_the_grant() -> None:
     plane = FakeControlPlane(granted_tokens=1_000, headroom_share_tokens=250)
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = _post_grant(client, plane)
 
     payload = response.json()
@@ -293,7 +294,7 @@ def test_headroom_share_tokens_is_sized_independently_of_the_grant() -> None:
 def test_final_grant_is_emitted_on_grant_and_renewal_for_the_ledger_wind_down() -> None:
     plane = FakeControlPlane(final_grant=True)
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane).json()
         renewed = client.post(
             f"{plane.api_url}/api/v1/budgets/lease/renew",
@@ -334,7 +335,7 @@ def test_grant_returns_complete_real_lease_response_and_records_request() -> Non
         lease_length_s=12.0,
     )
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = client.post(
             f"{plane.api_url}/api/v1/budgets/lease",
             json=_grant_payload(fail_open=False),
@@ -372,7 +373,7 @@ def test_active_same_holder_grant_replays_current_lease_and_fences_declaration_c
     changed_fail_open = {**original, "fail_open": False}
     changed_model = {**original, "model": "gpt-4o"}
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         first = client.post(f"{plane.api_url}/api/v1/budgets/lease", json=original)
         replay = client.post(
             f"{plane.api_url}/api/v1/budgets/lease",
@@ -455,7 +456,7 @@ def test_duplicate_grant_pairs_replay_as_the_same_ordered_declaration() -> None:
         fallback_models=["gemini-2.5-pro", "claude-sonnet-4-5"],
     )
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         first = client.post(f"{plane.api_url}/api/v1/budgets/lease", json=duplicated)
         replay = client.post(f"{plane.api_url}/api/v1/budgets/lease", json=normalized)
         conflict = client.post(f"{plane.api_url}/api/v1/budgets/lease", json=reordered)
@@ -468,7 +469,7 @@ def test_duplicate_grant_pairs_replay_as_the_same_ordered_declaration() -> None:
 @pytest.mark.unit
 def test_duplicate_renewal_pairs_replay_as_the_same_request() -> None:
     plane = FakeControlPlane()
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane).json()
         duplicated = LeaseRenewRequest(
             lease_id=grant["lease_id"],
@@ -515,7 +516,7 @@ def test_successful_renewal_widens_ordered_declaration_for_grant_replay() -> Non
         fallback_providers=[ProviderName.ANTHROPIC, ProviderName.GOOGLE],
         fallback_models=["claude-sonnet-4-5", "gemini-2.5-pro"],
     )
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = client.post(f"{plane.api_url}/api/v1/budgets/lease", json=narrow).json()
         renewal = LeaseRenewRequest(
             lease_id=grant["lease_id"],
@@ -563,7 +564,7 @@ def test_incomplete_renewal_redeclaration_is_ignored(
         fallback_providers=[ProviderName.GOOGLE],
         fallback_models=["gemini-2.5-pro"],
     )
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = client.post(f"{plane.api_url}/api/v1/budgets/lease", json=narrow).json()
         renewal = LeaseRenewRequest(
             lease_id=grant["lease_id"],
@@ -598,7 +599,7 @@ def test_incomplete_renewal_redeclaration_is_ignored(
 def test_renewal_verdict_covers_the_union_of_declared_and_redeclared_models() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(
             client,
             plane,
@@ -642,7 +643,7 @@ def test_sync_enforcer_renewal_widens_plane_declaration() -> None:
         renewal,
         ["gpt-5.5", "claude-sonnet-4-5"],
     )
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         replay = _post_grant(
             client,
             plane,
@@ -679,7 +680,7 @@ async def test_async_enforcer_renewal_widens_plane_declaration() -> None:
         renewal,
         ["gpt-5.5", "claude-sonnet-4-5"],
     )
-    async with httpx.AsyncClient(transport=plane.transport) as client:
+    async with httpx.AsyncClient(transport=plane.transport, headers=plane.auth_headers()) as client:
         replay = await client.post(
             f"{plane.api_url}/api/v1/budgets/lease",
             json=_grant_payload(
@@ -702,7 +703,7 @@ def test_sync_enforcer_can_recover_a_lost_same_holder_grant_response() -> None:
     plane = FakeControlPlane()
     enforcer = _make_enforcer(plane)
     holder_id = enforcer._lease.holder_id
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         lost = _post_grant(client, plane, holder_id=holder_id)
 
     recovered = _check(enforcer)
@@ -718,7 +719,7 @@ async def test_async_enforcer_can_recover_a_lost_same_holder_grant_response() ->
     plane = FakeControlPlane()
     enforcer = _make_async_enforcer(plane)
     holder_id = enforcer._lease.holder_id
-    async with httpx.AsyncClient(transport=plane.transport) as client:
+    async with httpx.AsyncClient(transport=plane.transport, headers=plane.auth_headers()) as client:
         lost = await client.post(
             f"{plane.api_url}/api/v1/budgets/lease",
             json=_grant_payload(holder_id=holder_id),
@@ -736,7 +737,7 @@ async def test_async_enforcer_can_recover_a_lost_same_holder_grant_response() ->
 def test_renew_replays_the_echoed_generation_and_fences_future_or_unknown_requests() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane).json()
         renewal_request = LeaseRenewRequest(
             lease_id=grant["lease_id"],
@@ -809,7 +810,7 @@ def test_renew_replays_the_echoed_generation_and_fences_future_or_unknown_reques
 def test_renewal_replay_is_keyed_by_generation_not_by_request_body() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane).json()
         first_request = LeaseRenewRequest(
             lease_id=grant["lease_id"],
@@ -838,7 +839,7 @@ def test_renewal_replay_is_keyed_by_generation_not_by_request_body() -> None:
 def test_renewal_echoing_a_terminal_successor_generation_gets_a_fresh_verdict() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane).json()
         plane.deny_next(period="monthly", scope="lease")
         terminal = client.post(
@@ -879,7 +880,7 @@ def test_sync_enforcer_can_apply_replayed_success_after_lost_renewal_response() 
     )
     if renewal is None:
         pytest.fail("held lease did not produce a renewal request")
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         lost = client.post(
             f"{plane.api_url}/api/v1/budgets/lease/renew",
             json=renewal.model_dump(mode="json"),
@@ -900,7 +901,7 @@ def test_sync_enforcer_can_apply_replayed_success_after_lost_renewal_response() 
 def test_surrender_is_recorded_and_idempotently_releases_tokens() -> None:
     plane = FakeControlPlane(granted_tokens=321)
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane).json()
         request = LeaseSurrenderRequest(
             lease_id=grant["lease_id"],
@@ -964,7 +965,7 @@ def test_surrender_is_recorded_and_idempotently_releases_tokens() -> None:
 def test_denied_grant_omits_lease_block_and_is_sticky_in_real_enforcer() -> None:
     raw_plane = FakeControlPlane(mode=BudgetMode.HARD_DENY)
     raw_plane.deny_next(period="agent_run", scope="lease")
-    with httpx.Client(transport=raw_plane.transport) as client:
+    with httpx.Client(transport=raw_plane.transport, headers=raw_plane.auth_headers()) as client:
         raw = _post_grant(client, raw_plane)
 
     assert raw.status_code == 200
@@ -1010,7 +1011,7 @@ def test_magic_lease_denials_are_hard_denies_on_an_alert_only_plane(
         remaining_budget=40.0,
     )
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = _post_grant(client, plane, model=model)
 
     payload = response.json()
@@ -1026,7 +1027,7 @@ def test_scripted_lease_denial_never_reports_negative_remaining_budget() -> None
     plane = FakeControlPlane(budget_limit=5.0, current_usage=6.0, remaining_budget=-1.0)
     plane.deny_next(period="monthly", scope="lease")
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = _post_grant(client, plane)
 
     payload = response.json()
@@ -1050,7 +1051,7 @@ def test_magic_fallback_drives_raw_lease_denial(
 ) -> None:
     plane = FakeControlPlane(mode=BudgetMode.ALERT_ONLY)
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = _post_grant(
             client,
             plane,
@@ -1068,7 +1069,7 @@ def test_magic_fallback_drives_raw_lease_denial(
 def test_tag_scoped_trigger_makes_a_lease_grant_ineligible_rather_than_denied() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         primary = _post_grant(client, plane, model="solwyn-test/deny-tag")
         fallback = _post_grant(
             client,
@@ -1100,7 +1101,7 @@ def test_check_scoped_denials_are_not_consumed_by_lease_traffic() -> None:
     plane = FakeControlPlane()
     plane.deny_next(1)
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         granted = _post_grant(client, plane)
         checked = client.post(
             f"{plane.api_url}/api/v1/budgets/check",
@@ -1148,7 +1149,7 @@ def test_fallback_ineligibility_omits_raw_lease_block_and_real_enforcer_uses_leg
     assert len(plane.lease_grants) == 1
     assert len(plane.checks) == 1
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         raw = _post_grant(
             client,
             plane,
@@ -1167,7 +1168,7 @@ def test_fallback_ineligibility_omits_raw_lease_block_and_real_enforcer_uses_leg
 @pytest.mark.unit
 def test_renewal_fallback_tag_trigger_is_terminal_ineligibility() -> None:
     plane = FakeControlPlane()
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane).json()
         renewal = LeaseRenewRequest(
             lease_id=grant["lease_id"],
@@ -1207,7 +1208,7 @@ def test_renewal_rechecks_magic_denials_and_replays_terminal_response(
     period: str,
 ) -> None:
     plane = FakeControlPlane(mode=BudgetMode.ALERT_ONLY)
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane, model=grant_model).json()
         renewal = LeaseRenewRequest(
             lease_id=grant["lease_id"],
@@ -1247,7 +1248,7 @@ def test_terminal_renewal_advances_generation_and_releases_on_the_predecessor(
     expiry in exactly the case the SDK reports fastest.
     """
     plane = FakeControlPlane()
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane).json()
         if terminal_kind == "deny":
             plane.deny_run("run-lease")
@@ -1341,7 +1342,7 @@ def test_a_stopped_runs_lease_is_released_whatever_generation_it_echoes() -> Non
     # wanted the lease gone — so the generation it echoes cannot matter, and
     # keeping the float to the deadline would punish the holder that told us.
     plane = FakeControlPlane()
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane).json()
         plane.stop_run("run-lease")
         released = client.post(
@@ -1373,7 +1374,7 @@ def test_a_live_successor_still_refuses_its_predecessors_release() -> None:
     # lease block, and that one IS in use — releasing its predecessor would
     # reclaim authority the holder is still drawing on.
     plane = FakeControlPlane()
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane).json()
         renewed = client.post(
             f"{plane.api_url}/api/v1/budgets/lease/renew",
@@ -1403,7 +1404,7 @@ def test_terminal_renewal_blocks_regrant_until_expiration() -> None:
     plane = FakeControlPlane()
     original = _grant_payload()
     changed = _grant_payload(model="gpt-4o")
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = client.post(f"{plane.api_url}/api/v1/budgets/lease", json=original).json()
         renewal = LeaseRenewRequest(
             lease_id=grant["lease_id"],
@@ -1499,7 +1500,7 @@ def test_ineligible_grant_omits_lease_block_and_falls_back_to_check(model: str) 
     assert len(plane.lease_grants) == 1
     assert len(plane.checks) == 1
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         raw = _post_grant(
             client,
             plane,
@@ -1533,7 +1534,7 @@ def test_renewal_rechecks_ineligibility_and_replays_terminal_response(
     }
     renewal_model = magic_models.get(trigger)
     plane = FakeControlPlane()
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane).json()
         if trigger == "plane":
             plane.lease_eligible = False
@@ -1622,7 +1623,7 @@ def test_lease_refusal_has_core_shape_and_real_enforcer_uses_legacy_check(
 
     raw_plane = FakeControlPlane()
     with (
-        httpx.Client(transport=raw_plane.transport) as client,
+        httpx.Client(transport=raw_plane.transport, headers=raw_plane.auth_headers()) as client,
         raw_plane.refuse_leases(status=status, code=code, requests=1),
     ):
         refused = _post_grant(client, raw_plane)
@@ -1637,7 +1638,7 @@ def test_lease_refusal_has_core_shape_and_real_enforcer_uses_legacy_check(
 def test_holder_cap_refusal_matches_grants_only_and_spends_no_other_budget() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane).json()
         with plane.refuse_leases(status=409, code="lease_holder_cap_exceeded", requests=1):
             renewed = client.post(
@@ -1671,7 +1672,7 @@ def test_holder_cap_refusal_matches_grants_only_and_spends_no_other_budget() -> 
 def test_lease_unavailable_refusal_still_matches_every_lease_path() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant = _post_grant(client, plane).json()
         with plane.refuse_leases(requests=3):
             refused_renew = client.post(
@@ -1706,7 +1707,7 @@ def test_lease_unavailable_refusal_still_matches_every_lease_path() -> None:
 def test_expire_leases_returns_not_found_until_a_new_generation_one_grant() -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         first = _post_grant(client, plane).json()
         plane.expire_leases()
         expired_request = LeaseRenewRequest(
@@ -1832,7 +1833,7 @@ def test_slow_request_freezes_lease_refusal_before_context_exit() -> None:
             raise RuntimeError("test did not release scripted sleep")
 
     with (
-        httpx.Client(transport=plane.transport) as client,
+        httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client,
         ThreadPoolExecutor(max_workers=1) as pool,
         patch("solwyn.testing._transport.time.sleep", side_effect=blocked_sleep),
     ):
@@ -1858,8 +1859,12 @@ def test_reset_recording_keeps_lease_state_and_planes_are_independent() -> None:
     first_plane = FakeControlPlane()
     second_plane = FakeControlPlane()
     with (
-        httpx.Client(transport=first_plane.transport) as first_client,
-        httpx.Client(transport=second_plane.transport) as second_client,
+        httpx.Client(
+            transport=first_plane.transport, headers=first_plane.auth_headers()
+        ) as first_client,
+        httpx.Client(
+            transport=second_plane.transport, headers=second_plane.auth_headers()
+        ) as second_client,
     ):
         first_grant = _post_grant(first_client, first_plane).json()
         second_grant = _post_grant(second_client, second_plane).json()
@@ -1910,7 +1915,7 @@ def test_reset_recording_keeps_lease_state_and_planes_are_independent() -> None:
 def test_lease_validation_is_422_without_private_input(path: str, payload: object) -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = client.post(f"{plane.api_url}{path}", json=payload)
 
     assert response.status_code == 422
@@ -1925,7 +1930,7 @@ async def test_async_transport_parity_for_lease_lifecycle_and_refusal() -> None:
     plane = FakeControlPlane()
     grant_request = _grant_payload()
 
-    async with httpx.AsyncClient(transport=plane.transport) as client:
+    async with httpx.AsyncClient(transport=plane.transport, headers=plane.auth_headers()) as client:
         grant_response = await client.post(
             f"{plane.api_url}/api/v1/budgets/lease",
             json=grant_request,
@@ -2298,7 +2303,7 @@ async def test_async_enforcer_and_wrap_cover_refusal_expiration_and_close() -> N
 def test_lease_paths_never_retain_the_task_two_501_placeholder(path: str) -> None:
     plane = FakeControlPlane()
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         response = client.get(f"{plane.api_url}{path}")
 
     assert response.status_code == 404

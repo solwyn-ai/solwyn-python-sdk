@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import pytest
+from conftest import plane_binding
 
 from solwyn._token_details import TokenDetails
 from solwyn.budget import AsyncBudgetEnforcer
@@ -22,14 +23,14 @@ async def _components(
 ) -> AsyncIterator[tuple[AsyncBudgetEnforcer, AsyncMetadataReporter]]:
     enforcer = AsyncBudgetEnforcer(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         cache_ttl=0,
         lease_enabled=False,
         transport=plane.transport,
     )
     reporter = AsyncMetadataReporter(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         flush_interval=60,
         max_send_attempts=1,
         transport=plane.transport,

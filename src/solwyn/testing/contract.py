@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import math
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, TypeVar, cast
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
+from solwyn._constants import AUTH_KEY_PATH, PROJECT_ECHO_HEADER, PROJECT_HEADER
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
+    AuthKeyResponse,
     BudgetCheckRequest,
     BudgetCheckResponse,
     BudgetConfirmRequest,
@@ -74,8 +77,16 @@ def _require(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def _headers(api_key: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {api_key}"}
+@dataclass(frozen=True, slots=True)
+class _Auth:
+    """The API key and the project every key request names (spec section 2.2)."""
+
+    api_key: str
+    project: str
+
+
+def _headers(auth: _Auth) -> dict[str, str]:
+    return {"Authorization": f"Bearer {auth.api_key}", PROJECT_HEADER: auth.project}
 
 
 def _body_preview(response: httpx.Response) -> str:
@@ -121,11 +132,11 @@ def _validate_model(
 
 def _post(
     http: httpx.Client,
-    api_key: str,
+    auth: _Auth,
     path: str,
     payload: dict[str, Any],
 ) -> httpx.Response:
-    return http.post(path, json=payload, headers=_headers(api_key))
+    return http.post(path, json=payload, headers=_headers(auth))
 
 
 def _check_payload(
@@ -237,7 +248,7 @@ def _require_price_hint_shape(payload: dict[str, Any], context: str) -> None:
 
 def _post_check(
     http: httpx.Client,
-    api_key: str,
+    auth: _Auth,
     *,
     context: str,
     agent_run_id: str | None = None,
@@ -246,7 +257,7 @@ def _post_check(
 ) -> dict[str, Any]:
     response = _post(
         http,
-        api_key,
+        auth,
         _CHECK_PATH,
         _check_payload(
             agent_run_id=agent_run_id,
@@ -273,11 +284,12 @@ def _require_deny_shape(payload: dict[str, Any], period: str) -> None:
     _require(parsed.denied_by_period == period, f"{context} failed SDK response validation")
 
 
-def assert_check_contract(http: httpx.Client, api_key: str) -> None:
+def assert_check_contract(http: httpx.Client, api_key: str, project: str) -> None:
     """Assert the check response shapes that change SDK behavior."""
+    auth = _Auth(api_key, project)
     monthly = _post_check(
         http,
-        api_key,
+        auth,
         context="monthly denial",
         tags={"contract_case": "monthly"},
     )
@@ -285,7 +297,7 @@ def assert_check_contract(http: httpx.Client, api_key: str) -> None:
 
     stopped = _post_check(
         http,
-        api_key,
+        auth,
         context="run_stopped denial",
         agent_run_id="contract-stopped-run",
     )
@@ -293,7 +305,7 @@ def assert_check_contract(http: httpx.Client, api_key: str) -> None:
 
     tag = _post_check(
         http,
-        api_key,
+        auth,
         context="tag denial",
         tags={"customer": "acme"},
     )
@@ -301,13 +313,13 @@ def assert_check_contract(http: httpx.Client, api_key: str) -> None:
 
     agent_run = _post_check(
         http,
-        api_key,
+        auth,
         context="agent_run denial",
         agent_run_id="contract-agent-run",
     )
     _require_deny_shape(agent_run, "agent_run")
 
-    allowed = _post_check(http, api_key, context="allow check")
+    allowed = _post_check(http, auth, context="allow check")
     _require(allowed.get("allowed") is True, f"allow check was denied: {allowed!r}")
     _require("denied_by_period" not in allowed, "allow check serialized denied_by_period")
     reservation_id = allowed.get("reservation_id")
@@ -322,8 +334,8 @@ def assert_check_contract(http: httpx.Client, api_key: str) -> None:
     _require(parsed.denied_by_period is None, "allow parsed a denied period")
 
 
-def _reservation(http: httpx.Client, api_key: str) -> str:
-    payload = _post_check(http, api_key, context="confirm setup check")
+def _reservation(http: httpx.Client, auth: _Auth) -> str:
+    payload = _post_check(http, auth, context="confirm setup check")
     _require(payload.get("allowed") is True, "confirm setup check was denied")
     reservation_id = payload.get("reservation_id")
     _require(isinstance(reservation_id, str), "confirm setup omitted reservation_id")
@@ -356,24 +368,25 @@ def _raw_confirm_base() -> dict[str, Any]:
     }
 
 
-def assert_confirm_contract(http: httpx.Client, api_key: str) -> None:
+def assert_confirm_contract(http: httpx.Client, api_key: str, project: str) -> None:
     """Assert valid, invalid, and replay-safe settlement wire shapes."""
-    reservation_id = _reservation(http, api_key)
+    auth = _Auth(api_key, project)
+    reservation_id = _reservation(http, auth)
     call_id = str(uuid.uuid4())
     payload = _confirm_payload(call_id=call_id, reservation_id=reservation_id)
     _require("lease_id" not in payload, "reservation confirm serialized lease_id")
     _require(payload.get("reservation_id") == reservation_id, "reservation key drifted")
 
-    first = _post(http, api_key, _CONFIRM_PATH, payload)
+    first = _post(http, auth, _CONFIRM_PATH, payload)
     _require_status(first, 204, "valid confirm")
     _require(first.content == b"", "204 confirm returned a response body")
 
-    duplicate_call = _post(http, api_key, _CONFIRM_PATH, payload)
+    duplicate_call = _post(http, auth, _CONFIRM_PATH, payload)
     _require_status(duplicate_call, 204, "call-id replay")
 
     reservation_replay = _post(
         http,
-        api_key,
+        auth,
         _CONFIRM_PATH,
         _confirm_payload(call_id=str(uuid.uuid4()), reservation_id=reservation_id),
     )
@@ -381,7 +394,7 @@ def assert_confirm_contract(http: httpx.Client, api_key: str) -> None:
 
     both = _post(
         http,
-        api_key,
+        auth,
         _CONFIRM_PATH,
         {
             **_raw_confirm_base(),
@@ -391,12 +404,12 @@ def assert_confirm_contract(http: httpx.Client, api_key: str) -> None:
     )
     _require_status(both, 422, "confirm with both settlement keys")
 
-    neither = _post(http, api_key, _CONFIRM_PATH, _raw_confirm_base())
+    neither = _post(http, auth, _CONFIRM_PATH, _raw_confirm_base())
     _require_status(neither, 422, "confirm with missing settlement key")
 
     unknown_reservation = _post(
         http,
-        api_key,
+        auth,
         _CONFIRM_PATH,
         _confirm_payload(call_id=str(uuid.uuid4()), reservation_id="res_contract_unknown"),
     )
@@ -429,7 +442,7 @@ def _grant_payload(
 
 def _post_grant(
     http: httpx.Client,
-    api_key: str,
+    auth: _Auth,
     run_id: str,
     holder_id: str,
     *,
@@ -438,7 +451,7 @@ def _post_grant(
 ) -> httpx.Response:
     return _post(
         http,
-        api_key,
+        auth,
         _LEASE_PATH,
         _grant_payload(run_id, holder_id, model=model, fail_open=fail_open),
     )
@@ -533,7 +546,7 @@ def _require_eligible_lease_shape(
 
 def _surrender(
     http: httpx.Client,
-    api_key: str,
+    auth: _Auth,
     *,
     lease_id: str,
     holder_id: str,
@@ -544,14 +557,15 @@ def _surrender(
         holder_id=holder_id,
         generation=generation,
     ).model_dump(mode="json")
-    return _post(http, api_key, _LEASE_SURRENDER_PATH, payload)
+    return _post(http, auth, _LEASE_SURRENDER_PATH, payload)
 
 
-def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
+def assert_lease_contract(http: httpx.Client, api_key: str, project: str) -> None:
     """Assert lease grant, refusal, fencing, settlement, and release shapes."""
+    auth = _Auth(api_key, project)
     holder_cap = _post_grant(
         http,
-        api_key,
+        auth,
         "contract-holder-cap",
         "contract-holder-cap-overflow",
     )
@@ -559,7 +573,7 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
 
     denied = _post_grant(
         http,
-        api_key,
+        auth,
         "contract-lease-denied",
         "contract-denied-holder",
     )
@@ -580,7 +594,7 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
 
     ineligible = _post_grant(
         http,
-        api_key,
+        auth,
         "contract-lease-ineligible",
         "contract-ineligible-holder",
         model=_UNPRICED_LEASE_MODEL,
@@ -591,7 +605,7 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
     holder_id = f"contract-holder-{uuid.uuid4().hex[:12]}"
     granted = _post_grant(
         http,
-        api_key,
+        auth,
         f"contract-lease-{uuid.uuid4().hex[:12]}",
         holder_id,
     )
@@ -610,7 +624,7 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
         generation=1,
     ).model_dump(mode="json")
     _require_lease_error(
-        _post(http, api_key, _LEASE_RENEW_PATH, unknown),
+        _post(http, auth, _LEASE_RENEW_PATH, unknown),
         404,
         "lease_not_found",
     )
@@ -621,7 +635,7 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
         generation=generation + 98,
     ).model_dump(mode="json")
     _require_lease_error(
-        _post(http, api_key, _LEASE_RENEW_PATH, wrong_generation),
+        _post(http, auth, _LEASE_RENEW_PATH, wrong_generation),
         409,
         "lease_generation_conflict",
     )
@@ -631,7 +645,7 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
         holder_id=holder_id,
         generation=generation,
     ).model_dump(mode="json")
-    renewed_response = _post(http, api_key, _LEASE_RENEW_PATH, renewal)
+    renewed_response = _post(http, auth, _LEASE_RENEW_PATH, renewal)
     _require_status(renewed_response, 200, "lease renewal")
     renewed = _object_json(renewed_response, "lease renewal")
     _renewed_lease_id, renewed_generation = _require_eligible_lease_shape(
@@ -644,14 +658,14 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
     confirm_payload = _confirm_payload(call_id=str(uuid.uuid4()), lease_id=lease_id)
     _require("reservation_id" not in confirm_payload, "lease confirm serialized reservation_id")
     _require(confirm_payload.get("lease_id") == lease_id, "lease confirm key drifted")
-    confirmed = _post(http, api_key, _CONFIRM_PATH, confirm_payload)
+    confirmed = _post(http, auth, _CONFIRM_PATH, confirm_payload)
     _require_status(confirmed, 204, "lease-tagged confirm")
-    replay = _post(http, api_key, _CONFIRM_PATH, confirm_payload)
+    replay = _post(http, auth, _CONFIRM_PATH, confirm_payload)
     _require_status(replay, 204, "lease-tagged confirm replay")
 
     released = _surrender(
         http,
-        api_key,
+        auth,
         lease_id=lease_id,
         holder_id=holder_id,
         generation=renewed_generation,
@@ -667,7 +681,7 @@ def assert_lease_contract(http: httpx.Client, api_key: str) -> None:
 
     repeated = _surrender(
         http,
-        api_key,
+        auth,
         lease_id=lease_id,
         holder_id=holder_id,
         generation=renewed_generation,
@@ -729,6 +743,7 @@ def _require_terminate_directive(
 def assert_run_control_contract(
     http: httpx.Client,
     api_key: str,
+    project: str,
     *,
     stopped_run_id: str,
 ) -> None:
@@ -738,9 +753,10 @@ def assert_run_control_contract(
     manipulation is lane-specific (the double scripts it, the live lane POSTs
     the dashboard stop), exactly like the pack's other setup.
     """
+    auth = _Auth(api_key, project)
     opted_in = _post_check(
         http,
-        api_key,
+        auth,
         context="stopped run directive check",
         agent_run_id=stopped_run_id,
         run_directive_version="1",
@@ -754,7 +770,7 @@ def assert_run_control_contract(
 
     without_opt_in = _post_check(
         http,
-        api_key,
+        auth,
         context="stopped run legacy check",
         agent_run_id=stopped_run_id,
     )
@@ -767,7 +783,7 @@ def assert_run_control_contract(
     other_run_id = f"contract-unstopped-{uuid.uuid4().hex[:12]}"
     other_run = _post_check(
         http,
-        api_key,
+        auth,
         context="unstopped run check",
         agent_run_id=other_run_id,
         run_directive_version="1",
@@ -833,14 +849,14 @@ def _lease_tagged_success_event() -> MetadataEvent:
 
 def _post_receipt(
     http: httpx.Client,
-    api_key: str,
+    auth: _Auth,
     event: MetadataEvent,
     context: str,
 ) -> None:
     response = http.post(
         _INGEST_PATH,
         json=[event.model_dump(mode="json")],
-        headers=_headers(api_key),
+        headers=_headers(auth),
     )
     _require_status(response, 202, context)
     body = _object_json(response, context)
@@ -850,7 +866,7 @@ def _post_receipt(
     )
 
 
-def assert_receipt_ingest_contract(http: httpx.Client, api_key: str) -> None:
+def assert_receipt_ingest_contract(http: httpx.Client, api_key: str, project: str) -> None:
     """Assert that denial receipts, aggregate replays and lease-tagged events ingest.
 
     All three events ride the ordinary metadata-ingest path and must be
@@ -860,15 +876,16 @@ def assert_receipt_ingest_contract(http: httpx.Client, api_key: str) -> None:
     the field rejects the whole batch with 422). Every call id is fresh so a
     live server's ingest dedup can never mask a rejection.
     """
+    auth = _Auth(api_key, project)
     _post_receipt(
         http,
-        api_key,
+        auth,
         _receipt_event(deny_source="server", input_tokens=1000),
         "denial receipt ingest",
     )
     _post_receipt(
         http,
-        api_key,
+        auth,
         _receipt_event(
             deny_source="aggregate_replay",
             input_tokens=3000,
@@ -878,18 +895,19 @@ def assert_receipt_ingest_contract(http: httpx.Client, api_key: str) -> None:
     )
     _post_receipt(
         http,
-        api_key,
+        auth,
         _lease_tagged_success_event(),
         "lease-tagged success ingest",
     )
 
 
-def assert_trace_ingest_contract(http: httpx.Client, api_key: str) -> None:
+def assert_trace_ingest_contract(http: httpx.Client, api_key: str, project: str) -> None:
     """Assert that metadata ingestion accepts sampled and unsampled trace ids.
 
     These fixtures use the ordinary event envelope, with fresh call ids so
     ingest deduplication cannot hide a rejected trace field.
     """
+    auth = _Auth(api_key, project)
     for sampled in (True, False):
         event = MetadataEvent.model_validate(
             {
@@ -899,4 +917,185 @@ def assert_trace_ingest_contract(http: httpx.Client, api_key: str) -> None:
                 "trace_sampled": sampled,
             }
         )
-        _post_receipt(http, api_key, event, "trace-correlated event ingest")
+        _post_receipt(http, auth, event, "trace-correlated event ingest")
+
+
+# ── API key scoping (spec sections 2.2 to 2.6) ─────────────────────────────
+
+_AUTH_KEY_FIELDS = frozenset(AuthKeyResponse.model_fields)
+_UNKNOWN_KEY = "solwyn_sk_" + "e" * 64
+_UNKNOWN_PROJECT = "solwyn-contract-no-such-project"
+_SELECTOR_REQUIRED_MESSAGE = (
+    "This API key needs a project. Set SOLWYN_PROJECT, or send the Solwyn-Project "
+    "header, to a project name or proj_ id."
+)
+_PROJECT_NOT_FOUND_MESSAGE = (
+    "No project on this API key matches Solwyn-Project. Check the name or proj_ id. "
+    "A renamed project's old name stops working; its proj_ id always works."
+)
+
+
+def _key_error_detail(
+    response: httpx.Response,
+    status: int,
+    code: str,
+    context: str,
+    *,
+    message: str | None = None,
+) -> dict[str, Any]:
+    _require_status(response, status, context)
+    body = _object_json(response, context)
+    detail = body.get("detail")
+    _require(isinstance(detail, dict), f"{context} detail must be an object: {body!r}")
+    detail = cast(dict[str, Any], detail)
+    _require(detail.get("code") == code, f"{context} code {detail.get('code')!r} != {code!r}")
+    if message is not None:
+        _require(
+            detail.get("message") == message,
+            f"{context} message drifted: {detail.get('message')!r}",
+        )
+    _require(
+        PROJECT_ECHO_HEADER not in response.headers,
+        f"{context} echoed {PROJECT_ECHO_HEADER} on an authentication failure",
+    )
+    return detail
+
+
+def _get_auth_key(
+    http: httpx.Client, headers: dict[str, str] | list[tuple[str, str]]
+) -> httpx.Response:
+    return http.get(AUTH_KEY_PATH, headers=headers)
+
+
+def assert_auth_key_contract(http: httpx.Client, api_key: str, project: str) -> None:
+    """Assert the key-scoping wire the SDK's project binding depends on.
+
+    ``api_key`` must be an active full-scope key and ``project`` a name or
+    ``proj_`` id of a live project on it. Covers ``GET /api/v1/auth/key`` (the
+    only source of the pinned id), the ``Solwyn-Project`` header rules, the
+    refusal shapes the SDK classifies, and the ``Solwyn-Project-Id`` echo.
+    """
+    auth = _Auth(api_key, project)
+
+    ok = _get_auth_key(http, _headers(auth))
+    _require_status(ok, 200, "auth key")
+    payload = _object_json(ok, "auth key")
+    _require(
+        set(payload) == _AUTH_KEY_FIELDS,
+        f"auth key fields drifted: {sorted(set(payload) ^ _AUTH_KEY_FIELDS)}",
+    )
+    try:
+        parsed = AuthKeyResponse.model_validate_json(ok.content)
+    except ValidationError as exc:
+        errors = exc.errors(include_url=False, include_input=False)
+        raise AssertionError(f"auth key schema validation failed: {errors!r}") from exc
+    _require(parsed.scope == "full", f"auth key scope must be full, got {parsed.scope!r}")
+    _require(
+        parsed.key_prefix == api_key[:26],
+        "auth key key_prefix must be the first 26 characters of the key",
+    )
+    _require(
+        "no-store" in ok.headers.get("cache-control", ""),
+        "auth key must answer Cache-Control: no-store",
+    )
+    _require(
+        ok.headers.get(PROJECT_ECHO_HEADER) == parsed.project_id,
+        f"auth key {PROJECT_ECHO_HEADER} must echo the resolved project id",
+    )
+
+    pinned = _get_auth_key(http, _headers(_Auth(api_key, parsed.project_id)))
+    _require_status(pinned, 200, "auth key by proj_ id")
+    _require(
+        _object_json(pinned, "auth key by proj_ id").get("project_id") == parsed.project_id,
+        "the proj_ id selector resolved a different project",
+    )
+
+    # A conforming HTTP/1.1 client (httpx via h11) refuses to send a header
+    # value with leading or trailing whitespace, and the SDK trims the selector
+    # before sending, so this probe sends no padding. The server's trimming of
+    # padded values is a server-side check (a raw-socket test in core).
+    folded = _get_auth_key(http, _headers(_Auth(api_key, parsed.project_name.upper())))
+    _require_status(folded, 200, "auth key by case-folded name")
+    _require(
+        _object_json(folded, "auth key by case-folded name").get("project_id") == parsed.project_id,
+        "name matching must be case-insensitive",
+    )
+
+    _key_error_detail(
+        _get_auth_key(http, {"Authorization": f"Bearer {api_key}"}),
+        400,
+        "project_selector_required",
+        "auth key without Solwyn-Project",
+        message=_SELECTOR_REQUIRED_MESSAGE,
+    )
+    _key_error_detail(
+        _get_auth_key(http, {"Authorization": f"Bearer {api_key}", PROJECT_HEADER: ""}),
+        400,
+        "project_selector_required",
+        "auth key with a blank Solwyn-Project",
+    )
+    _key_error_detail(
+        _get_auth_key(http, _headers(_Auth(api_key, _UNKNOWN_PROJECT))),
+        404,
+        "project_not_found",
+        "auth key for an unknown project",
+        message=_PROJECT_NOT_FOUND_MESSAGE,
+    )
+    _key_error_detail(
+        _get_auth_key(http, _headers(_Auth(api_key, "x" * 101))),
+        404,
+        "project_not_found",
+        "auth key with an over-long selector",
+    )
+    conflict = _key_error_detail(
+        _get_auth_key(
+            http,
+            [
+                ("Authorization", f"Bearer {api_key}"),
+                (PROJECT_HEADER, parsed.project_id),
+                (PROJECT_HEADER, _UNKNOWN_PROJECT),
+            ],
+        ),
+        400,
+        "project_selector_conflict",
+        "auth key with two different Solwyn-Project headers",
+        message="Send one Solwyn-Project header.",
+    )
+    _require(
+        conflict.get("reason") == "multiple_headers",
+        f"conflict reason drifted: {conflict.get('reason')!r}",
+    )
+
+    unknown = _get_auth_key(http, _headers(_Auth(_UNKNOWN_KEY, project)))
+    invalid = _key_error_detail(
+        unknown,
+        401,
+        "api_key_invalid",
+        "auth key with an unknown key",
+        message="Invalid or revoked API key.",
+    )
+    _require(
+        "project_budget_mode" in invalid and invalid["project_budget_mode"] is None,
+        f"an unknown key must report project_budget_mode null: {invalid!r}",
+    )
+    _require(
+        unknown.headers.get("www-authenticate") == 'Bearer error="invalid_token"',
+        'a 401 must carry WWW-Authenticate: Bearer error="invalid_token"',
+    )
+
+    _key_error_detail(
+        http.post(
+            _CHECK_PATH,
+            json=_check_payload(),
+            headers={"Authorization": f"Bearer {api_key}"},
+        ),
+        400,
+        "project_selector_required",
+        "budget check without Solwyn-Project",
+    )
+    checked = _post(http, auth, _CHECK_PATH, _check_payload())
+    _require_status(checked, 200, "budget check with Solwyn-Project")
+    _require(
+        checked.headers.get(PROJECT_ECHO_HEADER) == parsed.project_id,
+        f"budget check {PROJECT_ECHO_HEADER} must echo the resolved project id",
+    )

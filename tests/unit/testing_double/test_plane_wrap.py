@@ -540,12 +540,14 @@ def test_direct_client_construction_still_honors_ambient_environment_variables(
 
 
 @pytest.mark.unit
-def test_api_key_is_deterministic_and_valid_project_key_shape() -> None:
+def test_api_key_and_project_are_deterministic_and_valid_shapes() -> None:
     first = FakeControlPlane()
     second = FakeControlPlane()
 
     assert first.api_key == second.api_key
-    assert re.fullmatch(r"sk_proj_[0-9a-f]{64}", first.api_key)
+    assert re.fullmatch(r"solwyn_sk_[0-9a-f]{64}", first.api_key)
+    assert re.fullmatch(r"proj_[0-9a-f]{24}", first.project_id)
+    assert first.project_name == second.project_name == "fake-project"
     assert first.api_url == "http://control-plane.invalid"
 
 
@@ -554,7 +556,7 @@ def test_reset_recording_clears_only_recorded_requests() -> None:
     plane = FakeControlPlane()
     plane.deny_next(2)
 
-    with httpx.Client(transport=plane.transport) as client:
+    with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as client:
         first = client.post(
             f"{plane.api_url}/api/v1/budgets/check",
             json=_check_payload(),

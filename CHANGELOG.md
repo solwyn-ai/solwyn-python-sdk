@@ -5,7 +5,34 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
-## [Unreleased]
+## [0.11.0] - 2026-11-05
+
+API key scoping. Keys belong to your account and can reach one or more
+projects, so every client now names the project it spends against. This
+release needs a Solwyn API that supports scoped keys; old project keys stop
+working at the same time.
+
+### Breaking
+
+- **New key format and a required project.** Keys are now
+  `solwyn_sk_` followed by 64 lowercase hex characters. Pass the project with
+  `project=` (or set `SOLWYN_PROJECT`): a project name or a `proj_` id.
+  Constructing a client without one raises `ConfigurationError`. Old
+  `sk_proj_` keys are rejected when the client is constructed, with a message
+  that says to create a new key in the dashboard or with `solwyn keys create`.
+- **`project_id=` and `SOLWYN_PROJECT_ID` are gone.** `project_id=` raises
+  `ConfigurationError` (it used to raise `TypeError`), and `SOLWYN_PROJECT_ID`
+  is not read; if it is set and no project is configured, the error says to
+  rename it to `SOLWYN_PROJECT`.
+- **A read-only key is refused, not tolerated.** It used to log one error and
+  let calls continue unmetered. It now fails `validate()` and blocks every
+  call, whatever `fail_open` says.
+- **`solwyn.testing`:** `FakeControlPlane.wrap()` reserves `project`, the
+  plane's key is a `solwyn_sk_` key, its default `project_id` is a real
+  `proj_` id, and every request to it must name the project
+  (`plane.auth_headers()` gives a raw `httpx` client the headers). The
+  `solwyn.testing.contract` functions take the project as a new third
+  argument.
 
 ### Added
 
@@ -21,6 +48,100 @@ derived from git tags (hatch-vcs).
   `post_training.model_resources.extend_expiry`, classified like the other
   model-resource operations. Anthropic 2.5 and google-genai 2.34 add no new
   surfaces. Coverage fingerprints are refreshed for this admission.
+- **`Solwyn-Project` on every request.** The SDK sends the configured project
+  until it has validated, then the project's `proj_` id, so renaming the
+  project in the dashboard does not break a running client.
+- **Lazy validation and `validate()`.** Constructing a client makes no network
+  call. Before the first call that needs Solwyn, the SDK checks the key once
+  with `GET /api/v1/auth/key`. `client.validate()` (`await client.validate()`
+  on `AsyncSolwyn`) runs the same check on demand, returns the key's details,
+  raises on any refusal, and returns `None` when Solwyn cannot be reached.
+- **`ApiKeyRefusedError`**, a `ConfigurationError` with `code` and `field`,
+  raised when Solwyn refuses the key or the project: expired, revoked,
+  unrecognised or read-only keys, a project the key does not reach, or a
+  project that accepts only dedicated keys.
+- **`solwyn.testing`:** the fake control plane implements the scoped-key
+  contract: `GET /api/v1/auth/key`, the `Solwyn-Project` rules and refusal
+  codes, the `Solwyn-Project-Id` echo, and knobs to script them
+  (`expire_key()`, `revoke_key()`, `restore_key()`, `set_key_scope()`,
+  `rename_project()`, `archive_project()`, `require_dedicated_keys()`,
+  `budget_rules` with `FakeBudgetRule`, and `raw_response()`).
+  `solwyn.testing.contract.assert_auth_key_contract` checks the same contract
+  against a live API.
+
+### Changed
+
+- **A refusal is never an outage.** Every 401 from Solwyn, whatever its body,
+  is a key refusal. A refusal is recorded once and checked before anything
+  else on every call: no cached allow, held lease, open control-plane breaker
+  or `fail_open` setting can let a call past it, and a call already in flight
+  when another call met the refusal is blocked too, even if its own check
+  timed out. The SDK revalidates every 60 seconds and recovers on the first
+  success; a late answer can never clear or weaken a newer refusal.
+- **Alert-only projects keep running when a key expires.** After the client
+  has validated once, an expired or revoked key on a project that promises to
+  block nothing (alert-only, with no unpaused hard budget rule or run cap)
+  lets calls run unmetered, logging `solwyn.api_key_refused` at error on
+  every call. Every other refusal blocks, and at startup every refusal blocks.
+  A 401 always blocks first; the SDK re-checks the key at once (not on the
+  60-second retry schedule), and only that fresh answer can relax the block,
+  so the call that met the 401 pays one extra round trip.
+- **A refusal also stops a call already past its budget check.** Every
+  provider request the SDK sends (the first attempt, each failover hop, each
+  same-provider retry, streaming or not, and media calls) checks for a
+  refusal first, gives back the call's funding and raises
+  `ApiKeyRefusedError`. A 401 whose body never arrives still counts as a
+  refusal, never as an outage.
+- **Unmetered provider methods honour refusals.** Methods Solwyn does not
+  meter (for example OpenAI `batches.create`), whether allowed by
+  `on_unmetered` or acknowledged with `acknowledge_untracked`, raise
+  `ApiKeyRefusedError` while the key is refused, including through a
+  reference taken before the refusal. So do the calls the SDK hands straight
+  to the provider: `audio.speech.create` with an untracked TTS model, and
+  `converse`, `converse_stream`, `invoke_model`,
+  `invoke_model_with_response_stream` and `start_async_invoke` on clients that
+  are not Bedrock. A call that sends its request later (an async method's
+  coroutine, an async page iterator, a `with_streaming_response` manager, or
+  a new `responses.stream(...)` manager) checks again when it is awaited or
+  entered, and so does a handle that sends later: clients derived with
+  `with_options()` or `copy()`, a Google chat or live session, an OpenAI
+  realtime connection (also when opened with the manager's `enter()`), OpenAI
+  and Anthropic stream helpers, and pages that fetch their next page
+  (including a page obtained by awaiting, a page parsed from a
+  `with_raw_response` or `with_streaming_response` result, and every page
+  `iter_pages()` fetches). A derived client is still a context manager
+  (`with client.with_options(...) as derived:`). Unmetered methods run the
+  same key re-check as metered calls: right after a 401, 5 seconds after
+  Solwyn could not be reached, and 60 seconds after a refused re-check. So an
+  alert-only project whose only traffic is unmetered still relaxes to
+  unmetered running after a 401, instead of staying blocked.
+- **What a refusal stops.** A refusal stops every provider call admitted after
+  it is recorded. A call that had already passed Solwyn's checks may still
+  complete, even if the provider SDK's own async preparation or queueing sends
+  it slightly later.
+- **A 401 is never forgotten.** The SDK records the refusal as soon as the
+  401 status arrives; if its body then times out, is cancelled or is
+  interrupted, the call is still blocked.
+- `validate()` returns `None` whenever Solwyn could not be reached, even if an
+  earlier validation succeeded.
+- **Budget authority follows the project.** If validation pins a different
+  project than the one earlier calls reached (for example after an outage and
+  a rename), held leases and cached allows from before are dropped, and a
+  lease or allow answered after such a change is never kept.
+- **A refused client stays quiet.** While the key or project is refused, the
+  SDK sends Solwyn nothing but the key re-check: no budget checks, lease
+  requests or uploads. Queued confirms and metadata are dropped and counted
+  as `api_key_refused`, and the configuration error is logged once per code.
+  A client running unmetered on an alert-only project therefore stays
+  unmetered; it is re-blocked only by a late 401 to a request it sent before
+  the refusal, and that block lasts one key re-check. When a re-check
+  succeeds, normal traffic resumes. A re-check that cannot reach Solwyn is
+  retried after 5 seconds (one at a time); one that is refused waits 60. A
+  401 that arrives while a re-check is in flight makes that re-check's answer
+  stale: it can neither lift nor loosen the block, and a fresh re-check runs
+  right after it.
+- Breaker reports start once the project id is pinned by validation; a budget
+  check response no longer sets it.
 
 ## [0.10.2] - 2026-11-03
 

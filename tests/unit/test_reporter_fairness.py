@@ -11,6 +11,7 @@ from uuid import UUID
 
 import httpx
 import pytest
+from conftest import validated_binding
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent
@@ -47,7 +48,7 @@ def _pair(index: int) -> tuple[BudgetConfirmRequest, MetadataEvent]:
 def _reporter(mode: str, handler, **kwargs):
     options = dict(
         api_url="https://offline.invalid",
-        api_key="synthetic-unused",
+        binding=validated_binding(),
         transport=httpx.MockTransport(handler),
         flush_interval=3600,
         breaker_reporting_enabled=False,

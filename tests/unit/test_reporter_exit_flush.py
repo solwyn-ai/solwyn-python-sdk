@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import VALID_API_KEY, call_uuid
+from conftest import VALID_API_KEY, call_uuid, validated_binding
 
 import solwyn._lifecycle as lifecycle
 from solwyn._lifecycle import (
@@ -143,6 +143,7 @@ _CHILD = """
 from datetime import UTC, datetime
 
 import solwyn.reporter as r
+from solwyn._project import ProjectBinding
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest, MetadataEvent, ProviderName
 
@@ -165,7 +166,8 @@ event = MetadataEvent(
     timestamp=datetime.now(UTC),
     call_id="{call_id}",
 )
-rep = r.MetadataReporter("http://127.0.0.1:{port}", "sk_test_key", flush_interval=60.0)
+binding = ProjectBinding("sk_test_key", "p")
+rep = r.MetadataReporter("http://127.0.0.1:{port}", binding, flush_interval=60.0)
 rep.report_settlement(confirm, event)
 # NO close(): a normal interpreter exit must flush via the atexit hook.
 """
@@ -275,7 +277,7 @@ def test_async_finalizer_flushes_queued_confirm_on_gc(monkeypatch: pytest.Monkey
     sink: list[str] = []
     monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
 
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     # No running loop -> the confirm stays queued (never started).
     reporter.report_confirm(_make_confirm_request())
     assert len(reporter._confirm_queue) == 1
@@ -295,7 +297,9 @@ def test_async_finalizer_flushes_due_untracked_observation_on_gc(
     sink: list[str] = []
     monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
 
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, sdk_instance_id="gc-instance")
+    reporter = AsyncMetadataReporter(
+        _URL, validated_binding(VALID_API_KEY), sdk_instance_id="gc-instance"
+    )
     _observe_untracked(reporter)
 
     del reporter
@@ -313,7 +317,7 @@ def test_async_finalizer_has_no_untracked_delivery_state_when_reporting_disabled
 
     reporter = AsyncMetadataReporter(
         _URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         sdk_instance_id="gc-disabled-instance",
         report_untracked_surfaces=False,
     )
@@ -332,7 +336,9 @@ def test_blocking_exit_flush_initiates_due_untracked_cycle_without_spend_drops(
 ) -> None:
     sink: list[str] = []
     monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, sdk_instance_id="exit-instance")
+    reporter = AsyncMetadataReporter(
+        _URL, validated_binding(VALID_API_KEY), sdk_instance_id="exit-instance"
+    )
     _observe_untracked(reporter)
 
     blocking_exit_flush(reporter)
@@ -388,7 +394,9 @@ def test_failing_exit_advisory_post_is_silent_and_cadence_throttled(
         raise httpx.ConnectError("down")
 
     monkeypatch.setattr(httpx, "Client", _make_recording_client(sink, down))
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, sdk_instance_id="exit-failure")
+    reporter = AsyncMetadataReporter(
+        _URL, validated_binding(VALID_API_KEY), sdk_instance_id="exit-failure"
+    )
     _observe_untracked(reporter)
     state = reporter._untracked_state
     assert state is not None
@@ -418,7 +426,7 @@ def test_blocking_exit_flush_skips_untracked_delivery_when_reporting_disabled(
     monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
     reporter = AsyncMetadataReporter(
         _URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         sdk_instance_id="exit-disabled-instance",
         report_untracked_surfaces=False,
     )
@@ -439,7 +447,7 @@ def test_finalizer_is_gc_only_never_exit() -> None:
     it would drain still-LIVE reporters with logger-only accounting while
     their dropped_counts is fully observable. The finalizer must be GC-only;
     _exit_flush_all is the sole live-reporter exit owner."""
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     assert reporter._finalizer is not None
     assert reporter._finalizer.atexit is False
     reporter._finalizer.detach()
@@ -459,7 +467,7 @@ def test_gc_finalizer_losses_are_logged(
         raise httpx.ConnectError("down")
 
     monkeypatch.setattr(httpx, "Client", _make_recording_client(sink, _down))
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter.report_confirm(_make_confirm_request())
 
     with caplog.at_level("WARNING", logger="solwyn._lifecycle"):
@@ -480,7 +488,7 @@ def test_gc_finalizer_failed_aggregate_logs_underlying_receipt_count(
         raise httpx.ConnectError("down")
 
     monkeypatch.setattr(httpx, "Client", _make_recording_client([], _down))
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter._fold_or_count_event_drop(
         _make_event(
             status="budget_denied",
@@ -527,7 +535,7 @@ def test_gc_finalizer_full_legacy_rejection_logs_aggregate_cardinality(
     monkeypatch.setattr(
         httpx, "Client", _make_recording_client([], lambda _url: _LegacyRejectResponse())
     )
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter.report(
         _make_event(
             status="budget_denied",
@@ -576,7 +584,7 @@ def test_gc_finalizer_exact_index_rejection_disposes_only_the_named_event(
     monkeypatch.setattr(
         httpx, "Client", _make_recording_client([], lambda _url: _ExactRejectResponse())
     )
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter.report(_make_event(call_id=call_uuid("gc-exact-accepted")))
     reporter.report(
         _make_event(
@@ -640,7 +648,7 @@ def test_both_ingest_rejection_parsers_reach_the_same_disposition(
     response.json.return_value = {"ingested": 0, "rejected": rejected}
     reporter = MetadataReporter(
         _URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         flush_interval=60.0,
         breaker_reporting_enabled=False,
         report_untracked_surfaces=False,
@@ -659,7 +667,7 @@ def test_both_ingest_rejection_parsers_reach_the_same_disposition(
 
 @pytest.mark.unit
 def test_gc_drop_logging_exceptions_do_not_abort_remaining_exit_dispositions() -> None:
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter.report_confirm(_make_confirm_request())
     reporter.report(_make_event())
 
@@ -669,7 +677,7 @@ def test_gc_drop_logging_exceptions_do_not_abort_remaining_exit_dispositions() -
             reporter._settlement_queue,
             reporter._queue,
             reporter.api_url,
-            reporter.api_key,
+            reporter._binding,
             reporter._control_plane_breaker,
             0.0,
             _gc_drop_counter,
@@ -698,7 +706,9 @@ def test_exit_flush_skips_when_breaker_open(
         failure_threshold=1, recovery_timeout=1e9, success_threshold=1, name="control-plane"
     )
     breaker.record_failure()  # OPEN, not recovery-eligible
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, control_plane_breaker=breaker)
+    reporter = AsyncMetadataReporter(
+        _URL, validated_binding(VALID_API_KEY), control_plane_breaker=breaker
+    )
     reporter.report_confirm(_make_confirm_request())
 
     with caplog.at_level("ERROR"):
@@ -716,7 +726,7 @@ def test_exit_flush_skips_when_breaker_open(
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_close_detaches_finalizer() -> None:
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY), flush_interval=3600.0)
     reporter.start()
     assert reporter._finalizer is not None
     assert reporter._finalizer.alive
@@ -742,7 +752,7 @@ async def test_cancelled_close_keeps_exit_rescue_armed(
     """P1 review pin: a close() cancelled mid-flush must NOT disarm the atexit
     hook or the GC finalizer — they are the last delivery path for whatever
     the cancelled close left queued."""
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, flush_interval=3600.0)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY), flush_interval=3600.0)
     reporter.start()
     reporter.report_confirm(_make_confirm_request(call_id=call_uuid("in_hand")))
     reporter.report_confirm(_make_confirm_request(call_id=call_uuid("queued_behind")))
@@ -799,7 +809,9 @@ def test_exit_flush_breaker_open_still_ships_events(
         failure_threshold=1, recovery_timeout=1e9, success_threshold=1, name="control-plane"
     )
     breaker.record_failure()  # OPEN, not recovery-eligible
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, control_plane_breaker=breaker)
+    reporter = AsyncMetadataReporter(
+        _URL, validated_binding(VALID_API_KEY), control_plane_breaker=breaker
+    )
     reporter.report_confirm(_make_confirm_request())
     reporter.report_settlement(_make_confirm_request(), _make_event(call_id=call_uuid("pair")))
     reporter.report(_make_event(call_id=call_uuid("standalone")))
@@ -828,7 +840,7 @@ def test_exit_flush_counts_failed_posts(monkeypatch: pytest.MonkeyPatch) -> None
         raise httpx.ConnectError("down")
 
     monkeypatch.setattr(httpx, "Client", _make_recording_client(sink, _down))
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter.report_confirm(_make_confirm_request())
     reporter.report_settlement(_make_confirm_request(), _make_event())
     reporter.report(_make_event())
@@ -853,7 +865,7 @@ def test_exit_flush_counts_terminal_status_posts(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(
         httpx, "Client", _make_recording_client(sink, lambda _url: _terminal_response(400))
     )
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter.report_confirm(_make_confirm_request())
     reporter.report(_make_event())
 
@@ -883,7 +895,7 @@ def test_exit_flush_counts_202_rejections(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(
         httpx, "Client", _make_recording_client(sink, lambda _url: _PartialRejectResponse())
     )
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter.report_settlement(_make_confirm_request(), _make_event(call_id=call_uuid("pair")))
     reporter.report(_make_event(call_id=call_uuid("standalone")))
 
@@ -922,7 +934,7 @@ def test_exit_flush_counts_legacy_indexless_rejections_without_guessing_identity
     monkeypatch.setattr(
         httpx, "Client", _make_recording_client(sink, lambda _url: _LegacyRejectResponse())
     )
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     denied = _make_event(
         call_id=call_uuid("legacy-pair-denied"),
         status="budget_denied",
@@ -969,7 +981,7 @@ def test_exit_flush_full_legacy_rejection_counts_aggregate_cardinality(
     monkeypatch.setattr(
         httpx, "Client", _make_recording_client([], lambda _url: _LegacyRejectResponse())
     )
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter.report(
         _make_event(
             status="budget_denied",
@@ -1014,7 +1026,7 @@ def test_exit_flush_partial_legacy_rejection_charges_the_heaviest_receipt_weight
     monkeypatch.setattr(
         httpx, "Client", _make_recording_client([], lambda _url: _LegacyRejectResponse())
     )
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter.report(
         _make_event(
             call_id=call_uuid("exit-partial-aggregate"),
@@ -1055,7 +1067,7 @@ def test_exit_flush_non_integer_rejection_index_degrades_to_legacy_count_only(
     monkeypatch.setattr(
         httpx, "Client", _make_recording_client([], lambda _url: _MalformedIndexResponse())
     )
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter.report(
         _make_event(
             call_id=call_uuid("exit-malformed-denied"),
@@ -1087,7 +1099,7 @@ def test_exit_flush_refuses_reentrant_async_report_after_final_sweep(
     monkeypatch.setattr(
         httpx, "Client", _make_recording_client([], lambda _url: _terminal_response(400))
     )
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter.report(_make_event(call_id=call_uuid("exit-before-reentrant")))
     reentrant = _make_event(call_id=call_uuid("exit-reentrant"))
     reentered = threading.Event()
@@ -1125,7 +1137,7 @@ def test_exit_flush_waits_for_sync_seal_dispositions_before_skipping(
     """The enqueue gate is not a completion marker until seal publishes loss."""
     reporter = MetadataReporter(
         _URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         flush_interval=60.0,
         shutdown_deadline=0.5,
         breaker_reporting_enabled=False,
@@ -1196,7 +1208,7 @@ def test_worker_reentrant_close_finalizes_before_last_sync_reporter_reference_dr
     """A weak registry cannot rescue spend after the worker releases its last ref."""
     reporter = MetadataReporter(
         _URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         batch_size=1,
         flush_interval=0.01,
         max_send_attempts=5,
@@ -1322,7 +1334,7 @@ def test_reentrant_close_from_final_flush_worker_sends_instead_of_sealing() -> N
     and keeps draining."""
     reporter = MetadataReporter(
         _URL,
-        VALID_API_KEY,
+        validated_binding(VALID_API_KEY),
         batch_size=10,
         flush_interval=60.0,
         max_send_attempts=1,
@@ -1395,7 +1407,7 @@ def test_exit_flush_partial_deadline_counts_unsent_remainder(
         return _RecordingResponse()
 
     monkeypatch.setattr(httpx, "Client", _make_recording_client(sink, _consume_budget))
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, shutdown_deadline=5.0)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY), shutdown_deadline=5.0)
     reporter.report_confirm(_make_confirm_request(call_id=call_uuid("sent")))
     reporter.report_confirm(_make_confirm_request(call_id=call_uuid("expired")))
 
@@ -1422,7 +1434,9 @@ def test_exit_flush_open_breaker_gets_single_recovery_probe(
 
     monkeypatch.setattr(httpx, "Client", _make_recording_client(sink, _down))
     breaker = _eligible_open_breaker()
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, control_plane_breaker=breaker)
+    reporter = AsyncMetadataReporter(
+        _URL, validated_binding(VALID_API_KEY), control_plane_breaker=breaker
+    )
     for i in range(3):
         reporter.report_confirm(_make_confirm_request(call_id=call_uuid(f"c{i}")))
     reporter.report_settlement(_make_confirm_request(), _make_event())
@@ -1447,7 +1461,9 @@ def test_exit_flush_recovered_breaker_drains_backlog(monkeypatch: pytest.MonkeyP
     sink: list[str] = []
     monkeypatch.setattr(httpx, "Client", _make_recording_client(sink))
     breaker = _eligible_open_breaker()
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY, control_plane_breaker=breaker)
+    reporter = AsyncMetadataReporter(
+        _URL, validated_binding(VALID_API_KEY), control_plane_breaker=breaker
+    )
     for i in range(3):
         reporter.report_confirm(_make_confirm_request(call_id=call_uuid(f"c{i}")))
 
@@ -1473,7 +1489,7 @@ def test_exit_drain_publishes_disposition_before_returning(
     monkeypatch.setattr(
         httpx, "Client", _make_recording_client(sink, lambda _url: _terminal_response(400))
     )
-    reporter = AsyncMetadataReporter(_URL, VALID_API_KEY)
+    reporter = AsyncMetadataReporter(_URL, validated_binding(VALID_API_KEY))
     reporter.report(_make_event())
 
     gate = threading.Event()
@@ -1493,7 +1509,7 @@ def test_exit_drain_publishes_disposition_before_returning(
             reporter._settlement_queue,
             reporter._queue,
             reporter.api_url,
-            reporter.api_key,
+            reporter._binding,
             reporter._control_plane_breaker,
             0.15,  # join deadline expires while the publication is gated
             gated_counter,
@@ -1566,7 +1582,9 @@ def test_exit_flush_bounded_despite_slow_drip_post() -> None:
     server = _SlowDripServer()
     try:
         reporter = AsyncMetadataReporter(
-            f"http://127.0.0.1:{server.port}", VALID_API_KEY, shutdown_deadline=0.3
+            f"http://127.0.0.1:{server.port}",
+            validated_binding(VALID_API_KEY),
+            shutdown_deadline=0.3,
         )
         reporter.report(_make_event())
 

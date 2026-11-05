@@ -88,7 +88,7 @@ def _post_check(credentials: Credentials, payload: dict[str, object]) -> dict[st
         r = http.post(
             "/api/v1/budgets/check",
             json=payload,
-            headers={"Authorization": f"Bearer {credentials.api_key}"},
+            headers=credentials.key_headers(),
         )
         r.raise_for_status()
         data = r.json()
@@ -109,7 +109,7 @@ def _confirm_reservation(credentials: Credentials, reservation_id: str) -> None:
                 "call_id": str(uuid.uuid4()),
                 "token_details": {"input_tokens": 1000, "output_tokens": 2000},
             },
-            headers={"Authorization": f"Bearer {credentials.api_key}"},
+            headers=credentials.key_headers(),
         )
         r.raise_for_status()
 
@@ -138,7 +138,7 @@ def test_metadata_ingest_accepts_parent_agent_run_id(
         response = http.post(
             "/api/v1/metadata/ingest",
             json=[event.model_dump(mode="json")],
-            headers={"Authorization": f"Bearer {test_credentials.api_key}"},
+            headers=test_credentials.key_headers(),
         )
 
     response.raise_for_status()
@@ -182,7 +182,7 @@ def test_local_metadata_ingest_accepts_complete_denial_receipt(api_url: str) -> 
         response = http.post(
             "/api/v1/metadata/ingest",
             json=[event.model_dump(mode="json")],
-            headers={"Authorization": f"Bearer {credentials.api_key}"},
+            headers=credentials.key_headers(),
         )
 
     response.raise_for_status()
@@ -237,7 +237,7 @@ def run_capped_credentials(api_url: str) -> Credentials:
         )
         if r.status_code != 200:
             pytest.fail(f"runaway_run budget rule PUT failed: {r.status_code} {r.text}")
-    return Credentials(api_url=api_url, api_key=key)
+    return Credentials(api_url=api_url, api_key=key, project=project_id)
 
 
 @pytest.fixture(scope="session")
@@ -283,7 +283,7 @@ def tag_capped_credentials(api_url: str) -> Credentials:
         )
         if r.status_code != 200:
             pytest.fail(f"tag-scoped budget rule PUT failed: {r.status_code} {r.text}")
-    return Credentials(api_url=api_url, api_key=key)
+    return Credentials(api_url=api_url, api_key=key, project=project_id)
 
 
 @dataclass(frozen=True)
@@ -329,7 +329,7 @@ def stoppable_run(api_url: str) -> StoppableRun:
         project_response.raise_for_status()
         project = project_response.json()
         project_id = project["id"]
-        credentials = Credentials(api_url=api_url, api_key=project["key"])
+        credentials = Credentials(api_url=api_url, api_key=project["key"], project=project["id"])
         event = MetadataEvent(
             model="gpt-5.5",
             provider=ProviderName.OPENAI,
@@ -347,7 +347,7 @@ def stoppable_run(api_url: str) -> StoppableRun:
         ingest = http.post(
             "/api/v1/metadata/ingest",
             json=[event.model_dump(mode="json")],
-            headers={"Authorization": f"Bearer {credentials.api_key}"},
+            headers=credentials.key_headers(),
         )
         ingest.raise_for_status()
         runs_response = http.get(
@@ -541,7 +541,7 @@ LEASE_BLOCK_KEYS = (
 
 
 def _lease_headers(credentials: Credentials) -> dict[str, str]:
-    return {"Authorization": f"Bearer {credentials.api_key}"}
+    return credentials.key_headers()
 
 
 def _post_lease(credentials: Credentials, path: str, payload: dict[str, object]) -> httpx.Response:

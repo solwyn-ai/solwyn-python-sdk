@@ -10,7 +10,8 @@ Usage::
 
     client = Solwyn(
         OpenAI(),
-        api_key="sk_proj_...",
+        api_key="solwyn_sk_...",
+        project="checkout-bot",
     )
     response = client.chat.completions.create(
         model="gpt-5.5",
@@ -76,6 +77,7 @@ from solwyn._privacy import (
     prepare_legacy_google_metering_kwargs,
     prepare_legacy_google_translation_source_kwargs,
 )
+from solwyn._project import ProjectBinding
 from solwyn._proxies import (
     _AsyncAnthropicBetaProxy,
     _AsyncAudioProxy,
@@ -114,6 +116,7 @@ from solwyn._run_control import (
 from solwyn._surfaces import SurfaceSource
 from solwyn._token_details import TokenDetails
 from solwyn._types import (
+    AuthKeyResponse,
     BudgetConfirmRequest,
     CallStatus,
     DenySource,
@@ -2030,6 +2033,45 @@ def _failover_hop_bound(
     )
 
 
+def _raise_if_dispatch_refused(client: Solwyn | AsyncSolwyn) -> None:
+    """Raise the stored blocking refusal, if any (deferred-dispatch entry guard)."""
+    refusal = client._solwyn_budget.dispatch_refusal()
+    if refusal is not None:
+        raise refusal.error()
+
+
+def _refuse_dispatch_if_key_refused(
+    client: Solwyn | AsyncSolwyn,
+    *,
+    budget: BudgetCheckResult,
+    admitted: tuple[str, str],
+    primary: ProviderRuntime,
+    spend_unknown: bool,
+    call_id: str,
+) -> None:
+    """Binding guard before every physical provider dispatch.
+
+    The project gate runs once per admission, but a refusal can be recorded
+    while a call is already past it (by another call, a background send, or
+    this call's own failover re-check). Every attempt (the first hop, each
+    failover hop, each same-provider retry, buffered or streaming, chat,
+    Responses or media) checks the binding first, whatever funds it. A
+    blocking refusal gives the funding back (local lease claim released, a
+    per-call hold settled at zero) and raises before any provider I/O.
+    """
+    refusal = client._solwyn_budget.dispatch_refusal()
+    if refusal is None:
+        return
+    client._solwyn_budget.release_reservation(call_id, lease_claim_token=_lease_claim_token(budget))
+    close_out = _zero_usage_close_out(
+        client, budget, admitted, primary=primary, spend_unknown=spend_unknown
+    )
+    if close_out is not None:
+        client._solwyn_reporter.report_confirm(close_out)
+        client._solwyn_reporter.request_flush()
+    raise refusal.error()
+
+
 def _zero_usage_close_out(
     client: Solwyn | AsyncSolwyn,
     budget: BudgetCheckResult,
@@ -2102,7 +2144,8 @@ class Solwyn(_SolwynBase):
 
         client = Solwyn(
             OpenAI(),
-            api_key="sk_proj_...",
+            api_key="solwyn_sk_...",
+            project="checkout-bot",
         )
         response = client.chat.completions.create(
             model="gpt-5.5",
@@ -2126,6 +2169,7 @@ class Solwyn(_SolwynBase):
         client: object,
         *,
         api_key: str | None = None,
+        project: str | None = None,
         model: str | None = None,
         provider: str | None = None,
         fallback: object = None,
@@ -2143,9 +2187,6 @@ class Solwyn(_SolwynBase):
         # public surface (chat/messages/models). A unified Protocol would not
         # match all three. Type safety stops at the _sync_dispatch boundary.
         self._solwyn_client: Any = client
-
-        if "project_id" in config_kwargs:
-            raise TypeError("unexpected keyword argument 'project_id'")
 
         # Build the [primary, *fallbacks] runtime chain. All chain clients are
         # constructed up front so the first failover is pure dispatch.
@@ -2172,6 +2213,8 @@ class Solwyn(_SolwynBase):
         }
         if api_key is not None:
             cfg_kwargs["api_key"] = api_key
+        if project is not None:
+            cfg_kwargs["project"] = project
         if on_unmetered is not None:
             cfg_kwargs["on_unmetered"] = on_unmetered
         if acknowledge_untracked is not None:
@@ -2187,9 +2230,14 @@ class Solwyn(_SolwynBase):
         super().__init__(config, runtimes, selection_policy=selection_policy, mode="sync")
 
         # Budget enforcer
+        # One project binding per client, shared by the enforcer, the reporter
+        # and the exit drain: the Solwyn-Project header, validation state and
+        # refusal fence (spec section 6.2).
+        self._solwyn_binding = ProjectBinding(config.api_key, config.project)
         self._solwyn_budget = BudgetEnforcer(
             api_url=config.api_url,
-            api_key=config.api_key,
+            binding=self._solwyn_binding,
+            validation_timeout=config.budget_check_timeout,
             budget_mode=config.budget_mode,
             fail_open=config.fail_open,
             cache_ttl=config.budget_check_cache_ttl,
@@ -2207,7 +2255,7 @@ class Solwyn(_SolwynBase):
         # Metadata reporter
         self._solwyn_reporter = MetadataReporter(
             config.api_url,
-            config.api_key,
+            self._solwyn_binding,
             batch_size=config.reporter_batch_size,
             flush_interval=config.reporter_flush_interval,
             max_queue_size=config.reporter_max_queue_size,
@@ -2420,6 +2468,7 @@ class Solwyn(_SolwynBase):
         self._enforce_explicit_surface("converse", source=SurfaceSource.WRAPPER)
         if self._solwyn_dialect == "bedrock":
             return self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
+        self._enforce_key_refusal("converse")
         return self._solwyn_client.converse(**kwargs)
 
     def converse_stream(self, **kwargs: Any) -> Any:
@@ -2427,6 +2476,7 @@ class Solwyn(_SolwynBase):
         self._enforce_explicit_surface("converse_stream", source=SurfaceSource.WRAPPER)
         if self._solwyn_dialect == "bedrock":
             return self._intercepted_call(_force_stream=True, **_bedrock_internal_kwargs(kwargs))
+        self._enforce_key_refusal("converse_stream")
         return self._solwyn_client.converse_stream(**kwargs)
 
     def invoke_model(self, **kwargs: Any) -> Any:
@@ -2438,6 +2488,7 @@ class Solwyn(_SolwynBase):
         )
         if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        self._enforce_key_refusal("invoke_model")
         return self._solwyn_client.invoke_model(**kwargs)
 
     def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
@@ -2449,6 +2500,7 @@ class Solwyn(_SolwynBase):
         )
         if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        self._enforce_key_refusal("invoke_model_with_response_stream")
         return self._solwyn_client.invoke_model_with_response_stream(**kwargs)
 
     def start_async_invoke(self, **kwargs: Any) -> Any:
@@ -2460,6 +2512,7 @@ class Solwyn(_SolwynBase):
         )
         if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
+        self._enforce_key_refusal("start_async_invoke")
         return self._solwyn_client.start_async_invoke(**kwargs)
 
     def _readmit_failover_hop(
@@ -2773,7 +2826,6 @@ class Solwyn(_SolwynBase):
             getattr(budget, "failover_tuning_allowed", None)
         )
         deadline.replace_total(tuning.failover_total_timeout)
-        self._solwyn_reporter.observe_project_id(budget.project_id)
 
         if not budget.allowed:
             _report_budget_denial(
@@ -2844,6 +2896,15 @@ class Solwyn(_SolwynBase):
         def mark_dispatched() -> None:
             nonlocal dispatched
             dispatched = True
+
+        _refuse_dispatch_if_key_refused(
+            self,
+            budget=budget,
+            admitted=(provider, requested_model),
+            primary=runtime,
+            spend_unknown=False,
+            call_id=call_id,
+        )
 
         try:
             extra_client_options = self._extra_client_options(runtime, run_id=agent_run[0])
@@ -3192,7 +3253,6 @@ class Solwyn(_SolwynBase):
             getattr(budget, "failover_tuning_allowed", None)
         )
         deadline.replace_total(tuning.failover_total_timeout)
-        self._solwyn_reporter.observe_project_id(budget.project_id)
 
         if not budget.allowed:
             # Report estimated tokens so the API keeps an accurate running total
@@ -3441,6 +3501,14 @@ class Solwyn(_SolwynBase):
                 same_retries_left = tuning.same_provider_retries
                 advanced = False
                 while True:
+                    _refuse_dispatch_if_key_refused(
+                        self,
+                        budget=budget,
+                        admitted=admitted_identity,
+                        primary=primary,
+                        spend_unknown=admitted_spend_unknown,
+                        call_id=call_id,
+                    )
                     ctx = _AttemptContext(
                         model=served_model,
                         start_time=time.monotonic(),
@@ -3765,6 +3833,7 @@ class Solwyn(_SolwynBase):
                                 provider_failure=False,
                             ),
                             on_entry_error=on_entry_error,
+                            entry_guard=functools.partial(_raise_if_dispatch_refused, self),
                             on_abandoned_before_entry=_make_reservation_release_handler(
                                 self, budget, call_id=call_id, breaker=cb, admission=admission
                             ),
@@ -4199,6 +4268,23 @@ class Solwyn(_SolwynBase):
                 termination_handle.release()
             raise
 
+    def validate(self) -> AuthKeyResponse | None:
+        """Check the API key and project with Solwyn now.
+
+        Calls ``GET /api/v1/auth/key`` once. On success the project's ``proj_``
+        id is pinned (every later request names the project by id, so a rename
+        in the dashboard does not break this client) and the key's details are
+        returned. Every refusal raises :class:`solwyn.ApiKeyRefusedError` (a
+        :class:`solwyn.ConfigurationError`): an expired, revoked, unrecognised
+        or read-only key, or a project the key does not reach. Returns None
+        when Solwyn could not be reached; nothing changes and calls keep
+        following ``fail_open``.
+
+        Optional: without it the SDK validates lazily before the first call
+        that needs Solwyn. Call it at startup to fail fast on a bad key.
+        """
+        return self._solwyn_budget.validate()
+
     def close(self) -> None:
         """Shut down Solwyn state, then close the wrapped provider client."""
         # Streams still open settle first, as early closes, so their receipts
@@ -4293,7 +4379,8 @@ class AsyncSolwyn(_SolwynBase):
 
         async with AsyncSolwyn(
             AsyncOpenAI(),
-            api_key="sk_proj_...",
+            api_key="solwyn_sk_...",
+            project="checkout-bot",
         ) as client:
             response = await client.chat.completions.create(
                 model="gpt-5.5",
@@ -4319,6 +4406,7 @@ class AsyncSolwyn(_SolwynBase):
         client: object,
         *,
         api_key: str | None = None,
+        project: str | None = None,
         model: str | None = None,
         provider: str | None = None,
         fallback: object = None,
@@ -4334,9 +4422,6 @@ class AsyncSolwyn(_SolwynBase):
 
         # See sync Solwyn.__init__ for why _solwyn_client is typed Any.
         self._solwyn_client: Any = client
-
-        if "project_id" in config_kwargs:
-            raise TypeError("unexpected keyword argument 'project_id'")
 
         # Build the [primary, *fallbacks] runtime chain (constructed up front).
         # ``provider`` pins the primary identity and bypasses auto-detection.
@@ -4359,6 +4444,8 @@ class AsyncSolwyn(_SolwynBase):
         }
         if api_key is not None:
             cfg_kwargs["api_key"] = api_key
+        if project is not None:
+            cfg_kwargs["project"] = project
         if on_unmetered is not None:
             cfg_kwargs["on_unmetered"] = on_unmetered
         if acknowledge_untracked is not None:
@@ -4373,9 +4460,14 @@ class AsyncSolwyn(_SolwynBase):
             ) from exc
         super().__init__(config, runtimes, selection_policy=selection_policy, mode="async")
 
+        # One project binding per client, shared by the enforcer, the reporter
+        # and the exit drain: the Solwyn-Project header, validation state and
+        # refusal fence (spec section 6.2).
+        self._solwyn_binding = ProjectBinding(config.api_key, config.project)
         self._solwyn_budget = AsyncBudgetEnforcer(
             api_url=config.api_url,
-            api_key=config.api_key,
+            binding=self._solwyn_binding,
+            validation_timeout=config.budget_check_timeout,
             budget_mode=config.budget_mode,
             fail_open=config.fail_open,
             cache_ttl=config.budget_check_cache_ttl,
@@ -4391,7 +4483,7 @@ class AsyncSolwyn(_SolwynBase):
         self._solwyn_open_streams: weakref.WeakSet[_StreamSettlement] = weakref.WeakSet()
         self._solwyn_reporter = AsyncMetadataReporter(
             config.api_url,
-            config.api_key,
+            self._solwyn_binding,
             batch_size=config.reporter_batch_size,
             flush_interval=config.reporter_flush_interval,
             max_queue_size=config.reporter_max_queue_size,
@@ -4565,6 +4657,7 @@ class AsyncSolwyn(_SolwynBase):
         self._enforce_explicit_surface("converse", source=SurfaceSource.WRAPPER)
         if self._solwyn_dialect == "bedrock":
             return await self._intercepted_call(**_bedrock_internal_kwargs(kwargs))
+        await self._enforce_key_refusal_async("converse")
         return await self._solwyn_client.converse(**kwargs)
 
     async def converse_stream(self, **kwargs: Any) -> Any:
@@ -4574,6 +4667,7 @@ class AsyncSolwyn(_SolwynBase):
             return await self._intercepted_call(
                 _force_stream=True, **_bedrock_internal_kwargs(kwargs)
             )
+        await self._enforce_key_refusal_async("converse_stream")
         return await self._solwyn_client.converse_stream(**kwargs)
 
     async def invoke_model(self, **kwargs: Any) -> Any:
@@ -4585,6 +4679,7 @@ class AsyncSolwyn(_SolwynBase):
         )
         if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        await self._enforce_key_refusal_async("invoke_model")
         return await self._solwyn_client.invoke_model(**kwargs)
 
     async def invoke_model_with_response_stream(self, **kwargs: Any) -> Any:
@@ -4596,6 +4691,7 @@ class AsyncSolwyn(_SolwynBase):
         )
         if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_INVOKE_MODEL_GUIDANCE, field="invoke_model")
+        await self._enforce_key_refusal_async("invoke_model_with_response_stream")
         return await self._solwyn_client.invoke_model_with_response_stream(**kwargs)
 
     async def start_async_invoke(self, **kwargs: Any) -> Any:
@@ -4607,6 +4703,7 @@ class AsyncSolwyn(_SolwynBase):
         )
         if self._solwyn_dialect == "bedrock":
             raise ConfigurationError(_START_ASYNC_INVOKE_GUIDANCE, field="start_async_invoke")
+        await self._enforce_key_refusal_async("start_async_invoke")
         return await self._solwyn_client.start_async_invoke(**kwargs)
 
     async def _readmit_failover_hop(
@@ -4891,7 +4988,6 @@ class AsyncSolwyn(_SolwynBase):
             getattr(budget, "failover_tuning_allowed", None)
         )
         deadline.replace_total(tuning.failover_total_timeout)
-        self._solwyn_reporter.observe_project_id(budget.project_id)
 
         if not budget.allowed:
             _report_budget_denial(
@@ -4956,6 +5052,15 @@ class AsyncSolwyn(_SolwynBase):
         def mark_dispatched() -> None:
             nonlocal dispatched
             dispatched = True
+
+        _refuse_dispatch_if_key_refused(
+            self,
+            budget=budget,
+            admitted=(provider, requested_model),
+            primary=runtime,
+            spend_unknown=False,
+            call_id=call_id,
+        )
 
         try:
             extra_client_options = self._extra_client_options(runtime, run_id=agent_run[0])
@@ -5266,7 +5371,6 @@ class AsyncSolwyn(_SolwynBase):
             getattr(budget, "failover_tuning_allowed", None)
         )
         deadline.replace_total(tuning.failover_total_timeout)
-        self._solwyn_reporter.observe_project_id(budget.project_id)
 
         if not budget.allowed:
             # See the sync _intercepted_call: region rides the denied event.
@@ -5509,6 +5613,14 @@ class AsyncSolwyn(_SolwynBase):
                 same_retries_left = tuning.same_provider_retries
                 advanced = False
                 while True:
+                    _refuse_dispatch_if_key_refused(
+                        self,
+                        budget=budget,
+                        admitted=admitted_identity,
+                        primary=primary,
+                        spend_unknown=admitted_spend_unknown,
+                        call_id=call_id,
+                    )
                     ctx = _AttemptContext(
                         model=served_model,
                         start_time=time.monotonic(),
@@ -5825,6 +5937,7 @@ class AsyncSolwyn(_SolwynBase):
                                 provider_failure=False,
                             ),
                             on_entry_error=on_entry_error,
+                            entry_guard=functools.partial(_raise_if_dispatch_refused, self),
                             on_abandoned_before_entry=_make_async_reservation_release_handler(
                                 self, budget, call_id=call_id, breaker=cb, admission=admission
                             ),
@@ -6258,6 +6371,23 @@ class AsyncSolwyn(_SolwynBase):
             if termination_handle is not None:
                 termination_handle.release()
             raise
+
+    async def validate(self) -> AuthKeyResponse | None:
+        """Check the API key and project with Solwyn now (async twin of ``Solwyn.validate``).
+
+        Calls ``GET /api/v1/auth/key`` once. On success the project's ``proj_``
+        id is pinned (every later request names the project by id, so a rename
+        in the dashboard does not break this client) and the key's details are
+        returned. Every refusal raises :class:`solwyn.ApiKeyRefusedError` (a
+        :class:`solwyn.ConfigurationError`): an expired, revoked, unrecognised
+        or read-only key, or a project the key does not reach. Returns None
+        when Solwyn could not be reached; nothing changes and calls keep
+        following ``fail_open``.
+
+        Optional: without it the SDK validates lazily before the first call
+        that needs Solwyn. Call it at startup to fail fast on a bad key.
+        """
+        return await self._solwyn_budget.validate()
 
     async def close(self) -> None:
         """Shut down Solwyn state, then close the wrapped provider client."""

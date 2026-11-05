@@ -99,7 +99,7 @@ def test_run_handle_api_is_publicly_exported() -> None:
 
 @pytest.mark.unit
 def test_testing_package_exports_are_deliberately_pinned() -> None:
-    assert testing.__all__ == ["FakeControlPlane", "MAGIC_MODELS"]
+    assert testing.__all__ == ["FakeBudgetRule", "FakeControlPlane", "MAGIC_MODELS"]
     assert testing.FakeControlPlane is not None
     assert testing.MAGIC_MODELS
 
@@ -119,7 +119,7 @@ def import_without_pytest(name, globals=None, locals=None, fromlist=(), level=0)
 
 builtins.__import__ = import_without_pytest
 import solwyn.testing as testing
-assert testing.__all__ == ["FakeControlPlane", "MAGIC_MODELS"]
+assert testing.__all__ == ["FakeBudgetRule", "FakeControlPlane", "MAGIC_MODELS"]
 assert "solwyn.testing.pytest_plugin" not in sys.modules
 assert not any(name == "pytest" or name.startswith("pytest.") for name in sys.modules)
 """

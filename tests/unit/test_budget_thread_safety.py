@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from conftest import ALLOW_BUDGET_RESPONSE, call_uuid
+from conftest import ALLOW_BUDGET_RESPONSE, call_uuid, validated_binding
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest
@@ -24,7 +24,7 @@ def test_reporter_report_confirm_concurrent_appends() -> None:
     """report_confirm must be safe to call from many threads at once."""
     reporter = MetadataReporter(
         api_url="http://test",
-        api_key="sk_test",
+        binding=validated_binding("sk_test"),
     )
     try:
 
@@ -69,7 +69,7 @@ def test_budget_enforcer_uncounted_tally_concurrent() -> None:
     """
     enforcer = BudgetEnforcer(
         api_url="http://test",
-        api_key="sk_test",
+        binding=validated_binding("sk_test"),
     )
 
     THREADS = 8
@@ -128,7 +128,7 @@ def test_budget_enforcer_concurrent_checks_report_the_tally_once() -> None:
     """Concurrent successful checks never double-report or over-subtract."""
     enforcer = BudgetEnforcer(
         api_url="http://test",
-        api_key="sk_test",
+        binding=validated_binding("sk_test"),
         cache_ttl=0,
     )
     for _ in range(50):

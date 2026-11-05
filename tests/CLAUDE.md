@@ -47,6 +47,21 @@ a drifted directive or receipt field fails the double and the live API alike.
 Each lane still scripts its own server state: the double calls
 `plane.stop_run(...)`, the live lane POSTs the dashboard stop.
 
+## API key scoping in unit tests
+
+Unit tests build clients and enforcers that are not the project gate under
+test, often with no control-plane transport, so the autouse fixture in
+`tests/unit/conftest.py` switches off the gate's automatic
+`GET /api/v1/auth/key` (a binding stays `unvalidated` and sends the
+configured selector). Tests of the gate opt back in with
+`@pytest.mark.project_validation` (`test_api_key_errors.py`, the F1 to F18
+fixtures, and `test_project_binding.py`). Enforcers and reporters take a
+`ProjectBinding`: use `validated_binding()` (already validated, pinned to
+`VALID_PROJECT_ID`) or `plane_binding(plane)` for a `FakeControlPlane`. Raw
+`httpx` clients against the plane need `headers=plane.auth_headers()`.
+`SOLWYN_PROJECT` is set for every unit test; tests of the missing-project
+error delete it.
+
 ## Markers
 
 Every test must have a category marker. Marker order on methods:
@@ -57,7 +72,7 @@ Every test must have a category marker. Marker order on methods:
 @pytest.mark.parametrize(...)  # 3. parametrize
 ```
 
-Registered markers: `unit`, `integration`, `chaos`, `performance`, `stress`.
+Registered markers: `unit`, `integration`, `chaos`, `performance`, `stress`, `project_validation`.
 
 CI runs only `unit`. Integration is opt-in (PR label `run-integration` or `workflow_dispatch`).
 
@@ -71,7 +86,7 @@ make db-setup && make smoke-api-dev
 uv run pytest tests/ -m integration -v
 ```
 
-The integration conftest auto-creates a test user and project via the API. Set `SOLWYN_TEST_API_URL` (default `http://127.0.0.1:8080`), or `SOLWYN_TEST_API_KEY` + `SOLWYN_TEST_PROJECT_ID` to skip bootstrap. Direct `test_fake_provider.py` harness tests are the one exception: a targeted run has no control-plane dependency, so wire-shape coverage remains runnable while the API is offline.
+The integration conftest auto-creates a test user and project via the API. Set `SOLWYN_TEST_API_URL` (default `http://127.0.0.1:8080`), or `SOLWYN_TEST_API_KEY` + `SOLWYN_TEST_PROJECT` (a project name or `proj_` id) to skip bootstrap. Every live lane needs a core with API key scoping (WS-14b-1) deployed. Direct `test_fake_provider.py` harness tests are the one exception: a targeted run has no control-plane dependency, so wire-shape coverage remains runnable while the API is offline.
 
 Bootstrap needs the API's dev signup fast path. `make dev-api` with a Loops key configured runs verify-first signup (OTP emailed, stored hashed) — the suite then skips with guidance rather than failing. Use `make smoke-api-dev`, or provide `SOLWYN_TEST_API_KEY` (happy-path tests only; the hard-deny fixture always bootstraps its own project).
 

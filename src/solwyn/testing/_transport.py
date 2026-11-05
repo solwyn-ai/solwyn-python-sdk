@@ -19,6 +19,7 @@ class _Plane(Protocol):
         path: str,
         body: object,
         parse_error: PlaneResponse | None,
+        headers: httpx.Headers,
     ) -> PreparedPlaneRequest: ...
 
 
@@ -56,10 +57,18 @@ class FakeControlPlaneTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
             request.url.path,
             body,
             parse_error,
+            request.headers,
         )
 
     @staticmethod
     def _response(request: httpx.Request, result: PlaneResponse) -> httpx.Response:
+        if result.content is not None:
+            return httpx.Response(
+                result.status_code,
+                request=request,
+                headers=result.headers,
+                content=result.content,
+            )
         serialized = serialize_response(result)
         if serialized is None:
             return httpx.Response(

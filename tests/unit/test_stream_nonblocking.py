@@ -6,7 +6,7 @@ import ast
 from pathlib import Path
 
 import pytest
-from conftest import call_uuid
+from conftest import call_uuid, validated_binding
 
 from solwyn._token_details import TokenDetails
 from solwyn._types import BudgetConfirmRequest
@@ -87,7 +87,7 @@ def test_build_confirm_request_returns_pydantic_model() -> None:
     """build_confirm_request must return a BudgetConfirmRequest, not a dict."""
     enforcer = BudgetEnforcer(
         api_url="http://localhost:8000",
-        api_key="sk_test",
+        binding=validated_binding("sk_test"),
     )
     token_details = TokenDetails(
         input_tokens=10,
@@ -116,7 +116,7 @@ def test_build_confirm_request_narrows_service_tier_to_wire_literals() -> None:
     and stranding the reservation. The raw echo still reaches the API on the
     MetadataEvent, which is a bounded str.
     """
-    enforcer = BudgetEnforcer(api_url="http://localhost:8000", api_key="sk_test")
+    enforcer = BudgetEnforcer(api_url="http://localhost:8000", binding=validated_binding("sk_test"))
     token_details = TokenDetails(input_tokens=10, output_tokens=20)
 
     def _build(tier: str | None) -> BudgetConfirmRequest:

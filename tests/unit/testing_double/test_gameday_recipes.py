@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from conftest import plane_binding
 
 import solwyn
 from solwyn import BudgetExceededError
@@ -35,7 +36,7 @@ def _legacy_enforcer(
 ) -> BudgetEnforcer:
     return BudgetEnforcer(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         budget_mode=BudgetMode.ALERT_ONLY,
         fail_open=True,
         cache_ttl=0,
@@ -70,7 +71,9 @@ def _lease_check(enforcer: BudgetEnforcer, run_id: str) -> BudgetCheckResult:
 
 
 def _reservation(plane: FakeControlPlane) -> str:
-    with httpx.Client(transport=plane.transport, base_url=plane.api_url) as http:
+    with httpx.Client(
+        transport=plane.transport, base_url=plane.api_url, headers=plane.auth_headers()
+    ) as http:
         response = http.post(
             "/api/v1/budgets/check",
             json={
@@ -195,7 +198,7 @@ def test_slow_confirm_is_bounded_by_reporter_shutdown_deadline_and_counted_once(
     plane = FakeControlPlane()
     reporter = MetadataReporter(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         flush_interval=60,
         shutdown_deadline=0.05,
         transport=plane.transport,
@@ -253,7 +256,7 @@ def test_lease_refusal_ladder_uses_legacy_then_outage_drawdown_and_hard_deny() -
     with closing(
         BudgetEnforcer(
             plane.api_url,
-            plane.api_key,
+            plane_binding(plane),
             fail_open=True,
             cache_ttl=0,
             control_plane_breaker=breaker,
@@ -305,7 +308,7 @@ def test_breaker_held_confirm_recovers_and_drains_exactly_once() -> None:
     enforcer = _legacy_enforcer(plane, breaker=breaker)
     reporter = MetadataReporter(
         plane.api_url,
-        plane.api_key,
+        plane_binding(plane),
         flush_interval=60,
         control_plane_breaker=breaker,
         retry_backoff_base=0.001,
@@ -498,7 +501,7 @@ def test_a_local_velocity_stop_is_never_lifted_by_a_permissive_plane() -> None:
             checks_at_stop = len(plane.checks)
 
             # The plane itself is entirely permissive for this run...
-            with httpx.Client(transport=plane.transport) as http:
+            with httpx.Client(transport=plane.transport, headers=plane.auth_headers()) as http:
                 allowed = http.post(
                     f"{plane.api_url}/api/v1/budgets/check",
                     json={
