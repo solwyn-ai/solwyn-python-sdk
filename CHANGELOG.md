@@ -5,6 +5,23 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Versions are
 derived from git tags (hatch-vcs).
 
+## [Unreleased]
+
+### Added
+
+- **OpenAI SDK 3.46 and Together SDK 3.1 support.** OpenAI 3.46 adds two
+  administration APIs: `admin.organization.projects.service_tier_settings`
+  (`retrieve`, `update`) and `admin.organization.workload_identity_providers`
+  (`create`, `retrieve`, `update`, `list`, `delete`, plus `federation_rules`
+  with the same operations). They are classified like their sibling
+  administration resources (`projects.data_retention`, `certificates` and
+  `groups.roles`): unmetered, following `on_unmetered`, and requiring exact
+  acknowledgment tokens in strict mode, with raw and streaming response
+  helpers in their separate acknowledgment scope. Together 3.1 adds
+  `post_training.model_resources.extend_expiry`, classified like the other
+  model-resource operations. Anthropic 2.5 and google-genai 2.34 add no new
+  surfaces. Coverage fingerprints are refreshed for this admission.
+
 ## [0.10.2] - 2026-11-03
 
 Bug fixes: under `hard_deny`, a stream closed early or dropped, and a call that
