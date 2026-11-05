@@ -918,3 +918,67 @@ def test_failover_hop_recheck_refusal_raises_and_never_dispatches_the_fallback()
     assert excinfo.value.code == "api_key_invalid"
     assert fallback_bodies == []
     assert [check.model for check in plane.checks] == ["gpt-5.5"]
+
+
+@pytest.mark.unit
+def test_exit_drain_refusal_is_terminal_recorded_and_credits_the_breaker() -> None:
+    from solwyn import _lifecycle
+    from solwyn.circuit_breaker import CircuitBreaker
+
+    binding = validated_binding()
+    breaker = CircuitBreaker(name="control-plane", failure_threshold=1)
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers[PROJECT_HEADER])
+        return httpx.Response(404, json={"detail": {"code": "project_not_found"}})
+
+    headers, dispatched_at = binding.request_headers()
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+        outcome = _lifecycle._post_confirm_blocking(
+            http,
+            f"{_URL}{_CONFIRM_PATH}",
+            {},
+            headers,
+            breaker,
+            _lifecycle._monotonic() + 5,
+            binding=binding,
+            dispatched_at=dispatched_at,
+        )
+
+    assert outcome == "api_key_refused"
+    assert seen == [VALID_PROJECT_ID]
+    assert binding.refusal is not None and binding.refusal.code == "project_not_found"
+    assert breaker.get_state().state.value == "closed"
+
+
+@pytest.mark.unit
+def test_lease_surrender_refusal_is_recorded_and_never_retried() -> None:
+    binding = validated_binding()
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(401, content=_HARD_401, request=request)
+
+    enforcer = BudgetEnforcer(_URL, binding, transport=httpx.MockTransport(handler))
+    try:
+        from solwyn._types import LeaseSurrenderRequest
+
+        request = LeaseSurrenderRequest(
+            lease_id="lease-1", holder_id="holder-1", generation=1, spent_tokens=0
+        )
+        enforcer._surrender_payloads([request], deadline=_monotonic_now() + 5)
+        counts = enforcer.release_counts
+    finally:
+        enforcer.close()
+
+    assert calls == ["/api/v1/budgets/lease/surrender"]
+    assert counts.get("refused") == 1
+    assert binding.state == "refused"
+
+
+def _monotonic_now() -> float:
+    import time
+
+    return time.monotonic()
