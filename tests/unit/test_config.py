@@ -114,6 +114,29 @@ class TestEnvVarConstruction:
             "project name or proj_ id."
         )
 
+    @pytest.mark.parametrize("source", ["kwarg", "env"])
+    def test_a_padded_project_is_trimmed_before_it_reaches_the_wire(
+        self, monkeypatch: pytest.MonkeyPatch, source: str
+    ) -> None:
+        import h11
+
+        padded = " My Project\t"
+        if source == "env":
+            monkeypatch.setenv("SOLWYN_PROJECT", padded)
+            client = _make_solwyn(_mock_openai_client(), api_key=VALID_API_KEY)
+        else:
+            client = _make_solwyn(_mock_openai_client(), api_key=VALID_API_KEY, project=padded)
+        try:
+            headers, _generation = client._solwyn_binding.request_headers()
+        finally:
+            client.close()
+
+        assert headers["Solwyn-Project"] == "My Project"
+        # A real HTTP/1.1 send accepts it (h11 refuses padded header values).
+        h11.Connection(h11.CLIENT).send(
+            h11.Request(method="GET", target="/", headers=[("Host", "x"), *headers.items()])
+        )
+
     def test_project_loads_from_env_and_kwarg_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("SOLWYN_PROJECT", "  from-env\t")
 

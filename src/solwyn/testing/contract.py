@@ -1010,11 +1010,15 @@ def assert_auth_key_contract(http: httpx.Client, api_key: str, project: str) -> 
         "the proj_ id selector resolved a different project",
     )
 
-    folded = _get_auth_key(http, _headers(_Auth(api_key, f" {parsed.project_name.upper()}\t")))
-    _require_status(folded, 200, "auth key by case-folded, padded name")
+    # A conforming HTTP/1.1 client (httpx via h11) refuses to send a header
+    # value with leading or trailing whitespace, and the SDK trims the selector
+    # before sending, so this probe sends no padding. The server's trimming of
+    # padded values is a server-side check (a raw-socket test in core).
+    folded = _get_auth_key(http, _headers(_Auth(api_key, parsed.project_name.upper())))
+    _require_status(folded, 200, "auth key by case-folded name")
     _require(
         _object_json(folded, "auth key by case-folded name").get("project_id") == parsed.project_id,
-        "name matching must be case-insensitive and trim space and tab",
+        "name matching must be case-insensitive",
     )
 
     _key_error_detail(
@@ -1025,7 +1029,7 @@ def assert_auth_key_contract(http: httpx.Client, api_key: str, project: str) -> 
         message=_SELECTOR_REQUIRED_MESSAGE,
     )
     _key_error_detail(
-        _get_auth_key(http, {"Authorization": f"Bearer {api_key}", PROJECT_HEADER: " \t"}),
+        _get_auth_key(http, {"Authorization": f"Bearer {api_key}", PROJECT_HEADER: ""}),
         400,
         "project_selector_required",
         "auth key with a blank Solwyn-Project",

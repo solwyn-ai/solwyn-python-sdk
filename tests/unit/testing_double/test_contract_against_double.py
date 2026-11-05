@@ -495,6 +495,41 @@ def test_auth_key_contract_against_double() -> None:
         assert_auth_key_contract(http, plane.api_key, plane.project_name)
 
 
+class _WireHeaderCheck(httpx.BaseTransport):
+    """Validates every request's headers with h11, as a real HTTP/1.1 send would."""
+
+    def __init__(self, inner: httpx.BaseTransport) -> None:
+        self._inner = inner
+        self.project_values: list[bytes] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        import h11
+
+        connection = h11.Connection(h11.CLIENT)
+        connection.send(  # raises h11.LocalProtocolError on an illegal value
+            h11.Request(method=request.method, target="/", headers=list(request.headers.raw))
+        )
+        self.project_values.extend(
+            value for name, value in request.headers.raw if name.lower() == b"solwyn-project"
+        )
+        return self._inner.handle_request(request)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("by", ["name", "id"])
+def test_auth_key_contract_sends_only_header_values_a_real_client_can_send(by: str) -> None:
+    # Staging found the probe's padded selector (" NAME\t") refused by httpx
+    # (h11 LocalProtocolError) before it reached the server.
+    plane = FakeControlPlane()
+    wire = _WireHeaderCheck(plane.transport)
+    project = plane.project_name if by == "name" else plane.project_id
+    with httpx.Client(transport=wire, base_url=plane.api_url) as http:
+        assert_auth_key_contract(http, plane.api_key, project)
+
+    assert wire.project_values
+    assert all(value == value.strip(b" \t") for value in wire.project_values)
+
+
 @pytest.mark.unit
 def test_auth_key_contract_by_id_against_double() -> None:
     plane = FakeControlPlane()
