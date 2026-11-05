@@ -1072,6 +1072,9 @@ def _drain_queues_blocking(
                     advisory_batch = advisory_reports[offset : offset + 100]
                     if not advisory_batch:
                         continue
+                    if binding.refused:
+                        untracked_state.mark_sent(advisory_batch)  # dropped, not sent
+                        break
                     untracked_state.mark_attempted(advisory_batch, _monotonic())
                     try:
                         response = client.post(
@@ -1164,6 +1167,8 @@ def _post_confirm_blocking(
     """
     if _monotonic() >= deadline:
         return "expired"
+    if binding is not None and binding.refused:
+        return _API_KEY_REFUSED  # nothing but /auth/key goes out while refused
     admission = breaker.admit() if breaker is not None else None
     if admission is not None and not admission.allowed:
         return "held"
@@ -1224,6 +1229,8 @@ def _post_json_response(
     remaining = deadline - _monotonic()
     if remaining <= 0:
         return "expired", None
+    if binding is not None and binding.refused:
+        return _API_KEY_REFUSED, None
     try:
         response = client.post(url, json=payload, headers=headers, timeout=min(5.0, remaining))
         response.raise_for_status()

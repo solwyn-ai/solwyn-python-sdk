@@ -83,9 +83,9 @@ working at the same time.
   block nothing (alert-only, with no unpaused hard budget rule or run cap)
   lets calls run unmetered, logging `solwyn.api_key_refused` at error on
   every call. Every other refusal blocks, and at startup every refusal blocks.
-  A 401 always blocks first; the SDK re-checks the key at once, and only that
-  fresh answer can relax the block (the call that met the 401 pays one extra
-  round trip).
+  A 401 always blocks first; the SDK re-checks the key at once (not on the
+  60-second retry schedule), and only that fresh answer can relax the block,
+  so the call that met the 401 pays one extra round trip.
 - **A refusal also stops a call already past its budget check.** Every
   provider request the SDK sends (the first attempt, each failover hop, each
   same-provider retry, streaming or not, and media calls) checks for a
@@ -115,9 +115,14 @@ working at the same time.
   project than the one earlier calls reached (for example after an outage and
   a rename), held leases and cached allows from before are dropped, and a
   lease or allow answered after such a change is never kept.
-- Background items (confirms, metadata, advisory reports, lease releases)
-  that meet a refusal are dropped without retry, and the configuration error
-  is logged once per code.
+- **A refused client stays quiet.** While the key or project is refused, the
+  SDK sends Solwyn nothing but the key re-check: no budget checks, lease
+  requests or uploads. Queued confirms and metadata are dropped and counted
+  as `api_key_refused`, and the configuration error is logged once per code.
+  A client running unmetered on an alert-only project therefore stays
+  unmetered; it is re-blocked only by a late 401 to a request it sent before
+  the refusal, and that block lasts one key re-check. When a re-check
+  succeeds, normal traffic resumes.
 - Breaker reports start once the project id is pinned by validation; a budget
   check response no longer sets it.
 

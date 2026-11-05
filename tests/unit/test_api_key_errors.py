@@ -540,28 +540,29 @@ def test_f10_revalidation_200_recovers_and_the_header_is_the_pinned_id() -> None
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("path", [_CONFIRM_PATH, _INGEST_PATH])
-def test_f11_project_not_found_on_background_send_drops_item_and_blocks_next_call(
-    path: str,
-) -> None:
+def test_f11_project_not_found_on_background_send_drops_items_and_blocks_next_call() -> None:
     plane = FakeControlPlane(mode="hard_deny")
     with _wrapped(plane, reporter_flush_interval=3600) as (client, stub, _clock):
         client.validate()
         _call(client)
         plane.archive_project()
         reporter = client._solwyn_reporter
+        before = len(plane.project_headers)
         reporter._flush_remaining()
-        sends = _requests_to(plane, path)
-        reporter._flush_remaining()  # nothing left to retry
+        background = [path for path, _ in plane.project_headers[before:]]
+        reporter._flush_remaining()  # nothing left, and nothing sent while refused
 
         with pytest.raises(ApiKeyRefusedError) as excinfo:
             _call(client)
 
-    assert sends >= 1
-    assert _requests_to(plane, path) == sends
+    # The first background send met the 404 and refused the binding; every
+    # other queued item was dropped locally, unsent and never retried.
+    assert len(background) == 1 and background[0] in {_CONFIRM_PATH, _INGEST_PATH}
+    assert len(plane.project_headers) == before + 1
     assert plane.confirms == [] and plane.ingested == []
     assert len(reporter._confirm_queue) == len(reporter._settlement_queue) == 0
     assert len(reporter._queue) == 0
+    assert any(key.endswith("api_key_refused") for key in reporter.dropped_counts)
     assert excinfo.value.code == "project_not_found"
     assert excinfo.value.field == "project"
     assert str(excinfo.value) == (

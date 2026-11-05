@@ -415,8 +415,10 @@ def test_explicit_revalidation_returns_none_on_outage_after_prior_success(failur
     "prior,status,body",
     [
         ("valid", 403, b'{"detail":{"code":"read_only_key"}}'),
+        # A refused binding sends nothing (see the test below), so the hard
+        # 401 is observed from a valid one.
         (
-            "unmetered",
+            "valid",
             401,
             b'{"detail":{"code":"api_key_expired","project_budget_mode":"hard_deny"}}',
         ),
@@ -486,7 +488,6 @@ def test_gc_advisory_hard_401_cannot_leave_a_live_enforcer_unmetered():
 
     binding = ProjectBinding(KEY, "review")
     binding.apply_auth_key(200, json.dumps(AUTH).encode(), 0)
-    binding.refuse(Refusal("api_key_expired", "alert_only"), binding.generation)
     paths = []
 
     def control(request):
@@ -564,3 +565,56 @@ def test_interrupted_sync_401_body_tightens_existing_unmetered_refusal():
         enforcer.close()
 
     assert binding.refusal.effect == "block", "an interrupted 401 body was forgotten"
+
+
+def test_exit_advisory_sends_nothing_while_the_binding_is_refused():
+    """A refused binding (any effect) sends Solwyn nothing but /auth/key."""
+    from collections import deque
+    from datetime import UTC, datetime
+
+    from solwyn._lifecycle import _drain_queues_blocking
+    from solwyn._project import sync_status_hook
+    from solwyn._surfaces import SurfaceContext
+    from solwyn.reporter import _UntrackedReportState
+
+    binding = ProjectBinding(KEY, "review")
+    binding.apply_auth_key(200, json.dumps(AUTH).encode(), 0)
+    binding.refuse(Refusal("api_key_expired", "alert_only"), binding.generation)
+    advisory = _UntrackedReportState("review-advisory-instance")
+    advisory.observe(
+        context=SurfaceContext(
+            provider="openai", dialect="openai", client_shape="openai_sdk", mode="async"
+        ),
+        surface="batches.create",
+        rule_kind="unmetered_spend",
+        capability_scope="operation",
+        posture="allow",
+        seen_at=datetime.now(UTC),
+    )
+    paths = []
+
+    def client():
+        def handler(request):
+            paths.append(request.url.path)
+            return httpx.Response(202, json={"accepted": 1})
+
+        return httpx.Client(
+            transport=httpx.MockTransport(handler),
+            event_hooks={"response": [sync_status_hook(binding)]},
+        )
+
+    _drain_queues_blocking(
+        deque(),
+        deque(),
+        deque(),
+        "https://plane.test",
+        binding,
+        None,
+        2.0,
+        lambda *_args: None,
+        client,
+        untracked_state=advisory,
+    )
+
+    assert paths == []
+    assert binding.refusal is not None and binding.refusal.effect == "allow_unmetered"

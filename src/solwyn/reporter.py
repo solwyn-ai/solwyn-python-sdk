@@ -172,7 +172,15 @@ class _SendOutcome(enum.Enum):
     SENT = "sent"  # delivered
     HELD = "held"  # control-plane breaker refused admission — not an attempt
     RETRY = "retry"  # transient failure — retry after backoff
-    DROPPED = "dropped"  # terminal status / poison item / key refusal: never retry
+    DROPPED = "dropped"  # terminal status / poison item: never retry
+    # The key or project is refused: not sent (or refused by Solwyn), dropped
+    # locally and counted under ``api_key_refused``. Never retried.
+    REFUSED = "refused"
+
+
+def _terminal_reason(outcome: _SendOutcome) -> str:
+    """Drop reason of a terminal (non-retried) send outcome."""
+    return "api_key_refused" if outcome is _SendOutcome.REFUSED else "terminal_status"
 
 
 class _IngestRejectionKind(enum.Enum):
@@ -2663,7 +2671,7 @@ class MetadataReporter(_ReporterBase):
                 pending.next_attempt_at = next_at
                 self._park_confirm(pending)
                 break  # FIFO: nothing behind a backing-off head may jump it
-            self._resolve_confirm(drop_reason="terminal_status")
+            self._resolve_confirm(drop_reason=_terminal_reason(outcome))
         else:
             return bool(self._confirm_queue)
         return False
@@ -2718,7 +2726,9 @@ class MetadataReporter(_ReporterBase):
                 self._park_settlement(claim)
                 break
             # Terminal confirm: the event is still the durable spend truth.
-            self._resolve_settlement_to_event_queue(claim, confirm_drop_reason="terminal_status")
+            self._resolve_settlement_to_event_queue(
+                claim, confirm_drop_reason=_terminal_reason(outcome)
+            )
         else:
             return bool(self._settlement_queue)
         return False
@@ -2763,7 +2773,7 @@ class MetadataReporter(_ReporterBase):
                 self._resolve_retry_event_batch(claim, keep=keep)
                 break
             cycle_clean = False
-            self._resolve_dropped_event_batch(claim, "terminal_status")
+            self._resolve_dropped_event_batch(claim, _terminal_reason(result.outcome))
         else:
             more = bool(self._queue) and self.batch_size > 0
         if sent_clean_batch and cycle_clean:
@@ -2811,7 +2821,7 @@ class MetadataReporter(_ReporterBase):
         them is fine and is NOT counted as a spend drop.
         """
         for project_id, report in self._build_breaker_reports(force=force):
-            if self._deadline_expired(deadline):
+            if self._deadline_expired(deadline) or self._binding.refused:
                 return
             headers, dispatched_at = self._binding.request_headers()
             try:
@@ -2889,6 +2899,10 @@ class MetadataReporter(_ReporterBase):
             batch = built_reports[offset : offset + _UNTRACKED_REPORT_BATCH_SIZE]
             if not batch:
                 continue
+            if self._binding.refused:
+                # Advisory deltas are dropped (not counted as spend), not sent.
+                self._mark_untracked_reports_sent(batch)
+                continue
             self._mark_untracked_reports_attempted(batch)
             headers, dispatched_at = self._binding.request_headers()
             try:
@@ -2922,6 +2936,9 @@ class MetadataReporter(_ReporterBase):
         poison item returns DROPPED. Read-only-key is a policy skip, not a loss,
         so it returns SENT.
         """
+        if self._binding.refused:
+            # Refused key or project: nothing goes to Solwyn but /auth/key.
+            return _SendOutcome.REFUSED
         breaker = self._control_plane_breaker
         admission = breaker.admit() if breaker is not None else None
         if admission is not None and not admission.allowed:
@@ -2948,7 +2965,7 @@ class MetadataReporter(_ReporterBase):
                 # An answer, not an outage: credit the breaker; terminal drop.
                 if breaker is not None:
                     breaker.record_success()
-                return _SendOutcome.DROPPED
+                return _SendOutcome.REFUSED
             if breaker is not None:
                 breaker.record_failure()
             self._record_confirm_failure(exc)
@@ -2981,6 +2998,10 @@ class MetadataReporter(_ReporterBase):
             self._in_flight += 1
         dispatched_at: int | None = None
         try:
+            if self._binding.refused:
+                return _BatchSendResult(
+                    _SendOutcome.REFUSED, _IngestRejections(_IngestRejectionKind.MALFORMED)
+                )
             payload = [e.model_dump(mode="json") for e in batch]
             headers, dispatched_at = self._binding.request_headers()
             resp = self._http.post(
@@ -2995,7 +3016,7 @@ class MetadataReporter(_ReporterBase):
         except Exception as exc:
             if dispatched_at is not None and self._note_refusal(exc, dispatched_at):
                 return _BatchSendResult(
-                    _SendOutcome.DROPPED, _IngestRejections(_IngestRejectionKind.MALFORMED)
+                    _SendOutcome.REFUSED, _IngestRejections(_IngestRejectionKind.MALFORMED)
                 )
             # Log only the exception's class name — the type-name-only
             # convention every other except-block follows. Safe here even though
@@ -3554,7 +3575,7 @@ class AsyncMetadataReporter(_ReporterBase):
                 pending.next_attempt_at = next_at
                 self._confirm_queue.appendleft(pending)
                 break  # FIFO: nothing behind a backing-off head may jump it
-            self._count_drop("confirm", "terminal_status")
+            self._count_drop("confirm", _terminal_reason(outcome))
         else:
             return bool(self._confirm_queue)
         return False
@@ -3621,7 +3642,7 @@ class AsyncMetadataReporter(_ReporterBase):
                 pending.confirm.next_attempt_at = next_at
                 self._settlement_queue.appendleft(pending)
                 break
-            self._count_drop("settlement_confirm", "terminal_status")
+            self._count_drop("settlement_confirm", _terminal_reason(outcome))
             self._move_event_to_queue(pending.event)
         else:
             return bool(self._settlement_queue)
@@ -3688,7 +3709,7 @@ class AsyncMetadataReporter(_ReporterBase):
                     self._queue.extendleft(reversed(keep))
                 break
             cycle_clean = False
-            self._dispose_pending_events(prefix, "terminal_status")
+            self._dispose_pending_events(prefix, _terminal_reason(result.outcome))
         else:
             more = bool(self._queue) and self.batch_size > 0
         if sent_clean_batch and cycle_clean:
@@ -3729,7 +3750,7 @@ class AsyncMetadataReporter(_ReporterBase):
         are dropped, not counted as spend).
         """
         for project_id, report in self._build_breaker_reports(force=force):
-            if self._deadline_expired(deadline):
+            if self._deadline_expired(deadline) or self._binding.refused:
                 return
             headers, dispatched_at = self._binding.request_headers()
             try:
@@ -3803,6 +3824,10 @@ class AsyncMetadataReporter(_ReporterBase):
             batch = built_reports[offset : offset + _UNTRACKED_REPORT_BATCH_SIZE]
             if not batch:
                 continue
+            if self._binding.refused:
+                # Advisory deltas are dropped (not counted as spend), not sent.
+                self._mark_untracked_reports_sent(batch)
+                continue
             self._mark_untracked_reports_attempted(batch)
             headers, dispatched_at = self._binding.request_headers()
             try:
@@ -3828,6 +3853,8 @@ class AsyncMetadataReporter(_ReporterBase):
 
         See ``MetadataReporter._send_confirm``.
         """
+        if self._binding.refused:
+            return _SendOutcome.REFUSED
         breaker = self._control_plane_breaker
         admission = breaker.admit() if breaker is not None else None
         if admission is not None and not admission.allowed:
@@ -3851,7 +3878,7 @@ class AsyncMetadataReporter(_ReporterBase):
                 # An answer, not an outage: credit the breaker; terminal drop.
                 if breaker is not None:
                     breaker.record_success()
-                return _SendOutcome.DROPPED
+                return _SendOutcome.REFUSED
             if breaker is not None:
                 breaker.record_failure()
             self._record_confirm_failure(exc)
@@ -3882,6 +3909,10 @@ class AsyncMetadataReporter(_ReporterBase):
         self._in_flight += 1
         dispatched_at: int | None = None
         try:
+            if self._binding.refused:
+                return _BatchSendResult(
+                    _SendOutcome.REFUSED, _IngestRejections(_IngestRejectionKind.MALFORMED)
+                )
             payload = [e.model_dump(mode="json") for e in batch]
             headers, dispatched_at = self._binding.request_headers()
             resp = await self._http.post(
@@ -3897,7 +3928,7 @@ class AsyncMetadataReporter(_ReporterBase):
         except Exception as exc:
             if dispatched_at is not None and self._note_refusal(exc, dispatched_at):
                 return _BatchSendResult(
-                    _SendOutcome.DROPPED, _IngestRejections(_IngestRejectionKind.MALFORMED)
+                    _SendOutcome.REFUSED, _IngestRejections(_IngestRejectionKind.MALFORMED)
                 )
             # Log only the exception's class name — the type-name-only
             # convention every other except-block follows. Safe here even though

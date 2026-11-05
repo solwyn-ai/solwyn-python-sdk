@@ -263,9 +263,11 @@ class TestConfirmBreaker:
         transport = _CountingTransport("read_only")
         reporter = _make_reporter(breaker, transport)
 
-        for _ in range(3):
-            reporter._send_confirm(_confirm())
-        assert transport.count == 3
+        outcomes = [reporter._send_confirm(_confirm()) for _ in range(3)]
+        # The first 403 is an answer (breaker credited) and refuses the key;
+        # while refused nothing more is sent, so the next two drop locally.
+        assert transport.count == 1
+        assert {outcome.value for outcome in outcomes} == {"refused"}
         assert breaker.get_state().state is CircuitState.CLOSED
         assert reporter._consecutive_confirm_failures == 0
         reporter._http.close()

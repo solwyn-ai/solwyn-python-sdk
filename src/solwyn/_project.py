@@ -227,6 +227,16 @@ class ProjectBinding:
             return self._pinned_id
 
     @property
+    def refused(self) -> bool:
+        """True in any refused state (``block`` or ``allow_unmetered``).
+
+        While refused the SDK sends Solwyn nothing but the single-flight
+        ``/auth/key`` revalidation: data-plane items are dropped locally.
+        """
+        with self._lock:
+            return self._state == "refused"
+
+    @property
     def ever_valid(self) -> bool:
         with self._lock:
             return self._ever_valid

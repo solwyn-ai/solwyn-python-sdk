@@ -183,7 +183,9 @@ def test_sync_reporter_read_only_batches_are_terminal_and_log_once(
     ):
         reporter._flush_remaining()
 
-    assert post.call_count == 2
+    # The first refusal stops all traffic: everything after it is dropped
+    # locally, unsent.
+    assert post.call_count == 1
     assert len(reporter._confirm_queue) == 0
     assert len(reporter._queue) == 0
     assert reporter._consecutive_confirm_failures == 0
@@ -221,7 +223,9 @@ def test_sync_breaker_reports_read_only_errors_log_configuration_once(
     # A read-only key can never post a breaker report: the first 403 ends the
     # cycle (one POST per cycle, not one per provider) and later cycles stay
     # silent after the single one-time configuration error.
-    assert post.call_count == 2
+    # The first refusal stops all traffic: everything after it is dropped
+    # locally, unsent.
+    assert post.call_count == 1
     assert caplog.text.count("solwyn.configuration_error.read_only_key") == 1
     assert "reporter.breaker_send_failed" not in caplog.text
     reporter._http.close()
@@ -249,7 +253,9 @@ async def test_async_breaker_reports_read_only_errors_log_configuration_once(
         await reporter._flush_breaker_reports()
         await reporter._flush_breaker_reports()
 
-    assert reporter._http.post.await_count == 2
+    # The first refusal stops all traffic: everything after it is dropped
+    # locally, unsent.
+    assert reporter._http.post.await_count == 1
     assert caplog.text.count("solwyn.configuration_error.read_only_key") == 1
     assert "reporter.breaker_send_failed" not in caplog.text
     await reporter._http.aclose()
@@ -272,7 +278,9 @@ async def test_async_reporter_read_only_batches_are_terminal_and_log_once(
     with caplog.at_level("WARNING"):
         await reporter._flush_remaining()
 
-    assert reporter._http.post.await_count == 2
+    # The first refusal stops all traffic: everything after it is dropped
+    # locally, unsent.
+    assert reporter._http.post.await_count == 1
     assert len(reporter._confirm_queue) == 0
     assert len(reporter._queue) == 0
     assert reporter._consecutive_confirm_failures == 0

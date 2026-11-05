@@ -108,6 +108,11 @@ on every call. A 401 always blocks first; the SDK then re-checks the key at
 once, and only that fresh answer can let calls run unmetered, so the call that
 met the 401 pays one extra round trip. At startup every refusal blocks.
 
+While a refusal is stored the SDK sends Solwyn nothing but that key re-check:
+no budget checks, leases or usage uploads (queued usage is dropped and counted
+as `api_key_refused`). A re-check that succeeds clears the refusal and normal
+traffic resumes.
+
 Old project keys (`sk_proj_...`) no longer work; the SDK rejects them when
 the client is constructed. Create a key in the dashboard or with
 `solwyn keys create`. `SOLWYN_PROJECT_ID` is not read; use `SOLWYN_PROJECT`.

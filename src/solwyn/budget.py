@@ -3090,6 +3090,10 @@ class BudgetEnforcer(_BudgetEnforcerBase):
             request, uncounted_report = self._with_uncounted_report(request)
             # ── Phase 1: transport + HTTP status. Failures here are OUTAGE
             # semantics — unchanged from before the split.
+            if self._binding.refused:
+                # Refused since the gate: no check goes out; the exit check
+                # applies the stored refusal.
+                return self._refused_placeholder()
             headers, dispatched_at = self._binding.request_headers()
             try:
                 request_epoch = time.monotonic()
@@ -3344,6 +3348,8 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                 fallback_models=fallback_models,
             )
             payload = request.model_dump(mode="json")
+            if self._binding.refused:
+                return "refused", None
             headers, dispatched_at = self._binding.request_headers()
             try:
                 if timeout is not None:
@@ -3491,6 +3497,16 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                         expected_generation=request.generation,
                     )
                 return
+            if self._binding.refused:
+                # No renewal while refused; the next gate drops the lease.
+                with self._state_lock:
+                    self._lease.renewal_failed(
+                        agent_run_id,
+                        time.monotonic(),
+                        expected_lease_id=request.lease_id,
+                        expected_generation=request.generation,
+                    )
+                return
             headers, dispatched_at = self._binding.request_headers()
             try:
                 resp = self._http.post(
@@ -3572,6 +3588,10 @@ class BudgetEnforcer(_BudgetEnforcerBase):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return
+                    if self._binding.refused:
+                        with self._state_lock:
+                            self._count_release_locked("refused")
+                        break
                     request_started = True
                     headers, dispatched_at = self._binding.request_headers()
                     client.post(
@@ -4055,6 +4075,10 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
             request, uncounted_report = self._with_uncounted_report(request)
             # ── Phase 1: transport + HTTP status. Failures here are OUTAGE
             # semantics — unchanged from before the split.
+            if self._binding.refused:
+                # Refused since the gate: no check goes out; the exit check
+                # applies the stored refusal.
+                return self._refused_placeholder()
             headers, dispatched_at = self._binding.request_headers()
             try:
                 request_epoch = time.monotonic()
@@ -4301,6 +4325,8 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                 fallback_models=fallback_models,
             )
             payload = request.model_dump(mode="json")
+            if self._binding.refused:
+                return "refused", None
             headers, dispatched_at = self._binding.request_headers()
             try:
                 if timeout is not None:
@@ -4426,6 +4452,16 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
         try:
             if admission is not None and not admission.allowed:
                 logger.debug("lease.renew_skipped_breaker_open")
+                with self._state_lock:
+                    self._lease.renewal_failed(
+                        agent_run_id,
+                        time.monotonic(),
+                        expected_lease_id=request.lease_id,
+                        expected_generation=request.generation,
+                    )
+                return
+            if self._binding.refused:
+                # No renewal while refused; the next gate drops the lease.
                 with self._state_lock:
                     self._lease.renewal_failed(
                         agent_run_id,
@@ -4664,6 +4700,10 @@ class AsyncBudgetEnforcer(_BudgetEnforcerBase):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return
+                    if self._binding.refused:
+                        with self._state_lock:
+                            self._count_release_locked("refused")
+                        break
                     request_started = True
                     headers, dispatched_at = self._binding.request_headers()
                     resp = await client.post(
