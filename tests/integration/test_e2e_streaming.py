@@ -9,6 +9,7 @@ genuinely omit usage.
 from __future__ import annotations
 
 import httpx
+import openai
 import pytest
 from conftest import WireRecorder
 from fake_provider import RESPONSE_CONTENT, FakeProviderServer
@@ -31,7 +32,10 @@ class TestStreamErrorSettlement:
         fake_provider.drop_next_stream(after_chunks=1)
 
         stream = client.chat.completions.create(model="gpt-5.5", messages=MESSAGES, stream=True)
-        with pytest.raises(httpx.RemoteProtocolError):
+        # openai 3.46 wraps the drop as APIConnectionError (its cause is the
+        # transport's RemoteProtocolError); earlier releases let
+        # httpx.RemoteProtocolError through. Either way it is a mid-stream error.
+        with pytest.raises((httpx.RemoteProtocolError, openai.APIConnectionError)):
             for _chunk in stream:
                 pass
 
